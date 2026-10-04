@@ -160,34 +160,39 @@ def make_reg_entry(target_addr, n_args, restype=ctypes.c_uint64):
     if IS_WINDOWS:
         code = b"\x48\xB8" + struct.pack("<Q", target_addr) + b"\xFF\xE0"
     else:
-        parts = []
-        stack_in = n_args >= 7
-        # 72 (not 80): keeps rsp 16-byte aligned at the CALL, as SysV requires.
-        spill = 72 if stack_in else 56
-        parts.append(b"\x48\x83\xEC\x38" if spill == 56 else
-                     b"\x48\x81\xEC" + struct.pack("<I", spill))       # sub rsp, spill
-        if stack_in:
-            parts.append(b"\x48\x8B\x84\x24" + struct.pack("<I", spill + 8))
-            parts.append(b"\x48\x89\x44\x24\x30")                    # mov [rsp+48], rax
-        parts.append(b"\x4C\x89\x44\x24\x20")                       # mov [rsp+32], r8
-        parts.append(b"\x4C\x89\x4C\x24\x28")                       # mov [rsp+40], r9
+        # SysV delivers args 1..6 in rdi/rsi/rdx/rcx/r8/r9; PULSAR's internal
+        # convention is rcx/rdx/r8/r9 then caller slots [rsp+32], [rsp+40], ...
+        # (a callee sees its stack args 8 bytes higher, since CALL pushed the
+        # return address). So: rdi->rcx, rsi->rdx, rdx->r8, rcx->r9,
+        # r8->[rsp+32], r9->[rsp+40], and SysV's own stack args (7..) copied to
+        # [rsp+48], [rsp+56], ... Silently dropping args 8+ was a real bug:
+        # ple_combine read a RMSNorm weight pointer out of stack garbage.
+        n_src_stack = max(0, n_args - 6)
+        spill = max(72, 56 + 8 * n_src_stack)
+        spill = ((spill + 8) // 16) * 16 + 8        # rsp stays 16-byte aligned at CALL
+        assert spill - 8 >= 48 + 8 * (n_src_stack - 1), "frame too small to copy args"
+        parts = [b"\x48\x81\xEC" + struct.pack("<I", spill)]      # sub rsp, spill
+        for k in range(n_src_stack):
+            parts.append(b"\x48\x8B\x84\x24" + struct.pack("<I", spill + 8 + 8 * k))
+            parts.append(b"\x48\x89\x44\x24" + bytes([48 + 8 * k]))
+        parts.append(b"\x4C\x89\x44\x24\x20")                   # mov [rsp+32], r8 (arg5)
+        parts.append(b"\x4C\x89\x4C\x24\x28")                   # mov [rsp+40], r9 (arg6)
         if n_args < 7:
-            # unstated trailing stack args must be defined (0), never garbage
+            # Unstated trailing slots must be defined: kernels treat 0 as "use the
+            # default", so caller garbage would silently change behaviour.
             parts.append(b"\x48\xC7\x44\x24\x30" + struct.pack("<I", 0))
-        parts += [b"\x49\x89\xD2",                                   # mov r10, rdx (arg3)
-                  b"\x49\x89\xCB",                                   # mov r11, rcx (arg4)
-                  b"\x48\x89\xF9",                                   # mov rcx, rdi
-                  b"\x48\x89\xF2",                                   # mov rdx, rsi
-                  b"\x4D\x89\xD0",                                   # mov r8,  r10
-                  b"\x4D\x89\xD9"]                                   # mov r9,  r11
-        parts.append(b"\x48\xB8" + struct.pack("<Q", target_addr))    # movabs rax, target
-        # Always CALL (never a tail jmp): the frame was moved by `sub rsp`, so a
-        # tail jump would make the kernel's RET pop our own frame instead of the
-        # caller's return address.
-        parts.append(b"\xFF\xD0")                                     # call rax
-        parts.append(b"\x48\x83\xC4\x38" if spill == 56 else
-                     b"\x48\x81\xC4" + struct.pack("<I", spill))       # add rsp, spill
-        parts.append(b"\xC3")                                          # ret
+        parts += [b"\x49\x89\xD2",                               # mov r10, rdx (arg3)
+                  b"\x49\x89\xCB",                               # mov r11, rcx (arg4)
+                  b"\x48\x89\xF9",                               # mov rcx, rdi
+                  b"\x48\x89\xF2",                               # mov rdx, rsi
+                  b"\x4D\x89\xD0",                               # mov r8,  r10
+                  b"\x4D\x89\xD9"]                               # mov r9,  r11
+        parts.append(b"\x48\xB8" + struct.pack("<Q", target_addr))
+        # Always CALL, never a tail jmp: the frame moved, so a tail jump would
+        # make the kernel's RET pop our frame instead of the caller's RA.
+        parts.append(b"\xFF\xD0")                                 # call rax
+        parts.append(b"\x48\x81\xC4" + struct.pack("<I", spill))
+        parts.append(b"\xC3")                                      # ret
         code = b"".join(parts)
     stub = exec_alloc(len(code) + 64)
     exec_write(stub, code)

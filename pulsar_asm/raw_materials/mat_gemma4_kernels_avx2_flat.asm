@@ -697,6 +697,7 @@ ple_combine_avx2:
     jz      .pc_done
     vbroadcastss ymm10, dword [rsp + 40]                    ; pscale
     vbroadcastss ymm11, dword [rsp + 48]                    ; tscale = sqrt(ple_dim) = 16
+    mov     r11, [rsp + 64]              ; RMSNorm weight (per_layer_projection_norm)
     vbroadcastss ymm12, dword [rsp + 56]                    ; 1/sqrt(2)
     vmovss  xmm13, dword [K_EPS]
     vxorps  ymm0, ymm0, ymm0
@@ -733,6 +734,7 @@ ple_combine_avx2:
     ja      .pc_done
     vmulps  ymm3, ymm10, [rdx + r10 * 4]         ; proj * pscale
     vmulps  ymm3, ymm3, ymm0                     ; * rsqrt
+    vmulps  ymm3, ymm3, [r11 + r10 * 4]          ; * RMSNorm weight
     vmovups ymm4, [r8 + r10 * 4]
     vfmadd231ps ymm3, ymm4, ymm11                 ; + tok * tscale
     vmulps  ymm3, ymm3, ymm12
