@@ -400,6 +400,13 @@ class Gemma4:
         return out, (len(out) - len(tokens)) / max(time.time() - t, 1e-9)
 
     def close(self):
+        # Workers spin on their job slot and only look at stop_flag when the job
+        # sequence says there is nothing to do. pthread_join with the flag clear
+        # waits forever on a thread that is waiting to be told to stop, so set
+        # each worker's flag first. Thread i's block is at smp + 64 + i*128, and
+        # handles[k] belongs to thread k+1.
+        for k in range(len(getattr(self, "handles", []))):
+            ctypes.c_uint32.from_address(self.smp + 64 + (k + 1) * 128 + 8).value = 1
         for h in getattr(self, "handles", []):
             abi.join_worker(h)
         self.blob.close()

@@ -81,6 +81,67 @@ pulsar_asm\tools\fasm.exe pulsar_asm\engine\gemma_engine_flat.asm pulsar_asm\eng
 
 ---
 
+## Gemma 4 E2B — branch `gemma-4`
+
+The same rules applied to **Google Gemma 4 E2B-it** (text-only), Linux x86-64, CPU only: flat
+assembly hot path, bf16 weights streamed straight out of the blob, no PyTorch anywhere in the
+inference path.
+
+![gemma 4 e2b chatting](doc/gemma4-chat.gif)
+
+| measurement | value |
+|---|---|
+| decode | **5.9 tok/s** — 169.8 ms per step |
+| weights streamed | 9.258 GB per token → **54.5 GB/s** |
+| prefill | 48 tokens in 8.2 s (one token per step — prefill is not batched) |
+| engine | **8,948 bytes** of assembly, AVX2 encodings only |
+| correctness | 8-token greedy rollout matches an independent NumPy reference token for token, logits rel ≈ 2e-6; every blob tensor verified against the checkpoint |
+
+Measured on a 4-core Linux host with the 9.258 GB blob on a RAM-backed mount. On DRAM the step
+is bandwidth-bound rather than compute-bound, which is exactly why speculative decoding is worth
+measuring here: B candidate positions could ride along on a single weight read.
+
+What Gemma 4 changes architecturally:
+
+- **Per-layer inputs (PLE)** — a second, much smaller signal path. `RMSNorm(proj(x)) + emb[token]`
+  per layer, gated by `gelu_tanh(gate(x))`, added back after the FF block. The token branch stays
+  bf16 in the blob; storing it as fp32 would add 4.7 GB to a file that is already read once per
+  token, and the kernels widen it in registers.
+- **One KV head, and shared KV caches** — a single KV head per layer, and layers 15..34 read the
+  cache written by layer 14, so 20 layers cost no cache memory at all.
+- **Proportional RoPE** — HF zero-pads `inv_freq` to `head_dim/2`, so the tail of the head is
+  `cos=1, sin=0` and pairing stays `(i, i + head_dim/2)`. Narrowing the rotary window there looks
+  reasonable and is wrong; the parity test catches it.
+- **Sliding + full attention** — 512-token window on 4 of every 5 layers, so most attention reads
+  a window instead of the whole cache.
+
+**MTP.** Google ships a 4-layer assistant checkpoint for exactly this model. Its draft quality
+against our own target measures **0.70 accepted tokens per draft pass ≈ 1.70 tokens per verify
+pass** (`tools/bench_mtp.py`) — real signal, but turning it into speed needs an assembly drafter
+and a correct batched verify pass, neither of which this branch has yet. So MTP is off.
+
+Status, honestly:
+
+| part | state |
+|---|---|
+| converter, blob, byte-for-byte verification of 372 tensors | works |
+| greedy decode, chat CLI, layer-by-layer parity tests | works |
+| batched verify (B tokens per pass) | B=1 bit-identical to before; **B>1 disagrees and faults** |
+| MTP drafter in assembly | not written — the NumPy drafter is slower than the target it drives |
+| temperature / top-k / top-p sampler | context fields and head branch done, **kernel faults**, engine stays on argmax |
+| shutdown | `close()` used to join spin workers that were never told to stop; fixed |
+
+```bash
+python3 tools/convert_gemma4_safetensors.py --out /mnt/edge/pulsar/gemma4_e2b.bin
+python3 tools/verify_gemma4_blob.py --blob /mnt/edge/pulsar/gemma4_e2b.bin
+python3 tests/test_gemma4_kernels.py && python3 tests/test_gemma4_engine.py
+python3 run_gemma4_chat.py --demo        # the gif above
+python3 tools/bench_gemma4.py            # the table above
+python3 tools/make_demo_gif.py           # regenerate it
+```
+
+---
+
 ## 專案文檔與報告
 
 詳細物理極限檢討與架構對帳請參閱：doc/pulsar_asm_cpu_limit_retrospective.md。

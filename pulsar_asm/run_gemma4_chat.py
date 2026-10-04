@@ -27,6 +27,12 @@ DEFAULT_TOK = "/mnt/edge/pulsar/tok"
 TURN_OPEN, TURN_CLOSE = "<|turn>", "<turn|>"
 
 
+# One scripted reply, used by --demo and by tools/make_demo_gif.py, so the gif
+# and the CLI always show the same run.
+DEMO_PROMPT = ("In one short sentence: what is unusual about running a 2-billion "
+               "parameter language model in pure x86 assembly?")
+
+
 def load_tokenizer(path):
     from transformers import AutoTokenizer
     tk = AutoTokenizer.from_pretrained(path)
@@ -154,10 +160,8 @@ def main():
     chat = Chat(eng, tk, eos, max_new=a.max_new)
 
     if a.demo:
-        q = ("In one short sentence: what is unusual about running a 2-billion "
-             "parameter language model in pure x86 assembly?")
-        print(f"\n\033[1myou\033[0m> {q}\n")
-        chat.turn(q)
+        print(f"\n\033[1myou\033[0m> {DEMO_PROMPT}\n")
+        chat.turn(DEMO_PROMPT)
         print(f"\n\033[90m{chat.tps:.1f} tok/s  ·  greedy  ·  {a.threads} cores\033[0m")
         eng.close()
         return
