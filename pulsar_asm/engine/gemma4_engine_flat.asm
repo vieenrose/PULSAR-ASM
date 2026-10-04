@@ -83,11 +83,20 @@ CTR_SIN_FULL         equ 336
 CTR_ROPE_STR_SLIDE   equ 344   ; bytes per position, sliding tables
 CTR_ROPE_STR_FULL    equ 352   ; bytes per position, full tables
 CTR_MARK             equ 360   ; int64 progress breadcrumb, debug only
-CTR_MAXLAYER         equ 368   ; int64: run layers [0,MAXLAYER); = NLAYER normally.
+CTR_B                equ 368   ; int64 tokens per pass: 1 = decode, >1 = verify
+CTR_TOKENS           equ 376   ; int64* -> token id per row; TOKENS[0] == CTR_TOKEN
+CTR_OUTTOK           equ 384   ; int64* -> argmax per row, written by the head
+CTR_XSTRIDE          equ 392   ; bytes between activation rows = hidden*4
+CTR_PLEROW           equ 400   ; bytes between PLE rows = nlayer*ple_dim*4
+                                ; FASM lets two equates share a value silently:
+                                ; MAXLAYER briefly aliased B here, so a debug
+                                ; write to one changed the other. parse_abi now
+                                ; rejects duplicate offsets in these tables.
+CTR_MAXLAYER         equ 408   ; int64: run layers [0,MAXLAYER); = NLAYER normally.
                                 ; Separate from NLAYER because that also sizes
                                 ; the PLE row stride, so truncating it corrupts
                                 ; the per-layer embedding inputs.
-CTR_SIZE             equ 384
+CTR_SIZE             equ 416
 
 ; Per-layer descriptor: absolute pointers, built by the loader from the converted
 ; manifest, so the assembly contains no weight-layout knowledge.
@@ -127,6 +136,24 @@ FLAG_KVSTORE         equ 4     ; publishes its K/V as the shared state of its ty
 ; ------------------------------------------------------------------------------
 ; NOTE: the parameters must not be named out/w/x - FASM parses those as the OUT
 ; instruction or as expressions, and reports it as "illegal instruction".
+; Batched GEMM. Rows are the output dimension (M) and the batch is the second
+; dimension, so outputs land as [B][M] with the default stride M*4 - which is
+; the entire point: the weights are streamed once for all B tokens, and decode
+; is bound by streaming them.
+macro GEMMB dst, wp, xp, kk, mm, bb {
+    mov     rcx, dst
+    mov     rdx, wp
+    mov     r8, xp
+    mov     r9, kk
+    mov     rax, mm
+    mov     [rsp + 32], rax                   ; M
+    mov     rax, bb
+    mov     [rsp + 40], rax                   ; B
+    mov     rax, [rbx + CTR_SMP]
+    mov     [rsp + 48], rax                   ; worker pool state
+    call    smp_bf16_gemb_avx2
+}
+
 macro GEMB dst, wp, xp, kk, mm {
     mov     rcx, dst
     mov     rdx, wp
@@ -146,6 +173,7 @@ macro GEMB_RESID {
     mov     rdx, [rbx + CTR_BUF_X]
     mov     r8, [rbx + CTR_BUF_T2]
     mov     r9, [rbx + CTR_HIDDEN]
+    imul    r9, [rbx + CTR_B]                 ; elementwise: one call covers B rows
     mov     eax, C_ONE
     mov     [rsp + 32], rax
     mov     [rsp + 40], rax                   ; out = x*1 + t2*1
@@ -172,14 +200,26 @@ gemma4_step:
     mov     rbx, rcx
     mov     qword [rbx + CTR_MARK], 1
 
-    ; ---- 1) token embedding: x = embed[token] * sqrt(hidden) ----------------
-    mov     rcx, [rbx + CTR_BUF_X]
+    ; ---- 1) token embedding: x[b] = embed[token[b]] * sqrt(hidden) ----------
+    mov     qword [rsp + 128], 0              ; row counter (frame local)
+.step_emb:
+    mov     rcx, [rsp + 128]
+    imul    rcx, [rbx + CTR_XSTRIDE]
+    add     rcx, [rbx + CTR_BUF_X]
     mov     rdx, [rbx + CTR_EMB]
-    mov     r8, [rbx + CTR_TOKEN]
+    mov     rax, [rsp + 128]
+    shl     rax, 3                            ; &tokens[b]
+    add     rax, [rbx + CTR_TOKENS]
+    mov     r8, [rax]
     mov     r9, [rbx + CTR_HIDDEN]
     mov     eax, [rbx + CTR_EMB_SCALE]        ; the float itself, not a pointer
     mov     [rsp + 32], rax
     call    embed_bf16_avx2
+    mov     rax, [rsp + 128]
+    inc     rax
+    mov     [rsp + 128], rax
+    cmp     rax, [rbx + CTR_B]
+    jb      .step_emb
     mov     qword [rbx + CTR_MARK], 2
 
     ; ---- 2) per-layer PLE inputs for this token (HF's per_layer_inputs) -----
@@ -188,7 +228,7 @@ gemma4_step:
     mov     r14, [rbx + CTR_PLE_DIM]
     mov     r15, r13
     imul    r15, r14                          ; M = 35 * 256 = 8960
-    GEMB    <[rbx + CTR_BUF_PLE_NEXT]>, <[rbx + CTR_PLE_PROJ]>, <[rbx + CTR_BUF_X]>, <[rbx + CTR_HIDDEN]>, <r15>
+    GEMMB   <[rbx + CTR_BUF_PLE_NEXT]>, <[rbx + CTR_PLE_PROJ]>, <[rbx + CTR_BUF_X]>, <[rbx + CTR_HIDDEN]>, <r15>, <[rbx + CTR_B]>
 
     ; per layer: ( RMSNorm_256(proj_slice) + ple_emb[token][slice] * sqrt(ple_dim) ) / sqrt(2)
     ; The scale is applied INSIDE the norm, before the RMSNorm weight: eps is
@@ -198,27 +238,38 @@ gemma4_step:
     ; it must be the model's real layer count - overriding it to debug "run the
     ; first k layers" silently reads the wrong PLE rows. Truncation belongs in a
     ; separate field if we ever want it.
+    mov     qword [rsp + 128], 0              ; outer loop: batch row
+.step_plerow:
+    mov     rbp, [rsp + 128]
     mov     r12, 0
 .step_ple:
     cmp     r12, r13
-    jae     .step_layers
+    jae     .step_ple_done
     mov     rax, r12
-    imul    rax, r14                          ; slice offset in elements
+    imul    rax, r14                          ; this layer's slice, in ELEMENTS
+    mov     r11, rbp
+    imul    r11, [rbx + CTR_PLEROW]           ; plus this row's PLE row, in bytes
     mov     rcx, rax
     shl     rcx, 2
-    add     rcx, [rbx + CTR_BUF_PLE_IN]       ; out
+    add     rcx, r11
+    add     rcx, [rbx + CTR_BUF_PLE_IN]       ; out   = ple_in[b][l]
     mov     rdx, rax
     shl     rdx, 2
-    add     rdx, [rbx + CTR_BUF_PLE_NEXT]     ; context branch slice
-    ; token branch row = ple_emb + token*(nlayer*ple_dim) + layer*ple_dim
-    mov     r8, [rbx + CTR_TOKEN]
-    mov     r9, r13
-    imul    r9, r14
-    imul    r8, r9
-    add     r8, rax
-    shl     r8, 1                             ; bf16
+    add     rdx, r11
+    add     rdx, [rbx + CTR_BUF_PLE_NEXT]     ; proj  = proj[b][l]
+    ; token branch = ple_emb + (token*nlayer + layer)*ple_dim, shifted only
+    ; AFTER the base is added - shifting the pointer itself doubles the address
+    ; and faults where it cannot be explained.
+    mov     r10, r13
+    imul    r10, r14                          ; nlayer * ple_dim
+    mov     r8, rbp
+    shl     r8, 3
+    add     r8, [rbx + CTR_TOKENS]
+    mov     r8, [r8]                          ; this row's token id
+    imul    r8, r10
+    add     r8, rax                           ; + layer*ple_dim
+    shl     r8, 1                             ; bf16 -> bytes
     add     r8, [rbx + CTR_PLE_EMB]
-    mov     r9, r14                           ; D = ple_dim
     mov     eax, [rbx + CTR_PROJ_SCALE]
     mov     [rsp + 32], rax
     mov     eax, [rbx + CTR_PLE_TOK_SCALE]
@@ -227,9 +278,19 @@ gemma4_step:
     mov     [rsp + 48], rax
     mov     rax, [rbx + CTR_PLE_PROJ_NORM]
     mov     [rsp + 56], rax                   ; per_layer_projection_norm weight
+    ; arg4 (D = ple_dim) is set last: everything above needed r9/r10/r11 as
+    ; scratch, and leaving D as nlayer*ple_dim tells the kernel a 256-wide slice
+    ; is 8960 long, which runs off the end of the buffer.
+    mov     r9, r14
     call    ple_combine_avx2
     inc     r12
     jmp     .step_ple
+.step_ple_done:
+    mov     rax, [rsp + 128]
+    inc     rax
+    mov     [rsp + 128], rax
+    cmp     rax, [rbx + CTR_B]
+    jb      .step_plerow
 
     ; ---- 3) the 35 decoder layers -------------------------------------------
 .step_layers:
@@ -254,20 +315,56 @@ gemma4_step:
     ; ---- 4) final norm, tied logits head, greedy sample ---------------------
 .step_head:
     mov     qword [rbx + CTR_MARK], 5
+    mov     qword [rsp + 128], 0
+.step_headrow:
+    mov     rax, [rsp + 128]
+    imul    rax, [rbx + CTR_XSTRIDE]
     mov     rcx, [rbx + CTR_BUF_T1]
+    add     rcx, rax
     mov     rdx, [rbx + CTR_FINAL_NORM]
     mov     r8, [rbx + CTR_BUF_X]
+    add     r8, rax
     mov     r9, [rbx + CTR_HIDDEN]
     mov     eax, [rbx + CTR_RMS_EPS]
     mov     [rsp + 32], rax
-    call    rmsnorm_avx2                      ; t1 = norm(x)
+    call    rmsnorm_avx2                      ; t1[b] = norm(x[b])
+    mov     rax, [rsp + 128]
+    inc     rax
+    mov     [rsp + 128], rax
+    cmp     rax, [rbx + CTR_B]
+    jb      .step_headrow
 
+    ; Tied lm head, batched. This GEMM streams the whole 805 MB embedding table,
+    ; so doing it once for B rows instead of B times is most of the bandwidth
+    ; that speculative decoding saves; logits land as [B][vocab].
     mov     qword [rbx + CTR_MARK], 6
-    GEMB    <[rbx + CTR_BUF_LOGITS]>, <[rbx + CTR_EMB]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <[rbx + CTR_VOCAB]>
+    GEMMB   <[rbx + CTR_BUF_LOGITS]>, <[rbx + CTR_EMB]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <[rbx + CTR_VOCAB]>, <[rbx + CTR_B]>
 
+    ; One greedy sample per row: rax = argmax per row -> OUTTOK[b]
+    mov     rax, [rbx + CTR_VOCAB]
+    shl     rax, 2
+    mov     [rsp + 120], rax                  ; logits row stride
+    mov     qword [rsp + 128], 0
+.step_sample:
+    mov     rax, [rsp + 128]
+    imul    rax, [rsp + 120]
     mov     rcx, [rbx + CTR_BUF_LOGITS]
+    add     rcx, rax
     mov     rdx, [rbx + CTR_VOCAB]
-    call    sampler_argmax_avx2               ; rax = argmax (softcap is monotone)
+    call    sampler_argmax_avx2               ; softcap is monotone, so the head
+    mov     rdx, rax                          ; skips it and the answer holds
+    mov     rax, [rsp + 128]
+    shl     rax, 3
+    add     rax, [rbx + CTR_OUTTOK]
+    mov     [rax], rdx                        ; outtok[b] = argmax(row b)
+    mov     rax, [rsp + 128]
+    inc     rax
+    mov     [rsp + 128], rax
+    cmp     rax, [rbx + CTR_B]
+    jb      .step_sample
+
+    mov     rax, [rbx + CTR_OUTTOK]
+    mov     rax, [rax]                        ; row 0's token is the return value
     add     rsp, 136
     pop     r15
     pop     r14

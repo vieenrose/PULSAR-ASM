@@ -36,9 +36,24 @@ def parse_abi(path=ENGINE_ASM):
     txt = open(path).read()
 
     def grab(prefix):
-        out = {}
+        """Collect one equate table, rejecting offset collisions.
+
+        FASM lets two names share a value without complaining: CTR_B and
+        CTR_MAXLAYER once both sat at 368, so writing MAXLAYER from a test
+        quietly changed the batch size and every symptom pointed at the wrong
+        stage. The assembly is the layout's source of truth, so the check lives
+        where the layout is read.
+        """
+        out, seen = {}, {}
         for m in re.finditer(rf"^{prefix}([A-Z0-9_]+)\s+equ\s+(\S+)", txt, re.M):
-            out[m.group(1)] = int(m.group(2), 0)
+            name, val = m.group(1), int(m.group(2), 0)
+            out[name] = val
+            if not name.endswith("SIZE"):
+                seen.setdefault(val, []).append(name)
+        dup = {v: names for v, names in seen.items() if len(names) > 1}
+        if dup:
+            raise ValueError(f"{prefix} offsets collide: " +
+                             "; ".join(f"{v}: {n}" for v, n in dup.items()))
         return out
 
     ctr = grab("CTR_")
@@ -92,7 +107,7 @@ def rope_tables(meta, max_seq):
 class Gemma4:
     """Owns the mapping, the buffers, the worker pool, and the engine module."""
 
-    def __init__(self, weights, max_seq=1024, n_threads=4, manifest=None, verbose=True):
+    def __init__(self, weights, max_seq=1024, n_threads=4, maxb=8, manifest=None, verbose=True):
         t0 = time.time()
         abi.require_avx2_fma()
         self.CTR, self.D, self.FLAG = parse_abi()
@@ -113,6 +128,7 @@ class Gemma4:
         self.window = m["sliding_window"]
         self.n_share = m["first_kv_shared"]
         self.max_hd = max(m["head_dim_slide"], m["head_dim_full"])
+        self.maxb = maxb                        # rows a verify pass can hold
         self.max_inter = m["inter_base"] * (2 if m.get("double_wide", True) else 1)
 
         self.blob = abi.MappedFile(weights)
@@ -134,15 +150,21 @@ class Gemma4:
 
         # ---- activation buffers ---------------------------------------------
         H, V = self.hidden, self.vocab
+        # Row-major [MAXB][dim]: a batched pass indexes row b at b*dim, and with
+        # B = 1 this is exactly the single-token layout. LOGITS is the big one -
+        # 8 x vocab - because the tied head is the one GEMM that must cover every
+        # row in a single pass over the embedding table.
+        B = self.maxb
         buf = {}
-        for k, n in (("X", H), ("T1", H), ("T2", H), ("T3", H),
-                     ("Q", self.n_head * self.max_hd), ("A", self.n_head * self.max_hd),
+        for k, n in (("X", B * H), ("T1", B * H), ("T2", B * H), ("T3", B * H),
+                     ("Q", B * self.n_head * self.max_hd), ("A", B * self.n_head * self.max_hd),
                      ("K", self.max_hd), ("V", self.max_hd),
-                     ("SCORE", max_seq), ("G", self.max_inter), ("U", self.max_inter),
-                     ("M", self.max_inter), ("PLE_CUR", self.n_layers * self.ple_dim),
-                     ("PLE_NEXT", self.n_layers * self.ple_dim),
-                     ("PLE_IN", self.n_layers * self.ple_dim),
-                     ("LOGITS", V), ("TMP256", self.ple_dim)):
+                     ("SCORE", max_seq), ("G", B * self.max_inter), ("U", B * self.max_inter),
+                     ("M", B * self.max_inter),
+                     ("PLE_CUR", B * self.n_layers * self.ple_dim),
+                     ("PLE_NEXT", B * self.n_layers * self.ple_dim),
+                     ("PLE_IN", B * self.n_layers * self.ple_dim),
+                     ("LOGITS", B * V), ("TMP256", B * self.ple_dim)):
             buf[k] = f32(n)
         self.buf = buf
 
@@ -219,6 +241,14 @@ class Gemma4:
         put(CTR["WBASE"], base)
         put(CTR["DESC"], self.desc.ctypes.data)
         put(CTR["NLAYER"], self.n_layers)
+        put(CTR["B"], 1)
+        self.tokens = np.zeros(maxb, dtype=np.int64)
+        self.outtok = np.zeros(maxb, dtype=np.int64)
+        self._keep += [self.tokens, self.outtok]
+        put(CTR["TOKENS"], self.tokens.ctypes.data)
+        put(CTR["OUTTOK"], self.outtok.ctypes.data)
+        put(CTR["XSTRIDE"], self.hidden * 4)
+        put(CTR["PLEROW"], self.n_layers * self.ple_dim * 4)
         put(CTR["MAXLAYER"], self.n_layers)
         put(CTR["POS"], 0)
         put(CTR["TOKEN"], 0)
@@ -290,16 +320,39 @@ class Gemma4:
 
     def forward(self, token):
         """Feed one token at the current position, return the argmax for the next."""
-        if self.pos >= self.max_seq:
-            raise RuntimeError(f"position {self.pos} exceeds max_seq {self.max_seq}")
-        self._set("TOKEN", token)
-        self._set("POS", self.pos)
-        nxt = self.step(self.ctx_mem.ctypes.data)
-        self.pos += 1
-        return int(nxt)
+        return int(self.run([token])[0])       # run() owns the position update
 
-    def logits(self):
-        return self.buf["LOGITS"]
+    def run(self, tokens, pos=None):
+        """One pass over len(tokens) consecutive positions; returns each argmax.
+
+        With len == 1 this is plain decode and takes the identical code path it
+        always did (B = 1). With len > 1 it is a speculative verify pass: the
+        weights are streamed once for the whole block, which is the only reason
+        draft-then-verify can beat one-token-at-a-time on a bandwidth-bound CPU.
+        The caller owns acceptance; this just fills in the target's own answers.
+        """
+        b = len(tokens)
+        if b > self.maxb:
+            raise ValueError(f"batch {b} exceeds maxb {self.maxb}")
+        p0 = self.pos if pos is None else pos
+        if p0 + b > self.max_seq:
+            raise RuntimeError(f"positions {p0}..{p0 + b - 1} exceed max_seq {self.max_seq}")
+        self.tokens[:b] = tokens
+        self._set("TOKEN", int(tokens[0]))     # TOKENS[0] and TOKEN stay equal
+        self._set("B", b)
+        self._set("POS", p0)
+        self.step(self.ctx_mem.ctypes.data)
+        self._set("B", 1)
+        if pos is None:
+            self.pos = p0 + b
+        return self.outtok[:b].copy()
+
+    def logits(self, row=0):
+        """Row `row` of the logits block. The buffer is [maxb][vocab]: the tied
+        head computes every batched row in one pass over the embedding table, so
+        a batched run leaves B rows behind, not one."""
+        V = self.vocab
+        return self.buf["LOGITS"][row * V:(row + 1) * V]
 
     def generate(self, tokens, max_new=64, eos=None, each=None):
         out, t = list(tokens), time.time()

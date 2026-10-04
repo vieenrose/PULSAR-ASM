@@ -1,83 +1,150 @@
 ; ==============================================================================
 ; Project PULSAR-ASM | Gemma 4 E2B  (sub_assemblies/sub_gemma4_layer_flat.asm)
 ; ------------------------------------------------------------------------------
-; One decoder layer, transcribed from Gemma4TextDecoderLayer.forward().
+; One decoder layer, transcribed from Gemma4TextDecoderLayer.forward(), run for
+; CTR_B tokens at once (CTR_B = 1 is ordinary decode, B > 1 is speculative
+; verification).
 ;
 ; ENTRY:  rbx = ctx (layout in engine/gemma4_engine_flat.asm)
 ;         r15 = &layer descriptor
 ;         rax = layer index (selects this layer's PLE input slice)
-; EXIT:   rax = 0, rbx/rbp/r12..r15 preserved
+; EXIT:   rbx/rbp/r12..r15 preserved
+;
+; BATCHING
+; Activation buffers are [B][dim] row-major, so row b starts at base + b*stride
+; with stride = dim*4. Elementwise kernels therefore need no loop at all - they
+; just get N = B*dim - and only the row-normalizing work (RMSNorm, RoPE,
+; attention, anything position-dependent) loops over b. The GEMMs are the reason
+; for the whole exercise: one pass over the weights serves all B rows, and decode
+; is DRAM-bound, so that IS the speedup.
 ;
 ; Register use: rbx ctx | r15 descriptor | r13 cos | r14 sin | r12 head counter
-; | rbp scratch. Legal because PULSAR kernels preserve callee-saved registers -
-; the two attention kernels did not and had to be fixed: a kernel returning with
-; r12 changed corrupts whatever the interpreter kept there, and fails far from
-; its cause.
+; | rbp scratch/first GEMM arg. Legal because PULSAR kernels preserve
+; callee-saved registers - the two attention kernels did not and had to be fixed:
+; a kernel returning with r12 changed corrupts whatever the interpreter kept
+; there, and fails far from its cause.
 ;
-; Frame:  [rsp+0..32)   home space (kernels' shadow area, never touched)
-;         [rsp+32..64)  stack args for kernel calls (5th arg at +32, etc.)
-;         [rsp+64..]    locals: +64 &K[pos], +72 &V[pos], +80 kv_start,
-;                       +88 kv_len, +96 layer index
+; Frame:  [rsp+0..32)    home space (kernels' shadow area, never touched)
+;         [rsp+32..64)   stack args for kernel calls
+;         [rsp+64..]     locals, see EQU-ish list below (byte offsets)
+;              +64 scratch ptr   +72 scratch ptr   +80 kv_start  +88 kv_len
+;              +96 layer index   +104 b            +112 B
+;              +120 position of row b              +128 x stride
+;              +136 q stride     +144 ple row stride
+;              +152 inter stride +160 ple-scratch stride
 ; ==============================================================================
+
+L_B       equ 104                             ; current row
+L_N       equ 112                             ; B
+L_POS     equ 120                             ; position of the current row
+L_XS      equ 128                             ; row stride of the [*,hidden] buffers
+L_QS      equ 136                             ; row stride of Q/A
+L_PS      equ 144                             ; row stride of the PLE buffers
+L_IS      equ 152                             ; row stride of G/U
+L_TS      equ 160                             ; row stride of the PLE gate scratch
 
 gemma4_layer:
     push    rbp
     push    r12
     push    r13
     push    r14
-    sub     rsp, 128
+    sub     rsp, 192
     mov     [rsp + 96], rax
+    mov     rax, [rbx + CTR_B]
+    test    rax, rax
+    jnz     .ly_b_ok
+    mov     rax, 1
+.ly_b_ok:
+    mov     [rsp + L_N], rax
+    mov     qword [rsp + L_B], 0
     mov     rax, 200
     add     rax, [rsp + 96]
     mov     [rbx + CTR_MARK], rax             ; 100 + layer index, for post-mortem
 
-    ; ---- rope tables: full-attention layers use theta 1e6, sliding 1e4 ------
-    mov     rbp, [rbx + CTR_POS]
-    test    qword [r15 + D_FLAGS], FLAG_FULL
-    jz      .ly_rope_slide
-    mov     r13, [rbx + CTR_COS_FULL]
-    mov     r14, [rbx + CTR_SIN_FULL]
-    imul    rbp, [rbx + CTR_ROPE_STR_FULL]
-    jmp     .ly_rope_done
-.ly_rope_slide:
-    mov     r13, [rbx + CTR_COS_SLIDE]
-    mov     r14, [rbx + CTR_SIN_SLIDE]
-    imul    rbp, [rbx + CTR_ROPE_STR_SLIDE]
-.ly_rope_done:
-    add     r13, rbp
-    add     r14, rbp
-
-    ; ---- attention ---------------------------------------------------------
-    mov     rcx, [rbx + CTR_BUF_T1]
-    mov     rdx, [r15 + D_NIN]
-    mov     r8,  [rbx + CTR_BUF_X]
-    mov     r9,  [rbx + CTR_HIDDEN]
-    mov     eax, [rbx + CTR_RMS_EPS]
-    mov     [rsp + 32], rax
-    call    rmsnorm_avx2                        ; (out, w, x, N, eps)
-
-    mov     rbp, [r15 + D_HEADDIM]
-    imul    rbp, [rbx + CTR_NHEAD]              ; M = n_head * head_dim
-    GEMB    <[rbx + CTR_BUF_Q]>, <[r15 + D_QW]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <rbp>
-    add     qword [rbx + CTR_MARK], 1
-
-    ; per head: q_norm then rope. The norm is RMSNorm(head_dim) shared by all
-    ; heads, and it runs BEFORE rope - rotating first is a different function.
-    xor     r12d, r12d
-.ly_qnr:
-    mov     rbp, [r15 + D_HEADDIM]
-    mov     rcx, [rbx + CTR_BUF_Q]
-    mov     rax, r12
-    imul    rax, rbp
+    ; row strides, in bytes
+    mov     rax, [rbx + CTR_HIDDEN]
     shl     rax, 2
+    mov     [rsp + L_XS], rax
+    mov     rax, [r15 + D_HEADDIM]
+    imul    rax, [rbx + CTR_NHEAD]
+    shl     rax, 2
+    mov     [rsp + L_QS], rax
+    mov     rax, [rbx + CTR_PLE_DIM]
+    imul    rax, [rbx + CTR_NLAYER]
+    shl     rax, 2
+    mov     [rsp + L_PS], rax
+    mov     rax, [r15 + D_INTER]
+    shl     rax, 2
+    mov     [rsp + L_IS], rax
+    mov     rax, [rbx + CTR_PLE_DIM]
+    shl     rax, 2
+    mov     [rsp + L_TS], rax
+
+    ; ---- input_layernorm, per row ------------------------------------------
+    mov     qword [rsp + L_B], 0
+.ly_nin:
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_XS]
+    mov     rcx, [rbx + CTR_BUF_T1]
     add     rcx, rax
-    mov     rdx, [r15 + D_QNORM]
-    mov     r8, rcx                             ; in place
-    mov     r9, rbp
+    mov     rdx, [r15 + D_NIN]
+    mov     r8, [rbx + CTR_BUF_X]
+    add     r8, rax
+    mov     r9, [rbx + CTR_HIDDEN]
     mov     eax, [rbx + CTR_RMS_EPS]
     mov     [rsp + 32], rax
     call    rmsnorm_avx2
-    mov     rcx, [rbx + CTR_BUF_Q]
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_nin
+
+    ; ---- q = q_proj(t1): M = n_head*head_dim rows, B tokens per row --------
+    mov     rbp, [r15 + D_HEADDIM]
+    imul    rbp, [rbx + CTR_NHEAD]            ; M
+    GEMMB   <[rbx + CTR_BUF_Q]>, <[r15 + D_QW]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>
+
+    ; ---- per row, per head: q_norm then rope -------------------------------
+    ; The norm is RMSNorm(head_dim), shared by all heads, and it runs BEFORE
+    ; rope - rotating first is a different function. RoPE uses position POS+b,
+    ; so the cos/sin row moves with b (a batched pass has B different
+    ; positions, which is exactly what a single-token engine never exercises).
+    mov     qword [rsp + L_B], 0
+.ly_qrow:
+    mov     rax, [rbx + CTR_POS]
+    add     rax, [rsp + L_B]
+    mov     [rsp + L_POS], rax
+    mov     r13, [rbx + CTR_COS_SLIDE]
+    mov     r14, [rbx + CTR_SIN_SLIDE]
+    mov     rcx, [rbx + CTR_ROPE_STR_SLIDE]
+    test    qword [r15 + D_FLAGS], FLAG_FULL
+    jz      .ly_qrope_row
+    mov     r13, [rbx + CTR_COS_FULL]
+    mov     r14, [rbx + CTR_SIN_FULL]
+    mov     rcx, [rbx + CTR_ROPE_STR_FULL]
+.ly_qrope_row:
+    imul    rax, rcx
+    add     r13, rax
+    add     r14, rax
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_QS]
+    add     rax, [rbx + CTR_BUF_Q]
+    mov     [rsp + 64], rax                   ; &q[b][0]
+    xor     r12d, r12d
+.ly_qhead:
+    mov     rcx, [rsp + 64]
+    mov     rax, r12
+    imul    rax, [r15 + D_HEADDIM]
+    shl     rax, 2
+    add     rcx, rax
+    mov     rdx, [r15 + D_QNORM]
+    mov     r8, rcx                           ; in place
+    mov     r9, [r15 + D_HEADDIM]
+    mov     eax, [rbx + CTR_RMS_EPS]
+    mov     [rsp + 32], rax
+    call    rmsnorm_avx2
+    mov     rcx, [rsp + 64]
     mov     rax, r12
     imul    rax, [r15 + D_HEADDIM]
     shl     rax, 2
@@ -86,13 +153,17 @@ gemma4_layer:
     mov     r8, r14
     mov     r9, [r15 + D_HEADDIM]
     mov     rax, r9
-    shr     rax, 1                              ; rp = head_dim/2 pairs
+    shr     rax, 1                            ; rp = head_dim/2 pairs
     mov     [rsp + 32], rax
-    call    rope_apply_avx2                     ; (buf, cos, sin, H, rp)
+    call    rope_apply_avx2                   ; (buf, cos, sin, H, rp)
     inc     r12
     cmp     r12, [rbx + CTR_NHEAD]
-    jb      .ly_qnr
-    add     qword [rbx + CTR_MARK], 2
+    jb      .ly_qhead
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_qrow
 
     ; ---- K / V --------------------------------------------------------------
     ; KV-shared layers (15..34) have no k_proj/v_proj tensors at all: their
@@ -100,20 +171,47 @@ gemma4_layer:
     ; sliding, 14 for full), whose contents are already normed and rotated, so
     ; this entire block is skipped for them.
     test    qword [r15 + D_FLAGS], FLAG_KVSHARED
-    jnz     .ly_attn
-    mov     rbp, [rbx + CTR_POS]
-    mov     rax, rbp
+    jnz     .ly_window
+
+    ; B consecutive cache rows, written by one batched GEMM: row b lands at
+    ; (POS+b)*stride because the rows are contiguous and out_stride is M*4.
+    mov     rbp, [r15 + D_HEADDIM]
+    mov     rax, [rbx + CTR_POS]
     imul    rax, [r15 + D_KVSTRIDE]
     add     rax, [r15 + D_KV]
-    mov     [rsp + 64], rax                     ; &K[pos]
-    mov     rax, rbp
+    GEMMB   <rax>, <[r15 + D_KW]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>
+    mov     rax, [rbx + CTR_POS]
     imul    rax, [r15 + D_KVSTRIDE]
     add     rax, [r15 + D_VV]
-    mov     [rsp + 72], rax                     ; &V[pos]
+    GEMMB   <rax>, <[r15 + D_VW]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>
 
-    ; k goes straight into its cache row, then k_norm + rope in place
-    mov     rbp, [r15 + D_HEADDIM]
-    GEMB    <[rsp + 64]>, <[r15 + D_KW]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <rbp>
+    ; k_norm + rope, and v's scale-free norm, per row (v has no weight tensor in
+    ; the checkpoint, which is exactly why rmsnorm_scale exists)
+    mov     qword [rsp + L_B], 0
+.ly_kvrow:
+    mov     rax, [rbx + CTR_POS]
+    add     rax, [rsp + L_B]
+    mov     [rsp + L_POS], rax
+    mov     r13, [rbx + CTR_COS_SLIDE]
+    mov     r14, [rbx + CTR_SIN_SLIDE]
+    mov     rcx, [rbx + CTR_ROPE_STR_SLIDE]
+    test    qword [r15 + D_FLAGS], FLAG_FULL
+    jz      .ly_kvrope_row
+    mov     r13, [rbx + CTR_COS_FULL]
+    mov     r14, [rbx + CTR_SIN_FULL]
+    mov     rcx, [rbx + CTR_ROPE_STR_FULL]
+.ly_kvrope_row:
+    imul    rax, rcx
+    add     r13, rax
+    add     r14, rax
+    mov     rax, [rsp + L_POS]
+    imul    rax, [r15 + D_KVSTRIDE]
+    mov     rcx, rax
+    add     rcx, [r15 + D_KV]
+    mov     [rsp + 64], rcx
+    add     rax, [r15 + D_VV]
+    mov     [rsp + 72], rax
+
     mov     rcx, [rsp + 64]
     mov     rdx, [r15 + D_KNORM]
     mov     r8, rcx
@@ -130,64 +228,83 @@ gemma4_layer:
     mov     [rsp + 32], rax
     call    rope_apply_avx2
 
-    ; v likewise; its norm is scale-free (no weight tensor in the checkpoint),
-    ; which is exactly why rmsnorm_scale exists.
-    mov     rbp, [r15 + D_HEADDIM]
-    GEMB    <[rsp + 72]>, <[r15 + D_VW]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <rbp>
     mov     rcx, [rsp + 72]
     mov     rdx, rcx
     mov     r8, [r15 + D_HEADDIM]
     mov     r9, C_ONE
     mov     eax, [rbx + CTR_RMS_EPS]
     mov     [rsp + 32], rax
-    call    rmsnorm_scale_avx2                  ; (out, x, N, scale, eps)
+    call    rmsnorm_scale_avx2                ; (out, x, N, scale, eps)
 
-    ; ---- visible window ----------------------------------------------------
-.ly_attn:
-    add     qword [rbx + CTR_MARK], 4
-    mov     rbp, [rbx + CTR_POS]
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_kvrow
+
+    ; ---- attention, per row then per head ----------------------------------
+    ; MQA (one KV head) means the heads share these K/V rows, and the attention
+    ; scaling is 1.0 in Gemma 4 (q_norm/k_norm already bound the magnitudes), so
+    ; no 1/sqrt(head_dim) appears anywhere. Row b attends rows
+    ; [max(0, POS+b+1-window), POS+b+1) for sliding layers and [0, POS+b+1) for
+    ; full ones - a per-row window, which a single-token pass cannot express.
+.ly_window:
+    mov     qword [rsp + L_B], 0
+.ly_wrow:
+    mov     rax, [rbx + CTR_POS]
+    add     rax, [rsp + L_B]
+    mov     [rsp + L_POS], rax
+    test    qword [r15 + D_FLAGS], FLAG_KVSHARED
+    jz      .ly_wrange
+    mov     rax, [rbx + CTR_POS]              ; shared layers read the stored
+    add     rax, [rsp + L_B]                  ; cache, whose rows were written
+    mov     [rsp + L_POS], rax                ; for the same positions
+.ly_wrange:
+    mov     rbp, rax
     inc     rbp
-    mov     [rsp + 88], rbp                     ; kv_len = pos + 1
-    mov     qword [rsp + 80], 0                 ; kv_start = 0
+    mov     [rsp + 88], rbp                   ; kv_len = position + 1
+    mov     qword [rsp + 80], 0               ; kv_start = 0
     test    qword [r15 + D_FLAGS], FLAG_FULL
-    jnz     .ly_head
-    mov     rax, rbp
-    sub     rax, [rbx + CTR_WINDOW]             ; pos + 1 - window
-    jle     .ly_head
-    mov     [rsp + 80], rax                     ; first visible row
-    mov     rax, [rbx + CTR_WINDOW]
-    mov     [rsp + 88], rax
+    jnz     .ly_att_head
+    sub     rbp, [rbx + CTR_WINDOW]
+    jle     .ly_att_head
+    mov     [rsp + 80], rbp
+    mov     rbp, [rbx + CTR_WINDOW]
+    mov     [rsp + 88], rbp
 
-    ; ---- scores -> softmax -> values, per head ------------------------------
-    ; MQA (one KV head) means the 8 heads share these K/V rows; the attention
-    ; scaling is 1.0 in Gemma 4 (q_norm/k_norm already bound the magnitudes),
-    ; so no 1/sqrt(head_dim) appears anywhere.
-.ly_head:
+.ly_att_head:
     xor     r12d, r12d
 .ly_att:
     mov     rbp, [r15 + D_HEADDIM]
-    mov     rcx, [rbx + CTR_BUF_SCORE]
-    mov     rdx, [rbx + CTR_BUF_Q]
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_QS]
+    add     rax, [rbx + CTR_BUF_Q]
+    mov     rdx, rax
     mov     rax, r12
     imul    rax, rbp
     shl     rax, 2
-    add     rdx, rax
+    add     rdx, rax                          ; &q[b][head]
+    mov     rcx, [rbx + CTR_BUF_SCORE]
     mov     r8, [r15 + D_KV]
     mov     r9, [rsp + 88]
-    mov     [rsp + 32], rbp                     ; head_dim
+    mov     [rsp + 32], rbp                   ; head_dim
     mov     rax, [rsp + 80]
-    mov     [rsp + 40], rax                     ; kv_start
-    call    attn_scores_avx2                    ; (scores, q, K, kv_len, hd, start)
+    mov     [rsp + 40], rax                   ; kv_start
+    call    attn_scores_avx2                  ; (scores, q, K, kv_len, hd, start)
 
     mov     rcx, [rbx + CTR_BUF_SCORE]
     mov     rdx, [rsp + 88]
-    call    softmax_avx2                        ; (buf, n)
+    call    softmax_avx2
 
-    mov     rcx, [rbx + CTR_BUF_A]
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_QS]
+    add     rax, [rbx + CTR_BUF_A]
+    mov     rbp, rax
     mov     rax, r12
     imul    rax, [r15 + D_HEADDIM]
     shl     rax, 2
-    add     rcx, rax
+    add     rbp, rax                          ; &a[b][head]
+    mov     rcx, rbp
     mov     rdx, [r15 + D_VV]
     mov     r8, [rbx + CTR_BUF_SCORE]
     mov     r9, [rsp + 88]
@@ -195,123 +312,172 @@ gemma4_layer:
     mov     [rsp + 32], rax
     mov     rax, [rsp + 80]
     mov     [rsp + 40], rax
-    call    attn_values_avx2                    ; (out, V, w, n, hd, start)
+    call    attn_values_avx2                  ; (out, V, w, n, hd, start)
 
     inc     r12
     cmp     r12, [rbx + CTR_NHEAD]
     jb      .ly_att
-    add     qword [rbx + CTR_MARK], 8
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_wrow
 
-    ; x += post_attention_layernorm(o_proj(a))
-    mov     rax, [r15 + D_HEADDIM]
-    imul    rax, [rbx + CTR_NHEAD]
-    mov     rdx, [rbx + CTR_BUF_A]
+    ; ---- o_proj, then the attention residual -------------------------------
+    mov     rbp, [r15 + D_HEADDIM]
+    imul    rbp, [rbx + CTR_NHEAD]
+    GEMMB   <[rbx + CTR_BUF_T1]>, <[r15 + D_OW]>, <[rbx + CTR_BUF_A]>, <rbp>, <[rbx + CTR_HIDDEN]>, <[rsp + L_N]>
+
+    mov     qword [rsp + L_B], 0
+.ly_postr:
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_XS]
     mov     rcx, [rbx + CTR_BUF_T2]
-    mov     r8, rdx
-    mov     rdx, [r15 + D_OW]
-    mov     r9, rax                             ; K = n_head * head_dim
-    mov     rax, [rbx + CTR_HIDDEN]
-    mov     [rsp + 32], rax                     ; M = hidden
-    mov     qword [rsp + 40], 1                 ; B = 1
-    mov     rax, [rbx + CTR_SMP]
-    mov     [rsp + 48], rax
-    call    smp_bf16_gemb_avx2
-    mov     rcx, [rbx + CTR_BUF_T2]
+    add     rcx, rax
     mov     rdx, [r15 + D_NPOSTATT]
-    mov     r8, [rbx + CTR_BUF_T2]
+    mov     r8, [rbx + CTR_BUF_T1]
+    add     r8, rax
     mov     r9, [rbx + CTR_HIDDEN]
     mov     eax, [rbx + CTR_RMS_EPS]
     mov     [rsp + 32], rax
     call    rmsnorm_avx2
-    GEMB_RESID                                  ; x = x + t2
-    add     qword [rbx + CTR_MARK], 16
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_postr
+    GEMB_RESID                         ; x = x + t2, all rows at once
 
     ; ---- MLP (double-wide on KV-shared layers) ------------------------------
+    mov     qword [rsp + L_B], 0
+    mov     qword [rbx + CTR_MARK], 32
+.ly_preffr:
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_XS]
     mov     rcx, [rbx + CTR_BUF_T3]
+    add     rcx, rax
     mov     rdx, [r15 + D_NPREFF]
     mov     r8, [rbx + CTR_BUF_X]
+    add     r8, rax
     mov     r9, [rbx + CTR_HIDDEN]
     mov     eax, [rbx + CTR_RMS_EPS]
     mov     [rsp + 32], rax
     call    rmsnorm_avx2
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_preffr
 
     mov     rbp, [r15 + D_INTER]
-    GEMB    <[rbx + CTR_BUF_G]>, <[r15 + D_GATE]>, <[rbx + CTR_BUF_T3]>, <[rbx + CTR_HIDDEN]>, <rbp>
-    mov     rbp, [r15 + D_INTER]
-    GEMB    <[rbx + CTR_BUF_U]>, <[r15 + D_UP]>, <[rbx + CTR_BUF_T3]>, <[rbx + CTR_HIDDEN]>, <rbp>
+    GEMMB   <[rbx + CTR_BUF_G]>, <[r15 + D_GATE]>, <[rbx + CTR_BUF_T3]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>
+    GEMMB   <[rbx + CTR_BUF_U]>, <[r15 + D_UP]>, <[rbx + CTR_BUF_T3]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>
     mov     rcx, [rbx + CTR_BUF_G]
     mov     rdx, [rbx + CTR_BUF_G]
     mov     r8, [rbx + CTR_BUF_U]
-    mov     r9, [r15 + D_INTER]
-    call    geglu_avx2                          ; (out, gate, up, N)
-    mov     rbp, [rbx + CTR_HIDDEN]
-    GEMB    <[rbx + CTR_BUF_T2]>, <[r15 + D_DOWN]>, <[rbx + CTR_BUF_G]>, <[r15 + D_INTER]>, <rbp>
+    mov     r9, [r15 + D_INTER]               ; elementwise over the whole
+    imul    r9, [rsp + L_N]                   ; B*inter block, no loop needed
+    call    geglu_avx2                        ; (out, gate, up, N)
 
+    mov     rbp, [rbx + CTR_HIDDEN]
+    GEMMB   <[rbx + CTR_BUF_T2]>, <[r15 + D_DOWN]>, <[rbx + CTR_BUF_G]>, <[r15 + D_INTER]>, <rbp>, <[rsp + L_N]>
+
+    mov     qword [rsp + L_B], 0
+.ly_postrff:
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_XS]
     mov     rcx, [rbx + CTR_BUF_T2]
+    add     rcx, rax
     mov     rdx, [r15 + D_NPOSTFF]
     mov     r8, [rbx + CTR_BUF_T2]
+    add     r8, rax
     mov     r9, [rbx + CTR_HIDDEN]
     mov     eax, [rbx + CTR_RMS_EPS]
     mov     [rsp + 32], rax
     call    rmsnorm_avx2
-    GEMB_RESID                                  ; x = x + t2
-    add     qword [rbx + CTR_MARK], 32
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_postrff
+    GEMB_RESID                         ; x = x + t2
 
     ; ---- per-layer embeddings ----------------------------------------------
     ; gate = gelu_tanh(per_layer_input_gate(x)); mix = gate * ple_in[layer];
     ; x += post_per_layer_input_norm(per_layer_projection(mix))
+    ; The gate GEMM, the gelu and the projection are batched; only the multiply
+    ; by this layer's PLE slice needs a loop, because that slice is ple_dim wide
+    ; inside a nl*ple_dim row.
     mov     rbp, [rbx + CTR_PLE_DIM]
-    GEMB    <[rbx + CTR_BUF_TMP256]>, <[r15 + D_PLEGATE]>, <[rbx + CTR_BUF_X]>, <[rbx + CTR_HIDDEN]>, <rbp>
-
+    GEMMB   <[rbx + CTR_BUF_TMP256]>, <[r15 + D_PLEGATE]>, <[rbx + CTR_BUF_X]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>
+    mov     r8, [rbx + CTR_PLE_DIM]
+    imul    r8, [rsp + L_N]
     mov     rcx, [rbx + CTR_BUF_TMP256]
     mov     rdx, [rbx + CTR_BUF_TMP256]
-    mov     r8, [rbx + CTR_PLE_DIM]
-    call    gelu_tanh_avx2                      ; (out, x, N)
+    call    gelu_tanh_avx2                    ; (out, x, N) over all rows
 
-    mov     rcx, [rbx + CTR_BUF_TMP256]
     mov     rax, [rsp + 96]
     imul    rax, [rbx + CTR_PLE_DIM]
     shl     rax, 2
+    mov     [rsp + 72], rax                   ; slice offset inside a PLE row
+    mov     qword [rsp + L_B], 0
+.ly_plemul:
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_TS]
+    mov     rcx, [rbx + CTR_BUF_TMP256]
+    add     rcx, rax
+    mov     rdx, rcx
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_PS]
+    add     rax, [rsp + 72]
     add     rax, [rbx + CTR_BUF_PLE_IN]
-    mov     rdx, rax
-    mov     r9, [rbx + CTR_PLE_DIM]
-    call    mul_avx2                            ; gate *= this layer's PLE input
+    mov     rdx, rax                          ; (dst, src, N): N is the third
+    mov     r8, [rbx + CTR_PLE_DIM]           ; argument, so the pointer goes in
+    call    mul_avx2                          ; rdx first - r8 is already N
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_plemul
 
     mov     rbp, [rbx + CTR_HIDDEN]
-    GEMB    <[rbx + CTR_BUF_T2]>, <[r15 + D_PLEPROJ]>, <[rbx + CTR_BUF_TMP256]>, <[rbx + CTR_PLE_DIM]>, <rbp>
+    GEMMB   <[rbx + CTR_BUF_T2]>, <[r15 + D_PLEPROJ]>, <[rbx + CTR_BUF_TMP256]>, <[rbx + CTR_PLE_DIM]>, <rbp>, <[rsp + L_N]>
 
+    mov     qword [rsp + L_B], 0
+.ly_plenorm:
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_XS]
     mov     rcx, [rbx + CTR_BUF_T2]
+    add     rcx, rax
     mov     rdx, [r15 + D_PLENORM]
     mov     r8, [rbx + CTR_BUF_T2]
+    add     r8, rax
     mov     r9, [rbx + CTR_HIDDEN]
     mov     eax, [rbx + CTR_RMS_EPS]
     mov     [rsp + 32], rax
     call    rmsnorm_avx2
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_plenorm
+    GEMB_RESID                         ; x = x + ple projection
 
-    mov     rcx, [rbx + CTR_BUF_X]
-    mov     rdx, [rbx + CTR_BUF_X]
-    mov     r8, [rbx + CTR_BUF_T2]
-    mov     r9, [rbx + CTR_HIDDEN]
-    mov     eax, C_ONE
-    mov     [rsp + 32], rax
-    mov     [rsp + 40], rax                     ; x = x*1 + t2*1
-    call    add_scaled_avx2
-
-    ; x *= layer_scalar: a per-layer buffer (1.0 unless fine-tuned) applied to
-    ; the whole stream AFTER the PLE add, exactly as the reference orders it.
+    ; ---- layer_scalar, by value --------------------------------------------
+    ; Scalars travel BY VALUE in a register (the internal convention: scale_avx2
+    ; does `vmovd xmm0, r8d`). Dereference the descriptor's pointer first -
+    ; passing the address itself reinterprets 0x7f..4c40 as a float, multiplies
+    ; the residual stream by ~1e27, survives RMSNorm because RMSNorm is
+    ; scale-free, and only detonates at the logits.
     mov     rcx, [rbx + CTR_BUF_X]
     mov     rdx, [rbx + CTR_HIDDEN]
-    ; Scalars travel BY VALUE in a register (that is the internal convention:
-    ; scale_avx2 does `vmovd xmm0, r8d`). Dereference the descriptor's pointer
-    ; first - passing the address itself reinterprets 0x7f..4c40 as a float and
-    ; multiplies the residual stream by ~1e27, which survives RMSNorm (it is
-    ; scale-free) and only detonates at the logits.
+    imul    rdx, [rsp + L_N]
     mov     r8, [r15 + D_SCALAR]
     mov     eax, [r8]
     mov     r8d, eax
-    call    scale_avx2                          ; (buf, N, float value)
+    call    scale_avx2                        ; (buf, N, float value)
 
-    add     rsp, 128
+    add     rsp, 192
     pop     r14
     pop     r13
     pop     r12
