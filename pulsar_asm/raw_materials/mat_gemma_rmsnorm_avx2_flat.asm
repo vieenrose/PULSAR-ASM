@@ -96,12 +96,14 @@ gemma_rmsnorm_avx2:
     vmulss  xmm2, xmm2, xmm4       ; 0.5 * (3.0 - ...)
     vmulss  xmm1, xmm1, xmm2       ; XMM1 = refined rsqrt
 
-    vbroadcastss ymm0, xmm1        ; YMM0 = refined rsqrt
+    vshufps     xmm0, xmm1, xmm1, 0x00      ; AVX2-legal broadcast of xmm1[31:0]   ; YMM0 = refined rsqrt
+    vinsertf128 ymm0, ymm0, xmm0, 1
 
     ; Load 1.0f constant for Gemma unit offset: (1.0 + weight)
     mov     eax, 0x3F800000        ; 1.0f
     vmovd   xmm6, eax
-    vbroadcastss ymm6, xmm6        ; YMM6 = 1.0f
+    vshufps     xmm6, xmm6, xmm6, 0x00      ; AVX2-legal broadcast of xmm6[31:0]   ; YMM6 = 1.0f
+    vinsertf128 ymm6, ymm6, xmm6, 1
 
     ; Step 4: Normalization & Gemma Weight Scaling: y_i = x_i * rsqrt * (1.0 + weight_i)
     shl     r9, 2                  ; R9 = N * 4 bytes
