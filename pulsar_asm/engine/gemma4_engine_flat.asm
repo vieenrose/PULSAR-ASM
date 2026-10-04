@@ -93,10 +93,14 @@ CTR_PLEROW           equ 400   ; bytes between PLE rows = nlayer*ple_dim*4
                                 ; write to one changed the other. parse_abi now
                                 ; rejects duplicate offsets in these tables.
 CTR_MAXLAYER         equ 408   ; int64: run layers [0,MAXLAYER); = NLAYER normally.
+CTR_TEMP             equ 416   ; float bits: 0 = greedy argmax, else sampling
+CTR_TOPK             equ 424   ; int64: top-k width for the sampler
+CTR_TOPP             equ 432   ; float bits: nucleus mass
+CTR_RNG              equ 440   ; uint64* xorshift state, advanced in place
                                 ; Separate from NLAYER because that also sizes
                                 ; the PLE row stride, so truncating it corrupts
                                 ; the per-layer embedding inputs.
-CTR_SIZE             equ 416
+CTR_SIZE             equ 448
 
 ; Per-layer descriptor: absolute pointers, built by the loader from the converted
 ; manifest, so the assembly contains no weight-layout knowledge.
@@ -183,6 +187,7 @@ macro GEMB_RESID {
 include '../raw_materials/mat_bf16_gemb_avx2_flat.asm'
 include '../raw_materials/mat_gemma4_kernels_avx2_flat.asm'
 include '../sub_assemblies/sub_gemma4_layer_flat.asm'
+include '../sub_assemblies/sub_sampler_nucleus_flat.asm'
 
 ; ------------------------------------------------------------------------------
 ; gemma4_step(ctx) -> rax = argmax token id for the next position.
@@ -340,7 +345,8 @@ gemma4_step:
     mov     qword [rbx + CTR_MARK], 6
     GEMMB   <[rbx + CTR_BUF_LOGITS]>, <[rbx + CTR_EMB]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <[rbx + CTR_VOCAB]>, <[rbx + CTR_B]>
 
-    ; One greedy sample per row: rax = argmax per row -> OUTTOK[b]
+    ; One sample per row. A zero temperature keeps the argmax, which is what the
+    ; parity tests pin; anything else runs temperature -> top-k -> nucleus.
     mov     rax, [rbx + CTR_VOCAB]
     shl     rax, 2
     mov     [rsp + 120], rax                  ; logits row stride
@@ -348,15 +354,29 @@ gemma4_step:
 .step_sample:
     mov     rax, [rsp + 128]
     imul    rax, [rsp + 120]
-    mov     rcx, [rbx + CTR_BUF_LOGITS]
-    add     rcx, rax
+    add     rax, [rbx + CTR_BUF_LOGITS]
+    mov     rcx, rax                          ; this row's logits
     mov     rdx, [rbx + CTR_VOCAB]
+    mov     r12, [rbx + CTR_OUTTOK]
+    mov     r13, [rsp + 128]
+    shl     r13, 3
+    add     r12, r13                          ; &outtok[b]
+    mov     rax, [rbx + CTR_TEMP]
+    test    rax, rax
+    jz      .step_greedy
+    mov     r8, [rbx + CTR_TOPK]
+    mov     r9, [rbx + CTR_TOPP]              ; float bits, by value
+    mov     eax, [rbx + CTR_TEMP]
+    mov     [rsp + 32], rax
+    mov     rax, [rbx + CTR_RNG]
+    mov     [rsp + 40], rax
+    mov     [rsp + 48], r12                   ; the sampler writes its own answer
+    call    sampler_nucleus_avx2
+    jmp     .step_nextok
+.step_greedy:
     call    sampler_argmax_avx2               ; softcap is monotone, so the head
-    mov     rdx, rax                          ; skips it and the answer holds
-    mov     rax, [rsp + 128]
-    shl     rax, 3
-    add     rax, [rbx + CTR_OUTTOK]
-    mov     [rax], rdx                        ; outtok[b] = argmax(row b)
+    mov     [r12], rax                        ; skips it and the answer holds
+.step_nextok:
     mov     rax, [rsp + 128]
     inc     rax
     mov     [rsp + 128], rax

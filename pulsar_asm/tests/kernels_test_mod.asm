@@ -4,6 +4,7 @@
 use64
 
 include '../raw_materials/mat_gemma4_kernels_avx2_flat.asm'
+include '../sub_assemblies/sub_sampler_nucleus_flat.asm'
 
 ; ------------------------------------------------------------------------------
 ; Export directory: [ code ][ names ][ dd offs * N ][ dd nameoffs * N ][ dd N ][ 'PLSE' ]
@@ -25,16 +26,17 @@ plsar_n12: db 'softcap_tanh_avx2', 0
 plsar_n13: db 'ple_combine_avx2', 0
 plsar_n14: db 'sampler_argmax_avx2', 0
 plsar_n15: db 'mul_avx2', 0
+plsar_n16: db 'sampler_nucleus_avx2', 0
     align 4
     dd rmsnorm_avx2, rmsnorm_scale_avx2, gelu_tanh_avx2, geglu_avx2
     dd add_scaled_avx2, scale_avx2, zero_avx2, embed_bf16_avx2
     dd rope_apply_avx2, softmax_avx2, attn_scores_avx2, attn_values_avx2
     dd softcap_tanh_avx2, ple_combine_avx2, sampler_argmax_avx2
-    dd mul_avx2
+    dd mul_avx2, sampler_nucleus_avx2
 plsar_names:
     dd plsar_n0, plsar_n1, plsar_n2, plsar_n3, plsar_n4
     dd plsar_n5, plsar_n6, plsar_n7, plsar_n8, plsar_n9
     dd plsar_n10, plsar_n11, plsar_n12, plsar_n13, plsar_n14
-    dd plsar_n15
-    dd 16
+    dd plsar_n15, plsar_n16
+    dd 17
     db 'PLSE'

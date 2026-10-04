@@ -26,6 +26,11 @@ ENGINE_ASM = os.path.normpath(os.path.join(_HERE, "..", "engine", "gemma4_engine
 ENGINE_SRC = os.path.normpath(os.path.join(_HERE, "..", "engine", "gemma4_engine_flat.asm"))
 
 
+def _fbits(v):
+    """float32 bit pattern of v, as the integer the engine reads."""
+    return struct.unpack("<I", struct.pack("<f", float(v)))[0]
+
+
 def parse_abi(path=ENGINE_ASM):
     """Read the equate tables that define the context/descriptor ABI.
 
@@ -271,6 +276,16 @@ class Gemma4:
         putf(CTR["RMS_EPS"], m["rms_eps"])
         putf(CTR["SOFTCAP"], m["logit_softcapping"])
 
+        # Sampling stays off until asked for: TEMP == 0 keeps the argmax head,
+        # which is what the parity tests pin. set_sampling() turns on the
+        # checkpoint's own temperature/top_k/top_p.
+        self.rng = np.zeros(1, dtype=np.uint64)
+        self.rng[0] = 0x9E3779B97F4A7C15
+        put(CTR["RNG"], self.rng.ctypes.data)
+        put(CTR["TEMP"], 0)
+        put(CTR["TOPK"], 64)
+        put(CTR["TOPP"], _fbits(0.95))
+
         # spin-worker pool: master + (n_threads-1) pthreads
         self.smp = abi.exec_alloc(4096)
         ctypes.memset(self.smp, 0, 4096)
@@ -310,6 +325,23 @@ class Gemma4:
 
     def _get(self, field):
         return ctypes.c_uint64.from_address(self.ctx_mem.ctypes.data + self.CTR[field]).value
+
+    def set_sampling(self, temp=1.0, top_k=64, top_p=0.95, seed=None):
+        """temperature -> top-k -> nucleus, the way generation_config.json asks.
+
+        Not usable yet: sampler_nucleus_avx2 faults, so turning TEMP on would
+        take the process down with it. The plumbing (context fields, the head's
+        branch, this API) is finished and the kernel is the only gap; raising
+        here keeps a future CLI flag from finding that out the hard way.
+        """
+        raise NotImplementedError(
+            "sampler_nucleus_avx2 faults; see sub_assemblies/"
+            "sub_sampler_nucleus_flat.asm - the engine stays on argmax")
+        self._set("TEMP", _fbits(temp) if temp else 0)
+        self._set("TOPK", int(top_k))
+        self._set("TOPP", _fbits(top_p))
+        if seed is not None:
+            self.rng[0] = int(seed) or 1
 
     def reset(self):
         for k, (kk, vv) in self._caches.items():

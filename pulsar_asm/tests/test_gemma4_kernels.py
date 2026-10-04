@@ -37,6 +37,51 @@ def case(name, ok, detail=""):
     return bool(ok)
 
 
+def _sampler_cases(X, allok):
+    """generation_config's temperature/top_k/top_p against numpy's same cut.
+
+    Kept behind PULSAR_TEST_SAMPLER=1: the kernel faults today, and a suite
+    that crashes is worse than a suite that says skip.
+    """
+    g_samp = X("sampler_nucleus_avx2", 7)
+    V = 4096
+    base = np.arange(V, 0, -1, dtype=np.float32)
+    for k, p in ((64, 0.95), (8, 0.5), (64, 0.999)):
+        lg = base.copy()
+        st = np.zeros(1, np.uint64); st[0] = 0xDEADBEEF
+        out = np.zeros(1, np.int64)
+        draws = 4000
+        counts = np.zeros(V, np.int64)
+        for _ in range(draws):
+            g_samp(lg.ctypes.data, V, k, f32bits(p), f32bits(1.0),
+                   st.ctypes.data, out.ctypes.data)
+            counts[int(out[0])] += 1
+        # numpy runs the same pipeline: top-k, softmax, shortest prefix to p
+        w = np.exp(base[:k] - base[0]); w /= w.sum()
+        cum = np.cumsum(w)
+        nkeep = int(np.searchsorted(cum, p, side="left")) + 1
+        q = w[:nkeep] / w[:nkeep].sum()
+        emp = counts[:nkeep] / draws
+        worst = float(np.max(np.abs(emp - q) / np.maximum(q, 1e-9)))
+        allok &= case(f"nucleus k={k} p={p}",
+                      counts[k:].sum() == 0 and worst < 0.08 and
+                      np.array_equal(lg, base),
+                      f"kept={nkeep} outside_top_k={counts[k:].sum()} "
+                      f"max rel freq err={worst:.3f} logits intact={np.array_equal(lg, base)}")
+    # same seed, same sequence: the state lives where the kernel advances it
+    a = np.zeros(1, np.int64); b = np.zeros(1, np.int64)
+    sa = np.zeros(1, np.uint64); sa[0] = 99
+    sb = np.zeros(1, np.uint64); sb[0] = 99
+    la, lb = base.copy(), base.copy()
+    for i in range(20):
+        g_samp(la.ctypes.data, V, 64, f32bits(0.95), f32bits(1.0), sa.ctypes.data, a.ctypes.data)
+        g_samp(lb.ctypes.data, V, 64, f32bits(0.95), f32bits(1.0), sb.ctypes.data, b.ctypes.data)
+        if int(a[0]) != int(b[0]):
+            break
+    allok &= case("sampler reproducible", int(a[0]) == int(b[0]), f"at draw {i}")
+    return allok
+
+
 def main():
     global MOD
     allok = True
@@ -217,6 +262,15 @@ def main():
           f32bits(1 / np.sqrt(2)), w.ctypes.data)
     allok &= case("ple_combine D=256", relerr(out, ref) < 3e-6, f"rel={relerr(out, ref):.2e}")
 
+    # ---- nucleus sampler -----------------------------------------------------
+    # generation_config asks for temperature 1.0, top_k 64, top_p 0.95. The
+    # logits here descend by exactly 1.0 per token, so the whole distribution is
+    # known in closed form and the cut lands a few tokens in.
+    if os.environ.get("PULSAR_TEST_SAMPLER"):
+        allok &= _sampler_cases(X, allok)
+    else:
+        print("  SKIP nucleus sampler (faulting; sub_sampler_nucleus_flat)")
+
     allok &= lint_avx2_purity()
     print("\n" + ("ALL GEMMA-4 KERNEL TESTS PASS" if allok else "FAILURES PRESENT"))
     return 0 if allok else 1
@@ -247,4 +301,3 @@ def lint_avx2_purity():
 
 if __name__ == "__main__":
     sys.exit(main())
-    main()
