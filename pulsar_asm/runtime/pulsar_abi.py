@@ -249,15 +249,33 @@ class MappedFile:
         self.path = path
         self.size = os.path.getsize(path)
         self._fd = os.open(path, os.O_RDONLY)
-        flags = mmap.MAP_SHARED if shared else mmap.MAP_PRIVATE
-        self._mm = mmap.mmap(self._fd, self.size, flags=flags,
-                             prot=mmap.PROT_READ)
-        self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._mm))
-        if not IS_LINUX and self.size:
-            # Python's mmap on Windows cannot expose an address; fall back to mapping
-            # the file through the Win32 file-mapping API.
-            self._mm.close(); os.close(self._fd)
-            self.addr = _win_map(path)
+        self._mm = None
+        self._mapped = False
+        if IS_LINUX:
+            # Python's mmap cannot hand out an address for a read-only mapping
+            # (from_buffer needs a writable buffer), and mapping PROT_WRITE just
+            # to satisfy it would let a stray write silently copy-on-write.
+            # Map the file directly through mmap(2).
+            PROT_READ, MAP_PRIVATE, MAP_SHARED_ = 1, 0x02, 0x01
+            _libc.mmap.restype = ctypes.c_void_p
+            _libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_long]
+            _libc.munmap.restype = ctypes.c_int
+            _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            addr = _libc.mmap(None, self.size, PROT_READ,
+                              MAP_SHARED_ if shared else MAP_PRIVATE, self._fd, 0)
+            if addr is None or addr == (1 << 64) - 1:
+                raise OSError(f"mmap({path}, {self.size} bytes) failed: {ctypes.get_errno()}")
+            self.addr = addr
+            self._mapped = True
+        else:
+            flags = mmap.MAP_SHARED if shared else mmap.MAP_PRIVATE
+            self._mm = mmap.mmap(self._fd, self.size, flags=flags,
+                                 prot=mmap.PROT_READ)
+            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._mm))
+            if not IS_WINDOWS and self.size:
+                self._mm.close(); os.close(self._fd)
+                self.addr = _win_map(path)
 
     def touch(self, step=1 << 20):
         """Fault every page in so first-token latency is not charged to page faults."""
@@ -273,7 +291,10 @@ class MappedFile:
 
     def close(self):
         try:
-            self._mm.close()
+            if self._mapped:
+                _libc.munmap(self.addr, self.size)
+            elif self._mm is not None:
+                self._mm.close()
             os.close(self._fd)
         except Exception:
             pass

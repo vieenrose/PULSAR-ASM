@@ -287,7 +287,8 @@ smp_bf16_gemb_avx2:
     mov     dword [rbx + 0], 0         ; done_counter = 0
     inc     dword [rbx + 4]            ; job_seq++
     mov     eax, [rbx + 4]
-    mov     [rsp + 32 + 8], eax        ; (scratch, unused; keeps slot tidy)
+    mov     [rsp + 40], rax            ; park job_seq in a SLOT: rax/rax's aliases
+                                       ; get reused for row math in the loop below
 
     mov     rax, r12
     shr     rax, 2
@@ -349,6 +350,13 @@ smp_bf16_gemb_avx2:
     mov     [rcx + 80], r11            ; out_stride
     mov     r8, [rsp + 0]
     mov     [rcx + 72], r8             ; kernel (runtime address, see anchor above)
+    ; Publish LAST, and from the SLOT, not from a register this loop recomputes.
+    ; This used to be 'mov [rcx+0], eax' where eax still held row0 (= w*M/4, so
+    ; 64/128/192 for M=256): the first dispatch woke the workers because 64 != 0,
+    ; every LATER dispatch republished the same 64, matched last_job_id, and the
+    ; master spun forever in .l_smp_wait. Tests that varied M per call hid it -
+    ; a different M made row0 differ, so the workers still woke up.
+    mov     eax, [rsp + 40]
     mov     [rcx + 0], eax             ; job_id = job_seq  -> MESI invalidation
 
     inc     r15

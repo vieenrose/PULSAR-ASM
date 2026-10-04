@@ -79,6 +79,38 @@ macro EXP_CONSTS
 ;   relative error < 1e-7).  Scratch: t1 t2 t3 (vectors), eax.
 ;   K_P* are 32-byte BROADCAST vectors: vmovaps requires 32-byte alignment, so a
 ;   plain `dd` here would fault (#GP) on the first lane it tried to load.
+; -----------------------------------------------------------------------------
+; void copy_avx2(dst, src, N)   fp32 copy        (N a multiple of 8)
+copy_avx2:
+    xor     r10, r10
+.cp_l:
+    lea     rax, [r10 + 8]
+    cmp     rax, r9
+    ja      .cp_done
+    vmovups ymm0, [rdx + r10 * 4]
+    vmovups [rcx + r10 * 4], ymm0
+    add     r10, 8
+    jmp     .cp_l
+.cp_done:
+    ret
+
+; -----------------------------------------------------------------------------
+; void mul_avx2(dst, src, N)   dst[i] *= src[i]        (N a multiple of 8)
+; Used by the PLE gate: gate *= per-layer input.
+mul_avx2:
+    xor     r10, r10
+.mul_l:
+    lea     rax, [r10 + 8]
+    cmp     rax, r9
+    ja      .mul_done
+    vmovups ymm0, [rcx + r10 * 4]           ; VEX has no 2-operand memory form:
+    vmulps  ymm0, ymm0, [rdx + r10 * 4]     ; the memory operand must be src3
+    vmovups [rcx + r10 * 4], ymm0
+    add     r10, 8
+    jmp     .mul_l
+.mul_done:
+    ret
+
 ; ------------------------------------------------------------------------------
 macro EXP dst, t1, t2, t3
 {
@@ -403,39 +435,41 @@ embed_bf16_avx2:
 ;   by cos=1/sin=0 in the unused tail of the table, so this one kernel serves both.
 ; ==============================================================================
 rope_apply_avx2:
-    test    r9, r9
-    jz      .rp_done
-    shl     r9, 2                                ; H*4 = byte limit == half stride
-    mov     r11, rcx
-    add     r11, r9                              ; &vec[H] (x86 has no 3-register addressing)
+    ; buf, cos, sin, H, rp        rotate pairs (i, i+rp), rp = head_dim/2
+    ;
+    ; HF's proportional_rope pads inv_freq with zeros out to head_dim/2, so the
+    ; rotary window is always the whole head and the pairing stride is always
+    ; head_dim/2 - partial rotation shows up as cos=1/sin=0 in the tail of the
+    ; table, NOT as a narrower window. (Assuming rotate_half over a narrow
+    ; window pairs (i, i+rotary_dim/2) instead; it does not, here.)
+    mov     r11, [rsp + 40]
+    mov     rsi, rcx
+    mov     rax, r11
+    shl     rax, 2
+    add     rsi, rax                          ; hi base = buf + rp*4 (single index reg)
     xor     r10, r10
 .rp_loop:
-    lea     rax, [r10 + 32]
-    cmp     rax, r9
+    lea     rax, [r10 + 8]
+    cmp     rax, r11
     ja      .rp_done
-    vmovups ymm0, [rcx + r10]                    ; x1
-    vmovups ymm1, [r11 + r10]                    ; x2
-    vmovups ymm2, [rdx + r10]                    ; cos
-    vmovups ymm3, [r8  + r10]                    ; sin
-    vmulps  ymm4, ymm0, ymm2
-    vfnmadd231ps ymm4, ymm1, ymm3
-    vmovups [rcx + r10], ymm4
-    vmulps  ymm5, ymm1, ymm2
-    vfmadd231ps ymm5, ymm0, ymm3
-    vmovups [r11 + r10], ymm5
-    add     r10, 32
+    vmovups ymm0, [rcx + r10 * 4]             ; x[i]
+    vmovups ymm1, [rsi + r10 * 4]             ; x[i+rp]
+    vmovups ymm4, [rdx + r10 * 4]             ; cos[i]
+    vmovups ymm5, [r8 + r10 * 4]              ; sin[i]
+    vmulps  ymm2, ymm0, ymm4
+    vmulps  ymm3, ymm1, ymm5
+    vsubps  ymm2, ymm2, ymm3
+    vmulps  ymm3, ymm1, ymm4
+    vmulps  ymm0, ymm0, ymm5
+    vaddps  ymm3, ymm3, ymm0
+    vmovups [rcx + r10 * 4], ymm2
+    vmovups [rsi + r10 * 4], ymm3
+    add     r10, 8
     jmp     .rp_loop
 .rp_done:
     vzeroupper
     ret
 
-; ==============================================================================
-; softmax_avx2(buf, n)   -- in place, max-subtracted
-;   kv_len is arbitrary, so this kernel has real tail handling:
-;   * max:     bulk vectors + one OVERLAPPING final vector (max is idempotent);
-;              n < 8 falls back to a scalar scan.
-;   * exp/sum: bulk vectors + one VMASKMOVPS pass, which both avoids reading
-;              past the buffer and keeps inactive lanes out of the sum.
 ; ==============================================================================
 softmax_avx2:
     test    rdx, rdx
@@ -540,9 +574,13 @@ softmax_avx2:
 ; ==============================================================================
 attn_scores_avx2:
     test    r9, r9
-    jz      .at_done
-    mov     r14, [rsp + 40]                      ; head_dim (elements)
-    mov     r11, [rsp + 48]                      ; kv_start
+    jz      .at_ret
+    mov     r14, [rsp + 40]                      ; head_dim (elements). Stack args are
+    mov     r11, [rsp + 48]                      ; kv_start  read BEFORE any frame shift
+    push    r12                                  ; R12/R13/R14 are callee-saved: a kernel
+    push    r13                                  ; reached through a ctypes thunk must not
+    push    r14                                  ; come back with them changed (it did, and
+    sub     rsp, 8                               ; CPython noticed only intermittently)
     shl     r14, 2                               ; head_dim bytes = K row stride
     mov     rax, r14
     imul    rax, r11
@@ -579,6 +617,11 @@ attn_scores_avx2:
     inc     r12
     jmp     .at_p
 .at_done:
+    add     rsp, 8
+    pop     r14
+    pop     r13
+    pop     r12
+.at_ret:
     vzeroupper
     ret
 
@@ -590,9 +633,13 @@ attn_scores_avx2:
 ; ==============================================================================
 attn_values_avx2:
     test    r9, r9
-    jz      .av_done
-    mov     r13, [rsp + 40]                      ; head_dim
+    jz      .av_ret
+    mov     r13, [rsp + 40]                      ; head_dim (read before any frame shift)
     mov     r14, [rsp + 48]                      ; kv_start
+    push    r12                                  ; callee-saved, see attn_scores
+    push    r13
+    push    r14
+    sub     rsp, 8
     shl     r13, 2                               ; V row stride (bytes)
     mov     rax, r13
     imul    rax, r14
@@ -640,6 +687,11 @@ attn_values_avx2:
     add     r10, 256
     jmp     .av_chunk
 .av_done:
+    add     rsp, 8
+    pop     r14
+    pop     r13
+    pop     r12
+.av_ret:
     vzeroupper
     ret
 
@@ -735,7 +787,8 @@ ple_combine_avx2:
     vmulps  ymm3, ymm10, [rdx + r10 * 4]         ; proj * pscale
     vmulps  ymm3, ymm3, ymm0                     ; * rsqrt
     vmulps  ymm3, ymm3, [r11 + r10 * 4]          ; * RMSNorm weight
-    vmovups ymm4, [r8 + r10 * 4]
+    vpmovzxwd ymm4, [r8 + r10 * 2]               ; per_layer_embeddings is bf16
+    vpslld  ymm4, ymm4, 16
     vfmadd231ps ymm3, ymm4, ymm11                 ; + tok * tscale
     vmulps  ymm3, ymm3, ymm12
     vmovups [rcx + r10 * 4], ymm3
