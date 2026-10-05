@@ -1,0 +1,28 @@
+{
+  "id": "b3864ecc6",
+  "name": "Gen-cap 16 test",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hello\\n\" | timeout 120 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 800 950 16 > /tmp/chatg16.log 2>&1; echo EXIT=$?; awk \"/chat ready/{f=1} f\" /tmp/chatg16.log | wc -w'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b3864ecc6.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791237708738,
+  "endTime": 1791237714229,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 102357,
+  "bytesWritten": 10,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
