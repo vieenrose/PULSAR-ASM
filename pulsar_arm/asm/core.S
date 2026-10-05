@@ -682,7 +682,13 @@ _start:
     adrp x1, G_RNG
     add x1, x1, :lo12:G_RNG
     str x0, [x1]                 // deterministic RNG start
-    bl decode_test
+    adrp x0, J_bpe
+    add x0, x0, :lo12:J_bpe
+    ldr x0, [x0]
+    cbz x0, 0f                   // no bpe path: skip BPE stage
+    bl bpe_load
+    bl encode_test
+0:  bl decode_test
     mov x0, #0
     mov x8, #SYS_EXIT
     svc #0
@@ -1241,7 +1247,16 @@ file_stage_after_bench:
     b.ne 3f
     mov x3, #1
     str x3, [x2]                 // x2 = G_MODE addr (intact? str doesn't modify ✓)
-3:  cmp x0, #4                   // x0=argc, x1=argv intact (mode used x2/x3 only ✓)
+3:  // J_bpe from argv[5] (default 0 = skip BPE stage). x0=argc, x1=argv ✓
+    adrp x2, J_bpe
+    add x2, x2, :lo12:J_bpe
+    mov x3, #0
+    str x3, [x2]
+    cmp x0, #6
+    b.lo 4f
+    ldr x3, [x1, #40]            // argv[5] bpe.bin path
+    str x3, [x2]
+4:  cmp x0, #4                   // x0=argc, x1=argv intact (mode+bpe used x2/x3 only ✓)
     b.lo 1f
     ldr x0, [x1, #24]            // argv[3]
     bl parse_u64                 // x0 = tok (clobbers x0-x3; x1 dead? x1=argv NEEDED below! RELOAD from stack after (saved at entry ✓))
@@ -3609,6 +3624,7 @@ put_surf:
     .align 3
 OUTCUR:      .skip 8
 J_path:      .skip 8
+J_bpe:       .skip 8
 
     .section .text
     .align 2
@@ -3956,4 +3972,470 @@ sel_hit:
     movz w1, #4, lsl #16
     bl argmax_f32                // w0 = argmax
 9:  ldr x30, [sp], #16
+    ret
+
+    .section .bss
+    .align 3
+BBASE:       .skip 8
+B_RULES:     .skip 8
+B_CHARS:     .skip 8
+B_BYTEMAP:   .skip 8
+B_NRULES:    .skip 8
+B_NCHARS:    .skip 8
+    .align 4
+SYM:         .skip 2048*4
+
+    .section .rodata
+    .align 3
+bpe_magic:   .quad 0x4250455F424C4F42
+t_bpe:       .asciz "bpe rules: "
+
+    .section .text
+    .align 2
+/* bpe_load: x0 = bpe.bin path. mmaps read-only, verifies, sets cells. */
+bpe_load:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    mov x1, x0                   // path
+    mov x0, #-100
+    mov x2, #0
+    mov x3, #0
+    mov x8, #56
+    svc #0                       // openat
+    cmp x0, #0
+    b.lt 9f
+    str x0, [sp, #-16]!          // fd
+    mov x8, #62
+    ldr x0, [sp]                 // fd
+    mov x1, #0
+    mov x2, #2
+    svc #0                       // lseek END -> size (unused; mmap needs len! USE size)
+    cmp x0, #0
+    b.le 9f
+    mov x20, x0                  // size
+    mov x8, #222
+    mov x0, #0
+    mov x1, x20
+    mov x2, #1                   // PROT_READ
+    mov x3, #2
+    ldr x4, [sp]                 // fd
+    mov x5, #0
+    svc #0
+    cmp x0, #0
+    b.lt 9f
+    mov x19, x0                  // base
+    ldr x0, [sp], #16            // fd
+    mov x8, #57
+    svc #0                       // close
+    // verify magic
+    ldr x0, [x19]
+    adrp x1, bpe_magic
+    add x1, x1, :lo12:bpe_magic
+    ldr x1, [x1]
+    cmp x0, x1
+    b.ne 9f
+    // cells: BBASE=base; NRULES=[base+8]; NCHARS=[base+16]
+    adrp x0, BBASE
+    add x0, x0, :lo12:BBASE
+    str x19, [x0]
+    ldr x0, [x19, #8]            // nrules
+    adrp x1, B_NRULES
+    add x1, x1, :lo12:B_NRULES
+    str x0, [x1]
+    // RULES = base+24
+    add x0, x19, #24
+    adrp x1, B_RULES
+    add x1, x1, :lo12:B_RULES
+    str x0, [x1]
+    // CHARS = base+24+nrules*16 ; NCHARS = [base+16]
+    ldr x0, [x19, #16]           // nchars
+    adrp x1, B_NCHARS
+    add x1, x1, :lo12:B_NCHARS
+    str x0, [x1]
+    ldr x0, [x19, #8]            // nrules
+    lsl x0, x0, #4               // *16
+    add x0, x19, x0
+    add x2, x0, #24              // x2 = charmap base (x2 free? YES (recomputed). SAVE to cell + keep in x2? need x2 later? no. STORE then RELOAD when needed below.)
+    adrp x1, B_CHARS
+    add x1, x1, :lo12:B_CHARS
+    str x2, [x1]
+    // BYTEMAP = charmap + nchars*8
+    ldr x0, [x19, #16]           // nchars
+    lsl x0, x0, #3               // *8
+    add x0, x2, x0               // + charmap base (x2 intact? YES (no calls/overwrites between) ✓)
+    adrp x1, B_BYTEMAP
+    add x1, x1, :lo12:B_BYTEMAP
+    str x0, [x1]
+    // print n_rules (verify 514906)
+    adrp x0, t_bpe
+    add x0, x0, :lo12:t_bpe
+    bl print_cstr
+    ldr x0, [x19, #8]
+    bl print_u64
+    bl print_nl
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+    b 9f
+9:  adrp x0, e_vload
+    add x0, x0, :lo12:e_vload
+    bl print_cstr
+    mov x0, #1
+    mov x8, #SYS_EXIT
+    svc #0
+
+/* utf8_decode: x0 = ptr, x1 = end. Returns w0 = cp (or U+FFFD), x1 = next.
+ * Bounds-checked (never reads past end). Uses w2-w4 (+x4 saved ptr). No calls. */
+utf8_decode:
+    mov x4, x0                   // save ptr
+    cmp x0, x1
+    b.hs 9f                      // empty
+    ldrb w2, [x0]
+    cmp w2, #0x80
+    b.lo 8f                      // ASCII
+    cmp w2, #0xE0
+    b.lo 0f                      // 2-byte
+    cmp w2, #0xF0
+    b.lo 1f                      // 3-byte
+    cmp w2, #0xF8
+    b.hs 9f                      // 5+ byte lead: invalid
+    add x3, x0, #4               // need 4
+    cmp x3, x1
+    b.hi 9f
+    and w2, w2, #0x07
+    lsl w2, w2, #18
+    ldrb w3, [x0, #1]
+    and w3, w3, #0x3F
+    lsl w3, w3, #12
+    orr w2, w2, w3
+    ldrb w3, [x0, #2]
+    and w3, w3, #0x3F
+    lsl w3, w3, #6
+    orr w2, w2, w3
+    ldrb w3, [x0, #3]
+    and w3, w3, #0x3F
+    orr w0, w2, w3               // cp
+    add x1, x4, #4               // next
+    ret
+8:  mov w0, w2                   // ASCII cp
+    add x1, x4, #1               // next
+    ret
+0:  add x3, x0, #2               // need 2
+    cmp x3, x1
+    b.hi 9f
+    and w2, w2, #0x1F
+    lsl w2, w2, #6
+    ldrb w3, [x0, #1]
+    and w3, w3, #0x3F
+    orr w0, w2, w3               // cp
+    add x1, x4, #2               // next
+    ret
+1:  add x3, x0, #3               // need 3
+    cmp x3, x1
+    b.hi 9f
+    and w2, w2, #0x0F
+    lsl w2, w2, #12
+    ldrb w3, [x0, #1]
+    and w3, w3, #0x3F
+    lsl w3, w3, #6
+    orr w2, w2, w3
+    ldrb w3, [x0, #2]
+    and w3, w3, #0x3F
+    orr w0, w2, w3               // cp
+    add x1, x4, #3               // next
+    ret
+9:  mov w0, #0xFFFD
+    add x1, x4, #1               // skip bad byte (guarantees progress)
+    ret
+/* char_lookup: w0 = codepoint -> w0 = id, or -1. Binary search charmap.
+ * Uses x0-x4. No calls. */
+char_lookup:
+    adrp x1, B_CHARS
+    add x1, x1, :lo12:B_CHARS
+    ldr x1, [x1]                 // base (each entry cp:u32,id:u32)
+    adrp x2, B_NCHARS
+    add x2, x2, :lo12:B_NCHARS
+    ldr x2, [x2]                 // n
+    mov x3, #0                   // lo
+0:  cmp x3, x2
+    b.hs 1f                      // miss -> -1
+    add x4, x3, x2
+    lsr x4, x4, #1               // mid
+    lsl x5, x4, #3               // mid*8 -- x5 free? YES (uses x0-x5, no calls; caller recomputes). SAFE (leaf).
+    add x5, x1, x5
+    ldr w6, [x5]                 // entry cp -- w6? uses x0-x6 now. SAFE (leaf, caller recomputes).
+    cmp w0, w6
+    b.eq 2f
+    b.lo 3f                      // cp < entry: hi = mid... WAIT hi/lo update needs care: standard: if cp < entry.cp: hi = mid else lo = mid+1. x2 = hi, x3 = lo.
+    add x3, x4, #1               // lo = mid+1
+    b 0b
+3:  mov x2, x4                   // hi = mid
+    b 0b
+2:  ldr w0, [x5, #4]             // id
+    ret
+1:  mov w0, #-1
+    ret
+
+    .section .rodata
+    .align 3
+t_enc:       .asciz "enc: "
+t_ids2:      .asciz " -> "
+t_enc_over:  .asciz "encode overflow (prompt too long)\n"
+
+    .section .text
+    .align 2
+encode:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    str x25, [sp, #-16]!
+    mov x19, x0                  // text
+    add x20, x0, x1              // end
+    mov x21, x2                  // out
+    mov x22, x3                  // max (cap; informational: SYM fixed 2048)
+    adrp x23, SYM
+    add x23, x23, :lo12:SYM
+    mov x24, x19                 // p = text
+    mov w25, #0                  // n = 0
+0:  cmp x24, x20
+    b.hs 1f                      // init done
+    mov x26, x24                 // byte-start (fallback needs it)
+    mov x0, x24
+    mov x1, x20
+    bl utf8_decode               // w0 = cp, x1 = next (uses x0-x4; x26 safe)
+    mov x24, x1                  // p = next
+    cmp w0, #0x20
+    b.ne 2f
+    mov w0, #0x2581              // space -> U+2581
+2:  bl char_lookup               // w0 = id or -1 (uses x0-x6; x26 safe)
+    cmp w0, #0
+    b.ge 3f                      // hit
+    adrp x0, B_BYTEMAP
+    add x0, x0, :lo12:B_BYTEMAP
+    ldr x0, [x0]                 // bytemap
+4:  cmp x26, x24
+    b.hs 0b                      // fallback bytes done -> next char
+    ldrb w1, [x26]
+    ldr w1, [x0, x1, lsl #2]     // bytemap[b]
+    cmp w25, #2048
+    b.hs 9f
+    str w1, [x23, x25, lsl #2]
+    add x25, x25, #1
+    add x26, x26, #1
+    b 4b
+3:  cmp w25, #2048
+    b.hs 9f
+    str w0, [x23, x25, lsl #2]
+    add x25, x25, #1
+    b 0b
+1:  // Phase 2: merge loop (no calls; x26+ free as temps, x25 = n live)
+    adrp x8, B_RULES
+    add x8, x8, :lo12:B_RULES
+    ldr x8, [x8]                 // rules base
+    adrp x9, B_NRULES
+    add x9, x9, :lo12:B_NRULES
+    ldr x9, [x9]                 // nrules
+5:  mov w26, #0xFFFFFFFF         // best_rank = INF (w26: x26 dead here ✓)
+    mov w2, #0                   // j = 0
+6:  sub w3, w25, #1              // n-1
+    cmp w2, w3
+    b.hs 7f                      // scan done (j >= n-1)
+    ldr w4, [x23, x2, lsl #2]    // left = sym[j]
+    add w5, w2, #1
+    ldr w5, [x23, w5, lsl #2]    // right = sym[j+1]
+    lsl x10, x5, #32             // target key = left | right<<32
+    orr x10, x10, x4             // (x4/x5 zero-extended? w-reg writes zero-extend to x ✓)
+    mov x6, #0                   // lo
+    mov x7, x9                   // hi = nrules
+bs_loop:
+    cmp x6, x7
+    b.hs pair_next               // miss -> j++
+    add x11, x6, x7
+    lsr x11, x11, #1             // mid
+    lsl x12, x11, #4
+    add x12, x8, x12             // &rule[mid]
+    ldr x13, [x12]               // stored key (left | right<<32)
+    cmp x10, x13
+    b.eq bs_hit
+    b.lo bs_lo                   // target < stored: hi = mid
+    add x6, x11, #1              // lo = mid+1
+    b bs_loop
+bs_lo:
+    mov x7, x11                  // hi = mid
+    b bs_loop
+bs_hit:
+    ldr w13, [x12, #12]          // rank
+    cmp w13, w26
+    b.hs pair_next               // not better (strict < keeps leftmost ✓)
+    mov w26, w13                 // best_rank
+    mov w0, w2                   // best_j
+    ldr w1, [x12, #8]            // best_z = result
+pair_next:
+    add w2, w2, #1               // j++
+    b 6b                         // scan top
+7:  // scan done: any merge?
+    cmp w26, #0xFFFFFFFF
+    b.eq 8f                      // none -> copy out
+    str w1, [x23, x0, lsl #2]    // sym[best_j] = best_z
+    // memmove [best_j+1, n-1] down by one
+    add w2, w0, #1               // k = best_j+1
+mm_loop:
+    cmp w2, w25
+    b.hs mm_done
+    ldr w3, [x23, x2, lsl #2]    // sym[k]
+    sub w4, w2, #1
+    str w3, [x23, w4, lsl #2]    // sym[k-1]
+    add w2, w2, #1
+    b mm_loop
+mm_done:
+    sub w25, w25, #1             // n--
+    b 5b                         // next pass
+8:  // Phase 3: copy SYM[0..n-1] to out (x21), return n
+    cmp w25, w22                 // n <= caller max?
+    b.hi 9f
+    mov w2, #0                   // k
+cp_loop:
+    cmp w2, w25
+    b.hs cp_done
+    ldr w3, [x23, x2, lsl #2]
+    str w3, [x21, x2, lsl #2]
+    add w2, w2, #1
+    b cp_loop
+cp_done:
+    mov w0, w25                  // return n
+    ldr x25, [sp], #16
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+9:  adrp x0, t_enc_over
+    add x0, x0, :lo12:t_enc_over
+    bl print_cstr
+    mov x0, #1
+    mov x8, #SYS_EXIT
+    svc #0
+    .section .bss
+    .align 4
+ENC_OUT:     .skip 512*4
+
+    .section .rodata
+et0:  .asciz "Hello world"
+et1:  .asciz "The capital of France is"
+et2:  .asciz "Hello"
+et3:  .asciz "\n"
+et4:  .asciz " a"
+et5:  .asciz "caf\303\251 \346\227\245\346\234\254\350\252\236"
+et6:  .asciz "Name"
+et7:  .asciz "THE"
+et8:  .asciz "  spaces  "
+et9:  .asciz "x=1+2*3"
+et10: .asciz "\303\251"
+et11: .asciz "\346\227\245"
+et12: .asciz "A"
+et13: .asciz "\360\237\230\200"
+et14: .asciz "\001"
+et15: .asciz "\177"
+et16: .asciz "\342\200\213"
+et17: .asciz " Hello"
+
+    .section .text
+    .align 2
+/* enc_one: x0 = asciz text. Prints "enc: <text> -> <ids...>". */
+enc_one:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    mov x19, x0                  // text (print_* and encode preserve x19+ ✓)
+    adrp x0, t_enc
+    add x0, x0, :lo12:t_enc
+    bl print_cstr
+    mov x0, x19
+    bl print_cstr                // echo text
+    adrp x0, t_ids2
+    add x0, x0, :lo12:t_ids2
+    bl print_cstr
+    mov x0, x19
+    bl strlen_asm                // x0 = len
+    mov x1, x0                   // len
+    mov x0, x19                  // text
+    adrp x2, ENC_OUT
+    add x2, x2, :lo12:ENC_OUT
+    mov w3, #512
+    bl encode                    // w0 = n (uses SYM; preserves x19+ ✓)
+    mov w20, w0                  // n (w20: encode preserves x20 ✓ SAFE)
+    adrp x19, ENC_OUT
+    add x19, x19, :lo12:ENC_OUT  // REUSE x19 (text dead ✓; encode preserved x19 but we overwrite deliberately ✓)
+    mov w21, #0                  // k -- w21? x21 dead? x21 was out (dead ✓). BUT encode preserves x21; we overwrite w21 deliberately ✓. w21 vs... print_u64 clobbers x0-x2? print clobbers x0-x2,x8,x9 (per print_cstr comment; print_u64 similar?). w21 SAFE if print_* use x0-x9 max. VERIFY print_u64/print_sp regs! (check below before trusting).
+    b 0f
+0:  cmp w21, w20                 // k < n?
+    b.hs 1f
+    ldr w0, [x19, x21, lsl #2]   // id
+    bl print_u64                 // clobbers x0-x3,x8,x9; x19-x21 safe
+    bl print_sp
+    add w21, w21, #1
+    b 0b
+1:  bl print_nl
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
+/* encode_test: runs enc_one over et0..et17. */
+encode_test:
+    str x30, [sp, #-16]!
+    adrp x0, et0
+    add x0, x0, :lo12:et0
+    bl enc_one
+    adrp x0, et1
+    add x0, x0, :lo12:et1
+    bl enc_one
+    adrp x0, et2
+    add x0, x0, :lo12:et2
+    bl enc_one
+    adrp x0, et3
+    add x0, x0, :lo12:et3
+    bl enc_one
+    adrp x0, et4
+    add x0, x0, :lo12:et4
+    bl enc_one
+    adrp x0, et5
+    add x0, x0, :lo12:et5
+    bl enc_one
+    adrp x0, et6
+    add x0, x0, :lo12:et6
+    bl enc_one
+    adrp x0, et7
+    add x0, x0, :lo12:et7
+    bl enc_one
+    adrp x0, et8
+    add x0, x0, :lo12:et8
+    bl enc_one
+    adrp x0, et9
+    add x0, x0, :lo12:et9
+    bl enc_one
+    adrp x0, et10
+    add x0, x0, :lo12:et10
+    bl enc_one
+    adrp x0, et11
+    add x0, x0, :lo12:et11
+    bl enc_one
+    adrp x0, et12
+    add x0, x0, :lo12:et12
+    bl enc_one
+    adrp x0, et13
+    add x0, x0, :lo12:et13
+    bl enc_one
+    adrp x0, et14
+    add x0, x0, :lo12:et14
+    bl enc_one
+    adrp x0, et15
+    add x0, x0, :lo12:et15
+    bl enc_one
+    adrp x0, et16
+    add x0, x0, :lo12:et16
+    bl enc_one
+    adrp x0, et17
+    add x0, x0, :lo12:et17
+    bl enc_one
+    ldr x30, [sp], #16
     ret
