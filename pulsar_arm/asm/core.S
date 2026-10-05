@@ -2024,12 +2024,12 @@ build_one:
     mov w24, #0                  // p (x24: sincos-safe, tables_test-safe)
 0:  cmp w24, #512
     b.hs 9f
-    scvtf s6, w24                // (float)p
     mov w11, #0                  // i (x11: sincos-safe)
 1:  cmp w11, #128
     b.hs 2f
     ldr s1, [x0, x11, lsl #2]    // inv_i
-    fmul s0, s6, s1              // ang
+    scvtf s5, w24                // (float)p fresh (s5 dies in sincos, read first)
+    fmul s0, s5, s1              // ang
     bl sincos_asm                // s0=sin s1=cos
     lsl x3, x24, #7              // p*128
     add x3, x3, x11
