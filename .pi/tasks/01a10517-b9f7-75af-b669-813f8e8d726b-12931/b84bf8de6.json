@@ -1,0 +1,27 @@
+{
+  "id": "b84bf8de6",
+  "name": "Chat two-turn retest",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hello\\nThe capital of France is\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin > /tmp/chat4.log 2>&1; echo EXIT=$?; awk \"/chat ready/{f=1} f\" /tmp/chat4.log | cut -c1-70 | head -12'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b84bf8de6.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791235447738,
+  "endTime": 1791235501182,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 99246,
+  "bytesWritten": 336,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
