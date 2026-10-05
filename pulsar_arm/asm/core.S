@@ -706,6 +706,7 @@ f_00625:     .float 0.0625
 f_3:         .float 3.0
 t_expf:      .asciz "expf ticks/call: "
 t_tanhf:     .asciz "tanhf ticks/call: "
+    .align 2
 f_exp_hi:    .float 88.72283
 f_exp_lo:    .float -103.97208
 f_inv_ln2:   .float 1.4426950408889634
