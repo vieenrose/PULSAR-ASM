@@ -3598,9 +3598,12 @@ vparse:
     add x22, x22, #1
     tst x22, #0x3FF              // progress every 1024
     b.ne 14f
-    str x22, [sp, #-16]!         // save count (print clobbers x0-x9? uses x0-x2,x8,x9. x22 SAFE? print_u64 uses x0-x4! x22 SAFE ✓. But bl needs lr! SAVE lr too. Actually simpler: push x30+x22.)
+    str x22, [sp, #-16]!
     str x30, [sp, #-16]!
     mov x0, x22
+    bl print_u64                 // count
+    bl print_sp
+    sub x0, x23, x19            // scan offset in file
     bl print_u64
     bl print_nl
     ldr x30, [sp], #16
