@@ -130,11 +130,13 @@ was `hidden=1536` rather than `ple_dim=256`. So `tests/test_gemma4_batch.py` com
 against that same token run alone, not just the last one, and `tests/test_bf16_gemb.py` reproduces
 the padded row layouts directly.
 
-**MTP.** Google ships a 4-layer assistant checkpoint for exactly this model. Its draft quality
-against our own target measures **0.70 accepted tokens per draft pass ≈ 1.70 tokens per verify
-pass** (`tools/bench_mtp.py`) — real signal. The batched verify pass it depends on now works, so
-what is left is the drafter itself: it exists only in NumPy, where it is slower than the target it
-drives. So MTP is off.
+**MTP.** Google ships a 4-layer assistant checkpoint for exactly this model. The drafter now
+runs in AVX2 (`engine/mtp_draft_flat.asm`, `tests/test_mtp_draft.py` pins it to the oracle:
+4/4 draft tokens identical, `h_next` rel 7.6e-7) and the loop closes through the batched verifier
+(`tools/mtp_decode.py`): 24/24 greedy tokens identical to plain decode at 0.71 accepts/pass.
+Honest speed note: the loop costs two target passes per round (fresh `h` needs a single-token
+forward), so it lands at ~1.05x over sequential for now — chaining the assistant's own `h`
+across rounds would reach one pass per round.
 
 Status, honestly:
 
@@ -144,7 +146,7 @@ Status, honestly:
 | greedy decode, chat CLI, layer-by-layer parity tests | works |
 | batched verify (B tokens per pass) | works — B=2, 3 and 4 are bit-identical to the same tokens run one at a time, residual stream and KV caches alike. Three bugs stood in the way, all invisible at B=1: the shared activation buffers took their row strides from each layer's own `head_dim`/`inter` instead of the widest layer (batch 1 landed inside batch 0), `mul_avx2` read its element count from the wrong register and ran 1536 elements instead of 256, and `geglu_avx2` walked `B*inter` linearly across rows that are `max_inter` apart. |
 | sampling (temperature → top-k → top-p, xorshift64\* draw) | works — verified against NumPy: exact top-k at vocab 262144, draws within a 3-sigma band, identical logits |
-| MTP drafter in assembly | not written — the NumPy drafter is slower than the target it drives |
+| MTP drafter in assembly | works — 4/4 draft tokens identical to the oracle, 24/24 loop tokens identical to plain greedy, 0.71 accepts/pass at 1.5 ms/draft. Speedup is ~1.05x as wired (two target passes per round); carried-`h` across rounds is the open optimization |
 | agreement with other engines | llama.cpp's `gemma4` path disagrees with HF at the first step — it scores `用` at 0.913 where HF says 0.128, and its Chinese reads better because it is computing something else ([write-up](doc/llamacpp-gemma4-divergence.md)) |
 | reset between conversations | clears activations as well as KV; a reset engine now reproduces a fresh one exactly (it used to keep the previous PLE history) |
 | shutdown | `close()` used to join spin workers that were never told to stop; fixed |
