@@ -1,0 +1,28 @@
+{
+  "id": "b607b5b71",
+  "name": "CRLF handling test",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hello\\r\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 800 950 > /tmp/chatcrlf.log 2>&1; echo EXIT=$?; grep -a \"^> tpl:\" /tmp/chatcrlf.log | head -1 | cut -c1-60; tail -2 /tmp/chatcrlf.log | cut -c1-40'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b607b5b71.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791237495043,
+  "endTime": 1791237522936,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 102041,
+  "bytesWritten": 69,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
