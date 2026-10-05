@@ -4561,6 +4561,7 @@ readline:
 0:  cmp w2, w3
     b.hs 2f                      // full: truncate
     mov x0, #0                   // fd stdin
+    mov x2, #1                   // count = 1 byte
     mov x8, #63                  // read
     svc #0                       // n (x1=cursor intact? SVC preserves x1? SYSCALL clobbers x0 (return) only... x1/x2/x8 PRESERVED? Linux SVC preserves all except x0 (return value). x1 cursor SAFE ✓. x8 must be RESET each loop? x8 preserved ✓ but harmless to reset (already set before svc; loop re-sets x0 only... x8 intact ✓. Keep mov x8 inside loop for safety (2 insns, negligible for interactive).
     cmp x0, #0
