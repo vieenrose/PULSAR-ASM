@@ -1476,6 +1476,15 @@ kern_tests:
     bl rmsnorm_f32
     adrp x0, T0
     add x0, x0, :lo12:T0
+    bl print_u64                 // expect 6913632 (T0 addr)
+    bl print_sp
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    mov x0, x9
+    bl print_u64                 // expect same
+    bl print_nl
+    adrp x0, T0
+    add x0, x0, :lo12:T0
     mov w1, #4
     bl sum_sq
     bl print_f32                 // expect 30.0 (energy direct)
