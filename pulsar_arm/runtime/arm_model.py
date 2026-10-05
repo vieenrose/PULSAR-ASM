@@ -136,7 +136,7 @@ class Arm270m:
         for f_ in ("gemv_bf16", "rmsnorm_f32", "rope_half", "softmax_f32",
                    "gelu_tanh_f32", "gelu_mul_f32", "rmsnorm_add_f32",
                    "embed_row_f32", "attn_scores_f32",
-                   "attn_values_f32", "layer_step", "decode_step"):
+                   "attn_values_f32", "layer_step"):
             getattr(lib, f_).restype = None
         self.lib = lib
         self.pos = 0
