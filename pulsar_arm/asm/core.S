@@ -1097,11 +1097,12 @@ file_stage_after_bench:
 rmsnorm_f32:
     str s0, [sp, #-16]!          // spill eps
     movi v0.4s, #0
+    mov x5, x2                   // x cursor
     mov w9, #0
 0:  add w10, w9, #4
     cmp w10, w3
     b.hi 1f
-    ld1 {v1.4s}, [x2, x9, lsl #2]
+    ld1 {v1.4s}, [x5], #16
     fmla v0.4s, v1.4s, v1.4s
     add w9, w9, #4
     b 0b
@@ -1122,15 +1123,18 @@ rmsnorm_f32:
     fmov s2, #1.0
     fdiv s1, s2, s1              // inv
     dup v4.4s, v1.s[0]           // broadcast inv (s1)
+    mov x5, x2
+    mov x6, x1
+    mov x7, x0
     mov w9, #0
 4:  add w10, w9, #4
     cmp w10, w3
     b.hi 5f
-    ld1 {v2.4s}, [x2, x9, lsl #2]
-    ld1 {v3.4s}, [x1, x9, lsl #2]
+    ld1 {v2.4s}, [x5], #16
+    ld1 {v3.4s}, [x6], #16
     fmul v2.4s, v2.4s, v3.4s
     fmul v2.4s, v2.4s, v4.4s
-    st1 {v2.4s}, [x0, x9, lsl #2]
+    st1 {v2.4s}, [x7], #16
     add w9, w9, #4
     b 4b
 5:  cmp w9, w3
@@ -1238,7 +1242,8 @@ gelu_mul_f32:
 attn_scores_f32:
     str s0, [sp, #-16]!          // spill scale
     mov w9, #0                   // p
-    lsl x10, w4, #2              // hd*4 row stride (w4 zero-extended)
+    uxtw x10, w4
+    lsl x10, x10, #2              // hd*4 row stride
 0:  cmp w9, w3
     b.hs 9f
     mul x11, x9, x10
@@ -1286,11 +1291,15 @@ attn_values_f32:
     lsl x12, x12, #2
     add x12, x1, x12
     ld1 {v1.4s}, [x12]
-    ld1r {v2.4s}, [x2, x11, lsl #2]  // broadcast w[p]
+    lsl x13, x11, #2
+    add x13, x2, x13
+    ld1r {v2.4s}, [x13]  // broadcast w[p]
     fmla v0.4s, v1.4s, v2.4s
     add w11, w11, #1
     b 1b
-2:  st1 {v0.4s}, [x0, x9, lsl #2]
+2:  lsl x13, x9, #2
+    add x13, x0, x13
+    st1 {v0.4s}, [x13]
     add w9, w9, #4
     b 0b
 9:  ret
@@ -1325,18 +1334,22 @@ rmsnorm_add_f32:
     fmov s2, #1.0
     fdiv s1, s2, s1              // inv
     dup v4.4s, v1.s[0]
+    mov x5, x2
+    mov x6, x1
+    mov x7, x0
+    mov x8, x3
     mov w9, #0
 4:  add w10, w9, #4
     cmp w10, w4
     b.hi 5f
-    ld1 {v2.4s}, [x2, x9, lsl #2]
-    ld1 {v3.4s}, [x1, x9, lsl #2]
+    ld1 {v2.4s}, [x5], #16
+    ld1 {v3.4s}, [x6], #16
     fmul v2.4s, v2.4s, v3.4s
     fmul v2.4s, v2.4s, v4.4s
-    st1 {v2.4s}, [x0, x9, lsl #2]
-    ld1 {v3.4s}, [x3, x9, lsl #2]
+    st1 {v2.4s}, [x7], #16
+    ld1 {v3.4s}, [x8], #16
     fadd v3.4s, v3.4s, v2.4s
-    st1 {v3.4s}, [x3, x9, lsl #2]
+    st1 {v3.4s}, [x8], #16
     add w9, w9, #4
     b 4b
 5:  cmp w9, w4
@@ -1406,11 +1419,12 @@ argmax_f32:
 /* sum_sq(ptr,x0 n,w1) -> s0 = sum of squares (NEON 4-acc, C hsum order). */
 sum_sq:
     movi v0.4s, #0
+    mov x2, x0                   // cursor
     mov w9, #0
 0:  add w10, w9, #4
     cmp w10, w1
     b.hi 1f
-    ld1 {v1.4s}, [x0, x9, lsl #2]
+    ld1 {v1.4s}, [x2], #16
     fmla v0.4s, v1.4s, v1.4s
     add w9, w9, #4
     b 0b
