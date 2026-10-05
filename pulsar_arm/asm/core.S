@@ -1485,6 +1485,18 @@ kern_tests:
     bl print_nl
     adrp x9, T0
     add x9, x9, :lo12:T0
+    ldr s0, [x9]
+    bl print_f32                 // expect 1.0
+    bl print_sp
+    ldr s0, [x9, #4]             // expect 2.0
+    bl print_f32
+    bl print_sp
+    ldr s0, [x9, #8]             // expect 3.0
+    bl print_f32
+    bl print_sp
+    ldr s0, [x9, #12]            // expect 4.0
+    bl print_f32
+    bl print_nl
     ld1 {v1.4s}, [x9]            // inline: expect [1,2,3,4]
     movi v0.4s, #0
     fmla v0.4s, v1.4s, v1.4s
