@@ -1,0 +1,28 @@
+{
+  "id": "bb68871d4",
+  "name": "Download and inspect 1B GGUF",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '~/pulsar-rpi/v/bin/python - <<\"PY\" 2>&1 | tail -16\nfrom huggingface_hub import snapshot_download\nimport struct\np = snapshot_download(\"google/gemma-3-1b-it-qat-q4_0-gguf\", allow_patterns=[\"gemma-3-1b-it-q4_0.gguf\"])\nprint(\"SNAP:\", p, flush=True)\nimport glob, os\nf = glob.glob(p + \"/*.gguf\")[0]\nprint(\"SIZE-MB:\", os.path.getsize(f) // 1048576, flush=True)\nb = open(f, \"rb\")\nmagic, ver, nt, na = struct.unpack(\"<IIII\", b.read(16))\nprint(\"magic:\", hex(magic), \"ver:\", ver, \"tensors:\", nt, \"meta:\", na, flush=True)\n# walk metadata (KV) to find arch + key dims\nimport sys\ndef rd_str():\n    n = struct.unpack(\"<Q\", b.read(8))[0]\n    return b.read(n).decode(\"utf-8\", \"replace\")\ndef rd_val(t):\n    if t == 8: return rd_str()\n    if t == 4: return struct.unpack(\"<I\", b.read(4))[0]\n    if t == 6: return struct.unpack(\"<f\", b.read(4))[0]\n    if t == 7: return struct.unpack(\"<B\", b.read(1))[0]\n    if t == 9:\n        at = struct.unpack(\"<I\", b.read(4))[0]\n        return [rd_val(at) for _ in range(struct.unpack(\"<Q\", b.read(8))[0])]\n    raise ValueError(t)\nwant = (\"general.architecture\", \"gemma3.embedding_length\", \"gemma3.block_count\",\n        \"gemma3.feed_forward_length\", \"gemma3.attention.head_count\",\n        \"gemma3.attention.head_count_kv\", \"tokenizer.ggml.model\")\nfor _ in range(na):\n    klen = struct.unpack(\"<Q\", b.read(8))[0]\n    k = b.read(klen).decode(\"utf-8\", \"replace\")\n    t = struct.unpack(\"<I\", b.read(4))[0]\n    try: v = rd_val(t)\n    except: print(\"SKIP\", k, t, flush=True); break\n    if k in want or k.startswith(\"tokenizer\") and len(k) < 40: print(k, \"=\", v, flush=True)\nPY' 2>&1 | head -18",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bb68871d4.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791242170479,
+  "endTime": 1791242278252,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 110686,
+  "bytesWritten": 422,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 1200,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "bd47492e8",
+  "name": "List 1B GGUF repo files",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '~/pulsar-rpi/v/bin/python - <<\"PY\" 2>&1 | tail -12\nfrom huggingface_hub import list_repo_files, snapshot_download\nrepo = \"google/gemma-3-1b-it-qat-q4_0-gguf\"\ntry:\n    files = list_repo_files(repo)\n    print(\"FILES:\", [f for f in files if f.endswith((\".gguf\", \".json\"))][:8], flush=True)\nexcept Exception as e:\n    print(\"LIST-FAIL:\", str(e)[:120], flush=True)\nPY' 2>&1 | head -14",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bd47492e8.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791242143122,
+  "endTime": 1791242145086,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 110659,
+  "bytesWritten": 35,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 180,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

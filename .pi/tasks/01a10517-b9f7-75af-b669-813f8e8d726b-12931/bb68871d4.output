@@ -1,0 +1,4 @@
+Fetching 1 files:   0%|          | 0/1 [00:00<?, ?it/s]Fetching 1 files: 100%|██████████| 1/1 [01:45<00:00, 105.90s/it]Fetching 1 files: 100%|██████████| 1/1 [01:45<00:00, 105.90s/it]
+SNAP: /home/luigi/.cache/huggingface/hub/models--google--gemma-3-1b-it-qat-q4_0-gguf/snapshots/d1be121d36172a4b0b964657e2ee859d61138593
+SIZE-MB: 957
+magic: 0x46554747 ver: 3 tensors: 340 meta: 0
