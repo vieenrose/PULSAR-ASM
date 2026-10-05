@@ -525,6 +525,7 @@ t_ms:        .asciz " ms  "
 t_gbs:       .asciz " GB/s\n"
 s_inf:       .asciz "inf"
 s_nan:       .asciz "nan"
+    .align 2
 f_1:         .float 1.0
 f_2:         .float 2.0
 f_m3:        .float -3.0
@@ -547,6 +548,7 @@ f_c2:        .float -0.5
 f_c4:        .float 0.041666668
 f_c6:        .float -0.0013888889
 f_c8:        .float 0.000024801587
+    .align 3
 d_inv_2pi:   .double 0.15915494309189535
 d_2pi:       .double 6.283185307179586
 
