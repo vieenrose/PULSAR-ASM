@@ -561,6 +561,7 @@ _start:
     ldr x0, [sp]                  // argc
     add x1, sp, #8                // argv
     bl file_stage_after_bench
+    bl tables_test
     mov x0, #0
     mov x8, #SYS_EXIT
     svc #0
@@ -880,6 +881,12 @@ file_stage:
     svc #0
     ldr x22, [x21]               // N header bytes
     add x23, x21, #8             // hbase
+    adrp x0, G_base
+    add x0, x0, :lo12:G_base
+    str x21, [x0]
+    adrp x0, G_N
+    add x0, x0, :lo12:G_N
+    str x22, [x0]
     adrp x0, t_hdr
     add x0, x0, :lo12:t_hdr
     bl print_cstr
@@ -1082,10 +1089,25 @@ namebuf:     .skip 128
     .align 2
     .global file_stage_after_bench
 file_stage_after_bench:
-    // x0 = argc, x1 = argv[1] or 0
+    // x0 = argc, x1 = argv
     cmp x0, #2
     b.lo 0f
-    ldr x0, [x1, #8]             // argv[1]
+    str x30, [sp, #-16]!
+    str x1, [sp, #-16]!          // argv
+    mov x2, #2
+    adrp x3, G_tok
+    add x3, x3, :lo12:G_tok
+    str x2, [x3]                 // default tok=2
+    cmp x0, #3
+    b.lo 1f
+    ldr x0, [x1, #16]            // argv[2]
+    bl parse_u64                 // x0 = tok
+    adrp x1, G_tok
+    add x1, x1, :lo12:G_tok
+    str x0, [x1]
+1:  ldr x1, [sp], #16            // argv
+    ldr x0, [x1, #8]             // argv[1] path
+    ldr x30, [sp], #16
     b file_stage
 0:  adrp x0, t_usage
     add x0, x0, :lo12:t_usage
@@ -1934,3 +1956,337 @@ T3:          .skip 2048*4
     .section .text
     .align 2
     .global kern_tests
+
+/* ---------------- stage B-3a: RoPE tables + norm folding + embed ----------------
+ * Tables: cos/sin for sliding (theta 1e4) and full (1e6), 512 positions.
+ * inv_i = exp((-i/128) * ln theta). Angles pos*inv via sincos_asm.
+ * Norms: float64 (1+w) fold of every 1D tensor (matches f32vec bitwise).
+ * Embed: token row gather+scale. Anchors vs session-recorded values. */
+    .section .text
+    .align 2
+
+/* build_tables: fills INV_S/F + TCOS/TSIN_S/F. Clobbers x0-x14, s0-s7. */
+build_tables:
+    str x30, [sp, #-16]!
+    // inv arrays first (theta s=1e4, f=1e6)
+    adrp x0, f_ln4
+    add x0, x0, :lo12:f_ln4      // &ln (callee reloads per iter)
+    adrp x1, INV_S
+    add x1, x1, :lo12:INV_S
+    bl build_inv
+    adrp x0, f_ln6
+    add x0, x0, :lo12:f_ln6      // &ln
+    adrp x1, INV_F
+    add x1, x1, :lo12:INV_F
+    bl build_inv
+    // tables from inv arrays
+    adrp x0, INV_S
+    add x0, x0, :lo12:INV_S
+    adrp x1, TCOS_S
+    add x1, x1, :lo12:TCOS_S
+    adrp x2, TSIN_S
+    add x2, x2, :lo12:TSIN_S
+    bl build_one
+    adrp x0, INV_F
+    add x0, x0, :lo12:INV_F
+    adrp x1, TCOS_F
+    add x1, x1, :lo12:TCOS_F
+    adrp x2, TSIN_F
+    add x2, x2, :lo12:TSIN_F
+    bl build_one
+    ldr x30, [sp], #16
+    ret
+/* build_inv: x0 = &ln_theta, x1 = out[128]. inv_i = exp(-(i/128)*ln).
+ * x0/x1/x11-x13 survive expf (uses x9,x10,s0-s4). One push (lr). */
+build_inv:
+    str x30, [sp, #-16]!
+    mov w11, #0                  // i
+0:  cmp w11, #128
+    b.hs 1f
+    ldr s1, [x0]                 // ln
+    adrp x13, f_00078125
+    add x13, x13, :lo12:f_00078125
+    ldr s2, [x13]                // 1/128
+    scvtf s3, w11
+    fmul s3, s3, s2              // i/128
+    fmul s3, s3, s1              // i*ln/128
+    fneg s0, s3                  // e
+    bl expf_asm                  // s0 = inv
+    str s0, [x1, x11, lsl #2]
+    add w11, w11, #1
+    b 0b
+1:  ldr x30, [sp], #16
+    ret
+/* build_one: x0 = inv[128], x1 = cos[512][128], x2 = sin.
+ * x0-x2/x23/x24/s6 survive sincos (uses x9,s0-s5,d2-d5). */
+build_one:
+    str x30, [sp, #-16]!
+    mov w24, #0                  // p (x24: sincos-safe, tables_test-safe)
+0:  cmp w24, #512
+    b.hs 9f
+    scvtf s6, w24                // (float)p
+    mov w11, #0                  // i (x11: sincos-safe)
+1:  cmp w11, #128
+    b.hs 2f
+    ldr s1, [x0, x11, lsl #2]    // inv_i
+    fmul s0, s6, s1              // ang
+    bl sincos_asm                // s0=sin s1=cos
+    lsl x3, x24, #7              // p*128
+    add x3, x3, x11
+    lsl x3, x3, #2               // byte offset
+    add x4, x1, x3
+    str s1, [x4]                 // cos
+    add x4, x2, x3
+    str s0, [x4]                 // sin
+    add w11, w11, #1
+    b 1b
+2:  add w24, w24, #1
+    b 0b
+9:  ldr x30, [sp], #16
+    ret
+
+    .section .rodata
+    .align 3
+f_ln4:       .float 9.21034037
+f_ln6:       .float 13.81551056
+f_00078125:  .float 0.0078125
+f_sqrt640:   .float 25.29822128
+t_inv:       .asciz "inv_s[0..1] = "
+t_rcos:      .asciz "rcos_s[2][0..3] = "
+t_rsin:      .asciz "rsin_s[2][0..3] = "
+t_fnorm:     .asciz "fnorm_in0[0..3] = "
+t_emb:       .asciz "embed[0..3] = "
+
+    .section .bss
+    .align 4
+INV_S:       .skip 128*4
+INV_F:       .skip 128*4
+TCOS_S:      .skip 512*128*4
+TSIN_S:      .skip 512*128*4
+TCOS_F:      .skip 512*128*4
+TSIN_F:      .skip 512*128*4
+FL:          .skip 110*640*4
+G_base:      .skip 8
+G_N:         .skip 8
+G_tok:       .skip 8
+
+    .section .text
+    .align 2
+
+/* fold_vec: x0 = src u16, x1 = dst f32, w2 = n. float64 (1+w). No calls. */
+fold_vec:
+    adrp x3, d_one
+    add x3, x3, :lo12:d_one
+    ldr d1, [x3]                 // 1.0 f64
+0:  cbz w2, 1f
+    ldrh w3, [x0], #2
+    lsl w3, w3, #16
+    fmov s0, w3
+    fcvt d0, s0
+    fadd d0, d0, d1
+    fcvt s0, d0
+    str s0, [x1], #4
+    sub w2, w2, #1
+    b 0b
+1:  ret
+/* fold_norms: folds norms via tab[] into FL (FL[0]=final, FL[1+6i+j]). */
+fold_norms:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    stp x25, x26, [sp, #-16]!
+    adrp x0, G_base
+    add x0, x0, :lo12:G_base
+    ldr x19, [x0]                // file base
+    adrp x0, G_N
+    add x0, x0, :lo12:G_N
+    ldr x20, [x0]                // N
+    add x19, x19, #8
+    add x19, x19, x20            // x19 = data base
+    adrp x20, tab
+    add x20, x20, :lo12:tab      // x20 = tab
+    adrp x21, FL
+    add x21, x21, :lo12:FL       // x21 = folded base
+    adrp x22, kkind
+    add x22, x22, :lo12:kkind    // kind table
+    // final norm: slot1 -> FL[0]
+    mov x0, #56
+    add x24, x20, x0             // slot1 ptr
+    ldr x0, [x24]                // off
+    add x0, x19, x0              // src
+    ldr w2, [x24, #16]           // n = d0
+    mov x1, x21                  // dst = FL[0]
+    bl fold_vec
+    mov w25, #0                  // i = layer
+0:  cmp w25, #18
+    b.hs 9f
+    mov w26, #0                  // j = norm kind 0..5
+1:  cmp w26, #6
+    b.hs 2f
+    // dst = FL + (1+6i+j)*2560 (x0/x4 scratch)
+    mov x0, #6
+    mul x0, x25, x0
+    add x0, x0, x26
+    add x0, x0, #1
+    lsl x0, x0, #8               // *256
+    mov x4, #10
+    mul x0, x0, x4               // *2560
+    add x1, x21, x0              // dst
+    // src + n from slot 2+13i+k
+    ldrb w3, [x22, x26]          // kind k
+    mov x0, #13
+    mul x0, x25, x0
+    add x0, x0, x3
+    add x0, x0, #2
+    mov x4, #56
+    mul x0, x0, x4
+    add x24, x20, x0             // slot ptr
+    ldr x0, [x24]                // off
+    add x0, x19, x0              // src
+    ldr w2, [x24, #16]           // n
+    bl fold_vec
+    add w26, w26, #1
+    b 1b
+2:  add w25, w25, #1
+    b 0b
+9:  ldp x25, x26, [sp], #16
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
+    .section .rodata
+    .align 3
+d_one:       .double 1.0
+kkind:       .byte 0,1,2,7,8,12
+t_inv:       .asciz "inv_s[0..1] = "
+t_rcos:      .asciz "rcos_s[2][0..3] = "
+t_rsin:      .asciz "rsin_s[2][0..3] = "
+t_fnorm:     .asciz "fnorm_in0[0..3] = "
+t_emb:       .asciz "embed[0..3] = "
+
+    .section .bss
+    .align 4
+XB:          .skip 640*4
+
+    .section .text
+    .align 2
+/* tables_test: build tables, print anchors, fold norms, embed. */
+tables_test:
+    str x30, [sp, #-16]!
+    bl build_tables
+    // inv anchors (expect 1.0, 0.9305720)
+    adrp x0, t_inv
+    add x0, x0, :lo12:t_inv
+    bl print_cstr
+    adrp x9, INV_S
+    add x9, x9, :lo12:INV_S
+    ldr s0, [x9]
+    bl print_f32
+    bl print_sp
+    adrp x9, INV_S
+    add x9, x9, :lo12:INV_S
+    ldr s0, [x9, #4]
+    bl print_f32
+    bl print_nl
+    // table anchors pos2 (row byte offset 2*128*4 = 1024)
+    adrp x0, t_rcos
+    add x0, x0, :lo12:t_rcos
+    bl print_cstr
+    adrp x19, TCOS_S
+    add x19, x19, :lo12:TCOS_S
+    add x19, x19, #1024
+    ldr s0, [x19]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #4]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #8]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #12]
+    bl print_f32
+    bl print_nl
+    adrp x0, t_rsin
+    add x0, x0, :lo12:t_rsin
+    bl print_cstr
+    adrp x19, TSIN_S
+    add x19, x19, :lo12:TSIN_S
+    add x19, x19, #1024
+    ldr s0, [x19]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #4]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #8]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #12]
+    bl print_f32
+    bl print_nl
+    bl fold_norms
+    // fnorm anchor: FL[1] (layer0 in) = FL + 2560
+    adrp x0, t_fnorm
+    add x0, x0, :lo12:t_fnorm
+    bl print_cstr
+    adrp x19, FL
+    add x19, x19, :lo12:FL
+    add x19, x19, #2560
+    ldr s0, [x19]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #4]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #8]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #12]
+    bl print_f32
+    bl print_nl
+    // embed: token=G_tok into XB
+    adrp x0, G_tok
+    add x0, x0, :lo12:G_tok
+    ldr w2, [x0]                 // token
+    adrp x1, G_base
+    add x1, x1, :lo12:G_base
+    ldr x1, [x1]                 // file base
+    adrp x3, G_N
+    add x3, x3, :lo12:G_N
+    ldr x3, [x3]                 // N
+    add x1, x1, #8
+    add x1, x1, x3               // data base
+    adrp x3, tab
+    add x3, x3, :lo12:tab
+    ldr x3, [x3]                 // slot0 off
+    add x1, x1, x3               // emb base
+    adrp x0, XB
+    add x0, x0, :lo12:XB         // out
+    mov w3, #640
+    adrp x4, f_sqrt640
+    add x4, x4, :lo12:f_sqrt640
+    ldr s0, [x4]                 // scale
+    bl embed_row_f32
+    adrp x0, t_emb
+    add x0, x0, :lo12:t_emb
+    bl print_cstr
+    adrp x19, XB
+    add x19, x19, :lo12:XB       // x19 survives prints
+    ldr s0, [x19]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #4]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #8]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x19, #12]
+    bl print_f32
+    bl print_nl
+    ldr x30, [sp], #16
+    ret
