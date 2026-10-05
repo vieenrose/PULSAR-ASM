@@ -1471,19 +1471,30 @@ kern_tests:
     adrp x4, f_eps
     ldr s0, [x4, :lo12:f_eps]
     bl rmsnorm_f32
-    adrp x9, T0
-    add x9, x9, :lo12:T0
-    ldr s0, [x9]                 // expect 1.0
-    bl print_f32
-    bl print_sp
-    adrp x9, T1
-    add x9, x9, :lo12:T1
-    ldr s0, [x9]                 // expect 1.0
-    bl print_f32
-    bl print_sp
     adrp x9, T2
     add x9, x9, :lo12:T2
     ldr s0, [x9]                 // expect 0.3651
+    bl print_f32
+    bl print_sp
+    // tail-only: x=[2], w=[1], n=1 -> out=1.0
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    adrp x10, f_2
+    ldr s0, [x10, :lo12:f_2]
+    str s0, [x9]
+    adrp x0, T2
+    add x0, x0, :lo12:T2
+    adrp x1, T1
+    add x1, x1, :lo12:T1
+    adrp x2, T0
+    add x2, x2, :lo12:T0
+    mov w3, #1
+    adrp x4, f_eps
+    ldr s0, [x4, :lo12:f_eps]
+    bl rmsnorm_f32
+    adrp x9, T2
+    add x9, x9, :lo12:T2
+    ldr s0, [x9]                 // expect 1.0
     bl print_f32
     bl print_nl
     // -- rmsnorm: patterned x, w=0 -> sum(out^2) ~= 640
@@ -1696,9 +1707,13 @@ kern_tests:
     ldr s0, [x9]
     bl print_f32
     bl print_sp
+    adrp x9, T2
+    add x9, x9, :lo12:T2
     ldr s0, [x9, #4]
     bl print_f32
     bl print_sp
+    adrp x9, T2
+    add x9, x9, :lo12:T2
     ldr s0, [x9, #8]
     bl print_f32
     bl print_nl
@@ -1738,6 +1753,8 @@ kern_tests:
     ldr s0, [x9]
     bl print_f32
     bl print_sp
+    adrp x9, T2
+    add x9, x9, :lo12:T2
     ldr s0, [x9, #1020]          // out[255]
     bl print_f32
     bl print_nl
