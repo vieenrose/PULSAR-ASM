@@ -1,0 +1,27 @@
+{
+  "id": "b978c94e6",
+  "name": "Temp 0.7 chat test",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hello\\n\" | timeout 100 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 700 900 > /tmp/chat8.log 2>&1; echo EXIT=$?; grep -a \"temp:\" /tmp/chat8.log | head -1 | cut -c1-30; awk \"/chat ready/{f=1} f\" /tmp/chat8.log | cut -c1-65 | head -8'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b978c94e6.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791236067385,
+  "endTime": 1791236095163,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 100102,
+  "bytesWritten": 205,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "b3d808e1f",
+  "name": "Top-p 0.5 parse test",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hi\\n\" | timeout 100 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 700 500 > /tmp/chat9.log 2>&1; echo EXIT=$?; grep -a \"temp:\" /tmp/chat9.log | head -1 | cut -c1-35'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b3d808e1f.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791236175242,
+  "endTime": 1791236202755,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 100238,
+  "bytesWritten": 39,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
