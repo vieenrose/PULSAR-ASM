@@ -685,10 +685,28 @@ _start:
     adrp x0, J_bpe
     add x0, x0, :lo12:J_bpe
     ldr x0, [x0]
+    // chat mode? (J_chat -> require bpe, chat INSTEAD of decode)
+    adrp x1, J_chat
+    add x1, x1, :lo12:J_chat
+    ldr x1, [x1]
+    cbnz x1, 1f
     cbz x0, 0f                   // no bpe path: skip BPE stage
     bl bpe_load
     bl encode_test
 0:  bl decode_test
+    mov x0, #0
+    mov x8, #93
+    svc #0
+1:  // chat: bpe required
+    cbnz x0, 2f
+    adrp x0, t_nobpe
+    add x0, x0, :lo12:t_nobpe
+    bl print_cstr
+    mov x0, #1
+    mov x8, #93
+    svc #0
+2:  bl bpe_load
+    bl chat                      // noreturn (exits on EOF)
     mov x0, #0
     mov x8, #SYS_EXIT
     svc #0
@@ -1257,6 +1275,24 @@ file_stage_after_bench:
     ldr x3, [x1, #40]            // argv[5] bpe.bin path
     str x3, [x2]
 4:  cmp x0, #4                   // x0=argc, x1=argv intact (mode+bpe used x2/x3 only ✓)
+    // chat mode: argv[4][0]=='c' -> J_chat=1, G_MODE=1 (sample)
+    adrp x2, J_chat
+    add x2, x2, :lo12:J_chat
+    mov x3, #0
+    str x3, [x2]
+    cmp x0, #5
+    b.lo 5f
+    ldr x3, [x1, #32]            // argv[4]
+    ldrb w3, [x3]
+    cmp w3, #'c'
+    b.ne 5f
+    mov x3, #1
+    str x3, [x2]                 // J_chat = 1
+    adrp x2, G_MODE
+    add x2, x2, :lo12:G_MODE
+    str x3, [x2]                 // G_MODE = 1 (chat samples)
+5:  cmp x0, #4                   // argc>=4? (re-compare: flags stale here)
+    b.lo 1f
     b.lo 1f
     ldr x0, [x1, #24]            // argv[3]
     bl parse_u64                 // x0 = tok (clobbers x0-x3; x1 dead? x1=argv NEEDED below! RELOAD from stack after (saved at entry ✓))
@@ -4501,3 +4537,154 @@ rp_out:
     bl print_nl
     ldr x30, [sp], #16
     ret
+
+    .section .bss
+    .align 4
+INBUF:       .skip 4096
+J_chat:      .skip 8
+
+    .section .rodata
+t_chat:      .asciz "chat ready (sample mode; empty line skips, EOF quits)\n"
+t_gt:        .asciz "> "
+t_reset:     .asciz "[context full, resetting]\n"
+t_nobpe:     .asciz "chat mode needs bpe.bin (argv[5])\n"
+
+    .section .text
+    .align 2
+/* readline: -> w0 = len (0 = empty line) or -1 (EOF, no bytes).
+ * Byte-at-a-time (no leftover logic; prompts are short). Uses x0-x3. Leaf. */
+readline:
+    adrp x1, INBUF
+    add x1, x1, :lo12:INBUF      // cursor
+    mov w2, #0                   // len
+    mov w3, #4095                // cap
+0:  cmp w2, w3
+    b.hs 2f                      // full: truncate
+    mov x0, #0                   // fd stdin
+    mov x8, #63                  // read
+    svc #0                       // n (x1=cursor intact? SVC preserves x1? SYSCALL clobbers x0 (return) only... x1/x2/x8 PRESERVED? Linux SVC preserves all except x0 (return value). x1 cursor SAFE ✓. x8 must be RESET each loop? x8 preserved ✓ but harmless to reset (already set before svc; loop re-sets x0 only... x8 intact ✓. Keep mov x8 inside loop for safety (2 insns, negligible for interactive).
+    cmp x0, #0
+    b.le 1f                      // EOF/error
+    ldrb w0, [x1]
+    cmp w0, #10                  // \n?
+    b.eq 2f                      // done (strip)
+    add x1, x1, #1
+    add w2, w2, #1
+    b 0b
+1:  cbz w2, 3f                   // EOF with no bytes -> -1
+    mov w0, w2                   // partial line (no \n) -> len
+    ret
+3:  mov w0, #-1
+    ret
+2:  mov w0, w2                   // len (0 = empty line)
+    ret
+
+/* chat: interactive REPL. x19=pos, x20=turn, x21=n, x22=i/count, x23=tok. */
+chat:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    adrp x0, t_chat
+    add x0, x0, :lo12:t_chat
+    bl print_cstr
+    mov x19, #0                  // pos = 0
+    mov x20, #0                  // turn = 0
+chat_next:
+    adrp x0, t_gt
+    add x0, x0, :lo12:t_gt
+    bl print_cstr                // "> " (x19-x23 safe across prints ✓)
+    bl readline                  // w0 = len or -1 (uses x0-x3; x19+ safe ✓)
+    cmp w0, #-1
+    b.eq chat_bye
+    cbz w0, chat_next            // empty line -> reprompt
+    // strip trailing \r
+    adrp x1, INBUF
+    add x1, x1, :lo12:INBUF
+    sub x2, x0, #1               // x0 = len (w0 -> x0 zero-extended ✓)
+    ldrb w2, [x1, x2]
+    cmp w2, #13
+    b.ne 0f
+    sub w0, w0, #1               // len--
+    cbz w0, chat_next            // line was just \r
+0:  mov x24, x0                  // hold len (both paths ✓)
+chat_enc:
+    mov x1, x24                  // len
+    adrp x0, INBUF
+    add x0, x0, :lo12:INBUF
+    adrp x2, ENC_OUT
+    add x2, x2, :lo12:ENC_OUT
+    mov w3, #512
+    bl encode                    // w0 = n (preserves x19+ ✓)
+    mov x21, x0                  // n
+    // capacity: pos + n + (turn==0) + 128 > 480?
+    add x0, x19, x21             // pos + n
+    cbnz x20, chat_nobos
+    add x0, x0, #1               // +bos
+chat_nobos:
+    add x0, x0, #128             // +gen cap
+    cmp x0, #480
+    b.lo chat_prefill
+    adrp x0, t_reset
+    add x0, x0, :lo12:t_reset
+    bl print_cstr
+    mov x19, #0
+    mov x20, #0
+    b chat_enc                   // re-encode same line fresh (INBUF+x24 intact ✓)
+chat_prefill:
+    // bos on first turn
+    cbnz x20, chat_feed
+    adrp x0, G_pos
+    add x0, x0, :lo12:G_pos
+    str w19, [x0]                // G_pos = pos
+    mov w0, #2                   // bos
+    bl fwd_token                 // (preserves x19+ ✓)
+    add x19, x19, #1             // pos++
+chat_feed:
+    mov x22, #0                  // i = 0
+chat_floop:
+    cmp x22, x21                 // i < n?
+    b.hs chat_gen
+    adrp x0, G_pos
+    add x0, x0, :lo12:G_pos
+    str w19, [x0]
+    adrp x0, ENC_OUT
+    add x0, x0, :lo12:ENC_OUT
+    ldr w0, [x0, x22, lsl #2]    // ids[i] (x22 offset ✓)
+    bl fwd_token
+    add x19, x19, #1             // pos++
+    add x22, x22, #1             // i++
+    b chat_floop
+chat_gen:
+    // tok = ENC_OUT[n-1] (n>=1: encode of len>0 yields >=1 symbol ✓)
+    adrp x0, ENC_OUT
+    add x0, x0, :lo12:ENC_OUT
+    sub x1, x21, #1
+    ldr w23, [x0, x1, lsl #2]    // tok = last
+    mov x22, #0                  // count = 0
+chat_gloop:
+    cmp x22, #128
+    b.hs chat_end                // gen cap
+    adrp x0, G_pos
+    add x0, x0, :lo12:G_pos
+    str w19, [x0]
+    mov w0, w23
+    bl fwd_token                 // LG set
+    bl sampler                   // w0 = token (G_MODE=1 in chat → samples)
+    mov w23, w0                  // tok
+    cmp w23, #1
+    b.eq chat_end                // eos
+    mov x0, x23
+    bl put_surf                  // buffer (preserves x19+ ✓)
+    add x19, x19, #1             // pos++
+    add x22, x22, #1
+    b chat_gloop
+chat_end:
+    bl out_flush
+    bl print_nl
+    add x20, x20, #1             // turn++
+    b chat_next
+chat_bye:
+    mov x0, #0
+    mov x8, #93
+    svc #0
