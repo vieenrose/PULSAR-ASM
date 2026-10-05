@@ -1,0 +1,28 @@
+{
+  "id": "b4313b5b4",
+  "name": "Temperature sweep three runs",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && for T in 500 700 1000; do printf \"Hello\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin $T 950 > /tmp/sweep$T.log 2>&1; echo \"T$T-EXIT=$?\"; done; for T in 500 700 1000; do echo \"== T$T:\"; awk \"/chat ready/{f=1} f\" /tmp/sweep$T.log | wc -l; done'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b4313b5b4.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791236680935,
+  "endTime": 1791236763719,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 100935,
+  "bytesWritten": 73,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
