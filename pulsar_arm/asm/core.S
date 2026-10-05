@@ -676,6 +676,12 @@ _start:
     add x0, x0, :lo12:J_path
     ldr x0, [x0]
     bl vocab_load
+    adrp x0, rng_seed
+    add x0, x0, :lo12:rng_seed
+    ldr x0, [x0]                 // seed const
+    adrp x1, G_RNG
+    add x1, x1, :lo12:G_RNG
+    str x0, [x1]                 // deterministic RNG start
     bl decode_test
     mov x0, #0
     mov x8, #SYS_EXIT
@@ -1222,15 +1228,28 @@ file_stage_after_bench:
     adrp x3, G_tok
     add x3, x3, :lo12:G_tok
     str x2, [x3]                 // default tok=2
-    cmp x0, #4
+    // G_MODE from argv[4] (default 0; '1' -> sample mode)
+    adrp x2, G_MODE
+    add x2, x2, :lo12:G_MODE
+    mov x3, #0
+    str x3, [x2]
+    cmp x0, #5
+    b.lo 3f
+    ldr x3, [x1, #32]            // argv[4]
+    ldrb w3, [x3]
+    cmp w3, #'1'
+    b.ne 3f
+    mov x3, #1
+    str x3, [x2]                 // x2 = G_MODE addr (intact? str doesn't modify ✓)
+3:  cmp x0, #4                   // x0=argc, x1=argv intact (mode used x2/x3 only ✓)
     b.lo 1f
     ldr x0, [x1, #24]            // argv[3]
-    bl parse_u64                 // x0 = tok
+    bl parse_u64                 // x0 = tok (clobbers x0-x3; x1 dead? x1=argv NEEDED below! RELOAD from stack after (saved at entry ✓))
     adrp x1, G_tok
     add x1, x1, :lo12:G_tok
     str x0, [x1]
-1:  ldr x1, [sp], #16            // argv
-    ldr x0, [x1, #8]             // argv[1] path
+1:  ldr x1, [sp], #16            // pop argv
+    ldr x0, [x1, #8]             // argv[1] path -- WAIT x1 just popped (=argv) ✓, x0 = path ✓. But x0 was tok (dead ✓ fine).
     ldr x30, [sp], #16
     b file_stage
 0:  adrp x0, t_usage
@@ -3329,7 +3348,13 @@ decode_test:
     str w20, [x0]
     mov w0, w19
     bl fwd_token
-    mov w19, w0                  // tok
+    // sample mode? (G_MODE 1 -> sampler over LG; else greedy w0)
+    adrp x1, G_MODE
+    add x1, x1, :lo12:G_MODE
+    ldr x1, [x1]
+    cbz x1, 4f
+    bl sampler                   // w0 = sampled (LG ready)
+4:  mov w19, w0                  // tok
     // save IDBUF[pos-8] = tok (pos in w20)
     sub x1, x20, #8
     lsl x1, x1, #3
@@ -3701,4 +3726,234 @@ vspot:
 0:  mov w0, #10
     bl print_ch
     ldr x30, [sp], #16
+    ret
+
+    .section .bss
+    .align 3
+G_MODE:      .skip 8
+G_RNG:       .skip 8
+    .align 4
+TKIDX:       .skip 64*4
+TKVAL:       .skip 64*4
+
+    .section .rodata
+    .align 3
+rng_seed:    .quad 0x9E3779B97F4A7C15
+f_095:       .float 0.95
+f_inv24:     .float 0.000000059604644775390625
+
+    .section .text
+    .align 2
+/* rng_next: xorshift64* on G_rng. Returns x0. Leaf (no calls/stack). */
+rng_next:
+    adrp x1, G_RNG
+    add x1, x1, :lo12:G_RNG
+    ldr x0, [x1]
+    lsr x2, x0, #12
+    eor x0, x0, x2
+    lsl x2, x0, #25
+    eor x0, x0, x2
+    lsr x2, x0, #27
+    eor x0, x0, x2
+    movz x2, #0xcdd1
+    movk x2, #0x4f6c, lsl #16
+    movk x2, #0xf491, lsl #32
+    movk x2, #0x2545, lsl #48     // C = 0x2545F4914F6CDD1D
+    mul x0, x0, x2
+    adrp x1, G_RNG
+    add x1, x1, :lo12:G_RNG
+    str x0, [x1]                 // store back
+    ret
+
+/* softmax_temp(buf,x0 n,w1 temp,s0): softmax with temperature.
+ * temp in s7 across expf (uses s0-s4). Counter x11. No stack. */
+softmax_temp:
+    str x30, [sp, #-16]!
+    fmov s7, s0                  // temp (expf-safe: uses s0-s4)
+    ldr s0, [x0]
+    mov w11, #0
+    add w11, w11, #1             // start max-scan at 1 (buf[0] loaded)
+0:  cmp w11, w1
+    b.hs 1f
+    ldr s1, [x0, x11, lsl #2]
+    fcmp s1, s0
+    b.le 2f
+    fmov s0, s1
+2:  add w11, w11, #1
+    b 0b
+1:  fmov s6, s0                  // max (s6 survives expf calls)
+    mov w11, #0
+3:  cmp w11, w1
+    b.hs 4f
+    ldr s0, [x0, x11, lsl #2]
+    fsub s0, s0, s6              // x - max
+    fdiv s0, s0, s7              // /temp
+    bl expf_asm
+    str s0, [x0, x11, lsl #2]
+    add w11, w11, #1
+    b 3b
+4:  // sum
+    movi v6.4s, #0               // CAREFUL: s6 holds max, needed below? max NOT needed after exp loop (all (x-max) computed). REUSE s6/v6 freely ✓.
+    mov w11, #0
+5:  cmp w11, w1
+    b.hs 6f
+    ldr s0, [x0, x11, lsl #2]
+    fadd s6, s6, s0
+    add w11, w11, #1
+    b 5b
+6:  fmov s0, #1.0
+    fdiv s0, s0, s6
+    mov w11, #0
+7:  cmp w11, w1
+    b.hs 8f
+    ldr s1, [x0, x11, lsl #2]
+    fmul s1, s1, s0
+    str s1, [x0, x11, lsl #2]
+    add w11, w11, #1
+    b 7b
+8:  ldr x30, [sp], #16
+    ret
+/* topk_select(probs,x0 n,w1 k,w2 idx,x3 val,x4).
+ * Descending top-k via insertion. No calls (leaf). Uses x0-x9,s0-s1. */
+topk_select:
+    // init val[*] = -1e30
+    adrp x5, f_neg30
+    add x5, x5, :lo12:f_neg30
+    ldr s0, [x5]
+    mov w5, #0
+0:  cmp w5, w2
+    b.hs 1f
+    str s0, [x4, x5, lsl #2]
+    add w5, w5, #1
+    b 0b
+1:  mov w5, #0                   // i
+2:  cmp w5, w1
+    b.hs 9f
+    ldr s0, [x0, x5, lsl #2]     // v
+    mov w6, #0                   // p scan
+3:  cmp w6, w2
+    b.hs 4f                      // no slot
+    ldr s1, [x4, x6, lsl #2]
+    fcmp s0, s1
+    b.le 5f
+    b 6f                         // found p
+5:  add w6, w6, #1
+    b 3b
+6:  sub w7, w2, #1               // t = k-1; shift [p..k-2] right
+7:  cmp w7, w6
+    b.le 8f                      // t <= p: place
+    sub w8, w7, #1
+    ldr s1, [x4, x8, lsl #2]     // val[t-1]
+    str s1, [x4, x7, lsl #2]     // val[t]
+    ldr w8, [x3, x8, lsl #2]     // idx[t-1]
+    str w8, [x3, x7, lsl #2]     // idx[t]
+    sub w7, w7, #1
+    b 7b
+8:  str s0, [x4, x6, lsl #2]
+    str w5, [x3, x6, lsl #2]
+4:  add w5, w5, #1
+    b 2b
+9:  ret
+
+    .section .rodata
+    .align 2
+f_neg30:     .word 0xF0D1328A            // -1e30 (sentinel)
+
+    .section .text
+    .align 2
+/* sampler: LG ready. G_MODE 0 -> argmax; else temp/topk/topp sample.
+ * Returns w0 = token. Uses x0-x12,s0-s7 (no x19+). Saves lr. */
+sampler:
+    str x30, [sp, #-16]!
+    adrp x0, G_MODE
+    add x0, x0, :lo12:G_MODE
+    ldr x0, [x0]
+    cbz x0, 0f                   // mode 0: greedy argmax (bit-identical path)
+    // softmax_temp(LG, 262144, 1.0)
+    adrp x0, LG
+    add x0, x0, :lo12:LG
+    movz w1, #4, lsl #16         // 262144
+    fmov s0, #1.0
+    bl softmax_temp
+    // topk(LG, 262144, 64, TKIDX, TKVAL)
+    adrp x0, LG
+    add x0, x0, :lo12:LG
+    movz w1, #4, lsl #16
+    mov w2, #64
+    adrp x3, TKIDX
+    add x3, x3, :lo12:TKIDX
+    adrp x4, TKVAL
+    add x4, x4, :lo12:TKVAL
+    bl topk_select
+    // total = sum TKVAL[0..63]; cutoff = total*0.95
+    adrp x0, TKVAL
+    add x0, x0, :lo12:TKVAL
+    fmov s0, wzr                 // 0.0 (fmov from WZR is legal)
+    adrp x0, TKVAL
+    add x0, x0, :lo12:TKVAL
+    mov w1, #0
+1:  cmp w1, #64
+    b.hs 2f
+    ldr s1, [x0, x1, lsl #2]
+    fadd s0, s0, s1              // total
+    add w1, w1, #1
+    b 1b
+2:  adrp x1, f_095
+    add x1, x1, :lo12:f_095
+    ldr s1, [x1]
+    fmul s1, s0, s1              // cutoff = total*0.95 (s1; s0=total dead? total NEEDED? No (cutoff suffices). s0 dead ✓)
+    // walk cumulative to kept set
+    adrp x0, TKVAL
+    add x0, x0, :lo12:TKVAL
+    fmov s0, wzr                 // acc
+    mov w1, #0                   // j
+3:  cmp w1, #64
+    b.hs 4f                      // failsafe (rounding): kept=64
+    ldr s2, [x0, x1, lsl #2]
+    fadd s0, s0, s2
+    fcmp s0, s1
+    b.ge 4f                      // acc >= cutoff: kept=j+1, mass=s0
+    add w1, w1, #1
+    b 3b
+4:  cmp w1, #64
+    b.eq sel_full                // fell through (w1=64): kept=64
+    add w4, w1, #1               // hit path: kept = j+1
+    b sel_go
+sel_full:
+    mov w4, #64
+sel_go:
+    bl rng_next                  // x0 = u64 (uses x0-x2; w4/s0 safe)
+    lsr x0, x0, #40              // top 24 bits
+    scvtf s1, x0
+    adrp x0, f_inv24
+    add x0, x0, :lo12:f_inv24
+    ldr s2, [x0]                 // 2^-24
+    fmul s1, s1, s2              // frac in [0,1)
+    fmul s1, s1, s0              // r = frac*mass
+    fmov s2, wzr                 // acc
+    mov w5, #0                   // j
+sel_walk:
+    cmp w5, w4
+    b.hs sel_clamp               // failsafe (b.ge below always hits first)
+    adrp x0, TKVAL
+    add x0, x0, :lo12:TKVAL
+    ldr s3, [x0, x5, lsl #2]
+    fadd s2, s2, s3
+    fcmp s2, s1
+    b.ge sel_hit
+    add w5, w5, #1
+    b sel_walk
+sel_clamp:
+    sub w5, w4, #1
+sel_hit:
+    adrp x0, TKIDX
+    add x0, x0, :lo12:TKIDX
+    ldr w0, [x0, x5, lsl #2]     // token
+    b 9f                         // epilogue
+0:  // greedy
+    adrp x0, LG
+    add x0, x0, :lo12:LG
+    movz w1, #4, lsl #16
+    bl argmax_f32                // w0 = argmax
+9:  ldr x30, [sp], #16
     ret
