@@ -1,0 +1,28 @@
+{
+  "id": "bca6e075e",
+  "name": "Eight-turn robustness run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hi\\nHow are you today?\\nTell me a color.\\nWhy do you like it?\\nTell me an animal.\\nWhere does it live?\\nThanks for chatting.\\nGoodbye.\\n\" | timeout 400 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 800 950 > /tmp/chat8t.log 2>&1; echo EXIT=$?; grep -a -c \"^> \\|^> tpl:\" /tmp/chat8t.log; grep -a \"resetting\" /tmp/chat8t.log | head -2 | cut -c1-30'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bca6e075e.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791237003014,
+  "endTime": 1791237231941,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 101423,
+  "bytesWritten": 61,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
