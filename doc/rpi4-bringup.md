@@ -30,3 +30,18 @@ needs. This branch tracks Pi-side work; the x86 engine on `gemma-4` is untouched
 2. What tok/s does the reference manage (expectation: well under 1 tok/s)?
 3. Which kernels would an ARM port need for the 2/4-bit schema (dequant +
    GEMV in NEON, no AVX2 anywhere), and is the quality worth it?
+
+## First light (2026-10-05)
+
+- The non-IT `gemma-3-270m-qat-q4_0-unquantized` is a base model: it babbles
+  (`Category` loops, prompt echoing). Its tokenizer ships no chat template.
+  The `-it` variant (`google/gemma-3-270m-it-qat-q4_0-unquantized`) is the one
+  that follows instructions.
+- `-it` on Pi 4 CPU: loads in ~60 s at 1.4 GB peak, generates at **3.0 tok/s**
+  within 1.6 GB. `en` answers correctly (`The answer is Paris.`); `zh`
+  echoes the question and stops after 8 tokens - 270M-parameter reality.
+- Raw E2B-QAT comparison: it loads (304 s, 2.76 GB) but immediately swap-
+  thrashes (4+ GB in swap, 0.001 tok/s) because the box already runs ~700 MB
+  of ruby/postgres before we start. Not a viable reference without freeing RAM.
+- A `c10::Error` frame prints during generation on both models without stopping
+  output; cause not yet chased (suspect cache-implementation fallback).
