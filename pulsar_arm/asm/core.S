@@ -1464,6 +1464,11 @@ kern_tests:
     str s0, [x10, #4]
     str s0, [x10, #8]
     str s0, [x10, #12]
+    adrp x9, f_eps
+    add x9, x9, :lo12:f_eps
+    ldr s0, [x9]
+    bl print_f32                 // expect 0.000001
+    bl print_nl
     adrp x0, T2
     add x0, x0, :lo12:T2
     adrp x1, T1
