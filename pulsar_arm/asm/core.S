@@ -1452,6 +1452,14 @@ kern_tests:
     adrp x10, f_1
     ldr s0, [x10, :lo12:f_1]
     fmov s1, #2.0
+    fmov s0, s1
+    bl print_f32                 // expect 2.0 (fmov sanity)
+    bl print_nl
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    adrp x10, f_1
+    ldr s0, [x10, :lo12:f_1]
+    fmov s1, #2.0
     fmov s2, #3.0
     fmov s3, #4.0
     str s0, [x9]
