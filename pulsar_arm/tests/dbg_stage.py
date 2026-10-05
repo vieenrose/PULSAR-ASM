@@ -68,6 +68,48 @@ def main():
         mk = np.stack([[rope(Kn[t, j], cr[t], sr[t]) for j in range(1)] for t in range(3)])
         show("qrope", mq, qr)
         show("krope", mk, kr)
+        sd_all = {k: v.float().numpy() for k, v in L.state_dict().items()}
+        V = np.stack([(sd_all["self_attn.v_proj.weight"] @ x[t]).reshape(1, 256)
+                      for t in range(3)])
+        avs = []
+        for j in range(4):
+            sc = kr[0, :, 0, :] @ (qr[0, j, 2, :] / 16.0)
+            sc = sc - sc.max()
+            w = np.exp(sc).astype(np.float64)
+            w /= w.sum()
+            avs.append((w[:, None] * V[:, 0, :]).sum(0))
+        mav = np.concatenate(avs).astype(np.float32)
+        # my mirror's AV the same way from mq/mk
+        savs = []
+        for j in range(4):
+            sc = mk[:, 0, :] @ (mq[2, j, :] / 16.0)
+            sc = sc - sc.max()
+            w = np.exp(sc).astype(np.float64)
+            w /= w.sum()
+            savs.append((w[:, None] * V[:, 0, :]).sum(0))
+        sav = np.concatenate(savs).astype(np.float32)
+        show("attn-out", sav, mav)
+        mo = sd_all["self_attn.o_proj.weight"] @ sav
+        ho = sd_all["self_attn.o_proj.weight"] @ mav
+        show("o_proj", mo, ho)
+        mp = rms(mo, sd_all["post_attention_layernorm.weight"])
+        hp = rms(ho, sd_all["post_attention_layernorm.weight"])
+        show("post_attn", mp, hp)
+        # full HF layer-0 output for the end-to-end anchor
+        with torch.no_grad():
+            full = hf.model(input_ids=torch.tensor([ids]), use_cache=False,
+                            output_hidden_states=True)
+        ref1 = np.asarray(full.hidden_states[1].float())[0, 2]
+        x1 = x[2] + mp
+        mh = rms(x1, sd_all["pre_feedforward_layernorm.weight"])
+        c1 = np.float32(0.7978845608028654)
+        c3 = np.float32(0.044715) * c1
+        gg = sd_all["mlp.gate_proj.weight"] @ mh
+        uu = sd_all["mlp.up_proj.weight"] @ mh
+        gg = (0.5 * gg * (1 + np.tanh(c1 * gg + c3 * gg ** 3))).astype(np.float32) * uu
+        dd = rms(sd_all["mlp.down_proj.weight"] @ gg,
+                 sd_all["post_feedforward_layernorm.weight"])
+        show("layer0", x1 + dd, ref1)
 
 
 if __name__ == "__main__":
