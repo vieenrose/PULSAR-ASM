@@ -2699,3 +2699,574 @@ fwd_layer0:
     ldp x19, x20, [sp], #16
     ldr x30, [sp], #16
     ret
+
+    .section .bss
+    .align 4
+SAVXB:       .skip 640*4
+
+    .section .text
+    .align 2
+    .section .bss
+    .align 4
+KC:          .skip 18*512*256*4
+VC:          .skip 18*512*256*4
+LG:          .skip 262144*4
+G_pos:       .skip 8
+G_t0:        .skip 8
+G_t1:        .skip 8
+PROMPT:      .skip 8*4
+
+    .section .rodata
+    .align 3
+t_tok:       .asciz "tok: "
+t_tps:       .asciz "tok/s: "
+t_mpt:       .asciz "ms/token: "
+t_metric:    .asciz "METRIC ms_per_token="
+t_dot:       .asciz "."
+t_nl2:       .asciz "\n"
+def_prompt:  .word 2,107,1567,236765,107,304,2505,9694
+
+    .section .text
+    .align 2
+/* fwd_token: w0 = token in, G_pos set. Full 18 layers + head. Returns w0.
+ * x19=data x20=tab x21=FL x22=pos x23=li (saved). Scratch F*. */
+fwd_token:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    stp x25, x26, [sp, #-16]!
+    str x27, [sp, #-16]!
+    mov w9, w0                   // token (w9 dies at first bl; move on)
+    adrp x0, G_base
+    add x0, x0, :lo12:G_base
+    ldr x19, [x0]
+    adrp x0, G_N
+    add x0, x0, :lo12:G_N
+    ldr x0, [x0]
+    add x19, x19, #8
+    add x19, x19, x0             // x19 = data
+    adrp x20, tab
+    add x20, x20, :lo12:tab
+    adrp x21, FL
+    add x21, x21, :lo12:FL
+    adrp x0, G_pos
+    add x0, x0, :lo12:G_pos
+    ldr w22, [x0]                // pos
+    // X = embed(tok): emb = data + tab[0].off
+    ldr x0, [x20]                // slot0 off
+    add x1, x19, x0              // emb
+    adrp x0, XB
+    add x0, x0, :lo12:XB
+    mov w2, w9                   // token
+    mov w3, #640
+    adrp x4, f_sqrt640
+    add x4, x4, :lo12:f_sqrt640
+    ldr s0, [x4]
+    bl embed_row_f32
+    mov w23, #0                  // li
+0:  cmp w23, #18
+    b.hs 90f
+    // full? li==5||11||17 -> F tables else S
+    cmp w23, #5
+    b.eq 31f
+    cmp w23, #11
+    b.eq 31f
+    cmp w23, #17
+    b.eq 31f
+    adrp x0, TCOS_S
+    add x0, x0, :lo12:TCOS_S
+    adrp x1, TSIN_S
+    add x1, x1, :lo12:TSIN_S
+    b 32f
+31: adrp x0, TCOS_F
+    add x0, x0, :lo12:TCOS_F
+    adrp x1, TSIN_F
+    add x1, x1, :lo12:TSIN_F
+32: lsl x2, x22, #9              // pos*512
+    add x16, x0, x2              // cos row (x16 survives kernels)
+    add x17, x1, x2              // sin row
+    // H = norm(XB) with FL[1+6i]
+    mov x0, #6
+    mul x0, x23, x0
+    add x0, x0, #1
+    lsl x0, x0, #8
+    mov x1, #10
+    mul x0, x0, x1               // (1+6i)*2560
+    add x1, x21, x0              // norm w
+    adrp x0, FH
+    add x0, x0, :lo12:FH
+    adrp x2, XB
+    add x2, x2, :lo12:XB
+    mov w3, #640
+    adrp x4, f_eps
+    add x4, x4, :lo12:f_eps
+    ldr s0, [x4]
+    bl rmsnorm_f32
+    // Q = q(slot 2+13i+3), KV = k(slot+4)
+    mov x0, #13
+    mul x0, x23, x0
+    add x0, x0, #2               // 2+13i (layer base slot)
+    mov x24, x0                  // base slot (x24: kernels keep x19+? x24 SAFE: kernels use x0-x18 max... VERIFY: gemv x13, scores x15, rest <x14. x24+ SAFE. But fwd must preserve x24 for caller? caller=driver holds tok in w19 only. x24 dead across call. NO SAVE needed... EXCEPT ABI for future. Driver recomputes. FINE.)
+    add x0, x24, #3              // q slot
+    mov x4, #56
+    mul x0, x0, x4
+    add x0, x20, x0
+    ldr x0, [x0]                 // Wq off
+    add x2, x19, x0              // Wq
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FQ
+    add x4, x4, :lo12:FQ
+    mov w0, #1024
+    mov w1, #640
+    bl gemv_bf16
+    add x0, x24, #4              // k slot
+    mov x4, #56
+    mul x0, x0, x4
+    add x0, x20, x0
+    ldr x0, [x0]
+    add x2, x19, x0              // Wk
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FKV
+    add x4, x4, :lo12:FKV
+    mov w0, #256
+    mov w1, #640
+    bl gemv_bf16
+    // KN = norm(FKV) with FL[3+6i]; rope
+    mov x0, #6
+    mul x0, x23, x0
+    add x0, x0, #3
+    lsl x0, x0, #8
+    mov x4, #10
+    mul x0, x0, x4               // (3+6i)*2560
+    add x1, x21, x0              // kn w
+    adrp x0, FKN
+    add x0, x0, :lo12:FKN
+    adrp x2, FKV
+    add x2, x2, :lo12:FKV
+    mov w3, #256
+    adrp x4, f_eps
+    add x4, x4, :lo12:f_eps
+    ldr s0, [x4]
+    bl rmsnorm_f32
+    adrp x0, FKN
+    add x0, x0, :lo12:FKN
+    mov x1, x16                  // cos
+    mov x2, x17                  // sin
+    mov w3, #128
+    bl rope_half
+    // V = v-proj(slot base+5, 256x640) -> FV
+    add x0, x24, #5
+    mov x4, #56
+    mul x0, x0, x4
+    add x0, x20, x0
+    ldr x0, [x0]
+    add x2, x19, x0              // Wv
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FV
+    add x4, x4, :lo12:FV
+    mov w0, #256
+    mov w1, #640
+    bl gemv_bf16
+    // Kcache[i][pos] = KN; Vcache[i][pos] = FV(256 floats via FKN? NO: V is in FV!)
+    // cache bases: KC + i*524288 (x18 scratch: kernels keep x19+? x18 SAFE (max x15))
+    lsl x0, x23, #19             // i*524288
+    adrp x1, KC
+    add x1, x1, :lo12:KC
+    add x1, x1, x0               // Kbase[i]
+    adrp x2, VC
+    add x2, x2, :lo12:VC
+    add x2, x2, x0               // Vbase[i]
+    lsl x0, x22, #10             // pos*1024
+    add x0, x1, x0               // Krow dst
+    adrp x1, FKN
+    add x1, x1, :lo12:FKN        // KN src
+    add x2, x2, x0               // WAIT: x0 reused! recompute Vrow separately below
+    b 34f
+34: // lo/n by layer type (full: 5/11/17)
+    cmp w23, #5
+    b.eq 35f
+    cmp w23, #11
+    b.eq 35f
+    cmp w23, #17
+    b.eq 35f
+    add w0, w22, #1              // pos+1
+    sub w0, w0, #512
+    cmp w0, #0
+    b.ge 36f
+    mov w0, #0                   // lo
+36: add w1, w22, #1              // pos+1
+    cmp w1, #512
+    b.lo 37f
+    mov w1, #512
+37: mov w18, w1                  // n (held through heads)
+    b 38f
+35: mov w0, #0                   // lo = 0
+    add w18, w22, #1             // n = pos+1
+38: // krow -> x26 ; vrow -> x27 (x0 = lo)
+    lsl x1, x23, #19             // i*524288
+    adrp x2, KC
+    add x2, x2, :lo12:KC
+    add x2, x2, x1
+    lsl x1, x0, #10              // lo*1024
+    add x26, x2, x1
+    lsl x1, x23, #19
+    adrp x2, VC
+    add x2, x2, :lo12:VC
+    add x2, x2, x1
+    lsl x1, x0, #10
+    add x27, x2, x1
+    // K[i][pos] = KN (64 quads)
+    lsl x0, x22, #10             // pos*1024
+    lsl x1, x23, #19             // i*524288
+    adrp x2, KC
+    add x2, x2, :lo12:KC
+    add x2, x2, x1
+    add x2, x2, x0               // K dst
+    adrp x0, FKN
+    add x0, x0, :lo12:FKN
+    mov w1, #64
+39: cbz w1, 40f
+    ld1 {v0.4s}, [x0], #16
+    st1 {v0.4s}, [x2], #16
+    sub w1, w1, #1
+    b 39b
+40: // V[i][pos] = FV
+    lsl x0, x22, #10
+    lsl x1, x23, #19
+    adrp x2, VC
+    add x2, x2, :lo12:VC
+    add x2, x2, x1
+    add x2, x2, x0               // V dst
+    adrp x0, FV
+    add x0, x0, :lo12:FV
+    mov w1, #64
+41: cbz w1, 42f
+    ld1 {v0.4s}, [x0], #16
+    st1 {v0.4s}, [x2], #16
+    sub w1, w1, #1
+    b 41b
+42: // heads j in w25
+    mov w25, #0
+43: cmp w25, #4
+    b.hs 44f
+    lsl x3, x25, #10             // j*1024
+    mov w0, #2
+    bl nptr                      // x0 = FL_qn
+    mov x5, x0                   // w (x5 dead across call? recomputed? NO: x5 set here, used below AFTER?? order: set x5, then set x0 (out, overwrites FL_qn addr? ALREADY SAVED in x5 ✓), then x1=x5, x2... then call. x5 live INTO the call setup (not across a call) ✓ SAFE.
+    adrp x0, FQN
+    add x0, x0, :lo12:FQN
+    add x0, x0, x3               // out
+    mov x1, x5                   // w
+    adrp x2, FQ
+    add x2, x2, :lo12:FQ
+    add x2, x2, x3               // x
+    mov w3, #256
+    adrp x4, f_eps
+    add x4, x4, :lo12:f_eps
+    ldr s0, [x4]
+    bl rmsnorm_f32
+    lsl x3, x25, #10
+    adrp x0, FQN
+    add x0, x0, :lo12:FQN
+    add x0, x0, x3
+    mov x1, x16                  // cos
+    mov x2, x17                  // sin
+    mov w3, #128
+    bl rope_half
+    lsl x3, x25, #10
+    adrp x0, FS
+    add x0, x0, :lo12:FS
+    adrp x1, FQN
+    add x1, x1, :lo12:FQN
+    add x1, x1, x3               // q
+    mov x2, x26                  // krow
+    mov w3, w18                  // n
+    mov w4, #256
+    adrp x5, f_scale
+    add x5, x5, :lo12:f_scale
+    ldr s0, [x5]
+    bl attn_scores_f32
+    adrp x0, FS
+    add x0, x0, :lo12:FS
+    mov w1, w18
+    bl softmax_f32
+    lsl x3, x25, #10
+    adrp x0, FAV
+    add x0, x0, :lo12:FAV
+    add x0, x0, x3
+    mov x1, x27                  // vrow
+    adrp x2, FS
+    add x2, x2, :lo12:FS
+    mov w3, w18
+    mov w4, #256
+    bl attn_values_f32
+    add w25, w25, #1
+    b 43b
+44: // o = gemv(FH, Wo[slot base+6], FAV)
+    add x0, x24, #6
+    mov x4, #56
+    mul x0, x0, x4
+    add x0, x20, x0
+    ldr x0, [x0]
+    add x2, x19, x0              // Wo
+    adrp x3, FAV
+    add x3, x3, :lo12:FAV
+    adrp x4, FH
+    add x4, x4, :lo12:FH
+    mov w0, #640
+    mov w1, #1024
+    bl gemv_bf16
+    // H = rmsnorm_add(FH, FL[4+6i], FH, XB)
+    mov x0, #6
+    mul x0, x23, x0
+    add x0, x0, #4
+    lsl x0, x0, #8
+    mov x4, #10
+    mul x0, x0, x4               // (4+6i)*2560
+    add x1, x21, x0              // pa
+    adrp x0, FH
+    add x0, x0, :lo12:FH
+    adrp x2, FH
+    add x2, x2, :lo12:FH
+    adrp x3, XB
+    add x3, x3, :lo12:XB
+    mov w4, #640
+    adrp x5, f_eps
+    add x5, x5, :lo12:f_eps
+    ldr s0, [x5]
+    bl rmsnorm_add_f32
+    // H = rmsnorm(FH, FL[5+6i], XB)
+    mov x0, #6
+    mul x0, x23, x0
+    add x0, x0, #5
+    lsl x0, x0, #8
+    mov x4, #10
+    mul x0, x0, x4
+    add x1, x21, x0              // pf
+    adrp x0, FH
+    add x0, x0, :lo12:FH
+    adrp x2, XB
+    add x2, x2, :lo12:XB
+    mov w3, #640
+    adrp x4, f_eps
+    add x4, x4, :lo12:f_eps
+    ldr s0, [x4]
+    bl rmsnorm_f32
+    // G = gate(base+9), U = up(base+10)
+    add x0, x24, #9
+    mov x4, #56
+    mul x0, x0, x4
+    add x0, x20, x0
+    ldr x0, [x0]
+    add x2, x19, x0              // Wg
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FG
+    add x4, x4, :lo12:FG
+    mov w0, #2048
+    mov w1, #640
+    bl gemv_bf16
+    add x0, x24, #10
+    mov x4, #56
+    mul x0, x0, x4
+    add x0, x20, x0
+    ldr x0, [x0]
+    add x2, x19, x0              // Wu
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FU
+    add x4, x4, :lo12:FU
+    mov w0, #2048
+    mov w1, #640
+    bl gemv_bf16
+    adrp x0, FG
+    add x0, x0, :lo12:FG
+    adrp x1, FG
+    add x1, x1, :lo12:FG
+    adrp x2, FU
+    add x2, x2, :lo12:FU
+    mov w3, #2048
+    bl gelu_mul_f32
+    // H = down(base+11); H = rmsnorm_add(FL[6+6i])
+    add x0, x24, #11
+    mov x4, #56
+    mul x0, x0, x4
+    add x0, x20, x0
+    ldr x0, [x0]
+    add x2, x19, x0              // Wd
+    adrp x3, FG
+    add x3, x3, :lo12:FG
+    adrp x4, FH
+    add x4, x4, :lo12:FH
+    mov w0, #640
+    mov w1, #2048
+    bl gemv_bf16
+    mov x0, #6
+    mul x0, x23, x0
+    add x0, x0, #6
+    lsl x0, x0, #8
+    mov x4, #10
+    mul x0, x0, x4
+    add x1, x21, x0              // ff
+    adrp x0, FH
+    add x0, x0, :lo12:FH
+    adrp x2, FH
+    add x2, x2, :lo12:FH
+    adrp x3, XB
+    add x3, x3, :lo12:XB
+    mov w4, #640
+    adrp x5, f_eps
+    add x5, x5, :lo12:f_eps
+    ldr s0, [x5]
+    bl rmsnorm_add_f32
+    add w23, w23, #1
+    b 0b
+90: // final norm (FL[0]) + head + argmax
+    adrp x0, FH
+    add x0, x0, :lo12:FH
+    adrp x1, FL
+    add x1, x1, :lo12:FL
+    adrp x2, XB
+    add x2, x2, :lo12:XB
+    mov w3, #640
+    adrp x4, f_eps
+    add x4, x4, :lo12:f_eps
+    ldr s0, [x4]
+    bl rmsnorm_f32
+    mov w0, #262144
+    mov w1, #640
+    adrp x2, tab
+    add x2, x2, :lo12:tab
+    ldr x2, [x2]                 // slot0 off
+    add x2, x19, x2              // head table
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, LG
+    add x4, x4, :lo12:LG
+    bl gemv_bf16
+    adrp x0, LG
+    add x0, x0, :lo12:LG
+    mov w1, #262144
+    bl argmax_f32
+    b 91f
+91: ldr x27, [sp], #16
+    ldp x25, x26, [sp], #16
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
+    .section .rodata
+    .align 3
+t_ids:       .asciz "ids:"
+t_mpt2:      .asciz "ms/token: "
+t_tps2:      .asciz "tok/s: "
+t_metric2:   .asciz "METRIC ms_per_token="
+
+    .section .text
+    .align 2
+/* decode_test: prefill 8 fixed prompts, decode 32, time, print IDs+stats. */
+decode_test:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    str x21, [sp, #-16]!
+    adrp x21, def_prompt
+    add x21, x21, :lo12:def_prompt  // prompt base (x21 survives fwd: saved)
+    mov w20, #0
+0:  cmp w20, #8
+    b.hs 1f
+    adrp x0, G_pos
+    add x0, x0, :lo12:G_pos
+    str w20, [x0]
+    ldr w0, [x21, x20, lsl #2]   // prompt[i]
+    bl fwd_token                 // -> w0 (discard except last)
+    add w20, w20, #1
+    b 0b
+1:  // timed decode: tok = prompt[7] at pos 8..
+    ldr w19, [x21, #28]          // prompt[7] (x19 survives fwd: saved)
+    mrs x0, cntvct_el0
+    adrp x1, G_t0
+    add x1, x1, :lo12:G_t0
+    str x0, [x1]
+    mov w20, #8                  // pos
+2:  cmp w20, #40
+    b.hs 3f
+    adrp x0, G_pos
+    add x0, x0, :lo12:G_pos
+    str w20, [x0]
+    mov w0, w19
+    bl fwd_token
+    mov w19, w0                  // tok
+    mov x0, x19                  // print ID -- x0 clobbered? print_u64 takes x0 ✓ set fresh
+    str x19, [sp, #-16]!         // save tok across prints (x0-x9 die!)
+    str x20, [sp, #-16]!         // save pos
+    bl print_u64
+    bl print_sp
+    ldr x20, [sp], #16
+    ldr x19, [sp], #16
+    add w20, w20, #1
+    b 2b
+3:  bl print_nl
+    mrs x0, cntfrq_el0           // freq
+    adrp x1, G_t0
+    add x1, x1, :lo12:G_t0
+    ldr x1, [x1]
+    adrp x2, G_t1
+    add x2, x2, :lo12:G_t1
+    ldr x2, [x2]
+    sub x2, x2, x1               // dt ticks
+    str x2, [sp, #-16]!          // save dt
+    // ms_x100/token = dt*1e5/(freq*32)
+    mov x1, #100000
+    mul x1, x2, x1
+    mov x3, #32
+    mul x3, x0, x3
+    udiv x4, x1, x3
+    str x4, [sp, #-16]!          // save ms_x100
+    adrp x0, t_mpt2
+    add x0, x0, :lo12:t_mpt2
+    bl print_cstr
+    ldr x4, [sp]                 // peek ms_x100
+    mov x3, #100
+    udiv x0, x4, x3              // int
+    msub x1, x0, x3, x4          // frac
+    str x1, [sp, #-16]!          // save frac
+    bl print_u64                 // int
+    ldr x1, [sp], #16            // frac
+    mov w0, #'.'
+    bl print_ch
+    mov x2, #10
+    udiv x3, x1, x2              // tens
+    msub x0, x3, x2, x1          // ones
+    add x3, x3, #'0'
+    add x0, x0, #'0'
+    mov w1, w3                   // tens -> w1? print_ch takes w0! sequence:
+    // print tens (in w3), then ones (in w0): use stack for ones
+    str x0, [sp, #-16]!          // save ones
+    mov w0, w3                   // tens -- WAIT w3 holds tens? tens in x3 ✓
+    bl print_ch
+    ldr x0, [sp], #16            // ones
+    bl print_ch
+    bl print_nl
+    // tok/s: tps_x100 = 3200000/ms_total; ms_total = dt*1000/freq
+    ldr x2, [sp, #8]             // peek dt? stack: [ms_x100][dt][x30...]. [sp]=ms_x100, [sp+8]=dt
+    // (ms_x100 no longer needed after METRIC? METRIC needs ms_x100 AGAIN below! keep it: peek, don't pop yet)
+    adrp x0, t_tps2
+    add x0, x0, :lo12:t_tps2
+    bl print_cstr
+    ldr x2, [sp, #8]             // dt
+    // recompute freq? LOST (x0 clobbered long ago). RELOAD freq via mrs (cheap, constant)!
+    mrs x0, cntfrq_el0
+    mov x1, #1000
+    mul x1, x2, x1               // dt*1000
+    udiv x1, x1, x0              // ms_total
+    mov x0, #3200000             // 32*100*1000 -- movz+movk? 3200000 = 0x30D400: movz #0xD400 + movk #0x30. GAS may reject plain mov!
+    // (expand below)
+    b 4f
+4:  ldr x30, [sp], #16
+    ret
