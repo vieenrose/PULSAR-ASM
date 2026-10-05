@@ -38,7 +38,7 @@ cd pulsar_arm/asm && as -o core.o core.S && ld -static -o core core.o
 - Deterministic (fixed seed): greedy, sampled, and full chat transcripts all
   reproduce bit-for-bit across runs (proven by diff, runs #38-40).
 
-## Demo (270m chat, temp 0.8, cap 64)
+## Demo (270m-it-qat-q4_0 chat, temp 0.8, cap 64)
 
 ```
 $ printf 'Write a haiku about the sea.\n' | ./core model.safetensors vocab.bin 2 c bpe.bin 800 950 64
