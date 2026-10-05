@@ -125,10 +125,13 @@ class Arm270m:
         lib.argmax_f32.argtypes = [v, ctypes.c_int]
         lib.argmax_f32.restype = ctypes.c_int
         lib.embed_row_f32.argtypes = [v, v, ctypes.c_int, ctypes.c_int, ctypes.c_float]
-        lib.attn_scores_f32.argtypes = [v, v, v, ctypes.c_int, ctypes.c_int]
+        lib.attn_scores_f32.argtypes = [v, v, v, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+        lib.gelu_mul_f32.argtypes = [v, v, v, ctypes.c_int]
+        lib.rmsnorm_add_f32.argtypes = [v, v, v, v, ctypes.c_int, ctypes.c_float]
         lib.attn_values_f32.argtypes = [v, v, v, ctypes.c_int, ctypes.c_int]
         for f_ in ("gemv_bf16", "rmsnorm_f32", "rope_half", "softmax_f32",
-                   "gelu_tanh_f32", "embed_row_f32", "attn_scores_f32",
+                   "gelu_tanh_f32", "gelu_mul_f32", "rmsnorm_add_f32",
+                   "embed_row_f32", "attn_scores_f32",
                    "attn_values_f32"):
             getattr(lib, f_).restype = None
         self.lib = lib
@@ -169,24 +172,21 @@ class Arm270m:
                 lib.rmsnorm_f32(P(self.QN[seg]), P(self.norms[p + "self_attn.q_norm.weight"]),
                                 P(self.Q[seg]), HD, EPS)
                 lib.rope_half(P(self.QN[seg]), P(cos[pos]), P(sin[pos]), HD // 2)
-                lib.attn_scores_f32(P(self.S), P(self.QN[seg]), P(K[lo]), n, HD)
-                self.S[:n] *= np.float32(ATTN_SCALE)
+                lib.attn_scores_f32(P(self.S), P(self.QN[seg]), P(K[lo]), n, HD,
+                                    np.float32(ATTN_SCALE))
                 lib.softmax_f32(P(self.S), n)
                 lib.attn_values_f32(P(self.AV[seg]), P(V[lo]), P(self.S), n, HD)
             self._gemv(self.H, p + "self_attn.o_proj.weight", self.AV)
-            lib.rmsnorm_f32(P(self.H), P(self.norms[p + "post_attention_layernorm.weight"]),
-                            P(self.H), HID, EPS)
-            self.X += self.H
+            lib.rmsnorm_add_f32(P(self.H), P(self.norms[p + "post_attention_layernorm.weight"]),
+                                P(self.H), P(self.X), HID, EPS)
             lib.rmsnorm_f32(P(self.H), P(self.norms[p + "pre_feedforward_layernorm.weight"]),
                             P(self.X), HID, EPS)
             self._gemv(self.G, p + "mlp.gate_proj.weight", self.H)
             self._gemv(self.U, p + "mlp.up_proj.weight", self.H)
-            lib.gelu_tanh_f32(P(self.G), P(self.G), INTER)
-            self.G *= self.U
+            lib.gelu_mul_f32(P(self.G), P(self.G), P(self.U), INTER)
             self._gemv(self.H, p + "mlp.down_proj.weight", self.G)
-            lib.rmsnorm_f32(P(self.H), P(self.norms[p + "post_feedforward_layernorm.weight"]),
-                            P(self.H), HID, EPS)
-            self.X += self.H
+            lib.rmsnorm_add_f32(P(self.H), P(self.norms[p + "post_feedforward_layernorm.weight"]),
+                                P(self.H), P(self.X), HID, EPS)
             if self.tape is not None:
                 self.tape.append(self.X.copy())
         lib.rmsnorm_f32(P(self.H), P(self.norms["model.norm.weight"]), P(self.X),
@@ -194,4 +194,4 @@ class Arm270m:
         # tied head over the full vocab table (bf16 stream)
         lib.gemv_bf16(262144, HID, self.emb_ptr, P(self.H), P(self.LG))
         self.pos += 1
-        return int(np.argmax(self.LG))
+        return int(lib.argmax_f32(P(self.LG), 262144))

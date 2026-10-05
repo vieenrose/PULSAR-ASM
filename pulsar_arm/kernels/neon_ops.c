@@ -61,8 +61,10 @@ void gelu_tanh_f32(float *out, const float *x, int n) {
     }
 }
 
-/* scores[p] = dot(q, K[p]) over n rows of dim hd (K row-major) */
-void attn_scores_f32(float *s, const float *q, const float *K, int n, int hd) {
+/* scores[p] = dot(q, K[p]) * scale over n rows of dim hd (K row-major).
+ * The 1/sqrt(d) scale is fused on the store: identical flops to scaling
+ * the buffer afterwards, one less memory pass. */
+void attn_scores_f32(float *s, const float *q, const float *K, int n, int hd, float scale) {
     for (int p = 0; p < n; p++) {
         float32x4_t acc = vdupq_n_f32(0.0f);
         int d = 0;
@@ -71,7 +73,39 @@ void attn_scores_f32(float *s, const float *q, const float *K, int n, int hd) {
         float t = vaddvq_f32(acc);
         for (; d < hd; d++)
             t += K[(int64_t)p * hd + d] * q[d];
-        s[p] = t;
+        s[p] = t * scale;
+    }
+}
+
+/* out[i] = gelu_tanh(x[i]) * mult[i] (gate*up fuse; in-place safe) */
+void gelu_mul_f32(float *out, const float *x, const float *mult, int n) {
+    const float c1 = 0.7978845608028654f;
+    const float c3 = 0.044715f * c1;
+    for (int i = 0; i < n; i++) {
+        float v = x[i];
+        float t = tanhf(c1 * v + c3 * v * v * v);
+        out[i] = 0.5f * v * (1.0f + t) * mult[i];
+    }
+}
+
+/* out[i] = x[i]*inv*w[i]; acc[i] += out[i]  (norm+residual fuse) */
+void rmsnorm_add_f32(float *out, const float *w, const float *x, float *acc, int n, float eps) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 4 <= n; i += 4)
+        acc = vfmaq_f32(acc, vld1q_f32(x + i), vld1q_f32(x + i));
+    float e = vaddvq_f32(acc);
+    for (; i < n; i++)
+        e += x[i] * x[i];
+    float inv = 1.0f / sqrtf(e / n + eps);
+    for (i = 0; i + 4 <= n; i += 4) {
+        float32x4_t v = vmulq_n_f32(vmulq_f32(vld1q_f32(x + i), vld1q_f32(w + i)), inv);
+        vst1q_f32(out + i, v);
+        vst1q_f32(acc + i, vaddq_f32(vld1q_f32(acc + i), v));
+    }
+    for (; i < n; i++) {
+        out[i] = x[i] * inv * w[i];
+        acc[i] += out[i];
     }
 }
 
