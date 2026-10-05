@@ -682,6 +682,21 @@ _start:
     adrp x1, G_RNG
     add x1, x1, :lo12:G_RNG
     str x0, [x1]                 // deterministic RNG start
+    adrp x0, t_temp
+    add x0, x0, :lo12:t_temp
+    bl print_cstr
+    adrp x0, G_TEMP
+    add x0, x0, :lo12:G_TEMP
+    ldr s0, [x0]
+    bl print_f32
+    adrp x0, t_topp
+    add x0, x0, :lo12:t_topp
+    bl print_cstr
+    adrp x0, G_TOPP
+    add x0, x0, :lo12:G_TOPP
+    ldr s0, [x0]
+    bl print_f32
+    bl print_nl
     adrp x0, J_bpe
     add x0, x0, :lo12:J_bpe
     ldr x0, [x0]
@@ -1291,6 +1306,59 @@ file_stage_after_bench:
     adrp x2, G_MODE
     add x2, x2, :lo12:G_MODE
     str x3, [x2]                 // G_MODE = 1 (chat samples)
+    // G_TEMP argv[6] milli (default 1000), G_TOPP argv[7] milli (default 950)
+    adrp x2, G_TEMP
+    add x2, x2, :lo12:G_TEMP
+    movz w3, #0x3F80, lsl #16
+    str w3, [x2]                 // 1.0
+    adrp x2, G_TOPP
+    add x2, x2, :lo12:G_TOPP
+    movz w3, #0x3333
+    movk w3, #0x3F73, lsl #16
+    str w3, [x2]                 // 0.95
+    cmp x0, #7
+    b.lo 5f
+    ldr x3, [x1, #48]            // argv[6] ptr
+    str x0, [sp, #-16]!          // save argc
+    str x1, [sp, #-16]!          // save argv
+    mov x0, x3
+    bl parse_u64                 // x0 = milli
+    cmp x0, #50
+    b.hs 6f
+    mov x0, #50
+6:  cmp x0, #5000
+    b.lo 7f
+    mov x0, #5000
+7:  scvtf s0, x0
+    adrp x1, f_1000
+    add x1, x1, :lo12:f_1000
+    ldr s1, [x1]
+    fdiv s0, s0, s1
+    adrp x1, G_TEMP
+    add x1, x1, :lo12:G_TEMP
+    str s0, [x1]
+    ldr x0, [sp, #8]             // argc (stack: [sp]=argv, [sp+8]=argc ✓)
+    cmp x0, #8
+    b.lo 8f
+    ldr x1, [sp]                 // argv
+    ldr x0, [x1, #56]            // argv[7] ptr
+    bl parse_u64
+    cmp x0, #100
+    b.hs 9f
+    mov x0, #100
+9:  cmp x0, #1000
+    b.lo 10f
+    mov x0, #1000
+10: scvtf s0, x0
+    adrp x1, f_1000
+    add x1, x1, :lo12:f_1000
+    ldr s1, [x1]
+    fdiv s0, s0, s1
+    adrp x1, G_TOPP
+    add x1, x1, :lo12:G_TOPP
+    str s0, [x1]
+8:  ldr x1, [sp], #16            // restore argv
+    ldr x0, [sp], #16            // restore argc
 5:  cmp x0, #4                   // argc>=4? (re-compare: flags stale here)
     b.lo 1f
     b.lo 1f
@@ -3783,6 +3851,8 @@ vspot:
     .section .bss
     .align 3
 G_MODE:      .skip 8
+G_TEMP:      .skip 8
+G_TOPP:      .skip 8
 G_RNG:       .skip 8
     .align 4
 TKIDX:       .skip 64*4
@@ -3792,6 +3862,9 @@ TKVAL:       .skip 64*4
     .align 3
 rng_seed:    .quad 0x9E3779B97F4A7C15
 f_095:       .float 0.95
+f_1000:      .float 1000.0
+t_temp:      .asciz "temp: "
+t_topp:      .asciz " topp: "
 f_inv24:     .float 0.000000059604644775390625
 
     .section .text
@@ -3921,11 +3994,13 @@ sampler:
     add x0, x0, :lo12:G_MODE
     ldr x0, [x0]
     cbz x0, 0f                   // mode 0: greedy argmax (bit-identical path)
-    // softmax_temp(LG, 262144, 1.0)
+    // softmax_temp(LG, 262144, G_TEMP)
     adrp x0, LG
     add x0, x0, :lo12:LG
     movz w1, #4, lsl #16         // 262144
-    fmov s0, #1.0
+    adrp x2, G_TEMP
+    add x2, x2, :lo12:G_TEMP
+    ldr s0, [x2]                 // temp (x2 free here ✓)
     bl softmax_temp
     // topk(LG, 262144, 64, TKIDX, TKVAL)
     adrp x0, LG
@@ -3950,9 +4025,9 @@ sampler:
     fadd s0, s0, s1              // total
     add w1, w1, #1
     b 1b
-2:  adrp x1, f_095
-    add x1, x1, :lo12:f_095
-    ldr s1, [x1]
+2:  adrp x1, G_TOPP
+    add x1, x1, :lo12:G_TOPP
+    ldr s1, [x1]                 // top-p (was fixed 0.95)
     fmul s1, s0, s1              // cutoff = total*0.95 (s1; s0=total dead? total NEEDED? No (cutoff suffices). s0 dead ✓)
     // walk cumulative to kept set
     adrp x0, TKVAL
