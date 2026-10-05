@@ -357,10 +357,18 @@ gemv_bf16:
     fmla v23.4s, v5.4s, v9.4s
     add w11, w11, #16
     b 1b
-2:  addv s24, v20.4s
-    addv s25, v21.4s
-    addv s26, v22.4s
-    addv s27, v23.4s
+2:  faddp v20.4s, v20.4s, v20.4s
+    faddp v20.4s, v20.4s, v20.4s
+    faddp v21.4s, v21.4s, v21.4s
+    faddp v21.4s, v21.4s, v21.4s
+    faddp v22.4s, v22.4s, v22.4s
+    faddp v22.4s, v22.4s, v22.4s
+    faddp v23.4s, v23.4s, v23.4s
+    faddp v23.4s, v23.4s, v23.4s
+    fmov s24, s20
+    fmov s25, s21
+    fmov s26, s22
+    fmov s27, s23
     fadd s24, s24, s25
     fadd s24, s24, s26
     fadd s24, s24, s27
@@ -1106,8 +1114,8 @@ rmsnorm_f32:
     fmla v0.4s, v1.4s, v1.4s
     add w9, w9, #4
     b 0b
-1:  addv s1, v0.4s              // NEVER addv into its own vector (overlap hazard)
-    fmov s0, s1
+1:  faddp v0.4s, v0.4s, v0.4s    // pairwise hsum (gcc-proven); total in s0
+    faddp v0.4s, v0.4s, v0.4s
     mov w10, w9
 2:  cmp w10, w3
     b.hs 3f
@@ -1260,7 +1268,8 @@ attn_scores_f32:
     fmla v20.4s, v0.4s, v1.4s
     add w12, w12, #4
     b 1b
-2:  addv s0, v20.4s
+2:  faddp v20.4s, v20.4s, v20.4s
+    faddp v20.4s, v20.4s, v20.4s
 3:  cmp w12, w4
     b.hs 4f
     ldr s1, [x13], #4
@@ -1319,8 +1328,8 @@ rmsnorm_add_f32:
     fmla v0.4s, v1.4s, v1.4s
     add w9, w9, #4
     b 0b
-1:  addv s1, v0.4s              // NEVER addv into its own vector (overlap hazard)
-    fmov s0, s1
+1:  faddp v0.4s, v0.4s, v0.4s
+    faddp v0.4s, v0.4s, v0.4s
     mov w10, w9
 2:  cmp w10, w4
     b.hs 3f
@@ -1431,8 +1440,8 @@ sum_sq:
     fmla v0.4s, v1.4s, v1.4s
     add w9, w9, #4
     b 0b
-1:  addv s1, v0.4s              // NEVER addv into its own vector (overlap hazard)
-    fmov s0, s1
+1:  faddp v0.4s, v0.4s, v0.4s
+    faddp v0.4s, v0.4s, v0.4s
 2:  cmp w9, w1
     b.hs 3f
     ldr s1, [x0, x9, lsl #2]
@@ -1446,6 +1455,54 @@ sum_sq:
 kern_tests:
     str x30, [sp, #-16]!
     stp x19, x20, [sp, #-16]!
+    // -- gemv value: W=[[1,2,3,4],[5,6,7,8]] bf16, x=[1,1,1,1] -> [10,26]
+    adrp x0, k_gemv
+    add x0, x0, :lo12:k_gemv
+    bl print_cstr
+    adrp x19, T0
+    add x19, x19, :lo12:T0      // x19 survives prints; W base
+    adrp x20, T1
+    add x20, x20, :lo12:T1      // x base
+    movz w0, #0x3f80
+    strh w0, [x19]
+    movz w0, #0x4000
+    strh w0, [x19, #2]
+    movz w0, #0x4040
+    strh w0, [x19, #4]
+    movz w0, #0x4080
+    strh w0, [x19, #6]
+    movz w0, #0x40a0
+    strh w0, [x19, #8]
+    movz w0, #0x40c0
+    strh w0, [x19, #10]
+    movz w0, #0x40e0
+    strh w0, [x19, #12]
+    movz w0, #0x4100
+    strh w0, [x19, #14]
+    adrp x0, f_1
+    add x0, x0, :lo12:f_1
+    ldr s0, [x0]
+    str s0, [x20]
+    str s0, [x20, #4]
+    str s0, [x20, #8]
+    str s0, [x20, #12]
+    mov w0, #2
+    mov w1, #4
+    mov x2, x19
+    mov x3, x20
+    adrp x4, T2
+    add x4, x4, :lo12:T2
+    bl gemv_bf16
+    adrp x9, T2
+    add x9, x9, :lo12:T2
+    ldr s0, [x9]                 // expect 10.0
+    bl print_f32
+    bl print_sp
+    adrp x9, T2
+    add x9, x9, :lo12:T2
+    ldr s0, [x9, #4]             // expect 26.0
+    bl print_f32
+    bl print_nl
     // n=4 vector-path test: rmsnorm([1,2,3,4], w=1) -> out[0] ~= 0.3651
     adrp x9, T0
     add x9, x9, :lo12:T0
@@ -1831,6 +1888,7 @@ kern_tests:
     .section .rodata
     .align 3
 k_diag:      .asciz "diag: T0 f_001 = "
+k_gemv:      .asciz "kern: gemv [[1..4],[5..8]] x 1 = "
 k_rms:       .asciz "kern: rmsnorm sum(out^2)[640] = "
 k_rope:      .asciz "kern: rope |v| before after = "
 k_soft:      .asciz "kern: softmax sum argmax = "
