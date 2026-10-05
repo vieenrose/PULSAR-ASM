@@ -550,6 +550,114 @@ microbench:
     ldr x30, [sp], #16
     ret
 
+/* ---------------- math microbench: expf/tanhf ns per call ---------------- */
+math_bench:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    adrp x19, T0
+    add x19, x19, :lo12:T0       // base (survives expf/tanhf)
+    adrp x0, f_00625
+    add x0, x0, :lo12:f_00625
+    ldr s1, [x0]                 // 0.0625 (reloaded per iter? NO: s1 dies at bl. RELOAD inside fill only (no calls in fill) ✓ fill first, then bench.)
+    adrp x0, f_3
+    add x0, x0, :lo12:f_3
+    ldr s2, [x0]                 // 3.0
+    mov w10, #0
+0:  cmp w10, #2048
+    b.hs 1f
+    and w11, w10, #63
+    scvtf s0, w11
+    fmul s0, s0, s1
+    fsub s0, s0, s2              // -3..0.9375
+    str s0, [x19, x10, lsl #2]
+    add w10, w10, #1
+    b 0b
+1:  // expf: 2048 iters x 2048 = 4M calls
+    mrs x20, cntfrq_el0
+    mrs x13, cntvct_el0          // start
+    mov w11, #0
+2:  cmp w11, #2048
+    b.hs 3f
+    mov w12, #0
+4:  cmp w12, #2048
+    b.hs 5f
+    ldr s0, [x19, x12, lsl #2]
+    bl expf_asm
+    add w12, w12, #1
+    b 4b
+5:  add w11, w11, #1
+    b 2b
+3:  mrs x9, cntvct_el0           // end
+    sub x9, x9, x13              // dt ticks (4M expf)
+    mov x10, #100
+    mul x10, x9, x10             // dt*100
+    movz x11, #0x40, lsl #16     // 4194304 (x11: expf-safe? no calls below until prints; prints clobber x0-x9! x11 SAFE across prints? print funcs use x0-x4,x8,x9. x11 SAFE ✓)
+    udiv x11, x10, x11           // tpc_x100
+    str x11, [sp, #-16]!         // save
+    adrp x0, t_expf
+    add x0, x0, :lo12:t_expf
+    bl print_cstr
+    ldr x11, [sp], #16           // pop tpc
+    mov x3, #100
+    udiv x0, x11, x3             // int
+    msub x5, x0, x3, x11         // frac (x5 safe across prints ✓)
+    bl print_u64
+    mov x2, #10
+    udiv x3, x5, x2
+    msub x4, x3, x2, x5
+    add x3, x3, #'0'
+    add x4, x4, #'0'
+    mov w0, #'.'
+    bl print_ch
+    mov w0, w3
+    bl print_ch
+    mov w0, w4
+    bl print_ch
+    bl print_nl
+    // tanhf: same shape (4M calls)
+    mrs x13, cntvct_el0
+    mov w11, #0
+9:  cmp w11, #2048
+    b.hs 10f
+    mov w12, #0
+11: cmp w12, #2048
+    b.hs 12f
+    ldr s0, [x19, x12, lsl #2]
+    bl tanhf_asm
+    add w12, w12, #1
+    b 11b
+12: add w11, w11, #1
+    b 9b
+10: mrs x9, cntvct_el0
+    sub x9, x9, x13
+    mov x10, #100
+    mul x10, x9, x10
+    movz x11, #0x40, lsl #16
+    udiv x11, x10, x11
+    str x11, [sp, #-16]!
+    adrp x0, t_tanhf
+    add x0, x0, :lo12:t_tanhf
+    bl print_cstr
+    ldr x11, [sp], #16
+    mov x3, #100
+    udiv x0, x11, x3
+    msub x5, x0, x3, x11
+    bl print_u64
+    mov x2, #10
+    udiv x3, x5, x2
+    msub x4, x3, x2, x5
+    add x3, x3, #'0'
+    add x4, x4, #'0'
+    mov w0, #'.'
+    bl print_ch
+    mov w0, w3
+    bl print_ch
+    mov w0, w4
+    bl print_ch
+    bl print_nl
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
 /* ---------------- entry ---------------- */
 _start:
     adrp x0, banner
@@ -557,6 +665,7 @@ _start:
     bl print_cstr
     bl run_tests
     bl microbench
+    bl math_bench
     bl kern_tests
     ldr x0, [sp]                  // argc
     add x1, sp, #8                // argv
@@ -593,6 +702,10 @@ f_2:         .float 2.0
 f_m3:        .float -3.0
 f_half:      .float 0.5
 f_001:       .float 0.01
+f_00625:     .float 0.0625
+f_3:         .float 3.0
+t_expf:      .asciz "expf ticks/call: "
+t_tanhf:     .asciz "tanhf ticks/call: "
 f_exp_hi:    .float 88.72283
 f_exp_lo:    .float -103.97208
 f_inv_ln2:   .float 1.4426950408889634
