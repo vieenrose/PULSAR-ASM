@@ -549,6 +549,9 @@ _start:
     bl print_cstr
     bl run_tests
     bl microbench
+    ldr x0, [sp]                  // argc
+    add x1, sp, #8                // argv
+    bl file_stage_after_bench
     mov x0, #0
     mov x8, #SYS_EXIT
     svc #0
@@ -556,7 +559,7 @@ _start:
 /* ---------------- rodata ---------------- */
     .section .rodata
     .align 3
-banner:      .asciz "pulsar-asm core stage A (pure asm, no libc)\n"
+banner:      .asciz "pulsar-asm core stages A+B (pure asm, no libc)\n"
 t_exp1:      .asciz "exp(1)   = "
 t_expm3:     .asciz "exp(-3)  = "
 t_sin1:      .asciz "sin(1) cos(1) = "
@@ -609,3 +612,469 @@ numbuf:      .skip 64
 Wmat:        .skip 2048*640*2
 Xvec:        .skip 640*4
 Yvec:        .skip 2048*4
+
+/* ---------------- stage B-1: file I/O + safetensors header scan ----------------
+ * x0 = argv[1] (model path). Opens, sizes via lseek, mmaps whole file,
+ * locates all 236 tensors by quoted-name search, parses data_offsets +
+ * shape into tab[]. Prints anchors incl. real weight values. Noreturns
+ * via exit on hard error (w1 = code path id in x0... exit code in x0). */
+
+/* memmem: x0=hay, x1=hlen, x2=needle, x3=nlen -> x0=hit or 0. */
+memmem:
+    cbz x3, 9f                   // empty needle: return hay
+    cmp x1, x3
+    b.lo 8f
+    sub x4, x1, x3              // last start index
+    ldrb w5, [x2]               // first needle byte
+0:  ldrb w6, [x0]
+    cmp w6, w5
+    b.ne 3f
+    mov x7, #1
+2:  cmp x7, x3
+    b.hs 9f                     // full match, x0 = start
+    ldrb w6, [x0, x7]
+    ldrb w8, [x2, x7]
+    cmp w6, w8
+    b.ne 3f
+    add x7, x7, #1
+    b 2b
+3:  add x0, x0, #1
+    subs x4, x4, #1
+    b.ge 0b
+8:  mov x0, #0
+    ret
+9:  ret
+
+/* parse_u64: x0 = cursor -> x0 = value, x1 = cursor after digits. */
+parse_u64:
+    mov x2, #0
+0:  ldrb w3, [x0]
+    sub w3, w3, #'0'
+    cmp w3, #9
+    b.hi 1f
+    mov x4, #10
+    mul x2, x2, x4
+    add x2, x2, x3
+    add x0, x0, #1
+    b 0b
+1:  mov x1, x0
+    mov x0, x2
+    ret
+
+/* build_name: w0 = layer 0..17, x1 = template asciz with '@' slot,
+ * x2 = out buffer -> x0 = out buffer (quoted "name"). */
+build_name:
+    str x30, [sp, #-16]!
+    mov x3, x2
+    mov w4, #'"'
+    strb w4, [x3], #1
+0:  ldrb w4, [x1], #1
+    cbz w4, 2f
+    cmp w4, #'@'
+    b.ne 1f
+    // layer number 0..17, 1-2 digits
+    cmp w0, #10
+    b.lo 3f
+    mov x5, #10
+    udiv x6, x0, x5
+    msub x7, x6, x5, x0
+    add x6, x6, #'0'
+    add x7, x7, #'0'
+    strb w6, [x3], #1
+    mov w4, w7
+    b 1f
+3:  add w4, w0, #'0'
+1:  strb w4, [x3], #1
+    b 0b
+2:  mov w4, #'"'
+    strb w4, [x3], #1
+    mov w4, #0
+    strb w4, [x3]
+    mov x0, x2
+    ldr x30, [sp], #16
+    ret
+
+/* strlen: x0 = asciz -> x0 = len. */
+strlen_asm:
+    mov x1, x0
+0:  ldrb w2, [x1], #1
+    cbnz w2, 0b
+    sub x0, x1, x0
+    sub x0, x0, #1
+    ret
+
+
+/* find_tensor: x0 = quoted name, x4 = hbase, x5 = hlen, x6 = slot ptr
+ * Slot: +0 off, +8 end, +16 d0, +24 d1, +32 d2, +40 d3, +48 nd.
+ * Returns x0 = 1 ok / 0 missing. Keys searched explicitly (order-proof). */
+find_tensor:
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    str x30, [sp, #-16]!
+    mov x19, x0                  // name
+    mov x20, x4                  // hbase
+    mov x21, x5                  // hlen
+    mov x22, x6                  // slot
+    mov x0, x19
+    bl strlen_asm
+    mov x3, x0                   // nlen
+    mov x0, x20
+    mov x1, x21
+    mov x2, x19
+    bl memmem
+    cbz x0, ft_miss
+    mov x23, x0                  // name hit
+    // shape key from name hit
+    adrp x0, k_shape
+    add x0, x0, :lo12:k_shape
+    bl strlen_asm
+    mov x3, x0
+    adrp x2, k_shape
+    add x2, x2, :lo12:k_shape
+    mov x0, x23
+    sub x1, x21, x23
+    add x1, x1, x20
+    bl memmem
+    cbz x0, ft_miss
+    mov x23, x0                  // shape-key pos
+0:  ldrb w2, [x23], #1
+    cmp w2, #'['
+    b.ne 0b
+    mov x3, #0                   // nd
+1:  ldrb w2, [x23]
+    cmp w2, #']'
+    b.eq 2f
+    cmp w2, #'0'
+    b.lo 3f
+    cmp w2, #'9'
+    b.hi 3f
+    mov x0, x23
+    bl parse_u64                  // x0=val, x1=after
+    mov x23, x1
+    cmp x3, #4
+    b.hs 4f
+    lsl x4, x3, #3
+    add x4, x4, #16
+    str x0, [x22, x4]
+4:  add x3, x3, #1
+    b 1b
+3:  add x23, x23, #1
+    b 1b
+2:  str x3, [x22, #48]           // nd
+    // offsets key from name hit (x19 was overwritten? no: x19=name ptr;
+    // name hit is in x23's history... RECOVER: x19 still = name string ptr,
+    // not hit. Hit was overwritten by shape pos. RE-SEARCH name? No:
+    // offsets necessarily follow the name; search from shape-key pos is
+    // wrong if shape came after offsets. RELOAD hit: re-search name first.
+    mov x0, x19
+    bl strlen_asm
+    mov x3, x0
+    mov x0, x20
+    mov x1, x21
+    mov x2, x19
+    bl memmem
+    cbz x0, ft_miss
+    mov x23, x0                  // name hit again
+    adrp x0, k_offs
+    add x0, x0, :lo12:k_offs
+    bl strlen_asm
+    mov x3, x0
+    adrp x2, k_offs
+    add x2, x2, :lo12:k_offs
+    mov x0, x23
+    sub x1, x21, x23
+    add x1, x1, x20
+    bl memmem
+    cbz x0, ft_miss
+    mov x23, x0
+5:  ldrb w2, [x23], #1
+    cmp w2, #'['
+    b.ne 5b
+    // parse a
+6:  ldrb w2, [x23]
+    cmp w2, #'0'
+    b.lo 7f
+    cmp w2, #'9'
+    b.hi 7f
+    mov x0, x23
+    bl parse_u64
+    mov x23, x1
+    str x0, [x22]                // off
+    b 8f
+7:  add x23, x23, #1
+    b 6b
+    // parse b
+8:  ldrb w2, [x23]
+    cmp w2, #'0'
+    b.lo 9f
+    cmp w2, #'9'
+    b.hi 9f
+    mov x0, x23
+    bl parse_u64
+    mov x23, x1
+    str x0, [x22, #8]            // end
+    b 10f
+9:  add x23, x23, #1
+    b 8b
+10: mov x0, #1
+    b ft_ret
+ft_miss:
+    mov x0, #0
+ft_ret:
+    ldr x30, [sp], #16
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ret
+
+/* file_stage: x0 = model path. Prints anchors incl. real weight values. */
+file_stage:
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    stp x25, x26, [sp, #-16]!
+    str x30, [sp, #-16]!
+    mov x19, x0                  // path
+    mov x8, #56                  // openat
+    mov x0, #-100                // AT_FDCWD
+    mov x1, x19
+    mov x2, #0
+    mov x3, #0
+    svc #0
+    cmp x0, #0
+    b.lt f_err_open
+    mov x19, x0                  // fd
+    mov x8, #62                  // lseek
+    mov x0, x19
+    mov x1, #0
+    mov x2, #2                   // SEEK_END
+    svc #0
+    cmp x0, #0
+    b.le f_err_seek
+    mov x20, x0                  // size
+    mov x8, #222                 // mmap
+    mov x0, #0
+    mov x1, x20
+    mov x2, #1                   // PROT_READ
+    mov x3, #2                   // MAP_PRIVATE
+    mov x4, x19
+    mov x5, #0
+    svc #0
+    cmp x0, #0
+    b.lt f_err_map
+    mov x21, x0                  // base
+    mov x8, #57                  // close
+    mov x0, x19
+    svc #0
+    ldr x22, [x21]               // N header bytes
+    add x23, x21, #8             // hbase
+    adrp x0, t_hdr
+    add x0, x0, :lo12:t_hdr
+    bl print_cstr
+    mov x0, x22
+    bl print_u64
+    bl print_nl
+    adrp x0, t_fsz
+    add x0, x0, :lo12:t_fsz
+    bl print_cstr
+    mov x0, x20
+    bl print_u64
+    bl print_nl
+    // scan: slot0=embed, slot1=norm, then 13/layer
+    mov x24, #0                  // found
+    adrp x0, n_embed
+    add x0, x0, :lo12:n_embed
+    mov x4, x23
+    mov x5, x22
+    adrp x6, tab
+    add x6, x6, :lo12:tab
+    bl find_tensor
+    add x24, x24, x0
+    adrp x0, n_norm
+    add x0, x0, :lo12:n_norm
+    mov x4, x23
+    mov x5, x22
+    adrp x6, tab
+    add x6, x6, :lo12:tab
+    add x6, x6, #56
+    bl find_tensor
+    add x24, x24, x0
+    mov x25, #0                  // layer i
+11: cmp x25, #18
+    b.hs 12f
+    mov x26, #0                  // kind k
+13: cmp x26, #13
+    b.hs 14f
+    // template addr via pointer table (templates vary in length)
+    adrp x1, tmpl_ptrs
+    add x1, x1, :lo12:tmpl_ptrs
+    ldr x1, [x1, x26, lsl #3]
+    mov x0, x25                  // layer
+    adrp x2, namebuf
+    add x2, x2, :lo12:namebuf
+    bl build_name                // x0 = quoted name
+    mov x4, x23
+    mov x5, x22
+    // slot = 2 + 13*i + k  (x25=i, x26=k)
+    mov x6, #13
+    mul x6, x25, x6
+    add x6, x6, x26
+    add x6, x6, #2
+    mov x0, #56
+    mul x6, x6, x0
+    adrp x1, tab
+    add x1, x1, :lo12:tab
+    add x6, x6, x1
+    // find_tensor needs name in x0! RELOAD: namebuf addr
+    adrp x0, namebuf
+    add x0, x0, :lo12:namebuf
+    bl find_tensor
+    add x24, x24, x0
+    add x26, x26, #1
+    b 13b
+14: add x25, x25, #1
+    b 11b
+12: adrp x0, t_found
+    add x0, x0, :lo12:t_found
+    bl print_cstr
+    mov x0, x24
+    bl print_u64
+    bl print_nl
+    // anchors: embed shape (slot0 d0/d1)
+    adrp x0, t_embed
+    add x0, x0, :lo12:t_embed
+    bl print_cstr
+    adrp x1, tab
+    add x1, x1, :lo12:tab
+    ldr x0, [x1, #16]
+    bl print_u64
+    bl print_sp
+    ldr x0, [x1, #24]
+    bl print_u64
+    bl print_nl
+    // in_norm0 values (slot2): expect 15.0625 15.875 9.8125 40.5
+    adrp x0, t_in0
+    add x0, x0, :lo12:t_in0
+    bl print_cstr
+f_anchors_fixed:
+    adrp x1, tab
+    add x1, x1, :lo12:tab
+    add x1, x1, #112
+    ldr x3, [x1]                 // off
+    add x2, x21, #8
+    add x2, x2, x22
+    add x2, x2, x3
+    mov x4, #4
+15: ldrh w0, [x2], #2
+    lsl w0, w0, #16
+    fmov s0, w0
+    // save x2/x4 across print (uses x0-x4,x8,x9!)
+    str x2, [sp, #-16]!
+    str x4, [sp, #-16]!
+    bl print_f32
+    bl print_sp
+    ldr x4, [sp], #16
+    ldr x2, [sp], #16
+    subs x4, x4, #1
+    b.ne 15b
+    bl print_nl
+    // l17 down shape (slot 234): expect 640 x 2048
+    adrp x0, t_l17d
+    add x0, x0, :lo12:t_l17d
+    bl print_cstr
+    adrp x1, tab
+    add x1, x1, :lo12:tab
+    mov x0, #234
+    mov x2, #56
+    mul x0, x0, x2
+    add x1, x1, x0
+    ldr x0, [x1, #16]
+    bl print_u64
+    bl print_sp
+    ldr x0, [x1, #24]
+    bl print_u64
+    bl print_nl
+    b f_stage_ret
+f_err_open:
+    adrp x0, e_open
+    add x0, x0, :lo12:e_open
+    bl print_cstr
+    b f_stage_fail
+f_err_seek:
+    adrp x0, e_seek
+    add x0, x0, :lo12:e_seek
+    bl print_cstr
+    b f_stage_fail
+f_err_map:
+    adrp x0, e_map
+    add x0, x0, :lo12:e_map
+    bl print_cstr
+f_stage_fail:
+    mov x0, #1
+    mov x8, #SYS_EXIT
+    svc #0
+f_stage_ret:
+    ldr x30, [sp], #16
+    ldp x25, x26, [sp], #16
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ret
+
+/* ---------------- stage B-1 rodata/bss + entry wiring ---------------- */
+    .section .rodata
+    .align 3
+k_shape:     .asciz "\"shape\""
+k_offs:      .asciz "\"data_offsets\""
+n_embed:     .asciz "\"model.embed_tokens.weight\""
+n_norm:      .asciz "\"model.norm.weight\""
+t_in:        .asciz "model.layers.@.input_layernorm.weight"
+t_qn:        .asciz "model.layers.@.self_attn.q_norm.weight"
+t_kn:        .asciz "model.layers.@.self_attn.k_norm.weight"
+t_q:         .asciz "model.layers.@.self_attn.q_proj.weight"
+t_k:         .asciz "model.layers.@.self_attn.k_proj.weight"
+t_v:         .asciz "model.layers.@.self_attn.v_proj.weight"
+t_o:         .asciz "model.layers.@.self_attn.o_proj.weight"
+t_pa:        .asciz "model.layers.@.post_attention_layernorm.weight"
+t_pf:        .asciz "model.layers.@.pre_feedforward_layernorm.weight"
+t_g:         .asciz "model.layers.@.mlp.gate_proj.weight"
+t_u:         .asciz "model.layers.@.mlp.up_proj.weight"
+t_d:         .asciz "model.layers.@.mlp.down_proj.weight"
+t_ff:        .asciz "model.layers.@.post_feedforward_layernorm.weight"
+    .align 3
+tmpl_ptrs:
+    .quad t_in, t_qn, t_kn, t_q, t_k, t_v, t_o
+    .quad t_pa, t_pf, t_g, t_u, t_d, t_ff
+t_hdr:       .asciz "header bytes: "
+t_fsz:       .asciz "file bytes: "
+t_found:     .asciz "tensors found: "
+t_embed:     .asciz "embed rows cols: "
+t_in0:       .asciz "in_norm0[0..3] = "
+t_l17d:      .asciz "l17_down rows cols: "
+e_open:      .asciz "ERR open\n"
+e_seek:      .asciz "ERR seek\n"
+e_map:       .asciz "ERR mmap\n"
+t_usage:     .asciz "usage: core <model.safetensors>\n"
+
+    .section .bss
+    .align 3
+tab:         .skip 236*56
+namebuf:     .skip 128
+
+/* _start appends the file stage: microbench -> argv -> file_stage -> exit */
+    .section .text
+    .align 2
+    .global file_stage_after_bench
+file_stage_after_bench:
+    // x0 = argc, x1 = argv[1] or 0
+    cmp x0, #2
+    b.lo 0f
+    ldr x0, [x1, #8]             // argv[1]
+    b file_stage
+0:  adrp x0, t_usage
+    add x0, x0, :lo12:t_usage
+    bl print_cstr
+    mov x0, #0
+    mov x8, #SYS_EXIT
+    svc #0
