@@ -102,7 +102,7 @@ checkpoint's own `temperature 1.0 · top_k 64 · top_p 0.95` with `--temp/--top-
 | weights streamed | 9.258 GB per token → **54.5 GB/s** |
 | prefill | 48 tokens in 8.2 s (one token per step — prefill is not batched) |
 | engine | **8,948 bytes** of assembly, AVX2 encodings only |
-| correctness | 8-token greedy rollout matches an independent NumPy reference token for token, logits rel ≈ 2e-6; every blob tensor verified against the checkpoint; and against HuggingFace's own `gemma4` code loaded straight from the blob — **11 of 12 greedy tokens identical**, splitting only at a bf16 near-tie (`tools/ref_gemma4_hf.py --compare`) |
+| correctness | **bit-exact against a float32 NumPy reference** (corr 1.000000, max Δlogit 0.0000 over the top-100 tokens), and 11 of 12 greedy tokens identical to HuggingFace's own `gemma4` code loaded from the blob. The split at token 12 is not an engine bug: this engine widens bf16 weights and accumulates in fp32, while HF's bf16 path drifts up to 4.3 logits on those tokens and flattens the distribution (p 0.79 → 0.57 on the leader). Same argmax, different confidence. Every blob tensor verified against the checkpoint (`tools/ref_gemma4_hf.py --compare`, `tools/review_zh_logits.py`) |
 
 Measured on a 4-core Linux host with the 9.258 GB blob on a RAM-backed mount. On DRAM the step
 is bandwidth-bound rather than compute-bound, which is exactly why speculative decoding is worth
@@ -122,10 +122,19 @@ What Gemma 4 changes architecturally:
 - **Sliding + full attention** — 512-token window on 4 of every 5 layers, so most attention reads
   a window instead of the whole cache.
 
+**Batching.** B=1 parity is a good regression gate but a poor batching gate: every bug below left
+B=1 bit-identical while corrupting batch 1. A stride that is too small only moves row 1 into row 0's
+unused tail, and an element count read from the wrong register still gets row 0's first 256 elements
+right before overrunning — the count came from whatever the previous GEMM had parked in `r9`, which
+was `hidden=1536` rather than `ple_dim=256`. So `tests/test_gemma4_batch.py` compares every batch row
+against that same token run alone, not just the last one, and `tests/test_bf16_gemb.py` reproduces
+the padded row layouts directly.
+
 **MTP.** Google ships a 4-layer assistant checkpoint for exactly this model. Its draft quality
 against our own target measures **0.70 accepted tokens per draft pass ≈ 1.70 tokens per verify
-pass** (`tools/bench_mtp.py`) — real signal, but turning it into speed needs an assembly drafter
-and a correct batched verify pass, neither of which this branch has yet. So MTP is off.
+pass** (`tools/bench_mtp.py`) — real signal. The batched verify pass it depends on now works, so
+what is left is the drafter itself: it exists only in NumPy, where it is slower than the target it
+drives. So MTP is off.
 
 Status, honestly:
 
@@ -133,12 +142,13 @@ Status, honestly:
 |---|---|
 | converter, blob, byte-for-byte verification of 372 tensors | works |
 | greedy decode, chat CLI, layer-by-layer parity tests | works |
-| batched verify (B tokens per pass) | B=1 bit-identical to before; **B>1 disagrees and faults** |
+| batched verify (B tokens per pass) | works — B=2, 3 and 4 are bit-identical to the same tokens run one at a time, residual stream and KV caches alike. Three bugs stood in the way, all invisible at B=1: the shared activation buffers took their row strides from each layer's own `head_dim`/`inter` instead of the widest layer (batch 1 landed inside batch 0), `mul_avx2` read its element count from the wrong register and ran 1536 elements instead of 256, and `geglu_avx2` walked `B*inter` linearly across rows that are `max_inter` apart. |
 | sampling (temperature → top-k → top-p, xorshift64\* draw) | works — verified against NumPy: exact top-k at vocab 262144, draws within a 3-sigma band, identical logits |
 | MTP drafter in assembly | not written — the NumPy drafter is slower than the target it drives |
-| shutdown | `close()` used to join spin workers that were never told to stop; fixed |
+| agreement with other engines | llama.cpp's `gemma4` path disagrees with HF at the first step — it scores `用` at 0.913 where HF says 0.128, and its Chinese reads better because it is computing something else ([write-up](doc/llamacpp-gemma4-divergence.md)) |
 | reset between conversations | clears activations as well as KV; a reset engine now reproduces a fresh one exactly (it used to keep the previous PLE history) |
-| agreement with other engines | HF `gemma4` over the same weights produces this engine's trajectory. llama.cpp's `gemma4` path does not — it scores `用` at 0.913 where HF says 0.128, and its Chinese reads better because it is computing something else ([write-up](doc/llamacpp-gemma4-divergence.md)) |
+| shutdown | `close()` used to join spin workers that were never told to stop; fixed |
+| output quality | the checkpoint's own limit, not the port's. Verified directly: HF's logits put through the same top-64/top-0.95 cut at temp 1.0 produce the identical repetition loop (`用**用***…因為因為…`), so the sampler is faithful to the distribution it is given. Greedy stays the demo default because it is the only setting that completes a grammatical sentence here |
 
 ```bash
 python3 tools/convert_gemma4_safetensors.py --out /mnt/edge/pulsar/gemma4_e2b.bin

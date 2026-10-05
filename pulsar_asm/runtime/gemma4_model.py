@@ -253,6 +253,12 @@ class Gemma4:
         put(CTR["TOKENS"], self.tokens.ctypes.data)
         put(CTR["OUTTOK"], self.outtok.ctypes.data)
         put(CTR["XSTRIDE"], self.hidden * 4)
+        # Row strides for the buffers that are sized by the model's WIDEST layer.
+        # head_dim is 256 on sliding layers and 512 on full ones, inter doubles at
+        # the shared prefix, and a batched pass addresses row b at b*stride - so
+        # the stride has to come from the buffer, never from the layer.
+        put(CTR["QSTRIDE"], self.n_head * self.max_hd * 4)
+        put(CTR["ISTRIDE"], self.max_inter * 4)
         put(CTR["PLEROW"], self.n_layers * self.ple_dim * 4)
         put(CTR["MAXLAYER"], self.n_layers)
         put(CTR["POS"], 0)

@@ -81,11 +81,13 @@ macro EXP_CONSTS
 ;   plain `dd` here would fault (#GP) on the first lane it tried to load.
 ; -----------------------------------------------------------------------------
 ; void copy_avx2(dst, src, N)   fp32 copy        (N a multiple of 8)
+;   N is arg3 = R8. Nothing calls this today; had it counted from r9 like its
+;   old neighbour mul_avx2, it would have run past the count the same way.
 copy_avx2:
     xor     r10, r10
 .cp_l:
     lea     rax, [r10 + 8]
-    cmp     rax, r9
+    cmp     rax, r8
     ja      .cp_done
     vmovups ymm0, [rdx + r10 * 4]
     vmovups [rcx + r10 * 4], ymm0
@@ -97,11 +99,17 @@ copy_avx2:
 ; -----------------------------------------------------------------------------
 ; void mul_avx2(dst, src, N)   dst[i] *= src[i]        (N a multiple of 8)
 ; Used by the PLE gate: gate *= per-layer input.
+; N is arg3, so it arrives in R8. Reading it from R9 (as this did) is not a
+; harmless typo: the caller's preceding GEMMB leaves hidden=1536 in r9, so the
+; loop ran 1536 elements instead of ple_dim=256 and wrote 1280 floats past the
+; end of TMP256. Row 0's first 256 elements were still right, so B=1 parity
+; stayed green and the overrun only surfaced at B>1, where row 1 is what gets
+; stomped. Count-register/arg-position mismatches hide behind B=1 parity.
 mul_avx2:
     xor     r10, r10
 .mul_l:
     lea     rax, [r10 + 8]
-    cmp     rax, r9
+    cmp     rax, r8
     ja      .mul_done
     vmovups ymm0, [rcx + r10 * 4]           ; VEX has no 2-operand memory form:
     vmulps  ymm0, ymm0, [rdx + r10 * 4]     ; the memory operand must be src3

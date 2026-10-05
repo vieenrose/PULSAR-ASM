@@ -93,6 +93,8 @@ CTR_PLEROW           equ 400   ; bytes between PLE rows = nlayer*ple_dim*4
                                 ; write to one changed the other. parse_abi now
                                 ; rejects duplicate offsets in these tables.
 CTR_MAXLAYER         equ 408   ; int64: run layers [0,MAXLAYER); = NLAYER normally.
+CTR_QSTRIDE          equ 448   ; bytes between q/a rows = nhead*max_head_dim*4
+CTR_ISTRIDE          equ 456   ; bytes between mlp rows  = max_inter*4
 CTR_TEMP             equ 416   ; float bits: 0 = greedy argmax, else sampling
 CTR_TOPK             equ 424   ; int64: top-k width for the sampler
 CTR_TOPP             equ 432   ; float bits: nucleus mass
@@ -100,7 +102,7 @@ CTR_RNG              equ 440   ; uint64* xorshift state, advanced in place
                                 ; Separate from NLAYER because that also sizes
                                 ; the PLE row stride, so truncating it corrupts
                                 ; the per-layer embedding inputs.
-CTR_SIZE             equ 448
+CTR_SIZE             equ 464
 
 ; Per-layer descriptor: absolute pointers, built by the loader from the converted
 ; manifest, so the assembly contains no weight-layout knowledge.
@@ -145,6 +147,14 @@ FLAG_KVSTORE         equ 4     ; publishes its K/V as the shared state of its ty
 ; the entire point: the weights are streamed once for all B tokens, and decode
 ; is bound by streaming them.
 macro GEMMB dst, wp, xp, kk, mm, bb {
+    GEMMBX dst, wp, xp, kk, mm, bb, 0, 0
+}
+
+; xs = bytes between activation rows, os = bytes between output rows. Pass 0 for
+; either when the operand is exactly K (or M) wide; pass the buffer's stride when
+; the buffer is sized by the model's widest layer - q/a and the MLP rows are,
+; because head_dim and inter differ from layer to layer.
+macro GEMMBX dst, wp, xp, kk, mm, bb, xs, os {
     mov     rcx, dst
     mov     rdx, wp
     mov     r8, xp
@@ -155,6 +165,10 @@ macro GEMMB dst, wp, xp, kk, mm, bb {
     mov     [rsp + 40], rax                   ; B
     mov     rax, [rbx + CTR_SMP]
     mov     [rsp + 48], rax                   ; worker pool state
+    mov     rax, xs
+    mov     [rsp + 56], rax                   ; x row stride
+    mov     rax, os
+    mov     [rsp + 64], rax                   ; out row stride
     call    smp_bf16_gemb_avx2
 }
 
@@ -168,6 +182,11 @@ macro GEMB dst, wp, xp, kk, mm {
     mov     qword [rsp + 40], 1               ; B = 1 (single-token decode)
     mov     rax, [rbx + CTR_SMP]
     mov     [rsp + 48], rax                   ; worker pool state
+    mov     qword [rsp + 56], 0               ; x row stride  => K*4
+    mov     qword [rsp + 64], 0               ; out row stride => M*4
+    ; Every stack arg the callee reads must be written by the caller. A slot left
+    ; alone here is read as whatever the previous call left behind, which on the
+    ; decode path means a random row stride and a random segfault.
     call    smp_bf16_gemb_avx2
 }
 

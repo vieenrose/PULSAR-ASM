@@ -79,9 +79,13 @@ bf16_gemb_avx2:
     ; --------------------------------------------------------------------------
     mov     [rsp + 0],  r11            ; M
     mov     [rsp + 8],  r10            ; B
-    mov     rax, r9
+    mov     rax, [rsp + 192]           ; arg8: explicit x stride (0 => K*4). A row
+    test    rax, rax                   ; of a shared activation buffer is wider
+    jnz     .l_have_xstep              ; than this call's K when the buffer is
+    mov     rax, r9                    ; sized by the model's widest layer.
     shl     rax, 2
-    mov     [rsp + 16], rax            ; x rhs stride = K*4
+.l_have_xstep:
+    mov     [rsp + 16], rax            ; x rhs stride
     mov     rax, [rsp + 184]           ; arg7: explicit out stride (0 => M*4)
     test    rax, rax
     jnz     .l_have_ostep
@@ -264,7 +268,12 @@ smp_bf16_gemb_avx2:
     push    r14
     push    r15
     sub     rsp, 64
-    ; arg5 M -> [rsp+168], arg6 B -> [rsp+176], arg7 smp_state -> [rsp+184]
+    ; Incoming args sit ABOVE this frame (8 pushes + sub 64 = 136 bytes of
+    ; prologue, so arg5 lands at +168) and stay valid for the whole routine:
+    ; read them in place instead of copying them into frame slots. Growing this
+    ; frame moves every one of them by the same amount, so if you ever do grow
+    ; it, bump 168/176/184/192/200 in lockstep or the call silently reads garbage.
+    ;   +168 M  +176 B  +184 smp_state  +192 x_stride  +200 out_stride
     mov     r10, [rsp + 184]           ; smp_state
     mov     r11, [rsp + 168]           ; M
     mov     rbp, [rsp + 176]           ; B
@@ -345,9 +354,15 @@ smp_bf16_gemb_avx2:
     lea     r8, [rbx + 0]
     mov     [rcx + 56], r8             ; &done_counter
     mov     [rcx + 64], rbp            ; B
-    mov     r11, r12                   ; GLOBAL M: batch stride must be global.
-    shl     r11, 2                     ; (r11, NOT rax - rax still holds job_seq!)
+    mov     r11, [rsp + 200]           ; caller's out_stride, else GLOBAL M*4:
+    test    r11, r11                   ; a worker only ever owns a slice of the
+    jnz     .l_smp_jos                 ; rows, so the default can never be its own
+    mov     r11, r12                   ; M*4 - batch b >= 1 would land on the
+    shl     r11, 2                     ; wrong output rows. (r11, NOT rax: rax
+.l_smp_jos:                            ; still holds job_seq here.)
     mov     [rcx + 80], r11            ; out_stride
+    mov     rax, [rsp + 192]
+    mov     [rcx + 88], rax            ; x_stride (0 => the worker's own K*4)
     mov     r8, [rsp + 0]
     mov     [rcx + 72], r8             ; kernel (runtime address, see anchor above)
     ; Publish LAST, and from the SLOT, not from a register this loop recomputes.
@@ -371,9 +386,15 @@ smp_bf16_gemb_avx2:
     mov     rax, [rsp + 16]
     mov     [rsp + 32], rax            ; M = chunk
     mov     [rsp + 40], rbp            ; B
+    mov     rax, [rsp + 200]           ; out_stride: the master owns rows [0,chunk),
+    test    rax, rax                   ; so 0 would default to CHUNK*4 and send
+    jnz     .l_smp_mos                 ; batch b >= 1 to the wrong rows.
     mov     rax, r12
     shl     rax, 2
-    mov     [rsp + 48], rax            ; out_stride = M_global*4
+.l_smp_mos:
+    mov     [rsp + 48], rax
+    mov     rax, [rsp + 192]           ; x_stride - written AFTER r9 above has
+    mov     [rsp + 56], rax            ; picked K up out of this same slot
     call    bf16_gemb_avx2
 
 .l_smp_wait:
@@ -398,7 +419,10 @@ smp_bf16_gemb_avx2:
 .l_smp_single:
     mov     [rsp + 32], r11
     mov     [rsp + 40], rbp
-    mov     qword [rsp + 48], 0        ; out_stride => default M*4
+    mov     rax, [rsp + 200]
+    mov     [rsp + 48], rax            ; out_stride (0 => default M*4)
+    mov     rax, [rsp + 192]
+    mov     [rsp + 56], rax            ; x_stride (0 => default K*4)
     call    bf16_gemb_avx2
     add     rsp, 64
     pop     r15
@@ -449,8 +473,10 @@ smp_worker_proc4:
     mov     [rsp + 32], rax
     mov     rax, [r15 + 64]            ; B
     mov     [rsp + 40], rax
-    mov     rax, [r15 + 80]            ; out_stride (global M*4)
+    mov     rax, [r15 + 80]            ; out_stride (global M*4, or explicit)
     mov     [rsp + 48], rax
+    mov     rax, [r15 + 88]            ; x_stride
+    mov     [rsp + 56], rax
     mov     rax, [r15 + 72]            ; kernel
     call    rax
     mov     r11, [r15 + 56]

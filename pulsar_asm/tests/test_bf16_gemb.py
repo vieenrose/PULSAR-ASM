@@ -38,8 +38,10 @@ def run_case(mod, M, K, B, smp=0, seed=0):
     W = np.ascontiguousarray(wb)
     X = np.ascontiguousarray(xb)
 
-    gemv = abi.make_reg_entry(mod.exports["bf16_gemb_avx2"], 6)
-    gemv(out_asm.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, B)
+    # 8 args: arg7 out_stride and arg8 x_stride must be explicit - the
+# kernel reads those stack slots unconditionally.
+    gemv = abi.make_reg_entry(mod.exports["bf16_gemb_avx2"], 8)
+    gemv(out_asm.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, B, 0, 0)
 
     ref = (X @ wf.T).astype(np.float32)
     got = out_asm.reshape(B, M)
@@ -49,6 +51,57 @@ def run_case(mod, M, K, B, smp=0, seed=0):
     ok = rel < 2e-6
     print(f"  {'OK ' if ok else 'FAIL'} M={M:7d} K={K:5d} B={B}  "
           f"max|err|={err:.3e} rel={rel:.2e}")
+    return ok
+
+
+def run_smp_strided_case(mod, M, K, B, xs, os_, seed=1):
+    """Batched rows that are WIDER than this GEMM's M or K.
+
+    This is the shape the gemma4 engine actually uses: q/a rows are
+    n_head*max_head_dim wide while a sliding layer's GEMM is only
+    n_head*head_dim wide, and the MLP rows are max_inter wide while the layer's
+    GEMM is inter. A kernel that assumes "row b is at b*M" walks batch 1 into
+    batch 0 and, worse, leaves row 0 looking perfect - so it is tested here
+    against an explicit padded layout rather than trusted.
+    """
+    rng = np.random.default_rng(seed)
+    wb, wf = to_bf16_exact(rng.standard_normal((M, K), dtype=np.float32) * 0.022)
+
+    X = np.zeros((B, xs // 4), dtype=np.float32)
+    xb = rng.standard_normal((B, K), dtype=np.float32)
+    for b in range(B):
+        X[b, :K] = xb[b]
+    out_asm = np.zeros(B * (os_ // 4), dtype=np.float32)
+    # poison the padding: a kernel that reads across rows shows it immediately
+    X[:, K:] = -7.0
+    out_asm[:] = -7.0
+    W = np.ascontiguousarray(wb)
+
+    smp = abi.exec_alloc(4096)
+    ctypes.memset(smp, 0, 4096)
+    ctypes.c_uint64.from_address(smp + 16) .value = 4
+    worker = mod.exports["smp_worker_proc4"]
+    # A non-NULL smp_state with M >= 256 takes the POOLED path, which blocks until
+    # done_counter reaches n_workers-1. Handing it a pool pointer with no threads
+    # attached deadlocks instead of failing, so spawn them like run_smp_case does.
+    handles = [abi.spawn_worker(worker, smp + 64 + i * 128) for i in range(1, 4)]
+    entry = abi.make_reg_entry(mod.exports["smp_bf16_gemb_avx2"], 9)
+    entry(out_asm.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, B,
+          smp, xs, os_)
+    ctypes.memset(smp + 8, 0, 4)
+    for i in range(1, 4):
+        ctypes.c_uint32.from_address(smp + 64 + i * 128 + 8).value = 1
+    for h in handles:
+        abi.join_worker(h)
+
+    ref = (xb @ wf.T).astype(np.float32)
+    got = out_asm.reshape(B, os_ // 4)[:, :M]
+    err = float(np.max(np.abs(got - ref)))
+    scale = max(float(np.max(np.abs(ref))), 1e-30)
+    rel = err / scale
+    ok = rel < 2e-6
+    print(f"  {'OK ' if ok else 'FAIL'} smp strided M={M:6d} K={K:5d} B={B} "
+          f"x_stride={xs:6d} out_stride={os_:6d}  max|err|={err:.3e} rel={rel:.2e}")
     return ok
 
 
@@ -69,8 +122,10 @@ def run_smp_case(mod, M, K, B, seed=1):
 
     out_asm = np.zeros(B * M, dtype=np.float32)
     W = np.ascontiguousarray(wb)
-    gsmp = abi.make_reg_entry(mod.exports["smp_bf16_gemb_avx2"], 7)
-    gsmp(out_asm.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, B, smp)
+    # 9 args: the last two are x_stride and out_stride. Passing only 7 leaves
+    # those stack slots undefined, which the kernel has no way to detect.
+    gsmp = abi.make_reg_entry(mod.exports["smp_bf16_gemb_avx2"], 9)
+    gsmp(out_asm.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, B, smp, 0, 0)
 
     ref = (X @ wf.T).astype(np.float32)
     got = out_asm.reshape(B, M)
@@ -101,7 +156,7 @@ def run_smp_repeat(mod, n=6):
     ctypes.memset(smp, 0, 4096)
     worker = mod.exports["smp_worker_proc4"]
     handles = [abi.spawn_worker(worker, smp + 64 + i * 128) for i in range(1, 4)]
-    gsmp = abi.make_reg_entry(mod.exports["smp_bf16_gemb_avx2"], 7)
+    gsmp = abi.make_reg_entry(mod.exports["smp_bf16_gemb_avx2"], 9)
     g1 = abi.make_reg_entry(mod.exports["bf16_gemb_avx2"], 6)
     ok = True
     try:
@@ -112,7 +167,7 @@ def run_smp_repeat(mod, n=6):
             X = np.ascontiguousarray(rng.standard_normal((B, K), dtype=np.float32))
             out = np.zeros(B * M, dtype=np.float32)
             W = np.ascontiguousarray(wb)
-            gsmp(out.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, B, smp)
+            gsmp(out.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, B, smp, 0, 0)
             ref = (X @ wf.T).astype(np.float32)
             rel = float(np.max(np.abs(out.reshape(B, M) - ref))) / max(float(np.max(np.abs(ref))), 1e-30)
             dc = ctypes.c_uint32.from_address(smp).value
@@ -140,13 +195,13 @@ def bench(mod):
         ctypes.memset(smp, 0, 4096)
         worker = mod.exports["smp_worker_proc4"]
         handles = [abi.spawn_worker(worker, smp + 64 + i * 128) for i in range(1, 4)]
-        gsmp = abi.make_reg_entry(mod.exports["smp_bf16_gemb_avx2"], 7)
+        gsmp = abi.make_reg_entry(mod.exports["smp_bf16_gemb_avx2"], 9)
         for _ in range(2):
-            gsmp(out.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, 1, smp)
+            gsmp(out.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, 1, smp, 0, 0)
         t0 = time.perf_counter()
         n = 3
         for _ in range(n):
-            gsmp(out.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, 1, smp)
+            gsmp(out.ctypes.data, W.ctypes.data, X.ctypes.data, K, M, 1, smp, 0, 0)
         dt = (time.perf_counter() - t0) / n
         gbs = (M * K * 2) / dt / 1e9
         print(f"  M={M:7d} K={K} : {dt*1e3:7.2f} ms   {gbs:6.2f} GB/s streamed")
@@ -182,6 +237,14 @@ def main():
     allok &= run_smp_case(mod, 6144, 1536, 1)
     allok &= run_smp_case(mod, 262144, 1536, 1, seed=7)
     allok &= run_smp_case(mod, 4096, 1536, 3, seed=8)
+    # the engine's real layouts: q/a at n_head*max_head_dim, MLP at max_inter
+    allok &= run_smp_strided_case(mod, 2048, 1536, 2, 8 * 512 * 4, 8 * 512 * 4, seed=11)
+    allok &= run_smp_strided_case(mod, 6144, 1536, 2, 12288 * 4, 12288 * 4, seed=12)
+    # full-attention q_proj: M = n_head*head_dim = 8*512, rows still 8*512 wide,
+    # input contiguous (K == hidden). out_stride MUST be >= M*4 - a smaller value
+    # makes row b+1 overwrite row b and walks straight off the end of the buffer.
+    allok &= run_smp_strided_case(mod, 4096, 1536, 3, 1536 * 4, 8 * 512 * 4, seed=13)
+    allok &= run_smp_strided_case(mod, 1536, 6144, 2, 12288 * 4, 1536 * 4, seed=14)
     print()
     allok &= run_smp_repeat(mod)
 

@@ -65,17 +65,17 @@ gemma4_layer:
     mov     rax, [rbx + CTR_HIDDEN]
     shl     rax, 2
     mov     [rsp + L_XS], rax
-    mov     rax, [r15 + D_HEADDIM]
-    imul    rax, [rbx + CTR_NHEAD]
-    shl     rax, 2
-    mov     [rsp + L_QS], rax
+    mov     rax, [rbx + CTR_QSTRIDE]
+    mov     [rsp + L_QS], rax          ; n_head*MAX_head_dim*4, not this layer's:
+                                       ; the buffer is sized by the widest layer, so
+                                       ; deriving it from D_HEADDIM makes batch b>=1
+                                       ; land inside batch 0 on sliding layers
     mov     rax, [rbx + CTR_PLE_DIM]
     imul    rax, [rbx + CTR_NLAYER]
     shl     rax, 2
     mov     [rsp + L_PS], rax
-    mov     rax, [r15 + D_INTER]
-    shl     rax, 2
-    mov     [rsp + L_IS], rax
+    mov     rax, [rbx + CTR_ISTRIDE]
+    mov     [rsp + L_IS], rax          ; MAX_inter*4, same reason
     mov     rax, [rbx + CTR_PLE_DIM]
     shl     rax, 2
     mov     [rsp + L_TS], rax
@@ -103,7 +103,7 @@ gemma4_layer:
     ; ---- q = q_proj(t1): M = n_head*head_dim rows, B tokens per row --------
     mov     rbp, [r15 + D_HEADDIM]
     imul    rbp, [rbx + CTR_NHEAD]            ; M
-    GEMMB   <[rbx + CTR_BUF_Q]>, <[r15 + D_QW]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>
+    GEMMBX  <[rbx + CTR_BUF_Q]>, <[r15 + D_QW]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>, 0, <[rsp + L_QS]>   ; out rows are max_hd-wide
 
     ; ---- per row, per head: q_norm then rope -------------------------------
     ; The norm is RMSNorm(head_dim), shared by all heads, and it runs BEFORE
@@ -326,7 +326,7 @@ gemma4_layer:
     ; ---- o_proj, then the attention residual -------------------------------
     mov     rbp, [r15 + D_HEADDIM]
     imul    rbp, [rbx + CTR_NHEAD]
-    GEMMB   <[rbx + CTR_BUF_T1]>, <[r15 + D_OW]>, <[rbx + CTR_BUF_A]>, <rbp>, <[rbx + CTR_HIDDEN]>, <[rsp + L_N]>
+    GEMMBX  <[rbx + CTR_BUF_T1]>, <[r15 + D_OW]>, <[rbx + CTR_BUF_A]>, <rbp>, <[rbx + CTR_HIDDEN]>, <[rsp + L_N]>, <[rsp + L_QS]>, 0
 
     mov     qword [rsp + L_B], 0
 .ly_postr:
@@ -370,17 +370,32 @@ gemma4_layer:
     jb      .ly_preffr
 
     mov     rbp, [r15 + D_INTER]
-    GEMMB   <[rbx + CTR_BUF_G]>, <[r15 + D_GATE]>, <[rbx + CTR_BUF_T3]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>
-    GEMMB   <[rbx + CTR_BUF_U]>, <[r15 + D_UP]>, <[rbx + CTR_BUF_T3]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>
+    GEMMBX  <[rbx + CTR_BUF_G]>, <[r15 + D_GATE]>, <[rbx + CTR_BUF_T3]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>, 0, <[rsp + L_IS]>
+    GEMMBX  <[rbx + CTR_BUF_U]>, <[r15 + D_UP]>, <[rbx + CTR_BUF_T3]>, <[rbx + CTR_HIDDEN]>, <rbp>, <[rsp + L_N]>, 0, <[rsp + L_IS]>
+    ; One call PER ROW. geglu_avx2 walks its three operands linearly, so a single
+    ; flat pass over B*inter is only correct when inter is also the row stride.
+    ; G/U live in a buffer sized by the widest layer, so on a sliding layer the
+    ; rows are max_inter apart and a flat pass would read row 0's unused back half
+    ; as if it were batch 1 - which is exactly the batched-only corruption here.
+    mov     qword [rsp + L_B], 0
+.ly_geglu:
+    mov     rax, [rsp + L_B]
+    imul    rax, [rsp + L_IS]
     mov     rcx, [rbx + CTR_BUF_G]
-    mov     rdx, [rbx + CTR_BUF_G]
+    add     rcx, rax
+    mov     rdx, rcx                          ; gate (out aliases gate in place)
     mov     r8, [rbx + CTR_BUF_U]
-    mov     r9, [r15 + D_INTER]               ; elementwise over the whole
-    imul    r9, [rsp + L_N]                   ; B*inter block, no loop needed
+    add     r8, rax                           ; up
+    mov     r9, [r15 + D_INTER]
     call    geglu_avx2                        ; (out, gate, up, N)
+    mov     rax, [rsp + L_B]
+    inc     rax
+    mov     [rsp + L_B], rax
+    cmp     rax, [rsp + L_N]
+    jb      .ly_geglu
 
     mov     rbp, [rbx + CTR_HIDDEN]
-    GEMMB   <[rbx + CTR_BUF_T2]>, <[r15 + D_DOWN]>, <[rbx + CTR_BUF_G]>, <[r15 + D_INTER]>, <rbp>, <[rsp + L_N]>
+    GEMMBX  <[rbx + CTR_BUF_T2]>, <[r15 + D_DOWN]>, <[rbx + CTR_BUF_G]>, <[r15 + D_INTER]>, <rbp>, <[rsp + L_N]>, <[rsp + L_IS]>, 0
 
     mov     qword [rsp + L_B], 0
 .ly_postrff:

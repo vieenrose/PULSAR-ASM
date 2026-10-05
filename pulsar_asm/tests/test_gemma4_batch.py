@@ -38,13 +38,19 @@ def main():
 
     g.reset()
     g.pos = a.pos
-    seq = [int(g.forward(t)) for t in toks]
-    x_seq = g.buf["X"][:g.hidden].copy()
+    seq = []
+    x_seq = []
+    for t in toks:
+        seq.append(int(g.forward(t)))
+        # B == 1, so the step's stream is row 0. Keep EVERY step: the batched pass
+        # computes all of them at once, so row i of one must equal step i of the
+        # other. Comparing only the last step against batch row 0 compares the
+        # first token to the last and reports a real mismatch as a false failure.
+        x_seq.append(g.buf["X"][:g.hidden].copy())
     kv_seq = [c[0].copy() for c in g._caches.values()]
 
     g.reset()
     bat = [int(v) for v in g.run(toks, pos=a.pos)]
-    x_bat = g.buf["X"][:g.hidden].copy()
 
     ok = True
     same = seq == bat
@@ -54,9 +60,11 @@ def main():
     print(f"sequential  {seq}")
     print(f"batched     {bat}   {'match' if same else 'MISMATCH'}")
 
-    rel = float(np.abs(x_bat - x_seq).max() / np.abs(x_seq).max())
-    ok &= rel < 5e-6
-    print(f"final stream rel {rel:.2e}")
+    for i, xs in enumerate(x_seq):
+        xb = g.buf["X"][i * g.hidden:(i + 1) * g.hidden]
+        rel = float(np.abs(xb - xs).max() / max(float(np.abs(xs).max()), 1e-30))
+        ok &= rel < 5e-6
+        print(f"  stream row {i} rel {rel:.2e}")
     # every cache row the pass could have touched must land in the same place
     rows = slice(0, a.pos + len(toks))
     for i, (k, _) in g._caches.items():
