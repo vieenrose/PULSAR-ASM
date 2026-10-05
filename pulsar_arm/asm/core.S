@@ -1471,12 +1471,19 @@ kern_tests:
     adrp x4, f_eps
     ldr s0, [x4, :lo12:f_eps]
     bl rmsnorm_f32
-    adrp x9, T2
-    add x9, x9, :lo12:T2
-    ldr s0, [x9]
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    ldr s0, [x9]                 // expect 1.0
     bl print_f32
     bl print_sp
-    ldr s0, [x9, #12]
+    adrp x9, T1
+    add x9, x9, :lo12:T1
+    ldr s0, [x9]                 // expect 1.0
+    bl print_f32
+    bl print_sp
+    adrp x9, T2
+    add x9, x9, :lo12:T2
+    ldr s0, [x9]                 // expect 0.3651
     bl print_f32
     bl print_nl
     // -- rmsnorm: patterned x, w=0 -> sum(out^2) ~= 640
