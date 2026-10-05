@@ -3264,6 +3264,11 @@ decode_test:
     mov x1, #1000
     mul x1, x2, x1               // dt*1000
     udiv x1, x1, x0              // ms_total
+    str x1, [sp, #-16]!          // DIAG save ms_total
+    mov x0, x1
+    bl print_u64                 // DIAG ms_total (expect ~4590)
+    bl print_nl
+    ldr x1, [sp], #16            // restore ms_total
     movz x0, #0xd400
     movk x0, #0x30, lsl #16      // 3200000
     udiv x0, x0, x1              // tps_x100
