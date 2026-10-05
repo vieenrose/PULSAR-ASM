@@ -4236,14 +4236,14 @@ encode:
     adrp x9, B_NRULES
     add x9, x9, :lo12:B_NRULES
     ldr x9, [x9]                 // nrules
-5:  mov w26, #0xFFFFFFFF         // best_rank = INF (w26: x26 dead here ✓)
+5:  movn w26, #0                   // best_rank = INF (-1)
     mov w2, #0                   // j = 0
 6:  sub w3, w25, #1              // n-1
     cmp w2, w3
     b.hs 7f                      // scan done (j >= n-1)
     ldr w4, [x23, x2, lsl #2]    // left = sym[j]
-    add w5, w2, #1
-    ldr w5, [x23, w5, lsl #2]    // right = sym[j+1]
+    add x6, x2, #1                 // j+1 (x6: bsearch-lo, dead here ✓)
+    ldr w5, [x23, x6, lsl #2]    // right = sym[j+1]
     lsl x10, x5, #32             // target key = left | right<<32
     orr x10, x10, x4             // (x4/x5 zero-extended? w-reg writes zero-extend to x ✓)
     mov x6, #0                   // lo
@@ -4275,7 +4275,7 @@ pair_next:
     add w2, w2, #1               // j++
     b 6b                         // scan top
 7:  // scan done: any merge?
-    cmp w26, #0xFFFFFFFF
+    cmn w26, #1                   // best_rank == -1 (none)?
     b.eq 8f                      // none -> copy out
     str w1, [x23, x0, lsl #2]    // sym[best_j] = best_z
     // memmove [best_j+1, n-1] down by one
@@ -4285,7 +4285,7 @@ mm_loop:
     b.hs mm_done
     ldr w3, [x23, x2, lsl #2]    // sym[k]
     sub w4, w2, #1
-    str w3, [x23, w4, lsl #2]    // sym[k-1]
+    str w3, [x23, x4, lsl #2]    // sym[k-1] (x4: k-1 zero-extended ✓)
     add w2, w2, #1
     b mm_loop
 mm_done:
