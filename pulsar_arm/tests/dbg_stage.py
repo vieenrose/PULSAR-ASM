@@ -100,7 +100,7 @@ def main():
             full = hf.model(input_ids=torch.tensor([ids]), use_cache=False,
                             output_hidden_states=True)
         ref1 = np.asarray(full.hidden_states[1].float())[0, 2]
-        x1 = x[2] + mp
+        x1 = h[2] + mp
         mh = rms(x1, sd_all["pre_feedforward_layernorm.weight"])
         c1 = np.float32(0.7978845608028654)
         c3 = np.float32(0.044715) * c1
