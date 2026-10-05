@@ -25,8 +25,10 @@
 ;       x = x * layer_scalar
 ;   x = norm(x); logits = x . embed^T (tied weights); next = argmax(logits)
 ;
-; The tanh logit softcap is applied by the reference but is monotone, so argmax
-; is identical without it (asserted in tests/test_gemma4_kernels.py).
+; The tanh logit softcap is NOT monotone-neutral once a temperature is involved,
+; so the head applies it to every logits row (see .step_head_nocap). Under argmax
+; it makes no difference to the chosen token, which is the only reason the parity
+; tests never noticed it being absent.
 ;
 ; CONTEXT LAYOUT - the only ABI between Python and assembly. The loader PARSES
 ; these equates out of this file, so there is exactly one source of truth.
@@ -364,6 +366,21 @@ gemma4_step:
     mov     qword [rbx + CTR_MARK], 6
     GEMMB   <[rbx + CTR_BUF_LOGITS]>, <[rbx + CTR_EMB]>, <[rbx + CTR_BUF_T1]>, <[rbx + CTR_HIDDEN]>, <[rbx + CTR_VOCAB]>, <[rbx + CTR_B]>
 
+    ; final_logit_softcapping, applied HERE rather than in the sampler so every
+    ; consumer sees the logits the checkpoint actually defines. Skipping it is
+    ; only ever safe for argmax, where tanh's monotonicity makes the answer
+    ; identical - which is exactly why greedy parity stayed green while sampling
+    ; drew from a sharper distribution than the model's. The rows are contiguous
+    ; (the head GEMM defaults to M*4 with M = vocab), so one pass covers all B.
+    mov     r8, [rbx + CTR_SOFTCAP]
+    test    r8d, r8d                       ; cap 0 = no softcap in the config, and
+    jz      .step_head_nocap               ; 1/cap would be infinite, so skip it
+    mov     rcx, [rbx + CTR_BUF_LOGITS]
+    mov     rdx, [rbx + CTR_VOCAB]
+    imul    rdx, [rbx + CTR_B]             ; N = B * vocab
+    call    softcap_tanh_avx2
+.step_head_nocap:
+
     ; One sample per row. A zero temperature keeps the argmax, which is what the
     ; parity tests pin; anything else runs temperature -> top-k -> nucleus.
     mov     rax, [rbx + CTR_VOCAB]
@@ -393,8 +410,8 @@ gemma4_step:
     call    sampler_nucleus_avx2
     jmp     .step_nextok
 .step_greedy:
-    call    sampler_argmax_avx2               ; softcap is monotone, so the head
-    mov     [r12], rax                        ; skips it and the answer holds
+    call    sampler_argmax_avx2
+    mov     [r12], rax                        ; the head already applied the softcap
 .step_nextok:
     mov     rax, [rsp + 128]
     inc     rax

@@ -239,10 +239,21 @@ class Model:
         return h, x
 
     def logits(self, h, chunk=16384):
-        """Tied lm head, in row blocks: the table is 262144 x 1536."""
+        """Tied lm head, in row blocks: the table is 262144 x 1536.
+
+        Then final_logit_softcapping. HF returns cap*tanh(x/cap), not the raw dot
+        product. Under argmax the two name the same token, which is how this
+        reference AND the engine both missed it while still reproducing HF's
+        greedy tokens; under temperature the capped distribution is materially
+        flatter (E2B, first step of the zh prompt: p(top) 0.795 uncapped against
+        0.572 for HF), so an uncapped sampler draws sharper than the model is.
+        """
         V = self.m["vocab"]
         out = np.empty(V, dtype=np.float32)
         for s in range(0, V, chunk):
             blk = self.ref.w_row_block("embed", s, min(chunk, V - s))
             out[s:s + blk.shape[0]] = blk @ h
+        cap = self.m.get("logit_softcapping")
+        if cap:
+            out = (cap * np.tanh(out.astype(np.float64) / cap)).astype(np.float32)
         return out

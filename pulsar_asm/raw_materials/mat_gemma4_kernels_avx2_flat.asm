@@ -707,7 +707,9 @@ attn_values_avx2:
 ; softcap_tanh_avx2(logits, N, cap)  ->  cap * tanh(logits / cap)
 ;   tanh(z) = 2/(1 + exp(-2z)) - 1     (NOT 1 - 2/(1+exp(-2z)), which is -tanh)
 ;   Only needed when sampling with a temperature: under argmax the transform is
-;   monotone, so the engine skips it (a free win v1.0 could not take).
+;   monotone and the chosen token cannot change. The engine calls it from the head
+;   so that both paths read capped logits; nothing guards cap == 0, so the caller
+;   must (a zero cap means the model has no softcap, and 1/cap is infinite).
 ; ==============================================================================
 softcap_tanh_avx2:
     test    rdx, rdx
