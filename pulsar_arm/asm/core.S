@@ -411,10 +411,12 @@ microbench:
     adrp x9, Wmat
     add x9, x9, :lo12:Wmat
     mov x10, #0x1234
-    mov x11, #(2048*640)
-0:  mov x12, #1664525
+    movz x11, #0x14, lsl #16      // 2048*640
+0:  movz x12, #0x66ad
+    movk x12, #0x19, lsl #16     // 1664525
     mul x10, x10, x12
-    mov x12, #1013904223
+    movz x12, #0xf35f
+    movk x12, #0x3c6e, lsl #16   // 1013904223
     add x10, x10, x12
     strh w10, [x9], #2
     subs x11, x11, #1
