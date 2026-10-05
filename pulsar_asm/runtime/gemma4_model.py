@@ -31,12 +31,13 @@ def _fbits(v):
     return struct.unpack("<I", struct.pack("<f", float(v)))[0]
 
 
-def parse_abi(path=ENGINE_ASM):
+def parse_abi(path=ENGINE_ASM, prefix="CTR_", desc_prefix="D_", extras=("DESC_SIZE", "FLAG_FULL", "FLAG_KVSHARED", "FLAG_KVSTORE")):
     """Read the equate tables that define the context/descriptor ABI.
 
     The assembly declares them; the loader reads them. If they ever disagree the
     engine reads the wrong buffer, which shows up as plausible-looking garbage,
-    so the layout is never duplicated in Python.
+    so the layout is never duplicated in Python. Other modules (the MTP
+    drafter) reuse this with their own equate prefix and no descriptor table.
     """
     txt = open(path).read()
 
@@ -61,10 +62,10 @@ def parse_abi(path=ENGINE_ASM):
                              "; ".join(f"{v}: {n}" for v, n in dup.items()))
         return out
 
-    ctr = grab("CTR_")
-    d = grab("D_")
+    ctr = grab(prefix)
+    d = grab(desc_prefix) if desc_prefix else {}
     extra = {}
-    for name in ("DESC_SIZE", "FLAG_FULL", "FLAG_KVSHARED", "FLAG_KVSTORE"):
+    for name in extras:
         m = re.search(rf"^{name}\s+equ\s+(\S+)", txt, re.M)
         extra[name] = int(m.group(1), 0)
     return ctr, d, extra
