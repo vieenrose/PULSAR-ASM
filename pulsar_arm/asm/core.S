@@ -3535,7 +3535,17 @@ vocab_load:  // x0 = vocab.bin path. mmaps read-only, verifies, memcpys table.
     ldr x0, [sp], #16            // pop count
     bl print_u64                 // expect 262144
     bl print_nl
-    // OUTCUR = OUTBUF
+    // fixup: VTAB[i].off += base (file offsets -> abs addresses)
+    adrp x0, VTAB
+    add x0, x0, :lo12:VTAB
+    movz x1, #4, lsl #16         // 262144
+0:  cbz x1, 1f
+    ldr x2, [x0]
+    add x2, x2, x19              // + base (x19 = blob base, intact? memcpy used x0-x3; x19 intact ✓)
+    str x2, [x0], #16
+    sub x1, x1, #1
+    b 0b
+1:  // OUTCUR = OUTBUF
     adrp x0, OUTCUR
     add x0, x0, :lo12:OUTCUR
     adrp x1, OUTBUF
