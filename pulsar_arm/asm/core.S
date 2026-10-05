@@ -3222,7 +3222,8 @@ decode_test:
     sub x2, x2, x1               // dt ticks
     str x2, [sp, #-16]!          // save dt
     // ms_x100/token = dt*1e5/(freq*32)
-    mov x1, #100000
+    movz x1, #0x86a0
+    movk x1, #0x1, lsl #16        // 100000
     mul x1, x2, x1
     mov x3, #32
     mul x3, x0, x3
