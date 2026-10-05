@@ -1,0 +1,29 @@
+{
+  "id": "b8f0c67d5",
+  "name": "Long-prompt prefill test",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && cat > /tmp/long.txt <<'\"'\"'EOF'\"'\"'\nThe quick brown fox jumps over the lazy dog near the river bank every morning at sunrise. Engineers built a small computer from sand and light that can add numbers faster than any human. Rivers flow to the sea carrying stories from mountains high above the clouds where eagles fly. In the garden grow tomatoes, basil, peppers, roses, tulips, oak trees, ferns, moss, mushrooms after rain, sunflowers turning toward light, lavender smelling sweet, mint spreading fast, carrots underground, beans climbing poles, squash on vines, corn standing tall. The library holds thousands of books about history, science, mathematics, poetry, music, art, philosophy, cooking, travel, gardening, astronomy, geology, biology, chemistry, physics, languages, cultures, inventions, explorers, oceans, deserts, forests, cities, villages, bridges, towers, ships, trains, airplanes, bicycles. Children play games in the park while parents watch from benches under old trees. What is the capital of France?\nEOF\ntimeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 800 950 < /tmp/long.txt > /tmp/chatlong.log 2>&1; echo EXIT=$?; grep -a \"^> tpl:\" /tmp/chatlong.log | head -1 | cut -c1-60; grep -a -c \"resetting\" /tmp/chatlong.log'",
+  "status": "failed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b8f0c67d5.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791237270208,
+  "endTime": 1791237328772,
+  "exitCode": 1,
+  "signal": null,
+  "pid": 101705,
+  "bytesWritten": 70,
+  "isAgent": false,
+  "surviveReload": false,
+  "error": "Exited with code 1",
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
