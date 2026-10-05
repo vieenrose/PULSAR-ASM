@@ -30,9 +30,10 @@ with torch.no_grad():
                    output_hidden_states=True)
 
 arm = Arm270m(snap, max_seq=64, verbose=False)
-arm.tape = []
-for t in ids:
+for t in ids[:-1]:
     arm.forward(t)
+arm.tape = []
+arm.forward(ids[-1])
 
 print("prompt ids:", ids, flush=True)
 # embed check: fresh single-token embed through the C kernel
