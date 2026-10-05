@@ -293,11 +293,24 @@ class Gemma4:
         put(CTR["TOPK"], 64)
         put(CTR["TOPP"], _fbits(0.95))
 
-        # spin-worker pool: master + (n_threads-1) pthreads
+        # spin-worker pool: the assembly side is hardcoded for master + 3
+        # workers (row quarters, done_counter waits for exactly 3), so any
+        # other count either hangs (2-3: the missing workers never report)
+        # or idles extras (>= 5). Clamp honestly instead of hanging: 1 means
+        # single-threaded, anything else means the 4-wide pool. A null
+        # smp_state sends every GEMM down .l_smp_single, which is the whole
+        # pool bypass (CTR_NTHR is written but read by nothing).
         self.smp = abi.exec_alloc(4096)
         ctypes.memset(self.smp, 0, 4096)
         ctypes.c_uint64.from_address(self.smp + 16).value = n_threads
-        put(CTR["SMP"], self.smp)
+        if n_threads == 1:
+            put(CTR["SMP"], 0)
+            if verbose:
+                print("  single-threaded: pool bypassed (n_threads=1)")
+        else:
+            if verbose and n_threads != 4:
+                print(f"  pool is 4-wide by construction; using 4 workers, not {n_threads}")
+            put(CTR["SMP"], self.smp)
 
         for k, a in buf.items():
             key = "BUF_" + k
@@ -313,8 +326,9 @@ class Gemma4:
 
         self.mod = abi.load_module(ENGINE_SRC)
         self.worker = self.mod.exports["smp_worker_proc4"]
+        n_pool = 0 if n_threads == 1 else 3
         self.handles = [abi.spawn_worker(self.worker, self.smp + 64 + i * 128)
-                        for i in range(1, n_threads)]
+                        for i in range(1, n_pool + 1)]
         self.step = abi.make_reg_entry(self.mod.exports["gemma4_step"], 1)
         self.pos = 0
         if verbose:

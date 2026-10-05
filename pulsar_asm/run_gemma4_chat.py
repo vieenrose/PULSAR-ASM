@@ -148,7 +148,12 @@ class Chat:
         self.messages.append({"role": "user", "content": text})
         new = prompt_ids(self.tk, self.messages)
         if new[:len(self.ids)] != self.ids:
-            raise RuntimeError("re-rendered prompt is not an extension of the cached one")
+            # The fast path assumes decode -> strip -> re-encode round-trips,
+            # which it does not (a trailing space becomes part of a token,
+            # template markers shift). Fall back to replaying the whole
+            # render on a fresh engine: slower on these turns, always right.
+            self.eng.reset()
+            self.ids = []
         for t in new[len(self.ids):]:
             self.eng.forward(t)
         self.ids = new
