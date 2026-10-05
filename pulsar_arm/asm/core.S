@@ -1185,6 +1185,7 @@ rope_half:
 /* softmax_f32(buf,x0 n,w1). Scalar mirror; m + counter survive expf via stack. */
     .global softmax_f32
 softmax_f32:
+    str x30, [sp, #-16]!          // NON-LEAF: preserve lr across expf calls
     ldr s0, [x0]
     mov w9, #1
 0:  cmp w9, w1
@@ -1217,11 +1218,13 @@ softmax_f32:
     str s1, [x0, x9, lsl #2]
     add w9, w9, #1
     b 5b
-6:  ret
+6:  ldr x30, [sp], #16
+    ret
 
 /* gelu_mul_f32(out,x0 x,x1 mult,x2 n,w3). Scalar; w9 survives tanhf via stack. */
     .global gelu_mul_f32
 gelu_mul_f32:
+    str x30, [sp, #-16]!          // NON-LEAF: preserve lr across tanhf calls
     mov w9, #0
 0:  cmp w9, w3
     b.hs 1f
@@ -1240,7 +1243,8 @@ gelu_mul_f32:
     str s1, [x0, x9, lsl #2]
     add w9, w9, #1
     b 0b
-1:  ret
+1:  ldr x30, [sp], #16
+    ret
 
 /* attn_scores_f32(s,x0 q,x1 K,x2 n,w3 hd,w4 scale,s0). NEON dots, C order. */
     .global attn_scores_f32
