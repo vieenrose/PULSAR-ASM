@@ -3437,6 +3437,8 @@ put_surf:
     b.ne 1f
     b 9f                         // '[...': skip
 1:  // normal piece: emit with U+2581 -> space (bounds-checked)
+    mov x6, x3                   // ptr = surface (x6 was first BYTE!)
+    add x7, x3, x4               // end = surface + len
 2:  cmp x6, x7
     b.hs 7f
     ldrb w0, [x6]                // peek B0
