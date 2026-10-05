@@ -1769,6 +1769,7 @@ k_gelu:      .asciz "kern: gelu(1) = "
 k_scores:    .asciz "kern: scores = "
 k_values:    .asciz "kern: values[0] values[255] = "
 k_rmsadd:    .asciz "kern: acc[0] out[0] = "
+    .align 2
 f_eps:       .float 0.000001
 f_002:       .float 0.02
 f_07:        .float 0.7
