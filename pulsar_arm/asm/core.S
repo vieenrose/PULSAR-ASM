@@ -4547,6 +4547,7 @@ J_chat:      .skip 8
 t_chat:      .asciz "chat ready (sample mode; empty line skips, EOF quits)\n"
 t_gt:        .asciz "> "
 t_reset:     .asciz "[context full, resetting]\n"
+t_tpl:       .asciz "tpl: "
 t_nobpe:     .asciz "chat mode needs bpe.bin (argv[5])\n"
 
     .section .text
@@ -4614,6 +4615,26 @@ chat_enc:
     // x24 = len (held). tpl_build assembles template into ENC_OUT.
     bl tpl_build                 // w0 = n (preserves x19+; restores x24 ✓)
     mov x21, x0                  // n
+    // transparency: print "tpl: n ids..."
+    adrp x0, t_tpl
+    add x0, x0, :lo12:t_tpl
+    bl print_cstr
+    mov x0, x21
+    bl print_u64                 // n
+    bl print_sp
+    adrp x22, ENC_OUT
+    add x22, x22, :lo12:ENC_OUT  // x22 = base (x22 free here? prefill not started ✓; fwd not yet called ✓ SAFE)
+    mov w23, #0                  // k -- w23 free? tok not set yet ✓ SAFE
+tpl_pl:
+    cmp w23, w21
+    b.hs tpl_pd
+    ldr w0, [x22, x23, lsl #2]   // ids[k] (x23 offset ✓)
+    bl print_u64                 // (x22/w23/w21 safe? prints use x0-x9 ✓)
+    bl print_sp
+    add w23, w23, #1
+    b tpl_pl
+tpl_pd:
+    bl print_nl
     // capacity: pos + n + (turn==0) + 128 > 480?
     add x0, x19, x21             // pos + n
     cbnz x20, chat_nobos

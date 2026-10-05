@@ -1,0 +1,27 @@
+{
+  "id": "b6b64a1f2",
+  "name": "Chat template two-turn test",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hello\\nWhat is 2+2?\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin > /tmp/chat5.log 2>&1; echo EXIT=$?; awk \"/chat ready/{f=1} f\" /tmp/chat5.log | cut -c1-70 | head -14'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b6b64a1f2.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791235673441,
+  "endTime": 1791235730260,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 99528,
+  "bytesWritten": 428,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
