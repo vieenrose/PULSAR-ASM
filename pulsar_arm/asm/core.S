@@ -1195,20 +1195,17 @@ softmax_f32:
     fmov s0, s1
 2:  add w9, w9, #1
     b 0b
-1:  str s0, [sp, #-16]!          // m
-    movi v6.4s, #0                // sum (expf keeps s6+)
-    mov w9, #0
-3:  cmp w9, w1
+1:  fmov s16, s0                 // m (no stack: expf keeps s16+, x11+)
+    movi v6.4s, #0                // sum
+    mov w11, #0
+3:  cmp w11, w1
     b.hs 4f
-    ldr s0, [x0, x9, lsl #2]
-    ldr s1, [sp]                 // m
-    fsub s0, s0, s1
-    str x9, [sp, #-16]!
+    ldr s0, [x0, x11, lsl #2]
+    fsub s0, s0, s16
     bl expf_asm
-    ldr x9, [sp], #16
-    str s0, [x0, x9, lsl #2]     // x0 intact (expf uses x9,x10)
+    str s0, [x0, x11, lsl #2]
     fadd s6, s6, s0
-    add w9, w9, #1
+    add w11, w11, #1
     b 3b
 4:  fmov s0, #1.0
     fdiv s0, s0, s6
@@ -1220,8 +1217,7 @@ softmax_f32:
     str s1, [x0, x9, lsl #2]
     add w9, w9, #1
     b 5b
-6:  add sp, sp, #16              // drop m
-    ret
+6:  ret
 
 /* gelu_mul_f32(out,x0 x,x1 mult,x2 n,w3). Scalar; w9 survives tanhf via stack. */
     .global gelu_mul_f32
