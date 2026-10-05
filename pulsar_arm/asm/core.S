@@ -1340,6 +1340,24 @@ file_stage_after_bench:
     adrp x1, G_TOPP
     add x1, x1, :lo12:G_TOPP
     str s0, [x1]
+    // G_GENCAP argv[8] (default 128, clamp [1,400])
+    adrp x2, G_GENCAP
+    add x2, x2, :lo12:G_GENCAP
+    mov x3, #128
+    str x3, [x2]
+    cmp x19, #9
+    b.lo 8f                      // no arg: keep default
+    ldr x0, [x20, #64]           // argv[8] ptr
+    bl parse_u64                 // (x19/x20 intact ✓)
+    cmp x0, #1
+    b.hs 12f
+    mov x0, #1
+12: cmp x0, #400
+    b.lo 13f
+    mov x0, #400
+13: adrp x2, G_GENCAP
+    add x2, x2, :lo12:G_GENCAP
+    str x0, [x2]
 8:  mov x0, x19                  // restore argc
     mov x1, x20                  // restore argv
 
@@ -3854,6 +3872,7 @@ vspot:
 G_MODE:      .skip 8
 G_TEMP:      .skip 8
 G_TOPP:      .skip 8
+G_GENCAP:    .skip 8
 G_RNG:       .skip 8
     .align 4
 TKIDX:       .skip 64*4
@@ -4716,7 +4735,10 @@ tpl_pd:
     cbnz x20, chat_nobos
     add x0, x0, #1               // +bos
 chat_nobos:
-    add x0, x0, #128             // +gen cap
+    adrp x1, G_GENCAP
+    add x1, x1, :lo12:G_GENCAP
+    ldr x1, [x1]
+    add x0, x0, x1               // +gen cap (x1 free here ✓)
     cmp x0, #480
     b.lo chat_prefill
     adrp x0, t_reset
@@ -4755,9 +4777,12 @@ chat_gen:
     add x0, x0, :lo12:ENC_OUT
     sub x1, x21, #1
     ldr w23, [x0, x1, lsl #2]    // tok = last
+    adrp x0, G_GENCAP
+    add x0, x0, :lo12:G_GENCAP
+    ldr x24, [x0]                // gencap (x24=len dead here ✓; x19+ safe ✓)
     mov x22, #0                  // count = 0
 chat_gloop:
-    cmp x22, #128
+    cmp x22, x24
     b.hs chat_end                // gen cap
     adrp x0, G_pos
     add x0, x0, :lo12:G_pos
