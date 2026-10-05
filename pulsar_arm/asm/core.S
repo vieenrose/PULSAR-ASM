@@ -4383,6 +4383,7 @@ enc_one:
 /* encode_test: runs enc_one over et0..et17. */
 encode_test:
     str x30, [sp, #-16]!
+    bl rule_probe
     adrp x0, et0
     add x0, x0, :lo12:et0
     bl enc_one
@@ -4437,5 +4438,66 @@ encode_test:
     adrp x0, et17
     add x0, x0, :lo12:et17
     bl enc_one
+    ldr x30, [sp], #16
+    ret
+
+    .section .rodata
+t_probe:     .asciz "probe(He): "
+
+    .section .text
+    .align 2
+/* rule_probe: bsearches (236814,236744), prints result + rank. Expect 2209 5240. */
+rule_probe:
+    str x30, [sp, #-16]!
+    adrp x8, B_RULES
+    add x8, x8, :lo12:B_RULES
+    ldr x8, [x8]
+    adrp x9, B_NRULES
+    add x9, x9, :lo12:B_NRULES
+    ldr x9, [x9]
+    movz w4, #0x9D0E              // left H = 236814 (0x39D0E)
+    movk w4, #0x3, lsl #16
+    movz w5, #0x9CC8              // right e = 236744 (0x39CC8)
+    movk w5, #0x3, lsl #16
+    lsl x10, x5, #32
+    orr x10, x10, x4
+    mov x6, #0
+    mov x7, x9
+rp_bs:
+    cmp x6, x7
+    b.hs rp_miss
+    add x11, x6, x7
+    lsr x11, x11, #1
+    lsl x12, x11, #4
+    add x12, x8, x12
+    ldr x13, [x12]
+    cmp x10, x13
+    b.eq rp_hit
+    b.lo rp_lo
+    add x6, x11, #1
+    b rp_bs
+rp_lo:
+    mov x7, x11
+    b rp_bs
+rp_hit:
+    ldr w0, [x12, #8]            // result
+    ldr w1, [x12, #12]           // rank
+    b rp_out
+rp_miss:
+    mov w0, #-1
+    mov w1, #-1
+rp_out:
+    stp x0, x1, [sp, #-16]!      // save (print clobbers x0-x9? print_u64 uses x0-x3,x9! SAVE both. x0/x1 on stack ✓)
+    adrp x0, t_probe
+    add x0, x0, :lo12:t_probe
+    bl print_cstr
+    ldp x0, x1, [sp], #16        // restore (x0=result, x1=rank)
+    stp x0, x1, [sp, #-16]!      // re-save rank (print_u64 clobbers x1? uses x0-x3! YES clobbers x1. SAVE.)
+    bl print_u64                 // result
+    bl print_sp
+    ldp x0, x1, [sp], #16        // x1 = rank (x0 = stale result, dead)
+    mov x0, x1
+    bl print_u64                 // rank
+    bl print_nl
     ldr x30, [sp], #16
     ret
