@@ -342,14 +342,10 @@ gemv_bf16:
     add x13, x5, x11, lsl #1     // waddr = row + 2k
     ld1 {v0.8h}, [x13], #16
     ld1 {v1.8h}, [x13]
-    uxtl v2.4s, v0.4h
-    uxtl2 v3.4s, v0.8h
-    uxtl v4.4s, v1.4h
-    uxtl2 v5.4s, v1.8h
-    shl v2.4s, v2.4s, #16
-    shl v3.4s, v3.4s, #16
-    shl v4.4s, v4.4s, #16
-    shl v5.4s, v5.4s, #16
+    shll v2.4s, v0.4h, #16       // single-insn bf16->fp32 (gcc-proven)
+    shll2 v3.4s, v0.8h, #16
+    shll v4.4s, v1.4h, #16
+    shll2 v5.4s, v1.8h, #16
     add x13, x3, x11, lsl #2     // xaddr = x + 4k
     ld1 {v6.4s}, [x13], #16
     ld1 {v7.4s}, [x13], #16
