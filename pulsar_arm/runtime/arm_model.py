@@ -129,10 +129,11 @@ class Arm270m:
         lib.gelu_mul_f32.argtypes = [v, v, v, ctypes.c_int]
         lib.rmsnorm_add_f32.argtypes = [v, v, v, v, ctypes.c_int, ctypes.c_float]
         lib.attn_values_f32.argtypes = [v, v, v, ctypes.c_int, ctypes.c_int]
+        lib.layer_step.argtypes = [v] * 27 + [ctypes.c_int] * 3 + [ctypes.c_float]
         for f_ in ("gemv_bf16", "rmsnorm_f32", "rope_half", "softmax_f32",
                    "gelu_tanh_f32", "gelu_mul_f32", "rmsnorm_add_f32",
                    "embed_row_f32", "attn_scores_f32",
-                   "attn_values_f32"):
+                   "attn_values_f32", "layer_step"):
             getattr(lib, f_).restype = None
         self.lib = lib
         self.pos = 0
@@ -190,25 +191,16 @@ class Arm270m:
         softm = lb.softmax_f32
         aval = lb.attn_values_f32
         gm = lb.gelu_mul_f32
+        step = lb.layer_step
         X, H, Q, QN, KV, KN = self.pX, self.pH, self.pQ, self.pQN, self.pKV, self.pKN
         S, AV, G, U, LG = self.pS, self.pAV, self.pG, self.pU, self.pLG
-        HDB, RB, HDH = self.HDB, self.RB, HD // 2
+        RB = self.RB
         lb.embed_row_f32(X, self.emb_ptr, int(token), HID, self.ESCALE)
         pos = self.pos
         cpos = pos * RB
         for i, L in enumerate(self.layers):
             wq, wk, wv, wo, wg, wu, wd, nin, nq, nk, npa, npf, nff, \
                 cosb, sinb, kb, vb, full = L
-            rms(H, nin, X, HID, EPS)
-            gemv(wq[0], wq[1], wq[2], H, Q)
-            gemv(wk[0], wk[1], wk[2], H, KV)
-            rms(KN, nk, KV, HD, EPS)
-            rope(KN, cosb + cpos, sinb + cpos, HDH)
-            Karr = self.K[i]
-            Karr[pos] = self.KN
-            gemv(wv[0], wv[1], wv[2], H, KN)
-            Varr = self.V[i]
-            Varr[pos] = self.KN
             if full:
                 lo, n = 0, pos + 1
             else:
@@ -218,22 +210,10 @@ class Arm270m:
                 n = pos + 1
                 if n > WINDOW:
                     n = WINDOW
-            krow, vrow = kb + lo * HDB, vb + lo * HDB
-            for j in range(NHEAD):
-                off = j * HDB
-                rms(QN + off, nq, Q + off, HD, EPS)
-                rope(QN + off, cosb + cpos, sinb + cpos, HDH)
-                scores(S, QN + off, krow, n, HD, self.SCALE)
-                softm(S, n)
-                aval(AV + off, vrow, S, n, HD)
-            gemv(wo[0], wo[1], wo[2], AV, H)
-            rmsa(H, npa, H, X, HID, EPS)
-            rms(H, npf, X, HID, EPS)
-            gemv(wg[0], wg[1], wg[2], H, G)
-            gemv(wu[0], wu[1], wu[2], H, U)
-            gm(G, G, U, INTER)
-            gemv(wd[0], wd[1], wd[2], G, H)
-            rmsa(H, nff, H, X, HID, EPS)
+            step(X, H, Q, QN, KV, KN, S, AV, G, U, kb, vb,
+                 wq[2], wk[2], wv[2], wo[2], wg[2], wu[2], wd[2],
+                 nin, nq, nk, npa, npf, nff,
+                 cosb + cpos, sinb + cpos, pos, lo, n, self.SCALE)
             if self.tape is not None:
                 self.tape.append(self.X.copy())
         rms(H, self.pNormF, X, HID, EPS)

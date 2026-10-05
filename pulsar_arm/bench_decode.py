@@ -17,6 +17,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runtime.arm_model import Arm270m  # noqa: E402
 
 
+def soc_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return float(f.read().strip()) / 1000.0
+    except OSError:
+        return float("nan")
+
+
 def find_snap(explicit=None):
     if explicit and os.path.isfile(explicit):
         return explicit
@@ -32,6 +40,7 @@ def main():
     snap = find_snap(sys.argv[1] if len(sys.argv) > 1 else None)
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 32
     arm = Arm270m(snap, max_seq=256, verbose=True)
+    print(f"soc-temp-start: {soc_temp():.1f}C", flush=True)
     prompt = [2, 107, 1567, 236765, 107, 304, 2505, 9694]  # fixed 8-token prefill
     for t in prompt:
         arm.forward(t)
@@ -46,6 +55,7 @@ def main():
     print(f"decoded {n} tokens in {dt:.2f}s -> {1000.0 / ms:.2f} tok/s", flush=True)
     print(f"METRIC ms_per_token={ms:.4f}", flush=True)
     print(f"METRIC tok_per_sec={1000.0 / ms:.4f}", flush=True)
+    print(f"soc-temp-end: {soc_temp():.1f}C", flush=True)
     print("tail:", toks[-8:])
 
 

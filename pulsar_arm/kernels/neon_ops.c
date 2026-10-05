@@ -152,3 +152,44 @@ void embed_row_f32(float *out, const uint16_t *emb, int token, int dim, float sc
         out[i] = w * scale;
     }
 }
+
+/* Full Gemma-3 270m decoder layer in one call (dims fixed for this model).
+ * Makes the identical kernel calls in the identical order as the per-op
+ * path, so results are bit-identical; it just avoids ~200 ctypes crossings
+ * per token. Sliding vs full is expressed purely through lo/n. */
+extern void gemv_bf16(int M, int K, const uint16_t *W, const float *x, float *y);
+void layer_step(float *X, float *H, float *Q, float *QN, float *KV, float *KN,
+                float *S, float *AV, float *G, float *U,
+                float *Kc, float *Vc,
+                const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
+                const uint16_t *Wo, const uint16_t *Wg, const uint16_t *Wu,
+                const uint16_t *Wd,
+                const float *n_in, const float *n_q, const float *n_k,
+                const float *n_pa, const float *n_pf, const float *n_ff,
+                const float *cosr, const float *sinr,
+                int pos, int lo, int n, float scale) {
+    rmsnorm_f32(H, n_in, X, 640, 1e-6f);
+    gemv_bf16(1024, 640, Wq, H, Q);
+    gemv_bf16(256, 640, Wk, H, KV);
+    rmsnorm_f32(KN, n_k, KV, 256, 1e-6f);
+    rope_half(KN, cosr, sinr, 128);
+    memcpy(Kc + (int64_t)pos * 256, KN, 256 * sizeof(float));
+    gemv_bf16(256, 640, Wv, H, KN);
+    memcpy(Vc + (int64_t)pos * 256, KN, 256 * sizeof(float));
+    for (int j = 0; j < 4; j++) {
+        float *qs = QN + (int64_t)j * 256;
+        rmsnorm_f32(qs, n_q, Q + (int64_t)j * 256, 256, 1e-6f);
+        rope_half(qs, cosr, sinr, 128);
+        attn_scores_f32(S, qs, Kc + (int64_t)lo * 256, n, 256, scale);
+        softmax_f32(S, n);
+        attn_values_f32(AV + (int64_t)j * 256, Vc + (int64_t)lo * 256, S, n, 256);
+    }
+    gemv_bf16(640, 1024, Wo, AV, H);
+    rmsnorm_add_f32(H, n_pa, H, X, 640, 1e-6f);
+    rmsnorm_f32(H, n_pf, X, 640, 1e-6f);
+    gemv_bf16(2048, 640, Wg, H, G);
+    gemv_bf16(2048, 640, Wu, H, U);
+    gelu_mul_f32(G, G, U, 2048);
+    gemv_bf16(640, 2048, Wd, G, H);
+    rmsnorm_add_f32(H, n_ff, H, X, 640, 1e-6f);
+}
