@@ -1,0 +1,3 @@
+- 3-thread static-partition GEMV (OpenMP): rejected by memory wall (+4.2% slower, run #2). Revisit ONLY if per-token weight traffic drops substantially or on wider-bus hardware. Bit-identical design was proven (determinism held); patch lived in commit "rpi4: 3-thread OpenMP GEMV".
+- Head-GEMV (336MB = 61% of per-token traffic) top-1 shortcut with exact recompute + error-bound candidate prefilter: needs rigorous max-miss bound proof before trying.
+- Fuse elementwise passes into streaming kernels (attn scale into scores, G*=U into gelu, X+=H residual into rmsnorm write): saves small memory passes, bit-identical by construction.
