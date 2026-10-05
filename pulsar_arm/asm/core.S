@@ -4732,7 +4732,7 @@ tpl_build:
     // TBUF = "user\n" + line
     adrp x0, TBUF
     add x0, x0, :lo12:TBUF
-    mov w1, #0x7573              // "us"
+    mov w1, #0x7375              // "us" ([0]='u',[1]='s'; LE strh!)
     strh w1, [x0]
     mov w1, #0x7265              // "er"
     strh w1, [x0, #2]
