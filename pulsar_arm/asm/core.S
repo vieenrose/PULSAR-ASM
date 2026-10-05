@@ -3254,24 +3254,15 @@ decode_test:
     mov w0, w4
     bl print_ch                  // ones
     bl print_nl
-    // tok/s: tps_x100 = 3200000/ms_total; ms_total = dt*1000/freq
-    // stack: [ms_x100][dt][x21][x19,x20][x30]. dt at [sp,#8].
+    // tok/s from PROVEN ms_x100: tps_x100 = 1e7/ms_x100
+    // stack: [ms_x100][dt][x21][x19,x20][x30].
     adrp x0, t_tps2
     add x0, x0, :lo12:t_tps2
     bl print_cstr
-    ldr x2, [sp, #8]             // dt
-    mrs x0, cntfrq_el0
-    mov x1, #1000
-    mul x1, x2, x1               // dt*1000
-    udiv x1, x1, x0              // ms_total
-    str x1, [sp, #-16]!          // DIAG save ms_total
-    mov x0, x1
-    bl print_u64                 // DIAG ms_total (expect ~4590)
-    bl print_nl
-    ldr x1, [sp], #16            // restore ms_total
-    movz x0, #0xd400
-    movk x0, #0x30, lsl #16      // 3200000
-    udiv x0, x0, x1              // tps_x100
+    ldr x4, [sp]                 // ms_x100 (METRIC-proven)
+    movz x0, #0x9680
+    movk x0, #0x98, lsl #16      // 10000000
+    udiv x0, x0, x4              // tps_x100
     mov x3, #100
     udiv x4, x0, x3              // int
     msub x5, x4, x3, x0          // frac
