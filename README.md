@@ -14,16 +14,18 @@ Tokenizer, sampler, and chat live in `pulsar_arm/asm/core.S`.
 
 ```
 cd pulsar_arm/asm && as -o core.o core.S && ld -static -o core core.o
-./core <model.safetensors> <vocab.bin> [tok] [mode] [bpe.bin] [temp_milli] [topp_milli]
+./core <model.safetensors> <vocab.bin> [tok] [mode] [bpe.bin] [temp_milli] [topp_milli] [gencap]
 ```
 
 - `tools/mkvocab.py`: tokenizer.json → vocab.bin (surfaces + byte fallback).
 - `tools/mkbpe.py`: tokenizer.json → bpe.bin (514,906 rules, right-major for
   single-u64 binary search + 19,227 single chars + 256 byte fallbacks).
 - Modes: default greedy bench · `1` sample bench · `c` chat REPL (needs bpe).
-- Chat: `... 2 c bpe.bin [temp] [topp]` (temp milli, default 1000; topp default 950).
-  Template (SOT/EOT roles) verified id-exact vs HF; prefer temp ≥ 0.7
-  (0.5 degenerates into token loops, measured distinct4 0.09 vs 1.00).
+- Chat: `... 2 c bpe.bin [temp] [topp] [gencap]` (temp default 1000, min 50;
+  topp default 950; gencap default 128, max 400). Template (SOT/EOT roles)
+  verified id-exact vs HF. Sampling guidance (measured): prefer temp ≥ 0.7
+  (0.5 degenerates into token loops, distinct4 0.09 vs 1.00); top-p neutral
+  (0.5/0.95/1.0 all diverse); gen-cap bounds output cleanly.
 
 ## What was proven (26 experiments)
 
@@ -31,7 +33,10 @@ cd pulsar_arm/asm && as -o core.o core.S && ld -static -o core core.o
 - Bit-identical wins kept: -O3/cortex-a72, fused elementwise, C layer_step, tables.
 - asm GEMV at C parity (3.88 GB/s) via single-insn SHLL widening.
 - BPE encode 18/18 exact vs HF (char init, rank-order merges, leftmost ties).
-- Deterministic (fixed seed): greedy runs reproduce id-for-id.
+- Robustness proven: empty/whitespace/CRLF input, 203-token prefill, 8-turn
+  depth with context-reset recovery, EOF/exit paths, gen-cap boundary.
+- Deterministic (fixed seed): greedy, sampled, and full chat transcripts all
+  reproduce bit-for-bit across runs (proven by diff, runs #38-40).
 
 ## Layout
 `core.S`: file/mmap stage → compute kernels → layer forward → sampler →
