@@ -1443,17 +1443,40 @@ sum_sq:
 kern_tests:
     str x30, [sp, #-16]!
     stp x19, x20, [sp, #-16]!
-    // DIAG (temporary): T0 address, f_001 value
-    adrp x0, k_diag
-    add x0, x0, :lo12:k_diag
-    bl print_cstr
-    adrp x0, T0
-    add x0, x0, :lo12:T0
-    bl print_u64
+    // DIAG2 (temporary): rmsnorm([1,2,3,4], w=1) -> out[0] ~= 0.3651
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    adrp x10, f_1
+    ldr s0, [x10, :lo12:f_1]
+    fmov s1, #2.0
+    fmov s2, #3.0
+    fmov s3, #4.0
+    str s0, [x9]
+    str s1, [x9, #4]
+    str s2, [x9, #8]
+    str s3, [x9, #12]
+    adrp x10, T1
+    add x10, x10, :lo12:T1
+    str s0, [x10]
+    str s0, [x10, #4]
+    str s0, [x10, #8]
+    str s0, [x10, #12]
+    adrp x0, T2
+    add x0, x0, :lo12:T2
+    adrp x1, T1
+    add x1, x1, :lo12:T1
+    adrp x2, T0
+    add x2, x2, :lo12:T0
+    mov w3, #4
+    adrp x4, f_eps
+    ldr s0, [x4, :lo12:f_eps]
+    bl rmsnorm_f32
+    adrp x9, T2
+    add x9, x9, :lo12:T2
+    ldr s0, [x9]
+    bl print_f32
     bl print_sp
-    adrp x0, f_001
-    add x0, x0, :lo12:f_001
-    ldr s0, [x0]
+    ldr s0, [x9, #12]
     bl print_f32
     bl print_nl
     // -- rmsnorm: patterned x, w=0 -> sum(out^2) ~= 640
