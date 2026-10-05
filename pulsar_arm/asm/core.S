@@ -563,6 +563,10 @@ _start:
     bl file_stage_after_bench
     bl tables_test
     bl fwd_layer0
+    adrp x0, J_path
+    add x0, x0, :lo12:J_path
+    ldr x0, [x0]
+    bl vocab_load
     bl decode_test
     mov x0, #0
     mov x8, #SYS_EXIT
@@ -1079,7 +1083,7 @@ t_l17d:      .asciz "l17_down rows cols: "
 e_open:      .asciz "ERR open\n"
 e_seek:      .asciz "ERR seek\n"
 e_map:       .asciz "ERR mmap\n"
-t_usage:     .asciz "usage: core <model.safetensors>\n"
+t_usage:     .asciz "usage: core <model.safetensors> <tokenizer.json> [tok]\n"
 
     .section .bss
     .align 3
@@ -1091,18 +1095,22 @@ namebuf:     .skip 128
     .align 2
     .global file_stage_after_bench
 file_stage_after_bench:
-    // x0 = argc, x1 = argv
-    cmp x0, #2
+    // x0 = argc, x1 = argv. argv[1]=snap, argv[2]=tokjson, argv[3]=tok.
+    cmp x0, #3
     b.lo 0f
     str x30, [sp, #-16]!
     str x1, [sp, #-16]!          // argv
+    adrp x2, J_path
+    add x2, x2, :lo12:J_path
+    ldr x3, [x1, #16]            // argv[2] tokjson
+    str x3, [x2]
     mov x2, #2
     adrp x3, G_tok
     add x3, x3, :lo12:G_tok
     str x2, [x3]                 // default tok=2
-    cmp x0, #3
+    cmp x0, #4
     b.lo 1f
-    ldr x0, [x1, #16]            // argv[2]
+    ldr x0, [x1, #24]            // argv[3]
     bl parse_u64                 // x0 = tok
     adrp x1, G_tok
     add x1, x1, :lo12:G_tok
@@ -3165,6 +3173,7 @@ fwd_token:
     .section .rodata
     .align 3
 t_ids:       .asciz "ids:"
+t_text:      .asciz "text: "
 t_mpt2:      .asciz "ms/token: "
 t_tps2:      .asciz "tok/s: "
 t_metric2:   .asciz "METRIC ms_per_token="
@@ -3203,6 +3212,13 @@ decode_test:
     mov w0, w19
     bl fwd_token
     mov w19, w0                  // tok
+    // save IDBUF[pos-8] = tok (pos in w20)
+    sub x1, x20, #8
+    lsl x1, x1, #3
+    adrp x2, IDBUF
+    add x2, x2, :lo12:IDBUF
+    add x2, x2, x1
+    str w0, [x2]
     mov x0, x19                  // print ID -- x0 clobbered? print_u64 takes x0 ✓ set fresh
     str x19, [sp, #-16]!         // save tok across prints (x0-x9 die!)
     str x20, [sp, #-16]!         // save pos
@@ -3300,10 +3316,494 @@ decode_test:
     bl print_ch
     mov w0, w4
     bl print_ch
+    bl print_nl                  // (end METRIC line)
+    // text: surfaces of the 32 decoded IDs
+    adrp x0, t_text
+    add x0, x0, :lo12:t_text
+    bl print_cstr
+    mov w19, #0                  // i (x19: put_surf keeps x19+)
+0:  cmp w19, #32
+    b.hs 1f
+    lsl x0, x19, #3
+    adrp x1, IDBUF
+    add x1, x1, :lo12:IDBUF
+    add x1, x1, x0
+    ldr x0, [x1]                 // id
+    bl put_surf
+    add w19, w19, #1
+    b 0b
+1:  bl out_flush
     bl print_nl
     add sp, sp, #16              // drop ms_x100
     add sp, sp, #16              // drop dt
     ldr x21, [sp], #16
     ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
+    .section .bss
+    .align 4
+VTAB:        .skip 262144*16
+OUTBUF:      .skip 1048576
+IDBUF:       .skip 32*8
+J_base:      .skip 8
+J_len:       .skip 8
+
+    .section .text
+    .align 2
+/* hexval: w0 = hex char -> x0 = value (0-15). No validation (trusted). */
+hexval:
+    cmp w0, #'9'
+    b.hi 0f
+    sub w0, w0, #'0'
+    ret
+0:  cmp w0, #'F'
+    b.hi 1f
+    sub w0, w0, #'A'
+    add w0, w0, #10
+    ret
+1:  sub w0, w0, #'a'
+    add w0, w0, #10
+    ret
+/* utf8enc: w0 = codepoint, x1 = out ptr -> x1 advanced past bytes. */
+utf8enc:
+    cmp w0, #0x80
+    b.hs 0f
+    strb w0, [x1], #1
+    ret
+0:  cmp w0, #0x800
+    b.hs 1f
+    mov w2, #0xC0
+    lsr w3, w0, #6
+    orr w2, w2, w3
+    strb w2, [x1], #1
+    mov w2, #0x80
+    and w3, w0, #0x3F
+    orr w2, w2, w3
+    strb w2, [x1], #1
+    ret
+1:  mov w2, #0xE0
+    lsr w3, w0, #12
+    orr w2, w2, w3
+    strb w2, [x1], #1
+    mov w2, #0x80
+    lsr w3, w0, #6
+    and w3, w3, #0x3F
+    orr w2, w2, w3
+    strb w2, [x1], #1
+    mov w2, #0x80
+    and w3, w0, #0x3F
+    orr w2, w2, w3
+    strb w2, [x1], #1
+    ret
+
+    .section .text
+    .align 2
+/* dec_str: x4 = read (after opening quote), x5 = write. Decodes to closing
+ * quote (in place; write <= read always). Returns x4 = after quote, x5 = end.
+ * Handles \" \\ \/ \b \f \n \r \t \uXXXX + surrogates. Uses x0-x3,x6,x7. */
+dec_str:
+0:  ldrb w2, [x4], #1
+    cmp w2, #'"'
+    b.eq 9f
+    cmp w2, #'\\'
+    b.ne 1f
+    ldrb w2, [x4], #1
+    cmp w2, #'u'
+    b.eq 2f
+    cmp w2, #'n'
+    b.ne 3f
+    mov w2, #10
+    b 4f
+3:  cmp w2, #'t'
+    b.ne 5f
+    mov w2, #9
+    b 4f
+5:  cmp w2, #'r'
+    b.ne 6f
+    mov w2, #13
+    b 4f
+6:  cmp w2, #'b'
+    b.ne 7f
+    mov w2, #8
+    b 4f
+7:  cmp w2, #'f'
+    b.ne 8f
+    mov w2, #12
+    b 4f
+8:  // \" \\ \/ or unknown: keep char as-is
+4:  strb w2, [x5], #1
+    b 0b
+1:  strb w2, [x5], #1            // regular byte (incl. literal UTF-8)
+    b 0b
+2:  // \uXXXX -> w0 (inline hex, x6 = remaining count)
+    mov w0, #0
+    mov w6, #4
+10: ldrb w3, [x4], #1
+    cmp w3, #'9'
+    b.hi 11f
+    sub w3, w3, #'0'
+    b 12f
+11: cmp w3, #'F'
+    b.hi 13f
+    sub w3, w3, #'A'
+    add w3, w3, #10
+    b 12f
+13: sub w3, w3, #'a'
+    add w3, w3, #10
+12: lsl w0, w0, #4
+    orr w0, w0, w3
+    subs w6, w6, #1
+    b.ne 10b
+    // surrogate? (w0 = hi)
+    movz w3, #0xD800
+    sub w3, w0, w3
+    cmp w3, #0x400
+    b.hs 14f
+    ldrb w3, [x4]
+    cmp w3, #'\\'
+    b.ne 14f
+    ldrb w3, [x4, #1]
+    cmp w3, #'u'
+    b.ne 14f
+    add x4, x4, #2
+    mov w7, #0
+    mov w6, #4
+15: ldrb w3, [x4], #1
+    cmp w3, #'9'
+    b.hi 16f
+    sub w3, w3, #'0'
+    b 17f
+16: cmp w3, #'F'
+    b.hi 18f
+    sub w3, w3, #'A'
+    add w3, w3, #10
+    b 17f
+18: sub w3, w3, #'a'
+    add w3, w3, #10
+17: lsl w7, w7, #4
+    orr w7, w7, w3
+    subs w6, w6, #1
+    b.ne 15b
+    movz w3, #0xDC00
+    sub w7, w7, w3
+    movz w3, #0xD800
+    sub w0, w0, w3
+    lsl w0, w0, #10
+    add w0, w0, w7
+    mov w3, #1
+    lsl w3, w3, #16              // 0x10000
+    add w0, w0, w3
+14: mov x1, x5
+    bl utf8enc                   // (w0 -> [x1]), clobbers x0-x3
+    mov x5, x1
+    b 0b
+9:  ret
+/* vparse: x0 = hbase, x1 = hlen. Finds "vocab"{...}, stores id->(off,len).
+ * Returns x0 = count stored. State in x19-x24 (saved). */
+vparse:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    mov x19, x0                  // hbase
+    mov x20, x1                  // hlen
+    add x24, x19, x20            // hend
+    mov x22, #0                  // count (0 on early miss)
+    adrp x0, k_vocab
+    add x0, x0, :lo12:k_vocab
+    bl strlen_asm                // x0 = 7
+    mov x3, x0
+    adrp x2, k_vocab
+    add x2, x2, :lo12:k_vocab
+    mov x0, x19
+    mov x1, x20
+    bl memmem
+    cbz x0, 9f                   // 0 entries on miss
+    mov x23, x0                  // scan ptr (at key)
+0:  cmp x23, x24
+    b.hs 9f
+    ldrb w2, [x23], #1
+    cmp w2, #'{'
+    b.ne 0b
+    mov x22, #0                  // count (set early; keep here too)
+1:  cmp x23, x24                // bound check every iteration
+    b.hs 8f
+    // skip ws,','
+    ldrb w2, [x23]
+    cmp w2, #32
+    b.eq 2f
+    cmp w2, #10
+    b.eq 2f
+    cmp w2, #13
+    b.eq 2f
+    cmp w2, #9
+    b.eq 2f
+    cmp w2, #','
+    b.eq 2f
+    cmp w2, #'}'
+    b.eq 8f
+    cmp w2, #'"'
+    b.eq 3f
+    b 9f                         // malformed: stop, return count
+2:  add x23, x23, #1
+    b 1b
+3:  // string at x23: decode in place (read=write=x23+1)
+    add x4, x23, #1
+    mov x5, x4
+    str x4, [sp, #-16]!          // save start (dec clobbers x4)
+    bl dec_str                   // x4=after-quote, x5=end
+    ldr x6, [sp], #16            // start
+    sub x7, x5, x6               // len (x7 survives parse_u64)
+5:  ldrb w2, [x4]                // skip ws, expect ':'
+    cmp w2, #32
+    b.eq 6f
+    cmp w2, #10
+    b.eq 6f
+    cmp w2, #13
+    b.eq 6f
+    cmp w2, #9
+    b.eq 6f
+    cmp w2, #':'
+    b.eq 7f
+    mov x23, x4                  // resync after this string
+    b 1b
+6:  add x4, x4, #1
+    b 5b
+7:  add x4, x4, #1               // past ':'
+11: ldrb w2, [x4]                // skip ws before number
+    cmp w2, #32
+    b.eq 12f
+    cmp w2, #10
+    b.eq 12f
+    cmp w2, #13
+    b.eq 12f
+    cmp w2, #9
+    b.eq 12f
+    b 13f
+12: add x4, x4, #1
+    b 11b
+13: mov x0, x4
+    bl parse_u64                 // x0=id, x1=after
+    mov x23, x1                  // advance
+    mov x1, #262144
+    cmp x0, x1
+    b.hs 1b                      // out of range: skip
+    lsl x1, x0, #4               // id*16
+    adrp x2, VTAB
+    add x2, x2, :lo12:VTAB
+    add x2, x2, x1
+    str x6, [x2]                 // off (abs)
+    str x7, [x2, #8]             // len
+    add x22, x22, #1
+    b 1b
+8:  mov x0, x22
+    b 10f
+9:  mov x0, x22                  // count so far (0 on early miss? x22 unset on miss path! SET x22=0 early. FIX below.)
+10: ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
+    .section .rodata
+    .align 3
+k_vocab:     .asciz "\"vocab\""
+t_vocab:     .asciz "vocab ids: "
+e_vload:     .asciz "ERR vocab load\n"
+t_spot:      .asciz "spot: "
+
+    .section .text
+    .align 2
+/* out_flush: write(1, OUTBUF, cursor-OUTBUF); reset cursor. */
+out_flush:
+    adrp x0, OUTCUR
+    add x0, x0, :lo12:OUTCUR
+    ldr x1, [x0]                 // cursor
+    adrp x2, OUTBUF
+    add x2, x2, :lo12:OUTBUF
+    sub x1, x1, x2               // len
+    cbz x1, 0f
+    mov x0, #1
+    // write(1, OUTBUF, len): x0=1, x1=OUTBUF, x2=len -- x1/x2 reused!
+    // (x1 currently len, x2 = OUTBUF. shuffle:)
+    mov x3, x1                   // len
+    mov x1, x2                   // buf
+    mov x2, x3                   // len
+    mov x8, #64
+    svc #0
+    adrp x0, OUTCUR
+    add x0, x0, :lo12:OUTCUR
+    adrp x1, OUTBUF
+    add x1, x1, :lo12:OUTBUF
+    str x1, [x0]                 // reset cursor
+0:  ret
+/* put_surf: x0 = token id. Appends surface to OUTBUF (skips controls,
+ * byte-tokens emit raw byte, U+2581 -> space). Missing/empty -> skip. */
+put_surf:
+    str x30, [sp, #-16]!
+    lsl x1, x0, #4               // id*16
+    adrp x2, VTAB
+    add x2, x2, :lo12:VTAB
+    add x2, x2, x1
+    ldr x3, [x2]                 // off (abs)
+    ldr x4, [x2, #8]             // len
+    cbz x4, 9f                   // missing/empty: skip
+    adrp x5, OUTCUR
+    add x5, x5, :lo12:OUTCUR
+    ldr x5, [x5]                 // cursor (x5: no calls below? hexval only if byte-tok. bl hexval clobbers x0 only? hexval uses w0! x0 = id (dead after table load? id needed? NO (done). x1-x4: x1 dead, x2 dead, x3=off (NEEDED for loop!), x4=len (NEEDED!). hexval CLOBBERS x0 only? hexval: cmp/sub/add on w0, ret. SAFE for x3/x4/x5 ✓.)
+    ldrb w6, [x3]                // first byte
+    cmp w6, #'<'
+    b.ne 0f
+    // '<...': byte token "<0xHH>"? (len 6)
+    cmp x4, #6
+    b.ne 8f                      // other <...>: skip
+    ldrb w6, [x3, #1]
+    cmp w6, #'0'
+    b.ne 8f
+    ldrb w6, [x3, #2]
+    cmp w6, #'x'
+    b.ne 8f
+    ldrb w6, [x3, #5]
+    cmp w6, #'>'
+    b.ne 8f
+    ldrb w0, [x3, #3]
+    bl hexval                    // w0 = hi nibble (clobbers w0 only)
+    lsl w0, w0, #4
+    str w0, [sp, #-16]!          // save hi (need w0 for lo call!)
+    ldrb w0, [x3, #4]
+    bl hexval                    // w0 = lo
+    ldr w6, [sp], #16            // hi
+    lsl w6, w6, #4
+    orr w0, w6, w0               // byte
+    strb w0, [x5], #1
+    b 7f                         // store cursor, ret
+8:  // control token ('<...>' non-byte, or '[...'): skip. Also check '[':
+    // (already know s[0]=='<': skip unconditionally)
+    b 9f
+0:  cmp w6, #'['
+    b.ne 1f
+    b 9f                         // '[...': skip
+1:  // normal piece: emit with U+2581 -> space (bounds-checked)
+2:  cmp x6, x7
+    b.hs 7f
+    ldrb w0, [x6]                // peek B0
+    cmp w0, #0xE2
+    b.ne 4f
+    add x0, x6, #2               // need 3 bytes
+    cmp x0, x7
+    b.hs 4f
+    ldrb w0, [x6, #1]
+    cmp w0, #0x96
+    b.ne 4f
+    ldrb w0, [x6, #2]
+    cmp w0, #0x81
+    b.ne 4f
+    add x6, x6, #3               // consume U+2581
+    mov w0, #32
+    strb w0, [x5], #1
+    b 2b
+4:  ldrb w0, [x6], #1            // consume+emit single byte
+    strb w0, [x5], #1
+    b 2b
+7:  adrp x0, OUTCUR
+    add x0, x0, :lo12:OUTCUR
+    str x5, [x0]
+9:  ldr x30, [sp], #16
+    ret
+
+    .section .bss
+    .align 3
+OUTCUR:      .skip 8
+J_path:      .skip 8
+
+    .section .text
+    .align 2
+/* vocab_load: x0 = tokenizer.json path. mmaps, vparses, spot-checks.
+ * Prints count (expect 262144) + surfaces of 2,107,1567,108. */
+vocab_load:  // x0 = tokjson path. mmaps, vparses, spot-checks, inits OUTCUR.
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    mov x1, x0                   // path
+    mov x0, #-100                // AT_FDCWD
+    mov x2, #0
+    mov x3, #0
+    mov x8, #56
+    svc #0                       // openat
+    cmp x0, #0
+    b.lt 9f
+    str x0, [sp, #-16]!          // save fd
+    mov x8, #62                  // lseek END
+    ldr x0, [sp]                 // fd (peek)
+    mov x1, #0
+    mov x2, #2
+    svc #0
+    cmp x0, #0
+    b.le 9f
+    mov x20, x0                  // size
+    mov x8, #222                 // mmap
+    mov x0, #0
+    mov x1, x20
+    mov x2, #1
+    mov x3, #2
+    ldr x4, [sp]                 // fd (peek)
+    mov x5, #0
+    svc #0
+    cmp x0, #0
+    b.lt 9f
+    mov x19, x0                  // base
+    ldr x0, [sp], #16            // fd (pop)
+    mov x8, #57
+    svc #0                       // close (x19=base, x20=size intact? close uses x0/x8 only ✓)
+    mov x0, x19                  // hbase
+    mov x1, x20                  // hlen
+    bl vparse                    // x0 = count
+    str x0, [sp, #-16]!          // save count
+    adrp x0, t_vocab
+    add x0, x0, :lo12:t_vocab
+    bl print_cstr
+    ldr x0, [sp], #16            // count
+    bl print_u64                 // expect 262144
+    bl print_nl
+    // OUTCUR = OUTBUF
+    adrp x0, OUTCUR
+    add x0, x0, :lo12:OUTCUR
+    adrp x1, OUTBUF
+    add x1, x1, :lo12:OUTBUF
+    str x1, [x0]
+    // spot checks: raw surfaces of 2,107,1567,108
+    mov w0, #2
+    bl vspot
+    mov w0, #107
+    bl vspot
+    mov w0, #1567
+    bl vspot
+    mov w0, #108
+    bl vspot
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+9:  adrp x0, e_vload
+    add x0, x0, :lo12:e_vload
+    bl print_cstr
+    mov x0, #1
+    mov x8, #SYS_EXIT
+    svc #0
+/* vspot: w0 = id. Prints raw surface + newline (tests VTAB, not skip logic). */
+vspot:
+    str x30, [sp, #-16]!
+    lsl x1, x0, #4
+    adrp x2, VTAB
+    add x2, x2, :lo12:VTAB
+    add x2, x2, x1
+    ldr x1, [x2]                 // off
+    ldr x2, [x2, #8]             // len
+    cbz x2, 0f                   // missing: print nothing (still nl below? just ret)
+    mov x0, #1
+    // write(1, off, len): x0=1, x1=off, x2=len
+    mov x8, #64
+    svc #0
+0:  mov w0, #10
+    bl print_ch
     ldr x30, [sp], #16
     ret
