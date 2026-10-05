@@ -563,6 +563,7 @@ _start:
     bl file_stage_after_bench
     bl tables_test
     bl fwd_layer0
+    bl decode_test
     mov x0, #0
     mov x8, #SYS_EXIT
     svc #0
