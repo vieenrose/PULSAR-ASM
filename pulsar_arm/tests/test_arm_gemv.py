@@ -31,10 +31,12 @@ def main():
     worst = 0.0
     for M, K in ((1024, 640), (2048, 640), (640, 1024), (262144, 640)):
         Wf = rng.standard_normal((M, K)).astype(np.float32)
-        Wb = np.empty((M, K), dtype=np.uint16)
-        Wb[:] = ((Wf.view(np.uint32)) >> 16).astype(np.uint16)
+        Wb = ((Wf.view(np.uint32)) >> 16).astype(np.uint16)
         x = rng.standard_normal(K).astype(np.float32)
-        want = Wf @ x
+        # widen the SAME bf16 bits both sides read: isolates kernel arithmetic
+        # from input rounding (which production shares, reading one blob).
+        Wref = ((Wb.astype(np.uint32)) << 16).view(np.float32)
+        want = Wref @ x
         got = np.zeros(M, dtype=np.float32)
         t0 = time.perf_counter()
         lib.gemv_bf16(M, K, Wb.ctypes.data, x.ctypes.data, got.ctypes.data)
