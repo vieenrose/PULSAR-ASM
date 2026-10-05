@@ -3234,39 +3234,74 @@ decode_test:
     ldr x4, [sp]                 // peek ms_x100
     mov x3, #100
     udiv x0, x4, x3              // int
-    msub x1, x0, x3, x4          // frac
-    str x1, [sp, #-16]!          // save frac
+    msub x5, x0, x3, x4          // frac -> x5 (safe across print_u64)
     bl print_u64                 // int
-    ldr x1, [sp], #16            // frac
+    mov x2, #10
+    udiv x3, x5, x2              // tens
+    msub x4, x3, x2, x5          // ones (x3/x4 safe across print_ch)
+    add x3, x3, #'0'
+    add x4, x4, #'0'
     mov w0, #'.'
     bl print_ch
-    mov x2, #10
-    udiv x3, x1, x2              // tens
-    msub x0, x3, x2, x1          // ones
-    add x3, x3, #'0'
-    add x0, x0, #'0'
-    mov w1, w3                   // tens -> w1? print_ch takes w0! sequence:
-    // print tens (in w3), then ones (in w0): use stack for ones
-    str x0, [sp, #-16]!          // save ones
-    mov w0, w3                   // tens -- WAIT w3 holds tens? tens in x3 ✓
-    bl print_ch
-    ldr x0, [sp], #16            // ones
-    bl print_ch
+    mov w0, w3
+    bl print_ch                  // tens
+    mov w0, w4
+    bl print_ch                  // ones
     bl print_nl
     // tok/s: tps_x100 = 3200000/ms_total; ms_total = dt*1000/freq
-    ldr x2, [sp, #8]             // peek dt? stack: [ms_x100][dt][x30...]. [sp]=ms_x100, [sp+8]=dt
-    // (ms_x100 no longer needed after METRIC? METRIC needs ms_x100 AGAIN below! keep it: peek, don't pop yet)
+    // stack: [ms_x100][dt][x21][x19,x20][x30]. dt at [sp,#8].
     adrp x0, t_tps2
     add x0, x0, :lo12:t_tps2
     bl print_cstr
     ldr x2, [sp, #8]             // dt
-    // recompute freq? LOST (x0 clobbered long ago). RELOAD freq via mrs (cheap, constant)!
     mrs x0, cntfrq_el0
     mov x1, #1000
     mul x1, x2, x1               // dt*1000
     udiv x1, x1, x0              // ms_total
-    mov x0, #3200000             // 32*100*1000 -- movz+movk? 3200000 = 0x30D400: movz #0xD400 + movk #0x30. GAS may reject plain mov!
-    // (expand below)
-    b 4f
-4:  ldr x30, [sp], #16
+    movz x0, #0xd400
+    movk x0, #0x30, lsl #16      // 3200000
+    udiv x0, x0, x1              // tps_x100
+    mov x3, #100
+    udiv x4, x0, x3              // int
+    msub x5, x4, x3, x0          // frac
+    mov x0, x4
+    bl print_u64
+    mov x2, #10
+    udiv x3, x5, x2
+    msub x4, x3, x2, x5
+    add x3, x3, #'0'
+    add x4, x4, #'0'
+    mov w0, #'.'
+    bl print_ch
+    mov w0, w3
+    bl print_ch
+    mov w0, w4
+    bl print_ch
+    bl print_nl
+    // METRIC (ms_x100 still on stack top)
+    adrp x0, t_metric2
+    add x0, x0, :lo12:t_metric2
+    bl print_cstr
+    ldr x4, [sp]                 // ms_x100
+    mov x3, #100
+    udiv x0, x4, x3
+    msub x5, x0, x3, x4
+    bl print_u64
+    mov x2, #10
+    udiv x3, x5, x2
+    msub x4, x3, x2, x5
+    add x3, x3, #'0'
+    add x4, x4, #'0'
+    mov w0, #'.'
+    bl print_ch
+    mov w0, w3
+    bl print_ch
+    mov w0, w4
+    bl print_ch
+    bl print_nl
+    add sp, sp, #16              // drop ms_x100
+    add sp, sp, #16              // drop dt
+    ldr x21, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
     ret
