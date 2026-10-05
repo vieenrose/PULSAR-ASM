@@ -102,7 +102,7 @@ checkpoint's own `temperature 1.0 · top_k 64 · top_p 0.95` with `--temp/--top-
 | weights streamed | 9.258 GB per token → **54.5 GB/s** |
 | prefill | 48 tokens in 8.2 s (one token per step — prefill is not batched) |
 | engine | **8,948 bytes** of assembly, AVX2 encodings only |
-| correctness | 8-token greedy rollout matches an independent NumPy reference token for token, logits rel ≈ 2e-6; every blob tensor verified against the checkpoint |
+| correctness | 8-token greedy rollout matches an independent NumPy reference token for token, logits rel ≈ 2e-6; every blob tensor verified against the checkpoint; and against HuggingFace's own `gemma4` code loaded straight from the blob — **11 of 12 greedy tokens identical**, splitting only at a bf16 near-tie (`tools/ref_gemma4_hf.py --compare`) |
 
 Measured on a 4-core Linux host with the 9.258 GB blob on a RAM-backed mount. On DRAM the step
 is bandwidth-bound rather than compute-bound, which is exactly why speculative decoding is worth
@@ -138,12 +138,14 @@ Status, honestly:
 | MTP drafter in assembly | not written — the NumPy drafter is slower than the target it drives |
 | shutdown | `close()` used to join spin workers that were never told to stop; fixed |
 | reset between conversations | clears activations as well as KV; a reset engine now reproduces a fresh one exactly (it used to keep the previous PLE history) |
+| agreement with other engines | HF `gemma4` over the same weights produces this engine's trajectory. llama.cpp's `gemma4` path does not — it scores `用` at 0.913 where HF says 0.128, and its Chinese reads better because it is computing something else ([write-up](doc/llamacpp-gemma4-divergence.md)) |
 
 ```bash
 python3 tools/convert_gemma4_safetensors.py --out /mnt/edge/pulsar/gemma4_e2b.bin
 python3 tools/verify_gemma4_blob.py --blob /mnt/edge/pulsar/gemma4_e2b.bin
 python3 tests/test_gemma4_kernels.py && python3 tests/test_gemma4_engine.py
 python3 run_gemma4_chat.py --demo        # the gifs above (add --lang zh / --temp 1.0)
+python3 tools/ref_gemma4_hf.py --compare    # HF ground truth vs the engine, same weights
 python3 tools/bench_gemma4.py            # the table above
 python3 tools/make_demo_gif.py --lang en # regenerate a clip; --lang zh for the Chinese one
 ```
