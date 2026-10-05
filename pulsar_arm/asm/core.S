@@ -3744,7 +3744,7 @@ vocab_load:  // x0 = tokjson path. mmaps, vparses, spot-checks, inits OUTCUR.
     mov x8, #222                 // mmap
     mov x0, #0
     mov x1, x20
-    mov x2, #1
+    mov x2, #3                   // PROT_READ|WRITE (in-place decode, private)
     mov x3, #2
     ldr x4, [sp]                 // fd (peek)
     mov x5, #0
