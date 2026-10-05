@@ -3596,6 +3596,9 @@ vparse:
     str x6, [x2]                 // off (abs)
     str x7, [x2, #8]             // len
     add x22, x22, #1
+    mov x0, #28000               // TEMP CAP (bisection)
+    cmp x22, x0
+    b.hs 8f                      // clean exit with count
     tst x22, #0x3FF              // progress every 1024
     b.ne 14f
     str x22, [sp, #-16]!
