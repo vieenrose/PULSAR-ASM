@@ -1242,7 +1242,7 @@ t_l17d:      .asciz "l17_down rows cols: "
 e_open:      .asciz "ERR open\n"
 e_seek:      .asciz "ERR seek\n"
 e_map:       .asciz "ERR mmap\n"
-t_usage:     .asciz "usage: core <model.safetensors> <tokenizer.json> [tok]\n"
+t_usage:     .asciz "usage: core <model.safetensors> <vocab.bin> [tok] [mode] [bpe.bin] [temp_milli] [topp_milli] [gencap]\n  mode: 0 greedy (default), 1 sample, c chat REPL (needs bpe.bin)\n  temp default 1000 (min 50), topp default 950, gencap default 128 (max 400)\n"
 
     .section .bss
     .align 3
