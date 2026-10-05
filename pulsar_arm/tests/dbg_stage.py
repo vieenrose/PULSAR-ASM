@@ -73,7 +73,7 @@ def main():
                       for t in range(3)])
         avs = []
         for j in range(4):
-            sc = kr[0, :, 0, :] @ (qr[0, j, 2, :] / 16.0)
+            sc = kr[:, 0, :] @ (qr[2, j, :] / 16.0)
             sc = sc - sc.max()
             w = np.exp(sc).astype(np.float64)
             w /= w.sum()
