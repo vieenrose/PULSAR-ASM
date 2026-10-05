@@ -16,6 +16,10 @@
 
 void gemv_bf16(int M, int K, const uint16_t *W, const float *x, float *y) {
     for (int m = 0; m < M; m++) {
+        /* hint the next weight row (~1.3KB ahead). Hint-only: no effect
+         * on results; helps only if the HW prefetcher lags at page edges. */
+        if (m + 1 < M)
+            __builtin_prefetch(W + (int64_t)(m + 1) * K, 0, 3);
         const uint16_t *row = W + (int64_t)m * K;
         float32x4_t a0 = vdupq_n_f32(0.0f);
         float32x4_t a1 = vdupq_n_f32(0.0f);
