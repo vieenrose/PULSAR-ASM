@@ -34,7 +34,8 @@ EPS = 1e-6
 
 
 def build():
-    r = subprocess.run(["gcc", "-O3", "-mcpu=cortex-a72", "-fPIC", "-shared"] + SRC + ["-o", SO, "-lm"],
+    r = subprocess.run(["gcc", "-O3", "-mcpu=cortex-a72", "-fno-math-errno", "-fno-trapping-math",
+      "-fPIC", "-shared"] + SRC + ["-o", SO, "-lm"],
                        capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stderr)
