@@ -3212,7 +3212,11 @@ decode_test:
     ldr x19, [sp], #16
     add w20, w20, #1
     b 2b
-3:  bl print_nl
+3:  mrs x0, cntvct_el0           // end ticks (G_t1 was never stored!)
+    adrp x1, G_t1
+    add x1, x1, :lo12:G_t1
+    str x0, [x1]
+    bl print_nl
     mrs x0, cntfrq_el0           // freq
     adrp x1, G_t0
     add x1, x1, :lo12:G_t0
@@ -3221,16 +3225,6 @@ decode_test:
     add x2, x2, :lo12:G_t1
     ldr x2, [x2]
     sub x2, x2, x1               // dt ticks
-    mov x4, x2                   // dt staging (x4+ survive prints)
-    mov x5, x0                   // freq staging
-    mov x0, x4
-    bl print_u64                 // DIAG dt
-    bl print_sp
-    mov x0, x5
-    bl print_u64                 // DIAG freq
-    bl print_nl
-    mov x2, x4                   // restore dt
-    mov x0, x5                   // restore freq
     str x2, [sp, #-16]!          // save dt
     // ms_x100/token = dt*1e5/(freq*32)
     movz x1, #0x86a0
