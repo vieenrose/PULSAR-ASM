@@ -549,6 +549,7 @@ _start:
     bl print_cstr
     bl run_tests
     bl microbench
+    bl kern_tests
     ldr x0, [sp]                  // argc
     add x1, sp, #8                // argv
     bl file_stage_after_bench
@@ -1084,3 +1085,688 @@ file_stage_after_bench:
     mov x0, #0
     mov x8, #SYS_EXIT
     svc #0
+
+
+/* ---------------- stage B-2: compute kernels ---------------- */
+    .section .text
+    .align 2
+
+/* rmsnorm_f32(out,x0 w,x1 x,x2 n,w3 eps,s0). Mirrors neon_ops.c incl. the
+ * (x*w)*inv vector vs (x*inv)*w tail quirk. */
+    .global rmsnorm_f32
+rmsnorm_f32:
+    str s0, [sp, #-16]!          // spill eps
+    movi v0.4s, #0
+    mov w9, #0
+0:  add w10, w9, #4
+    cmp w10, w3
+    b.hi 1f
+    ld1 {v1.4s}, [x2, x9, lsl #2]
+    fmla v0.4s, v1.4s, v1.4s
+    add w9, w9, #4
+    b 0b
+1:  addv s0, v0.4s
+    mov w10, w9
+2:  cmp w10, w3
+    b.hs 3f
+    ldr s1, [x2, x10, lsl #2]
+    fmul s1, s1, s1
+    fadd s0, s0, s1
+    add w10, w10, #1
+    b 2b
+3:  scvtf s1, w3
+    fdiv s1, s0, s1              // e/n
+    ldr s2, [sp], #16            // eps
+    fadd s1, s1, s2
+    fsqrt s1, s1
+    fmov s2, #1.0
+    fdiv s1, s2, s1              // inv
+    dup v4.4s, v1.s[0]           // broadcast inv (s1)
+    mov w9, #0
+4:  add w10, w9, #4
+    cmp w10, w3
+    b.hi 5f
+    ld1 {v2.4s}, [x2, x9, lsl #2]
+    ld1 {v3.4s}, [x1, x9, lsl #2]
+    fmul v2.4s, v2.4s, v3.4s
+    fmul v2.4s, v2.4s, v4.4s
+    st1 {v2.4s}, [x0, x9, lsl #2]
+    add w9, w9, #4
+    b 4b
+5:  cmp w9, w3
+    b.hs 6f
+    ldr s2, [x2, x9, lsl #2]
+    fmul s2, s2, s1
+    ldr s3, [x1, x9, lsl #2]
+    fmul s2, s2, s3              // (x*inv)*w
+    str s2, [x0, x9, lsl #2]
+    add w9, w9, #1
+    b 5b
+6:  ret
+
+/* rope_half(v,x0 cos,x1 sin,x2 h,w3). Scalar exact mirror. */
+    .global rope_half
+rope_half:
+    lsl x4, x3, #2               // h*4
+    mov w9, #0
+0:  cmp w9, w3
+    b.hs 1f
+    lsl x5, x9, #2
+    ldr s0, [x0, x5]
+    add x6, x5, x4
+    ldr s1, [x0, x6]
+    ldr s2, [x1, x5]
+    ldr s3, [x2, x5]
+    fmul s4, s0, s2              // a*c (separate roundings, like C)
+    fmul s5, s1, s3              // b*s
+    fsub s4, s4, s5
+    str s4, [x0, x5]
+    fmul s4, s1, s2              // b*c
+    fmul s5, s0, s3              // a*s
+    fadd s4, s4, s5
+    str s4, [x0, x6]
+    add w9, w9, #1
+    b 0b
+1:  ret
+
+/* softmax_f32(buf,x0 n,w1). Scalar mirror; m + counter survive expf via stack. */
+    .global softmax_f32
+softmax_f32:
+    ldr s0, [x0]
+    mov w9, #1
+0:  cmp w9, w1
+    b.hs 1f
+    ldr s1, [x0, x9, lsl #2]
+    fcmp s1, s0
+    b.le 2f
+    fmov s0, s1
+2:  add w9, w9, #1
+    b 0b
+1:  str s0, [sp, #-16]!          // m
+    movi v6.4s, #0                // sum (expf keeps s6+)
+    mov w9, #0
+3:  cmp w9, w1
+    b.hs 4f
+    ldr s0, [x0, x9, lsl #2]
+    ldr s1, [sp]                 // m
+    fsub s0, s0, s1
+    str x9, [sp, #-16]!
+    bl expf_asm
+    ldr x9, [sp], #16
+    str s0, [x0, x9, lsl #2]     // x0 intact (expf uses x9,x10)
+    fadd s6, s6, s0
+    add w9, w9, #1
+    b 3b
+4:  fmov s0, #1.0
+    fdiv s0, s0, s6
+    mov w9, #0
+5:  cmp w9, w1
+    b.hs 6f
+    ldr s1, [x0, x9, lsl #2]
+    fmul s1, s1, s0
+    str s1, [x0, x9, lsl #2]
+    add w9, w9, #1
+    b 5b
+6:  add sp, sp, #16              // drop m
+    ret
+
+/* gelu_mul_f32(out,x0 x,x1 mult,x2 n,w3). Scalar; w9 survives tanhf via stack. */
+    .global gelu_mul_f32
+gelu_mul_f32:
+    mov w9, #0
+0:  cmp w9, w3
+    b.hs 1f
+    ldr s0, [x1, x9, lsl #2]
+    str x9, [sp, #-16]!
+    bl tanhf_asm                 // s0 = t (clobbers x9!)
+    ldr x9, [sp], #16
+    ldr s1, [x1, x9, lsl #2]     // v
+    fmov s2, #0.5
+    fmul s1, s2, s1              // 0.5*v first (C order)
+    fmov s2, #1.0
+    fadd s2, s2, s0              // 1+t
+    fmul s1, s1, s2
+    ldr s2, [x2, x9, lsl #2]
+    fmul s1, s1, s2
+    str s1, [x0, x9, lsl #2]
+    add w9, w9, #1
+    b 0b
+1:  ret
+
+/* attn_scores_f32(s,x0 q,x1 K,x2 n,w3 hd,w4 scale,s0). NEON dots, C order. */
+    .global attn_scores_f32
+attn_scores_f32:
+    str s0, [sp, #-16]!          // spill scale
+    mov w9, #0                   // p
+    lsl x10, w4, #2              // hd*4 row stride (w4 zero-extended)
+0:  cmp w9, w3
+    b.hs 9f
+    mul x11, x9, x10
+    add x13, x2, x11             // row cursor
+    mov x14, x1                  // q cursor
+    movi v20.4s, #0              // single acc (C order)
+    bic w15, w4, #15             // klim
+    mov w12, #0                  // d
+1:  cmp w12, w15
+    b.hs 2f
+    ld1 {v0.4s}, [x13], #16
+    ld1 {v1.4s}, [x14], #16
+    fmla v20.4s, v0.4s, v1.4s
+    add w12, w12, #4
+    b 1b
+2:  addv s0, v20.4s
+3:  cmp w12, w4
+    b.hs 4f
+    ldr s1, [x13], #4
+    ldr s2, [x14], #4
+    fmul s1, s1, s2              // separate mul+add (C order)
+    fadd s0, s0, s1
+    add w12, w12, #1
+    b 3b
+4:  ldr s1, [sp]                 // scale
+    fmul s0, s0, s1
+    str s0, [x0, x9, lsl #2]
+    add w9, w9, #1
+    b 0b
+9:  add sp, sp, #16
+    ret
+
+/* attn_values_f32(out,x0 V,x1 w,x2 n,w3 hd,w4). C order: d-outer, p-inner. */
+    .global attn_values_f32
+attn_values_f32:
+    mov w10, w4                  // hd (write w-reg: x10 zero-extended)
+    mov w9, #0                   // d
+0:  cmp w9, w4
+    b.hs 9f
+    movi v0.4s, #0
+    mov w11, #0                  // p
+1:  cmp w11, w3
+    b.hs 2f
+    madd x12, x11, x10, x9       // p*hd + d (elements)
+    lsl x12, x12, #2
+    add x12, x1, x12
+    ld1 {v1.4s}, [x12]
+    ld1r {v2.4s}, [x2, x11, lsl #2]  // broadcast w[p]
+    fmla v0.4s, v1.4s, v2.4s
+    add w11, w11, #1
+    b 1b
+2:  st1 {v0.4s}, [x0, x9, lsl #2]
+    add w9, w9, #4
+    b 0b
+9:  ret
+
+/* rmsnorm_add_f32(out,x0 w,x1 x,x2 acc,x3 n,w4 eps,s0). Norm + residual. */
+    .global rmsnorm_add_f32
+rmsnorm_add_f32:
+    str s0, [sp, #-16]!
+    movi v0.4s, #0
+    mov w9, #0
+0:  add w10, w9, #4
+    cmp w10, w4
+    b.hi 1f
+    ld1 {v1.4s}, [x2, x9, lsl #2]
+    fmla v0.4s, v1.4s, v1.4s
+    add w9, w9, #4
+    b 0b
+1:  addv s0, v0.4s
+    mov w10, w9
+2:  cmp w10, w4
+    b.hs 3f
+    ldr s1, [x2, x10, lsl #2]
+    fmul s1, s1, s1
+    fadd s0, s0, s1
+    add w10, w10, #1
+    b 2b
+3:  scvtf s1, w4
+    fdiv s1, s0, s1
+    ldr s2, [sp], #16            // eps
+    fadd s1, s1, s2
+    fsqrt s1, s1
+    fmov s2, #1.0
+    fdiv s1, s2, s1              // inv
+    dup v4.4s, v1.s[0]
+    mov w9, #0
+4:  add w10, w9, #4
+    cmp w10, w4
+    b.hi 5f
+    ld1 {v2.4s}, [x2, x9, lsl #2]
+    ld1 {v3.4s}, [x1, x9, lsl #2]
+    fmul v2.4s, v2.4s, v3.4s
+    fmul v2.4s, v2.4s, v4.4s
+    st1 {v2.4s}, [x0, x9, lsl #2]
+    ld1 {v3.4s}, [x3, x9, lsl #2]
+    fadd v3.4s, v3.4s, v2.4s
+    st1 {v3.4s}, [x3, x9, lsl #2]
+    add w9, w9, #4
+    b 4b
+5:  cmp w9, w4
+    b.hs 6f
+    ldr s2, [x2, x9, lsl #2]
+    fmul s2, s2, s1
+    ldr s3, [x1, x9, lsl #2]
+    fmul s2, s2, s3
+    str s2, [x0, x9, lsl #2]
+    ldr s3, [x3, x9, lsl #2]
+    fadd s3, s3, s2
+    str s3, [x3, x9, lsl #2]
+    add w9, w9, #1
+    b 5b
+6:  ret
+
+/* embed_row_f32(out,x0 emb,x1 token,w2 dim,w3 scale,s0). bf16 gather+scale. */
+    .global embed_row_f32
+embed_row_f32:
+    dup v6.4s, v0.s[0]           // broadcast scale (s0)
+    uxtw x5, w2
+    uxtw x6, w3
+    mul x5, x5, x6               // token*dim (elements)
+    lsl x5, x5, #1
+    add x5, x1, x5               // row (u16 ptr)
+    mov w9, #0                   // i
+    bic w10, w3, #7              // ilim = dim & ~7
+0:  cmp w9, w10
+    b.hs 1f
+    ld1 {v0.8h}, [x5], #16
+    shll v1.4s, v0.4h, #16
+    shll2 v2.4s, v0.8h, #16
+    fmul v1.4s, v1.4s, v6.4s
+    fmul v2.4s, v2.4s, v6.4s
+    st1 {v1.4s}, [x0], #16
+    st1 {v2.4s}, [x0], #16
+    add w9, w9, #8
+    b 0b
+1:  cmp w9, w3
+    b.hs 2f
+    ldrh w11, [x5], #2
+    lsl w11, w11, #16
+    fmov s1, w11
+    fmul s1, s1, s0              // w*scale (s0 intact: no calls)
+    str s1, [x0], #4
+    add w9, w9, #1
+    b 1b
+2:  ret
+
+/* argmax_f32(buf,x0 n,w1) -> w0. First max wins. */
+    .global argmax_f32
+argmax_f32:
+    ldr s0, [x0]
+    mov w0, #0
+    mov w9, #1
+0:  cmp w9, w1
+    b.hs 1f
+    ldr s1, [x0, x9, lsl #2]
+    fcmp s1, s0
+    b.le 2f
+    fmov s0, s1
+    mov w0, w9
+2:  add w9, w9, #1
+    b 0b
+1:  ret
+
+/* sum_sq(ptr,x0 n,w1) -> s0 = sum of squares (NEON 4-acc, C hsum order). */
+sum_sq:
+    movi v0.4s, #0
+    mov w9, #0
+0:  add w10, w9, #4
+    cmp w10, w1
+    b.hi 1f
+    ld1 {v1.4s}, [x0, x9, lsl #2]
+    fmla v0.4s, v1.4s, v1.4s
+    add w9, w9, #4
+    b 0b
+1:  addv s0, v0.4s
+2:  cmp w9, w1
+    b.hs 3f
+    ldr s1, [x0, x9, lsl #2]
+    fmul s1, s1, s1
+    fadd s0, s0, s1
+    add w9, w9, #1
+    b 2b
+3:  ret
+
+/* kern_tests: self-consistent kernel checks (no checkpoint needed). */
+kern_tests:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    // -- rmsnorm: patterned x, w=0 -> sum(out^2) ~= 640
+    adrp x0, k_rms
+    add x0, x0, :lo12:k_rms
+    bl print_cstr
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    mov w10, #0
+0:  cmp w10, #640
+    b.hs 1f
+    mov x11, #7
+    mul x11, x10, x11
+    mov x12, #13
+    udiv x13, x11, x12
+    msub x13, x13, x12, x11      // (7i)%13
+    sub x13, x13, #6
+    scvtf s0, x13
+    adrp x11, f_001
+    ldr s1, [x11, :lo12:f_001]
+    fmul s0, s0, s1
+    str s0, [x9, x10, lsl #2]
+    add w10, w10, #1
+    b 0b
+1:  adrp x9, T1                  // w = 0
+    add x9, x9, :lo12:T1
+    mov w10, #0
+2:  cmp w10, #640
+    b.hs 3f
+    str wzr, [x9, x10, lsl #2]
+    add w10, w10, #1
+    b 2b
+3:  adrp x0, T2
+    add x0, x0, :lo12:T2
+    adrp x1, T1
+    add x1, x1, :lo12:T1
+    adrp x2, T0
+    add x2, x2, :lo12:T0
+    mov w3, #640
+    adrp x4, f_eps
+    ldr s0, [x4, :lo12:f_eps]
+    bl rmsnorm_f32
+    adrp x0, T2
+    add x0, x0, :lo12:T2
+    mov w1, #640
+    bl sum_sq
+    bl print_f32                 // expect ~639.9994
+    bl print_nl
+    // -- rope: norm preserved
+    adrp x0, k_rope
+    add x0, x0, :lo12:k_rope
+    bl print_cstr
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    mov w10, #0
+4:  cmp w10, #256
+    b.hs 5f
+    sub w11, w10, #128
+    scvtf s0, w11
+    adrp x11, f_002
+    ldr s1, [x11, :lo12:f_002]
+    fmul s0, s0, s1
+    str s0, [x9, x10, lsl #2]
+    add w10, w10, #1
+    b 4b
+5:  adrp x0, T0
+    add x0, x0, :lo12:T0
+    mov w1, #256
+    bl sum_sq
+    fmov s6, s0                  // before (s6 survives: callees use s0-s5)
+    bl print_f32
+    bl print_sp
+    adrp x9, f_07
+    ldr s0, [x9, :lo12:f_07]
+    bl sincos_asm                // s0=sin s1=cos
+    adrp x9, T1
+    add x9, x9, :lo12:T1
+    adrp x10, T2
+    add x10, x10, :lo12:T2
+    mov w11, #0
+6:  cmp w11, #128
+    b.hs 7f
+    str s0, [x9, x11, lsl #2]
+    str s1, [x10, x11, lsl #2]
+    add w11, w11, #1
+    b 6b
+7:  adrp x0, T0
+    add x0, x0, :lo12:T0
+    adrp x1, T1
+    add x1, x1, :lo12:T1
+    adrp x2, T2
+    add x2, x2, :lo12:T2
+    mov w3, #128
+    bl rope_half
+    adrp x0, T0
+    add x0, x0, :lo12:T0
+    mov w1, #256
+    bl sum_sq
+    bl print_f32                 // expect == before
+    bl print_nl
+    // -- softmax: sum == 1, argmax == 39
+    adrp x0, k_soft
+    add x0, x0, :lo12:k_soft
+    bl print_cstr
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    mov w10, #0
+8:  cmp w10, #40
+    b.hs 9f
+    scvtf s0, w10
+    fmov s1, #0.5
+    fmul s0, s0, s1
+    adrp x11, f_10
+    ldr s1, [x11, :lo12:f_10]
+    fsub s0, s0, s1
+    str s0, [x9, x10, lsl #2]
+    add w10, w10, #1
+    b 8b
+9:  adrp x0, T0
+    add x0, x0, :lo12:T0
+    mov w1, #40
+    bl softmax_f32
+    // scalar sum
+    fmov s6, wzr
+    mov w10, #0
+10: cmp w10, #40
+    b.hs 11f
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    ldr s0, [x9, x10, lsl #2]
+    fadd s6, s6, s0
+    add w10, w10, #1
+    b 10b
+11: fmov s0, s6
+    bl print_f32                 // expect 1.0000000
+    bl print_sp
+    adrp x0, T0
+    add x0, x0, :lo12:T0
+    mov w1, #40
+    bl argmax_f32
+    bl print_u64                 // expect 39
+    bl print_nl
+    // -- gelu: gelu_mul([1],[1],1)[0] ~= 0.8412
+    adrp x0, k_gelu
+    add x0, x0, :lo12:k_gelu
+    bl print_cstr
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    adrp x10, f_1
+    ldr s0, [x10, :lo12:f_1]
+    str s0, [x9]
+    adrp x9, T1
+    add x9, x9, :lo12:T1
+    str s0, [x9]
+    adrp x0, T2
+    add x0, x0, :lo12:T2
+    adrp x1, T0
+    add x1, x1, :lo12:T0
+    adrp x2, T1
+    add x2, x2, :lo12:T1
+    mov w3, #1
+    bl gelu_mul_f32
+    adrp x9, T2
+    add x9, x9, :lo12:T2
+    ldr s0, [x9]
+    bl print_f32
+    bl print_nl
+    // -- scores: q=e0, K=[e0,e1,-e0] -> 0.0625 0 -0.0625
+    adrp x0, k_scores
+    add x0, x0, :lo12:k_scores
+    bl print_cstr
+    adrp x9, T0                  // q = e0 (256)
+    add x9, x9, :lo12:T0
+    mov w10, #0
+12: cmp w10, #256
+    b.hs 13f
+    str wzr, [x9, x10, lsl #2]
+    add w10, w10, #1
+    b 12b
+13: adrp x10, f_1
+    ldr s0, [x10, :lo12:f_1]
+    str s0, [x9]                 // q[0]=1
+    adrp x9, T1                  // K 3x256 zeroed
+    add x9, x9, :lo12:T1
+    mov w10, #0
+14: cmp w10, #768
+    b.hs 15f
+    str wzr, [x9, x10, lsl #2]
+    add w10, w10, #1
+    b 14b
+15: str s0, [x9]                 // K[0][0]=1
+    adrp x10, f_1
+    ldr s0, [x10, :lo12:f_1]
+    str s0, [x9, #1028]          // K[1][1]=1 (row1 off 1024 + 4)
+    fneg s0, s0
+    str s0, [x9, #2048]          // K[2][0]=-1 (row2 off 2048)
+    adrp x0, T2
+    add x0, x0, :lo12:T2
+    adrp x1, T0
+    add x1, x1, :lo12:T0
+    adrp x2, T1
+    add x2, x2, :lo12:T1
+    mov w3, #3
+    mov w4, #256
+    adrp x5, f_scale
+    ldr s0, [x5, :lo12:f_scale]
+    bl attn_scores_f32
+    adrp x9, T2
+    add x9, x9, :lo12:T2
+    ldr s0, [x9]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x9, #4]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x9, #8]
+    bl print_f32
+    bl print_nl
+    // -- values: rows 1/2/3, w=one-hot[1] -> out=2.0
+    adrp x0, k_values
+    add x0, x0, :lo12:k_values
+    bl print_cstr
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    mov w10, #0
+16: cmp w10, #768
+    b.hs 17f
+    lsr x11, x10, #8             // row = i/256 (0,1,2)
+    add x11, x11, #1
+    scvtf s0, x11
+    str s0, [x9, x10, lsl #2]
+    add w10, w10, #1
+    b 16b
+17: adrp x9, T1                  // w = [0,1,0]
+    add x9, x9, :lo12:T1
+    str wzr, [x9]
+    adrp x10, f_1
+    ldr s0, [x10, :lo12:f_1]
+    str s0, [x9, #4]
+    str wzr, [x9, #8]
+    adrp x0, T2
+    add x0, x0, :lo12:T2
+    adrp x1, T0
+    add x1, x1, :lo12:T0
+    adrp x2, T1
+    add x2, x2, :lo12:T1
+    mov w3, #3
+    mov w4, #256
+    bl attn_values_f32
+    adrp x9, T2
+    add x9, x9, :lo12:T2
+    ldr s0, [x9]
+    bl print_f32
+    bl print_sp
+    ldr s0, [x9, #1020]          // out[255]
+    bl print_f32
+    bl print_nl
+    // -- rmsnorm_add: acc=1 + norm
+    adrp x0, k_rmsadd
+    add x0, x0, :lo12:k_rmsadd
+    bl print_cstr
+    adrp x9, T3                  // acc = 1.0 (640)
+    add x9, x9, :lo12:T3
+    adrp x10, f_1
+    ldr s0, [x10, :lo12:f_1]
+    mov w11, #0
+18: cmp w11, #640
+    b.hs 19f
+    str s0, [x9, x11, lsl #2]
+    add w11, w11, #1
+    b 18b
+19: // rebuild x pattern in T0, zero w in T1[0..639]
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    adrp x10, T1
+    add x10, x10, :lo12:T1
+    mov w11, #0
+21: cmp w11, #640
+    b.hs 22f
+    mov x12, #7
+    mul x12, x11, x12
+    mov x13, #13
+    udiv x14, x12, x13
+    msub x14, x14, x13, x12
+    sub x14, x14, #6
+    scvtf s0, x14
+    adrp x12, f_001
+    ldr s1, [x12, :lo12:f_001]
+    fmul s0, s0, s1
+    str s0, [x9, x11, lsl #2]
+    str wzr, [x10, x11, lsl #2]
+    add w11, w11, #1
+    b 21b
+22: adrp x0, T2                  // out
+    add x0, x0, :lo12:T2
+    adrp x1, T1                  // w (zeros)
+    add x1, x1, :lo12:T1
+    adrp x2, T0                  // x
+    add x2, x2, :lo12:T0
+    adrp x3, T3                  // acc (ones)
+    add x3, x3, :lo12:T3
+    mov w4, #640
+    adrp x5, f_eps
+    ldr s0, [x5, :lo12:f_eps]
+    bl rmsnorm_add_f32
+    adrp x9, T3
+    add x9, x9, :lo12:T3
+    ldr s0, [x9]                 // acc[0] = 1 + out[0]
+    bl print_f32
+    bl print_sp
+    adrp x9, T2
+    add x9, x9, :lo12:T2
+    ldr s0, [x9]                 // out[0]
+    bl print_f32
+    bl print_nl
+20: ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
+    .section .rodata
+    .align 3
+k_rms:       .asciz "kern: rmsnorm sum(out^2)[640] = "
+k_rope:      .asciz "kern: rope |v| before after = "
+k_soft:      .asciz "kern: softmax sum argmax = "
+k_gelu:      .asciz "kern: gelu(1) = "
+k_scores:    .asciz "kern: scores = "
+k_values:    .asciz "kern: values[0] values[255] = "
+k_rmsadd:    .asciz "kern: acc[0] out[0] = "
+f_eps:       .float 0.000001
+f_002:       .float 0.02
+f_07:        .float 0.7
+f_10:        .float 10.0
+f_scale:     .float 0.0625
+
+    .section .bss
+    .align 4
+T0:          .skip 2048*4
+T1:          .skip 2048*4
+T2:          .skip 2048*4
+T3:          .skip 2048*4
+
+    .section .text
+    .align 2
+    .global kern_tests
