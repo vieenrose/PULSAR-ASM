@@ -87,7 +87,14 @@ The same rules applied to **Google Gemma 4 E2B-it** (text-only), Linux x86-64, C
 assembly hot path, bf16 weights streamed straight out of the blob, no PyTorch anywhere in the
 inference path.
 
-![gemma 4 e2b chatting](doc/gemma4-chat.gif)
+![gemma 4 e2b chatting in English](doc/gemma4-chat-en.gif)
+
+![gemma 4 e2b chatting in Traditional Chinese](doc/gemma4-chat-zh.gif)
+
+Both clips are real runs of `python3 run_gemma4_chat.py --demo` — no mock, no edited text. The
+Chinese one answers in Traditional Chinese (a CJK-capable monospace font is picked up automatically).
+Each clip decodes with one policy, printed in its own status line: greedy by default, or the
+checkpoint's own `temperature 1.0 · top_k 64 · top_p 0.95` with `--temp/--top-k/--top-p/--seed`.
 
 | measurement | value |
 |---|---|
@@ -127,17 +134,18 @@ Status, honestly:
 | converter, blob, byte-for-byte verification of 372 tensors | works |
 | greedy decode, chat CLI, layer-by-layer parity tests | works |
 | batched verify (B tokens per pass) | B=1 bit-identical to before; **B>1 disagrees and faults** |
+| sampling (temperature → top-k → top-p, xorshift64\* draw) | works — verified against NumPy: exact top-k at vocab 262144, draws within a 3-sigma band, identical logits |
 | MTP drafter in assembly | not written — the NumPy drafter is slower than the target it drives |
-| temperature / top-k / top-p sampler | context fields and head branch done, **kernel faults**, engine stays on argmax |
 | shutdown | `close()` used to join spin workers that were never told to stop; fixed |
+| reset between conversations | clears activations as well as KV; a reset engine now reproduces a fresh one exactly (it used to keep the previous PLE history) |
 
 ```bash
 python3 tools/convert_gemma4_safetensors.py --out /mnt/edge/pulsar/gemma4_e2b.bin
 python3 tools/verify_gemma4_blob.py --blob /mnt/edge/pulsar/gemma4_e2b.bin
 python3 tests/test_gemma4_kernels.py && python3 tests/test_gemma4_engine.py
-python3 run_gemma4_chat.py --demo        # the gif above
+python3 run_gemma4_chat.py --demo        # the gifs above (add --lang zh / --temp 1.0)
 python3 tools/bench_gemma4.py            # the table above
-python3 tools/make_demo_gif.py           # regenerate it
+python3 tools/make_demo_gif.py --lang en # regenerate a clip; --lang zh for the Chinese one
 ```
 
 ---

@@ -13,6 +13,8 @@ and the tok/s comparable across modes. A sampler is a separate change.
 """
 
 import argparse
+import json
+import re
 import os
 import sys
 import time
@@ -29,8 +31,61 @@ TURN_OPEN, TURN_CLOSE = "<|turn>", "<turn|>"
 
 # One scripted reply, used by --demo and by tools/make_demo_gif.py, so the gif
 # and the CLI always show the same run.
-DEMO_PROMPT = ("In one short sentence: what is unusual about running a 2-billion "
-               "parameter language model in pure x86 assembly?")
+DEMO_PROMPT = ("In one short sentence: why is a CPU running a language model "
+               "limited by memory rather than by its cores?")
+
+
+def gen_config(path):
+    """The checkpoint's own sampling defaults, for once and for all.
+
+    Kept separate from load_tokenizer so the model class and the tests never
+    inherit a sampling policy they did not ask for - parity wants argmax.
+    """
+    gc = os.path.join(path, "generation_config.json")
+    try:
+        return json.load(open(gc))
+    except OSError:
+        return {}
+
+
+def sampler_from_config(eng, path, args):
+    """Configure the head; returns a label for the footer."""
+    gc = gen_config(path)
+    if getattr(args, "greedy", False) or not gc.get("do_sample", False):
+        eng.set_sampling(temp=0)
+        return "greedy"
+    temp = args.temp if args.temp is not None else gc.get("temperature", 1.0)
+    topk = args.top_k if args.top_k is not None else gc.get("top_k", 64)
+    topp = args.top_p if args.top_p is not None else gc.get("top_p", 0.95)
+    eng.set_sampling(temp=temp, top_k=topk, top_p=topp, seed=args.seed)
+    return f"temp {temp} \u00b7 top_k {topk} \u00b7 top_p {topp}"
+
+
+_BYTE_TOK = re.compile(r"<0x([0-9A-Fa-f]{2})>")
+
+
+def decode_text(tk, ids):
+    """Decode generated ids the way Gemma's SentencePiece model actually means.
+
+    gemma-4's tokenizer.json sets byte_fallback: the vocabulary carries 256
+    <0xNN> tokens and any character that fell apart gets re-encoded as a byte
+    run. HF's GemmaTokenizer.decode (the class this tokenizer.json declares)
+    drops those tokens on the floor, so a reply that contains one silently loses
+    its content: "2" disappears from "**2**-billion", and CJK, which leans on
+    byte fallback hardest, turns to noise. Walking the pieces directly and
+    turning <0xNN> back into bytes is what spiece_decode would have done.
+    """
+    specials = tk.all_special_tokens
+    out = bytearray()
+    for tok in tk.convert_ids_to_tokens(ids):
+        if tok is None or tok in specials:
+            continue
+        m = _BYTE_TOK.fullmatch(tok)
+        if m:
+            out.append(int(m.group(1), 16))
+        else:
+            out.extend(tok.replace("\u2581", " ").encode("utf-8", "surrogatepass"))
+    return out.decode("utf-8", "replace")
 
 
 def load_tokenizer(path):
@@ -152,21 +207,27 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--max-new", type=int, default=512)
     ap.add_argument("--demo", action="store_true", help="one scripted reply, for the README gif")
+    ap.add_argument("--greedy", action="store_true", help="argmax instead of the checkpoint's sampling")
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--temp", type=float, default=None)
+    ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--top-p", type=float, default=None)
     a = ap.parse_args()
 
     tk, eos = load_tokenizer(a.tok)
     print("loading engine ...", flush=True)
     eng = Gemma4(a.weights, max_seq=a.max_seq, n_threads=a.threads, verbose=True)
+    mode = sampler_from_config(eng, a.tok, a)
     chat = Chat(eng, tk, eos, max_new=a.max_new)
 
     if a.demo:
         print(f"\n\033[1myou\033[0m> {DEMO_PROMPT}\n")
         chat.turn(DEMO_PROMPT)
-        print(f"\n\033[90m{chat.tps:.1f} tok/s  ·  greedy  ·  {a.threads} cores\033[0m")
+        print(f"\n\033[90m{chat.tps:.1f} tok/s  ·  {mode}  ·  {a.threads} cores\033[0m")
         eng.close()
         return
 
-    print("\nPULSAR-Gemma4 · E2B-it text-only · greedy · /reset clears the cache · /exit\n")
+    print(f"\nPULSAR-Gemma4 · E2B-it text-only · {mode} · /reset clears the cache · /exit\n")
     while True:
         try:
             q = input("\033[1myou\033[0m> ").strip()

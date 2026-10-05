@@ -1,11 +1,4 @@
 ; ==============================================================================
-; STATUS: NOT WORKING YET - do not call it. The engine's TEMP field stays 0, so
-; the head runs the argmax and this code never executes. Faults land between the
-; nucleus cut and the draw, where the only memory operands are frame locals; the
-; stages either side of it run clean, which is the part that does not add up and
-; is why this stopped being worth the debugging time. Re-derive the frame map
-; against tests/kernels_test_mod.asm before trusting anything below.
-; ==============================================================================
 ; Project PULSAR-ASM | Sub-Assembly: sub_sampler_nucleus_flat.asm
 ; ------------------------------------------------------------------------------
 ; Temperature -> top-k -> top-p (nucleus) sampling, AVX2, zero CRT.
@@ -52,9 +45,11 @@ SK_NORM equ 872
 SK_KEEP equ 880
 NEG_INF equ 0FF800000h
 SK_FRAME equ 1032
-SK_A5 equ SK_FRAME + 40
-SK_A6 equ SK_FRAME + 48
-SK_A7 equ SK_FRAME + 56
+SK_PUSH  equ 48                             ; six pushes in the prologue
+SK_ARG   equ SK_FRAME + SK_PUSH + 8         ; +8: CALL pushed the return address
+SK_A5 equ SK_ARG + 32
+SK_A6 equ SK_ARG + 40
+SK_A7 equ SK_ARG + 48
 SK_RNGMUL equ 0x2545F4914F6CDD1D
 
 sampler_nucleus_avx2:
@@ -68,9 +63,12 @@ sampler_nucleus_avx2:
     mov     [rsp + SK_LOGITS], rcx
     mov     [rsp + SK_N], rdx
     mov     [rsp + SK_P], r9                  ; float bits
-    ; Stack args sit 8 bytes above the caller's slots, because CALL pushed the
-    ; return address: arg5 at [rsp+40], arg6 at [rsp+48], arg7 at [rsp+56] - all
-    ; of them shifted again by the frame below.
+    ; Where the stack args are, exactly. The caller put arg5..arg7 in its own
+    ; [rsp+32,40,48]; CALL pushed the return address (+8); then the six pushes
+    ; and the frame below moved rsp by another 48 + SK_FRAME. Both shifts count,
+    ; and forgetting the pushes is what made this kernel fault: it read the rng
+    ; and out pointers out of the return-address slot, so the state load walked
+    ; into whatever address a return pointer happens to be.
     mov     rax, [rsp + SK_A5]                ; temperature
     mov     [rsp + SK_TEMP], rax
     mov     rax, [rsp + SK_A6]                ; rng state

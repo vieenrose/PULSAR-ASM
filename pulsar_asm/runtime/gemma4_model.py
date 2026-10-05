@@ -326,17 +326,15 @@ class Gemma4:
     def _get(self, field):
         return ctypes.c_uint64.from_address(self.ctx_mem.ctypes.data + self.CTR[field]).value
 
-    def set_sampling(self, temp=1.0, top_k=64, top_p=0.95, seed=None):
+    def set_sampling(self, temp=0.0, top_k=64, top_p=0.95, seed=None):
         """temperature -> top-k -> nucleus, the way generation_config.json asks.
 
-        Not usable yet: sampler_nucleus_avx2 faults, so turning TEMP on would
-        take the process down with it. The plumbing (context fields, the head's
-        branch, this API) is finished and the kernel is the only gap; raising
-        here keeps a future CLI flag from finding that out the hard way.
+        Defaults to greedy on purpose. Anything else would make a bare
+        set_sampling(seed=...) - which is what you write when you only want a
+        seed - silently switch sampling on, and the parity tests pin an argmax
+        trajectory. The chat CLI passes the checkpoint's generation_config
+        values explicitly.
         """
-        raise NotImplementedError(
-            "sampler_nucleus_avx2 faults; see sub_assemblies/"
-            "sub_sampler_nucleus_flat.asm - the engine stays on argmax")
         self._set("TEMP", _fbits(temp) if temp else 0)
         self._set("TOPK", int(top_k))
         self._set("TOPP", _fbits(top_p))
@@ -344,10 +342,23 @@ class Gemma4:
             self.rng[0] = int(seed) or 1
 
     def reset(self):
+        """Clear every piece of recurrent state, not just the KV caches.
+
+        The per-layer PLE keeps its own recent-row ring in the activation
+        buffers, so zeroing only K/V left a previous conversation's PLE history
+        behind. That made the first turn after a reset depend on whatever the
+        process had generated before it, and two runs that should have been the
+        same - a fresh engine versus one that had already answered something -
+        drifted apart. Zeroing the activation set makes a reset engine agree with
+        a new one, which is what "deterministic" has to mean here.
+        """
         for k, (kk, vv) in self._caches.items():
             kk[:] = 0.0
             vv[:] = 0.0
-        self.pos = 0
+        for a in self.buf.values():
+            a[:] = 0.0                    # activations only - never self._keep,
+        self.pos = 0                      # that also holds the rope and scale tables
+
         self._set("POS", 0)
 
     def forward(self, token):

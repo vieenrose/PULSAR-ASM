@@ -40,8 +40,9 @@ def case(name, ok, detail=""):
 def _sampler_cases(X, allok):
     """generation_config's temperature/top_k/top_p against numpy's same cut.
 
-    Kept behind PULSAR_TEST_SAMPLER=1: the kernel faults today, and a suite
-    that crashes is worse than a suite that says skip.
+    The k=64 case is the interesting one: with logits descending by exactly 1.0
+    the nucleus keeps 3 tokens at p=0.95 and 7 at p=0.999, so a wrong cut shows
+    up as draws landing on the wrong candidate rather than as a rounding error.
     """
     g_samp = X("sampler_nucleus_avx2", 7)
     V = 4096
@@ -62,12 +63,18 @@ def _sampler_cases(X, allok):
         nkeep = int(np.searchsorted(cum, p, side="left")) + 1
         q = w[:nkeep] / w[:nkeep].sum()
         emp = counts[:nkeep] / draws
-        worst = float(np.max(np.abs(emp - q) / np.maximum(q, 1e-9)))
+        # Compare inside each bin's own sampling noise. A relative-error check is
+        # meaningless on a bin holding 0.2% of the mass - six expected draws move
+        # 40% on their own - so the bound is 3 sigma plus a floor, which is what
+        # makes the tail of the nucleus testable at all.
+        tol = 3.0 * np.sqrt(q * (1.0 - q) / draws) + 1e-4
+        over = float(np.max(np.abs(emp - q) - tol))
         allok &= case(f"nucleus k={k} p={p}",
-                      counts[k:].sum() == 0 and worst < 0.08 and
+                      counts[k:].sum() == 0 and over <= 0 and
                       np.array_equal(lg, base),
                       f"kept={nkeep} outside_top_k={counts[k:].sum()} "
-                      f"max rel freq err={worst:.3f} logits intact={np.array_equal(lg, base)}")
+                      f"worst 3-sigma excess={over:+.4f} "
+                      f"logits intact={np.array_equal(lg, base)}")
     # same seed, same sequence: the state lives where the kernel advances it
     a = np.zeros(1, np.int64); b = np.zeros(1, np.int64)
     sa = np.zeros(1, np.uint64); sa[0] = 99
@@ -266,10 +273,7 @@ def main():
     # generation_config asks for temperature 1.0, top_k 64, top_p 0.95. The
     # logits here descend by exactly 1.0 per token, so the whole distribution is
     # known in closed form and the cut lands a few tokens in.
-    if os.environ.get("PULSAR_TEST_SAMPLER"):
-        allok &= _sampler_cases(X, allok)
-    else:
-        print("  SKIP nucleus sampler (faulting; sub_sampler_nucleus_flat)")
+    allok &= _sampler_cases(X, allok)
 
     allok &= lint_avx2_purity()
     print("\n" + ("ALL GEMMA-4 KERNEL TESTS PASS" if allok else "FAILURES PRESENT"))
