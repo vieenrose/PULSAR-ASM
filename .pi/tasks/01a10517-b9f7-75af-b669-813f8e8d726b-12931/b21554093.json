@@ -1,0 +1,28 @@
+{
+  "id": "b21554093",
+  "name": "GIF transcript take two",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hello\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 1000 950 48 > /tmp/gifdemo2.log 2>&1; echo EXIT=$?; awk \"/chat ready/{f=1} f\" /tmp/gifdemo2.log | cut -c1-70 | head -12'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b21554093.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791244519571,
+  "endTime": 1791244531164,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 113072,
+  "bytesWritten": 202,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
