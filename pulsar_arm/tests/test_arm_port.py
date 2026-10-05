@@ -58,18 +58,21 @@ def main():
          f"max|d|={float(np.abs(lg1 - lg2).max()):.2e}")
 
     # module-level: HF layer 17 on our exact L16 output matches our L17 output
-    arm.tape = []
-    arm.forward(1567)
+    # (fresh pos-0 instance so HF's empty-cache module sees the same 1-key
+    # context our driver saw; a pos>0 tape would need a prefilled cache)
+    arm0 = Arm270m(snap, max_seq=64, verbose=False)
+    arm0.tape = []
+    arm0.forward(1567)
     with torch.no_grad():
         L = hf.model.layers[17]
         cos, sin = hf.model.rotary_emb(torch.empty(1, 1, 640),
-                                       torch.tensor([[arm.pos - 1]]),
+                                       torch.tensor([[0]]),
                                        layer_type="full_attention")
-        y = L(hidden_states=torch.from_numpy(arm.tape[16]).unsqueeze(0).unsqueeze(0),
+        y = L(hidden_states=torch.from_numpy(arm0.tape[16]).unsqueeze(0).unsqueeze(0),
               position_embeddings=(cos, sin), attention_mask=None,
               past_key_values=DynamicCache())
         y = np.asarray(y[0, 0] if not isinstance(y, tuple) else y[0][0, 0])
-    d = float(np.abs(y - arm.tape[17]).max())
+    d = float(np.abs(y - arm0.tape[17]).max())
     case("module L17 agreement", d < 0.05, f"max|d|={d:.4f} (values O(1e4))")
     print("ALL PORT CHECKS PASS" if not falls else f"FAILURES: {falls}")
     return 1 if falls else 0
