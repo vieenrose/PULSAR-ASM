@@ -743,7 +743,7 @@ find_tensor:
 0:  ldrb w2, [x23], #1
     cmp w2, #'['
     b.ne 0b
-    mov x3, #0                   // nd
+    mov x24, #0                  // nd (x24: parse_u64 can't clobber)
 1:  ldrb w2, [x23]
     cmp w2, #']'
     b.eq 2f
@@ -754,16 +754,16 @@ find_tensor:
     mov x0, x23
     bl parse_u64                  // x0=val, x1=after
     mov x23, x1
-    cmp x3, #4
+    cmp x24, #4
     b.hs 4f
-    lsl x4, x3, #3
+    lsl x4, x24, #3
     add x4, x4, #16
     str x0, [x22, x4]
-4:  add x3, x3, #1
+4:  add x24, x24, #1
     b 1b
 3:  add x23, x23, #1
     b 1b
-2:  str x3, [x22, #48]           // nd
+2:  str x24, [x22, #48]          // nd
     // offsets key from name hit (x19 was overwritten? no: x19=name ptr;
     // name hit is in x23's history... RECOVER: x19 still = name string ptr,
     // not hit. Hit was overwritten by shape pos. RE-SEARCH name? No:
