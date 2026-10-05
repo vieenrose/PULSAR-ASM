@@ -24,8 +24,8 @@ def main():
     snap = sys.argv[1]
     blk = int(sys.argv[2]) if len(sys.argv) > 2 else 16
     nrounds = int(sys.argv[3]) if len(sys.argv) > 3 else 3
-    old = load("arm_old", "/tmp/arm_old.py")
-    new = load("arm_new", "/tmp/arm_new.py")
+    old = load("arm_old", sys.argv[4] if len(sys.argv) > 4 else "runtime/arm_old.py")
+    new = load("arm_new", sys.argv[5] if len(sys.argv) > 5 else "runtime/arm_new.py")
     A = old.Arm270m(snap, max_seq=256, verbose=False)
     B = new.Arm270m(snap, max_seq=256, verbose=False)
     prompt = [2, 107, 1567, 236765, 107, 304, 2505, 9694]
