@@ -2161,11 +2161,6 @@ fold_norms:
     .align 3
 d_one:       .double 1.0
 kkind:       .byte 0,1,2,7,8,12
-t_inv:       .asciz "inv_s[0..1] = "
-t_rcos:      .asciz "rcos_s[2][0..3] = "
-t_rsin:      .asciz "rsin_s[2][0..3] = "
-t_fnorm:     .asciz "fnorm_in0[0..3] = "
-t_emb:       .asciz "embed[0..3] = "
 
     .section .bss
     .align 4
