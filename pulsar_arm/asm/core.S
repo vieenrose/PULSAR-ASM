@@ -174,9 +174,9 @@ expf_asm:
     fadd s3, s3, s4
     fmul s3, s3, s2
     fadd s0, s3, s4             // p(r)
-    // ldexp: bits += (k+127)<<23
+    // ldexp: result bits += k<<23 (adds k to the biased exponent; no
+    // mantissa carry since low 23 bits add zero)
     fmov w10, s0
-    add x9, x9, #127
     lsl x9, x9, #23
     add w10, w10, w9
     fmov s0, w10
@@ -232,11 +232,40 @@ sincos_asm:
     ldr d4, [x9, :lo12:d_2pi]
     fmul d4, d3, d4
     fsub d2, d2, d4              // r in [-pi, pi]
-    fcvt s2, d2
-    // sin poly degree 9: x - x^3/6 + x^5/120 - x^7/5040 + x^9/362880
+    // quadrant fold to [-pi/2, pi/2]: r>pi/2 -> (pi-r, cos negates);
+    // r<-pi/2 -> (r+pi, both negate). Polynomial error then < 1e-8.
+    adrp x9, d_pi
+    ldr d5, [x9, :lo12:d_pi]
+    fmov d6, #0.5
+    fmul d7, d5, d6              // pi/2
+    fcmp d2, d7
+    b.le 4f
+    fsub d2, d5, d2
+    mov w9, #0
+    mov w10, #1
+    b 5f
+4:  fneg d7, d7
+    fcmp d2, d7
+    b.ge 6f
+    fadd d2, d2, d5
+    mov w9, #1
+    mov w10, #1
+    b 5f
+6:  mov w9, #0
+    mov w10, #0
+5:  fcvt s2, d2                   // r'
     fmul s3, s2, s2              // x2
+    // sin degree 13
+    adrp x9, f_s13
+    ldr s4, [x9, :lo12:f_s13]
+    fmul s4, s4, s3
+    adrp x9, f_s11
+    ldr s5, [x9, :lo12:f_s11]
+    fadd s4, s4, s5
+    fmul s4, s4, s3
     adrp x9, f_s9
-    ldr s4, [x9, :lo12:f_s9]
+    ldr s5, [x9, :lo12:f_s9]
+    fadd s4, s4, s5
     fmul s4, s4, s3
     adrp x9, f_s7
     ldr s5, [x9, :lo12:f_s7]
@@ -252,10 +281,21 @@ sincos_asm:
     fmul s4, s4, s3
     fmov s5, #1.0
     fadd s4, s4, s5
-    fmul s0, s4, s2              // sin
-    // cos poly degree 8: 1 - x^2/2 + x^4/24 - x^6/720 + x^8/40320
+    fmul s0, s4, s2
+    cbnz w9, 7f
+    b 8f
+7:  fneg s0, s0
+    // cos degree 12
+8:  adrp x9, f_c12
+    ldr s4, [x9, :lo12:f_c12]
+    fmul s4, s4, s3
+    adrp x9, f_c10
+    ldr s5, [x9, :lo12:f_c10]
+    fadd s4, s4, s5
+    fmul s4, s4, s3
     adrp x9, f_c8
-    ldr s4, [x9, :lo12:f_c8]
+    ldr s5, [x9, :lo12:f_c8]
+    fadd s4, s4, s5
     fmul s4, s4, s3
     adrp x9, f_c6
     ldr s5, [x9, :lo12:f_c6]
@@ -270,7 +310,10 @@ sincos_asm:
     fadd s4, s4, s5
     fmul s4, s4, s3
     fmov s5, #1.0
-    fadd s1, s4, s5              // + c0
+    fadd s1, s4, s5
+    cbnz w10, 9f
+    ret
+9:  fneg s1, s1
     ret
 
 /* ---------------- gemv_bf16: mirrors neon_gemv.c lane-for-lane ----------------
@@ -448,9 +491,10 @@ microbench:
     b.ne 2b
     mrs x9, cntvct_el0
     sub x9, x9, x21              // ticks
+    mov x19, x9                  // stash: ms print clobbers x9-x11
     // ms = ticks*1000/freq ; print
     mov x10, #1000
-    mul x11, x9, x10
+    mul x11, x19, x10
     udiv x11, x11, x20
     adrp x0, t_bench
     add x0, x0, :lo12:t_bench
@@ -463,7 +507,7 @@ microbench:
     // GB/s (weight bytes) = 20*2048*640*2 * freq / ticks / 1e9
     movz x11, #0x320, lsl #16     // 20*2048*640*2 weight bytes
     mul x11, x11, x20
-    udiv x11, x11, x9            // bytes per second
+    udiv x11, x11, x19            // /ticks
     movz x10, #0xca00
     movk x10, #0x3b9a, lsl #16   // 1e9
     udiv x12, x11, x10           // int part
@@ -548,7 +592,12 @@ f_c2:        .float -0.5
 f_c4:        .float 0.041666668
 f_c6:        .float -0.0013888889
 f_c8:        .float 0.000024801587
+f_c10:       .float -0.00000027557319
+f_c12:       .float 0.0000000020876752
+f_s11:       .float -0.0000000250521
+f_s13:       .float 0.00000000016059
     .align 3
+d_pi:        .double 3.141592653589793
 d_inv_2pi:   .double 0.15915494309189535
 d_2pi:       .double 6.283185307179586
 
