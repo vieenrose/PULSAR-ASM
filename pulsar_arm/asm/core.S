@@ -1532,6 +1532,9 @@ kern_tests:
     movi v0.4s, #0
     fmla v0.4s, v1.4s, v1.4s
     st1 {v0.4s}, [x9]
+    ld1 {v1.4s}, [x19]           // reload: prints below clobbered v-regs
+    movi v0.4s, #0               // recompute: no vector state survives prints
+    fmla v0.4s, v1.4s, v1.4s
     ldr s0, [x9]
     bl print_f32                 // expect 1.0 (fmla lane0)
     bl print_sp
