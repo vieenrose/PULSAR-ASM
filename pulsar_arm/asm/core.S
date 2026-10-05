@@ -1483,10 +1483,13 @@ kern_tests:
     mov x0, x9
     bl print_u64                 // expect same
     bl print_nl
-    adrp x0, T0
-    add x0, x0, :lo12:T0
-    mov w1, #4
-    bl sum_sq
+    adrp x9, T0
+    add x9, x9, :lo12:T0
+    ld1 {v1.4s}, [x9]            // inline: expect [1,2,3,4]
+    movi v0.4s, #0
+    fmla v0.4s, v1.4s, v1.4s
+    addv s1, v0.4s
+    fmov s0, s1
     bl print_f32                 // expect 30.0 (energy direct)
     bl print_sp
     adrp x9, T2
