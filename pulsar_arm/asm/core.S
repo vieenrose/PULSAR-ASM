@@ -1309,11 +1309,12 @@ attn_values_f32:
 rmsnorm_add_f32:
     str s0, [sp, #-16]!
     movi v0.4s, #0
+    mov x5, x2                   // x cursor
     mov w9, #0
 0:  add w10, w9, #4
     cmp w10, w4
     b.hi 1f
-    ld1 {v1.4s}, [x2, x9, lsl #2]
+    ld1 {v1.4s}, [x5], #16
     fmla v0.4s, v1.4s, v1.4s
     add w9, w9, #4
     b 0b
