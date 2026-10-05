@@ -2066,6 +2066,10 @@ t_rcos:      .asciz "rcos_s[2][0..3] = "
 t_rsin:      .asciz "rsin_s[2][0..3] = "
 t_fnorm:     .asciz "fnorm_in0[0..3] = "
 t_emb:       .asciz "embed[0..3] = "
+t_vocab:     .asciz "vocab ids: "
+e_vload:     .asciz "ERR vocab load\n"
+    .align 3
+v_magic:     .quad 0x564F4341424C4242
 
     .section .bss
     .align 4
