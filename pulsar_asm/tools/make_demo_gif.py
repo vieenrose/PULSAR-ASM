@@ -51,7 +51,7 @@ L10N = {
         "title": "pulsar · gemma-4-e2b · CPU 推論",
         "you": "你> ",
         "model": "模型> ",
-        "prompt": "用一句話說：為什麼用組合語言寫語言模型很奇怪？",
+        "prompt": "一個星期有幾天？請用中文回答。",
         "loading": "載入引擎 · 已映射 9.258 GB",
         "prefill": "填充 KV 快取",
         "greedy": "貪婪解碼",
@@ -139,7 +139,8 @@ def main():
                           # set_sampling with the default temp would turn
                           # sampling back on under a footer that says greedy
     chat = cli.Chat(eng, tk, eos, max_new=a.max_new)
-    ids = list(chat.turn(L["prompt"], quiet=True))
+    prompt = a.prompt or L["prompt"]
+    ids = list(chat.turn(prompt, quiet=True))
     tps = chat.n_tok / max(chat.clock, 1e-9)
     nbytes = eng.mod.size
     eng.close()
@@ -169,7 +170,7 @@ def main():
 
     head = [(cmd, 0.0, DIM)]
     prompt_rows = head + [(t, xoff, PROMPT_COL)
-                          for t, xoff in wrap(L["prompt"], font, text_w, you_px)]
+                          for t, xoff in wrap(prompt, font, text_w, you_px)]
 
     for _ in range(a.fps):
         draw_frame(head + [("", 0.0, FG)], L["loading"], False)
