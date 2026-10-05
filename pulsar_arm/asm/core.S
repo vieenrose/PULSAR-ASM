@@ -1228,9 +1228,20 @@ gelu_mul_f32:
     mov w9, #0
 0:  cmp w9, w3
     b.hs 1f
-    ldr s0, [x1, x9, lsl #2]
+    ldr s0, [x1, x9, lsl #2]     // v
     str x9, [sp, #-16]!
-    bl tanhf_asm                 // s0 = t (clobbers x9!)
+    adrp x9, f_c1
+    add x9, x9, :lo12:f_c1
+    ldr s1, [x9]                 // c1
+    adrp x9, f_c3
+    add x9, x9, :lo12:f_c3
+    ldr s2, [x9]                 // c3
+    fmul s3, s1, s0              // c1*v
+    fmul s4, s2, s0              // c3*v
+    fmul s4, s4, s0              // c3*v^2
+    fmul s4, s4, s0              // c3*v^3
+    fadd s0, s3, s4              // u = c1*v + c3*v^3 (C order)
+    bl tanhf_asm                 // s0 = t(u)
     ldr x9, [sp], #16
     ldr s1, [x1, x9, lsl #2]     // v
     fmov s2, #0.5
@@ -1270,6 +1281,7 @@ attn_scores_f32:
     b 1b
 2:  faddp v20.4s, v20.4s, v20.4s
     faddp v20.4s, v20.4s, v20.4s
+    fmov s0, s20                 // total -> s0 (v20 lanes != s0!)
 3:  cmp w12, w4
     b.hs 4f
     ldr s1, [x13], #4
@@ -1841,7 +1853,7 @@ kern_tests:
     str s0, [x9, x11, lsl #2]
     add w11, w11, #1
     b 18b
-19: // rebuild x pattern in T0, zero w in T1[0..639]
+19: // rebuild x pattern in T0, ones w in T1[0..639]
     adrp x9, T0
     add x9, x9, :lo12:T0
     adrp x10, T1
@@ -1860,12 +1872,15 @@ kern_tests:
     ldr s1, [x12, :lo12:f_001]
     fmul s0, s0, s1
     str s0, [x9, x11, lsl #2]
-    str wzr, [x10, x11, lsl #2]
+    adrp x12, f_1
+    add x12, x12, :lo12:f_1
+    ldr s1, [x12]
+    str s1, [x10, x11, lsl #2]   // w = 1.0 (unfolded)
     add w11, w11, #1
     b 21b
 22: adrp x0, T2                  // out
     add x0, x0, :lo12:T2
-    adrp x1, T1                  // w (zeros)
+    adrp x1, T1                  // w (ones)
     add x1, x1, :lo12:T1
     adrp x2, T0                  // x
     add x2, x2, :lo12:T0
@@ -1906,6 +1921,8 @@ f_002:       .float 0.02
 f_07:        .float 0.7
 f_10:        .float 10.0
 f_scale:     .float 0.0625
+f_c1:        .float 0.79788456
+f_c3:        .float 0.03567741
 
     .section .bss
     .align 4
