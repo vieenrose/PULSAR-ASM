@@ -1,1 +1,2 @@
 {"type":"config","name":"gemma-3-270m ARM decode speed (3-core target)","metricName":"ms_per_token","metricUnit":"ms","bestDirection":"lower"}
+{"run":1,"commit":"8efe012","metric":158.83,"metrics":{"tok_per_sec":6.296},"status":"keep","description":"baseline: single-threaded driver, port gates pass, 6.3 tok/s","timestamp":1791209566263,"segment":0,"confidence":null,"asi":{"hypothesis":"single-threaded C+NEON driver baseline; memory-bound at ~540MB weights per token over Pi4 ~4GB/s bus"}}
