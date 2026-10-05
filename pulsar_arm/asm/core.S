@@ -1446,15 +1446,7 @@ sum_sq:
 kern_tests:
     str x30, [sp, #-16]!
     stp x19, x20, [sp, #-16]!
-    // DIAG2 (temporary): rmsnorm([1,2,3,4], w=1) -> out[0] ~= 0.3651
-    adrp x9, T0
-    add x9, x9, :lo12:T0
-    adrp x10, f_1
-    ldr s0, [x10, :lo12:f_1]
-    fmov s1, #2.0
-    fmov s0, s1
-    bl print_f32                 // expect 2.0 (fmov sanity)
-    bl print_nl
+    // n=4 vector-path test: rmsnorm([1,2,3,4], w=1) -> out[0] ~= 0.3651
     adrp x9, T0
     add x9, x9, :lo12:T0
     adrp x10, f_1
@@ -1482,69 +1474,6 @@ kern_tests:
     adrp x4, f_eps
     ldr s0, [x4, :lo12:f_eps]
     bl rmsnorm_f32
-    adrp x0, T0
-    add x0, x0, :lo12:T0
-    bl print_u64                 // expect 6913632 (T0 addr)
-    bl print_sp
-    adrp x9, T0
-    add x9, x9, :lo12:T0
-    mov x0, x9
-    bl print_u64                 // expect same
-    bl print_nl
-    adrp x9, T0
-    add x9, x9, :lo12:T0
-    ldr s0, [x9]
-    bl print_f32                 // expect 1.0
-    bl print_sp
-    adrp x9, T0
-    add x9, x9, :lo12:T0
-    ldr s0, [x9, #4]             // expect 2.0
-    bl print_f32
-    bl print_sp
-    adrp x9, T0
-    add x9, x9, :lo12:T0
-    ldr s0, [x9, #8]             // expect 3.0
-    bl print_f32
-    bl print_sp
-    adrp x9, T0
-    add x9, x9, :lo12:T0
-    ldr s0, [x9, #12]            // expect 4.0
-    bl print_f32
-    bl print_nl
-    adrp x9, T1
-    add x9, x9, :lo12:T1
-    ldr s0, [x9]                 // w[0], expect 1.0
-    bl print_f32
-    bl print_nl
-    adrp x19, T0
-    add x19, x19, :lo12:T0      // x19 survives prints
-    ld1 {v1.4s}, [x19]
-    adrp x9, T3
-    add x9, x9, :lo12:T3
-    st1 {v1.4s}, [x9]            // spill loaded lanes
-    ldr s0, [x9]
-    bl print_f32                 // expect 1.0 (load path)
-    bl print_sp
-    ldr s0, [x9, #4]
-    bl print_f32                 // expect 2.0
-    bl print_nl
-    ld1 {v1.4s}, [x19]
-    movi v0.4s, #0
-    fmla v0.4s, v1.4s, v1.4s
-    st1 {v0.4s}, [x9]
-    ld1 {v1.4s}, [x19]           // reload: prints below clobbered v-regs
-    movi v0.4s, #0               // recompute: no vector state survives prints
-    fmla v0.4s, v1.4s, v1.4s
-    ldr s0, [x9]
-    bl print_f32                 // expect 1.0 (fmla lane0)
-    bl print_sp
-    ldr s0, [x9, #8]
-    bl print_f32                 // expect 9.0 (fmla lane2)
-    bl print_nl
-    addv s1, v0.4s
-    fmov s0, s1
-    bl print_f32                 // expect 30.0 (addv)
-    bl print_sp
     adrp x9, T2
     add x9, x9, :lo12:T2
     ldr s0, [x9]                 // expect 0.3651
