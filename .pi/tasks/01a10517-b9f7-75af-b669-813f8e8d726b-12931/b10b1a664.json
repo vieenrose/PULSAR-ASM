@@ -1,0 +1,28 @@
+{
+  "id": "b10b1a664",
+  "name": "Top-p sweep two runs",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && for P in 500 1000; do printf \"Hello\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 1000 $P > /tmp/sweepP$P.log 2>&1; echo \"P$P-EXIT=$?\"; done'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b10b1a664.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791236858768,
+  "endTime": 1791236914990,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 101174,
+  "bytesWritten": 25,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
