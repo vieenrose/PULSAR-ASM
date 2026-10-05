@@ -1326,7 +1326,8 @@ file_stage_after_bench:
     cmp x0, #50
     b.hs 6f
     mov x0, #50
-6:  cmp x0, #5000
+6:  mov x3, #5000                // (cmp imm max 4095; via reg)
+    cmp x0, x3
     b.lo 7f
     mov x0, #5000
 7:  scvtf s0, x0
