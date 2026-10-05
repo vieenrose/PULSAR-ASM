@@ -1,0 +1,42 @@
+{
+  "id": "bc532fa45",
+  "name": "Download BF16 GGUF",
+  "command": "mkdir -p /mnt/edge/gemma4-hf && cd /mnt/edge/gemma4-hf && curl -sL -o gemma-4-E2B-it-BF16.gguf \"https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-BF16.gguf\" && ls -la gemma-4-E2B-it-BF16.gguf",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bc532fa45.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791184150790,
+  "endTime": 1791184991628,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 16968,
+  "bytesWritten": 72,
+  "isAgent": false,
+  "surviveReload": true,
+  "reloadSurvival": {
+    "schemaVersion": "pi-background-tasks.reload-shell.v1",
+    "authority": "same-process-live-owner",
+    "hostPid": 12931,
+    "sessionId": "01a10517-b9f7-75af-b669-813f8e8d726b",
+    "cwdRealpath": "/home/user/PULSAR-ASM",
+    "launchNonce": "fc0dc34e4bff965f6c00e37b1793c108",
+    "completionId": "bc532fa45:1",
+    "spawnedAt": 1791184150790,
+    "childPid": 16968,
+    "outputCapBytes": 20971520,
+    "leaseGeneration": 2,
+    "handoffCount": 1,
+    "posixProcessGroupId": 16968
+  },
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

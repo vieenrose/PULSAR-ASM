@@ -30,43 +30,53 @@ geglu_avx2:
     ; Load constants
     mov     eax, 0x3FCC422A        ; c1 = 1.59576912f
     vmovd   xmm6, eax
-    vbroadcastss ymm6, xmm6
+    vshufps     xmm6, xmm6, xmm6, 0x00      ; AVX2-legal broadcast of xmm6[31:0]
+    vinsertf128 ymm6, ymm6, xmm6, 1
 
     mov     eax, 0x3D922279        ; c3 = 0.071354816f
     vmovd   xmm7, eax
-    vbroadcastss ymm7, xmm7
+    vshufps     xmm7, xmm7, xmm7, 0x00      ; AVX2-legal broadcast of xmm7[31:0]
+    vinsertf128 ymm7, ymm7, xmm7, 1
 
     mov     eax, 0xC2B00000        ; -88.0f
     vmovd   xmm8, eax
-    vbroadcastss ymm8, xmm8
+    vshufps     xmm8, xmm8, xmm8, 0x00      ; AVX2-legal broadcast of xmm8[31:0]
+    vinsertf128 ymm8, ymm8, xmm8, 1
 
     mov     eax, 0x42B00000        ; +88.0f
     vmovd   xmm9, eax
-    vbroadcastss ymm9, xmm9
+    vshufps     xmm9, xmm9, xmm9, 0x00      ; AVX2-legal broadcast of xmm9[31:0]
+    vinsertf128 ymm9, ymm9, xmm9, 1
 
     mov     eax, 0x3FB8AA3B        ; log2(e) = 1.44269504f
     vmovd   xmm10, eax
-    vbroadcastss ymm10, xmm10
+    vshufps     xmm10, xmm10, xmm10, 0x00      ; AVX2-legal broadcast of xmm10[31:0]
+    vinsertf128 ymm10, ymm10, xmm10, 1
 
     mov     eax, 0x3F317218        ; ln(2) = 0.69314718f
     vmovd   xmm11, eax
-    vbroadcastss ymm11, xmm11
+    vshufps     xmm11, xmm11, xmm11, 0x00      ; AVX2-legal broadcast of xmm11[31:0]
+    vinsertf128 ymm11, ymm11, xmm11, 1
 
     mov     eax, 0x3D2AAAAB        ; 1/24 = 0.041666668f
     vmovd   xmm12, eax
-    vbroadcastss ymm12, xmm12
+    vshufps     xmm12, xmm12, xmm12, 0x00      ; AVX2-legal broadcast of xmm12[31:0]
+    vinsertf128 ymm12, ymm12, xmm12, 1
 
     mov     eax, 0x3E2AAAAB        ; 1/6 = 0.16666667f
     vmovd   xmm13, eax
-    vbroadcastss ymm13, xmm13
+    vshufps     xmm13, xmm13, xmm13, 0x00      ; AVX2-legal broadcast of xmm13[31:0]
+    vinsertf128 ymm13, ymm13, xmm13, 1
 
     mov     eax, 0x3F000000        ; 0.5f
     vmovd   xmm14, eax
-    vbroadcastss ymm14, xmm14
+    vshufps     xmm14, xmm14, xmm14, 0x00      ; AVX2-legal broadcast of xmm14[31:0]
+    vinsertf128 ymm14, ymm14, xmm14, 1
 
     mov     eax, 0x3F800000        ; 1.0f
     vmovd   xmm15, eax
-    vbroadcastss ymm15, xmm15
+    vshufps     xmm15, xmm15, xmm15, 0x00      ; AVX2-legal broadcast of xmm15[31:0]
+    vinsertf128 ymm15, ymm15, xmm15, 1
 
 .l_geglu_loop:
     lea     rax, [r10 + 8]

@@ -1,0 +1,23 @@
+📡 Resolving google/gemma-4-E2B-it ...
+   checkpoint: 10.25 GB / 2,011 tensors / header 263,960 B
+🧱 flat blob size: 9.258 GB  (540 blobs)
+📦 preallocated /mnt/edge/pulsar/gemma4_e2b.bin
+🚀 streaming 540 tensors / 9.26 GB with 8 parallel range readers
+      40/540 tensors    0.13 GB   0.01 GB/s  eta    953s
+      80/540 tensors    0.28 GB   0.01 GB/s  eta    965s
+     120/540 tensors    0.45 GB   0.01 GB/s  eta    902s
+     160/540 tensors    0.67 GB   0.01 GB/s  eta    833s
+     200/540 tensors    0.80 GB   0.01 GB/s  eta    863s
+     240/540 tensors    0.97 GB   0.01 GB/s  eta    837s
+     280/540 tensors    1.21 GB   0.01 GB/s  eta    793s
+     320/540 tensors    1.54 GB   0.01 GB/s  eta    768s
+     360/540 tensors    1.96 GB   0.01 GB/s  eta    682s
+     400/540 tensors    2.28 GB   0.01 GB/s  eta    663s
+     440/540 tensors    2.63 GB   0.01 GB/s  eta    636s
+     480/540 tensors    2.98 GB   0.01 GB/s  eta    585s
+     520/540 tensors    3.32 GB   0.01 GB/s  eta    563s
+     540/540 tensors    9.26 GB   0.01 GB/s  eta     -0s
+✅ done in 830.2s -> /mnt/edge/pulsar/gemma4_e2b.bin (9.258 GB)
+🔬 verifying random samples against the source checkpoint...
+   262 small blobs verified exhaustively, 12 large blobs sampled
+   ✔ layout verified byte-for-byte on 274 probes

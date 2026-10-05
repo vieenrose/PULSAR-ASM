@@ -73,7 +73,9 @@ gemma_forward_step:
     mov     rcx, [r15 + 0]         ; RCX = x (2048 floats destination)
     mov     eax, 0x423504F3        ; 45.254834f = sqrt(2048)
     vmovd   xmm7, eax
-    vbroadcastss ymm7, xmm7        ; YMM7 = embed_scale
+    vinsertf128 ymm7, ymm7, xmm7, 1 ; YMM7 = embed_scale. Register-source 'vbroadcastss
+    vshufps   ymm7, ymm7, ymm7, 0x00; ymm, xmm' needs AVX-512F; AVX2 can only broadcast
+                                      ; from memory, so build the lane copy by hand.
 
     xor     r10, r10               ; element index 0 .. 2047
 .l_embed_loop:

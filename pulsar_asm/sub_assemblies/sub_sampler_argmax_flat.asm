@@ -26,7 +26,8 @@ sampler_argmax_avx2:
 
     ; Initialize with first element
     vmovss  xmm0, dword [rcx]      ; XMM0[0] = current max_val
-    vbroadcastss ymm0, xmm0        ; YMM0 = [max_val, ...]
+    vinsertf128 ymm0, ymm0, xmm0, 1 ; YMM0 = [max_val, ...]. The one-instruction
+    vshufps   ymm0, ymm0, ymm0, 0x00; register-source broadcast is AVX-512-only.
     xor     rax, rax               ; RAX = best_idx = 0
 
     mov     r8, rdx
@@ -58,7 +59,9 @@ sampler_argmax_avx2:
     jbe     .l_skip_cand
 
     vmovaps xmm0, xmm3
-    vbroadcastss ymm0, xmm0        ; update running max
+    vinsertf128 ymm0, ymm0, xmm0, 1   ; update running max. NOTE: 'vbroadcastss ymm0,
+    vshufps   ymm0, ymm0, ymm0, 0x00  ; xmm0' is AVX-512-only (EVEX) - it assembles and
+                                      ; works on AVX-512 hosts but #UDs on AVX2.
     lea     rsi, [r10 + r9 * 4]
     shr     rsi, 2                 ; RSI = best_idx
     mov     rax, rsi

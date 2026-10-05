@@ -1,0 +1,28 @@
+{
+  "id": "b1e0dbf56",
+  "name": "Convert E2B blob",
+  "command": "cd /home/user/PULSAR-ASM/pulsar_asm && python3 -u tools/convert_gemma4_safetensors.py --repo google/gemma-4-E2B-it --out /mnt/edge/pulsar/gemma4_e2b.bin --workers 8 2>&1 | tail -30",
+  "status": "killed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-11418/b1e0dbf56.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791182784645,
+  "endTime": 1791182991043,
+  "exitCode": null,
+  "signal": "SIGTERM",
+  "pid": 12051,
+  "bytesWritten": 0,
+  "isAgent": false,
+  "surviveReload": false,
+  "error": "Killed during Pi session shutdown (reload)",
+  "notified": false,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
