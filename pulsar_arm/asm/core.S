@@ -1443,6 +1443,19 @@ sum_sq:
 kern_tests:
     str x30, [sp, #-16]!
     stp x19, x20, [sp, #-16]!
+    // DIAG (temporary): T0 address, f_001 value
+    adrp x0, k_diag
+    add x0, x0, :lo12:k_diag
+    bl print_cstr
+    adrp x0, T0
+    add x0, x0, :lo12:T0
+    bl print_u64
+    bl print_sp
+    adrp x0, f_001
+    add x0, x0, :lo12:f_001
+    ldr s0, [x0]
+    bl print_f32
+    bl print_nl
     // -- rmsnorm: patterned x, w=0 -> sum(out^2) ~= 640
     adrp x0, k_rms
     add x0, x0, :lo12:k_rms
@@ -1762,6 +1775,7 @@ kern_tests:
 
     .section .rodata
     .align 3
+k_diag:      .asciz "diag: T0 f_001 = "
 k_rms:       .asciz "kern: rmsnorm sum(out^2)[640] = "
 k_rope:      .asciz "kern: rope |v| before after = "
 k_soft:      .asciz "kern: softmax sum argmax = "
