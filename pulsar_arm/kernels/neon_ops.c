@@ -193,3 +193,78 @@ void layer_step(float *X, float *H, float *Q, float *QN, float *KV, float *KN,
     gemv_bf16(640, 2048, Wd, G, H);
     rmsnorm_add_f32(H, n_ff, H, X, 640, 1e-6f);
 }
+
+/* Per-layer pointer bundle for decode_step (built once in Python, 18 entries).
+ * Same kernels, same order as the per-op path: bit-identical. */
+typedef struct {
+    const uint16_t *wq, *wk, *wv, *wo, *wg, *wu, *wd;
+    const float *n_in, *n_q, *n_k, *n_pa, *n_pf, *n_ff;
+    const float *cos, *sin;
+    float *kb, *vb;
+    int full;
+} LayerW;
+
+#define WIN 512  /* sliding window (model-fixed; full layers ignore it) */
+
+static inline void layer_body(float *X, float *H, float *Q, float *QN,
+                              float *KV, float *KN, float *S, float *AV,
+                              float *G, float *U, const LayerW *L,
+                              const float *cosr, const float *sinr,
+                              int pos, int lo, int n, float scale) {
+    rmsnorm_f32(H, L->n_in, X, 640, 1e-6f);
+    gemv_bf16(1024, 640, L->wq, H, Q);
+    gemv_bf16(256, 640, L->wk, H, KV);
+    rmsnorm_f32(KN, L->n_k, KV, 256, 1e-6f);
+    rope_half(KN, cosr, sinr, 128);
+    memcpy(L->kb + (int64_t)pos * 256, KN, 256 * sizeof(float));
+    gemv_bf16(256, 640, L->wv, H, KN);
+    memcpy(L->vb + (int64_t)pos * 256, KN, 256 * sizeof(float));
+    for (int j = 0; j < 4; j++) {
+        float *qs = QN + (int64_t)j * 256;
+        rmsnorm_f32(qs, L->n_q, Q + (int64_t)j * 256, 256, 1e-6f);
+        rope_half(qs, cosr, sinr, 128);
+        attn_scores_f32(S, qs, L->kb + (int64_t)lo * 256, n, 256, scale);
+        softmax_f32(S, n);
+        attn_values_f32(AV + (int64_t)j * 256, L->vb + (int64_t)lo * 256, S, n, 256);
+    }
+    gemv_bf16(640, 1024, L->wo, AV, H);
+    rmsnorm_add_f32(H, L->n_pa, H, X, 640, 1e-6f);
+    rmsnorm_f32(H, L->n_pf, X, 640, 1e-6f);
+    gemv_bf16(2048, 640, L->wg, H, G);
+    gemv_bf16(2048, 640, L->wu, H, U);
+    gelu_mul_f32(G, G, U, 2048);
+    gemv_bf16(640, 2048, L->wd, G, H);
+    rmsnorm_add_f32(H, L->n_ff, H, X, 640, 1e-6f);
+}
+
+/* Whole decode step in one call: embed + 18 layers + final norm + head +
+ * argmax. tape may be NULL (no taping) or point to 18x640 floats receiving
+ * X after each layer (port-test path only). Returns the next token. */
+int decode_step(float *X, float *H, float *Q, float *QN, float *KV, float *KN,
+                float *S, float *AV, float *G, float *U, float *LG,
+                const LayerW *L, const uint16_t *emb, const float *normF,
+                float *tape, int token, int pos, float scale, float escale) {
+    embed_row_f32(X, emb, token, 640, escale);
+    for (int i = 0; i < 18; i++) {
+        int lo, n;
+        if (L[i].full) {
+            lo = 0;
+            n = pos + 1;
+        } else {
+            lo = pos + 1 - WIN;
+            if (lo < 0)
+                lo = 0;
+            n = pos + 1;
+            if (n > WIN)
+                n = WIN;
+        }
+        layer_body(X, H, Q, QN, KV, KN, S, AV, G, U, &L[i],
+                   L[i].cos + (int64_t)pos * 128, L[i].sin + (int64_t)pos * 128,
+                   pos, lo, n, scale);
+        if (tape)
+            memcpy(tape + (int64_t)i * 640, X, 640 * sizeof(float));
+    }
+    rmsnorm_f32(H, normF, X, 640, 1e-6f);
+    gemv_bf16(262144, 640, emb, H, LG);
+    return argmax_f32(LG, 262144);
+}

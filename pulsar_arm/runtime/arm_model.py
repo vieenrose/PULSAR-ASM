@@ -130,10 +130,13 @@ class Arm270m:
         lib.rmsnorm_add_f32.argtypes = [v, v, v, v, ctypes.c_int, ctypes.c_float]
         lib.attn_values_f32.argtypes = [v, v, v, ctypes.c_int, ctypes.c_int]
         lib.layer_step.argtypes = [v] * 27 + [ctypes.c_int] * 3 + [ctypes.c_float]
+        lib.decode_step.argtypes = ([v] * 15 + [ctypes.c_int] * 2
+                                    + [ctypes.c_float] * 2)
+        lib.decode_step.restype = ctypes.c_int
         for f_ in ("gemv_bf16", "rmsnorm_f32", "rope_half", "softmax_f32",
                    "gelu_tanh_f32", "gelu_mul_f32", "rmsnorm_add_f32",
                    "embed_row_f32", "attn_scores_f32",
-                   "attn_values_f32", "layer_step"):
+                   "attn_values_f32", "layer_step", "decode_step"):
             getattr(lib, f_).restype = None
         self.lib = lib
         self.pos = 0
@@ -173,6 +176,20 @@ class Arm270m:
                 P(self.norms[p + "post_feedforward_layernorm.weight"]),
                 P(cs), P(sn), P(self.K[i]), P(self.V[i]), i in FULL_AT,
             ))
+        # LayerW struct array for decode_step (mirrors the C layout: 17
+        # pointers + 1 int). Built once; the per-token path passes one ptr.
+        class LayerW(ctypes.Structure):
+            _fields_ = [(f"f{d}", v) for d in range(17)] + [("full", ctypes.c_int)]
+        self._lw = (LayerW * NLAY)(*[
+            LayerW(wq[2], wk[2], wv[2], wo[2], wg[2], wu[2], wd[2],
+                   nin, nq, nk, npa, npf, nff, cosb, sinb, kb, vb,
+                   1 if full else 0)
+            for (wq, wk, wv, wo, wg, wu, wd, nin, nq, nk, npa, npf, nff,
+                 cosb, sinb, kb, vb, full) in self.layers
+        ])
+        self._lwp = ctypes.addressof(self._lw)
+        self._tapebuf = np.zeros((NLAY, HID), dtype=np.float32)
+        self.pTapeBuf = P(self._tapebuf)
         if verbose:
             print(f"  arm module ready, init {time.time()-t0:.1f}s", flush=True)
 
@@ -183,41 +200,19 @@ class Arm270m:
 
     def forward(self, token):
         lb = self.lib
-        gemv = lb.gemv_bf16
-        rms = lb.rmsnorm_f32
-        rmsa = lb.rmsnorm_add_f32
-        rope = lb.rope_half
-        scores = lb.attn_scores_f32
-        softm = lb.softmax_f32
-        aval = lb.attn_values_f32
-        gm = lb.gelu_mul_f32
-        step = lb.layer_step
-        X, H, Q, QN, KV, KN = self.pX, self.pH, self.pQ, self.pQN, self.pKV, self.pKN
-        S, AV, G, U, LG = self.pS, self.pAV, self.pG, self.pU, self.pLG
-        RB = self.RB
-        lb.embed_row_f32(X, self.emb_ptr, int(token), HID, self.ESCALE)
-        pos = self.pos
-        cpos = pos * RB
-        for i, L in enumerate(self.layers):
-            wq, wk, wv, wo, wg, wu, wd, nin, nq, nk, npa, npf, nff, \
-                cosb, sinb, kb, vb, full = L
-            if full:
-                lo, n = 0, pos + 1
-            else:
-                lo = pos + 1 - WINDOW
-                if lo < 0:
-                    lo = 0
-                n = pos + 1
-                if n > WINDOW:
-                    n = WINDOW
-            step(X, H, Q, QN, KV, KN, S, AV, G, U, kb, vb,
-                 wq[2], wk[2], wv[2], wo[2], wg[2], wu[2], wd[2],
-                 nin, nq, nk, npa, npf, nff,
-                 cosb + cpos, sinb + cpos, pos, lo, n, self.SCALE)
-            if self.tape is not None:
-                self.tape.append(self.X.copy())
-        rms(H, self.pNormF, X, HID, EPS)
-        # tied head over the full vocab table (bf16 stream)
-        gemv(262144, HID, self.emb_ptr, H, LG)
+        if self.tape is not None:
+            r = lb.decode_step(self.pX, self.pH, self.pQ, self.pQN,
+                               self.pKV, self.pKN, self.pS, self.pAV,
+                               self.pG, self.pU, self.pLG, self._lwp,
+                               self.emb_ptr, self.pNormF, self.pTapeBuf,
+                               int(token), self.pos, self.SCALE, self.ESCALE)
+            for i in range(NLAY):
+                self.tape.append(self._tapebuf[i].copy())
+        else:
+            r = lb.decode_step(self.pX, self.pH, self.pQ, self.pQN,
+                               self.pKV, self.pKN, self.pS, self.pAV,
+                               self.pG, self.pU, self.pLG, self._lwp,
+                               self.emb_ptr, self.pNormF, None,
+                               int(token), self.pos, self.SCALE, self.ESCALE)
         self.pos += 1
-        return int(lb.argmax_f32(LG, 262144))
+        return int(r)
