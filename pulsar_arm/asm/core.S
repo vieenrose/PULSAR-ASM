@@ -296,10 +296,14 @@ gemv_bf16:
     add x13, x5, x11, lsl #1     // waddr = row + 2k
     ld1 {v0.8h}, [x13], #16
     ld1 {v1.8h}, [x13]
-    ushll v2.4s, v0.4h, #16
-    ushll2 v3.4s, v0.8h, #16
-    ushll v4.4s, v1.4h, #16
-    ushll2 v5.4s, v1.8h, #16
+    uxtl v2.4s, v0.4h
+    uxtl2 v3.4s, v0.8h
+    uxtl v4.4s, v1.4h
+    uxtl2 v5.4s, v1.8h
+    shl v2.4s, v2.4s, #16
+    shl v3.4s, v3.4s, #16
+    shl v4.4s, v4.4s, #16
+    shl v5.4s, v5.4s, #16
     add x13, x3, x11, lsl #2     // xaddr = x + 4k
     ld1 {v6.4s}, [x13], #16
     ld1 {v7.4s}, [x13], #16
@@ -455,15 +459,17 @@ microbench:
     add x0, x0, :lo12:t_ms
     bl print_cstr
     // GB/s (weight bytes) = 20*2048*640*2 * freq / ticks / 1e9
-    mov x11, #(20*2048*640*2)
+    movz x11, #0x320, lsl #16     // 20*2048*640*2 weight bytes
     mul x11, x11, x20
     udiv x11, x11, x9            // bytes per second
-    mov x10, #1000000000
+    movz x10, #0xca00
+    movk x10, #0x3b9a, lsl #16   // 1e9
     udiv x12, x11, x10           // int part
     msub x13, x12, x10, x11      // rem
     mov x10, #100
     mul x13, x13, x10
-    mov x10, #1000000000
+    movz x10, #0xca00
+    movk x10, #0x3b9a, lsl #16   // 1e9
     udiv x13, x13, x10           // 2 decimals
     mov x0, x12
     bl print_u64
