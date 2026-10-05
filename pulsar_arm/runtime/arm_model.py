@@ -137,6 +137,41 @@ class Arm270m:
         self.lib = lib
         self.pos = 0
         self.tape = None  # when a list, forward() appends X after each layer
+        # Hot-loop tables: everything forward() needs as plain ints, so the
+        # per-token path does no dict lookups, no f-strings, no shape reads
+        # and no numpy view temporaries. Same kernels, same order, same bits.
+        P = lambda a: a.ctypes.data  # noqa: E731
+        self.pX, self.pH = P(self.X), P(self.H)
+        self.pQ, self.pQN = P(self.Q), P(self.QN)
+        self.pKV, self.pKN = P(self.KV), P(self.KN)
+        self.pS, self.pAV = P(self.S), P(self.AV)
+        self.pG, self.pU, self.pLG = P(self.G), P(self.U), P(self.LG)
+        self.pNormF = P(self.norms["model.norm.weight"])
+        self.SCALE = np.float32(ATTN_SCALE)
+        self.ESCALE = np.float32(HID ** 0.5)
+        self.HDB = HD * 4       # row stride in bytes for K/V/heads
+        self.RB = (HD // 2) * 4  # rope row stride in bytes
+        self.layers = []
+        for i in range(NLAY):
+            p = f"model.layers.{i}."
+
+            def wp(nm, _p=p):
+                ptr, shape = self.w[_p + nm]
+                return (shape[0], shape[1], ptr)
+            cs, sn = self.tables["f" if i in FULL_AT else "s"]
+            self.layers.append((
+                wp("self_attn.q_proj.weight"), wp("self_attn.k_proj.weight"),
+                wp("self_attn.v_proj.weight"), wp("self_attn.o_proj.weight"),
+                wp("mlp.gate_proj.weight"), wp("mlp.up_proj.weight"),
+                wp("mlp.down_proj.weight"),
+                P(self.norms[p + "input_layernorm.weight"]),
+                P(self.norms[p + "self_attn.q_norm.weight"]),
+                P(self.norms[p + "self_attn.k_norm.weight"]),
+                P(self.norms[p + "post_attention_layernorm.weight"]),
+                P(self.norms[p + "pre_feedforward_layernorm.weight"]),
+                P(self.norms[p + "post_feedforward_layernorm.weight"]),
+                P(cs), P(sn), P(self.K[i]), P(self.V[i]), i in FULL_AT,
+            ))
         if verbose:
             print(f"  arm module ready, init {time.time()-t0:.1f}s", flush=True)
 
@@ -146,52 +181,63 @@ class Arm270m:
         self.lib.gemv_bf16(M, shape[1], ptr, x.ctypes.data, out.ctypes.data)
 
     def forward(self, token):
-        lib = self.lib
-        P = lambda a: a.ctypes.data
-        lib.embed_row_f32(P(self.X), self.emb_ptr, int(token), HID, HID ** 0.5)
+        lb = self.lib
+        gemv = lb.gemv_bf16
+        rms = lb.rmsnorm_f32
+        rmsa = lb.rmsnorm_add_f32
+        rope = lb.rope_half
+        scores = lb.attn_scores_f32
+        softm = lb.softmax_f32
+        aval = lb.attn_values_f32
+        gm = lb.gelu_mul_f32
+        X, H, Q, QN, KV, KN = self.pX, self.pH, self.pQ, self.pQN, self.pKV, self.pKN
+        S, AV, G, U, LG = self.pS, self.pAV, self.pG, self.pU, self.pLG
+        HDB, RB, HDH = self.HDB, self.RB, HD // 2
+        lb.embed_row_f32(X, self.emb_ptr, int(token), HID, self.ESCALE)
         pos = self.pos
-        for i in range(NLAY):
-            full = i in FULL_AT
-            p = f"model.layers.{i}."
-            lib.rmsnorm_f32(P(self.H), P(self.norms[p + "input_layernorm.weight"]),
-                            P(self.X), HID, EPS)
-            self._gemv(self.Q, p + "self_attn.q_proj.weight", self.H)
-            self._gemv(self.KV, p + "self_attn.k_proj.weight", self.H)
-            lib.rmsnorm_f32(P(self.KN), P(self.norms[p + "self_attn.k_norm.weight"]),
-                            P(self.KV), HD, EPS)
-            cos, sin = self.tables["f" if full else "s"]
-            lib.rope_half(P(self.KN), P(cos[pos]), P(sin[pos]), HD // 2)
-            K, V = self.K[i], self.V[i]
-            K[pos] = self.KN
-            self._gemv(self.KN, p + "self_attn.v_proj.weight", self.H)
-            V[pos] = self.KN
-            lo = 0 if full else max(0, pos + 1 - WINDOW)
-            n = pos + 1 if full else min(pos + 1, WINDOW)
+        cpos = pos * RB
+        for i, L in enumerate(self.layers):
+            wq, wk, wv, wo, wg, wu, wd, nin, nq, nk, npa, npf, nff, \
+                cosb, sinb, kb, vb, full = L
+            rms(H, nin, X, HID, EPS)
+            gemv(wq[0], wq[1], wq[2], H, Q)
+            gemv(wk[0], wk[1], wk[2], H, KV)
+            rms(KN, nk, KV, HD, EPS)
+            rope(KN, cosb + cpos, sinb + cpos, HDH)
+            Karr = self.K[i]
+            Karr[pos] = self.KN
+            gemv(wv[0], wv[1], wv[2], H, KN)
+            Varr = self.V[i]
+            Varr[pos] = self.KN
+            if full:
+                lo, n = 0, pos + 1
+            else:
+                lo = pos + 1 - WINDOW
+                if lo < 0:
+                    lo = 0
+                n = pos + 1
+                if n > WINDOW:
+                    n = WINDOW
+            krow, vrow = kb + lo * HDB, vb + lo * HDB
             for j in range(NHEAD):
-                seg = slice(j * HD, (j + 1) * HD)
-                lib.rmsnorm_f32(P(self.QN[seg]), P(self.norms[p + "self_attn.q_norm.weight"]),
-                                P(self.Q[seg]), HD, EPS)
-                lib.rope_half(P(self.QN[seg]), P(cos[pos]), P(sin[pos]), HD // 2)
-                lib.attn_scores_f32(P(self.S), P(self.QN[seg]), P(K[lo]), n, HD,
-                                    np.float32(ATTN_SCALE))
-                lib.softmax_f32(P(self.S), n)
-                lib.attn_values_f32(P(self.AV[seg]), P(V[lo]), P(self.S), n, HD)
-            self._gemv(self.H, p + "self_attn.o_proj.weight", self.AV)
-            lib.rmsnorm_add_f32(P(self.H), P(self.norms[p + "post_attention_layernorm.weight"]),
-                                P(self.H), P(self.X), HID, EPS)
-            lib.rmsnorm_f32(P(self.H), P(self.norms[p + "pre_feedforward_layernorm.weight"]),
-                            P(self.X), HID, EPS)
-            self._gemv(self.G, p + "mlp.gate_proj.weight", self.H)
-            self._gemv(self.U, p + "mlp.up_proj.weight", self.H)
-            lib.gelu_mul_f32(P(self.G), P(self.G), P(self.U), INTER)
-            self._gemv(self.H, p + "mlp.down_proj.weight", self.G)
-            lib.rmsnorm_add_f32(P(self.H), P(self.norms[p + "post_feedforward_layernorm.weight"]),
-                                P(self.H), P(self.X), HID, EPS)
+                off = j * HDB
+                rms(QN + off, nq, Q + off, HD, EPS)
+                rope(QN + off, cosb + cpos, sinb + cpos, HDH)
+                scores(S, QN + off, krow, n, HD, self.SCALE)
+                softm(S, n)
+                aval(AV + off, vrow, S, n, HD)
+            gemv(wo[0], wo[1], wo[2], AV, H)
+            rmsa(H, npa, H, X, HID, EPS)
+            rms(H, npf, X, HID, EPS)
+            gemv(wg[0], wg[1], wg[2], H, G)
+            gemv(wu[0], wu[1], wu[2], H, U)
+            gm(G, G, U, INTER)
+            gemv(wd[0], wd[1], wd[2], G, H)
+            rmsa(H, nff, H, X, HID, EPS)
             if self.tape is not None:
                 self.tape.append(self.X.copy())
-        lib.rmsnorm_f32(P(self.H), P(self.norms["model.norm.weight"]), P(self.X),
-                        HID, EPS)
+        rms(H, self.pNormF, X, HID, EPS)
         # tied head over the full vocab table (bf16 stream)
-        lib.gemv_bf16(262144, HID, self.emb_ptr, P(self.H), P(self.LG))
+        gemv(262144, HID, self.emb_ptr, H, LG)
         self.pos += 1
-        return int(lib.argmax_f32(P(self.LG), 262144))
+        return int(lb.argmax_f32(LG, 262144))
