@@ -4278,8 +4278,8 @@ pair_next:
     cmn w26, #1                   // best_rank == -1 (none)?
     b.eq 8f                      // none -> copy out
     str w1, [x23, x0, lsl #2]    // sym[best_j] = best_z
-    // memmove [best_j+1, n-1] down by one
-    add w2, w0, #1               // k = best_j+1
+    // memmove [best_j+2, n-1] down by one (result at best_j must survive!)
+    add w2, w0, #2               // k = best_j+2
 mm_loop:
     cmp w2, w25
     b.hs mm_done
