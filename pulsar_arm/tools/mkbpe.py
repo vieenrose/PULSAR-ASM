@@ -25,8 +25,19 @@ def main():
     rules = []
     for i, (a, b) in enumerate(merges):
         rules.append((vocab[a], vocab[b], vocab[a + b], i))
-    rules.sort(key=lambda r: (r[0], r[1]))
-    print(f"rules: {len(rules)} (sorted for binary search)", flush=True)
+    # Sort right-major to match the asm single-u64 key (left | right<<32,
+    # little-endian load compares right first). Stable: same (l,r) keeps
+    # rank order, so dedup keeps the lowest rank (mirrors dict-first-wins).
+    rules.sort(key=lambda r: (r[1], r[0]))
+    deduped = []
+    prev = None
+    for r in rules:
+        if (r[0], r[1]) != prev:
+            deduped.append(r)
+            prev = (r[0], r[1])
+    print(f"rules: {len(rules)} sorted, {len(rules)-len(deduped)} dupes dropped",
+          flush=True)
+    rules = deduped
     chars = sorted((ord(s), i) for s, i in vocab.items() if len(s) == 1)
     print(f"single-char pieces: {len(chars)}", flush=True)
     bmap = []

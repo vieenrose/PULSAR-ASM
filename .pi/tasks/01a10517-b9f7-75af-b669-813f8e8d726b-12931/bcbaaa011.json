@@ -1,0 +1,27 @@
+{
+  "id": "bcbaaa011",
+  "name": "BPE encode verification run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cp /tmp/bpe.bin ~/PULSAR-ARM/pulsar_arm/bpe.bin && cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && timeout 280 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 0 ~/PULSAR-ARM/pulsar_arm/bpe.bin > /tmp/enc22.log 2>&1; echo EXIT=$?; grep -a \"bpe rules:\" /tmp/enc22.log | head -1; grep -a -c \"^enc:\" /tmp/enc22.log'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bcbaaa011.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791234062044,
+  "endTime": 1791234069425,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 97683,
+  "bytesWritten": 28,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
