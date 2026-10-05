@@ -3599,7 +3599,7 @@ vparse:
     mov x0, #28000               // TEMP CAP (bisection)
     cmp x22, x0
     b.hs 8f                      // clean exit with count
-    tst x22, #0x3FF              // progress every 1024
+    tst x22, #0x3F               // progress every 64 (TEMP bisect)
     b.ne 14f
     str x22, [sp, #-16]!
     str x30, [sp, #-16]!
