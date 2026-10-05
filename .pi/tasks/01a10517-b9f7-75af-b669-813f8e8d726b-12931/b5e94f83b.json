@@ -1,0 +1,28 @@
+{
+  "id": "b5e94f83b",
+  "name": "Empty-line robustness run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hello\\n\\n   \\nBye\\n\" | timeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 800 950 > /tmp/chatempty.log 2>&1; echo EXIT=$?; grep -a -c \"^> \" /tmp/chatempty.log'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b5e94f83b.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791237368882,
+  "endTime": 1791237452949,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 101865,
+  "bytesWritten": 9,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
