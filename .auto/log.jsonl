@@ -1,0 +1,1 @@
+{"type":"config","name":"gemma-3-270m ARM decode speed (3-core target)","metricName":"ms_per_token","metricUnit":"ms","bestDirection":"lower"}
