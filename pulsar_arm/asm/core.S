@@ -613,6 +613,8 @@ Wmat:        .skip 2048*640*2
 Xvec:        .skip 640*4
 Yvec:        .skip 2048*4
 
+    .section .text
+    .align 2
 /* ---------------- stage B-1: file I/O + safetensors header scan ----------------
  * x0 = argv[1] (model path). Opens, sizes via lseek, mmaps whole file,
  * locates all 236 tensors by quoted-name search, parses data_offsets +
