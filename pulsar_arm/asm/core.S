@@ -4611,13 +4611,8 @@ chat_next:
     cbz w0, chat_next            // line was just \r
 0:  mov x24, x0                  // hold len (both paths ✓)
 chat_enc:
-    mov x1, x24                  // len
-    adrp x0, INBUF
-    add x0, x0, :lo12:INBUF
-    adrp x2, ENC_OUT
-    add x2, x2, :lo12:ENC_OUT
-    mov w3, #512
-    bl encode                    // w0 = n (preserves x19+ ✓)
+    // x24 = len (held). tpl_build assembles template into ENC_OUT.
+    bl tpl_build                 // w0 = n (preserves x19+; restores x24 ✓)
     mov x21, x0                  // n
     // capacity: pos + n + (turn==0) + 128 > 480?
     add x0, x19, x21             // pos + n
@@ -4682,6 +4677,13 @@ chat_gloop:
     add x22, x22, #1
     b chat_gloop
 chat_end:
+    // close model turn: feed EOT (106)
+    adrp x0, G_pos
+    add x0, x0, :lo12:G_pos
+    str w19, [x0]
+    mov w0, #106
+    bl fwd_token
+    add x19, x19, #1             // pos++
     bl out_flush
     bl print_nl
     add x20, x20, #1             // turn++
@@ -4690,3 +4692,77 @@ chat_bye:
     mov x0, #0
     mov x8, #93
     svc #0
+
+    .section .bss
+    .align 4
+TBUF:        .skip 4096
+
+    .section .rodata
+t_model:     .asciz "model\n"
+
+    .section .text
+    .align 2
+/* tpl_build: INBUF+x24(len) -> ENC_OUT assembled turn ids. Returns w0 = n.
+ * Layout: [105] + enc("user\n"+line) + [106,107,105] + enc("model\n").
+ * Saves/restores x24 (encode clobbers it). Uses TBUF/ENC_OUT. No x19+ touched. */
+tpl_build:
+    str x30, [sp, #-16]!
+    str x24, [sp, #-16]!          // len (encode clobbers x24!)
+    // TBUF = "user\n" + line
+    adrp x0, TBUF
+    add x0, x0, :lo12:TBUF
+    mov w1, #0x7573              // "us"
+    strh w1, [x0]
+    mov w1, #0x7265              // "er"
+    strh w1, [x0, #2]
+    mov w1, #10                  // "\n"
+    strb w1, [x0, #4]            // TBUF[0..4] = "user\n" (exact, no spill ✓)
+    // copy line INBUF[0..x24-1] -> TBUF[5..]
+    adrp x1, INBUF
+    add x1, x1, :lo12:INBUF
+    add x0, x0, #5               // dst = TBUF+5 (x0 recomputed below ✓)
+    mov x2, #0                   // i
+0:  cmp x2, x24
+    b.hs 1f
+    ldrb w3, [x1, x2]
+    strb w3, [x0, x2]
+    add x2, x2, #1
+    b 0b
+1:  // encode(TBUF, len+5 -> ENC_OUT+1, max 500)
+    adrp x0, TBUF
+    add x0, x0, :lo12:TBUF
+    add x1, x24, #5              // len+5
+    adrp x2, ENC_OUT
+    add x2, x2, :lo12:ENC_OUT
+    add x2, x2, #4               // +1 slot (ENC_OUT[0] = 105 below)
+    mov w3, #500
+    bl encode                    // w0 = nu (x24 clobbered; restored at exit ✓)
+    str x0, [sp, #-16]!          // save nu (encode#2 clobbers x0-x8!)
+    mov x1, x0                   // nu
+    adrp x0, ENC_OUT
+    add x0, x0, :lo12:ENC_OUT
+    mov w2, #105
+    str w2, [x0]                 // [0] = SOT
+    lsl x3, x1, #2               // nu*4
+    add x2, x0, x3
+    add x2, x2, #4               // x2 = &ENC_OUT[1+nu]
+    mov w3, #106
+    str w3, [x2]
+    mov w3, #107
+    str w3, [x2, #4]
+    mov w3, #105
+    str w3, [x2, #8]             // [106,107,105]
+    // encode("model\n" -> ENC_OUT[4+nu], max 8)
+    adrp x0, t_model
+    add x0, x0, :lo12:t_model
+    mov x1, #6
+    add x2, x2, #12              // &ENC_OUT[4+nu]
+    mov w3, #8
+    bl encode                    // w0 = nm
+    mov x1, x0                   // nm
+    ldr x0, [sp], #16            // nu
+    add x0, x0, x1               // nu + nm
+    add x0, x0, #4               // n = 1 + nu + 3 + nm
+    ldr x24, [sp], #16           // restore len
+    ldr x30, [sp], #16
+    ret
