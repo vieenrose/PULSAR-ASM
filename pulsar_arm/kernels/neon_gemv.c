@@ -13,14 +13,10 @@
 #include <arm_neon.h>
 #include <stdint.h>
 #include <string.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
-/* One output row, sequential fp32 accumulation. Thread-agnostic: whichever
- * thread owns the row computes exactly the serial result, so a static
- * row partition across threads is bit-identical to the serial loop. */
-static inline float gemv_row(const uint16_t *row, const float *x, int K) {
+void gemv_bf16(int M, int K, const uint16_t *W, const float *x, float *y) {
+    for (int m = 0; m < M; m++) {
+        const uint16_t *row = W + (int64_t)m * K;
         float32x4_t a0 = vdupq_n_f32(0.0f);
         float32x4_t a1 = vdupq_n_f32(0.0f);
         float32x4_t a2 = vdupq_n_f32(0.0f);
@@ -45,19 +41,6 @@ static inline float gemv_row(const uint16_t *row, const float *x, int K) {
             memcpy(&w, &u, 4);
             s += w * x[k];
         }
-        return s;
-}
-
-void gemv_bf16(int M, int K, const uint16_t *W, const float *x, float *y) {
-    int m;
-    if (M >= 1024) {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(3)
-#endif
-        for (m = 0; m < M; m++)
-            y[m] = gemv_row(W + (int64_t)m * K, x, K);
-    } else {
-        for (m = 0; m < M; m++)
-            y[m] = gemv_row(W + (int64_t)m * K, x, K);
+        y[m] = s;
     }
 }

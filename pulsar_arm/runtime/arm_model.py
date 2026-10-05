@@ -34,7 +34,7 @@ EPS = 1e-6
 
 
 def build():
-    r = subprocess.run(["gcc", "-O2", "-fPIC", "-shared", "-fopenmp"] + SRC + ["-o", SO, "-lm", "-lgomp"],
+    r = subprocess.run(["gcc", "-O2", "-fPIC", "-shared"] + SRC + ["-o", SO, "-lm"],
                        capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stderr)
