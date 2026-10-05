@@ -1259,6 +1259,7 @@ file_stage_after_bench:
     b.lo 0f
     str x30, [sp, #-16]!
     str x1, [sp, #-16]!          // argv
+    stp x19, x20, [sp, #-16]!    // (temp/topp hold argc/argv across parses)
     adrp x2, J_path
     add x2, x2, :lo12:J_path
     ldr x3, [x1, #16]            // argv[2] tokjson
@@ -1316,13 +1317,12 @@ file_stage_after_bench:
     movz w3, #0x3333
     movk w3, #0x3F73, lsl #16
     str w3, [x2]                 // 0.95
-    cmp x0, #7
+    mov x19, x0                  // argc (x19: parse-safe? parse uses x0-x4 ✓)
+    mov x20, x1                  // argv (x20: parse-safe ✓)
+    cmp x19, #7
     b.lo 5f
-    ldr x3, [x1, #48]            // argv[6] ptr
-    str x0, [sp, #-16]!          // save argc
-    str x1, [sp, #-16]!          // save argv
-    mov x0, x3
-    bl parse_u64                 // x0 = milli
+    ldr x0, [x20, #48]           // argv[6] ptr
+    bl parse_u64                 // x0 = milli (x19/x20 intact ✓)
     cmp x0, #50
     b.hs 6f
     mov x0, #50
@@ -1338,12 +1338,10 @@ file_stage_after_bench:
     adrp x1, G_TEMP
     add x1, x1, :lo12:G_TEMP
     str s0, [x1]
-    ldr x0, [sp, #8]             // argc (stack: [sp]=argv, [sp+8]=argc ✓)
-    cmp x0, #8
+    cmp x19, #8
     b.lo 8f
-    ldr x1, [sp]                 // argv
-    ldr x0, [x1, #56]            // argv[7] ptr
-    bl parse_u64
+    ldr x0, [x20, #56]           // argv[7] ptr
+    bl parse_u64                 // (x19/x20 intact ✓)
     cmp x0, #100
     b.hs 9f
     mov x0, #100
@@ -1358,9 +1356,9 @@ file_stage_after_bench:
     adrp x1, G_TOPP
     add x1, x1, :lo12:G_TOPP
     str s0, [x1]
-8:  ldr x1, [sp], #16            // restore argv
-    ldr x0, [sp], #16            // restore argc
-5:  cmp x0, #4                   // argc>=4? (re-compare: flags stale here)
+8:  mov x0, x19                  // restore argc
+    mov x1, x20                  // restore argv
+5:  cmp x0, #4
     b.lo 1f
     b.lo 1f
     ldr x0, [x1, #24]            // argv[3]
@@ -1368,7 +1366,8 @@ file_stage_after_bench:
     adrp x1, G_tok
     add x1, x1, :lo12:G_tok
     str x0, [x1]
-1:  ldr x1, [sp], #16            // pop argv
+1:  ldp x19, x20, [sp], #16        // restore (reverse of push order)
+    ldr x1, [sp], #16            // pop argv
     ldr x0, [x1, #8]             // argv[1] path -- WAIT x1 just popped (=argv) ✓, x0 = path ✓. But x0 was tok (dead ✓ fine).
     ldr x30, [sp], #16
     b file_stage
