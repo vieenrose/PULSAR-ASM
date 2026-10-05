@@ -53,7 +53,8 @@ def main():
         show("kn", Kn, hkn)
         # rotary_emb returns a (cos, sin) tuple
         cos, sin = hf.model.rotary_emb(torch.empty(1, 3, 640),
-                                       torch.tensor([[0, 1, 2]]))
+                                       torch.tensor([[0, 1, 2]]),
+                                       layer_type="sliding_attention")
         qr, kr = apply_rotary_pos_emb(q4, k1, cos, sin, unsqueeze_dim=1)
         qr = qr.numpy().transpose(0, 2, 1, 3).reshape(3, 4, 256)
         kr = kr.numpy().transpose(0, 2, 1, 3).reshape(3, 1, 256)
