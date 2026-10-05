@@ -1,0 +1,27 @@
+{
+  "id": "b99705bae",
+  "name": "BPE 18-18 plus metric run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && timeout 280 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 0 ~/PULSAR-ARM/pulsar_arm/bpe.bin > /tmp/enc22c.log 2>&1; echo EXIT=$?; grep -a \"METRIC\" /tmp/enc22c.log | head -1'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b99705bae.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791234497569,
+  "endTime": 1791234506157,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 98140,
+  "bytesWritten": 34,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
