@@ -223,6 +223,7 @@ tanhf_sat:
 /* ---------------- sincos: reduce in f64, poly in f32 ---------------- */
 /* sincos_asm: s0 = x -> s0 = sin(x), s1 = cos(x). |x| < 600. */
 sincos_asm:
+    stp x19, x20, [sp, #-16]!     // flags must survive adrp (clobbers x9)
     fcvt d2, s0                  // x in f64
     adrp x9, d_inv_2pi
     ldr d3, [x9, :lo12:d_inv_2pi]
@@ -241,18 +242,18 @@ sincos_asm:
     fcmp d2, d7
     b.le 4f
     fsub d2, d5, d2
-    mov w9, #0
-    mov w10, #1
+    mov w19, #0
+    mov w20, #1
     b 5f
 4:  fneg d7, d7
     fcmp d2, d7
     b.ge 6f
     fadd d2, d2, d5
-    mov w9, #1
-    mov w10, #1
+    mov w19, #1
+    mov w20, #1
     b 5f
-6:  mov w9, #0
-    mov w10, #0
+6:  mov w19, #0
+    mov w20, #0
 5:  fcvt s2, d2                   // r'
     fmul s3, s2, s2              // x2
     // sin degree 13
@@ -282,7 +283,7 @@ sincos_asm:
     fmov s5, #1.0
     fadd s4, s4, s5
     fmul s0, s4, s2
-    cbnz w9, 7f
+    cbnz w19, 7f
     b 8f
 7:  fneg s0, s0
     // cos degree 12
@@ -311,9 +312,11 @@ sincos_asm:
     fmul s4, s4, s3
     fmov s5, #1.0
     fadd s1, s4, s5
-    cbnz w10, 9f
+    cbnz w20, 9f
+    ldp x19, x20, [sp], #16
     ret
 9:  fneg s1, s1
+    ldp x19, x20, [sp], #16
     ret
 
 /* ---------------- gemv_bf16: mirrors neon_gemv.c lane-for-lane ----------------
