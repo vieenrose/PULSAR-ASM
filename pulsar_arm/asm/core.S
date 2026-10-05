@@ -949,10 +949,12 @@ file_stage:
     bl print_cstr
     adrp x1, tab
     add x1, x1, :lo12:tab
-    ldr x0, [x1, #16]
+    ldr x19, [x1, #16]              // (x1 dies in prints; x19+ survive)
+    ldr x20, [x1, #24]
+    mov x0, x19
     bl print_u64
     bl print_sp
-    ldr x0, [x1, #24]
+    mov x0, x20
     bl print_u64
     bl print_nl
     // in_norm0 values (slot2): expect 15.0625 15.875 9.8125 40.5
@@ -991,10 +993,12 @@ f_anchors_fixed:
     mov x2, #56
     mul x0, x0, x2
     add x1, x1, x0
-    ldr x0, [x1, #16]
+    ldr x19, [x1, #16]
+    ldr x20, [x1, #24]
+    mov x0, x19
     bl print_u64
     bl print_sp
-    ldr x0, [x1, #24]
+    mov x0, x20
     bl print_u64
     bl print_nl
     b f_stage_ret
