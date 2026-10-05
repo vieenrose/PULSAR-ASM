@@ -1415,7 +1415,7 @@ embed_row_f32:
     .global argmax_f32
 argmax_f32:
     ldr s0, [x0]
-    mov w0, #0
+    mov w2, #0                   // best idx (x0 is the buffer; never clobber!)
     mov w9, #1
 0:  cmp w9, w1
     b.hs 1f
@@ -1423,10 +1423,11 @@ argmax_f32:
     fcmp s1, s0
     b.le 2f
     fmov s0, s1
-    mov w0, w9
+    mov w2, w9
 2:  add w9, w9, #1
     b 0b
-1:  ret
+1:  mov w0, w2
+    ret
 
 /* sum_sq(ptr,x0 n,w1) -> s0 = sum of squares (NEON 4-acc, C hsum order). */
 sum_sq:
@@ -1584,12 +1585,15 @@ kern_tests:
     str s0, [x9, x10, lsl #2]
     add w10, w10, #1
     b 0b
-1:  adrp x9, T1                  // w = 0
+1:  adrp x9, T1                  // w = 1 (zeros would null the signal)
     add x9, x9, :lo12:T1
+    adrp x10, f_1
+    add x10, x10, :lo12:f_1
+    ldr s0, [x10]
     mov w10, #0
 2:  cmp w10, #640
     b.hs 3f
-    str wzr, [x9, x10, lsl #2]
+    str s0, [x9, x10, lsl #2]
     add w10, w10, #1
     b 2b
 3:  adrp x0, T2
