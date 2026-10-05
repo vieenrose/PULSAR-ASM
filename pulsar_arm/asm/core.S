@@ -1488,13 +1488,24 @@ kern_tests:
     ldr s0, [x9]
     bl print_f32                 // expect 1.0
     bl print_sp
+    adrp x9, T0
+    add x9, x9, :lo12:T0
     ldr s0, [x9, #4]             // expect 2.0
     bl print_f32
     bl print_sp
+    adrp x9, T0
+    add x9, x9, :lo12:T0
     ldr s0, [x9, #8]             // expect 3.0
     bl print_f32
     bl print_sp
+    adrp x9, T0
+    add x9, x9, :lo12:T0
     ldr s0, [x9, #12]            // expect 4.0
+    bl print_f32
+    bl print_nl
+    adrp x9, T1
+    add x9, x9, :lo12:T1
+    ldr s0, [x9]                 // w[0], expect 1.0
     bl print_f32
     bl print_nl
     ld1 {v1.4s}, [x9]            // inline: expect [1,2,3,4]
