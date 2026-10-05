@@ -98,14 +98,14 @@ print_f32:
     mov w0, #'.'
     bl print_ch
     fmov s3, #10.0
-    mov w9, #7
+    mov w12, #7
 3:  fmul s2, s2, s3
     frintm s1, s2
     fcvtzs x0, s1
     add x0, x0, #'0'
     bl print_ch_direct           // leaf: preserves lr and s-regs
     fsub s2, s2, s1
-    subs w9, w9, #1
+    subs w12, w12, #1
     b.ne 3b
     ldr x30, [sp], #16
     ret
