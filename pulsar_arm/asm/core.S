@@ -562,6 +562,7 @@ _start:
     add x1, sp, #8                // argv
     bl file_stage_after_bench
     bl tables_test
+    bl fwd_layer0
     mov x0, #0
     mov x8, #SYS_EXIT
     svc #0
@@ -2283,5 +2284,418 @@ tables_test:
     ldr s0, [x19, #12]
     bl print_f32
     bl print_nl
+    ldr x30, [sp], #16
+    ret
+
+    .section .rodata
+    .align 3
+s_X:         .asciz "L0 X "
+s_H:         .asciz "L0 H "
+s_QN0:       .asciz "L0 QN0 "
+s_AV:        .asciz "L0 AV "
+s_POST:      .asciz "L0 POST "
+s_X1:        .asciz "L0 X1 "
+s_GG:        .asciz "L0 GG "
+s_D:         .asciz "L0 D "
+s_X2:        .asciz "L0 X2 "
+s_max:       .asciz "max="
+s_vec:       .asciz " v=["
+s_comma:     .asciz ","
+s_rb:        .asciz "]"
+
+    .section .bss
+    .align 4
+FH:          .skip 640*4
+FQ:          .skip 1024*4
+FQN:         .skip 1024*4
+FKV:         .skip 256*4
+FKN:         .skip 256*4
+FV:          .skip 256*4
+FS:          .skip 512*4
+FAV:         .skip 1024*4
+FG:          .skip 2048*4
+FU:          .skip 2048*4
+
+    .section .text
+    .align 2
+/* print_sig: x0=label, x1=vec, w2=n. Prints "label max=.. v=[..]".
+ * Stack-peek discipline: vec/n live on stack, reloaded before EVERY use
+ * (prints clobber x0-x9 and s0-s3). Nothing held across bl in regs. */
+print_sig:
+    str x30, [sp, #-16]!
+    stp x1, x2, [sp, #-16]!      // [sp] = vec, n
+    bl print_cstr                // label
+    ldr x3, [sp]                 // vec
+    ldr w4, [sp, #8]             // n
+    ldr s0, [x3]
+    fabs s0, s0
+    mov w5, #1
+0:  cmp w5, w4
+    b.hs 1f
+    ldr s1, [x3, x5, lsl #2]
+    fabs s1, s1
+    fcmp s1, s0
+    b.le 2f
+    fmov s0, s1
+2:  add w5, w5, #1
+    b 0b
+1:  str s0, [sp, #-16]!          // save max across print
+    adrp x0, s_max
+    add x0, x0, :lo12:s_max
+    bl print_cstr
+    ldr s0, [sp], #16
+    bl print_f32
+    adrp x0, s_vec
+    add x0, x0, :lo12:s_vec
+    bl print_cstr
+    ldr x3, [sp]
+    ldr s0, [x3]
+    bl print_f32
+    adrp x0, s_comma
+    add x0, x0, :lo12:s_comma
+    bl print_cstr
+    ldr x3, [sp]
+    ldr s0, [x3, #4]
+    bl print_f32
+    adrp x0, s_comma
+    add x0, x0, :lo12:s_comma
+    bl print_cstr
+    ldr x3, [sp]
+    ldr s0, [x3, #8]
+    bl print_f32
+    adrp x0, s_comma
+    add x0, x0, :lo12:s_comma
+    bl print_cstr
+    ldr x3, [sp]
+    ldr s0, [x3, #12]
+    bl print_f32
+    adrp x0, s_rb
+    add x0, x0, :lo12:s_rb
+    bl print_cstr
+    bl print_nl
+    ldp x1, x2, [sp], #16        // pop vec,n (balance)
+    ldr x30, [sp], #16
+    ret
+/* wptr: w0 = slot -> x0 = data+off. Uses x0/x1. x19=data (preserved). */
+wptr:
+    mov x1, #56
+    mul x0, x0, x1
+    adrp x1, tab
+    add x1, x1, :lo12:tab
+    add x0, x1, x0               // slot addr
+    ldr x1, [x0]                 // off
+    add x0, x19, x1              // data+off
+    ret
+/* nptr: w0 = fldidx -> x0 = FL+idx*2560. Uses x0/x1. */
+nptr:
+    lsl x0, x0, #8               // *256
+    mov x1, #10
+    mul x0, x0, x1               // *2560
+    adrp x1, FL
+    add x1, x1, :lo12:FL
+    add x0, x1, x0
+    ret
+/* fwd_layer0: single token (G_tok), pos 0, layer 0 sliding. Prints L0 sig.
+ * x19=data, x20=scratch-pad base? NO: adrp fresh per call except x19.
+ * Holds x19=data across all calls (kernels keep x19+). Saves x19/x30. */
+fwd_layer0:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    adrp x0, G_base
+    add x0, x0, :lo12:G_base
+    ldr x19, [x0]
+    adrp x0, G_N
+    add x0, x0, :lo12:G_N
+    ldr x0, [x0]
+    add x19, x19, #8
+    add x19, x19, x0             // x19 = data base
+    // X = embed(tok)
+    adrp x0, G_tok
+    add x0, x0, :lo12:G_tok
+    ldr w2, [x0]                 // token
+    mov w0, #0
+    bl wptr                      // x0 = emb (slot0)
+    mov x1, x0                   // emb
+    adrp x0, XB
+    add x0, x0, :lo12:XB
+    mov w3, #640
+    adrp x4, f_sqrt640
+    add x4, x4, :lo12:f_sqrt640
+    ldr s0, [x4]
+    bl embed_row_f32             // (XB, emb, tok, 640, esc)
+    adrp x0, s_X
+    add x0, x0, :lo12:s_X
+    adrp x1, XB
+    add x1, x1, :lo12:XB
+    mov w2, #640
+    bl print_sig
+    // H = norm(XB) with FL[1]
+    mov w0, #1
+    bl nptr                      // x0 = FL[1]
+    mov x1, x0                   // w
+    adrp x0, FH
+    add x0, x0, :lo12:FH         // out
+    adrp x2, XB
+    add x2, x2, :lo12:XB         // x
+    mov w3, #640
+    adrp x4, f_eps
+    add x4, x4, :lo12:f_eps
+    ldr s0, [x4]
+    bl rmsnorm_f32
+    adrp x0, s_H
+    add x0, x0, :lo12:s_H
+    adrp x1, FH
+    add x1, x1, :lo12:FH
+    mov w2, #640
+    bl print_sig
+    // Q = q-proj(slot5,1024x640) . KV = k-proj(slot6,256x640)
+    mov w0, #5
+    bl wptr
+    mov x2, x0                   // Wq
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FQ
+    add x4, x4, :lo12:FQ
+    mov w0, #1024
+    mov w1, #640
+    bl gemv_bf16
+    mov w0, #6
+    bl wptr
+    mov x2, x0                   // Wk
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FKV
+    add x4, x4, :lo12:FKV
+    mov w0, #256
+    mov w1, #640
+    bl gemv_bf16
+    // KN = norm(KV) with FL[3]; rope (sliding pos0)
+    mov w0, #3
+    bl nptr
+    mov x1, x0
+    adrp x0, FKN
+    add x0, x0, :lo12:FKN
+    adrp x2, FKV
+    add x2, x2, :lo12:FKV
+    mov w3, #256
+    adrp x4, f_eps
+    add x4, x4, :lo12:f_eps
+    ldr s0, [x4]
+    bl rmsnorm_f32
+    adrp x0, FKN
+    add x0, x0, :lo12:FKN
+    adrp x1, TCOS_S
+    add x1, x1, :lo12:TCOS_S
+    adrp x2, TSIN_S
+    add x2, x2, :lo12:TSIN_S
+    mov w3, #128
+    bl rope_half
+    // V = v-proj(slot7,256x640) into FV
+    mov w0, #7
+    bl wptr
+    mov x2, x0                   // Wv
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FV
+    add x4, x4, :lo12:FV
+    mov w0, #256
+    mov w1, #640
+    bl gemv_bf16
+    // heads j=0..3 (w20; kernels keep x19+, print_sig keeps x20)
+    mov w20, #0                  // j
+20: cmp w20, #4
+    b.hs 29f
+    lsl x3, x20, #10             // j*1024
+    mov w0, #2
+    bl nptr                      // x0 = FL[2] (qn)
+    mov x1, x0                   // w
+    adrp x0, FQN
+    add x0, x0, :lo12:FQN
+    add x0, x0, x3               // out
+    adrp x2, FQ
+    add x2, x2, :lo12:FQ
+    add x2, x2, x3               // x
+    mov w3, #256
+    adrp x4, f_eps
+    add x4, x4, :lo12:f_eps
+    ldr s0, [x4]
+    bl rmsnorm_f32
+    lsl x3, x20, #10
+    adrp x0, FQN
+    add x0, x0, :lo12:FQN
+    add x0, x0, x3
+    adrp x1, TCOS_S
+    add x1, x1, :lo12:TCOS_S
+    adrp x2, TSIN_S
+    add x2, x2, :lo12:TSIN_S
+    mov w3, #128
+    bl rope_half
+    cbnz w20, 21f
+    adrp x0, s_QN0
+    add x0, x0, :lo12:s_QN0
+    adrp x1, FQN
+    add x1, x1, :lo12:FQN
+    mov w2, #256
+    bl print_sig
+21: lsl x3, x20, #10
+    adrp x0, FS
+    add x0, x0, :lo12:FS
+    adrp x1, FQN
+    add x1, x1, :lo12:FQN
+    add x1, x1, x3
+    adrp x2, FKN
+    add x2, x2, :lo12:FKN
+    mov w3, #1
+    mov w4, #256
+    adrp x5, f_scale
+    add x5, x5, :lo12:f_scale
+    ldr s0, [x5]
+    bl attn_scores_f32
+    adrp x0, FS
+    add x0, x0, :lo12:FS
+    mov w1, #1
+    bl softmax_f32
+    lsl x3, x20, #10
+    adrp x0, FAV
+    add x0, x0, :lo12:FAV
+    add x0, x0, x3
+    adrp x1, FV
+    add x1, x1, :lo12:FV
+    adrp x2, FS
+    add x2, x2, :lo12:FS
+    mov w3, #1
+    mov w4, #256
+    bl attn_values_f32
+    add w20, w20, #1
+    b 20b
+29: adrp x0, s_AV
+    add x0, x0, :lo12:s_AV
+    adrp x1, FAV
+    add x1, x1, :lo12:FAV
+    mov w2, #1024
+    bl print_sig
+    // H = o-proj(slot8, 640x1024)
+    mov w0, #8
+    bl wptr
+    mov x2, x0                   // Wo
+    adrp x3, FAV
+    add x3, x3, :lo12:FAV
+    adrp x4, FH
+    add x4, x4, :lo12:FH
+    mov w0, #640
+    mov w1, #1024
+    bl gemv_bf16
+    // H = rmsnorm_add(H, FL[4], H, XB); print POST, X1
+    mov w0, #4
+    bl nptr
+    mov x1, x0                   // pa
+    adrp x0, FH
+    add x0, x0, :lo12:FH
+    adrp x2, FH
+    add x2, x2, :lo12:FH
+    adrp x3, XB
+    add x3, x3, :lo12:XB
+    mov w4, #640
+    adrp x5, f_eps
+    add x5, x5, :lo12:f_eps
+    ldr s0, [x5]
+    bl rmsnorm_add_f32
+    adrp x0, s_POST
+    add x0, x0, :lo12:s_POST
+    adrp x1, FH
+    add x1, x1, :lo12:FH
+    mov w2, #640
+    bl print_sig
+    adrp x0, s_X1
+    add x0, x0, :lo12:s_X1
+    adrp x1, XB
+    add x1, x1, :lo12:XB
+    mov w2, #640
+    bl print_sig
+    // H = rmsnorm(FH, FL[5], XB); G = gate(slot11); U = up(slot12)
+    mov w0, #5
+    bl nptr
+    mov x1, x0                   // pf
+    adrp x0, FH
+    add x0, x0, :lo12:FH
+    adrp x2, XB
+    add x2, x2, :lo12:XB
+    mov w3, #640
+    adrp x4, f_eps
+    add x4, x4, :lo12:f_eps
+    ldr s0, [x4]
+    bl rmsnorm_f32
+    mov w0, #11
+    bl wptr
+    mov x2, x0                   // Wg
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FG
+    add x4, x4, :lo12:FG
+    mov w0, #2048
+    mov w1, #640
+    bl gemv_bf16
+    mov w0, #12
+    bl wptr
+    mov x2, x0                   // Wu
+    adrp x3, FH
+    add x3, x3, :lo12:FH
+    adrp x4, FU
+    add x4, x4, :lo12:FU
+    mov w0, #2048
+    mov w1, #640
+    bl gemv_bf16
+    adrp x0, FG
+    add x0, x0, :lo12:FG
+    adrp x1, FG
+    add x1, x1, :lo12:FG
+    adrp x2, FU
+    add x2, x2, :lo12:FU
+    mov w3, #2048
+    bl gelu_mul_f32
+    adrp x0, s_GG
+    add x0, x0, :lo12:s_GG
+    adrp x1, FG
+    add x1, x1, :lo12:FG
+    mov w2, #2048
+    bl print_sig
+    // H = down(slot13, 640x2048); H = rmsnorm_add(FL[6]); print D, X2
+    mov w0, #13
+    bl wptr
+    mov x2, x0                   // Wd
+    adrp x3, FG
+    add x3, x3, :lo12:FG
+    adrp x4, FH
+    add x4, x4, :lo12:FH
+    mov w0, #640
+    mov w1, #2048
+    bl gemv_bf16
+    mov w0, #6
+    bl nptr
+    mov x1, x0                   // ff
+    adrp x0, FH
+    add x0, x0, :lo12:FH
+    adrp x2, FH
+    add x2, x2, :lo12:FH
+    adrp x3, XB
+    add x3, x3, :lo12:XB
+    mov w4, #640
+    adrp x5, f_eps
+    add x5, x5, :lo12:f_eps
+    ldr s0, [x5]
+    bl rmsnorm_add_f32
+    adrp x0, s_D
+    add x0, x0, :lo12:s_D
+    adrp x1, FH
+    add x1, x1, :lo12:FH
+    mov w2, #640
+    bl print_sig
+    adrp x0, s_X2
+    add x0, x0, :lo12:s_X2
+    adrp x1, XB
+    add x1, x1, :lo12:XB
+    mov w2, #640
+    bl print_sig
+    ldp x19, x20, [sp], #16
     ldr x30, [sp], #16
     ret
