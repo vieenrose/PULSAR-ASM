@@ -1,0 +1,27 @@
+{
+  "id": "b82088b13",
+  "name": "Chat EOF and two-turn test",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && timeout 60 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin < /dev/null > /tmp/chatnull2.log 2>&1; echo NULL-EXIT=$?; printf \"Hello\\nThe capital of France is\\n\" | timeout 120 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin > /tmp/chat2turn.log 2>&1; echo TURN-EXIT=$?; echo \"--- null tail:\"; tail -2 /tmp/chatnull2.log | cut -c1-50; echo \"--- 2turn responses:\"; grep -a -A3 \"^> \" /tmp/chat2turn.log | cut -c1-65 | head -10'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b82088b13.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791235378832,
+  "endTime": 1791235380348,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 99161,
+  "bytesWritten": 117,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -4552,32 +4552,33 @@ t_nobpe:     .asciz "chat mode needs bpe.bin (argv[5])\n"
     .section .text
     .align 2
 /* readline: -> w0 = len (0 = empty line) or -1 (EOF, no bytes).
- * Byte-at-a-time (no leftover logic; prompts are short). Uses x0-x3. Leaf. */
+ * Byte-at-a-time (no leftover logic; prompts are short).
+ * x1=cursor, x2=read-count(1), w4=len, w3=cap. Leaf (x19+ safe). */
 readline:
     adrp x1, INBUF
     add x1, x1, :lo12:INBUF      // cursor
-    mov w2, #0                   // len
+    mov w4, #0                   // len (x4: SVC preserves x1-x7 ✓)
     mov w3, #4095                // cap
-0:  cmp w2, w3
+    mov x2, #1                   // count (SVC preserves x2 ✓ set once)
+0:  cmp w4, w3
     b.hs 2f                      // full: truncate
     mov x0, #0                   // fd stdin
-    mov x4, #1                   // count = 1 (x4, NOT x2=len!)
     mov x8, #63                  // read
-    svc #0                       // n (x1=cursor intact? SVC preserves x1? SYSCALL clobbers x0 (return) only... x1/x2/x8 PRESERVED? Linux SVC preserves all except x0 (return value). x1 cursor SAFE ✓. x8 must be RESET each loop? x8 preserved ✓ but harmless to reset (already set before svc; loop re-sets x0 only... x8 intact ✓. Keep mov x8 inside loop for safety (2 insns, negligible for interactive).
+    svc #0                       // n (x1=cursor, x2=1 preserved ✓)
     cmp x0, #0
     b.le 1f                      // EOF/error
     ldrb w0, [x1]
     cmp w0, #10                  // \n?
     b.eq 2f                      // done (strip)
     add x1, x1, #1
-    add w2, w2, #1
+    add w4, w4, #1
     b 0b
-1:  cbz w2, 3f                   // EOF with no bytes -> -1
-    mov w0, w2                   // partial line (no \n) -> len
+1:  cbz w4, 3f                   // EOF with no bytes -> -1
+    mov w0, w4                   // partial line -> len
     ret
 3:  mov w0, #-1
     ret
-2:  mov w0, w2                   // len (0 = empty line)
+2:  mov w0, w4                   // len (0 = empty line)
     ret
 
 /* chat: interactive REPL. x19=pos, x20=turn, x21=n, x22=i/count, x23=tok. */

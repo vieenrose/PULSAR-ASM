@@ -1,0 +1,7 @@
+NULL-EXIT=0
+TURN-EXIT=0
+--- null tail:
+chat ready (sample mode; empty line skips, EOF qui
+> 
+--- 2turn responses:
+> 
