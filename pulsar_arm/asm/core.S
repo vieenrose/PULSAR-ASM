@@ -1371,7 +1371,7 @@ rmsnorm_add_f32:
     fmul v2.4s, v2.4s, v3.4s
     fmul v2.4s, v2.4s, v4.4s
     st1 {v2.4s}, [x7], #16
-    ld1 {v3.4s}, [x8], #16
+    ld1 {v3.4s}, [x8]
     fadd v3.4s, v3.4s, v2.4s
     st1 {v3.4s}, [x8], #16
     add w9, w9, #4
