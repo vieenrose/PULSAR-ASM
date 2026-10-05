@@ -129,6 +129,7 @@ class Arm270m:
             getattr(lib, f_).restype = None
         self.lib = lib
         self.pos = 0
+        self.tape = None  # when a list, forward() appends X after each layer
         if verbose:
             print(f"  arm module ready, init {time.time()-t0:.1f}s", flush=True)
 
@@ -182,6 +183,8 @@ class Arm270m:
             lib.rmsnorm_f32(P(self.H), P(self.norms[p + "post_feedforward_layernorm.weight"]),
                             P(self.H), HID, EPS)
             self.X += self.H
+            if self.tape is not None:
+                self.tape.append(self.X.copy())
         lib.rmsnorm_f32(P(self.H), P(self.norms["model.norm.weight"]), P(self.X),
                         HID, EPS)
         # tied head over the full vocab table (bf16 stream)
