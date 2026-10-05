@@ -38,6 +38,23 @@ cd pulsar_arm/asm && as -o core.o core.S && ld -static -o core core.o
 - Deterministic (fixed seed): greedy, sampled, and full chat transcripts all
   reproduce bit-for-bit across runs (proven by diff, runs #38-40).
 
+## Demo (270m chat, temp 0.8, cap 64)
+
+```
+$ printf 'Write a haiku about the sea.\n' | ./core model.safetensors vocab.bin 2 c bpe.bin 800 950 64
+chat ready (sample mode; empty line skips, EOF quits)
+> tpl: 16 105 2364 107 6974 496 678 20517 1003 506 5442 236761 106 107 105 4368 107
+This is an essential.
+(
+This is a.
+This is a.
+This is a.
+The poem is a
+```
+
+Sampling varies run to run (fixed seed reproduces exactly); temp < 0.7 tends to
+loop — see guidance above. Prefill ids print as `tpl:` for transparency.
+
 ## Layout
 `core.S`: file/mmap stage → compute kernels → layer forward → sampler →
 BPE + chat → bench/chat drivers. Build-time converters in `tools/`.
