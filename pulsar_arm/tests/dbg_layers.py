@@ -20,7 +20,7 @@ repo = os.path.dirname(snap)
 
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 tk = AutoTokenizer.from_pretrained(repo, trust_remote_code=False)
-hf = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.bfloat16, device_map="cpu")
+hf = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.float32, device_map="cpu")
 hf.eval()
 
 ids = [2, 107, 1567]

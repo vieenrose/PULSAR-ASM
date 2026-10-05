@@ -36,7 +36,10 @@ def main():
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tk = AutoTokenizer.from_pretrained(repo, trust_remote_code=False)
-    hf = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.bfloat16,
+    # fp32, not bf16: torch's oneDNN bf16 matmul fails on ARM (mkldnn_matmul
+    # throws), so a bf16 reference here would measure torch's fallback, not
+    # the checkpoint. fp32 is the honest ground truth on this machine.
+    hf = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.float32,
                                               device_map="cpu")
     hf.eval()
 
