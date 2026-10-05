@@ -1106,7 +1106,8 @@ rmsnorm_f32:
     fmla v0.4s, v1.4s, v1.4s
     add w9, w9, #4
     b 0b
-1:  addv s0, v0.4s
+1:  addv s1, v0.4s              // NEVER addv into its own vector (overlap hazard)
+    fmov s0, s1
     mov w10, w9
 2:  cmp w10, w3
     b.hs 3f
@@ -1318,7 +1319,8 @@ rmsnorm_add_f32:
     fmla v0.4s, v1.4s, v1.4s
     add w9, w9, #4
     b 0b
-1:  addv s0, v0.4s
+1:  addv s1, v0.4s              // NEVER addv into its own vector (overlap hazard)
+    fmov s0, s1
     mov w10, w9
 2:  cmp w10, w4
     b.hs 3f
@@ -1429,7 +1431,8 @@ sum_sq:
     fmla v0.4s, v1.4s, v1.4s
     add w9, w9, #4
     b 0b
-1:  addv s0, v0.4s
+1:  addv s1, v0.4s              // NEVER addv into its own vector (overlap hazard)
+    fmov s0, s1
 2:  cmp w9, w1
     b.hs 3f
     ldr s1, [x0, x9, lsl #2]
