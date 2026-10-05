@@ -1291,22 +1291,6 @@ file_stage_after_bench:
     ldr x3, [x1, #40]            // argv[5] bpe.bin path
     str x3, [x2]
 4:  cmp x0, #4                   // x0=argc, x1=argv intact (mode+bpe used x2/x3 only ✓)
-    // chat mode: argv[4][0]=='c' -> J_chat=1, G_MODE=1 (sample)
-    adrp x2, J_chat
-    add x2, x2, :lo12:J_chat
-    mov x3, #0
-    str x3, [x2]
-    cmp x0, #5
-    b.lo 5f
-    ldr x3, [x1, #32]            // argv[4]
-    ldrb w3, [x3]
-    cmp w3, #'c'
-    b.ne 5f
-    mov x3, #1
-    str x3, [x2]                 // J_chat = 1
-    adrp x2, G_MODE
-    add x2, x2, :lo12:G_MODE
-    str x3, [x2]                 // G_MODE = 1 (chat samples)
     // G_TEMP argv[6] milli (default 1000), G_TOPP argv[7] milli (default 950)
     adrp x2, G_TEMP
     add x2, x2, :lo12:G_TEMP
@@ -1320,7 +1304,7 @@ file_stage_after_bench:
     mov x19, x0                  // argc (x19: parse-safe? parse uses x0-x4 ✓)
     mov x20, x1                  // argv (x20: parse-safe ✓)
     cmp x19, #7
-    b.lo 5f
+    b.lo 8f                      // no temp arg: join restores (=no-op), fall to chat
     ldr x0, [x20, #48]           // argv[6] ptr
     bl parse_u64                 // x0 = milli (x19/x20 intact ✓)
     cmp x0, #50
@@ -1358,6 +1342,23 @@ file_stage_after_bench:
     str s0, [x1]
 8:  mov x0, x19                  // restore argc
     mov x1, x20                  // restore argv
+
+    // chat mode: argv[4][0]=='c' -> J_chat=1, G_MODE=1 (sample)
+    adrp x2, J_chat
+    add x2, x2, :lo12:J_chat
+    mov x3, #0
+    str x3, [x2]
+    cmp x0, #5
+    b.lo 5f
+    ldr x3, [x1, #32]            // argv[4]
+    ldrb w3, [x3]
+    cmp w3, #'c'
+    b.ne 5f
+    mov x3, #1
+    str x3, [x2]                 // J_chat = 1
+    adrp x2, G_MODE
+    add x2, x2, :lo12:G_MODE
+    str x3, [x2]                 // G_MODE = 1 (chat samples)
 5:  cmp x0, #4
     b.lo 1f
     b.lo 1f
