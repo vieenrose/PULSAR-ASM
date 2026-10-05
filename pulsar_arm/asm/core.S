@@ -1516,12 +1516,31 @@ kern_tests:
     ldr s0, [x9]                 // w[0], expect 1.0
     bl print_f32
     bl print_nl
-    ld1 {v1.4s}, [x9]            // inline: expect [1,2,3,4]
+    adrp x19, T0
+    add x19, x19, :lo12:T0      // x19 survives prints
+    ld1 {v1.4s}, [x19]
+    adrp x9, T3
+    add x9, x9, :lo12:T3
+    st1 {v1.4s}, [x9]            // spill loaded lanes
+    ldr s0, [x9]
+    bl print_f32                 // expect 1.0 (load path)
+    bl print_sp
+    ldr s0, [x9, #4]
+    bl print_f32                 // expect 2.0
+    bl print_nl
+    ld1 {v1.4s}, [x19]
     movi v0.4s, #0
     fmla v0.4s, v1.4s, v1.4s
+    st1 {v0.4s}, [x9]
+    ldr s0, [x9]
+    bl print_f32                 // expect 1.0 (fmla lane0)
+    bl print_sp
+    ldr s0, [x9, #8]
+    bl print_f32                 // expect 9.0 (fmla lane2)
+    bl print_nl
     addv s1, v0.4s
     fmov s0, s1
-    bl print_f32                 // expect 30.0 (energy direct)
+    bl print_f32                 // expect 30.0 (addv)
     bl print_sp
     adrp x9, T2
     add x9, x9, :lo12:T2
