@@ -67,13 +67,17 @@ class Arm270m:
             off, shape = self.off[name]
             return base + off, shape
 
-        # norms widened once at load (vectors, not streams)
+        # norms widened once at load (vectors, not streams). Gemma3RMSNorm
+        # multiplies by (1 + w), not w (weights init to zero, not one) - so
+        # the +1 is folded here and the C kernel stays a plain scale. Done
+        # in float64 before the fp32 cast to keep it exact to ~1e-9.
         def f32vec(name):
             off, shape = self.off[name]
             u = np.frombuffer(mm, dtype=np.uint16,
                               count=int(np.prod(shape)),
                               offset=off).astype(np.uint32)
-            return np.ascontiguousarray(((u << 16).view(np.float32)))
+            w = ((u << 16).view(np.float32)).astype(np.float64)
+            return np.ascontiguousarray((1.0 + w).astype(np.float32))
 
         self.w = {}   # name -> (ptr, shape) for bf16 streams (kept as pointers)
         for k in self.off:
