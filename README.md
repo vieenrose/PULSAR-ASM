@@ -148,7 +148,7 @@ Status, honestly:
 | agreement with other engines | llama.cpp's `gemma4` path disagrees with HF at the first step — it scores `用` at 0.913 where HF says 0.128, and its Chinese reads better because it is computing something else ([write-up](doc/llamacpp-gemma4-divergence.md)) |
 | reset between conversations | clears activations as well as KV; a reset engine now reproduces a fresh one exactly (it used to keep the previous PLE history) |
 | shutdown | `close()` used to join spin workers that were never told to stop; fixed |
-| output quality | the checkpoint's own limit, not the port's. Verified directly: HF's logits put through the same top-64/top-0.95 cut at temp 1.0 produce the identical repetition loop (`用**用***…因為因為…`), so the sampler is faithful to the distribution it is given. Greedy stays the demo default because it is the only setting that completes a grammatical sentence here |
+| output quality | the checkpoint's own limit, not the port's. Verified directly: HF's logits put through the same top-64/top-0.95 cut at temp 1.0 produce the identical repetition loop (`用**用***…因為因為…`), so the sampler is faithful to the distribution it is given. Greedy stays the en demo default; the zh clip runs the checkpoint's own sampling config at disclosed seed 9, the one sampled setting found that completes grammatical sentences on a hard prompt (greedy answers the same question with garbled characters and an English non sequitur) |
 
 ```bash
 python3 tools/convert_gemma4_safetensors.py --out /mnt/edge/pulsar/gemma4_e2b.bin

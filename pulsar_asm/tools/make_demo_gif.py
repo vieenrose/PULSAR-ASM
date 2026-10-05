@@ -51,7 +51,7 @@ L10N = {
         "title": "pulsar · gemma-4-e2b · CPU 推論",
         "you": "你> ",
         "model": "模型> ",
-        "prompt": "一個星期有幾天？請用中文回答。",
+        "prompt": "請用一句話解釋什麼是量子力學。",
         "loading": "載入引擎 · 已映射 9.258 GB",
         "prefill": "填充 KV 快取",
         "greedy": "貪婪解碼",
@@ -71,16 +71,17 @@ UNIT = re.compile(
 
 def wrap(text, font, width, indent_px):
     """Greedy fill by measured width. Returns (line, x_offset) pairs."""
-    out, line, w = [], "", 0.0
+    out = []
     limit = width - indent_px
-    for unit in UNIT.findall(text):
-        uw = font.getlength(unit)
-        if line and w + uw > limit:
-            out.append((line, indent_px))
-            line, w = unit.lstrip(" "), font.getlength(unit.lstrip(" "))
-        else:
-            line, w = line + unit, w + uw
-    if line:
+    for para in text.split("\n"):
+        line, w = "", 0.0
+        for unit in UNIT.findall(para):
+            uw = font.getlength(unit)
+            if line and w + uw > limit:
+                out.append((line, indent_px))
+                line, w = unit.lstrip(" "), font.getlength(unit.lstrip(" "))
+            else:
+                line, w = line + unit, w + uw
         out.append((line, indent_px))
     return out or [("", indent_px)]
 
@@ -135,6 +136,8 @@ def main():
     mode = cli.sampler_from_config(eng, a.tok, a)
     if mode == "greedy":
         mode = L["greedy"]
+    else:
+        mode += f" · seed {a.seed}"
                           # sampler_from_config already seeded it; re-calling
                           # set_sampling with the default temp would turn
                           # sampling back on under a footer that says greedy
