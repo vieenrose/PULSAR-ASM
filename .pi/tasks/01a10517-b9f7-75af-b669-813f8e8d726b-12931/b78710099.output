@@ -1,0 +1,12 @@
+loading...
+Loading weights:   0%|          | 0/236 [00:00<?, ?it/s]Loading weights:   0%|          | 1/236 [00:13<53:59, 13.78s/it]Loading weights: 100%|██████████| 236/236 [00:13<00:00, 17.02it/s]
+loaded
+NIDS: 98
+TOP8: [(48, 40.72), (49, 29.276), (52, 28.003), (50, 25.917), (47, 24.238), (46, 24.139), (51, 23.994), (105, 21.626)]
+Traceback (most recent call last):
+  File "/home/luigi/fc_truth2.py", line 48, in <module>
+    print(tid, repr(p.tokenizer.decode([tid])), flush=True)
+                    ^^^^^^^^^^^
+  File "/home/luigi/pulsar-rpi/v/lib/python3.11/site-packages/transformers/tokenization_utils_base.py", line 1306, in __getattr__
+    raise AttributeError(f"{self.__class__.__name__} has no attribute {key}")
+AttributeError: GemmaTokenizer has no attribute tokenizer. Did you mean: '_tokenizer'?

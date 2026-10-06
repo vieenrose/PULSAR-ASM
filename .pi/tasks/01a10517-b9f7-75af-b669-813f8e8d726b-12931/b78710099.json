@@ -1,0 +1,28 @@
+{
+  "id": "b78710099",
+  "name": "HF eager-attention ground truth",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/fc_truth2.py luigi@raspberrypi.tailf63b31.ts.net:fc_truth2.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/fc_truth2.py' 2>&1 | tail -16",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b78710099.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791262211875,
+  "endTime": 1791262273578,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 131224,
+  "bytesWritten": 834,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 1800,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
