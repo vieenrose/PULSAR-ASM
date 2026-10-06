@@ -66,7 +66,11 @@ Real runs, nothing re-typed: prompt, `tpl:` ids and response are the engine's
 own bytes, the status bar carries that session's measured rate, and the amber
 `>` line is the user turn (in the FunctionGemma clips it is the user message
 inside the prompt file — file mode does not echo it, so the status bar names
-the file). Only pacing is libertied.
+the file). The two FunctionGemma clips also show the system turn verbatim,
+i.e. where the tool is defined. All four frames share one font size (17) and
+one typeface — DejaVu Sans Mono, with WenQuanYi Zen Hei used only for the CJK
+glyphs DejaVu lacks, at the same size and line height. Only pacing is
+libertied.
 
 ![270m chat demo](doc/gemma3-270m-chat-en.gif)
 ![270m chat demo, Traditional Chinese](doc/gemma3-270m-chat-zh-tw.gif)
