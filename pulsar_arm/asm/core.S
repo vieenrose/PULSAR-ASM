@@ -3086,6 +3086,8 @@ G_GROUP:     .skip 8                  // query heads per kv head (n_head/n_kv)
 G_TSLOT:     .skip 8                  // tensors per layer in the tensor table
 WK:          .skip 9*8                // q k v o gate up down, then emb, final norm
 NKIND:       .skip 6*8                // tensor kind behind each folded norm slot
+G_SFL:       .skip 8                  // start of the narrow (head_dim) norm region
+FLTAB:       .skip 256*8              // address of every folded norm vector
 
     .section .text
     .align 2
@@ -3134,14 +3136,23 @@ fold_norms:
     add x21, x21, :lo12:FL       // x21 = folded base
     adrp x22, NKIND
     add x22, x22, :lo12:NKIND    // kind table (arch-specific, set by the loader)
-    // final norm: slot1 -> FL[0]
-    mov x0, #56
-    add x24, x20, x0             // slot1 ptr
+    // final norm -> FL[0]. Which tensor that is differs by format: the
+    // safetensors table has it at slot 1, the blob at slot 0, so it comes from
+    // WK[8] like everything else here.
+    adrp x1, WK
+    add x1, x1, :lo12:WK
+    ldr x0, [x1, #64]            // WK[8]
+    mov x4, #56
+    mul x0, x0, x4
+    add x24, x20, x0             // slot ptr
     ldr x0, [x24]                // off
     add x0, x19, x0              // src
     ldr w2, [x24, #16]           // n = d0
     mov x1, x21                  // dst = FL[0]
     bl fold_vec
+    adrp x4, FLTAB
+    add x4, x4, :lo12:FLTAB
+    str x21, [x4]                // and record it: fldidx 0 is the final norm
     mov w25, #0                  // i = layer
 0:  adrp x0, G_NLAY
     add x0, x0, :lo12:G_NLAY
@@ -3151,7 +3162,18 @@ fold_norms:
     mov w26, #0                  // j = norm kind 0..5
 1:  cmp w26, #6
     b.hs 2f
-    // dst = FL + (1+6i+j)*2560 (x0/x4 scratch)
+    // Destination of norm j of layer i, and the same address recorded in
+    // FLTAB[1+6i+j] so the forward can find it without knowing any of this.
+    // gemma3: one flat region, (1+6i+j) entries of HID floats - exactly the
+    // arithmetic that has been here since the beginning, so the safetensors run
+    // cannot tell the difference. qwen3: two regions, because its q_norm and
+    // k_norm are head_dim wide rather than hidden wide, and the two norms it
+    // does not have (pre/post feedforward) alias post_attention_layernorm,
+    // which is the norm qwen3 puts in front of the MLP.
+    adrp x0, G_ARCH
+    add x0, x0, :lo12:G_ARCH
+    ldr w0, [x0]
+    cbnz w0, fn_dst_b
     mov x0, #6
     mul x0, x25, x0
     add x0, x0, x26
@@ -3161,6 +3183,51 @@ fold_norms:
     ldr x4, [x4]
     mul x0, x0, x4               // * (HID*4)
     add x1, x21, x0              // dst
+    b fn_tab
+fn_dst_b:
+    cmp x26, #1
+    b.eq fn_q
+    cmp x26, #2
+    b.eq fn_k
+    mov x0, x25
+    lsl x0, x0, #1               // 2i
+    cbnz x26, fn_dst_pa          // j = 3,4,5 -> the post-attention entry
+    add x0, x0, #1               // j = 0 -> input_layernorm
+    b fn_dst_big
+fn_dst_pa:
+    add x0, x0, #2
+fn_dst_big:
+    adrp x4, G_HIDB
+    add x4, x4, :lo12:G_HIDB
+    ldr x4, [x4]
+    mul x0, x0, x4
+    add x1, x21, x0
+    b fn_tab
+fn_q:
+    mov x0, x25
+    lsl x0, x0, #1               // small entry 2i
+    b fn_small
+fn_k:
+    mov x0, x25
+    lsl x0, x0, #1
+    add x0, x0, #1               // small entry 2i+1
+fn_small:
+    adrp x4, G_HDB
+    add x4, x4, :lo12:G_HDB
+    ldr x4, [x4]
+    mul x0, x0, x4
+    adrp x4, G_SFL
+    add x4, x4, :lo12:G_SFL
+    ldr x4, [x4]
+    add x1, x4, x0
+fn_tab:
+    mov x4, #6
+    mul x4, x25, x4
+    add x4, x4, x26
+    add x4, x4, #1               // 1 + 6i + j
+    adrp x5, FLTAB
+    add x5, x5, :lo12:FLTAB
+    str x1, [x5, x4, lsl #3]
     // src + n from slot 2 + (tensors per layer)*i + kind
     ldr x3, [x22, x26, lsl #3]   // kind k
     adrp x0, G_TSLOT
@@ -3507,6 +3574,25 @@ geom_cells:
     adrp x1, G_KSTRIDE
     add x1, x1, :lo12:G_KSTRIDE
     str x6, [x1]
+    // The narrow norms (q_norm/k_norm on qwen3, head_dim wide) live past the
+    // HID-wide region: FL + (1 + 2*layers) entries. Gemma3 never reads this -
+    // its FLTAB entries are the flat (1+6i+j)*HIDB addresses it always had - so
+    // for arch 0 the value only has to be harmless, not free.
+    adrp x1, G_NLAY
+    add x1, x1, :lo12:G_NLAY
+    ldr x5, [x1]
+    lsl x5, x5, #1               // 2*layers
+    add x5, x5, #1               // + the final norm
+    adrp x1, G_HIDB
+    add x1, x1, :lo12:G_HIDB
+    ldr x6, [x1]
+    mul x5, x5, x6
+    adrp x1, FL
+    add x1, x1, :lo12:FL
+    add x5, x1, x5
+    adrp x1, G_SFL
+    add x1, x1, :lo12:G_SFL
+    str x5, [x1]
     scvtf s0, w2                 // score scale 1/sqrt(head_dim): for 256 that
     fsqrt s0, s0                 // is exactly 0.0625, the constant the gemma
     fmov s1, #1.0                // path has always passed
@@ -3566,16 +3652,19 @@ wslot:
     add x0, x0, x2
     ret
 
-/* nptr: w0 = fldidx -> x0 = FL+idx*2560. Uses x0/x1. */
-nptr:
-    adrp x1, G_HIDB
-    add x1, x1, :lo12:G_HIDB
-    ldr x1, [x1]
-    mul x0, x0, x1               // * (HID*4)
-    adrp x1, FL
-    add x1, x1, :lo12:FL
-    add x0, x1, x0
+/* fltab: x0 = fldidx (the same 1+6i+j the arithmetic used) -> x0 = the address
+ * of that norm vector. The table is built by fold_norms as it writes, so an
+ * entry cannot disagree with the bytes it points at. x0/x1. */
+    .global fltab
+fltab:
+    adrp x1, FLTAB
+    add x1, x1, :lo12:FLTAB
+    ldr x0, [x1, x0, lsl #3]
     ret
+
+/* nptr is gone: it hardwired "norm vector = FL + idx*(HID*4)", which is only the
+ * gemma3 layout. fltab answers the same question through the table fold_norms
+ * builds, so the narrow q/k norms need no special case in the forward. */
 /* fwd_layer0: single token (G_tok), pos 0, layer 0 sliding. Prints L0 sig.
  * x19=data, x20=scratch-pad base? NO: adrp fresh per call except x19.
  * Holds x19=data across all calls (kernels keep x19+). Saves x19/x30. */
@@ -3617,7 +3706,7 @@ fwd_layer0:
     bl print_sig
     // H = norm(XB) with FL[1]
     mov w0, #1
-    bl nptr                      // x0 = FL[1]
+    bl fltab                     // FL[1] -> the fold table
     mov x1, x0                   // w
     adrp x0, FH
     add x0, x0, :lo12:FH         // out
@@ -3675,8 +3764,8 @@ fwd_layer0:
 25: mov x0, x25
     bl head_off                  // x3 = h*head_dim*4
     mov w0, #3
-    bl nptr                      // x0 = FL[3] (kn). BEFORE the pointers below:
-    mov x5, x0                   // nptr works in x0/x1, so an out pointer built
+    bl fltab                     // kn = norm slot 3. BEFORE the pointers
+    mov x5, x0                   // fltab works in x0/x1, so an out pointer built
                                  // here would be eaten by it - the version of
                                  // this block that did that wrote the normalised
                                  // K over FL[3], the layer-0 k_norm weights, and
@@ -3747,7 +3836,7 @@ l0kr:
     mov x0, x20
     bl head_off                  // x3 = j*head_dim*4 (was lsl #10)
     mov w0, #2
-    bl nptr                      // x0 = FL[2] (qn)
+    bl fltab                     // qn = norm slot 2
     mov x1, x0                   // w
     adrp x0, FQN
     add x0, x0, :lo12:FQN
@@ -3857,7 +3946,7 @@ l0qr:
     bl gemv_arch
     // H = rmsnorm_add(H, FL[4], H, XB); print POST, X1
     mov w0, #4
-    bl nptr
+    bl fltab                     // norm slot 4 of layer 0
     mov x1, x0                   // pa
     adrp x0, FH
     add x0, x0, :lo12:FH
@@ -3890,7 +3979,7 @@ l0qr:
     bl print_sig
     // H = rmsnorm(FH, FL[5], XB); G = gate(slot11); U = up(slot12)
     mov w0, #5
-    bl nptr
+    bl fltab                     // norm slot 5 of layer 0
     mov x1, x0                   // pf
     adrp x0, FH
     add x0, x0, :lo12:FH
@@ -3973,7 +4062,7 @@ l0qr:
     ldr w1, [x5]
     bl gemv_arch
     mov w0, #6
-    bl nptr
+    bl fltab                     // norm slot 6 of layer 0
     mov x1, x0                   // ff
     adrp x0, FH
     add x0, x0, :lo12:FH
@@ -4104,11 +4193,8 @@ fwd_token:
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #1
-    adrp x1, G_HIDB
-    add x1, x1, :lo12:G_HIDB
-    ldr x1, [x1]
-    mul x0, x0, x1               // (1+6i)*(HID*4)
-    add x1, x21, x0              // norm w
+    bl fltab                   // norm w (address from the fold table)
+    mov x1, x0
     adrp x0, FH
     add x0, x0, :lo12:FH
     adrp x2, XB
@@ -4161,11 +4247,8 @@ fwd_kvh:
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #3
-    adrp x4, G_HIDB
-    add x4, x4, :lo12:G_HIDB
-    ldr x4, [x4]
-    mul x0, x0, x4               // (3+6i)*(HID*4)
-    add x5, x21, x0              // kn w (stashed; x1 is a temp above)
+    bl fltab                   // kn w (stashed; x1 is a temp above) (address from the fold table)
+    mov x5, x0
     adrp x0, FKN
     add x0, x0, :lo12:FKN
     add x0, x0, x3               // out
@@ -4295,7 +4378,7 @@ fwd_kvh:
     mov x0, #6
     mul x0, x23, x0              // 6i
     add x0, x0, #2               // + q_norm slot
-    bl nptr                      // x0 = FL[2+6i] (qn)
+    bl fltab                     // qn = norm slot 2 of this layer
     mov x5, x0                   // w: needed only into the arg setup below, and
                                  // it dies in the rmsnorm call, which is fine
                                  // because x1 = x5 happens before that call
@@ -4386,11 +4469,8 @@ fwd_kvh:
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #4
-    adrp x4, G_HIDB
-    add x4, x4, :lo12:G_HIDB
-    ldr x4, [x4]
-    mul x0, x0, x4               // (4+6i)*(HID*4)
-    add x1, x21, x0              // pa
+    bl fltab                   // pa (address from the fold table)
+    mov x1, x0
     adrp x0, FH
     add x0, x0, :lo12:FH
     adrp x2, FH
@@ -4408,11 +4488,8 @@ fwd_kvh:
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #5
-    adrp x4, G_HIDB
-    add x4, x4, :lo12:G_HIDB
-    ldr x4, [x4]
-    mul x0, x0, x4
-    add x1, x21, x0              // pf
+    bl fltab                   // pf (address from the fold table)
+    mov x1, x0
     adrp x0, FH
     add x0, x0, :lo12:FH
     adrp x2, XB
@@ -4489,11 +4566,8 @@ fwd_kvh:
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #6
-    adrp x4, G_HIDB
-    add x4, x4, :lo12:G_HIDB
-    ldr x4, [x4]
-    mul x0, x0, x4
-    add x1, x21, x0              // ff
+    bl fltab                   // ff (address from the fold table)
+    mov x1, x0
     adrp x0, FH
     add x0, x0, :lo12:FH
     adrp x2, FH
