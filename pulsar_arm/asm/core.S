@@ -5031,18 +5031,6 @@ read_all:
     b 0b
 1:  mov w0, w2
     ret
-read_all:
-    adrp x1, INBUF
-    add x1, x1, :lo12:INBUF      // cursor
-    mov w2, #0                   // len
-    mov w3, #4095                // cap
-0:  cmp w2, w3
-    b.hs 1f                      // full
-    sub x3, x3, x2                // remaining = cap - len (x3 was cap! CLOBBERED (now remaining). Loop reuses? Next iter needs cap again! RECOMPUTE cap each iter? Use x4 for cap (fixed)? x4 free? Leaf uses x0-x4 (callers hold x19+ ✓ SAFE). FIX below: cap in x4, remaining in x3.
-    b 1f
-1:  mov w0, w2
-    ret
-
 /* file_run: raw-prefill one-shot. INBUF=len via read_all; encode; prefill
  * (no bos/template; prompt carries its own controls); gen; print; exit.
  * Holds x19=pos, x21=n, x22=count, x23=tok (all fwd-safe, x19+ ✓). */
