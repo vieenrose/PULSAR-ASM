@@ -1,0 +1,29 @@
+{
+  "id": "be9d2d6fb",
+  "name": "Download 1B QAT weights",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -c \"from huggingface_hub import snapshot_download as d; p=d(\\\"google/gemma-3-1b-it-qat-q4_0-unquantized\\\", allow_patterns=[\\\"*.json\\\",\\\"*.safetensors\\\",\\\"*.txt\\\"]); print(\\\"SNAP\\\", p)\"; ls -la ~/.cache/huggingface/hub/models--google--gemma-3-1b-it-qat-q4_0-unquantized/snapshots/*/ 2>/dev/null'",
+  "description": "Fetch google/gemma-3-1b-it-qat-q4_0-unquantized (~2 GB, gated, Pi token) into the Pi HF cache",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10fc1-c0ef-7673-bb51-71844efa13ff-154590/be9d2d6fb.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791276110662,
+  "endTime": 1791276322336,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 157976,
+  "bytesWritten": 1408,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,12 @@
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files:  14%|█▍        | 1/7 [00:00<00:03,  1.99it/s]Fetching 7 files: 100%|██████████| 7/7 [03:29<00:00, 31.19s/it]Fetching 7 files: 100%|██████████| 7/7 [03:29<00:00, 29.88s/it]
+SNAP /home/luigi/.cache/huggingface/hub/models--google--gemma-3-1b-it-qat-q4_0-unquantized/snapshots/a6692c1945954f4aa39a17b8dfba4a7e62db3d4f
+total 16
+drwxr-xr-x 2 luigi luigi 4096 Oct  6 16:45 .
+drwxr-xr-x 3 luigi luigi 4096 Oct  6 16:41 ..
+lrwxrwxrwx 1 luigi luigi   52 Oct  6 16:41 added_tokens.json -> ../../blobs/e17bde03d42feda32d1abfca6d3b598b9a020df7
+lrwxrwxrwx 1 luigi luigi   52 Oct  6 16:41 config.json -> ../../blobs/bc9fdf2eb031545a6c13a0ac1350af33175bc2cc
+lrwxrwxrwx 1 luigi luigi   52 Oct  6 16:41 generation_config.json -> ../../blobs/3d589876faad712a9bfb6d3a98073e0f4ab5f75c
+lrwxrwxrwx 1 luigi luigi   76 Oct  6 16:45 model.safetensors -> ../../blobs/6d571889049c5550a2cdcc3e1846646e595b683ce0d3c7bea904ed8874cf8ef2
+lrwxrwxrwx 1 luigi luigi   52 Oct  6 16:41 special_tokens_map.json -> ../../blobs/1a6193244714d3d78be48666cb02cdbfac62ad86
+lrwxrwxrwx 1 luigi luigi   76 Oct  6 16:41 tokenizer.json -> ../../blobs/7d4046bf0505a327dd5a0abbb427ecd4fc82f99c2ceaa170bc61ecde12809b0c
+lrwxrwxrwx 1 luigi luigi   52 Oct  6 16:41 tokenizer_config.json -> ../../blobs/a61bd5aa75d5816ed84f7c77550ec269d8729033

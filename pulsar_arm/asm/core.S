@@ -1106,7 +1106,7 @@ file_stage:
     bl find_tensor
     add x24, x24, x0
     mov x25, #0                  // layer i
-11: cmp x25, #18
+11: cmp x25, #64                 // safety cap; real count comes from the file
     b.hs 12f
     mov x26, #0                  // kind k
 13: cmp x26, #13
@@ -1136,11 +1136,89 @@ file_stage:
     add x0, x0, :lo12:namebuf
     bl find_tensor
     add x24, x24, x0
-    add x26, x26, #1
+    cbnz w26, 15f                // remember kind0 (input_layernorm) presence
+    adrp x1, G_L0FOUND
+    add x1, x1, :lo12:G_L0FOUND
+    str x0, [x1]
+15: add x26, x26, #1
     b 13b
-14: add x25, x25, #1
+14: adrp x0, G_L0FOUND
+    add x0, x0, :lo12:G_L0FOUND
+    ldr x0, [x0]
+    cbz x0, 12f                  // no such layer -> stop counting
+    add x25, x25, #1
     b 11b
-12: adrp x0, t_found
+12: // ---- model dims from the header: no hard-coded sizes ----
+    adrp x1, tab
+    add x1, x1, :lo12:tab
+    ldr x2, [x1, #16]            // slot0.rows = vocab
+    adrp x0, G_VOC
+    add x0, x0, :lo12:G_VOC
+    str x2, [x0]
+    ldr x2, [x1, #24]            // slot0.cols = hidden
+    adrp x0, G_HID
+    add x0, x0, :lo12:G_HID
+    str x2, [x0]
+    lsl x2, x2, #2               // hidden*4
+    adrp x0, G_HIDB
+    add x0, x0, :lo12:G_HIDB
+    str x2, [x0]
+    ldr x2, [x1, #632]           // slot11 (gate_proj).rows = intermediate
+    adrp x0, G_INTER
+    add x0, x0, :lo12:G_INTER
+    str x2, [x0]
+    adrp x0, G_NLAY
+    add x0, x0, :lo12:G_NLAY
+    str x25, [x0]                // layers found
+    // embed scale = sqrt(hidden): table for the known checkpoints, fsqrt else
+    adrp x0, G_HID
+    add x0, x0, :lo12:G_HID
+    ldr w2, [x0]
+    cmp w2, #640
+    b.ne 21f
+    adrp x3, f_sqrt640
+    add x3, x3, :lo12:f_sqrt640
+    b 23f
+21: cmp w2, #1152
+    b.ne 22f
+    adrp x3, f_sqrt1152
+    add x3, x3, :lo12:f_sqrt1152
+    b 23f
+22: scvtf s0, w2
+    fsqrt s0, s0
+    adrp x3, G_SQRT
+    add x3, x3, :lo12:G_SQRT
+    str s0, [x3]
+    b 24f
+23: ldr s0, [x3]
+    adrp x3, G_SQRT
+    add x3, x3, :lo12:G_SQRT
+    str s0, [x3]
+24: // anchors
+    adrp x0, t_dims
+    add x0, x0, :lo12:t_dims
+    bl print_cstr
+    adrp x1, G_HID
+    add x1, x1, :lo12:G_HID
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    adrp x1, G_INTER
+    add x1, x1, :lo12:G_INTER
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    adrp x1, G_NLAY
+    add x1, x1, :lo12:G_NLAY
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    adrp x1, G_VOC
+    add x1, x1, :lo12:G_VOC
+    ldr x0, [x1]
+    bl print_u64
+    bl print_nl
+    adrp x0, t_found
     add x0, x0, :lo12:t_found
     bl print_cstr
     mov x0, x24
@@ -1258,6 +1336,7 @@ tmpl_ptrs:
 t_hdr:       .asciz "header bytes: "
 t_fsz:       .asciz "file bytes: "
 t_found:     .asciz "tensors found: "
+t_dims:      .asciz "dims hid/inter/layers/vocab: "
 t_embed:     .asciz "embed rows cols: "
 t_in0:       .asciz "in_norm0[0..3] = "
 t_l17d:      .asciz "l17_down rows cols: "
@@ -2376,6 +2455,7 @@ f_ln4:       .float 9.21034037
 f_ln6:       .float 13.81551056
 f_00078125:  .float 0.0078125
 f_sqrt640:   .float 25.29822128
+f_sqrt1152:  .float 33.94112550
 t_inv:       .asciz "inv_s[0..1] = "
 t_rcos:      .asciz "rcos_s[2][0..3] = "
 t_rsin:      .asciz "rsin_s[2][0..3] = "
@@ -2394,10 +2474,17 @@ TCOS_S:      .skip 512*128*4
 TSIN_S:      .skip 512*128*4
 TCOS_F:      .skip 512*128*4
 TSIN_F:      .skip 512*128*4
-FL:          .skip 110*640*4
+FL:          .skip 157*1152*4        // (1+6*NLAY) x HID: 270m 109x640, 1B 157x1152
 G_base:      .skip 8
 G_N:         .skip 8
 G_tok:       .skip 8
+G_HID:       .skip 8                  // hidden size (270m 640 / 1B 1152)
+G_HIDB:      .skip 8                  // HID*4: FL entry stride and vector bytes
+G_INTER:     .skip 8                  // intermediate size (270m 2048 / 1B 6912)
+G_NLAY:      .skip 8                  // decoder layers (270m 18 / 1B 26)
+G_VOC:       .skip 8                  // vocab (262144 both)
+G_SQRT:      .skip 8                  // embed scale sqrt(HID), f32
+G_L0FOUND:   .skip 8                  // scratch: was input_layernorm found?
 
     .section .text
     .align 2
@@ -2448,7 +2535,10 @@ fold_norms:
     mov x1, x21                  // dst = FL[0]
     bl fold_vec
     mov w25, #0                  // i = layer
-0:  cmp w25, #18
+0:  adrp x0, G_NLAY
+    add x0, x0, :lo12:G_NLAY
+    ldr w0, [x0]
+    cmp w25, w0
     b.hs 9f
     mov w26, #0                  // j = norm kind 0..5
 1:  cmp w26, #6
@@ -2458,9 +2548,10 @@ fold_norms:
     mul x0, x25, x0
     add x0, x0, x26
     add x0, x0, #1
-    lsl x0, x0, #8               // *256
-    mov x4, #10
-    mul x0, x0, x4               // *2560
+    adrp x4, G_HIDB
+    add x4, x4, :lo12:G_HIDB
+    ldr x4, [x4]
+    mul x0, x0, x4               // * (HID*4)
     add x1, x21, x0              // dst
     // src + n from slot 2+13i+k
     ldrb w3, [x22, x26]          // kind k
@@ -2493,7 +2584,7 @@ kkind:       .byte 0,1,2,7,8,12
 
     .section .bss
     .align 4
-XB:          .skip 640*4
+XB:          .skip 1152*4
 
     .section .text
     .align 2
@@ -2591,8 +2682,8 @@ tables_test:
     adrp x0, XB
     add x0, x0, :lo12:XB         // out
     mov w3, #640
-    adrp x4, f_sqrt640
-    add x4, x4, :lo12:f_sqrt640
+    adrp x4, G_SQRT
+    add x4, x4, :lo12:G_SQRT
     ldr s0, [x4]                 // scale
     bl embed_row_f32
     adrp x0, t_emb
@@ -2633,7 +2724,7 @@ s_rb:        .asciz "]"
 
     .section .bss
     .align 4
-FH:          .skip 640*4
+FH:          .skip 1152*4
 FQ:          .skip 1024*4
 FQN:         .skip 1024*4
 FKV:         .skip 256*4
@@ -2641,8 +2732,8 @@ FKN:         .skip 256*4
 FV:          .skip 256*4
 FS:          .skip 512*4
 FAV:         .skip 1024*4
-FG:          .skip 2048*4
-FU:          .skip 2048*4
+FG:          .skip 6912*4
+FU:          .skip 6912*4
 
     .section .text
     .align 2
@@ -2716,9 +2807,10 @@ wptr:
     ret
 /* nptr: w0 = fldidx -> x0 = FL+idx*2560. Uses x0/x1. */
 nptr:
-    lsl x0, x0, #8               // *256
-    mov x1, #10
-    mul x0, x0, x1               // *2560
+    adrp x1, G_HIDB
+    add x1, x1, :lo12:G_HIDB
+    ldr x1, [x1]
+    mul x0, x0, x1               // * (HID*4)
     adrp x1, FL
     add x1, x1, :lo12:FL
     add x0, x1, x0
@@ -2747,8 +2839,8 @@ fwd_layer0:
     adrp x0, XB
     add x0, x0, :lo12:XB
     mov w3, #640
-    adrp x4, f_sqrt640
-    add x4, x4, :lo12:f_sqrt640
+    adrp x4, G_SQRT
+    add x4, x4, :lo12:G_SQRT
     ldr s0, [x4]
     bl embed_row_f32             // (XB, emb, tok, 640, esc)
     adrp x0, s_X
@@ -2765,7 +2857,9 @@ fwd_layer0:
     add x0, x0, :lo12:FH         // out
     adrp x2, XB
     add x2, x2, :lo12:XB         // x
-    mov w3, #640
+    adrp x4, G_HID
+    add x4, x4, :lo12:G_HID
+    ldr w3, [x4]
     adrp x4, f_eps
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
@@ -2785,7 +2879,9 @@ fwd_layer0:
     adrp x4, FQ
     add x4, x4, :lo12:FQ
     mov w0, #1024
-    mov w1, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     mov w0, #6
     bl wptr
@@ -2795,7 +2891,9 @@ fwd_layer0:
     adrp x4, FKV
     add x4, x4, :lo12:FKV
     mov w0, #256
-    mov w1, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     // KN = norm(KV) with FL[3]; rope (sliding pos0)
     mov w0, #3
@@ -2827,7 +2925,9 @@ fwd_layer0:
     adrp x4, FV
     add x4, x4, :lo12:FV
     mov w0, #256
-    mov w1, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     // heads j=0..3 (w20; kernels keep x19+, print_sig keeps x20)
     mov w20, #0                  // j
@@ -2910,7 +3010,9 @@ fwd_layer0:
     add x3, x3, :lo12:FAV
     adrp x4, FH
     add x4, x4, :lo12:FH
-    mov w0, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w0, [x5]
     mov w1, #1024
     bl gemv_bf16
     // H = rmsnorm_add(H, FL[4], H, XB); print POST, X1
@@ -2948,7 +3050,9 @@ fwd_layer0:
     add x0, x0, :lo12:FH
     adrp x2, XB
     add x2, x2, :lo12:XB
-    mov w3, #640
+    adrp x4, G_HID
+    add x4, x4, :lo12:G_HID
+    ldr w3, [x4]
     adrp x4, f_eps
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
@@ -2960,8 +3064,12 @@ fwd_layer0:
     add x3, x3, :lo12:FH
     adrp x4, FG
     add x4, x4, :lo12:FG
-    mov w0, #2048
-    mov w1, #640
+    adrp x5, G_INTER
+    add x5, x5, :lo12:G_INTER
+    ldr w0, [x5]
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     mov w0, #12
     bl wptr
@@ -2970,8 +3078,12 @@ fwd_layer0:
     add x3, x3, :lo12:FH
     adrp x4, FU
     add x4, x4, :lo12:FU
-    mov w0, #2048
-    mov w1, #640
+    adrp x5, G_INTER
+    add x5, x5, :lo12:G_INTER
+    ldr w0, [x5]
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     adrp x0, FG
     add x0, x0, :lo12:FG
@@ -2979,7 +3091,9 @@ fwd_layer0:
     add x1, x1, :lo12:FG
     adrp x2, FU
     add x2, x2, :lo12:FU
-    mov w3, #2048
+    adrp x4, G_INTER
+    add x4, x4, :lo12:G_INTER
+    ldr w3, [x4]
     bl gelu_mul_f32
     adrp x0, s_GG
     add x0, x0, :lo12:s_GG
@@ -2995,8 +3109,12 @@ fwd_layer0:
     add x3, x3, :lo12:FG
     adrp x4, FH
     add x4, x4, :lo12:FH
-    mov w0, #640
-    mov w1, #2048
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w0, [x5]
+    adrp x5, G_INTER
+    add x5, x5, :lo12:G_INTER
+    ldr w1, [x5]
     bl gemv_bf16
     mov w0, #6
     bl nptr
@@ -3030,14 +3148,14 @@ fwd_layer0:
 
     .section .bss
     .align 4
-SAVXB:       .skip 640*4
+SAVXB:       .skip 1152*4
 
     .section .text
     .align 2
     .section .bss
     .align 4
-KC:          .skip 18*512*256*4
-VC:          .skip 18*512*256*4
+KC:          .skip 26*512*256*4
+VC:          .skip 26*512*256*4
 LG:          .skip 262144*4
 G_pos:       .skip 8
 G_t0:        .skip 8
@@ -3088,19 +3206,21 @@ fwd_token:
     add x0, x0, :lo12:XB
     mov w2, w9                   // token
     mov w3, #640
-    adrp x4, f_sqrt640
-    add x4, x4, :lo12:f_sqrt640
+    adrp x4, G_SQRT
+    add x4, x4, :lo12:G_SQRT
     ldr s0, [x4]
     bl embed_row_f32
     mov w23, #0                  // li
-0:  cmp w23, #18
+0:  adrp x0, G_NLAY
+    add x0, x0, :lo12:G_NLAY
+    ldr w0, [x0]
+    cmp w23, w0
     b.hs 90f
-    // full? li==5||11||17 -> F tables else S
-    cmp w23, #5
-    b.eq 31f
-    cmp w23, #11
-    b.eq 31f
-    cmp w23, #17
+    // full when i mod 6 == 5 -> F tables else S
+    mov w2, #6
+    udiv w3, w23, w2
+    msub w2, w3, w2, w23
+    cmp w2, #5
     b.eq 31f
     adrp x0, TCOS_S
     add x0, x0, :lo12:TCOS_S
@@ -3118,15 +3238,18 @@ fwd_token:
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #1
-    lsl x0, x0, #8
-    mov x1, #10
-    mul x0, x0, x1               // (1+6i)*2560
+    adrp x1, G_HIDB
+    add x1, x1, :lo12:G_HIDB
+    ldr x1, [x1]
+    mul x0, x0, x1               // (1+6i)*(HID*4)
     add x1, x21, x0              // norm w
     adrp x0, FH
     add x0, x0, :lo12:FH
     adrp x2, XB
     add x2, x2, :lo12:XB
-    mov w3, #640
+    adrp x4, G_HID
+    add x4, x4, :lo12:G_HID
+    ldr w3, [x4]
     adrp x4, f_eps
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
@@ -3147,7 +3270,9 @@ fwd_token:
     adrp x4, FQ
     add x4, x4, :lo12:FQ
     mov w0, #1024
-    mov w1, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     add x0, x24, #4              // k slot
     mov x4, #56
@@ -3160,15 +3285,18 @@ fwd_token:
     adrp x4, FKV
     add x4, x4, :lo12:FKV
     mov w0, #256
-    mov w1, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     // KN = norm(FKV) with FL[3+6i]; rope
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #3
-    lsl x0, x0, #8
-    mov x4, #10
-    mul x0, x0, x4               // (3+6i)*2560
+    adrp x4, G_HIDB
+    add x4, x4, :lo12:G_HIDB
+    ldr x4, [x4]
+    mul x0, x0, x4               // (3+6i)*(HID*4)
     add x1, x21, x0              // kn w
     adrp x0, FKN
     add x0, x0, :lo12:FKN
@@ -3197,7 +3325,9 @@ fwd_token:
     adrp x4, FV
     add x4, x4, :lo12:FV
     mov w0, #256
-    mov w1, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     // Kcache[i][pos] = KN; Vcache[i][pos] = FV(256 floats via FKN? NO: V is in FV!)
     // cache bases: KC + i*524288 (x18 scratch: kernels keep x19+? x18 SAFE (max x15))
@@ -3214,12 +3344,11 @@ fwd_token:
     add x1, x1, :lo12:FKN        // KN src
     add x2, x2, x0               // WAIT: x0 reused! recompute Vrow separately below
     b 34f
-34: // lo/n by layer type (full: 5/11/17)
-    cmp w23, #5
-    b.eq 35f
-    cmp w23, #11
-    b.eq 35f
-    cmp w23, #17
+34: // lo/n by layer type: full attention when i mod 6 == 5
+    mov w2, #6
+    udiv w3, w23, w2
+    msub w2, w3, w2, w23         // w2 = i mod 6
+    cmp w2, #5
     b.eq 35f
     add w0, w22, #1              // pos+1
     sub w0, w0, #512
@@ -3350,16 +3479,19 @@ fwd_token:
     add x3, x3, :lo12:FAV
     adrp x4, FH
     add x4, x4, :lo12:FH
-    mov w0, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w0, [x5]
     mov w1, #1024
     bl gemv_bf16
     // H = rmsnorm_add(FH, FL[4+6i], FH, XB)
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #4
-    lsl x0, x0, #8
-    mov x4, #10
-    mul x0, x0, x4               // (4+6i)*2560
+    adrp x4, G_HIDB
+    add x4, x4, :lo12:G_HIDB
+    ldr x4, [x4]
+    mul x0, x0, x4               // (4+6i)*(HID*4)
     add x1, x21, x0              // pa
     adrp x0, FH
     add x0, x0, :lo12:FH
@@ -3376,15 +3508,18 @@ fwd_token:
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #5
-    lsl x0, x0, #8
-    mov x4, #10
+    adrp x4, G_HIDB
+    add x4, x4, :lo12:G_HIDB
+    ldr x4, [x4]
     mul x0, x0, x4
     add x1, x21, x0              // pf
     adrp x0, FH
     add x0, x0, :lo12:FH
     adrp x2, XB
     add x2, x2, :lo12:XB
-    mov w3, #640
+    adrp x4, G_HID
+    add x4, x4, :lo12:G_HID
+    ldr w3, [x4]
     adrp x4, f_eps
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
@@ -3400,8 +3535,12 @@ fwd_token:
     add x3, x3, :lo12:FH
     adrp x4, FG
     add x4, x4, :lo12:FG
-    mov w0, #2048
-    mov w1, #640
+    adrp x5, G_INTER
+    add x5, x5, :lo12:G_INTER
+    ldr w0, [x5]
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     add x0, x24, #10
     mov x4, #56
@@ -3413,8 +3552,12 @@ fwd_token:
     add x3, x3, :lo12:FH
     adrp x4, FU
     add x4, x4, :lo12:FU
-    mov w0, #2048
-    mov w1, #640
+    adrp x5, G_INTER
+    add x5, x5, :lo12:G_INTER
+    ldr w0, [x5]
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     bl gemv_bf16
     adrp x0, FG
     add x0, x0, :lo12:FG
@@ -3422,7 +3565,9 @@ fwd_token:
     add x1, x1, :lo12:FG
     adrp x2, FU
     add x2, x2, :lo12:FU
-    mov w3, #2048
+    adrp x4, G_INTER
+    add x4, x4, :lo12:G_INTER
+    ldr w3, [x4]
     bl gelu_mul_f32
     // H = down(base+11); H = rmsnorm_add(FL[6+6i])
     add x0, x24, #11
@@ -3435,14 +3580,19 @@ fwd_token:
     add x3, x3, :lo12:FG
     adrp x4, FH
     add x4, x4, :lo12:FH
-    mov w0, #640
-    mov w1, #2048
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w0, [x5]
+    adrp x5, G_INTER
+    add x5, x5, :lo12:G_INTER
+    ldr w1, [x5]
     bl gemv_bf16
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #6
-    lsl x0, x0, #8
-    mov x4, #10
+    adrp x4, G_HIDB
+    add x4, x4, :lo12:G_HIDB
+    ldr x4, [x4]
     mul x0, x0, x4
     add x1, x21, x0              // ff
     adrp x0, FH
@@ -3465,13 +3615,19 @@ fwd_token:
     add x1, x1, :lo12:FL
     adrp x2, XB
     add x2, x2, :lo12:XB
-    mov w3, #640
+    adrp x4, G_HID
+    add x4, x4, :lo12:G_HID
+    ldr w3, [x4]
     adrp x4, f_eps
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
-    mov w0, #262144
-    mov w1, #640
+    adrp x5, G_VOC
+    add x5, x5, :lo12:G_VOC
+    ldr w0, [x5]
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w1, [x5]
     adrp x2, tab
     add x2, x2, :lo12:tab
     ldr x2, [x2]                 // slot0 off
@@ -3483,7 +3639,9 @@ fwd_token:
     bl gemv_bf16
     adrp x0, LG
     add x0, x0, :lo12:LG
-    mov w1, #262144
+    adrp x2, G_VOC
+    add x2, x2, :lo12:G_VOC
+    ldr w1, [x2]
     bl argmax_f32
     b 91f
 91: ldr x27, [sp], #16
