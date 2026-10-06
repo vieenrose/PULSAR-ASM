@@ -91,6 +91,34 @@ class GGUF:
         raise SystemExit(f"unsupported gguf type {tt} for {name}")
 
 
+# GGUF -> HF (Qwen3) tensor names, so the engine sees the names it expects.
+_NAME_MAP = {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "output_norm.weight": "model.norm.weight",
+    "output.weight": "lm_head.weight",
+}
+
+
+def _hf_name(name):
+    if name in _NAME_MAP:
+        return _NAME_MAP[name]
+    if name.startswith("blk."):
+        layer, role = name[4:].split(".", 1)
+        role = {"attn_norm.weight": "input_layernorm.weight",
+                "attn_q.weight": "self_attn.q_proj.weight",
+                "attn_k.weight": "self_attn.k_proj.weight",
+                "attn_v.weight": "self_attn.v_proj.weight",
+                "attn_output.weight": "self_attn.o_proj.weight",
+                "attn_q_norm.weight": "self_attn.q_norm.weight",
+                "attn_k_norm.weight": "self_attn.k_norm.weight",
+                "ffn_norm.weight": "post_attention_layernorm.weight",
+                "ffn_gate.weight": "mlp.gate_proj.weight",
+                "ffn_up.weight": "mlp.up_proj.weight",
+                "ffn_down.weight": "mlp.down_proj.weight"}.get(role, role)
+        return f"model.layers.{layer}.{role}"
+    return name
+
+
 def convert(src, out):
     g = GGUF(src)
     hdr, payload, offs = {}, [], 0
@@ -100,11 +128,11 @@ def convert(src, out):
         if tt == T_Q2_0:
             rows, cols, dt = dims[1], dims[0], "Q2_0"
         elif tt == T_F32:
-            rows, cols, dt = (dims[1], dims[0]) if len(dims) == 2 else (dims[0], 1)
+            dt = "F32"
+            rows, cols = (dims[1], dims[0]) if len(dims) == 2 else (dims[0], 1)
         else:
             raise SystemExit(f"{name}: unexpected dtype {tt}")
-        hdr[name.replace("blk.", "model.layers.").replace(".attn_", ".self_attn.")
-            if name.startswith("blk.") else name] = {
+        hdr[_hf_name(name)] = {
             "dtype": dt, "shape": [rows, cols], "data_offsets": [offs, offs + nb]}
         payload.append((name, offs, nb))
         offs += nb
