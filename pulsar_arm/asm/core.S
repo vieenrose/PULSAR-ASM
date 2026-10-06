@@ -1193,22 +1193,41 @@ file_stage:
     adrp x0, G_NLAY
     add x0, x0, :lo12:G_NLAY
     str x25, [x0]                // layers found
-    // q/k/v widths and the ternary group size: these are the literals the
-    // gemma3 forward path used before they were cells, so a safetensors run
-    // dispatches to exactly the GEMV shapes it always had. The pulsar branch
-    // below recomputes the two widths from n_head/n_kv x head_dim.
-    mov x2, #1024
-    adrp x0, G_QDIM
-    add x0, x0, :lo12:G_QDIM
+    // gemma3 attention geometry: the literals the forward path used before
+    // they were cells (4 q heads + 1 kv head of 256, a 512-position sliding
+    // window with every 6th layer full, 512 positions per cache row set), plus
+    // the ternary group size. geom_cells derives everything downstream of
+    // these, so a safetensors run gets exactly the shapes it always had; the
+    // pulsar branch below re-derives them from the blob's own geometry.
+    mov x2, #4
+    adrp x0, G_NHEAD
+    add x0, x0, :lo12:G_NHEAD
+    str x2, [x0]
+    mov x2, #1
+    adrp x0, G_NKV
+    add x0, x0, :lo12:G_NKV
     str x2, [x0]
     mov x2, #256
-    adrp x0, G_KVDIM
-    add x0, x0, :lo12:G_KVDIM
+    adrp x0, G_HD
+    add x0, x0, :lo12:G_HD
+    str x2, [x0]
+    mov x2, #512
+    adrp x0, G_WIN
+    add x0, x0, :lo12:G_WIN
+    str x2, [x0]
+    mov x2, #6
+    adrp x0, G_FULLMOD
+    add x0, x0, :lo12:G_FULLMOD
+    str x2, [x0]
+    mov x2, #512
+    adrp x0, G_KVCAP
+    add x0, x0, :lo12:G_KVCAP
     str x2, [x0]
     mov x2, #128
     adrp x0, G_TERN
     add x0, x0, :lo12:G_TERN
     str x2, [x0]
+    bl geom_cells
     // embed scale = sqrt(hidden): table for the known checkpoints, fsqrt else
     adrp x0, G_HID
     add x0, x0, :lo12:G_HID
@@ -1393,24 +1412,21 @@ f_anchors_fixed:
     adrp x0, G_SQRT
     add x0, x0, :lo12:G_SQRT
     str w2, [x0]
-    // projection row counts from the blob geometry (1.7B: 16x128 / 8x128)
-    adrp x1, G_HD
-    add x1, x1, :lo12:G_HD
-    ldr x3, [x1]
-    adrp x1, G_NHEAD
-    add x1, x1, :lo12:G_NHEAD
-    ldr x2, [x1]
-    mul x2, x2, x3
-    adrp x0, G_QDIM
-    add x0, x0, :lo12:G_QDIM
+    // projection row counts from the blob geometry (1.7B: 16x128 / 8x128).
+    // Qwen3 has no sliding window and every layer attends over the whole
+    // context, bounded by the disclosed 1024-position cache cap.
+    mov x2, #0
+    adrp x0, G_WIN
+    add x0, x0, :lo12:G_WIN
     str x2, [x0]
-    adrp x1, G_NKV
-    add x1, x1, :lo12:G_NKV
-    ldr x2, [x1]
-    mul x2, x2, x3
-    adrp x0, G_KVDIM
-    add x0, x0, :lo12:G_KVDIM
+    adrp x0, G_FULLMOD
+    add x0, x0, :lo12:G_FULLMOD
     str x2, [x0]
+    mov x2, #1024
+    adrp x0, G_KVCAP
+    add x0, x0, :lo12:G_KVCAP
+    str x2, [x0]
+    bl geom_cells
     // ternary_gemv_b3 decodes one 128-weight / 28-byte group; a blob packed
     // differently has to refuse, not mis-run silently.
     adrp x1, G_TERN
@@ -1430,6 +1446,54 @@ f_grp_ok:
     bl print_cstr
     adrp x1, G_ARCH
     add x1, x1, :lo12:G_ARCH
+    ldr x0, [x1]
+    bl print_u64
+    bl print_nl
+    // the geometry the blob derived, so the cells can be checked against the
+    // header without a debugger (only the blob path prints this)
+    adrp x0, t_geom
+    add x0, x0, :lo12:t_geom
+    bl print_cstr
+    adrp x1, G_NHEAD
+    add x1, x1, :lo12:G_NHEAD
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    adrp x1, G_NKV
+    add x1, x1, :lo12:G_NKV
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    adrp x1, G_HD
+    add x1, x1, :lo12:G_HD
+    ldr x0, [x1]
+    bl print_u64
+    bl print_nl
+    adrp x0, t_geom2
+    add x0, x0, :lo12:t_geom2
+    bl print_cstr
+    adrp x1, G_WIN
+    add x1, x1, :lo12:G_WIN
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    adrp x1, G_FULLMOD
+    add x1, x1, :lo12:G_FULLMOD
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    adrp x1, G_KVCAP
+    add x1, x1, :lo12:G_KVCAP
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    adrp x1, G_KVROW
+    add x1, x1, :lo12:G_KVROW
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    adrp x1, G_KSTRIDE
+    add x1, x1, :lo12:G_KSTRIDE
     ldr x0, [x1]
     bl print_u64
     bl print_nl
@@ -1506,6 +1570,8 @@ pk_grp:       .asciz "\"pulsar.ternary_group\""
 tp_arch:      .asciz "pulsar blob arch_id: "
 ep_arch:      .asciz "ERROR: only the gemma3 path is implemented; this blob needs qwen3/ternary\n"
 ep_grp:       .asciz "ERROR: unsupported pulsar.ternary_group (the kernel decodes 128)\n"
+t_geom:       .asciz "blob geom q/kv/hd: "
+t_geom2:      .asciz "blob geom win/fullmod/cap/kvrow/kstride: "
 t_dims:      .asciz "dims hid/inter/layers/vocab: "
 t_embed:     .asciz "embed rows cols: "
 t_in0:       .asciz "in_norm0[0..3] = "
@@ -2710,6 +2776,15 @@ G_EPS12:     .skip 8                  // qwen3: eps * 1e12 (int)
 G_QDIM:      .skip 8                  // q/o rows: gemma3 1024, qwen3 n_head*hd
 G_KVDIM:     .skip 8                  // k/v rows: gemma3 256, qwen3 n_kv*hd
 G_TERN:      .skip 8                  // pulsar.ternary_group (kernel does 128)
+G_HHALF:     .skip 8                  // head_dim/2: rope pairs and rope row size
+G_HDB:       .skip 8                  // head_dim*4: head stride inside FQ/FKN/FAV
+G_ASCALE:    .skip 8                  // attention scale 1/sqrt(head_dim), f32
+G_WIN:       .skip 8                  // sliding window (0 = none, qwen3)
+G_FULLMOD:   .skip 8                  // full-attn every Nth layer (0 = all)
+G_TROW:      .skip 8                  // rope table row bytes (hd/2 * 4)
+G_KVROW:     .skip 8                  // KV cache row bytes (n_kv*hd*4)
+G_KSTRIDE:   .skip 8                  // KV cache layer stride bytes
+G_KVCAP:     .skip 8                  // positions kept per layer (gemma 512)
 
     .section .text
     .align 2
@@ -3060,6 +3135,66 @@ pget:
     ldr x30, [sp], #16
     ret
 2:  ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
+/* geom_cells: derive the attention and cache geometry from the per-arch
+ * constants G_NHEAD / G_NKV / G_HD / G_WIN / G_FULLMOD / G_KVCAP. Both arches
+ * call it, so the forward path reads one set of cells and a gemma3 safetensors
+ * still gets exactly the literals it always used: 4 q heads and 1 kv head of
+ * 256, a 512-position sliding window with every 6th layer full, score scale
+ * 1/sqrt(256) = 0.0625, 128-float rope rows and a 1024-byte KV row with a
+ * 512-row layer stride. No calls; x0-x7 and s0/s1 only, because file_stage
+ * keeps its scan state in x19+. */
+geom_cells:
+    str x30, [sp, #-16]!
+    adrp x1, G_HD
+    add x1, x1, :lo12:G_HD
+    ldr x2, [x1]                 // head_dim
+    lsr x3, x2, #1               // head_dim/2
+    adrp x1, G_HHALF
+    add x1, x1, :lo12:G_HHALF
+    str x3, [x1]
+    lsl x4, x2, #2               // head_dim*4
+    adrp x1, G_HDB
+    add x1, x1, :lo12:G_HDB
+    str x4, [x1]
+    lsl x5, x3, #2               // (head_dim/2)*4 = rope row bytes
+    adrp x1, G_TROW
+    add x1, x1, :lo12:G_TROW
+    str x5, [x1]
+    adrp x1, G_NHEAD
+    add x1, x1, :lo12:G_NHEAD
+    ldr x6, [x1]
+    mul x6, x6, x2               // n_head*head_dim
+    adrp x1, G_QDIM
+    add x1, x1, :lo12:G_QDIM
+    str x6, [x1]
+    adrp x1, G_NKV
+    add x1, x1, :lo12:G_NKV
+    ldr x7, [x1]
+    mul x6, x7, x2               // n_kv*head_dim
+    adrp x1, G_KVDIM
+    add x1, x1, :lo12:G_KVDIM
+    str x6, [x1]
+    lsl x6, x6, #2               // *4 = cache row bytes
+    adrp x1, G_KVROW
+    add x1, x1, :lo12:G_KVROW
+    str x6, [x1]
+    adrp x1, G_KVCAP
+    add x1, x1, :lo12:G_KVCAP
+    ldr x7, [x1]
+    mul x7, x7, x6               // positions * row bytes
+    adrp x1, G_KSTRIDE
+    add x1, x1, :lo12:G_KSTRIDE
+    str x7, [x1]
+    scvtf s0, w2                 // score scale 1/sqrt(head_dim): for 256 that
+    fsqrt s0, s0                 // is exactly 0.0625, the constant the gemma
+    fmov s1, #1.0                // path has always passed
+    fdiv s0, s1, s0
+    adrp x1, G_ASCALE
+    add x1, x1, :lo12:G_ASCALE
+    str s0, [x1]
     ldr x30, [sp], #16
     ret
 
