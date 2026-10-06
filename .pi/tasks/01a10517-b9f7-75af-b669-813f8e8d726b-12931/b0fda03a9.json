@@ -1,0 +1,28 @@
+{
+  "id": "b0fda03a9",
+  "name": "HF V and KN reference",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/av_ref.py luigi@raspberrypi.tailf63b31.ts.net:av_ref.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/av_ref.py' 2>&1 | tail -6",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b0fda03a9.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791263607367,
+  "endTime": 1791263629658,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 132920,
+  "bytesWritten": 351,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 900,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
