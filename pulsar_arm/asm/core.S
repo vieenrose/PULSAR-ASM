@@ -1470,6 +1470,11 @@ f_grp_ok:
     add x1, x1, :lo12:G_HD
     ldr x0, [x1]
     bl print_u64
+    bl print_sp
+    adrp x1, G_GROUP
+    add x1, x1, :lo12:G_GROUP
+    ldr x0, [x1]
+    bl print_u64
     bl print_nl
     // and the rope constant the table builder will use, so ln_f64 is checkable
     // from the log alone (the refusal means nothing else in this run reads it)
@@ -1584,7 +1589,7 @@ pk_grp:       .asciz "\"pulsar.ternary_group\""
 tp_arch:      .asciz "pulsar blob arch_id: "
 ep_arch:      .asciz "ERROR: only the gemma3 path is implemented; this blob needs qwen3/ternary\n"
 ep_grp:       .asciz "ERROR: unsupported pulsar.ternary_group (the kernel decodes 128)\n"
-t_geom:       .asciz "blob geom q/kv/hd: "
+t_geom:       .asciz "blob geom q/kv/hd/group: "
 t_geom2:      .asciz "blob geom win/fullmod/cap/kvrow/kstride: "
 t_lnt:        .asciz "blob ln(theta): "
 t_dims:      .asciz "dims hid/inter/layers/vocab: "
@@ -1960,13 +1965,16 @@ silu_mul_f32:
 1:  ldr x30, [sp], #16
     ret
 
-/* attn_scores_f32(s,x0 q,x1 K,x2 n,w3 hd,w4 scale,s0). NEON dots, C order. */
+/* attn_scores_f32(s,x0 q,x1 K,x2 n,w3 hd,w4,s0 scale,x5 row stride bytes).
+ * NEON dots, C order. The row stride is an argument because with grouped-query
+ * attention consecutive positions of one kv head are the whole cache row apart,
+ * not head_dim*4 apart; gemma3 has one kv head, so both numbers coincide and
+ * the address math is what it was. */
     .global attn_scores_f32
 attn_scores_f32:
     str s0, [sp, #-16]!          // spill scale
     mov w9, #0                   // p
-    uxtw x10, w4
-    lsl x10, x10, #2              // hd*4 row stride
+    mov x10, x5                  // row stride bytes
 0:  cmp w9, w3
     b.hs 9f
     mul x11, x9, x10
@@ -2001,7 +2009,9 @@ attn_scores_f32:
 9:  add sp, sp, #16
     ret
 
-/* attn_values_f32(out,x0 V,x1 w,x2 n,w3 hd,w4). C order: d-outer, p-inner. */
+/* attn_values_f32(out,x0 V,x1 w,x2 n,w3 hd,w4,x5 row stride bytes). C order:
+ * d-outer, p-inner; the stride is an argument for the same reason it is one in
+ * attn_scores_f32. */
     .global attn_values_f32
 attn_values_f32:
     mov w10, w4                  // hd (write w-reg: x10 zero-extended)
@@ -2012,8 +2022,8 @@ attn_values_f32:
     mov w11, #0                  // p
 1:  cmp w11, w3
     b.hs 2f
-    madd x12, x11, x10, x9       // p*hd + d (elements)
-    lsl x12, x12, #2
+    lsl x13, x9, #2              // d*4
+    madd x12, x11, x5, x13       // p*stride + d*4
     add x12, x1, x12
     ld1 {v1.4s}, [x12]
     lsl x13, x11, #2
@@ -2505,6 +2515,7 @@ kern_tests:
     mov w4, #256
     adrp x5, f_scale
     ldr s0, [x5, :lo12:f_scale]
+    mov x5, #1024                // row stride = hd*4, as the kernel derived
     bl attn_scores_f32
     adrp x9, T2
     add x9, x9, :lo12:T2
@@ -2551,6 +2562,7 @@ kern_tests:
     add x2, x2, :lo12:T1
     mov w3, #3
     mov w4, #256
+    mov x5, #1024                // row stride = hd*4
     bl attn_values_f32
     adrp x9, T2
     add x9, x9, :lo12:T2
@@ -2885,6 +2897,24 @@ kcache_row:
     madd x0, x23, x2, x0         // + layer*stride
     ret
 
+/* head_off: x0 = head index -> x3 = head*G_HDB, the stride of one head through
+ * FQ/FQN/FAV/FKN/FV (lsl #10 on gemma3), and x4 = the byte offset of the kv head
+ * that head attends to, (head/G_GROUP)*G_HDB, which is 0 for every gemma3 head
+ * because it has four query heads and a single kv head. Leaf; x0-x4. Called
+ * wherever the offsets were literals, because both loops need them and neither
+ * survives the kernels in between. */
+head_off:
+    adrp x2, G_HDB
+    add x2, x2, :lo12:G_HDB
+    ldr x2, [x2]
+    mul x3, x0, x2
+    adrp x1, G_GROUP
+    add x1, x1, :lo12:G_GROUP
+    ldr x1, [x1]
+    udiv x0, x0, x1
+    mul x4, x0, x2
+    ret
+
     .section .rodata
     .align 3
 f_ln4:       .float 9.21034037
@@ -2940,6 +2970,7 @@ G_TROW:      .skip 8                  // rope table row bytes (hd/2 * 4)
 G_KVROW:     .skip 8                  // KV cache row bytes (n_kv*hd*4)
 G_KSTRIDE:   .skip 8                  // KV cache layer stride bytes
 G_KVCAP:     .skip 8                  // positions kept per layer (gemma 512)
+G_GROUP:     .skip 8                  // query heads per kv head (n_head/n_kv)
 
     .section .text
     .align 2
@@ -3320,29 +3351,33 @@ geom_cells:
     str x5, [x1]
     adrp x1, G_NHEAD
     add x1, x1, :lo12:G_NHEAD
-    ldr x6, [x1]
-    mul x6, x6, x2               // n_head*head_dim
-    adrp x1, G_QDIM
-    add x1, x1, :lo12:G_QDIM
-    str x6, [x1]
+    ldr x6, [x1]                 // n_head
     adrp x1, G_NKV
     add x1, x1, :lo12:G_NKV
-    ldr x7, [x1]
-    mul x6, x7, x2               // n_kv*head_dim
+    ldr x7, [x1]                 // n_kv
+    udiv x5, x6, x7              // query heads per kv head: 4 on gemma3, so
+    adrp x1, G_GROUP             // every head maps to kv head 0
+    add x1, x1, :lo12:G_GROUP
+    str x5, [x1]
+    mul x5, x6, x2               // n_head*head_dim
+    adrp x1, G_QDIM
+    add x1, x1, :lo12:G_QDIM
+    str x5, [x1]
+    mul x5, x7, x2               // n_kv*head_dim
     adrp x1, G_KVDIM
     add x1, x1, :lo12:G_KVDIM
-    str x6, [x1]
-    lsl x6, x6, #2               // *4 = cache row bytes
+    str x5, [x1]
+    lsl x5, x5, #2               // *4 = cache row bytes
     adrp x1, G_KVROW
     add x1, x1, :lo12:G_KVROW
-    str x6, [x1]
+    str x5, [x1]
     adrp x1, G_KVCAP
     add x1, x1, :lo12:G_KVCAP
-    ldr x7, [x1]
-    mul x7, x7, x6               // positions * row bytes
+    ldr x6, [x1]
+    mul x6, x6, x5               // positions * row bytes
     adrp x1, G_KSTRIDE
     add x1, x1, :lo12:G_KSTRIDE
-    str x7, [x1]
+    str x6, [x1]
     scvtf s0, w2                 // score scale 1/sqrt(head_dim): for 256 that
     fsqrt s0, s0                 // is exactly 0.0625, the constant the gemma
     fmov s1, #1.0                // path has always passed
@@ -3464,22 +3499,41 @@ fwd_layer0:
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
     bl gemv_arch
-    // KN = norm(KV) with FL[3]; rope (sliding pos0)
+    // KN = norm(KV) with FL[3] and rope, once per kv head. On qwen3 both the
+    // norm and the rotation are per head (8 of them); gemma3 has one kv head,
+    // so the loop runs once and this is exactly the two calls it used to be.
+    bl lay_full                  // layer 0: sliding on gemma3, full on qwen3
+    mov x25, #0                  // h
+25: mov x0, x25
+    bl head_off                  // x3 = h*head_dim*4
     mov w0, #3
-    bl nptr
-    mov x1, x0
+    bl nptr                      // x0 = FL[3] (kn). BEFORE the pointers below:
+    mov x5, x0                   // nptr works in x0/x1, so an out pointer built
+                                 // here would be eaten by it - the version of
+                                 // this block that did that wrote the normalised
+                                 // K over FL[3], the layer-0 k_norm weights, and
+                                 // still printed identical L0 signatures because
+                                 // softmax over one key makes the scores
+                                 // irrelevant at pos 0. The bench ate the damage.
     adrp x0, FKN
     add x0, x0, :lo12:FKN
+    add x0, x0, x3
     adrp x2, FKV
     add x2, x2, :lo12:FKV
-    mov w3, #256
+    add x2, x2, x3
+    mov x1, x5                   // w
+    adrp x3, G_HD
+    add x3, x3, :lo12:G_HD
+    ldr w3, [x3]                 // n = head_dim (256 on gemma3)
     adrp x4, f_eps
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
-    bl lay_full                  // layer 0: sliding on gemma3, full on qwen3
+    mov x0, x25
+    bl head_off
     adrp x0, FKN
     add x0, x0, :lo12:FKN
+    add x0, x0, x3
     adrp x1, TCOS_S
     add x1, x1, :lo12:TCOS_S
     adrp x2, TSIN_S
@@ -3490,8 +3544,16 @@ fwd_layer0:
     adrp x2, TSIN_F
     add x2, x2, :lo12:TSIN_F
 l0kr:
-    mov w3, #128
+    adrp x3, G_HHALF
+    add x3, x3, :lo12:G_HHALF
+    ldr w3, [x3]                 // pairs = head_dim/2 (128 on gemma3)
     bl rope_half
+    add x25, x25, #1
+    adrp x0, G_NKV
+    add x0, x0, :lo12:G_NKV
+    ldr x0, [x0]
+    cmp x25, x0
+    b.lt 25b
     // V = v-proj(slot7,256x640) into FV
     mov w0, #7
     bl wptr
@@ -3507,11 +3569,15 @@ l0kr:
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
     bl gemv_arch
-    // heads j=0..3 (w20; kernels keep x19+, print_sig keeps x20)
+    // heads j = 0..n_head-1 (w20; kernels keep x19+, print_sig keeps x20)
     mov w20, #0                  // j
-20: cmp w20, #4
+20: adrp x0, G_NHEAD
+    add x0, x0, :lo12:G_NHEAD
+    ldr x0, [x0]
+    cmp x20, x0
     b.hs 29f
-    lsl x3, x20, #10             // j*1024
+    mov x0, x20
+    bl head_off                  // x3 = j*head_dim*4 (was lsl #10)
     mov w0, #2
     bl nptr                      // x0 = FL[2] (qn)
     mov x1, x0                   // w
@@ -3521,13 +3587,16 @@ l0kr:
     adrp x2, FQ
     add x2, x2, :lo12:FQ
     add x2, x2, x3               // x
-    mov w3, #256
+    adrp x3, G_HD
+    add x3, x3, :lo12:G_HD
+    ldr w3, [x3]                 // n = head_dim
     adrp x4, f_eps
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
     bl lay_full                  // same rule as the K rope (x0/x3 redone below)
-    lsl x3, x20, #10
+    mov x0, x20
+    bl head_off
     adrp x0, FQN
     add x0, x0, :lo12:FQN
     add x0, x0, x3
@@ -3541,7 +3610,9 @@ l0kr:
     adrp x2, TSIN_F
     add x2, x2, :lo12:TSIN_F
 l0qr:
-    mov w3, #128
+    adrp x3, G_HHALF
+    add x3, x3, :lo12:G_HHALF
+    ldr w3, [x3]
     bl rope_half
     cbnz w20, 21f
     adrp x0, s_QN0
@@ -3550,7 +3621,8 @@ l0qr:
     add x1, x1, :lo12:FQN
     mov w2, #256
     bl print_sig
-21: lsl x3, x20, #10
+21: mov x0, x20
+    bl head_off                  // x3 = this q head, x4 = the kv head it reads
     adrp x0, FS
     add x0, x0, :lo12:FS
     adrp x1, FQN
@@ -3558,26 +3630,39 @@ l0qr:
     add x1, x1, x3
     adrp x2, FKN
     add x2, x2, :lo12:FKN
+    add x2, x2, x4
     mov w3, #1
-    mov w4, #256
-    adrp x5, f_scale
-    add x5, x5, :lo12:f_scale
-    ldr s0, [x5]
+    adrp x5, G_HD
+    add x5, x5, :lo12:G_HD
+    ldr w4, [x5]                 // hd
+    adrp x5, G_ASCALE
+    add x5, x5, :lo12:G_ASCALE
+    ldr s0, [x5]                 // 1/sqrt(hd): 0.0625 on gemma3
+    adrp x5, G_KVROW
+    add x5, x5, :lo12:G_KVROW
+    ldr x5, [x5]                 // row stride (1024 on gemma3 = hd*4)
     bl attn_scores_f32
     adrp x0, FS
     add x0, x0, :lo12:FS
     mov w1, #1
     bl softmax_f32
-    lsl x3, x20, #10
+    mov x0, x20
+    bl head_off
     adrp x0, FAV
     add x0, x0, :lo12:FAV
     add x0, x0, x3
     adrp x1, FV
     add x1, x1, :lo12:FV
+    add x1, x1, x4
     adrp x2, FS
     add x2, x2, :lo12:FS
     mov w3, #1
-    mov w4, #256
+    adrp x5, G_HD
+    add x5, x5, :lo12:G_HD
+    ldr w4, [x5]
+    adrp x5, G_KVROW
+    add x5, x5, :lo12:G_KVROW
+    ldr x5, [x5]
     bl attn_values_f32
     add w20, w20, #1
     b 20b
@@ -3905,7 +3990,13 @@ fwd_token:
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
     bl gemv_arch
-    // KN = norm(FKV) with FL[3+6i]; rope
+    // KN = norm(FKV) with FL[3+6i] and rope, once per kv head: qwen3 has 8 of
+    // them and both the norm and the rotation are per head. gemma3 has one, so
+    // the loop body runs once and is the pair of calls this was.
+    mov x25, #0                  // h
+fwd_kvh:
+    mov x0, x25
+    bl head_off                  // x3 = h*head_dim*4
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #3
@@ -3913,22 +4004,38 @@ fwd_token:
     add x4, x4, :lo12:G_HIDB
     ldr x4, [x4]
     mul x0, x0, x4               // (3+6i)*(HID*4)
-    add x1, x21, x0              // kn w
+    add x5, x21, x0              // kn w (stashed; x1 is a temp above)
     adrp x0, FKN
     add x0, x0, :lo12:FKN
+    add x0, x0, x3               // out
     adrp x2, FKV
     add x2, x2, :lo12:FKV
-    mov w3, #256
+    add x2, x2, x3               // x
+    mov x1, x5
+    adrp x3, G_HD
+    add x3, x3, :lo12:G_HD
+    ldr w3, [x3]                 // n = head_dim (256 on gemma3)
     adrp x4, f_eps
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
+    mov x0, x25
+    bl head_off
     adrp x0, FKN
     add x0, x0, :lo12:FKN
+    add x0, x0, x3
     mov x1, x16                  // cos
     mov x2, x17                  // sin
-    mov w3, #128
+    adrp x3, G_HHALF
+    add x3, x3, :lo12:G_HHALF
+    ldr w3, [x3]                 // pairs = head_dim/2 (128 on gemma3)
     bl rope_half
+    add x25, x25, #1
+    adrp x0, G_NKV
+    add x0, x0, :lo12:G_NKV
+    ldr x0, [x0]
+    cmp x25, x0
+    b.lt fwd_kvh
     // V = v-proj(slot base+5, 256x640) -> FV
     add x0, x24, #5
     mov x4, #56
@@ -4017,9 +4124,13 @@ fwd_token:
     b 41b
 42: // heads j in w25
     mov w25, #0
-43: cmp w25, #4
+43: adrp x0, G_NHEAD
+    add x0, x0, :lo12:G_NHEAD
+    ldr x0, [x0]
+    cmp x25, x0
     b.hs 44f
-    lsl x3, x25, #10             // j*1024
+    mov x0, x25
+    bl head_off                  // x3 = j*head_dim*4 (was lsl #10), x4 = kv head
     // q_norm of THIS layer: FL[2+6i]. Was a constant #2 (= layer 0 only), so
     // every layer >= 1 used layer 0's q_norm. Invisible at pos 0 (softmax
     // over one key makes scores irrelevant); corrupts attention from pos 1 on.
@@ -4027,7 +4138,9 @@ fwd_token:
     mul x0, x23, x0              // 6i
     add x0, x0, #2               // + q_norm slot
     bl nptr                      // x0 = FL[2+6i] (qn)
-    mov x5, x0                   // w (x5 dead across call? recomputed? NO: x5 set here, used below AFTER?? order: set x5, then set x0 (out, overwrites FL_qn addr? ALREADY SAVED in x5 ✓), then x1=x5, x2... then call. x5 live INTO the call setup (not across a call) ✓ SAFE.
+    mov x5, x0                   // w: needed only into the arg setup below, and
+                                 // it dies in the rmsnorm call, which is fine
+                                 // because x1 = x5 happens before that call
     adrp x0, FQN
     add x0, x0, :lo12:FQN
     add x0, x0, x3               // out
@@ -4035,45 +4148,64 @@ fwd_token:
     adrp x2, FQ
     add x2, x2, :lo12:FQ
     add x2, x2, x3               // x
-    mov w3, #256
+    adrp x3, G_HD
+    add x3, x3, :lo12:G_HD
+    ldr w3, [x3]                 // n = head_dim (256 on gemma3)
     adrp x4, f_eps
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
-    lsl x3, x25, #10
+    mov x0, x25
+    bl head_off
     adrp x0, FQN
     add x0, x0, :lo12:FQN
     add x0, x0, x3
     mov x1, x16                  // cos
     mov x2, x17                  // sin
-    mov w3, #128
+    adrp x3, G_HHALF
+    add x3, x3, :lo12:G_HHALF
+    ldr w3, [x3]                 // pairs = head_dim/2 (128 on gemma3)
     bl rope_half
-    lsl x3, x25, #10
+    mov x0, x25
+    bl head_off
     adrp x0, FS
     add x0, x0, :lo12:FS
     adrp x1, FQN
     add x1, x1, :lo12:FQN
     add x1, x1, x3               // q
     mov x2, x26                  // krow
+    add x2, x2, x4               // + the kv head this query reads (0 on gemma3)
     mov w3, w18                  // n
-    mov w4, #256
-    adrp x5, f_scale
-    add x5, x5, :lo12:f_scale
-    ldr s0, [x5]
+    adrp x5, G_HD
+    add x5, x5, :lo12:G_HD
+    ldr w4, [x5]                 // hd
+    adrp x5, G_ASCALE
+    add x5, x5, :lo12:G_ASCALE
+    ldr s0, [x5]                 // 1/sqrt(hd): exactly 0.0625 on gemma3
+    adrp x5, G_KVROW
+    add x5, x5, :lo12:G_KVROW
+    ldr x5, [x5]                 // row stride (hd*4 with one kv head)
     bl attn_scores_f32
     adrp x0, FS
     add x0, x0, :lo12:FS
     mov w1, w18
     bl softmax_f32
-    lsl x3, x25, #10
+    mov x0, x25
+    bl head_off
     adrp x0, FAV
     add x0, x0, :lo12:FAV
     add x0, x0, x3
     mov x1, x27                  // vrow
+    add x1, x1, x4
     adrp x2, FS
     add x2, x2, :lo12:FS
     mov w3, w18
-    mov w4, #256
+    adrp x5, G_HD
+    add x5, x5, :lo12:G_HD
+    ldr w4, [x5]
+    adrp x5, G_KVROW
+    add x5, x5, :lo12:G_KVROW
+    ldr x5, [x5]
     bl attn_values_f32
     add w25, w25, #1
     b 43b
