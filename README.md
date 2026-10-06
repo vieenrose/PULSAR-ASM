@@ -42,29 +42,11 @@ cd pulsar_arm/asm && as -o core.o core.S && ld -static -o core core.o
 
 ![270m chat demo](doc/gemma3-270m-chat-en.gif)
 
-```
-$ printf 'Hello\n' | ./core model.safetensors vocab.bin 2 c bpe.bin 1000 950 48
-chat ready (sample mode; empty line skips, EOF quits)
-> tpl: 9 105 2364 107 9259 106 107 105 4368 107
-This is an initial message is 'best_
-
-The best _
-
-It is a.
-I
-Here is a great,
-I am
-The
-the
-I am a person of
-A strong
-The
-I
-```
+`printf 'Hello\n' | ./core model.safetensors vocab.bin 2 c bpe.bin 1000 950 48`
+— GIF rendered from that exact run (only pacing libertied).
 
 Sampling varies run to run (fixed seed reproduces exactly); temp < 0.7 tends to
 loop — see guidance above. Prefill ids print as `tpl:` for transparency.
-The GIF above is rendered from this exact transcript (only pacing libertied).
 
 ## Layout
 `core.S`: file/mmap stage → compute kernels → layer forward → sampler →
