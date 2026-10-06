@@ -93,12 +93,30 @@ static inline float h2f(uint16_t h) {
  * (#if cannot sit inside a macro body, hence a macro per stage.)
  * Measured on the Pi, 2026-10-06, real layer-5 q_proj bytes:
  *   V5 loads only                          0.04 ns/weight
- *   V3 fma + plane loads, no digit math    0.54   <- load:fma ratio; row
- *                                                     blocking is the fix
+ *   V3 fma + plane loads, no digit math    0.54   <- load:fma ratio
  *   V4 convert + fma, no digit math        2.17   <- the converts are the wall
  *   V1 digit math + load, no convert       1.38
  *   V0 full, digit form                    1.98   (2.0x)
- *   V6 full, no convert                    0.91   (4.3x, ~1544 ms/token)
+ *   V6 full, no convert                    0.91   (4.3x, ~1540 ms/token)  WINNER
+ *   V7 integer digit chain                 1.61   dead end: 120 int instrs per
+ *                                                     row-group cost more than
+ *                                                     the 64 FP ones they saved
+ *   V8 16-lane blocked quarters            1.65   dead end, and wrong: a 16-byte
+ *                                                     load against an 8-lane
+ *                                                     quarter maps half the
+ *                                                     lanes to the wrong column
+ *   V9 V6 with rows hoisted inside         1.67   dead end in C: t0[4]/a0[4] as
+ *                                                     arrays spill to the stack.
+ *                                                     Whether sharing plane loads
+ *                                                     across 4 rows actually wins
+ *                                                     can only be answered in asm,
+ *                                                     where the registers are
+ *                                                     chosen by hand.
+ * Two traps in these numbers, both recorded so nobody quotes a wrong one: the
+ * argv dispatch once compared argv[2][1] to 6 instead of '6', so every "variant"
+ * silently ran the slow kernel and all five timings came out identical; and a
+ * kernel that never stores its result gets its body deleted, which made V7 look
+ * like 0.33 ns/weight (11.8x) until the missing store was fixed.
  * A72's vector int->float convert is ~9 cycles of throughput; the digit form
  * needs 40 per group, so it costs 1.6 ns/weight all by itself.
  */
@@ -264,6 +282,172 @@ static void gemv_neon6(int rows, const uint8_t *w, float *y) {
     }
 }
 
+
+/* ---- VARIANT 7: 4-row blocking, integer digit chain, no converts ----------
+ * Two more things to fix after V6:
+ *   - every FMA carried two plane loads, so the load ports, not the FMA, set the
+ *     rate (that is why V3 with no digit math at all still cost 0.54). Four rows
+ *     share each plane load.
+ *   - the float t-chain put a mul and a rint on the same FP pipe as the FMAs,
+ *     and it was serial: t_{j+1} = rint(t_j * third). Computing each t_j
+ *     directly from v with SQDMULH (integer pipe, ~0.25 instr per weight) makes
+ *     all five chains independent and moves 2/3 of the work off FP1.
+ * float(t_j) comes from the magic-add, which is integer-pipe too.
+ */
+static inline float32x4_t i16lo_f(int16x8_t v) {
+    const int32x4_t magic = vdupq_n_s32(0x4B000000);
+    float32x4_t f = vreinterpretq_f32_s32(vaddq_s32(
+        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vreinterpretq_u16_s16(v)))), magic));
+    return vsubq_f32(f, vreinterpretq_f32_s32(magic));
+}
+static inline float32x4_t i16hi_f(int16x8_t v) {
+    const int32x4_t magic = vdupq_n_s32(0x4B000000);
+    float32x4_t f = vreinterpretq_f32_s32(vaddq_s32(
+        vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(vreinterpretq_u16_s16(v)))), magic));
+    return vsubq_f32(f, vreinterpretq_f32_s32(magic));
+}
+
+static void gemv_neon7(int rows, const uint8_t *w, float *y) {
+    for (int r0 = 0; r0 < rows; r0 += 4) {
+        const uint8_t *b[4];
+        float sc[4];
+        for (int k = 0; k < 4; k++) {
+            b[k] = w + (size_t)(r0 + k) * NG * 28;
+            sc[k] = 0.0f;
+        }
+        float tot[4] = {0, 0, 0, 0};
+        for (int g = 0; g < NG; g++) {
+            const float *qg = &QP[g][0][0];
+            float gs = GS[g];
+            float t4[4];
+            for (int k = 0; k < 4; k++) {
+                float acc = 0.0f;
+                for (int q = 0; q < 4; q++) {
+                    int16x8_t v16 = vreinterpretq_s16_u16(
+                        vmovl_u8(vld1_u8(b[k] + g * 28 + 2 + q * 8)));
+                    float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+                    for (int j = 0; j < 5; j++) {
+                        int16x8_t t = j == 0 ? v16
+                            : vqdmulhq_s16(v16, vdupq_n_s16(MAGIC[j]));
+                        a0 = vfmaq_f32(a0, i16lo_f(t), vld1q_f32(qg + j * 32 + q * 8));
+                        a1 = vfmaq_f32(a1, i16hi_f(t), vld1q_f32(qg + j * 32 + q * 8 + 4));
+                    }
+                    float32x4_t s = vaddq_f32(a0, a1);
+                    float32x2_t p = vadd_f32(vget_low_f32(s), vget_high_f32(s));
+                    acc += vget_lane_f32(vpadd_f32(p, p), 0);
+                }
+                t4[k] = (acc - gs) * h2f(*(const uint16_t *)(b[k] + g * 28));
+            }
+            /* the four rows read the same 10 plane vectors per digit position;
+             * the loop above still reloads them, which is what the next step
+             * (reordering q/j outside k) removes */
+            for (int k = 0; k < 4; k++) tot[k] += t4[k];
+        }
+        for (int k = 0; k < 4; k++) y[r0 + k] = tot[k];
+    }
+}
+
+
+/* ---- VARIANT 8: V6's math, rows hoisted inside ---------------------------
+ * V7 moved the digit chain to the integer pipe and lost (120 int instructions
+ * per row-group beat the 64 FP ones it saved). What it never did was the actual
+ * blocking: the row loop sat inside q, so every row reloaded the plane vectors.
+ * Here the row loop is inside the digit loop, so one plane load feeds four rows.
+ * Register budget: t0/t1 x4 rows (8) + acc x4 rows (8) + 2 planes = 18.
+ */
+static void gemv_neon8(int rows, const uint8_t *w, float *y) {
+    const float32x4_t third = vdupq_n_f32(THIRD);
+    for (int r0 = 0; r0 < rows; r0 += 4) {
+        const uint8_t *b[4];
+        float tot[4] = {0, 0, 0, 0};
+        for (int k = 0; k < 4; k++) b[k] = w + (size_t)(r0 + k) * NG * 28;
+        for (int g = 0; g < NG; g++) {
+            const float *qg = &QP[g][0][0];
+            float part[4];
+            for (int k = 0; k < 4; k++) part[k] = 0.0f;
+            for (int q = 0; q < 4; q++) {
+                float32x4_t t0[4], t1[4], a0[4], a1[4];
+                for (int k = 0; k < 4; k++) {
+                    uint8x8_t vb = vget_low_u8(vld1q_u8(b[k] + g * 28 + 2 + q * 8));
+                    uint8x8_t wl = vb, wh = vget_high_u8(vld1q_u8(b[k] + g * 28 + 2 + q * 8));
+                    t0[k] = bytef32(wl, 0); t1[k] = bytef32(wh, 0);
+                    (void)vb;
+                    a0[k] = vdupq_n_f32(0); a1[k] = vdupq_n_f32(0);
+                }
+                for (int j = 0; j < 5; j++) {
+                    float32x4_t p0 = vld1q_f32(qg + j * 32 + q * 8);
+                    float32x4_t p1 = vld1q_f32(qg + j * 32 + q * 8 + 4);
+                    for (int k = 0; k < 4; k++) {
+                        a0[k] = vfmaq_f32(a0[k], t0[k], p0);
+                        a1[k] = vfmaq_f32(a1[k], t1[k], p1);
+                        if (j < 4) {
+                            t0[k] = vrndmq_f32(vmulq_f32(t0[k], third));
+                            t1[k] = vrndmq_f32(vmulq_f32(t1[k], third));
+                        }
+                    }
+                }
+                for (int k = 0; k < 4; k++) {
+                    float32x4_t s = vaddq_f32(a0[k], a1[k]);
+                    float32x2_t pp = vadd_f32(vget_low_f32(s), vget_high_f32(s));
+                    part[k] += vget_lane_f32(vpadd_f32(pp, pp), 0);
+                }
+            }
+            for (int k = 0; k < 4; k++)
+                tot[k] += (part[k] - GS[g]) * h2f(*(const uint16_t *)(b[k] + g * 28));
+        }
+        for (int k = 0; k < 4; k++) y[r0 + k] = tot[k];
+    }
+}
+
+
+/* ---- VARIANT 9: V6 with the row loop hoisted inside ----------------------
+ * V8 had the right idea and the wrong lane mapping (it loaded 16 code bytes for
+ * an 8-lane quarter, so half the lanes indexed the wrong plane column, and the
+ * 16-lane version needs 32 registers). This keeps V6's 8-byte quarters and just
+ * moves the row loop inside the digit loop, so each plane vector is loaded once
+ * and used by four rows: 10 plane loads per row-group instead of 40.
+ */
+static void gemv_neon9(int rows, const uint8_t *w, float *y) {
+    const float32x4_t third = vdupq_n_f32(THIRD);
+    for (int r0 = 0; r0 < rows; r0 += 4) {
+        const uint8_t *b[4];
+        float tot[4] = {0, 0, 0, 0};
+        for (int k = 0; k < 4; k++) b[k] = w + (size_t)(r0 + k) * NG * 28;
+        for (int g = 0; g < NG; g++) {
+            const float *qg = &QP[g][0][0];
+            float part[4] = {0, 0, 0, 0};
+            for (int q = 0; q < 4; q++) {
+                float32x4_t t0[4], t1[4], a0[4], a1[4];
+                for (int k = 0; k < 4; k++) {
+                    uint8x8_t vb = vld1_u8(b[k] + g * 28 + 2 + q * 8);
+                    t0[k] = bytef32(vb, 0); t1[k] = bytef32(vb, 1);
+                    a0[k] = vdupq_n_f32(0.0f); a1[k] = vdupq_n_f32(0.0f);
+                }
+                for (int j = 0; j < 5; j++) {
+                    float32x4_t p0 = vld1q_f32(qg + j * 32 + q * 8);
+                    float32x4_t p1 = vld1q_f32(qg + j * 32 + q * 8 + 4);
+                    for (int k = 0; k < 4; k++) {
+                        a0[k] = vfmaq_f32(a0[k], t0[k], p0);
+                        a1[k] = vfmaq_f32(a1[k], t1[k], p1);
+                        if (j < 4) {
+                            t0[k] = vrndmq_f32(vmulq_f32(t0[k], third));
+                            t1[k] = vrndmq_f32(vmulq_f32(t1[k], third));
+                        }
+                    }
+                }
+                for (int k = 0; k < 4; k++) {
+                    float32x4_t sm = vaddq_f32(a0[k], a1[k]);
+                    float32x2_t pp = vadd_f32(vget_low_f32(sm), vget_high_f32(sm));
+                    part[k] += vget_lane_f32(vpadd_f32(pp, pp), 0);
+                }
+            }
+            for (int k = 0; k < 4; k++)
+                tot[k] += (part[k] - GS[g]) * h2f(*(const uint16_t *)(b[k] + g * 28));
+        }
+        for (int k = 0; k < 4; k++) y[r0 + k] = tot[k];
+    }
+}
+
 int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] : "/home/luigi/bonsai_b3.bin";
     int fd = open(path, O_RDONLY); struct stat st; fstat(fd, &st);
@@ -291,7 +475,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < COLS; i++) X[i] = ((i * 37) % 251) / 125.0f - 1.0f;
     deinterleave(X);
     ternary_gemv_b3(ROWS, COLS, W, X, YA);
-    if (argc > 2 && !strcmp(argv[2], "v6")) { build_q(); gemv_neon6(ROWS, W, YB); } else gemv_neon(ROWS, W, YB);
+    if (argc > 2 && argv[2][1] == '6') { build_q(); gemv_neon6(ROWS, W, YB); } else if (argc > 2 && argv[2][1] == '7') { build_q(); gemv_neon7(ROWS, W, YB); } else if (argc > 2 && argv[2][1] == '8') { build_q(); gemv_neon8(ROWS, W, YB); } else if (argc > 2 && argv[2][1] == '9') { build_q(); gemv_neon9(ROWS, W, YB); } else gemv_neon(ROWS, W, YB);
     double mx = 0, md = 0;
     for (int r = 0; r < ROWS; r++) {
         double d = fabs(YA[r] - YB[r]);
@@ -313,7 +497,10 @@ int main(int argc, char **argv) {
     }
     for (int t = 0; t < 4; t++) {
         clock_gettime(CLOCK_MONOTONIC, &a);
-        if (argc > 2 && !strcmp(argv[2], "v6")) gemv_neon6(ROWS, W, YB);
+        if (argc > 2 && argv[2][1] == '6') gemv_neon6(ROWS, W, YB);
+        else if (argc > 2 && argv[2][1] == '7') gemv_neon7(ROWS, W, YB);
+        else if (argc > 2 && argv[2][1] == '8') gemv_neon8(ROWS, W, YB);
+        else if (argc > 2 && argv[2][1] == '9') gemv_neon9(ROWS, W, YB);
         else gemv_neon(ROWS, W, YB);
         clock_gettime(CLOCK_MONOTONIC, &b);
         sink += YB[0];
