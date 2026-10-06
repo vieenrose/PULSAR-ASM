@@ -124,3 +124,20 @@
   8. gates: Gemma regression (bench ids byte-identical + 144-pair oracle diff)
      AND Bonsai layer/position diff vs /tmp/oracle_test.log (1.7B, 140 blocks)
      and /tmp/oracle4b_b3.log (4B, 180 blocks), then end-to-end ' Paris'.
+- METRIC DRIFT RESOLVED (2026-10-07): the ~170 ms/token seen during the arch
+  substeps is ambient drift, not a regression. Same-job A/B, both binaries
+  interleaved: core_p5 (pre-arch, read 147-149 earlier today) 169.03 and 170.53,
+  core_arch6 (arch substeps + bss resize) 170.04 and 170.89 => ratio 1.002-1.006.
+  Lesson repeated: never compare absolutes across hours on this Pi; always
+  interleave the two binaries in one job.
+- DEMO PATH for Bonsai (what remains before a demo exists): (1) loader must read
+  each tensor's dtype from the blob header ("B3_128" vs "F32") so ternary
+  tensors are distinguishable from bf16 weights; (2) wire asm/ternary_gemv.S
+  (already verified at C parity) for the q/k/v/o/gate/up/down projections, the
+  embedding row gather and the tied head; (3) attention: kv head =
+  j/(n_head/n_kv), rope pairs = hd/2, scores over hd, no sliding window,
+  theta from the blob, scale 1/sqrt(hd); (4) FL two-region layout (HID-wide
+  input/post-attn + final, HD-wide q/k norms); (5) ids mode ('i' = raw token ids
+  on stdin) + G_TOPK so the card's temp 0.5 / top_p 0.85 / top_k 20 can be used;
+  (6) then the layer/position diff against /tmp/oracle_test.log (1.7B) and
+  /tmp/oracle4b_b3.log (4B), and only then the ceiling-prompt hunt + GIFs.
