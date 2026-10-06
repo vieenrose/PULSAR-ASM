@@ -3282,8 +3282,13 @@ fwd_token:
 43: cmp w25, #4
     b.hs 44f
     lsl x3, x25, #10             // j*1024
-    mov w0, #2
-    bl nptr                      // x0 = FL_qn
+    // q_norm of THIS layer: FL[2+6i]. Was a constant #2 (= layer 0 only), so
+    // every layer >= 1 used layer 0's q_norm. Invisible at pos 0 (softmax
+    // over one key makes scores irrelevant); corrupts attention from pos 1 on.
+    mov x0, #6
+    mul x0, x23, x0              // 6i
+    add x0, x0, #2               // + q_norm slot
+    bl nptr                      // x0 = FL[2+6i] (qn)
     mov x5, x0                   // w (x5 dead across call? recomputed? NO: x5 set here, used below AFTER?? order: set x5, then set x0 (out, overwrites FL_qn addr? ALREADY SAVED in x5 ✓), then x1=x5, x2... then call. x5 live INTO the call setup (not across a call) ✓ SAFE.
     adrp x0, FQN
     add x0, x0, :lo12:FQN

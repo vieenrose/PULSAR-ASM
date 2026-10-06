@@ -34,7 +34,10 @@ def rms(x, w, eps=1e-6):
 
 L = "model.layers.0."
 emb = T("model.embed_tokens.weight", 640 * 262144)
-h = emb[2 * 640:3 * 640]
+h = emb[2 * 640:3 * 640] * math.sqrt(640.0)  # HF scales the embedding
+# by sqrt(hidden_size) (Gemma3TextScaledWordEmbedding). Without this the
+# residual after post_attention_layernorm is wrong and every MLP signature
+# below diverges from HF even though the engine is correct.
 H = rms(h, T(L + "input_layernorm.weight", 640))
 AV = np.tile(M(L + "self_attn.v_proj.weight", 256, 640) @ H, 4)
 ao = M(L + "self_attn.o_proj.weight", 640, 1024) @ AV

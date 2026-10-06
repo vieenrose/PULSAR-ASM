@@ -56,24 +56,28 @@ with torch.no_grad():
     att = torch.softmax(scores, dim=-1)
     ctx = (att[:, None] * vh).sum(0)                          # [256]
     ctx4 = ctx.repeat(4)                                      # GQA expand
+    sig("AV", ctx4)                                           # engine L0 AV = pre-o_proj
     ao = ctx4 @ L.self_attn.o_proj.weight.float().T
-    sig("AV", ao)
+    sig("AO", ao)
 
-    resid = h + ao
-    sig("POST", resid)
+    # HF Gemma3DecoderLayer order: post_attention_layernorm(ao), THEN residual.
+    pa = ao * torch.rsqrt(ao.pow(2).mean() + 1e-6) \
+        * (1.0 + L.post_attention_layernorm.weight.double()).float()
+    sig("POST", pa)
+    resid = h + pa
+    sig("X1", resid)
 
     pn = resid * torch.rsqrt(resid.pow(2).mean() + 1e-6) \
-        * (1.0 + L.post_attention_layernorm.weight.double()).float()
+        * (1.0 + L.pre_feedforward_layernorm.weight.double()).float()
+    sig("PN", pn)
     gate = pn @ L.mlp.gate_proj.weight.float().T
     up = pn @ L.mlp.up_proj.weight.float().T
     gg = torch.nn.functional.gelu(gate, approximate="tanh") * up
     sig("GG", gg)
     d = gg @ L.mlp.down_proj.weight.float().T
-    sig("D", d)
-    pre = resid + d
-    pre = pre * torch.rsqrt(pre.pow(2).mean() + 1e-6) \
-        * (1.0 + L.pre_feedforward_layernorm.weight.double()).float()
-    out = pre * torch.rsqrt(pre.pow(2).mean() + 1e-6) \
+    # post_feedforward_layernorm is applied to the MLP output, THEN residual add.
+    dff = d * torch.rsqrt(d.pow(2).mean() + 1e-6) \
         * (1.0 + L.post_feedforward_layernorm.weight.double()).float()
-    x2 = resid + out
+    sig("D", dff)
+    x2 = resid + dff
     sig("X2", x2)
