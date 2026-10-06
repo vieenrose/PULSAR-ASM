@@ -1,0 +1,28 @@
+{
+  "id": "bc9f281d0",
+  "name": "Post-fix chat and tool call",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S2=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && S3=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && printf \"Hello\\n\" | timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 800 950 40 > /tmp/c2.log 2>&1; echo \"270M-CHAT=$?\"; awk \"/chat ready/{f=1} f\" /tmp/c2.log | tail -n +3 | head -5 | cut -c1-58; timeout 200 ./core $S3 ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/tool_official.txt > /tmp/t2.log 2>&1; echo \"FC-TOOL=$?\"; tail -5 /tmp/t2.log | cut -c1-70'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bc9f281d0.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791262037017,
+  "endTime": 1791262080443,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 131028,
+  "bytesWritten": 175,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 700,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
