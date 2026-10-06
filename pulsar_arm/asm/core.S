@@ -822,6 +822,8 @@ f_s13:       .float 0.00000000016059
 d_pi:        .double 3.141592653589793
 d_inv_2pi:   .double 0.15915494309189535
 d_2pi:       .double 6.283185307179586
+d_ln2:       .double 0.6931471805599453
+d_2m52:      .double 2.220446049250313e-16
 
 /* ---------------- bss ---------------- */
     .section .bss
@@ -1469,6 +1471,18 @@ f_grp_ok:
     ldr x0, [x1]
     bl print_u64
     bl print_nl
+    // and the rope constant the table builder will use, so ln_f64 is checkable
+    // from the log alone (the refusal means nothing else in this run reads it)
+    adrp x0, t_lnt
+    add x0, x0, :lo12:t_lnt
+    bl print_cstr
+    adrp x0, G_ROPE_T
+    add x0, x0, :lo12:G_ROPE_T
+    ldr x0, [x0]
+    bl ln_f64
+    fcvt s0, d0
+    bl print_f32
+    bl print_nl
     adrp x0, t_geom2
     add x0, x0, :lo12:t_geom2
     bl print_cstr
@@ -1572,6 +1586,7 @@ ep_arch:      .asciz "ERROR: only the gemma3 path is implemented; this blob need
 ep_grp:       .asciz "ERROR: unsupported pulsar.ternary_group (the kernel decodes 128)\n"
 t_geom:       .asciz "blob geom q/kv/hd: "
 t_geom2:      .asciz "blob geom win/fullmod/cap/kvrow/kstride: "
+t_lnt:        .asciz "blob ln(theta): "
 t_dims:      .asciz "dims hid/inter/layers/vocab: "
 t_embed:     .asciz "embed rows cols: "
 t_in0:       .asciz "in_norm0[0..3] = "
@@ -2654,7 +2669,14 @@ T3:          .skip 2048*4
 /* build_tables: fills INV_S/F + TCOS/TSIN_S/F. Clobbers x0-x14, s0-s7. */
 build_tables:
     str x30, [sp, #-16]!
-    // inv arrays first (theta s=1e4, f=1e6)
+    str x19, [sp, #-16]!
+    // inv arrays first. gemma3 has one theta per table kind - sliding 1e4, full
+    // 1e6, the two constants it always used - and a pulsar blob takes theta from
+    // its header and gives it to both tables, because it has no sliding layers.
+    adrp x0, G_ARCH
+    add x0, x0, :lo12:G_ARCH
+    ldr w0, [x0]
+    cbnz w0, btab_blob
     adrp x0, f_ln4
     add x0, x0, :lo12:f_ln4      // &ln (callee reloads per iter)
     adrp x1, INV_S
@@ -2665,6 +2687,27 @@ build_tables:
     adrp x1, INV_F
     add x1, x1, :lo12:INV_F
     bl build_inv
+    b btab_cos
+btab_blob:
+    adrp x0, G_ROPE_T
+    add x0, x0, :lo12:G_ROPE_T
+    ldr x0, [x0]
+    bl ln_f64                    // d0 = ln(theta), f64 so the 1/h products stay
+    fcvt s0, d0
+    adrp x19, G_LNT
+    add x19, x19, :lo12:G_LNT
+    str s0, [x19]
+    adrp x0, G_LNT
+    add x0, x0, :lo12:G_LNT
+    adrp x1, INV_S
+    add x1, x1, :lo12:INV_S
+    bl build_inv
+    adrp x0, G_LNT
+    add x0, x0, :lo12:G_LNT
+    adrp x1, INV_F
+    add x1, x1, :lo12:INV_F
+    bl build_inv
+btab_cos:
     // tables from inv arrays
     adrp x0, INV_S
     add x0, x0, :lo12:INV_S
@@ -2680,22 +2723,28 @@ build_tables:
     adrp x2, TSIN_F
     add x2, x2, :lo12:TSIN_F
     bl build_one
+    ldr x19, [sp], #16
     ldr x30, [sp], #16
     ret
-/* build_inv: x0 = &ln_theta, x1 = out[128]. inv_i = exp(-(i/128)*ln).
- * x0/x1/x11-x13 survive expf (uses x9,x10,s0-s4). One push (lr). */
+/* build_inv: x0 = &ln_theta, x1 = out[]. inv_i = exp(-(i/h)*ln) for i < h,
+ * h = head_dim/2 (128 for gemma3, so the 1/h below is the same 0.0078125 this
+ * used to load and every entry comes out bit-identical). x0/x1/x11/x14/s6-s7
+ * survive expf (uses x9,x10,s0-s4). One push (lr). */
 build_inv:
     str x30, [sp, #-16]!
+    adrp x14, G_HHALF
+    add x14, x14, :lo12:G_HHALF
+    ldr x14, [x14]               // h
+    scvtf s6, w14
+    fmov s7, #1.0
+    fdiv s6, s7, s6              // 1/h
     mov w11, #0                  // i
-0:  cmp w11, #128
+0:  cmp x11, x14
     b.hs 1f
     ldr s1, [x0]                 // ln
-    adrp x13, f_00078125
-    add x13, x13, :lo12:f_00078125
-    ldr s2, [x13]                // 1/128
     scvtf s3, w11
-    fmul s3, s3, s2              // i/128
-    fmul s3, s3, s1              // i*ln/128
+    fmul s3, s3, s6              // i/h
+    fmul s3, s3, s1              // i*ln/h
     fneg s0, s3                  // e
     bl expf_asm                  // s0 = inv
     str s0, [x1, x11, lsl #2]
@@ -2703,23 +2752,36 @@ build_inv:
     b 0b
 1:  ldr x30, [sp], #16
     ret
-/* build_one: x0 = inv[128], x1 = cos[512][128], x2 = sin.
- * x0-x2/x23/x24/s6 survive sincos (uses x9,s0-s5,d2-d5). */
+/* build_one: x0 = inv[], x1 = cos, x2 = sin; G_HHALF entries per row, G_KVCAP
+ * rows, rows G_TROW bytes apart. For gemma3 that is the 512x128 layout of
+ * floats it always built, and the byte offset below is the same p*512 + i*4.
+ * x0-x2/x24/w24/s6 survive sincos (uses x9,s0-s5,d2-d5); x21-x23 are pushed for
+ * whoever called tables_test. */
 build_one:
     str x30, [sp, #-16]!
-    mov w24, #0                  // p (x24: sincos-safe, tables_test-safe)
-0:  cmp w24, #512
+    stp x21, x22, [sp, #-16]!
+    str x23, [sp, #-16]!
+    adrp x21, G_HHALF
+    add x21, x21, :lo12:G_HHALF
+    ldr x21, [x21]               // entries per row
+    adrp x22, G_KVCAP
+    add x22, x22, :lo12:G_KVCAP
+    ldr x22, [x22]               // positions
+    adrp x23, G_TROW
+    add x23, x23, :lo12:G_TROW
+    ldr x23, [x23]               // row bytes
+    mov w24, #0                  // p (x24: sincos-safe)
+0:  cmp x24, x22
     b.hs 9f
     mov w11, #0                  // i (x11: sincos-safe)
-1:  cmp w11, #128
+1:  cmp x11, x21
     b.hs 2f
     ldr s1, [x0, x11, lsl #2]    // inv_i
     scvtf s5, w24                // (float)p fresh (s5 dies in sincos, read first)
     fmul s0, s5, s1              // ang
     bl sincos_asm                // s0=sin s1=cos
-    lsl x3, x24, #7              // p*128
-    add x3, x3, x11
-    lsl x3, x3, #2               // byte offset
+    mul x3, x24, x23             // p*row bytes
+    add x3, x3, x11, lsl #2      // + i*4
     add x4, x1, x3
     str s1, [x4]                 // cos
     add x4, x2, x3
@@ -2728,7 +2790,82 @@ build_one:
     b 1b
 2:  add w24, w24, #1
     b 0b
-9:  ldr x30, [sp], #16
+9:  ldr x23, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
+/* ln_f64: w0 = positive integer (a rope theta) -> d0 = ln(w0). Splits
+ * x = m*2^k with m in [1,2), then ln = k*ln2 + 2*(z + z^3/3 + ... + z^13/13)
+ * with z = (m-1)/(m+1) <= 1/3, so the dropped term is under 3e-9 of the sum.
+ * All of it in f64 on purpose: k*ln2 in f32 would put ~1e-6 of absolute error
+ * into ln(theta), and build_inv multiplies that by p, so the rope angles at
+ * p=1000 would drift by a thousandth of a radian. No calls; x0-x4, d0-d7. */
+ln_f64:
+    scvtf d0, w0
+    fmov x1, d0
+    lsr x2, x1, #52
+    sub x2, x2, #1023            // k
+    mov x3, #1
+    lsl x3, x3, #52
+    sub x3, x3, #1             // mantissa mask: 2^52-1 (a mov of that literal is
+                               // not encodable, and 0x1 + twelve zeros is 2^48,
+                               // which this was, and quietly skewed m)
+    and x1, x1, x3               // mantissa bits
+    scvtf d1, x1
+    adrp x3, d_2m52
+    add x3, x3, :lo12:d_2m52
+    ldr d2, [x3]
+    fmul d1, d1, d2
+    fmov d3, #1.0
+    fadd d1, d1, d3              // m in [1,2)
+    fsub d4, d1, d3
+    fadd d5, d1, d3
+    fdiv d4, d4, d5              // z
+    fmul d5, d4, d4              // z^2
+    fmov d6, d4                  // running z^n (starts at z, not 1: the series
+                                 // is z + z^3/3 + ..., so z^1 over n=1)
+    fmov d7, xzr                 // sum (fmov d,#0.0 is not encodable)
+    mov x3, #1
+lnf_0:
+    scvtf d0, x3
+    fdiv d0, d6, d0
+    fadd d7, d7, d0
+    fmul d6, d6, d5
+    add x3, x3, #2
+    cmp x3, #15
+    b.lt lnf_0
+    fadd d7, d7, d7              // 2*sum = ln(m)
+    scvtf d0, x2
+    adrp x1, d_ln2
+    add x1, x1, :lo12:d_ln2
+    ldr d1, [x1]
+    fmul d0, d0, d1
+    fadd d0, d7, d0
+    ret
+
+/* lay_full: layer x23 -> x18 = 1 if that layer attends over the whole context.
+ * G_FULLMOD 0 means all of them (qwen3 has no sliding window); otherwise every
+ * FULLMOD-th layer, which for gemma3 is i mod 6 == 5 - the test that used to be
+ * spelled out twice here. Result goes in x18 because the kernels never touch
+ * past x15 and fwd_token already keeps n there. Clobbers x0-x3. */
+lay_full:
+    str x30, [sp, #-16]!
+    adrp x1, G_FULLMOD
+    add x1, x1, :lo12:G_FULLMOD
+    ldr x1, [x1]
+    cbz x1, lay_full_y
+    udiv x2, x23, x1
+    msub x2, x2, x1, x23         // i mod fullmod
+    sub x1, x1, #1
+    cmp x2, x1
+    b.eq lay_full_y
+    mov x18, #0
+    ldr x30, [sp], #16
+    ret
+lay_full_y:
+    mov x18, #1
+    ldr x30, [sp], #16
     ret
 
     .section .rodata
@@ -2772,6 +2909,7 @@ G_NHEAD:     .skip 8                  // qwen3: query heads
 G_NKV:       .skip 8                  // qwen3: kv heads
 G_HD:        .skip 8                  // qwen3: head_dim
 G_ROPE_T:    .skip 8                  // qwen3: rope theta (int)
+G_LNT:       .skip 8                  // ln(theta) as f32, for a blob's tables
 G_EPS12:     .skip 8                  // qwen3: eps * 1e12 (int)
 G_QDIM:      .skip 8                  // q/o rows: gemma3 1024, qwen3 n_head*hd
 G_KVDIM:     .skip 8                  // k/v rows: gemma3 256, qwen3 n_kv*hd
@@ -3232,6 +3370,7 @@ fwd_layer0:
     ldr x0, [x0]
     add x19, x19, #8
     add x19, x19, x0             // x19 = data base
+    mov x23, #0                  // this body is layer 0; lay_full reads x23
     // X = embed(tok)
     adrp x0, G_tok
     add x0, x0, :lo12:G_tok
@@ -3321,12 +3460,19 @@ fwd_layer0:
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
+    bl lay_full                  // layer 0: sliding on gemma3, full on qwen3
     adrp x0, FKN
     add x0, x0, :lo12:FKN
     adrp x1, TCOS_S
     add x1, x1, :lo12:TCOS_S
     adrp x2, TSIN_S
     add x2, x2, :lo12:TSIN_S
+    cbz x18, l0kr
+    adrp x1, TCOS_F
+    add x1, x1, :lo12:TCOS_F
+    adrp x2, TSIN_F
+    add x2, x2, :lo12:TSIN_F
+l0kr:
     mov w3, #128
     bl rope_half
     // V = v-proj(slot7,256x640) into FV
@@ -3363,6 +3509,7 @@ fwd_layer0:
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
+    bl lay_full                  // same rule as the K rope (x0/x3 redone below)
     lsl x3, x20, #10
     adrp x0, FQN
     add x0, x0, :lo12:FQN
@@ -3371,6 +3518,12 @@ fwd_layer0:
     add x1, x1, :lo12:TCOS_S
     adrp x2, TSIN_S
     add x2, x2, :lo12:TSIN_S
+    cbz x18, l0qr
+    adrp x1, TCOS_F
+    add x1, x1, :lo12:TCOS_F
+    adrp x2, TSIN_F
+    add x2, x2, :lo12:TSIN_F
+l0qr:
     mov w3, #128
     bl rope_half
     cbnz w20, 21f
@@ -3657,12 +3810,10 @@ fwd_token:
     ldr w0, [x0]
     cmp w23, w0
     b.hs 90f
-    // full when i mod 6 == 5 -> F tables else S
-    mov w2, #6
-    udiv w3, w23, w2
-    msub w2, w3, w2, w23
-    cmp w2, #5
-    b.eq 31f
+    // F tables for a full-attention layer, S tables otherwise (gemma3: every
+    // 6th layer is full; a qwen3 blob has no sliding layers at all)
+    bl lay_full
+    cbnz x18, 31f
     adrp x0, TCOS_S
     add x0, x0, :lo12:TCOS_S
     adrp x1, TSIN_S
@@ -3672,7 +3823,10 @@ fwd_token:
     add x0, x0, :lo12:TCOS_F
     adrp x1, TSIN_F
     add x1, x1, :lo12:TSIN_F
-32: lsl x2, x22, #9              // pos*512
+32: adrp x3, G_TROW              // pos * rope row bytes (512 on gemma3)
+    add x3, x3, :lo12:G_TROW
+    ldr x3, [x3]
+    mul x2, x22, x3
     add x16, x0, x2              // cos row (x16 survives kernels)
     add x17, x1, x2              // sin row
     // H = norm(XB) with FL[1+6i]
@@ -3791,25 +3945,24 @@ fwd_token:
     add x1, x1, :lo12:FKN        // KN src
     add x2, x2, x0               // WAIT: x0 reused! recompute Vrow separately below
     b 34f
-34: // lo/n by layer type: full attention when i mod 6 == 5
-    mov w2, #6
-    udiv w3, w23, w2
-    msub w2, w3, w2, w23         // w2 = i mod 6
-    cmp w2, #5
-    b.eq 35f
-    add w0, w22, #1              // pos+1
-    sub w0, w0, #512
-    cmp w0, #0
+34: bl lay_full                  // layer type (the mod-6 test used to sit here)
+    cbnz x18, 35f
+    adrp x4, G_WIN
+    add x4, x4, :lo12:G_WIN
+    ldr x4, [x4]                 // 512 on gemma3
+    add x0, x22, #1              // pos+1
+    sub x0, x0, x4
+    cmp x0, #0
     b.ge 36f
-    mov w0, #0                   // lo
-36: add w1, w22, #1              // pos+1
-    cmp w1, #512
+    mov x0, #0                   // lo
+36: add x1, x22, #1              // pos+1
+    cmp x1, x4
     b.lo 37f
-    mov w1, #512
-37: mov w18, w1                  // n (held through heads)
+    mov x1, x4                   // n = win
+37: mov x18, x1                  // n (held through heads)
     b 38f
-35: mov w0, #0                   // lo = 0
-    add w18, w22, #1             // n = pos+1
+35: mov x0, #0                   // lo = 0
+    add x18, x22, #1             // n = pos+1
 38: // krow -> x26 ; vrow -> x27 (x0 = lo)
     lsl x1, x23, #19             // i*524288
     adrp x2, KC
