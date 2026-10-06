@@ -1,0 +1,28 @@
+{
+  "id": "b15a01208",
+  "name": "FunctionGemma chat demos en zh",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm && /home/luigi/pulsar-rpi/v/bin/python -u -c \"open(\\\"/tmp/fc_hello.txt\\\",\\\"w\\\").write(\\\"<bos><start_of_turn>user\\nHello<end_of_turn>\\n<start_of_turn>model\\n\\\")\" && /home/luigi/pulsar-rpi/v/bin/python -u -c \"open(\\\"/tmp/fc_nihao.txt\\\",\\\"w\\\").write(\\\"<bos><start_of_turn>user\\n\\xe4\\xbd\\xa0\\xe5\\xa5\\xbd\\xef\\xbc\\x81<end_of_turn>\\n<start_of_turn>model\\n\\\")\" && cd asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin 1000 950 48 < /tmp/fc_hello.txt > /tmp/fc_hello.log 2>&1; echo EN-EXIT=$?; timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin 1000 950 48 < /tmp/fc_nihao.txt > /tmp/fc_nihao.log 2>&1; echo ZH-EXIT=$?; echo \"== EN:\"; tail -6 /tmp/fc_hello.log | cut -c1-55; echo \"== ZH:\"; tail -6 /tmp/fc_nihao.log | cut -c1-55'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b15a01208.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791257879913,
+  "endTime": 1791257903649,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 126817,
+  "bytesWritten": 363,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 700,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

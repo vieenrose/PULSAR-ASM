@@ -1,0 +1,28 @@
+{
+  "id": "b6833dd9e",
+  "name": "FunctionGemma identity prompt",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm && /home/luigi/pulsar-rpi/v/bin/python -u -c \"open(\\\"/tmp/fc_who.txt\\\",\\\"w\\\").write(\\\"<bos><start_of_turn>user\\nWhat is your name?<end_of_turn>\\n<start_of_turn>model\\n\\\")\" && cd asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin 1000 950 48 < /tmp/fc_who.txt > /tmp/fc_who.log 2>&1; echo EXIT=$?; tail -6 /tmp/fc_who.log | cut -c1-60'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b6833dd9e.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791257923743,
+  "endTime": 1791257935697,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 126857,
+  "bytesWritten": 252,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
