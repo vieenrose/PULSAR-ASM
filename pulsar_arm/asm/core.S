@@ -400,6 +400,12 @@ gemv_bf16:
     .global gemv_arch
 gemv_arch:
     adrp x8, G_ARCH
+    add x8, x8, :lo12:G_ARCH       // the lo12 here is not optional: without it
+                                   // this reads whatever shares G_ARCH's page
+                                   // base, which is 0, so every arch branch fell
+                                   // into the gemma3 path - and because 0 is also
+                                   // the right answer for gemma3, no gemma gate
+                                   // could ever have noticed
     ldr w8, [x8]
     cbnz w8, gvw_tern
     b gemv_bf16
@@ -2141,6 +2147,12 @@ add_f32_e:
     .global rmsadd_arch
 rmsadd_arch:
     adrp x8, G_ARCH
+    add x8, x8, :lo12:G_ARCH       // the lo12 here is not optional: without it
+                                   // this reads whatever shares G_ARCH's page
+                                   // base, which is 0, so every arch branch fell
+                                   // into the gemma3 path - and because 0 is also
+                                   // the right answer for gemma3, no gemma gate
+                                   // could ever have noticed
     ldr w8, [x8]
     cbnz w8, rmsadd_plain
     b rmsnorm_add_f32
@@ -2192,6 +2204,12 @@ embed_row_f32:
     .global embed_arch
 embed_arch:
     adrp x8, G_ARCH
+    add x8, x8, :lo12:G_ARCH       // the lo12 here is not optional: without it
+                                   // this reads whatever shares G_ARCH's page
+                                   // base, which is 0, so every arch branch fell
+                                   // into the gemma3 path - and because 0 is also
+                                   // the right answer for gemma3, no gemma gate
+                                   // could ever have noticed
     ldr w8, [x8]
     cbnz w8, emb_tern
     b embed_row_f32
@@ -3024,19 +3042,27 @@ FLTAB:       .skip 256*8              // address of every folded norm vector
     .section .text
     .align 2
 
-/* fold_vec: x0 = src u16, x1 = dst f32, w2 = n. float64 (1+w). No calls. */
+/* fold_vec: x0 = src, x1 = dst f32, w2 = n. The element width and the fold are
+ * both arch-dependent: gemma3's norms are bf16 in the safetensors and its
+ * architecture means (1 + w), a qwen3 blob stores them as F32 and its norms are
+ * applied plain, so for arch 1 this is a straight copy. */
 fold_vec:
     adrp x3, G_ARCH
     add x3, x3, :lo12:G_ARCH
     ldr w3, [x3]
-    cbz w3, 2f
-    fmov d1, xzr                 // qwen3: plain w (x * (1 + w) folds nothing)
-    b 3f
-2:  adrp x3, d_one
+    cbz w3, fv_gemma
+fv_tern:                           // qwen3: F32 in, plain w out
+    cbz w2, fv_ret
+    ldr s0, [x0], #4
+    str s0, [x1], #4
+    sub w2, w2, #1
+    b fv_tern
+fv_gemma:                          // gemma3: bf16 in, (1 + w) in float64
+    adrp x3, d_one
     add x3, x3, :lo12:d_one
-    ldr d1, [x3]                 // gemma3: (1 + w)
-3:
-0:  cbz w2, 1f
+    ldr d1, [x3]
+fv_g_loop:
+    cbz w2, fv_ret
     ldrh w3, [x0], #2
     lsl w3, w3, #16
     fmov s0, w3
@@ -3045,8 +3071,9 @@ fold_vec:
     fcvt s0, d0
     str s0, [x1], #4
     sub w2, w2, #1
-    b 0b
-1:  ret
+    b fv_g_loop
+fv_ret:
+    ret
 /* fold_norms: folds norms via tab[] into FL (FL[0]=final, FL[1+6i+j]). */
 fold_norms:
     str x30, [sp, #-16]!
