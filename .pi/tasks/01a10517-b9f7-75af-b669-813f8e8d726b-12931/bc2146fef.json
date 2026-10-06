@@ -1,0 +1,28 @@
+{
+  "id": "bc2146fef",
+  "name": "Post-fix correctness check",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S2=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && for N in 1 6; do timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin 700 950 8 < /tmp/n$N.txt > /tmp/s$N.log 2>&1; printf \"n=%s: \" $N; awk \"/^tpl:/{f=1} f\" /tmp/s$N.log | tail -n +2 | head -2 | cut -c1-40; done; timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin > /tmp/sb.log 2>&1; grep -a \"text:\" -A2 /tmp/sb.log | head -3 | cut -c1-50; grep -a METRIC /tmp/sb.log'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bc2146fef.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791263971182,
+  "endTime": 1791263979701,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 133360,
+  "bytesWritten": 462,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 700,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -5152,9 +5152,7 @@ file_gloop:
     mov w0, w23
     bl fwd_token
     bl sampler
-    cbnz x22, 0f                 // first step only
-    bl lgprobe                    // DEBUG: argmax + probe logits
-0:  mov w23, w0                  // tok
+    mov w23, w0                  // tok
     mov w23, w0                  // tok                  // tok
     cmp w23, #1
     b.eq file_end                // eos
@@ -5173,53 +5171,3 @@ file_bye:
 
     .section .text
     .align 2
-
-    .section .rodata
-t_lgp:      .asciz "lgp: am="
-t_atv:      .asciz " lg"
-t_eq:       .asciz "="
-
-    .section .text
-    .align 2
-/* lgprobe: argmax id+val, then LG[9079], LG[506], LG[50429]. Inline, no tables. */
-lgprobe:
-    str x30, [sp, #-16]!
-    stp x19, x20, [sp, #-16]!    // x19 = caller's pos! MUST preserve
-    adrp x19, LG
-    add x19, x19, :lo12:LG
-    mov x0, x19
-    movz x1, #4, lsl #16         // 262144
-    bl argmax_f32                // w0 = am id
-    adrp x1, t_lgp
-    add x1, x1, :lo12:t_lgp
-    bl print_cstr
-    mov w3, w0
-    bl pvv
-    movz w3, #0x238F             // 9079 ' Paris'
-    bl pvv
-    movz w3, #0x1FA              // 506 ' the'
-    bl pvv
-    movz w3, #0xC4CD             // 50429 'Paris'
-    bl pvv
-    bl print_nl
-    ldp x19, x20, [sp], #16
-    ldr x30, [sp], #16
-    ret
-/* pvv: prints " lg<id>=<val>" using x19 as LG base. Uses x0-x4. */
-pvv:
-    str x30, [sp, #-16]!
-    lsl x0, x3, #2
-    ldr s0, [x19, x0]
-    adrp x1, t_atv
-    add x1, x1, :lo12:t_atv
-    bl print_cstr
-    mov x0, x3
-    bl print_u64
-    adrp x1, t_eq
-    add x1, x1, :lo12:t_eq
-    bl print_cstr
-    lsl x0, x3, #2
-    ldr s0, [x19, x0]
-    bl print_f32
-    ldr x30, [sp], #16
-    ret

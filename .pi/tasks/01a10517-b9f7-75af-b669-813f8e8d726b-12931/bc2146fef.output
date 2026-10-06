@@ -1,0 +1,4 @@
+n=1: /bin/bash: line 1:  8880 Segmentation fault      timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin 700 950 8 < /tmp/n$N.txt > /tmp/s$N.log 2>&1
+n=6: /bin/bash: line 1:  8887 Segmentation fault      timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin 700 950 8 < /tmp/n$N.txt > /tmp/s$N.log 2>&1
+text:  in in in in должность in долж�
+METRIC ms_per_token=147.41
