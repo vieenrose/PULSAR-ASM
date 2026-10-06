@@ -1,0 +1,2 @@
+/bin/bash: -c: line 3: syntax error near unexpected token `('
+/bin/bash: -c: line 3: `for r in [\"google/gemma-3-270m-it-qat-q8_0-gguf\", \"google/gemma-3-270m-it-qat-q8_0-unquantized\", \"google/gemma-3-270m-it-q8_0-gguf\", \"google/gemma-3-270m-qat-q8_0-unquantized\"]-area".replace(\"-area\",\"\"):'

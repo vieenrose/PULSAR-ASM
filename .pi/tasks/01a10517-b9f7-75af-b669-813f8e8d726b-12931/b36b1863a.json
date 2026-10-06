@@ -1,0 +1,28 @@
+{
+  "id": "b36b1863a",
+  "name": "Self-intro Chinese run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"\\xe4\\xbb\\x8b\\xe7\\xb4\\xb9\\xe4\\xbd\\xa0\\xe8\\x87\\xaa\\xe5\\xb7\\xb1\\xe3\\x80\\x82\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 1000 950 48 > /tmp/gifdemozh4.log 2>&1; echo EXIT=$?; awk \"/chat ready/{f=1} f\" /tmp/gifdemozh4.log | cut -c1-55 | head -12'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b36b1863a.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791247240572,
+  "endTime": 1791247252304,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 115907,
+  "bytesWritten": 164,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

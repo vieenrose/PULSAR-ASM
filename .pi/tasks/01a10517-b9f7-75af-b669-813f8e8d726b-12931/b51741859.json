@@ -1,0 +1,29 @@
+{
+  "id": "b51741859",
+  "name": "Probe Q8 repo candidates",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u -c \"\nfrom huggingface_hub import list_repo_files\nfor r in [\\\"google/gemma-3-270m-it-qat-q8_0-gguf\\\", \\\"google/gemma-3-270m-it-qat-q8_0-unquantized\\\", \\\"google/gemma-3-270m-it-q8_0-gguf\\\", \\\"google/gemma-3-270m-qat-q8_0-unquantized\\\"]-area\".replace(\\\"-area\\\",\\\"\\\"):\n    pass\n\" 2>&1 | head -3; echo MARKER1'",
+  "status": "failed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b51741859.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791247336190,
+  "endTime": 1791247336445,
+  "exitCode": 2,
+  "signal": null,
+  "pid": 115988,
+  "bytesWritten": 303,
+  "isAgent": false,
+  "surviveReload": false,
+  "error": "Exited with code 2",
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 120,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
