@@ -3942,7 +3942,10 @@ fwd_token:
     add x3, x3, :lo12:FH
     adrp x4, LG
     add x4, x4, :lo12:LG
-    bl gemv_bf16
+    // tied head = embed_tokens^T . h. Qwen3 ties the head and the table is
+    // B3_128, so this is the ternary GEMV over [vocab,hidden] (151669 rows x 16
+    // groups on 1.7B); gemma3 keeps gemv_bf16 through the arch branch.
+    bl gemv_arch
     adrp x0, LG
     add x0, x0, :lo12:LG
     adrp x2, G_VOC
