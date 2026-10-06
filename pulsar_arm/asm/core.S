@@ -1282,41 +1282,83 @@ f_anchors_fixed:
     mov x0, x20
     bl print_u64
     bl print_nl
-    // PULSAR blobs carry pulsar.arch_id; safetensors do not (G_ARCH stays 0).
-    adrp x0, k_parch
-    add x0, x0, :lo12:k_parch
-    bl strlen_asm
-    mov x3, x0
-    mov x0, x23                  // header base
-    mov x1, x22                  // header length
-    adrp x2, k_parch
-    add x2, x2, :lo12:k_parch
-    bl memmem
-    cbz x0, 7f
-8:  ldrb w1, [x0], #1           // scan to the first digit after the key
-    cmp w1, #'0'
-    b.lo 8b
-    cmp w1, #'9'
-    b.hi 8b
-    sub x0, x0, #1
-    bl parse_u64
+    // PULSAR geometry from the header keys (absent in safetensors, so
+    // every cell keeps its slot-derived value: gemma3 unchanged).
+    adrp x0, pk_arch
+    add x0, x0, :lo12:pk_arch
     adrp x1, G_ARCH
     add x1, x1, :lo12:G_ARCH
-    str w0, [x1]
-7:  adrp x0, G_ARCH
+    bl pget
+    adrp x0, pk_hid
+    add x0, x0, :lo12:pk_hid
+    adrp x1, G_HID
+    add x1, x1, :lo12:G_HID
+    bl pget
+    adrp x0, pk_inter
+    add x0, x0, :lo12:pk_inter
+    adrp x1, G_INTER
+    add x1, x1, :lo12:G_INTER
+    bl pget
+    adrp x0, pk_layers
+    add x0, x0, :lo12:pk_layers
+    adrp x1, G_NLAY
+    add x1, x1, :lo12:G_NLAY
+    bl pget
+    adrp x0, pk_nhead
+    add x0, x0, :lo12:pk_nhead
+    adrp x1, G_NHEAD
+    add x1, x1, :lo12:G_NHEAD
+    bl pget
+    adrp x0, pk_nkv
+    add x0, x0, :lo12:pk_nkv
+    adrp x1, G_NKV
+    add x1, x1, :lo12:G_NKV
+    bl pget
+    adrp x0, pk_hd
+    add x0, x0, :lo12:pk_hd
+    adrp x1, G_HD
+    add x1, x1, :lo12:G_HD
+    bl pget
+    adrp x0, pk_voc
+    add x0, x0, :lo12:pk_voc
+    adrp x1, G_VOC
+    add x1, x1, :lo12:G_VOC
+    bl pget
+    adrp x0, pq_rope
+    add x0, x0, :lo12:pq_rope
+    adrp x1, G_ROPE_T
+    add x1, x1, :lo12:G_ROPE_T
+    bl pget
+    adrp x0, pk_eps
+    add x0, x0, :lo12:pk_eps
+    adrp x1, G_EPS12
+    add x1, x1, :lo12:G_EPS12
+    bl pget
+    adrp x0, G_ARCH
     add x0, x0, :lo12:G_ARCH
     ldr w0, [x0]
     cbz w0, f_stage_ret          // 0 = gemma3 safetensors: path unchanged
-    adrp x0, t_arch
-    add x0, x0, :lo12:t_arch
+    adrp x0, G_HID
+    add x0, x0, :lo12:G_HID
+    ldr w1, [x0]
+    lsl w2, w1, #2               // HID*4
+    adrp x0, G_HIDB
+    add x0, x0, :lo12:G_HIDB
+    str w2, [x0]
+    mov w2, #0x3f800000          // 1.0f: qwen3 does not scale embeddings
+    adrp x0, G_SQRT
+    add x0, x0, :lo12:G_SQRT
+    str w2, [x0]
+    adrp x0, tp_arch
+    add x0, x0, :lo12:tp_arch
     bl print_cstr
     adrp x1, G_ARCH
     add x1, x1, :lo12:G_ARCH
     ldr x0, [x1]
     bl print_u64
     bl print_nl
-    adrp x0, e_arch
-    add x0, x0, :lo12:e_arch
+    adrp x0, ep_arch
+    add x0, x0, :lo12:ep_arch
     bl print_cstr
     mov x0, #2
     mov x8, #SYS_EXIT
@@ -1374,9 +1416,18 @@ tmpl_ptrs:
 t_hdr:       .asciz "header bytes: "
 t_fsz:       .asciz "file bytes: "
 t_found:     .asciz "tensors found: "
-k_parch:     .asciz "\"pulsar.arch_id\""
-t_arch:      .asciz "pulsar blob arch_id: "
-e_arch:      .asciz "ERROR: only the gemma3 path is implemented; this blob needs qwen3/ternary\n"
+pk_arch:     .asciz "\"pulsar.arch_id\""
+pk_hid:       .asciz "\"pulsar.hidden\""
+pk_inter:     .asciz "\"pulsar.inter\""
+pk_layers:    .asciz "\"pulsar.layers\""
+pk_nhead:     .asciz "\"pulsar.n_head\""
+pk_nkv:       .asciz "\"pulsar.n_kv\""
+pk_hd:        .asciz "\"pulsar.head_dim\""
+pk_voc:       .asciz "\"pulsar.vocab\""
+pq_rope:      .asciz "\"pulsar.rope_theta_int\""
+pk_eps:       .asciz "\"pulsar.eps_e12\""
+tp_arch:      .asciz "pulsar blob arch_id: "
+ep_arch:      .asciz "ERROR: only the gemma3 path is implemented; this blob needs qwen3/ternary\n"
 t_dims:      .asciz "dims hid/inter/layers/vocab: "
 t_embed:     .asciz "embed rows cols: "
 t_in0:       .asciz "in_norm0[0..3] = "
@@ -2527,6 +2578,11 @@ G_VOC:       .skip 8                  // vocab (262144 both)
 G_SQRT:      .skip 8                  // embed scale sqrt(HID), f32
 G_L0FOUND:   .skip 8                  // scratch: was input_layernorm found?
 G_ARCH:      .skip 8                  // pulsar.arch_id (0 gemma3, 1 qwen3)
+G_NHEAD:     .skip 8                  // qwen3: query heads
+G_NKV:       .skip 8                  // qwen3: kv heads
+G_HD:        .skip 8                  // qwen3: head_dim
+G_ROPE_T:    .skip 8                  // qwen3: rope theta (int)
+G_EPS12:     .skip 8                  // qwen3: eps * 1e12 (int)
 
     .section .text
     .align 2
@@ -2842,6 +2898,37 @@ print_sig:
     ldp x1, x2, [sp], #16        // pop vec,n (balance)
     ldr x30, [sp], #16
     ret
+/* pget: x0 = key asciz, x1 = dst cell. Reads pulsar.<key> from the header the
+ * loader is scanning (x23 base, x22 len) and stores the integer. Returns
+ * w0 = 1 if present. Absent keys leave the cell alone, which is how
+ * safetensors keep their slot-derived dims. Clobbers x0-x9. */
+pget:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    mov x19, x0
+    mov x20, x1
+    bl strlen_asm
+    mov x3, x0
+    mov x0, x23
+    mov x1, x22
+    mov x2, x19
+    bl memmem
+    cbz x0, 2f
+1:  ldrb w1, [x0], #1
+    cmp w1, #'0'
+    b.lo 1b
+    cmp w1, #'9'
+    b.hi 1b
+    sub x0, x0, #1
+    bl parse_u64
+    str w0, [x20]
+    ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+2:  ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
 /* wptr: w0 = slot -> x0 = data+off. Uses x0/x1. x19=data (preserved). */
 wptr:
     mov x1, #56
