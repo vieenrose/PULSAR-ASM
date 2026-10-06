@@ -2103,6 +2103,53 @@ rmsnorm_add_f32:
     b 5b
 6:  ret
 
+/* add_f32(x0 dst, x1 src, w2 n): dst[i] += src[i]. NEON 4-wide with a scalar
+ * tail, the shape the other elementwise kernels have; one add has no rounding
+ * order to preserve, so vectorising it cannot move a value. */
+    .global add_f32
+add_f32:
+    mov w9, #0
+    bic w10, w2, #3              // n & ~3
+add_f32_v:
+    cmp w9, w10
+    b.hs add_f32_t
+    ld1 {v0.4s}, [x1], #16
+    ld1 {v1.4s}, [x0]
+    fadd v1.4s, v1.4s, v0.4s
+    st1 {v1.4s}, [x0], #16
+    add w9, w9, #4
+    b add_f32_v
+add_f32_t:
+    cmp w9, w2
+    b.hs add_f32_e
+    ldr s0, [x1, x9, lsl #2]
+    ldr s1, [x0, x9, lsl #2]
+    fadd s0, s1, s0
+    str s0, [x0, x9, lsl #2]
+    add w9, w9, #1
+    b add_f32_t
+add_f32_e:
+    ret
+
+/* rmsadd_arch(out,x0 w,x1 x,x2 acc,x3 n,w4 eps,s0): the residual add at the two
+ * per-layer sites, arg-compatible with rmsnorm_add_f32. Gemma3 norms the value it
+ * adds - that is what its post_attention and post_feedforward layernorms mean -
+ * while qwen3 has no normed residual, so it adds x into acc and leaving out
+ * alone is legal at both sites because out is recomputed before anything reads
+ * it: the pre-MLP norm right after the attention one, and the next layer's input
+ * norm (or the final norm after the loop) after the layer-end one. */
+    .global rmsadd_arch
+rmsadd_arch:
+    adrp x8, G_ARCH
+    ldr w8, [x8]
+    cbnz w8, rmsadd_plain
+    b rmsnorm_add_f32
+rmsadd_plain:
+    mov x0, x3                   // dst = acc
+    mov x1, x2                   // src = x
+    mov w2, w4                   // n
+    b add_f32
+
 /* embed_row_f32(out,x0 emb,x1 token,w2 dim,w3 scale,s0). bf16 gather+scale. */
     .global embed_row_f32
 embed_row_f32:
@@ -3703,7 +3750,7 @@ l0qr:
     adrp x5, f_eps
     add x5, x5, :lo12:f_eps
     ldr s0, [x5]
-    bl rmsnorm_add_f32
+    bl rmsadd_arch
     adrp x0, s_POST
     add x0, x0, :lo12:s_POST
     adrp x1, FH
@@ -3819,7 +3866,7 @@ l0qr:
     adrp x5, f_eps
     add x5, x5, :lo12:f_eps
     ldr s0, [x5]
-    bl rmsnorm_add_f32
+    bl rmsadd_arch
     adrp x0, s_D
     add x0, x0, :lo12:s_D
     adrp x1, FH
@@ -4248,7 +4295,7 @@ fwd_kvh:
     adrp x5, f_eps
     add x5, x5, :lo12:f_eps
     ldr s0, [x5]
-    bl rmsnorm_add_f32
+    bl rmsadd_arch
     // H = rmsnorm(FH, FL[5+6i], XB)
     mov x0, #6
     mul x0, x23, x0
@@ -4360,7 +4407,7 @@ fwd_kvh:
     adrp x5, f_eps
     add x5, x5, :lo12:f_eps
     ldr s0, [x5]
-    bl rmsnorm_add_f32
+    bl rmsadd_arch
     add w23, w23, #1
     b 0b
 90: // final norm (FL[0]) + head + argmax
