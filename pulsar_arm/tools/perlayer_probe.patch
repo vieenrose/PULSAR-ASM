@@ -11,15 +11,15 @@
      adrp x0, banner
      add x0, x0, :lo12:banner
      bl print_cstr
-@@ -2398,6 +2402,7 @@
- G_base:      .skip 8
- G_N:         .skip 8
- G_tok:       .skip 8
+@@ -2485,6 +2489,7 @@
+ G_VOC:       .skip 8                  // vocab (262144 both)
+ G_SQRT:      .skip 8                  // embed scale sqrt(HID), f32
+ G_L0FOUND:   .skip 8                  // scratch: was input_layernorm found?
 +G_dbg:       .skip 8
  
      .section .text
      .align 2
-@@ -2623,6 +2628,8 @@
+@@ -2714,6 +2719,8 @@
  s_AV:        .asciz "L0 AV "
  s_POST:      .asciz "L0 POST "
  s_X1:        .asciz "L0 X1 "
@@ -28,7 +28,7 @@
  s_GG:        .asciz "L0 GG "
  s_D:         .asciz "L0 D "
  s_X2:        .asciz "L0 X2 "
-@@ -3456,6 +3463,27 @@
+@@ -3606,6 +3613,29 @@
      add x5, x5, :lo12:f_eps
      ldr s0, [x5]
      bl rmsnorm_add_f32
@@ -50,7 +50,9 @@
 +    add x0, x0, :lo12:s_DX
 +    adrp x1, XB
 +    add x1, x1, :lo12:XB
-+    mov w2, #640
++    adrp x2, G_HID
++    add x2, x2, :lo12:G_HID
++    ldr w2, [x2]
 +    bl print_sig
 +101:
      add w23, w23, #1
