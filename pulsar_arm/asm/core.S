@@ -1282,7 +1282,45 @@ f_anchors_fixed:
     mov x0, x20
     bl print_u64
     bl print_nl
-    b f_stage_ret
+    // PULSAR blobs carry pulsar.arch_id; safetensors do not (G_ARCH stays 0).
+    adrp x0, k_parch
+    add x0, x0, :lo12:k_parch
+    bl strlen_asm
+    mov x3, x0
+    mov x0, x23                  // header base
+    mov x1, x22                  // header length
+    adrp x2, k_parch
+    add x2, x2, :lo12:k_parch
+    bl memmem
+    cbz x0, 7f
+8:  ldrb w1, [x0], #1           // scan to the first digit after the key
+    cmp w1, #'0'
+    b.lo 8b
+    cmp w1, #'9'
+    b.hi 8b
+    sub x0, x0, #1
+    bl parse_u64
+    adrp x1, G_ARCH
+    add x1, x1, :lo12:G_ARCH
+    str w0, [x1]
+7:  adrp x0, G_ARCH
+    add x0, x0, :lo12:G_ARCH
+    ldr w0, [x0]
+    cbz w0, f_stage_ret          // 0 = gemma3 safetensors: path unchanged
+    adrp x0, t_arch
+    add x0, x0, :lo12:t_arch
+    bl print_cstr
+    adrp x1, G_ARCH
+    add x1, x1, :lo12:G_ARCH
+    ldr x0, [x1]
+    bl print_u64
+    bl print_nl
+    adrp x0, e_arch
+    add x0, x0, :lo12:e_arch
+    bl print_cstr
+    mov x0, #2
+    mov x8, #SYS_EXIT
+    svc #0
 f_err_open:
     adrp x0, e_open
     add x0, x0, :lo12:e_open
@@ -1336,6 +1374,9 @@ tmpl_ptrs:
 t_hdr:       .asciz "header bytes: "
 t_fsz:       .asciz "file bytes: "
 t_found:     .asciz "tensors found: "
+k_parch:     .asciz "\"pulsar.arch_id\""
+t_arch:      .asciz "pulsar blob arch_id: "
+e_arch:      .asciz "ERROR: only the gemma3 path is implemented; this blob needs qwen3/ternary\n"
 t_dims:      .asciz "dims hid/inter/layers/vocab: "
 t_embed:     .asciz "embed rows cols: "
 t_in0:       .asciz "in_norm0[0..3] = "
@@ -2485,6 +2526,7 @@ G_NLAY:      .skip 8                  // decoder layers (270m 18 / 1B 26)
 G_VOC:       .skip 8                  // vocab (262144 both)
 G_SQRT:      .skip 8                  // embed scale sqrt(HID), f32
 G_L0FOUND:   .skip 8                  // scratch: was input_layernorm found?
+G_ARCH:      .skip 8                  // pulsar.arch_id (0 gemma3, 1 qwen3)
 
     .section .text
     .align 2
