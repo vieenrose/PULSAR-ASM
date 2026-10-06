@@ -4749,6 +4749,7 @@ t_reset:     .asciz "[context full, resetting]\n"
 t_tpl:       .asciz "tpl: "
 t_nobpe:     .asciz "chat mode needs bpe.bin (argv[5])\n"
 t_toolong:   .asciz "prompt too long for context\n"
+t_lgchk:     .asciz "lg nan inf: "
 
     .section .text
     .align 2
@@ -5141,8 +5142,11 @@ file_gloop:
     str w19, [x0]
     mov w0, w23
     bl fwd_token
+    cbnz x22, lg_skip            // first iter only (w0 dead: sampler overwrites)
+    bl lgcheck                   // (x0-x6 scratch; x19+ holds safe ✓)
+lg_skip:
     bl sampler
-    mov w23, w0                  // tok
+    mov w23, w0                  // tok                  // tok
     cmp w23, #1
     b.eq file_end                // eos
     mov x0, x23
@@ -5157,3 +5161,45 @@ file_bye:
     mov x0, #0
     mov x8, #93
     svc #0
+
+    .section .text
+    .align 2
+/* lgcheck TEMP: scans LG[0..262143] (f32), counts NaN/inf via bits. Prints counts. */
+lgcheck:
+    str x30, [sp, #-16]!
+    adrp x0, LG
+    add x0, x0, :lo12:LG
+    mov w1, #0                   // i
+    mov w2, #0                   // nan count
+    mov w3, #0                   // inf count (exp==255, mantissa==0)
+    // need n=262144 = 0x40000: cmp w1, #0x40000? 0x40000 > 4095 (movz? use lsr? Load via movz+movk? 0x40000 = 4<<16: movz w4, #4, lsl #16.
+    movz w4, #4, lsl #16         // 262144
+0:  cmp w1, w4
+    b.hs 1f
+    ldr w5, [x0, x1, lsl #2]     // bits (x1 offset ✓)
+    lsr w6, w5, #23              // exp+sign? exp = (bits>>23)&0xFF. Use ubfx? ubfx w6, w5, #23, #8 (untested? ubfx basic? Use lsr+and (proven mov/and?). and w6, w6? Need mask 0xFF (movz ✓). DO lsr+and.
+    and w6, w6, #0xFF            // BUG: and-imm 0xFF ✓ encodable. But w6 currently = bits>>23 (includes sign at bit8!). and 0xFF keeps exp+sign? bits>>23 = [sign, exp(8)] (9 bits). &0xFF keeps exp (low 8)? sign is bit 8 (0x100), &0xFF clears it ✓ exp only ✓.
+    cmp w6, #0xFF
+    b.ne 2f                      // exp != 255: finite
+    lsl w6, w5, #9               // mantissa <<9 (drop sign+exp)? mantissa = bits & 0x7FFFFF. Use: lsl to drop top 9, then... check nonzero via: lsl w6, w5, #9; cbnz (nonzero = NaN, else inf).
+    cbnz w6, 3f                  // NaN
+    add w3, w3, #1               // inf
+    b 2f
+3:  add w2, w2, #1               // NaN
+2:  add w1, w1, #1
+    b 0b
+1:  // stack: [sp]=x3(inf), [sp+8]=x2(nan), [sp+16]=x30
+    str x2, [sp, #-16]!
+    str x3, [sp, #-16]!
+    adrp x0, t_lgchk
+    add x0, x0, :lo12:t_lgchk
+    bl print_cstr
+    ldr x0, [sp, #8]             // nan
+    bl print_u64
+    bl print_sp
+    ldr x0, [sp]                 // inf
+    bl print_u64
+    bl print_nl
+    add sp, sp, #32              // drop x3+x2 saves
+    ldr x30, [sp], #16
+    ret

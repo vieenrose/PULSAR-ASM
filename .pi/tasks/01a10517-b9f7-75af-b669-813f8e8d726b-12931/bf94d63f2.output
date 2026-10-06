@@ -1,0 +1,3 @@
+Loading weights:   0%|          | 0/236 [00:00<?, ?it/s]Loading weights:   0%|          | 1/236 [00:09<36:02,  9.20s/it]Loading weights: 100%|██████████| 236/236 [00:09<00:00, 25.53it/s]
+NIDS: 98
+[tailscale-ssh: process died: signal: illegal instruction]

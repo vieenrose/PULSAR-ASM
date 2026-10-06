@@ -1,0 +1,28 @@
+{
+  "id": "bf94d63f2",
+  "name": "HF ground-truth first token",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/fc_truth.py luigi@raspberrypi.tailf63b31.ts.net:fc_truth.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/fc_truth.py' 2>&1 | tail -6",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bf94d63f2.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791258161342,
+  "endTime": 1791258198691,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 127071,
+  "bytesWritten": 278,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 1500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
