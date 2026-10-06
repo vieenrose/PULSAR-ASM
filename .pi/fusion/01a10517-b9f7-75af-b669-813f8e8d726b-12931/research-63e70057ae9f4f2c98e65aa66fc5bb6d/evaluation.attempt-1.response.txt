@@ -1,0 +1,194 @@
+{
+  "schema_version": "pi-background-tasks.fusion-evaluation.v1",
+  "candidate_assessments": [
+    {
+      "candidate_id": "A",
+      "summary": "A detailed and implementable specification covering the exact developer trigger, declaration grammar, control tokens, turn layout, generation settings, zero-shot behavior, and tool-response continuation. It is especially useful for explaining serialization details and connecting the documentation to the repository's token-table gap.",
+      "strengths": [
+        "States the exact developer content with the required absence of trailing punctuation or whitespace and places it immediately before the declaration token.",
+        "Provides a concrete serialized weather declaration and correctly distinguishes bare structural keys from escaped string values, including uppercased STRING and OBJECT type names.",
+        "Documents the role and turn framing, BOS placement, generation-prompt suffix, function-call grammar, response grammar, and the observed post-tool continuation.",
+        "Correctly explains that the examples use the unmodified checkpoint zero-shot and that fine-tuning is a mitigation for semantic or multi-turn limitations rather than a prerequisite for basic calling.",
+        "Identifies that only max_new_tokens=128 and the EOS pad token are documented generation settings, while labeling greedy decoding as an inference from Hugging Face defaults.",
+        "Flags the four function-call/response control tokens missing from the repository's exact-match token table."
+      ],
+      "limitations": [
+        "It calls declaration whitespace the most likely mismatch even though the supplied context says the 98-token prefill is already bit-exact, which underweights the stronger engine-side diagnosis.",
+        "The section labeled as a complete verbatim prompt abbreviates the declaration with an ellipsis, so it is not by itself a fully copyable literal prompt.",
+        "Some repository findings, detokenizer properties, and stop-token details are presented beside official statements even though they are not all established by the three declared documents.",
+        "The source mapping is generally clear but less systematic than candidate B's page-by-page labeling."
+      ],
+      "useful_contributions": [
+        "Supplies the most complete exact weather declaration, including the unusual spaces before selected closing braces.",
+        "Explains why declaration values, enum members, required entries, and uppercase type names must all use escape delimiters.",
+        "Provides a concrete model continuation showing the call, response, and final answer within one rendered model turn.",
+        "Provides actionable checks for BOS ownership, greedy decoding, missing control-token mappings, and post-call stopping."
+      ],
+      "risks": [
+        "A user might unnecessarily rewrite an already token-exact prompt to chase the whitespace discrepancy instead of first comparing forward-pass logits and cache boundaries.",
+        "Treating every inferred detokenizer or stop detail as an official serialization rule could cause an implementation to diverge from the shipped processor template."
+      ]
+    },
+    {
+      "candidate_id": "B",
+      "summary": "A carefully source-labeled response that separates documented facts, observed examples, template-dependent behavior, and repository diagnostics. It addresses all five requested areas and gives a strong engine-side debugging path conditioned on the already bit-exact prefill.",
+      "strengths": [
+        "Uses explicit source labels for the formatting, Hugging Face, and full-sequence pages, making individual claims relatively easy to audit.",
+        "States the exact developer message, serialized declaration grammar, escaped type names, array-item escaping, literal quote handling, and bare numeric values.",
+        "Provides a reconstructed literal London prompt while clearly warning that its exact bytes still need to come from the shipped chat template.",
+        "Explains the distinction between rendered role names such as model and message-API roles such as assistant and tool.",
+        "Correctly concludes that the documented basic examples are zero-shot and that multi-turn, multi-step, and indirect-language cases may require fine-tuning or better tool descriptions.",
+        "Provides a focused debugging sequence: compare against Hugging Face off-Pi, inspect the first generated position, verify numerics, complete the token table, and diff any independently written card.",
+        "Explicitly records documentation ambiguities instead of presenting them as settled facts."
+      ],
+      "limitations": [
+        "The phrase to emit no stray spaces is in tension with its own observation that the processor-rendered output can contain spaces before closing braces; the safe rule is to preserve processor output rather than normalize whitespace.",
+        "Its full London prompt is reconstructed rather than printed verbatim by the declared documentation, as the response itself acknowledges.",
+        "The proposed alphabetical ordering is inferred from examples rather than stated as a general template contract.",
+        "The statement that BOS is emitted by the template but not by the raw-prefill path could be read ambiguously; the raw file prompt must still match the processor output containing BOS."
+      ],
+      "useful_contributions": [
+        "Best organizes claims by declared source and clearly identifies which formatting details are direct rules versus observations.",
+        "Connects the exact prefill match to the conclusion that prompt wording and escaping no longer explain the observed failure.",
+        "Provides concrete repository checks for first-position handling, KV-cache alignment, BF16 behavior, control-token coverage, and byte-level template comparison.",
+        "Captures the documented mitigation hierarchy for weak tool descriptions and the checkpoint's stated training scope."
+      ],
+      "risks": [
+        "If followed literally, whitespace normalization could alter a prompt that is already processor-correct.",
+        "The reconstructed prompt or observed role ownership could be mistaken for a stable template guarantee instead of something that must be verified against the installed tokenizer and chat template."
+      ]
+    },
+    {
+      "candidate_id": "C",
+      "summary": "A comprehensive specification with strong emphasis on not hand-serializing the prompt, validating control-token IDs from tokenizer data, implementing stop conditions, and investigating engine internals when token IDs already match Hugging Face.",
+      "strengths": [
+        "Correctly gives the developer trigger and explains that the schema is supplied separately through the tools argument rather than appended to the developer text.",
+        "Covers escaped strings, uppercased types, escaped enum and required values, literal quotes, bare numeric values, and the need to preserve processor-generated whitespace.",
+        "Describes BOS, role framing, turn delimiters, the three pairs of function-control tokens, the separate escape delimiter, and the post-tool rendering.",
+        "Correctly identifies max_new_tokens=128 as the only documented generation budget and greedy decoding as the Hugging Face default rather than a separately documented sampling recommendation.",
+        "States the zero-shot and fine-tuning caveats clearly, including the trained single-turn and parallel scope and the lack of explicit multi-turn training.",
+        "Finds repository-specific weaknesses that are directly relevant to implementation: an incomplete control-token table, a decode loop lacking the documented response stop, and the need to compare engine numerics and logits."
+      ],
+      "limitations": [
+        "It overstates the documentation by describing prose rambling as a documented consequence of omitting the developer message and by calling a 0.81 prose probability the documented limited-description symptom.",
+        "The limited-description example concerns an indirect hot-or-cold query, so it does not establish why an explicit London query with a processor-identical prompt fails.",
+        "It suggests that the full-sequence declaration contains comma-space separators, which is stronger than the concrete rendered examples support; the clearly demonstrated discrepancy concerns spaces before selected closing braces.",
+        "Its London prompt is explicitly reconstructed, so it should not be presented as an exact official byte string without processor verification.",
+        "Adding end_function_call as an optional stop is not supported by the declared documentation's specific additional-stop statement."
+      ],
+      "useful_contributions": [
+        "Makes the template-derived whitespace rule operational by directing the implementer to generate and compare the actual repr output.",
+        "Provides concrete instructions for obtaining the four missing token IDs from tokenizer metadata rather than guessing them.",
+        "Identifies a concrete repository stop-loop defect that could append junk after a valid function call.",
+        "Adds useful residual checks involving attention configuration, RoPE, normalization, softcapping, masks, and first-token logit comparison."
+      ],
+      "risks": [
+        "The unsupported 0.81-to-limited-description diagnosis could send the debugging effort toward schema-description tuning even though the failing query is explicit and its token IDs match.",
+        "Stopping on end_function_call without defining how the expected response prefix is re-fed could truncate or alter the documented continuation protocol."
+      ]
+    }
+  ],
+  "agreements": [
+    "All three identify the exact developer content as You are a model that can do function calling with the following functions, with developer as the API role and no trailing punctuation or whitespace.",
+    "All three agree that the function declaration begins with declaration: followed by the bare function name and that all string values, including type names, enum values, and required entries, are enclosed by escape tokens.",
+    "All three identify STRING and OBJECT as the escaped, uppercased serialized forms of the JSON type names.",
+    "All three recognize that the documentation examples disagree about declaration whitespace and that the installed processor or chat template is the authoritative source.",
+    "All three describe the six function-control tokens as three start/end pairs and treat escape as a separate delimiter.",
+    "All three describe the turn framing as start-of-turn plus role and newline, followed by content and end-of-turn, with a model generation-prompt suffix.",
+    "All three agree that max_new_tokens=128 is documented and that temperature, top_p, top_k, and do_sample are not explicitly specified in the declared pages.",
+    "All three agree that Hugging Face's shown call omits sampling arguments and therefore uses its non-sampling greedy default, while distinguishing that conclusion from an explicitly documented temperature value.",
+    "All three agree that google/functiongemma-270m-it works zero-shot for the documented basic single-turn cases and that fine-tuning is not a prerequisite for those cases.",
+    "All three note the checkpoint's stated lack of explicit multi-turn and multi-step training and the role of better descriptions or fine-tuning for difficult semantic cases.",
+    "All three flag the repository's missing mappings for the function-call and function-response control tokens.",
+    "All three recommend processor-derived serialization and engine-side comparisons rather than continued speculation about the developer wording."
+  ],
+  "conflicts": [
+    {
+      "topic": "Which declaration whitespace should be considered authoritative",
+      "positions": [
+        {
+          "candidate_id": "A",
+          "position": "Treats the full-sequence decoded processor output, including spaces before two closing braces, as the authoritative byte rendering and calls that difference the most likely mismatch."
+        },
+        {
+          "candidate_id": "B",
+          "position": "Acknowledges that the examples conflict and says to use apply_chat_template as ground truth, but also advises emitting no stray spaces."
+        },
+        {
+          "candidate_id": "C",
+          "position": "Treats both snippets as illustrative and says the actual processor output, including whatever spacing it emits, must be copied verbatim."
+        }
+      ],
+      "resolution": "Use processor.apply_chat_template with the installed model snapshot as the sole byte-level authority. Preserve unusual spaces exactly and assert equality against the resulting token IDs. Do not normalize either documentation example. Given the reported 98-of-98 prefill match, this discrepancy is not the cause of the current failing run unless the independently supplied raw card differs elsewhere."
+    },
+    {
+      "topic": "Primary diagnosis of the rambling first token",
+      "positions": [
+        {
+          "candidate_id": "A",
+          "position": "Initially emphasizes declaration whitespace as the most likely root cause before later directing attention to engine internals."
+        },
+        {
+          "candidate_id": "B",
+          "position": "Treats prompt format as ruled out by the bit-exact match and prioritizes first-position, KV-cache, numeric, and layer-level divergence."
+        },
+        {
+          "candidate_id": "C",
+          "position": "Mentions serialization and stops but also maps the 0.81 prose result to the documented limited-description scenario, despite the query being explicit."
+        }
+      ],
+      "resolution": "Do not diagnose either whitespace or tool-description weakness from the supplied evidence. Since the explicit London prompt already tokenizes identically, first compare Hugging Face and PULSAR first-token logits at the same prefill position, then inspect cache alignment, attention masks, RoPE, normalization, softcapping, and dtype. Treat description enrichment only as a separate semantic-quality experiment."
+    },
+    {
+      "topic": "Whether to stop generation at end_function_call",
+      "positions": [
+        {
+          "candidate_id": "A",
+          "position": "Lists EOS, end-of-turn, and start_function_response as the relevant terminators and does not claim end_function_call is the documented additional stop."
+        },
+        {
+          "candidate_id": "B",
+          "position": "Uses the documented start_function_response stop together with normal turn and EOS endings, without elevating end_function_call to a documented requirement."
+        },
+        {
+          "candidate_id": "C",
+          "position": "Proposes the documented stop set but additionally suggests end_function_call may be used as an optional stop."
+        }
+      ],
+      "resolution": "Implement the page-mandated start_function_response stop and the normal EOS and end-of-turn handling. Do not call end_function_call a documented requirement. If an engine protocol also stops there, document it as an independent implementation choice and ensure the tool-response continuation is reconstructed consistently with the chat template."
+    }
+  ],
+  "synthesis_plan": {
+    "must_include": [
+      {
+        "candidate_id": "A",
+        "contribution": "Include its complete escaped weather declaration, concrete post-tool continuation, and explanation of escaped arrays, uppercased types, and bare numeric response values."
+      },
+      {
+        "candidate_id": "B",
+        "contribution": "Use its page-by-page citation mapping, explicit documentation-versus-inference distinctions, reconstructed London prompt, and prioritized engine-side debugging checks."
+      },
+      {
+        "candidate_id": "C",
+        "contribution": "Include its repository-specific stop-loop finding, tokenizer-derived control-token ID procedure, and residual attention, RoPE, normalization, and numeric checks."
+      }
+    ],
+    "must_resolve": [
+      "Make the installed processor and chat template authoritative for every byte and token ID, including unusual whitespace that differs from prose examples.",
+      "State explicitly that the given 98-of- token prefill match rules out developer wording, declaration escaping, and whitespace as explanations for the current output failure.",
+      "Separate documented facts from inferences: max_new_tokens=128 is documented; greedy behavior follows from omitted sampling arguments and Hugging Face defaults; temperature, top_p, and top_k have no documented recommended numeric values.",
+      "Keep start_function_response as the documented additional stop while treating other stop choices as implementation-specific and requiring consistent history reconstruction.",
+      "Require all four missing function-control token IDs to be read from the installed tokenizer or token JSON, never inferred.",
+      "Use the explicit London query and processor-identical token IDs when comparing first-token logits; do not infer a limited-description failure from the 0.81 value alone."
+    ],
+    "must_avoid": [
+      "Do not hand-copy either declaration example or normalize processor-produced spaces.",
+      "Do not claim that the documentation specifies temperature=0, top_p, top_k, or any other numeric sampling values.",
+      "Do not claim that fine-tuning is required for the documented single-turn or parallel function-calling examples.",
+      "Do not treat the reconstructed London prompt as byte-exact without a processor-level assertion.",
+      "Do not infer or invent the four missing control-token IDs.",
+      "Do not treat omission of the developer message, declaration whitespace, or an indirect-description failure as a proven cause of the current bit-exact failing run.",
+      "Do not present end_function_call as a documented stop without defining the corresponding continuation protocol."
+    ]
+  }
+}

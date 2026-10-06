@@ -5113,7 +5113,12 @@ file_pd:
 file_prefill:
     mov x22, #0                  // i = 0
 file_floop:
-    cmp x22, x21
+    // prefill feeds ids[0 .. n-2] only; file_gloop feeds ids[n-1] first and
+    // samples its logits (matches HF: sample after the final prompt token's
+    // forward). Feeding all n here would duplicate the last token and shift
+    // every subsequent position by one.
+    sub x1, x21, #1              // n-1
+    cmp x22, x1
     b.hs file_gen
     adrp x0, G_pos
     add x0, x0, :lo12:G_pos
