@@ -1106,7 +1106,7 @@ file_stage:
     bl find_tensor
     add x24, x24, x0
     mov x25, #0                  // layer i
-11: cmp x25, #64                 // safety cap; real count comes from the file
+11: cmp x25, #38                 // cap: 2+13*38 slots fit in tab[]
     b.hs 12f
     mov x26, #0                  // kind k
 13: cmp x26, #13
@@ -1347,7 +1347,7 @@ t_usage:     .asciz "usage: core <model.safetensors> <vocab.bin> [tok] [mode] [b
 
     .section .bss
     .align 3
-tab:         .skip 236*56
+tab:         .skip 512*56             // 2 + 13*layers slots (270m 236, 1B 340)
 namebuf:     .skip 128
 
 /* _start appends the file stage: microbench -> argv -> file_stage -> exit */

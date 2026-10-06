@@ -8,6 +8,7 @@ Usage:
     hf_greedy.py <repo-dir-or-cache-name> <ids,comma,separated> <n_new>
     hf_greedy.py google/gemma-3-1b-it-qat-q4_0-unquantized 2,107,1567 32
 """
+import os
 import sys
 
 import torch
@@ -16,11 +17,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 torch.backends.mkldnn.enabled = False
 torch.set_num_threads(1)
 
+# fp32 needs ~4x the checkpoint (1B fp32 does not fit the Pi's 3.8 GB), so the
+# dtype is selectable: HF_DTYPE=bfloat16 for the big checkpoints.
+DTYPE = {"float32": torch.float32, "bfloat16": torch.bfloat16,
+         "float16": torch.float16}[os.environ.get("HF_DTYPE", "float32")]
+
 
 def main():
     repo, ids, n = sys.argv[1], [int(v) for v in sys.argv[2].split(",")], int(sys.argv[3])
     tok = AutoTokenizer.from_pretrained(repo)
-    m = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.float32,
+    m = AutoModelForCausalLM.from_pretrained(repo, dtype=DTYPE,
                                              device_map="cpu",
                                              attn_implementation="eager")
     m.eval()
