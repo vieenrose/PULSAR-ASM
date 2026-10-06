@@ -5196,15 +5196,12 @@ top8_debug:
     b.hs 1f
     ldr w0, [x19, x21, lsl #2]   // id
     str x0, [sp, #-16]!
-    ldr s0, [x20, x21, lsl #2]   // prob
-    str q0, [sp, #-16]!
-    bl print_u64
+    ldr s0, [x20, x21, lsl #2]   // prob (s0 survives print_u64? prints use GPRs only -> yes ✓)
+    str x0, [sp, #-16]!          // id
+    bl print_u64                 // prints use x0-x9 (no FP) -> s0 intact ✓
     bl print_sp
-    ldr q0, [sp], #16
-    fmov s1, v0.s[0]
-    fmov s0, s1
     ldr x0, [sp], #16
-    bl print_f32
+    bl print_f32                 // print s0 (prob)
     bl print_sp
     add x21, x21, #1
     b 0b
