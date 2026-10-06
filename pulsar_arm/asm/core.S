@@ -4974,8 +4974,18 @@ q8dot:
     add x1, x1, #34              // next block
     sub w2, w2, #32
     b 0b
-1:  // reduce v0.4s -> s0
-    addv s0, v0.4s
+1:  // reduce v0 (addv broken on this toolchain/CPU; use proven umov/fadd)
+    umov w0, v0.s[0]
+    fmov s0, w0
+    umov w1, v0.s[1]
+    fmov s1, w1
+    fadd s0, s0, s1
+    umov w1, v0.s[2]
+    fmov s1, w1
+    fadd s0, s0, s1
+    umov w1, v0.s[3]
+    fmov s1, w1
+    fadd s0, s0, s1
     ret
 
 /* q8_test: fills Q8TX[i]=i*0.5, q8dot over q8t_data (64), asserts -2943.0.
@@ -5016,4 +5026,7 @@ q8_test:
     bl print_cstr
     ldr x30, [sp], #16
     ret
+
+
+
 
