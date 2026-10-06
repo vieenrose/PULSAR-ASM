@@ -112,11 +112,38 @@ dafd0d4 engine: SwiGLU for qwen3 (silu_mul_f32 + arch branch at the 2 call sites
    Worth checking in the same pass: whether `embed_arch` really dispatches to the
    b3 row gather for arch 1 (a bf16 read of a 448-byte packed row would look
    exactly like this), and the `G_N`/`G_base` the blob branch stores.
-5. **raw-ids mode + `G_TOPK`** — `i` suffix = ids already tokenised (pipe
+5. **first blob run** — the arch-1 refusal is still in place (gemma gates green,
+   `bonsai_b3.bin` exits 2), but lifting it in a scratch build now runs the whole
+   model, and **layer 0 is validated stage by stage against python** at pos 0 with
+   prompt `2,107,1567,85096,107,304,2505,9694` (note `def_prompt`'s 236765 is out
+   of range for qwen's 151669 vocab - use 85096 for blob runs):
+   X/H/AV/POST/X1/GG/D/X2 all match `q2_0_ref.py`'s arithmetic to fp32 accumulation
+   order (`H 0.9861995 vs 0.9861994`, `AV 0.9563199 vs 0.9563196`,
+   `X2 10.6656312 vs 10.6656303`). At pos 0 attention is exactly the kv-head value
+   vector tiled over its query heads, so a pos-0 match validates the norms, both
+   GEMV paths, silu and the GQA tiling, but **not** rope or the softmax.
+   Two bugs found by that first run, both fixed in `bb20079`, both unreachable
+   from a gemma run and therefore invisible to every gate that ever ran:
+   - the arch dispatchers did `adrp x8, G_ARCH; ldr w8, [x8]` with **no
+     `add x8, x8, :lo12:G_ARCH`** - the page base reads 0, which is gemma3's
+     answer, so every arch branch silently took the gemma path. `tools/check_adrp.py`
+     now checks the class (0 sites on the fixed file, 3 on the old one).
+   - `fold_vec` chose its addend by arch but always loaded bf16 (`ldrh`+`lsl #16`).
+     Gemma3's norms are bf16; a blob stores them as **F32**, so arch 1 decoded
+     every norm at twice the density - `[w0,w1,w2,...]` became `[0,w0,0,w1,...]`.
+     Still to fix (cosmetic): the `in_norm0[0..3]` debug print has the same
+     bf16-blindness and runs before the arch is parsed, so it prints `0 w0 0 w1`
+     for a blob; a comment says so, the fold itself is right.
+   **Speed, unsolved: 7070-7730 ms/token** on the blob (target ~99). The ternary
+   decode is the scalar reference; nothing has been attempted on it yet.
+   Next: oracle8 (`/tmp/oracle8.log`, ids above) for layers 1+ and pos > 0, then
+   the generated-id comparison; rope and softmax are the untested parts.
+6. **raw-ids mode + `G_TOPK`** — `i` suffix = ids already tokenised (pipe
    `tools/qwen_ids.py`); cells `G_TEMP`/`G_TOPP` exist (defaults 1.0 / 0.95,
    G_GENCAP 128) but top-k is hardcoded 64 — the Bonsai card needs 20 with
-   temp 0.5 / top_p 0.85.
-6. **oracle diff → demo** — per (layer, position) vs `/tmp/oracle_test.log`
+   temp 0.5 / top_p 0.85. Until this exists, blob comparisons have to go through
+   `def_prompt` patched in a scratch build, which is what step 5 did.
+7. **oracle diff → demo** — per (layer, position) vs `/tmp/oracle_test.log`
    (1.7B, 140 DX blocks) and `/tmp/oracle4b_b3.log` (4B, 180 blocks), then the
    ceiling-prompt hunt, GIFs (DejaVu 17 / line height 23, frames = real engine
    bytes, transcripts byte-diffed), README entry.
