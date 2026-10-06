@@ -2589,9 +2589,16 @@ G_EPS12:     .skip 8                  // qwen3: eps * 1e12 (int)
 
 /* fold_vec: x0 = src u16, x1 = dst f32, w2 = n. float64 (1+w). No calls. */
 fold_vec:
-    adrp x3, d_one
+    adrp x3, G_ARCH
+    add x3, x3, :lo12:G_ARCH
+    ldr w3, [x3]
+    cbz w3, 2f
+    fmov d1, xzr                 // qwen3: plain w (x * (1 + w) folds nothing)
+    b 3f
+2:  adrp x3, d_one
     add x3, x3, :lo12:d_one
-    ldr d1, [x3]                 // 1.0 f64
+    ldr d1, [x3]                 // gemma3: (1 + w)
+3:
 0:  cbz w2, 1f
     ldrh w3, [x0], #2
     lsl w3, w3, #16
