@@ -5184,6 +5184,7 @@ t_eq:       .asciz "="
 /* lgprobe: argmax id+val, then LG[9079], LG[506], LG[50429]. Inline, no tables. */
 lgprobe:
     str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!    // x19 = caller's pos! MUST preserve
     adrp x19, LG
     add x19, x19, :lo12:LG
     mov x0, x19
@@ -5201,6 +5202,7 @@ lgprobe:
     movz w3, #0xC4CD             // 50429 'Paris'
     bl pvv
     bl print_nl
+    ldp x19, x20, [sp], #16
     ldr x30, [sp], #16
     ret
 /* pvv: prints " lg<id>=<val>" using x19 as LG base. Uses x0-x4. */
