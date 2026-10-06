@@ -1,0 +1,28 @@
+{
+  "id": "bb6632c31",
+  "name": "Greedy tool-call run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/tool_official.txt > /tmp/toolgreedy.log 2>&1; echo EXIT=$?; tail -8 /tmp/toolgreedy.log | cut -c1-72'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bb6632c31.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791258655839,
+  "endTime": 1791258656098,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 127705,
+  "bytesWritten": 155,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
