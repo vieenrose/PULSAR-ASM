@@ -1,0 +1,9 @@
+BENCH-EXIT=0
+text: :
+Name:
+This is a:
+The word
+METRIC ms_per_token=146.60
+/bin/bash: line 1:  5710 Done                    printf "Hello\n"
+      5711 Segmentation fault      | timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 800 950 40 > /tmp/c1.log 2>&1
+CHAT-EXIT=139

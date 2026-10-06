@@ -1419,7 +1419,8 @@ file_join:
     adrp x2, G_MODE
     add x2, x2, :lo12:G_MODE
     str x3, [x2]                 // G_MODE = 1 (chat samples)
-    b 11f
+    // fall through to the tok parse below (the old 'b 11f' pointed at a
+    // label that no longer existed here -> wild jump -> segfault)
 5:  cmp x0, #4
     b.lo 1f
     b.lo 1f

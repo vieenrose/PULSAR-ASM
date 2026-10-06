@@ -1,0 +1,28 @@
+{
+  "id": "b44052ca9",
+  "name": "Boundary fix bench and chat",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S2=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin > /tmp/b1.log 2>&1; echo \"BENCH-EXIT=$?\"; grep -a \"text:\" -A3 /tmp/b1.log | head -4 | cut -c1-60; grep -a \"METRIC\" /tmp/b1.log | head -1; printf \"Hello\\n\" | timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 800 950 40 > /tmp/c1.log 2>&1; echo CHAT-EXIT=$?; awk \"/chat ready/{f=1} f\" /tmp/c1.log | tail -n +3 | head -6 | cut -c1-58'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b44052ca9.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791261918119,
+  "endTime": 1791261927081,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 130889,
+  "bytesWritten": 314,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
