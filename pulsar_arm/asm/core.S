@@ -5153,7 +5153,7 @@ file_gloop:
     bl fwd_token
     bl sampler
     cbnz x22, 0f                 // first step only
-    bl lg_dump                    // DEBUG: dump LG for numpy comparison
+    bl lgprobe                    // DEBUG: argmax + probe logits
 0:  mov w23, w0                  // tok
     mov w23, w0                  // tok                  // tok
     cmp w23, #1
@@ -5175,32 +5175,72 @@ file_bye:
     .align 2
 
     .section .rodata
-p_lgout:    .asciz "/tmp/lg_asm.bin"
+    .align 4
+t_lgp:      .asciz "lgp: am="
+t_at:       .asciz " lg"
+t_rp:       .asciz "="
+t_com:      .asciz " "
+t_ids:      .word 9079, 506, 50429
+t_nids:     .word 3
 
     .section .text
     .align 2
-/* lg_dump: write LG (262144 f32 = 1MB) to /tmp/lg_asm.bin. Debug only.
- * Uses x0-x5; clobbers v0-v1 not needed. Leaf-ish (SVCs). */
-lg_dump:
+/* lgprobe: prints argmax id+val, then LG[9079], LG[506], LG[50429].
+ * Uses x0-x9. */
+lgprobe:
     str x30, [sp, #-16]!
-    adrp x0, p_lgout
-    add x0, x0, :lo12:p_lgout
-    mov x1, #1                   // O_WRONLY
-    mov x2, #65                  // O_WRONLY|O_CREAT
-    mov x3, #0x1A4               // 0644
-    mov x8, #56                  // openat
-    svc #0
-    cmp x0, #0
-    b.lt 1f
-    mov x4, x0                   // fd
-    mov x0, #4                   // fd
-    adrp x1, LG
-    add x1, x1, :lo12:LG
-    movz x2, #0x10, lsl #16      // 1<<20 = 1048576
-    mov x8, #64                  // write
-    svc #0
-    mov x0, x4
-    mov x8, #57                  // close
-    svc #0
-1:  ldr x30, [sp], #16
+    adrp x19, LG
+    add x19, x19, :lo12:LG
+    mov x0, x19
+    movz x1, #4, lsl #16         // 262144
+    bl argmax_f32                // w0 = argmax id
+    adrp x1, t_lgp
+    add x1, x1, :lo12:t_lgp
+    bl print_cstr
+    mov x3, x0                   // am id
+    bl pv                       // prints x3's value at LG
+    adrp x1, t_com
+    add x1, x1, :lo12:t_com
+    bl print_cstr
+    adrp x1, t_at
+    add x1, x1, :lo12:t_at
+    bl print_cstr
+    adrp x1, t_ids
+    add x1, x1, :lo12:t_ids
+    ldr w2, [x1]                 // 9079
+    adrp x1, t_at
+    add x1, x1, :lo12:t_at
+    bl print_cstr
+    mov x3, x2
+    bl pv
+    bl spc
+    ldr w2, [x1, #4]             // 506
+    adrp x1, t_at
+    add x1, x1, :lo12:t_at
+    bl print_cstr
+    mov x3, x2
+    bl pv
+    bl spc
+    ldr w2, [x1, #8]             // 50429
+    adrp x1, t_at
+    add x1, x1, :lo12:t_at
+    bl print_cstr
+    mov x3, x2
+    bl pv
+    bl print_nl
+    ldr x30, [sp], #16
     ret
+
+/* pv: prints LG[x3] (x19=base). Uses x0-x4. */
+pv:
+    str x30, [sp, #-16]!
+    lsl x0, x3, #2
+    ldr s0, [x19, x0]
+    bl print_f32
+    ldr x30, [sp], #16
+    ret
+/* spc: print space. */
+spc:
+    adrp x0, t_com
+    add x0, x0, :lo12:t_com
+    b print_cstr

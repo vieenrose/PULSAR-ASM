@@ -1,0 +1,3 @@
+EXIT=139
+/bin/bash: line 1:  7493 Segmentation fault      timeout 200 ./core $S3 ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/tool_official.txt > /tmp/lgdump.log 2>&1
+ls: cannot access '/tmp/lg_asm.bin': No such file or directory

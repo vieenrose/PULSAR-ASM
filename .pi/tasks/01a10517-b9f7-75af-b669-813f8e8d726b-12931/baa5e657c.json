@@ -1,0 +1,28 @@
+{
+  "id": "baa5e657c",
+  "name": "Dump engine logits for FC",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S3=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 200 ./core $S3 ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/tool_official.txt > /tmp/lgdump.log 2>&1; echo EXIT=$?; ls -la /tmp/lg_asm.bin 2>&1 | head -1'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/baa5e657c.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791263061310,
+  "endTime": 1791263088772,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 132229,
+  "bytesWritten": 266,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
