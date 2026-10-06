@@ -1,7 +1,10 @@
 """Render real PULSAR-ARM transcripts as terminal GIFs (E2B fashion).
 
 Nothing in the frames is faked: every spec below is a byte-for-byte transcript
-of a real `./core ...` run on the Pi with the HF-exact build (the q_norm fix),
+of a real `./core ...` run on the Pi with the HF-exact build (the q_norm fix).
+Trailing blank lines that the gen cap can leave behind are trimmed; sampling
+is the model's recommended config (temp 1.0, top-k 64, top-p 0.95), which is
+what the engine's sampler already implements.
 and the status line carries that session's measured rate. The amber `>` line is
 the user turn. Only pacing is libertied (fixed-cadence reveal), as in
 pulsar_asm's make_demo_gif.py.
@@ -54,25 +57,50 @@ SPECS = {
     "1b-en": dict(
         out="gemma3-1b-chat-en.gif",
         title="pulsar \u00b7 gemma-3-1b-it \u00b7 cpu",
-        cmd="$ printf 'Name three colors.\\n' | ./core"
-            " gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48",
-        you="> Name three colors.",
-        tpl="tpl: 12 105 2364 107 1567 1806 7913 236761 106 107 105 4368 107",
-        response=("Okay, here are three colors:\n\n1.  Blue\n2.  Red\n3.  Green"),
+        cmd="$ printf 'List the four seasons and one thing that changes in"
+            " each.\\n' | ./core gemma-3-1b-it-qat-q4_0.safetensors"
+            " vocab.bin 2 c bpe.bin 1000 950 123",
+        you="> List the four seasons and one thing that changes in each.",
+        tpl="tpl: 20 105 2364 107 1613 506 2390 18046 532 886 3210 600 3731"
+            " 528 1546 236761 106 107 105 4368 107",
+        response=("Okay, here are the four seasons and one thing that changes in"
+                  " each:\n\n"
+                  "1.  **Spring:** Blossoms and new growth!\n"
+                  "2.  **Summer:** Warm sunshine and longer days.\n"
+                  "3.  **Autumn (Fall):** Falling leaves and cooler"
+                  " temperatures.\n"
+                  "4.  **Winter:** Snowflakes and cold weather.\n\n"
+                  "Let me know if you'd like to know more about any of"
+                  " these seasons!"),
         status="1.8 tok/s \u00b7 temp 1.0 \u00b7 3 cores",
         wrap="word"),
 
     "1b-zh-tw": dict(
         out="gemma3-1b-chat-zh-tw.gif",
         title="pulsar \u00b7 gemma-3-1b-it \u00b7 cpu",
-        cmd="$ printf '\u8acb\u5217\u51fa\u4e09\u7a2e\u984f\u8272\u3002\\n'"
-            " | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin"
-            " 1000 950 48",
-        you="> \u8acb\u5217\u51fa\u4e09\u7a2e\u984f\u8272\u3002",
-        tpl="tpl: 15 105 2364 107 239230 238046 237191 237589 238396 158519"
-            " 236924 106 107 105 4368 107",
-        response="\u597d\u7684\uff0c\u9019\u4e09\u7a2e\u984f\u8272\uff1a"
-                 "\n\n1.  \u85cd\u8272\n2.  \u7da0\u8272\n3.  \u7d05\u8272",
+        cmd="$ printf '\u8acb\u5217\u51fa\u4fdd\u6301\u5065\u5eb7\u7684\u4e09\u500b"
+            "\u8981\u9ede\u3002\\n' | ./core gemma-3-1b-it-qat-q4_0.safetensors"
+            " vocab.bin 2 c bpe.bin 1000 950 172",
+        you="> \u8acb\u5217\u51fa\u4fdd\u6301\u5065\u5eb7\u7684\u4e09\u500b\u8981\u9ede\u3002",
+        tpl="tpl: 18 105 2364 107 239230 238046 237191 36267 27789 102058"
+            " 237629 237208 238745 236924 106 107 105 4368 107",
+        response=(
+            "\u597d\u7684\uff0c\u4ee5\u4e0b\u662f\u4fdd\u6301\u5065\u5eb7\u7684\u4e09\u500b\u8981\u9ede\uff1a\n\n"
+            "1. **\u898f\u5f8b\u904b\u52d5\uff1a** \u904b\u52d5\u4e0d\u50c5\u80fd\u5e6b\u52a9\u7dad\u6301\u9ad4\u91cd\uff0c"
+            "\u66f4\u80fd\u63d0\u5347\u5fc3\u8840\u7ba1\u5065\u5eb7\u3001\u589e\u5f37\u808c\u8089\u3001"
+            "\u6539\u5584\u60c5\u7dd2\u3001\u63d0\u5347\u8a8d\u77e5\u529f\u80fd\u3002"
+            "\u5efa\u8b70\u6bcf\u5929\u81f3\u5c11\u9032\u884c30\u5206\u9418\u4e2d\u7b49\u5f37\u5ea6\u904b\u52d5\uff0c"
+            "\u4f8b\u5982\u5feb\u8d70\u3001\u6e38\u6cf3\u3001\u8df3\u821e\u7b49\u3002\n"
+            "2. **\u5065\u5eb7\u98f2\u98df\uff1a** \u5747\u8861\u98f2\u98df\uff0c\u651d\u53d6\u8db3\u5920\u7684"
+            "\u852c\u83dc\u3001\u6c34\u679c\u3001\u5168\u7a40\u985e\u3001\u86cb\u767d\u8cea\u548c\u5065\u5eb7"
+            "\u8102\u80aa\u3002\u907f\u514d\u904e\u591a\u52a0\u5de5\u98df\u54c1\u3001\u7cd6\u548c\u4e0d\u5065\u5eb7"
+            "\u7684\u8102\u80aa\u3002\n"
+            "3. **\u5145\u8db3\u7761\u7720\uff1a** \u7761\u7720\u662f\u8eab\u9ad4\u548c\u7cbe\u795e\u7684"
+            "\u5145\u96fb\uff0c\u5145\u8db3\u7684\u7761\u7720\u80fd\u5e6b\u52a9\u6062\u5fa9\u3001"
+            "\u589e\u5f37\u514d\u75ab\u529b\u3001\u63d0\u9ad8\u5c08\u6ce8\u529b\uff0c\u4e26\u6709\u52a9\u65bc"
+            "\u60c5\u7dd2\u7a69\u5b9a\u3002\u5efa\u8b70\u6bcf\u665a\u7372\u5f977-8\u5c0f\u6642\u7684"
+            "\u7761\u7720\u3002\n\n"
+            "\u5e0c\u671b\u9019\u4e9b\u8cc7\u8a0a\u5c0d\u60a8\u6709\u5e6b\u52a9\uff01 "),
         status="1.8 token/s \u00b7 temp 1.0 \u00b7 3 \u6838\u5fc3",
         wrap="char"),
 

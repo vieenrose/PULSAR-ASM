@@ -64,9 +64,10 @@ own `tokenizer.json` with the same two tools.
 | `topp_milli` | top-p ×1000 (default 950) |
 | `gencap` | max generated tokens (default 128, max 400) |
 
-Measured sampling guidance: keep temp ≥ 0.7 (0.5 degenerates into token
-loops), top-p is neutral here (0.5 / 0.95 / 1.0 all stay diverse), and gencap
-bounds output cleanly. The chat template (SOT/EOT roles) is verified id-exact
+Sampling follows the model card: temperature 1.0, **top-k 64**, top-p 0.95
+(min-p 0), which is what the sampler implements. Measured guidance beyond that:
+keep temp ≥ 0.7 (0.5 degenerates into token loops), top-p is neutral here
+(0.5 / 0.95 / 1.0 all stay diverse), and gencap bounds output cleanly. The chat template (SOT/EOT roles) is verified id-exact
 against HF, and every run prints its prefill ids as `tpl:` for transparency.
 
 ## Demos
@@ -81,15 +82,22 @@ typeface — DejaVu Sans Mono, with WenQuanYi Zen Hei used only for the CJK
 glyphs DejaVu lacks, at the same size and line height. Only pacing is
 libertied.
 
-**gemma-3-1b-it** — the 1B answers multi-item requests the 270m cannot:
+**gemma-3-1b-it** — each clip uses the most complex prompt the checkpoint
+answers *correctly* (a four-item structured list, and a three-item one in
+zh-TW), both complete and clean end to end:
 
 ![1B chat demo](doc/gemma3-1b-chat-en.gif)
 ![1B chat demo, Traditional Chinese](doc/gemma3-1b-chat-zh-tw.gif)
 
 ```sh
-printf 'Name three colors.\n'          | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48
-printf '請列出三種顏色。\n'              | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48
+printf 'List the four seasons and one thing that changes in each.\n' | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 123
+printf '請列出保持健康的三個要點。\n'                                | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 172
 ```
+
+The gen caps above are tuned to end on the model's closing line (123 for the
+English clip, 172 for the zh-TW one); the sampler is the checkpoint's
+recommended configuration — temperature 1.0, top-k 64, top-p 0.95 — which is
+what the engine implements.
 
 **gemma-3-270m-it** — same binary, 18 layers:
 
