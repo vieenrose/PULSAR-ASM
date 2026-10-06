@@ -1,0 +1,7 @@
+Loading weights:   0%|          | 0/236 [00:00<?, ?it/s]Loading weights:   0%|          | 1/236 [00:01<07:46,  1.99s/it]Loading weights: 100%|██████████| 236/236 [00:02<00:00, 116.66it/s]
+IDS: [2, 818, 5279, 529, 7001, 563]
+n=1: TOP3=[(3617, 'package'), (1106, 'import'), (1987, 'const')]
+n=2: TOP3=[(2634, ' air'), (3847, ' provided'), (2255, ' old')]
+n=3: TOP3=[(529, ' of'), (3207, ' city'), (532, ' and')]
+n=4: TOP3=[(506, ' the'), (7001, ' France'), (672, ' this')]
+n=6: TOP3=[(9079, ' Paris'), (506, ' the'), (50429, 'Paris')]

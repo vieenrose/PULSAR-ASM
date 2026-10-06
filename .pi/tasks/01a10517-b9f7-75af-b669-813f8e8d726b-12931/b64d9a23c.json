@@ -1,0 +1,28 @@
+{
+  "id": "b64d9a23c",
+  "name": "HF length bisect with files",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/bisect_len.py luigi@raspberrypi.tailf63b31.ts.net:bisect_len.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/bisect_len.py' 2>&1 | tail -8",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b64d9a23c.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791262783128,
+  "endTime": 1791262811866,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 131878,
+  "bytesWritten": 556,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 1200,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -5152,7 +5152,9 @@ file_gloop:
     mov w0, w23
     bl fwd_token
     bl sampler
-    mov w23, w0                  // tok
+    cbnz x22, 0f                 // first step only
+    bl lg_dump                    // DEBUG: dump LG for numpy comparison
+0:  mov w23, w0                  // tok
     mov w23, w0                  // tok                  // tok
     cmp w23, #1
     b.eq file_end                // eos
@@ -5171,3 +5173,34 @@ file_bye:
 
     .section .text
     .align 2
+
+    .section .rodata
+p_lgout:    .asciz "/tmp/lg_asm.bin"
+
+    .section .text
+    .align 2
+/* lg_dump: write LG (262144 f32 = 1MB) to /tmp/lg_asm.bin. Debug only.
+ * Uses x0-x5; clobbers v0-v1 not needed. Leaf-ish (SVCs). */
+lg_dump:
+    str x30, [sp, #-16]!
+    adrp x0, p_lgout
+    add x0, x0, :lo12:p_lgout
+    mov x1, #1                   // O_WRONLY
+    mov x2, #65                  // O_WRONLY|O_CREAT
+    mov x3, #0x1A4               // 0644
+    mov x8, #56                  // openat
+    svc #0
+    cmp x0, #0
+    b.lt 1f
+    mov x4, x0                   // fd
+    mov x0, #4                   // fd
+    adrp x1, LG
+    add x1, x1, :lo12:LG
+    movz x2, #0x10, lsl #16      // 1<<20 = 1048576
+    mov x8, #64                  // write
+    svc #0
+    mov x0, x4
+    mov x8, #57                  // close
+    svc #0
+1:  ldr x30, [sp], #16
+    ret

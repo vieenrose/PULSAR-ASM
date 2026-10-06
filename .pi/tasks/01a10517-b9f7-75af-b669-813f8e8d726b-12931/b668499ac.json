@@ -1,0 +1,28 @@
+{
+  "id": "b668499ac",
+  "name": "HF layer-0 reference vectors",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/l0_ref.py luigi@raspberrypi.tailf63b31.ts.net:l0_ref.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/l0_ref.py' 2>&1 | tail -10",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b668499ac.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791262975319,
+  "endTime": 1791262999607,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 132114,
+  "bytesWritten": 758,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 900,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

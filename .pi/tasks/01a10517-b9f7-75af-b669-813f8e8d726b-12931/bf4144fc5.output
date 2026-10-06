@@ -1,0 +1,4 @@
+Loading weights:   0%|          | 0/236 [00:00<?, ?it/s]Loading weights:   0%|          | 1/236 [00:03<14:40,  3.75s/it]Loading weights: 100%|██████████| 236/236 [00:03<00:00, 62.33it/s]
+short: n=6 TOP3=[(9079, ' Paris'), (506, ' the'), (50429, 'Paris')] logits=[37.45, 29.15, 28.73]
+mid: n=37 TOP3=[(9079, ' Paris'), (107, '\n'), (506, ' the')] logits=[24.77, 22.89, 22.85]
+long: n=112 TOP3=[(9079, ' Paris'), (506, ' the'), (5628, ' located')] logits=[25.19, 25.08, 24.95]

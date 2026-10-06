@@ -1,0 +1,28 @@
+{
+  "id": "b2dd247ae",
+  "name": "Engine on short mid long cases",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S2=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && for C in short mid long; do timeout 200 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin < /tmp/c_$C.txt > /tmp/e_$C.log 2>&1; echo \"== $C (exit $?)\"; awk \"/^tpl:/{f=1} f\" /tmp/e_$C.log | tail -n +2 | head -3 | cut -c1-55; done'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b2dd247ae.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791262626611,
+  "endTime": 1791262706768,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 131709,
+  "bytesWritten": 317,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 800,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

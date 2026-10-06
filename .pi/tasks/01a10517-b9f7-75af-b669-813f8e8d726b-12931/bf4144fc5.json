@@ -1,0 +1,28 @@
+{
+  "id": "bf4144fc5",
+  "name": "HF short-mid-long comparison",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/cmp270.py luigi@raspberrypi.tailf63b31.ts.net:cmp270.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/cmp270.py' 2>&1 | tail -5",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bf4144fc5.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791262511207,
+  "endTime": 1791262559766,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 131576,
+  "bytesWritten": 498,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 1800,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

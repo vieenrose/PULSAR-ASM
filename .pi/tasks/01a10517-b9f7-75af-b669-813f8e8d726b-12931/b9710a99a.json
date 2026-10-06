@@ -1,0 +1,28 @@
+{
+  "id": "b9710a99a",
+  "name": "Long context test on 270m",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm && /home/luigi/pulsar-rpi/v/bin/python -u -c \"\nprose = (\\\"The library holds thousands of books about history science mathematics poetry music art philosophy cooking travel gardening astronomy geology biology chemistry physics languages cultures inventions explorers oceans deserts forests cities villages bridges towers ships trains airplanes bicycles. Children play games in the park while parents watch from benches under old trees. \\\" * 3) + \\\"The capital of France is\\\"\nopen(\\\"/tmp/long270.txt\\\",\\\"w\\\").write(\\\"<bos>\\\" + prose + \\\"\\\")\n\" && wc -c /tmp/long270.txt && cd asm && S2=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && timeout 200 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin 700 950 40 < /tmp/long270.txt > /tmp/long270.log 2>&1; echo EXIT=$?; tail -6 /tmp/long270.log | cut -c1-62'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b9710a99a.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791262434781,
+  "endTime": 1791262478099,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 131507,
+  "bytesWritten": 156,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
