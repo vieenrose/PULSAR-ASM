@@ -2868,6 +2868,23 @@ lay_full_y:
     ldr x30, [sp], #16
     ret
 
+/* kcache_row: x0 = position, x1 = cache base (KC or VC), x23 = layer -> x0 = the
+ * address of that position's KV row, layer*G_KSTRIDE + pos*G_KVROW. On gemma3
+ * those are the 524288 and 1024 the inline shifts spelled; on the 1.7B blob they
+ * are 4194304 and 4096 (8 kv heads x 128 floats, 1024 positions disclosed),
+ * which is what the 36x1024x1024-float KC/VC buffers were sized for. Leaf; x0-x2
+ * only, so the forward path keeps everything else across it. */
+kcache_row:
+    adrp x2, G_KVROW
+    add x2, x2, :lo12:G_KVROW
+    ldr x2, [x2]
+    madd x0, x0, x2, x1          // base + pos*row
+    adrp x2, G_KSTRIDE
+    add x2, x2, :lo12:G_KSTRIDE
+    ldr x2, [x2]
+    madd x0, x23, x2, x0         // + layer*stride
+    ret
+
     .section .rodata
     .align 3
 f_ln4:       .float 9.21034037
@@ -3930,21 +3947,10 @@ fwd_token:
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
     bl gemv_arch
-    // Kcache[i][pos] = KN; Vcache[i][pos] = FV(256 floats via FKN? NO: V is in FV!)
-    // cache bases: KC + i*524288 (x18 scratch: kernels keep x19+? x18 SAFE (max x15))
-    lsl x0, x23, #19             // i*524288
-    adrp x1, KC
-    add x1, x1, :lo12:KC
-    add x1, x1, x0               // Kbase[i]
-    adrp x2, VC
-    add x2, x2, :lo12:VC
-    add x2, x2, x0               // Vbase[i]
-    lsl x0, x22, #10             // pos*1024
-    add x0, x1, x0               // Krow dst
-    adrp x1, FKN
-    add x1, x1, :lo12:FKN        // KN src
-    add x2, x2, x0               // WAIT: x0 reused! recompute Vrow separately below
-    b 34f
+    b 34f                        // the cache addresses are all computed below;
+                                 // this block used to pre-compute them here, then
+                                 // label 38 recomputed every one of them, which
+                                 // is why the shifts moved twice
 34: bl lay_full                  // layer type (the mod-6 test used to sit here)
     cbnz x18, 35f
     adrp x4, G_WIN
@@ -3963,48 +3969,51 @@ fwd_token:
     b 38f
 35: mov x0, #0                   // lo = 0
     add x18, x22, #1             // n = pos+1
-38: // krow -> x26 ; vrow -> x27 (x0 = lo)
-    lsl x1, x23, #19             // i*524288
-    adrp x2, KC
-    add x2, x2, :lo12:KC
-    add x2, x2, x1
-    lsl x1, x0, #10              // lo*1024
-    add x26, x2, x1
-    lsl x1, x23, #19
-    adrp x2, VC
-    add x2, x2, :lo12:VC
-    add x2, x2, x1
-    lsl x1, x0, #10
-    add x27, x2, x1
-    // K[i][pos] = KN (64 quads)
-    lsl x0, x22, #10             // pos*1024
-    lsl x1, x23, #19             // i*524288
-    adrp x2, KC
-    add x2, x2, :lo12:KC
-    add x2, x2, x1
-    add x2, x2, x0               // K dst
+38: // krow -> x26 ; vrow -> x27 (x0 = lo). layer*G_KSTRIDE + pos*G_KVROW, which
+    // for gemma3 is the i*524288 + lo*1024 the four shifts used to spell.
+    mov x4, x0                   // lo (kcache_row takes x0 = position)
+    adrp x1, KC
+    add x1, x1, :lo12:KC
+    bl kcache_row
+    mov x26, x0
+    mov x0, x4
+    adrp x1, VC
+    add x1, x1, :lo12:VC
+    bl kcache_row
+    mov x27, x0
+    // K[i][pos] = KN (G_KVROW/16 quads: 64 on gemma3, 256 on the 1.7B blob)
+    mov x0, x22
+    adrp x1, KC
+    add x1, x1, :lo12:KC
+    bl kcache_row
+    mov x2, x0                   // K dst
     adrp x0, FKN
     add x0, x0, :lo12:FKN
-    mov w1, #64
-39: cbz w1, 40f
+    adrp x1, G_KVROW
+    add x1, x1, :lo12:G_KVROW
+    ldr x1, [x1]
+    lsr x1, x1, #4               // quads
+39: cbz x1, 40f
     ld1 {v0.4s}, [x0], #16
     st1 {v0.4s}, [x2], #16
-    sub w1, w1, #1
+    sub x1, x1, #1
     b 39b
 40: // V[i][pos] = FV
-    lsl x0, x22, #10
-    lsl x1, x23, #19
-    adrp x2, VC
-    add x2, x2, :lo12:VC
-    add x2, x2, x1
-    add x2, x2, x0               // V dst
+    mov x0, x22
+    adrp x1, VC
+    add x1, x1, :lo12:VC
+    bl kcache_row
+    mov x2, x0                   // V dst
     adrp x0, FV
     add x0, x0, :lo12:FV
-    mov w1, #64
-41: cbz w1, 42f
+    adrp x1, G_KVROW
+    add x1, x1, :lo12:G_KVROW
+    ldr x1, [x1]
+    lsr x1, x1, #4
+41: cbz x1, 42f
     ld1 {v0.4s}, [x0], #16
     st1 {v0.4s}, [x2], #16
-    sub w1, w1, #1
+    sub x1, x1, #1
     b 41b
 42: // heads j in w25
     mov w25, #0
