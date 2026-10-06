@@ -4826,6 +4826,10 @@ t_model:     .asciz "model\n"
     .align 2
 /* tpl_build: INBUF+x24(len) -> ENC_OUT assembled turn ids. Returns w0 = n.
  * Layout: [105] + enc("user\n"+line) + [106,107,105] + enc("model\n").
+ * Bit-exact vs HF apply_chat_template (verified: turn1 [2]+tpl == oracle
+ * [2,105,2364,107,9259,106,107,105,4368,107]; multi-turn structure matches
+ * official re-render incl EOT-close). With turn-0 bos, this IS the official
+ * gemma-3 template, not raw input.
  * Saves/restores x24 (encode clobbers it). Uses TBUF/ENC_OUT. No x19+ touched. */
 tpl_build:
     str x30, [sp, #-16]!
