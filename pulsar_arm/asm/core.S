@@ -667,6 +667,7 @@ _start:
     bl microbench
     bl math_bench
     bl kern_tests
+    bl q8_test
     ldr x0, [sp]                  // argc
     add x1, sp, #8                // argv
     bl file_stage_after_bench
@@ -4890,5 +4891,128 @@ tpl_build:
     add x0, x0, x1               // nu + nm
     add x0, x0, #4               // n = 1 + nu + 3 + nm
     ldr x24, [sp], #16           // restore len
+    ldr x30, [sp], #16
+    ret
+
+    .section .rodata
+    .align 4
+q8t_data:
+    .hword 0x3C00                // block1 scale 1.0
+    .byte 0xFD,0xFE,0xFF,0x00,0x01,0x02,0x03,0xFD,0xFE,0xFF,0x00,0x01,0x02,0x03,0xFD,0xFE
+    .byte 0xFF,0x00,0x01,0x02,0x03,0xFD,0xFE,0xFF,0x00,0x01,0x02,0x03,0xFD,0xFE,0xFF,0x00
+    .hword 0x3800                // block2 scale 0.5
+    .byte 0x00,0xFF,0xFE,0xFD,0xFC,0x00,0xFF,0xFE,0xFD,0xFC,0x00,0xFF,0xFE,0xFD,0xFC,0x00
+    .byte 0xFF,0xFE,0xFD,0xFC,0x00,0xFF,0xFE,0xFD,0xFC,0x00,0xFF,0xFE,0xFD,0xFC,0x00,0xFF
+q8t_exp: .word 0xC537F000         // -2943.0
+t_q8pass: .asciz "q8: PASS\n"
+t_q8fail: .asciz "q8: FAIL\n"
+
+    .section .bss
+    .align 4
+Q8TX:        .skip 64*4
+
+    .section .text
+    .align 2
+/* q8dot: x0 = x (F32, n), x1 = Q8_0 row, w2 = n (mult 32). Returns s0 = dot.
+ * Fused: unpack int8 -> fp32, x scale, dot F32 x. Exact vs scalar dequant
+ * for small magnitudes. Uses v0-v7, x0-x6. Leaf. */
+q8dot:
+    movi v0.4s, #0               // acc = 0
+0:  cbz w2, 1f
+    ldr h1, [x1]                 // scale fp16
+    fcvt s1, h1                  // fp32 scale (A72 scalar fcvt: verified by self-test)
+    ldr q2, [x1, #2]             // quants[0..15]
+    ldr q3, [x1, #18]            // quants[16..31]
+    // weights[0..7]
+    sxtl v4.8h, v2.8b
+    sxtl v6.4s, v4.4h
+    sxtl2 v7.4s, v4.8h
+    scvtf v6.4s, v6.4s
+    scvtf v7.4s, v7.4s
+    fmul v6.4s, v6.4s, v1.s[0]
+    fmul v7.4s, v7.4s, v1.s[0]
+    ldr q4, [x0], #16            // x[0..3]
+    ldr q5, [x0], #16            // x[4..7]
+    fmla v0.4s, v6.4s, v4.4s
+    fmla v0.4s, v7.4s, v5.4s
+    // weights[8..15]
+    sxtl2 v4.8h, v2.16b
+    sxtl v6.4s, v4.4h
+    sxtl2 v7.4s, v4.8h
+    scvtf v6.4s, v6.4s
+    scvtf v7.4s, v7.4s
+    fmul v6.4s, v6.4s, v1.s[0]
+    fmul v7.4s, v7.4s, v1.s[0]
+    ldr q4, [x0], #16            // x[8..11]
+    ldr q5, [x0], #16            // x[12..15]
+    fmla v0.4s, v6.4s, v4.4s
+    fmla v0.4s, v7.4s, v5.4s
+    // weights[16..23]
+    sxtl v4.8h, v3.8b
+    sxtl v6.4s, v4.4h
+    sxtl2 v7.4s, v4.8h
+    scvtf v6.4s, v6.4s
+    scvtf v7.4s, v7.4s
+    fmul v6.4s, v6.4s, v1.s[0]
+    fmul v7.4s, v7.4s, v1.s[0]
+    ldr q4, [x0], #16            // x[16..19]
+    ldr q5, [x0], #16            // x[20..23]
+    fmla v0.4s, v6.4s, v4.4s
+    fmla v0.4s, v7.4s, v5.4s
+    // weights[24..31]
+    sxtl2 v4.8h, v3.16b
+    sxtl v6.4s, v4.4h
+    sxtl2 v7.4s, v4.8h
+    scvtf v6.4s, v6.4s
+    scvtf v7.4s, v7.4s
+    fmul v6.4s, v6.4s, v1.s[0]
+    fmul v7.4s, v7.4s, v1.s[0]
+    ldr q4, [x0], #16            // x[24..27]
+    ldr q5, [x0], #16            // x[28..31]
+    fmla v0.4s, v6.4s, v4.4s
+    fmla v0.4s, v7.4s, v5.4s
+    add x1, x1, #34              // next block
+    sub w2, w2, #32
+    b 0b
+1:  // reduce v0.4s -> s0
+    addv s0, v0.4s
+    ret
+
+/* q8_test: fills Q8TX[i]=i*0.5, q8dot over q8t_data (64), asserts -2943.0.
+ * Prints PASS, else FAIL + exit 1. */
+q8_test:
+    str x30, [sp, #-16]!
+    adrp x0, Q8TX
+    add x0, x0, :lo12:Q8TX
+    mov w1, #0                   // i
+    fmov s1, wzr                 // v = 0.0
+    fmov s2, #0.5
+0:  cmp w1, #64
+    b.hs 1f
+    str s1, [x0, x1, lsl #2]     // Q8TX[i] = v (x1 offset? x1 used as index AND i... x1 holds i (w1 ops zero-extend ✓). BUT str uses [x0, x1, lsl #2] with x1 = i ✓ x-form ✓. HOWEVER x1 is ALSO... fine here (no conflict in this loop).
+    fadd s1, s1, s2              // v += 0.5
+    add w1, w1, #1
+    b 0b
+1:  adrp x0, Q8TX
+    add x0, x0, :lo12:Q8TX
+    adrp x1, q8t_data
+    add x1, x1, :lo12:q8t_data
+    mov w2, #64
+    bl q8dot                     // s0 = dot (clobbers x0-x6,v0-v7; x30 saved ✓)
+    fmov w0, s0                  // bits
+    adrp x1, q8t_exp
+    add x1, x1, :lo12:q8t_exp
+    ldr w1, [x1]
+    cmp w0, w1
+    b.eq 2f
+    adrp x0, t_q8fail
+    add x0, x0, :lo12:t_q8fail
+    bl print_cstr
+    mov x0, #1
+    mov x8, #93
+    svc #0
+2:  adrp x0, t_q8pass
+    add x0, x0, :lo12:t_q8pass
+    bl print_cstr
     ldr x30, [sp], #16
     ret
