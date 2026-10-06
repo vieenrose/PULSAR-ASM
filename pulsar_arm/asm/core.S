@@ -2592,7 +2592,7 @@ TCOS_S:      .skip 512*128*4
 TSIN_S:      .skip 512*128*4
 TCOS_F:      .skip 512*128*4
 TSIN_F:      .skip 512*128*4
-FL:          .skip 157*1152*4        // (1+6*NLAY) x HID: 270m 109x640, 1B 157x1152
+FL:          .skip 200000*4        // big+small norm regions, 36 layers        // (1+6*NLAY) x HID: 270m 109x640, 1B 157x1152
 G_base:      .skip 8
 G_N:         .skip 8
 G_tok:       .skip 8
@@ -2715,7 +2715,7 @@ kkind:       .byte 0,1,2,7,8,12
 
     .section .bss
     .align 4
-XB:          .skip 1152*4
+XB:          .skip 2560*4
 
     .section .text
     .align 2
@@ -2860,16 +2860,16 @@ s_rb:        .asciz "]"
 
     .section .bss
     .align 4
-FH:          .skip 1152*4
-FQ:          .skip 1024*4
-FQN:         .skip 1024*4
-FKV:         .skip 256*4
-FKN:         .skip 256*4
-FV:          .skip 256*4
-FS:          .skip 512*4
-FAV:         .skip 1024*4
-FG:          .skip 6912*4
-FU:          .skip 6912*4
+FH:          .skip 2560*4
+FQ:          .skip 4096*4             // 32 q heads x 128
+FQN:         .skip 4096*4
+FKV:         .skip 1024*4             // 8 kv heads x 128
+FKN:         .skip 1024*4
+FV:          .skip 1024*4
+FS:          .skip 1024*4             // scores: context cap
+FAV:         .skip 4096*4
+FG:          .skip 9728*4
+FU:          .skip 9728*4
 
     .section .text
     .align 2
@@ -3343,14 +3343,14 @@ fwd_layer0:
 
     .section .bss
     .align 4
-SAVXB:       .skip 1152*4
+SAVXB:       .skip 2560*4
 
     .section .text
     .align 2
     .section .bss
     .align 4
-KC:          .skip 26*512*256*4
-VC:          .skip 26*512*256*4
+KC:          .skip 36*1024*1024*4     // 36 layers x 1024-pos cap x kv 1024
+VC:          .skip 36*1024*1024*4
 LG:          .skip 262144*4
 G_pos:       .skip 8
 G_t0:        .skip 8
