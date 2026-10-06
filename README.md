@@ -41,6 +41,7 @@ cd pulsar_arm/asm && as -o core.o core.S && ld -static -o core core.o
 ## Demo (270m-it-qat-q4_0 chat, temp 1.0, cap 48)
 
 ![270m chat demo](doc/gemma3-270m-chat-en.gif)
+![270m chat demo in Chinese](doc/gemma3-270m-chat-zh.gif)
 
 `printf 'Hello\n' | ./core model.safetensors vocab.bin 2 c bpe.bin 1000 950 48`
 — GIF rendered from that exact run (only pacing libertied).
