@@ -63,3 +63,25 @@
   then a hallucinated source list). Binaries search the gen cap until the last
   line is the model's own closing sentence, then diff the embedded transcript
   against a fresh run byte-for-byte.
+- BONSAI TERNARY RUNTIME (state at 2026-10-06 late session):
+  * tools/q2_0_gguf.py: GGUF Q2_0 -> PULSAR blob, lossless base-3 repack
+    (5 trits/byte, 28 B/group) = 82.4% of Q2_0; blobs on the Pi:
+    bonsai_b3.bin 376.8 MB (1.7B), bonsai4b_b3.bin 880.6 MB (4B). Runtime
+    params live in the blob header (pulsar.arch_id/hidden/inter/layers/
+    n_head/n_kv/head_dim/vocab/eps/rope_theta/ternary_group/pack).
+  * tools/q2_0_ref.py: Qwen3 + Q2_0/base-3 oracle, VALIDATED (argmax ' Paris'
+    = 12095 for "The capital of France is"; 1.7B: 140 DX signatures over 5
+    positions; 4B reference runs the same way).
+  * kernels/ternary_gemv.c: C reference, PASSES all four PTGV fixtures
+    (scalar-vs-oracle 4.4e-06 .. 5.2e-05; NEON same order, ~1e-5).
+  * asm/ternary_gemv.S: DRAFT, NOT PASSING. First bug found and fixed: the
+    kernel calls `bl half_to_float` but never saved x30, so its own ret jumped
+    back into the loop (segfault). After that fix it returns but computes the
+    wrong values (ASM-vs-oracle rel ~0.9-2.7 on the B3 fixtures, while the
+    Q2_0 fixture passes because the harness routes fmt=0 to the C path). The
+    decode loop mirrors the C reference line for line, so the next step is a
+    row-0 asm-vs-C-vs-oracle dump to find where it diverges - prime suspects
+    are the per-byte trit extraction (udiv/msub) and the xg indexing
+    (`lsl x9, x25, #9` assumes 128 floats = 512 B per group).
+  * Lesson worth keeping: any asm routine that calls a helper must save x30
+    first; core.S kernels all do, this new file did not.

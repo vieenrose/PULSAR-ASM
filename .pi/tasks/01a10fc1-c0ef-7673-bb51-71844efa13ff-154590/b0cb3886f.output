@@ -1,0 +1,7 @@
+oracle(b3) EXIT=0
+ARGMAX p4 12095
+ARGMAX p4 12095
+compared 140 (layer,pos) pairs, Q2_0 vs base-3 repack
+Traceback (most recent call last):
+  File "<stdin>", line 22, in <module>
+TypeError: 'NoneType' object is not subscriptable

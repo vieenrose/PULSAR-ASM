@@ -78,7 +78,7 @@ static inline void decode_block(int fmt, const uint8_t *codes, float *trit) {
     }
 }
 
-static void ternary_gemv_scalar(int fmt, int rows, int cols, const uint8_t *w,
+void ternary_gemv_scalar(int fmt, int rows, int cols, const uint8_t *w,
                                 const float *x, float *y) {
     int ng = cols / GROUP;
     int gb = fmt ? 2 + B3_CODE_BYTES : 2 + Q20_CODE_BYTES;
@@ -99,7 +99,7 @@ static void ternary_gemv_scalar(int fmt, int rows, int cols, const uint8_t *w,
     }
 }
 
-static void ternary_gemv_neon(int fmt, int rows, int cols, const uint8_t *w,
+void ternary_gemv_neon(int fmt, int rows, int cols, const uint8_t *w,
                               const float *x, float *y) {
     int ng = cols / GROUP;
     int gb = fmt ? 2 + B3_CODE_BYTES : 2 + Q20_CODE_BYTES;
