@@ -2045,6 +2045,26 @@ embed_row_f32:
     b 1b
 2:  ret
 
+/* embed_arch: arch-aware embedding gather, same args as embed_row_f32
+ * (x0 = out, x1 = table, w2 = token, w3 = cols, s0 = scale). gemma3
+ * tail-branches into embed_row_f32; a pulsar blob gathers one B3_128 row with
+ * embed_row_b3, which decodes x16/x17 as temps - hence the same save/restore
+ * gemv_arch does. x30 is saved because embed_row_b3 is called, not tail-jumped
+ * into (the x30 lesson from the kernel's own first draft). */
+    .global embed_arch
+embed_arch:
+    adrp x8, G_ARCH
+    ldr w8, [x8]
+    cbnz w8, emb_tern
+    b embed_row_f32
+emb_tern:
+    str x30, [sp, #-16]!
+    stp x16, x17, [sp, #-16]!
+    bl embed_row_b3
+    ldp x16, x17, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
 /* argmax_f32(buf,x0 n,w1) -> w0. First max wins. */
     .global argmax_f32
 argmax_f32:
@@ -3092,7 +3112,7 @@ fwd_layer0:
     adrp x4, G_SQRT
     add x4, x4, :lo12:G_SQRT
     ldr s0, [x4]
-    bl embed_row_f32             // (XB, emb, tok, 640, esc)
+    bl embed_arch                // (XB, emb, tok, HID, esc): bf16 or one B3 row
     adrp x0, s_X
     add x0, x0, :lo12:s_X
     adrp x1, XB
@@ -3495,7 +3515,7 @@ fwd_token:
     adrp x4, G_SQRT
     add x4, x4, :lo12:G_SQRT
     ldr s0, [x4]
-    bl embed_row_f32
+    bl embed_arch
     mov w23, #0                  // li
 0:  adrp x0, G_NLAY
     add x0, x0, :lo12:G_NLAY

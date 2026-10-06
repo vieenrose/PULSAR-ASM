@@ -14,6 +14,9 @@
  *   ternary_gemv_neon    - same algorithm, 8-wide NEON FMA; the intra-group
  *                          accumulation order differs, so it agrees with the
  *                          scalar path to ~1e-5 relative rather than exactly
+ * Plus the embedding gather, whose asm mirror is embed_row_b3:
+ *   ternary_row_b3       - dequantise one row (the tied table is a row read
+ *                          for the embedding, a GEMV for the logits)
  * Both accumulate per group in the order the oracle uses, then acc += scale*s,
  * so the result matches the numpy oracle to fp32 rounding.
  *
@@ -128,6 +131,24 @@ void ternary_gemv_neon(int fmt, int rows, int cols, const uint8_t *w,
             acc += scale * s;
         }
         y[r] = acc;
+    }
+}
+
+/* One row of a B3_128 matrix, dequantised - the asm embed_row_b3 mirror. The
+ * token embedding is tied to the head, so the same blocks that make a GEMV for
+ * the logits are a plain row read here. escale is folded into the per-group
+ * scale exactly like the asm does; for Qwen3 it is 1.0 and the fold is exact. */
+void ternary_row_b3(const uint8_t *w, int row, int cols, float escale, float *out) {
+    int ng = cols / GROUP;
+    int gb = 2 + B3_CODE_BYTES;
+    float trit[GROUP];
+    const uint8_t *blk = w + (size_t)row * ng * gb;
+    for (int g = 0; g < ng; g++) {
+        float scale = f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+        float sg = scale * escale;
+        decode_block(1, blk + 2, trit);
+        for (int i = 0; i < GROUP; i++) out[g * GROUP + i] = trit[i] * sg;
+        blk += gb;
     }
 }
 
