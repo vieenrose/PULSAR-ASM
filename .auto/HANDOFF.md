@@ -84,37 +84,34 @@ dafd0d4 engine: SwiGLU for qwen3 (silu_mul_f32 + arch branch at the 2 call sites
    (169-171 vs 171-173 ms/token same-job). Everything the forward path needs is a
    cell now: `G_NHEAD G_NKV G_HD G_HHALF G_HDB G_QDIM G_KVDIM G_GROUP G_ASCALE
    G_WIN G_FULLMOD G_KVCAP G_TROW G_KVROW G_KSTRIDE`.
-4. **FL two-region layout** — what is left, and it is loader work, not forward
-   work. Verified against `~/bonsai_b3.bin`'s own tensor table (do not trust any
-   earlier "kind-major" note):
-   - Blob order is **layer-major**: slot 0 `model.norm.weight`, slot 1
-     `model.embed_tokens.weight`, then **11 tensors per layer** in this order:
-     `0 k_proj, 1 k_norm, 2 input_layernorm, 3 o_proj, 4 q_proj, 5 q_norm,
-     6 v_proj, 7 down_proj, 8 gate_proj, 9 post_attention_layernorm, 10 up_proj`.
-     So `slot(i,k) = 2 + 11i + k`.
-   - Gemma's safetensors table is also layer-major but with **13** tensors per
-     layer (6 norms + 7 projections), and the code assumes it everywhere:
-     `fold_norms` uses `slot = 2 + 13i + kkind[j]` with `kkind = 0,1,2,7,8,12`,
-     and `wptr` callers use literal kinds for layer 0 (`slot 7` = v_proj,
-     `11` = gate, `13` = down) plus `13*i` in the loop. So step 4 is: tensors-per-
-     layer as a cell (13 vs 11), a blob norm-kind map
-     (`input_ln 2, q_norm 5, k_norm 1, post_attn 9`, and the two slots gemma3 has
-     and qwen3 does not - pre_ff, post_ff - pointed at kind 9, which is what
-     qwen3 means as the norm in front of the MLP), a blob projection-kind map for
-     the `wptr` callers, and the FL layout below.
-   - Proposed FL layout for arch 1: big region `FL + (1+2i)*HIDB` = layer i's
-     input_layernorm, `FL + (2+2i)*HIDB` = post_attention_layernorm (also used as
-     the pre-MLP norm), then a small region `SFL = FL + (1+2*NLAY)*HIDB` with
-     `SFL + 2i*HDB` = q_norm and `SFL + (2i+1)*HDB` = k_norm. 1.7B:
-     (1+56)*2048 + 56*128 = 123,904 floats; 4B: (1+72)*2560 + 72*128 = 196,096 -
-     both fit the 200k buffer, 4B with almost nothing to spare.
-   - Cleanest route: have `fold_norms` build `FLTAB[idx] = destination address` as
-     it writes (index = the same `1+6i+j` arithmetic the forward already does,
-     `FLTAB[0] = FL`), so the table and the writes cannot disagree, and replace
-     every forward norm address with `bl fltab`. Gemma's entries are then exactly
-     `FL + idx*HIDB`, i.e. today's arithmetic, so gemma3 cannot move.
-   - Until step 4 lands, arch 1 must keep refusing at load time. The forward is
-     now geometry-driven; the weights and norms it would read are not.
+4. **FL two-region layout + loader slot addressing** — DONE, `feat/qwen3-attention`:
+   `86f2e5b` (G_TSLOT/WK/NKIND + `wslot`), `68c7f26` (`FLTAB` built by
+   fold_norms; `nptr`/`wptr` deleted), `c30a5c6` (**correction**: the tensor table
+   is filled by NAME into the canonical slots `2 + 13*layer + kind`, embedding at
+   0 and final norm at 1, **for both formats** — a qwen3 blob is that same table
+   with kinds 8/12 (pre/post_feedforward_layernorm) absent, and q_norm/k_norm at
+   kinds 1/2 where the forward already looks. The per-arch maps of `86f2e5b` were
+   wrong and made the first blob run NaN).
+   Arch-1 FL layout: `FL + (1+2i)*HIDB` = input_layernorm, `FL + (2+2i)*HIDB` =
+   post_attention_layernorm (also the pre-MLP norm, which is what qwen3 means),
+   `G_SFL + 2i*HDB` / `+(HD*4)` = q_norm/k_norm with `G_SFL = FL + (1+2*NLAY)*HIDB`.
+   1.7B needs 123,904 of FL's 200,000 floats, 4B needs 196,096 — 2% headroom.
+   Gemma stayed byte-identical at every one of the three commits.
+
+   **Step 5 status, first scratch run (refusal lifted with `b f_stage_ret`, not
+   committed):** the engine gets to the forward and prints the L0 block, but `X`
+   (the embedding) is garbage from element 0 — `max=9.2e18`, values mixing 3.9e15
+   with 0.0087 — then H/FL-derived values are 0 and everything after is NaN, and
+   the run dies with SIGBUS later. Checked and cleared already: the data base is
+   right (`file 376763327 - (8+38647) = 376724672 = max data_offset`, so no
+   padding and `base+8+N` is correct), the embedding row stride is right
+   (448 B = 16 groups × 28), the tables print the right geometry, and the slot
+   map is the canonical one. So the next probe is `embed_row_b3` on a *real* blob
+   row against `tools/q2_0_ref.py`'s embedding for the same token id — the kernel
+   has only ever been validated on synthetic fixtures, never on `bonsai_b3.bin`.
+   Worth checking in the same pass: whether `embed_arch` really dispatches to the
+   b3 row gather for arch 1 (a bf16 read of a 448-byte packed row would look
+   exactly like this), and the `G_N`/`G_base` the blob branch stores.
 5. **raw-ids mode + `G_TOPK`** — `i` suffix = ids already tokenised (pipe
    `tools/qwen_ids.py`); cells `G_TEMP`/`G_TOPP` exist (defaults 1.0 / 0.95,
    G_GENCAP 128) but top-k is hardcoded 64 — the Bonsai card needs 20 with
