@@ -696,6 +696,13 @@ _start:
     add x0, x0, :lo12:G_TOPP
     ldr s0, [x0]
     bl print_f32
+    adrp x0, t_gencap
+    add x0, x0, :lo12:t_gencap
+    bl print_cstr
+    adrp x0, G_GENCAP
+    add x0, x0, :lo12:G_GENCAP
+    ldr x0, [x0]
+    bl print_u64
     bl print_nl
     adrp x0, J_bpe
     add x0, x0, :lo12:J_bpe
@@ -1306,26 +1313,30 @@ file_stage_after_bench:
     ldr x3, [x1, #40]            // argv[5] bpe.bin path
     str x3, [x2]
 4:  cmp x0, #4                   // x0=argc, x1=argv intact (mode+bpe used x2/x3 only ✓)
-    // G_TEMP argv[6] milli (default 1000), G_TOPP argv[7] milli (default 950)
+    // defaults (unconditional): G_TEMP=1.0, G_TOPP=0.95, G_GENCAP=128
     adrp x2, G_TEMP
     add x2, x2, :lo12:G_TEMP
     movz w3, #0x3F80, lsl #16
-    str w3, [x2]                 // 1.0
+    str w3, [x2]
     adrp x2, G_TOPP
     add x2, x2, :lo12:G_TOPP
     movz w3, #0x3333
     movk w3, #0x3F73, lsl #16
-    str w3, [x2]                 // 0.95
-    mov x19, x0                  // argc (x19: parse-safe? parse uses x0-x4 ✓)
-    mov x20, x1                  // argv (x20: parse-safe ✓)
+    str w3, [x2]
+    adrp x2, G_GENCAP
+    add x2, x2, :lo12:G_GENCAP
+    mov x3, #128
+    str x3, [x2]
+    mov x19, x0                  // argc (parse-safe: parse uses x0-x4 ✓)
+    mov x20, x1                  // argv
     cmp x19, #7
-    b.lo 8f                      // no temp arg: join restores (=no-op), fall to chat
-    ldr x0, [x20, #48]           // argv[6] ptr
-    bl parse_u64                 // x0 = milli (x19/x20 intact ✓)
+    b.lo 8f                      // no temp arg: keep all defaults
+    ldr x0, [x20, #48]           // argv[6]
+    bl parse_u64
     cmp x0, #50
     b.hs 6f
     mov x0, #50
-6:  mov x3, #5000                // (cmp imm max 4095; via reg)
+6:  mov x3, #5000
     cmp x0, x3
     b.lo 7f
     mov x0, #5000
@@ -1338,9 +1349,9 @@ file_stage_after_bench:
     add x1, x1, :lo12:G_TEMP
     str s0, [x1]
     cmp x19, #8
-    b.lo 8f
-    ldr x0, [x20, #56]           // argv[7] ptr
-    bl parse_u64                 // (x19/x20 intact ✓)
+    b.lo 8f                      // no topp arg (also guards argv[7] NULL deref!)
+    ldr x0, [x20, #56]           // argv[7]
+    bl parse_u64
     cmp x0, #100
     b.hs 9f
     mov x0, #100
@@ -1355,15 +1366,10 @@ file_stage_after_bench:
     adrp x1, G_TOPP
     add x1, x1, :lo12:G_TOPP
     str s0, [x1]
-    // G_GENCAP argv[8] (default 128, clamp [1,400])
-    adrp x2, G_GENCAP
-    add x2, x2, :lo12:G_GENCAP
-    mov x3, #128
-    str x3, [x2]
     cmp x19, #9
-    b.lo 8f                      // no arg: keep default
-    ldr x0, [x20, #64]           // argv[8] ptr
-    bl parse_u64                 // (x19/x20 intact ✓)
+    b.lo 8f                      // no gencap arg
+    ldr x0, [x20, #64]           // argv[8]
+    bl parse_u64
     cmp x0, #1
     b.hs 12f
     mov x0, #1
@@ -3921,6 +3927,7 @@ f_095:       .float 0.95
 f_1000:      .float 1000.0
 t_temp:      .asciz "temp: "
 t_topp:      .asciz " topp: "
+t_gencap:    .asciz " gencap: "
 f_inv24:     .float 0.000000059604644775390625
 
     .section .text
