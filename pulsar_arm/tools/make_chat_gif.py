@@ -68,10 +68,7 @@ SPECS = {
         title="pulsar \u00b7 functiongemma-270m-it \u00b7 cpu",
         cmd="$ ./core model.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16"
             " < tool_official.txt",
-        you=None,
-        note="# prompt file = official FunctionGemma example"
-             " (developer turn + tool schema)",
-        user_note="# user turn: What's the temperature in London?",
+        you="> What's the temperature in London?",
         tpl="tpl: 98 2 105 55060 107 3048 659 496 2028 600 740 776 1292 11687 "
             "607 506 2269 5151 46 163688 236787 828 236779 4002 236779 27495 "
             "236782 7777 236787 52 81113 506 1873 4022 573 496 2238 4563 "
@@ -81,7 +78,7 @@ SPECS = {
             "2084 236787 52 60688 52 1807 47 106 107 105 2364 107 3689 236789 "
             "236751 506 4022 528 5860 236881 106 107 105 4368 107",
         response="call:get_current_temperature{location:London}",
-        status="file mode \u00b7 greedy \u00b7 cap 16",
+        status="file mode (tool_official.txt) \u00b7 greedy \u00b7 cap 16",
         font=MONO, wrap="word"),
 
     "fc-zh-tw": dict(
@@ -89,11 +86,8 @@ SPECS = {
         title="pulsar \u00b7 functiongemma-270m-it \u00b7 cpu",
         cmd="$ ./core model.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16"
             " < tool_official_zhtw.txt",
-        you=None,
-        note="# \u540c\u4e00\u500b schema\uff0c\u554f\u984c\u63db\u6210"
-             " zh-TW",
-        user_note="# user turn: \u5011\u6566\u7684\u6eab\u5ea6\u662f\u591a"
-                  "\u5c11\uff1f",
+        you="> \u5011\u6566\u7684\u6eab\u5ea6\u662f\u591a\u5c11\uff1f\u3000"
+            "\uff08zh-TW\uff09",
         tpl="tpl: 96 2 105 55060 107 3048 659 496 2028 600 740 776 1292 11687 "
             "607 506 2269 5151 46 163688 236787 828 236779 4002 236779 27495 "
             "236782 7777 236787 52 81113 506 1873 4022 573 496 2238 4563 "
@@ -103,7 +97,8 @@ SPECS = {
             "2084 236787 52 60688 52 1807 47 106 107 105 2364 107 241849 "
             "241281 236918 190519 187330 237536 106 107 105 4368 107",
         response="call:get_current_temperature{location:London}",
-        status="file mode \u00b7 greedy \u00b7 cap 16",
+        status="file mode (tool_official_zhtw.txt) \u00b7 greedy"
+               " \u00b7 cap 16",
         font=CJK, wrap="word"),
 }
 
@@ -142,19 +137,15 @@ def render(name, spec, out_dir=DOC):
     text_w = w - 2 * pad
     mid_px = font.getlength("model> ")
 
-    # `#`-prefixed rows are labels (never printed by the engine); everything
-    # else is the engine's own bytes.
+    # rows: command, then the user turn (amber, same as the chat clips),
+    # then the engine's own `tpl:` id dump. In file mode the engine does not
+    # echo the prompt, so the status bar names the prompt file.
     head = [(t, 0.0, DIM)
             for t in wrap(spec["cmd"], font, text_w, "word")]
     you_rows = head if not spec["you"] else head + [(spec["you"], 0.0,
                                                      PROMPT_COL)]
-    label_rows = list(you_rows)
-    for key in ("note", "user_note"):
-        if spec.get(key):
-            label_rows += [(t, 0.0, DIM)
-                           for t in wrap(spec[key], font, text_w, "word")]
-    tpl_rows = label_rows + [(t, 0.0, DIM)
-                             for t in wrap(spec["tpl"], font, text_w, "word")]
+    tpl_rows = you_rows + [(t, 0.0, DIM)
+                           for t in wrap(spec["tpl"], font, text_w, "word")]
 
     full = wrap(spec["response"], font, text_w - mid_px, spec["wrap"])
     max_rows = (h - 46 - top) // lh - 3
