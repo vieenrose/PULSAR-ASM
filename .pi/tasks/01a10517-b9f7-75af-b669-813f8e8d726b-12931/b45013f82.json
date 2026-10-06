@@ -1,0 +1,28 @@
+{
+  "id": "b45013f82",
+  "name": "FunctionGemma first bench run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cp /tmp/fcvocab.bin ~/PULSAR-ARM/pulsar_arm/fcvocab.bin && cp /tmp/fcbpe.bin ~/PULSAR-ARM/pulsar_arm/fcbpe.bin && cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 250 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 0 ~/PULSAR-ARM/pulsar_arm/fcbpe.bin > /tmp/fcbench.log 2>&1; echo EXIT=$?; grep -a -c \"^enc:\" /tmp/fcbench.log; grep -a -E \"^[0-9]+ \" /tmp/fcbench.log | head -1 | cut -c1-70; grep -a \"METRIC\" /tmp/fcbench.log | head -1'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b45013f82.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791250160081,
+  "endTime": 1791250176811,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 119274,
+  "bytesWritten": 108,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

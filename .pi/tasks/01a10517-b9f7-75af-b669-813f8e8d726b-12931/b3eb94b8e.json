@@ -1,0 +1,28 @@
+{
+  "id": "b3eb94b8e",
+  "name": "Download and inspect FunctionGemma",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/fc_inspect.py luigi@raspberrypi.tailf63b31.ts.net:fc_inspect.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/fc_inspect.py' 2>&1 | head -30",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b3eb94b8e.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791249879597,
+  "endTime": 1791249943014,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 118972,
+  "bytesWritten": 1972,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 1200,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
