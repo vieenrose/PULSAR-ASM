@@ -80,7 +80,15 @@
     that reporter bug, not a data mismatch.
   * kernels/ternary_gemv.c: C reference, PASSES all four PTGV fixtures
     (scalar-vs-oracle 4.4e-06 .. 5.2e-05; NEON same order, ~1e-5).
-  * asm/ternary_gemv.S: DRAFT, NOT PASSING. First bug found and fixed: the
+  * asm/ternary_gemv.S: PASSES. Synthetic fixtures (x = all ones, so only trit
+    count and scale matter) isolated the two bugs: (1) `bl half_to_float`
+    without saving x30 -> ret into the row loop; (2) half_to_float ORed the
+    mantissa in without `lsl #13`, so a scale of 1.5 became 1.00003 and every
+    scaled sum was off by ~1/3. After both fixes the asm reproduces the C
+    reference digit-for-digit on every fixture (real: 4.39e-06 / 5.22e-05 /
+    8.91e-07; synthetic boundary cases: exactly 0). Harness: tests/test_ternary_asm.c
+    + tests/mk_syn_ternary.py.
+  * ORIGINAL DRAFT NOTE (kept for the record): First bug found and fixed: the
     kernel calls `bl half_to_float` but never saved x30, so its own ret jumped
     back into the loop (segfault). After that fix it returns but computes the
     wrong values (ASM-vs-oracle rel ~0.9-2.7 on the B3 fixtures, while the

@@ -94,6 +94,7 @@ half_to_float:
     b.eq 1f                      // inf / nan
     add  w2, w2, #112            // bias adjust (127 - 15)
     lsl  w2, w2, #23
+    lsl  w3, w3, #13             // mantissa -> fp32 bit position
     orr  w3, w3, w2
     orr  w3, w3, w1
     fmov s0, w3
