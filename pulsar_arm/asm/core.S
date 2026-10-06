@@ -3444,24 +3444,13 @@ fwd_token:
     add x0, x0, :lo12:FH
     adrp x2, FH
     add x2, x2, :lo12:FH
-    adrp x3, FQ
-    add x3, x3, :lo12:FQ          // resid (was XB: wrong vector)
+    adrp x3, XB
+    add x3, x3, :lo12:XB
     mov w4, #640
     adrp x5, f_eps
     add x5, x5, :lo12:f_eps
     ldr s0, [x5]
     bl rmsnorm_add_f32
-    // advance the residual stream: XB = FH. (This was missing: every layer
-    // re-read the raw embedding, and the head read the embedding too.)
-    adrp x0, XB
-    add x0, x0, :lo12:XB
-    adrp x1, FH
-    add x1, x1, :lo12:FH
-    mov w2, #160                 // 640 floats / 4
-xs: ld1 {v0.4s}, [x1], #16
-    st1 {v0.4s}, [x0], #16
-    subs w2, w2, #1
-    b.ne xs
     add w23, w23, #1
     b 0b
 90: // final norm (FL[0]) + head + argmax

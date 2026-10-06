@@ -1,4 +1,0 @@
-/bin/bash: line 1:  8167 Segmentation fault      timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin < /tmp/n$N.txt > /tmp/r$N.log 2>&1
-/bin/bash: line 1:  8173 Segmentation fault      timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin < /tmp/n$N.txt > /tmp/r$N.log 2>&1
-n=1: n=2: /bin/bash: line 1:  8178 Segmentation fault      timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin < /tmp/n$N.txt > /tmp/r$N.log 2>&1
-n=6: 
