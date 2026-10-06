@@ -1,0 +1,28 @@
+{
+  "id": "bb7a00eea",
+  "name": "Identify gelu_mul behaviour",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/gelu_id.py luigi@raspberrypi.tailf63b31.ts.net:gelu_id.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/gelu_id.py' 2>&1 | tail -7",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bb7a00eea.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791265460828,
+  "endTime": 1791265472653,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 134883,
+  "bytesWritten": 550,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

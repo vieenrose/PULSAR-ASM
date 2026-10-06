@@ -1,0 +1,28 @@
+{
+  "id": "ba9f3b4d2",
+  "name": "Full layer-0 python reference",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/l0_full.py luigi@raspberrypi.tailf63b31.ts.net:l0_full.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/l0_full.py' 2>&1 | tail -9",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/ba9f3b4d2.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791264361494,
+  "endTime": 1791265082996,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 133797,
+  "bytesWritten": 50,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 900,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

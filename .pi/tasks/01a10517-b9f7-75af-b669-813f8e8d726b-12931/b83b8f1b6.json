@@ -1,0 +1,28 @@
+{
+  "id": "b83b8f1b6",
+  "name": "Identify actual MLP input vector",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/gg_id.py luigi@raspberrypi.tailf63b31.ts.net:gg_id.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/gg_id.py' 2>&1 | tail -10",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b83b8f1b6.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791265253075,
+  "endTime": 1791265264252,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 134604,
+  "bytesWritten": 799,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

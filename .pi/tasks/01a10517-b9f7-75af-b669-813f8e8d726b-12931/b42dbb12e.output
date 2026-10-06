@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/luigi/gg_w.py", line 53, in <module>
+    Wo2 = np.vstack([Wo, np.zeros((2048 - 640, 640))])
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/luigi/pulsar-rpi/v/lib/python3.11/site-packages/numpy/_core/shape_base.py", line 290, in vstack
+    return _nx.concatenate(arrs, 0, dtype=dtype, casting=casting)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: all the input array dimensions except for the concatenation axis must match exactly, but along dimension 1, the array at index 0 has size 1024 and the array at index 1 has size 640

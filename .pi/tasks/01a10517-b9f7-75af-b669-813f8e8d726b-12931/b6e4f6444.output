@@ -1,0 +1,27 @@
+layer-0 tensors in file order (engine slot k = index):
+  k=0 model.layers.0.input_layernorm.weight
+  k=1 model.layers.0.mlp.down_proj.weight
+  k=2 model.layers.0.mlp.gate_proj.weight
+  k=3 model.layers.0.mlp.up_proj.weight
+  k=4 model.layers.0.post_attention_layernorm.weight
+  k=5 model.layers.0.post_feedforward_layernorm.weight
+  k=6 model.layers.0.pre_feedforward_layernorm.weight
+  k=7 model.layers.0.self_attn.k_norm.weight
+  k=8 model.layers.0.self_attn.k_proj.weight
+  k=9 model.layers.0.self_attn.o_proj.weight
+  k=10 model.layers.0.self_attn.q_norm.weight
+  k=11 model.layers.0.self_attn.q_proj.weight
+  k=12 model.layers.0.self_attn.v_proj.weight
+
+engine GG v=[0.0128295, -0.047304, 0.1459861, 0.2033802] max=184.6180
+k= 0 input_layernorm.weight                       v=[-0.3436, 0.0017, -1.6516, 0.1451] max= 158.2507
+k= 1 down_proj.weight                       v=[0.0015, -0.0060, -0.0001, 0.0024] max=   0.6177
+k= 2 gate_proj.weight                       v=[0.0016, -0.0056, -0.0006, 0.0005] max=   0.6105
+k= 3 up_proj.weight                       v=[0.0015, -0.0065, 0.0000, 0.0043] max=   0.6183
+k= 4 post_attention_layernorm.weight                       v=[0.0200, -7.0575, 5.1429, -9.5172] max= 133.1378
+k= 5 post_feedforward_layernorm.weight                       v=[-0.0624, -47.9348, 29.0233, -63.8372] max=1033.2966
+k= 6 pre_feedforward_layernorm.weight                       v=[-0.0056, 0.0385, -0.0088, 0.0323] max=  12.2168
+k= 8 k_proj.weight                       v=[0.0012, -0.0061, -0.0001, 0.0049] max=   0.6038
+k= 9 o_proj.weight                       v=[0.0016, -0.0063, -0.0003, 0.0029] max=   0.6148
+k=11 q_proj.weight                       v=[0.0016, -0.0066, -0.0003, 0.0025] max=   0.6220
+k=12 v_proj.weight                       v=[0.0014, -0.0065, -0.0007, -0.0003] max=   0.6167

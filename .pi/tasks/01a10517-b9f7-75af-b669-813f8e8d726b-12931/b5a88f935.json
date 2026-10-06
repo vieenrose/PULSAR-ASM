@@ -1,0 +1,28 @@
+{
+  "id": "b5a88f935",
+  "name": "Post-revert baseline verification",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S2=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && S3=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin > /tmp/v0.log 2>&1; echo \"270M-BENCH:\"; grep -a \"text:\" -A2 /tmp/v0.log | head -3 | cut -c1-45; grep -a METRIC /tmp/v0.log; timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin 700 950 6 < /tmp/n6.txt > /tmp/v6.log 2>&1; echo \"n6:\"; awk \"/^tpl:/{f=1} f\" /tmp/v6.log | tail -n +2 | head -2 | cut -c1-40; timeout 200 ./core $S3 ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/tool_official.txt > /tmp/vt.log 2>&1; echo \"FC:\"; tail -3 /tmp/vt.log | cut -c1-64'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b5a88f935.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791264234469,
+  "endTime": 1791264285040,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 133659,
+  "bytesWritten": 93,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 800,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

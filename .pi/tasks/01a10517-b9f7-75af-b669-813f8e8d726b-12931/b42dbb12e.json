@@ -1,0 +1,28 @@
+{
+  "id": "b42dbb12e",
+  "name": "Test gate up variants",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/gg_w.py luigi@raspberrypi.tailf63b31.ts.net:gg_w.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/gg_w.py' 2>&1 | tail -11",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b42dbb12e.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791265304690,
+  "endTime": 1791265315185,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 134658,
+  "bytesWritten": 631,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

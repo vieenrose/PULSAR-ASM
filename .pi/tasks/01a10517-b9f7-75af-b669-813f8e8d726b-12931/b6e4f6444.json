@@ -1,0 +1,28 @@
+{
+  "id": "b6e4f6444",
+  "name": "Brute force pre FF norm slot",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/slot_brute.py luigi@raspberrypi.tailf63b31.ts.net:slot_brute.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/slot_brute.py' 2>&1 | tail -28",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b6e4f6444.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791265408212,
+  "endTime": 1791265419645,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 134806,
+  "bytesWritten": 1818,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "b264f3739",
+  "name": "Identify MLP norm slot",
+  "command": "cd /home/user/PULSAR-ASM && scp -o BatchMode=yes pulsar_arm/tools/mlp_slot.py luigi@raspberrypi.tailf63b31.ts.net:mlp_slot.py 2>&1 | head -1; ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -u /home/luigi/mlp_slot.py' 2>&1 | tail -6",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b264f3739.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791265181972,
+  "endTime": 1791265195213,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 134494,
+  "bytesWritten": 404,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

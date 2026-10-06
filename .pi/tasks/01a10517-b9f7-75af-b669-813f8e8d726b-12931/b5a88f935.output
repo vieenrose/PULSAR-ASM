@@ -1,0 +1,12 @@
+270M-BENCH:
+text: :
+Name:
+This is a:
+METRIC ms_per_token=148.33
+n6:
+ a person.
+
+FC:
+2
+20 2
+}
