@@ -4332,6 +4332,47 @@ encode:
 0:  cmp x24, x20
     b.hs 1f                      // init done
     mov x26, x24                 // byte-start (fallback needs it)
+    ldrb w0, [x24]
+    cmp w0, #0x3C                // '<'? (control-token lead)
+    b.ne ctrl_no
+    // table walk: ct_tab entries (ptr,len,id); x0-x5 scratch (all dead here ✓)
+    adrp x0, ct_tab
+    add x0, x0, :lo12:ct_tab
+    mov w1, #0                   // entry idx
+ctrl_entry:
+    cmp w1, #4
+    b.hs ctrl_no                 // no match: normal path
+    lsl x2, x1, #4               // idx*16
+    add x2, x0, x2               // &entry
+    ldr x3, [x2]                 // lit ptr
+    ldr w4, [x2, #8]             // len
+    ldr w5, [x2, #12]            // id
+    add x2, x24, x4              // p+len
+    cmp x2, x20
+    b.hi ctrl_next               // not enough bytes left
+    mov x2, #0                   // k
+ctrl_cmp:
+    cmp x2, x4
+    b.hs ctrl_hit                // all matched
+    ldrb w0, [x24, x2]           // text[k]
+    ldrb w6, [x3, x2]            // lit[k] (w6, NOT w3: x3 is the base!)
+    cmp w0, w6
+    b.ne ctrl_next
+    add x2, x2, #1
+    b ctrl_cmp
+ctrl_next:
+    // (x3 dead here; recomputed per entry)
+    add w1, w1, #1
+    b ctrl_entry
+ctrl_hit:
+    // store id (w5), advance p, count
+    cmp w25, #2048
+    b.hs 9f                      // encode overflow exit
+    str w5, [x23, x25, lsl #2]   // SYM[n] = id
+    add x25, x25, #1
+    add x24, x24, x4             // p += len
+    b 0b                         // phase-1 top
+ctrl_no:
     mov x0, x24
     mov x1, x20
     bl utf8_decode               // w0 = cp, x1 = next (uses x0-x4; x26 safe)
@@ -4470,6 +4511,9 @@ et14: .asciz "\001"
 et15: .asciz "\177"
 et16: .asciz "\342\200\213"
 et17: .asciz " Hello"
+et18: .asciz "<bos>"
+et19: .asciz "<start_of_turn>Hi<end_of_turn>"
+et20: .asciz "a<eos>b"
 
     .section .text
     .align 2
@@ -4568,6 +4612,15 @@ encode_test:
     bl enc_one
     adrp x0, et17
     add x0, x0, :lo12:et17
+    bl enc_one
+    adrp x0, et18
+    add x0, x0, :lo12:et18
+    bl enc_one
+    adrp x0, et19
+    add x0, x0, :lo12:et19
+    bl enc_one
+    adrp x0, et20
+    add x0, x0, :lo12:et20
     bl enc_one
     ldr x30, [sp], #16
     ret
@@ -4893,3 +4946,23 @@ tpl_build:
     ldr x30, [sp], #16
     ret
 
+
+    .section .rodata
+    .align 3
+ct_bos:      .ascii "<bos>"
+ct_eos:      .ascii "<eos>"
+ct_eot:      .ascii "<end_of_turn>"
+ct_sot:      .ascii "<start_of_turn>"
+    .align 3
+ct_tab:       // (ptr, len, id) x4
+    .quad ct_bos
+    .word 5, 2
+    .quad ct_eos
+    .word 5, 1
+    .quad ct_eot
+    .word 13, 106
+    .quad ct_sot
+    .word 15, 105
+
+    .section .text
+    .align 2
