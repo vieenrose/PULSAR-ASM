@@ -190,6 +190,10 @@ def pulsar_meta(g):
         "pulsar.vocab": g.tensors["token_embd.weight"][0][1],
         "pulsar.eps": m["qwen3.attention.layer_norm_rms_epsilon"],
         "pulsar.rope_theta": m["qwen3.rope.freq_base"],
+        # integer forms for the asm loader (it parses integers, not floats):
+        # rope_theta is exactly 1e6 or 5e6, eps is 1e-6 => 1e-6 * 1e12 = 1e6
+        "pulsar.rope_theta_int": int(round(m["qwen3.rope.freq_base"])),
+        "pulsar.eps_e12": int(round(m["qwen3.attention.layer_norm_rms_epsilon"] * 1e12)),
         "pulsar.ternary_group": GROUP,
     }
 
