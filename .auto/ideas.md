@@ -26,3 +26,23 @@
   tools/perlayer_probe.patch (`patch -p0 < ...`, rebuild) to localize any
   future divergence to a layer+position in ONE run. Both are how the q_norm
   bug was found.
+- MIGRATION RECIPE (2026-10-06, 270m -> 1B): the expensive part is not the maths
+  but the 270m constants hiding in the forward path. Parameterized now: HID,
+  INTER, NLAY, VOC, the FL entry stride, every rmsnorm n / gemv M,K / gelu n /
+  argmax n, the embed scale sqrt(HID), and full attention = `i mod 6 == 5`
+  (HF's default when config.json has no layer_types). Traps found the hard way:
+  tab[] must hold 2+13*layers slots (236 was 270m-only), and the embed gather
+  and rmsnorm_add take their length as an argument - both were literal 640.
+  Always grep for the literal immediately before a call, not only in the index
+  arithmetic.
+- 1B numbers (Pi 4, 3 cores): 543 ms/token = 1.8 tok/s, 2.00 GB weights per
+  token => ~3.7 GB/s, i.e. the same 3.93 GB/s wall as 270m. 1B is the first
+  checkpoint here that answers multi-item prompts correctly (3 colors, lists,
+  one-sentence explanations); 270m tops out at one-line facts.
+- PARITY TOOLING that works: tools/fwd_ref.py (fp64, any checkpoint via
+  FWD_MODEL), tools/l0_any.py (layer-0 only, fits any size), tools/hf_greedy.py
+  (manual loop; HF_DTYPE=bfloat16 because 1B fp32 exceeds the Pi's 3.8 GB), and
+  tools/perlayer_probe.patch to dump per-layer residuals from the asm.
+- Next candidates: gemma-3-4b (hidden 2560, 34 layers, inter 10240) needs bigger
+  bss and will not fit 3.8 GB in fp32 for the HF check; consider int8 weights
+  or a 2-bit path only if the bus wall ever stops binding.
