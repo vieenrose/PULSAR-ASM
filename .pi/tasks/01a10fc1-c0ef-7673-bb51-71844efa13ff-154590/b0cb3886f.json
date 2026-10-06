@@ -1,0 +1,26 @@
+{
+  "id": "b0cb3886f",
+  "name": "Verify lossless repack",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~ && /home/luigi/pulsar-rpi/v/bin/python -u q2_0_ref.py bonsai_b3.bin 785,6722,315,9625,374 3 > /tmp/oracle_b3.log 2>&1; echo \"oracle(b3) EXIT=$?\"; grep \"^ARGMAX p4\" /tmp/oracle_b3.log; grep \"^ARGMAX p4\" /tmp/oracle_test.log\n/home/luigi/pulsar-rpi/v/bin/python - <<\"EOF\"\nimport re\ndef load(path):\n    d, lay, pos = {}, None, None\n    for line in open(path):\n        m = re.match(r\"^DX L(\\d+) p(\\d+)$\", line.strip())\n        if m: lay, pos = int(m.group(1)), int(m.group(2)); continue\n        m = re.match(r\"^DX max=([-\\d.eE+]+) v=\\[([^\\]]*)\\]$\", line.strip())\n        if m and lay is not None:\n            d.setdefault((lay, pos), (float(m.group(1)), [float(v) for v in m.group(2).split(\",\")]))\n    return d\na, b = load(\"/tmp/oracle_test.log\"), load(\"/tmp/oracle_b3.log\")\nkeys = sorted(set(a) & set(b))\nworst = (0.0, None)\nfor k in keys:\n    (am, av), (bm, bv) = a[k], b[k]\n    rel = abs(am - bm) / max(abs(am), 1e-30)\n    if rel > worst[0]: worst = (rel, k)\n    for x, y in zip(av, bv):\n        r2 = abs(x - y) / max(abs(x), 1e-30)\n        if r2 > worst[0]: worst = (r2, k)\nprint(f\"compared {len(keys)} (layer,pos) pairs, Q2_0 vs base-3 repack\")\nprint(f\"worst relative difference: {worst[0]:.3e} at L{worst[1][0]} p{worst[1][1]}\")\nprint(\"VERDICT:\", \"bit-identical\" if worst[0] == 0.0 else \"differs\")\nEOF'",
+  "description": "Verify the base-3 repack is lossless: run the oracle on the repacked 1.7B blob and diff every DX signature against the Q2_0 run",
+  "status": "running",
+  "outputPath": ".pi/tasks/01a10fc1-c0ef-7673-bb51-71844efa13ff-154590/b0cb3886f.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791284460254,
+  "pid": 168315,
+  "bytesWritten": 0,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": false,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 5400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

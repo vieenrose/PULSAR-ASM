@@ -20,13 +20,48 @@ import json
 import struct
 import sys
 
+import numpy as np
+
 GGUF_MAGIC = 0x46554747
 T_F32, T_F16, T_Q2_0 = 0, 1, 42
 GROUP = 128                 # weights per ternary group
-GROUP_BYTES = 2 + GROUP // 4    # fp16 scale + 2-bit codes = 34
+GROUP_BYTES = 2 + GROUP // 4    # Q2_0: fp16 scale + 2-bit codes = 34
+TRITS_PER_BYTE = 5          # base-3 packing: 3**5 = 243 <= 256
+B3_CODE_BYTES = -(-GROUP // TRITS_PER_BYTE)     # 26 bytes for 128 trits
+B3_GROUP_BYTES = 2 + B3_CODE_BYTES              # fp16 scale + base-3 codes = 28
 
 _SCALARS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f",
             7: "<B", 10: "<Q", 11: "<q", 12: "<d"}
+
+
+def q2_0_to_codes(raw, rows, ng):
+    """(rows, ng, 34) Q2_0 blocks -> (scales (rows,ng) fp16 bytes, codes (rows,ng,128) 0..2)."""
+    b = np.frombuffer(raw, dtype=np.uint8)[: rows * ng * GROUP_BYTES]
+    b = b.reshape(rows, ng, GROUP_BYTES)
+    scales = b[:, :, :2].copy()
+    codes = np.empty((rows, ng, GROUP), dtype=np.uint8)
+    for k in range(4):
+        codes[:, :, k::4] = (b[:, :, 2:] >> (2 * k)) & 3
+    return scales, codes
+
+
+def codes_to_b3(codes):
+    """(rows, ng, 128) codes 0..2 -> (rows, ng, 26) base-3 bytes (5 trits each)."""
+    rows, ng, _ = codes.shape
+    c = codes.astype(np.uint16)
+    out = np.zeros((rows, ng, B3_CODE_BYTES), dtype=np.uint8)
+    for k in range(B3_CODE_BYTES):
+        chunk = c[:, :, k * TRITS_PER_BYTE:(k + 1) * TRITS_PER_BYTE]
+        w = (3 ** np.arange(chunk.shape[2])).astype(np.uint16)
+        out[:, :, k] = (chunk * w).sum(axis=2).astype(np.uint8)
+    return out
+
+
+def repack_tensor(raw, rows, ng):
+    """Q2_0 tensor bytes -> lossless base-3 group bytes (scale + 26 code bytes)."""
+    scales, codes = q2_0_to_codes(raw, rows, ng)
+    out = np.concatenate([scales, codes_to_b3(codes)], axis=2)
+    return out.tobytes()
 
 
 class GGUF:
@@ -75,6 +110,9 @@ class GGUF:
         dims, tt, off = self.tensors[name]
         self.f.seek(self.data_start + off + offset)
         return self.f.read(nbytes) if nbytes else self.f.read(self.nbytes(name))
+
+    def hdr_dtype(self, name):
+        return self.tensors[name][1]
 
     def nbytes(self, name):
         dims, tt, _ = self.tensors[name]
@@ -156,13 +194,17 @@ def pulsar_meta(g):
     }
 
 
-def build_header(g, lens):
+def build_header(g, lens, pack="b3"):
     hdr, payload, offs = {}, [], 0
     for name in g.order:
         dims, tt, _ = g.tensors[name]
         nb = lens[name]
         if tt == T_Q2_0:
-            rows, cols, dt = dims[1], dims[0], "Q2_0"
+            rows, cols = dims[1], dims[0]
+            dt = "Q2_0" if pack == "q2_0" else "B3_128"
+            if pack != "q2_0":
+                assert cols % GROUP == 0
+                nb = rows * (cols // GROUP) * B3_GROUP_BYTES
         elif tt == T_F32:
             dt = "F32"
             rows, cols = (dims[1], dims[0]) if len(dims) == 2 else (dims[0], 1)
@@ -173,16 +215,23 @@ def build_header(g, lens):
         payload.append((name, offs, nb))
         offs += nb
     hdr.update(pulsar_meta(g))
+    hdr["pulsar.pack"] = 0 if pack == "q2_0" else 1
     return hdr, payload, offs
 
 
-def convert(src, out):
+def convert(src, out, pack="b3"):
+    """pack: "q2_0" keeps the GGUF blocks verbatim; "b3" repacks the codes
+    losslessly as 5 trits per byte (28 B/128 groups instead of 34)."""
     g = GGUF(src)
     lens = tensor_lengths(g)
-    hdr, payload, offs = build_header(g, lens)
+    hdr, payload, offs = build_header(g, lens, pack)
     blob = bytearray()
     for name, o, nb in payload:
-        blob += g.raw(name)
+        raw = g.raw(name)
+        if pack != "q2_0" and g.hdr_dtype(name) == T_Q2_0:
+            rows, cols = hdr[_hf_name(name)]["shape"]
+            raw = repack_tensor(raw, rows, cols // GROUP)
+        blob += raw
     with open(out, "wb") as fh:
         h = json.dumps(hdr).encode()
         fh.write(struct.pack("<Q", len(h)))
@@ -196,7 +245,8 @@ def convert(src, out):
 
 def main():
     src, out = sys.argv[1], sys.argv[2]
-    g = convert(src, out)
+    pack = sys.argv[3] if len(sys.argv) > 3 else "b3"
+    g = convert(src, out, pack)
     m = g.meta
     print("meta:", {k: v for k, v in m.items() if not isinstance(v, str)
                     or len(v) < 40})

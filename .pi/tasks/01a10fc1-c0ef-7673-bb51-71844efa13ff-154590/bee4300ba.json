@@ -1,0 +1,29 @@
+{
+  "id": "bee4300ba",
+  "name": "4B oracle reference run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~ && /home/luigi/pulsar-rpi/v/bin/python -u q2_0_ref.py bonsai4b_q2_0.bin 785,6722,315,9625,374 3 > /tmp/oracle4b.log 2>&1; echo \"EXIT=$?\"; head -1 /tmp/oracle4b.log; echo \"--- DX L35 p4 ---\"; grep -A1 \"^DX L35 p4\" /tmp/oracle4b.log; tail -2 /tmp/oracle4b.log; echo \"--- oracle size ---\"; wc -l /tmp/oracle4b.log'",
+  "description": "Run the Qwen3/Q2_0 fp32 oracle on the 4B blob (5 positions x 36 layers) to produce the asm verification reference",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10fc1-c0ef-7673-bb51-71844efa13ff-154590/bee4300ba.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791283513474,
+  "endTime": 1791283649050,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 167286,
+  "bytesWritten": 258,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 5400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

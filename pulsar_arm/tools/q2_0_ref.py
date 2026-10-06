@@ -29,7 +29,10 @@ import sys
 import numpy as np
 
 GROUP = 128
-GROUP_BYTES = 34
+GROUP_BYTES = 34            # Q2_0: fp16 scale + 32 B of 2-bit codes
+TRITS_PER_BYTE = 5          # base-3 repack: 3**5 = 243 <= 256
+B3_CODE_BYTES = -(-GROUP // TRITS_PER_BYTE)
+B3_GROUP_BYTES = 2 + B3_CODE_BYTES
 EPS = 1e-6
 HEAD_CHUNK = 16384            # rows per chunk when streaming the tied head
 
@@ -57,23 +60,45 @@ class Blob:
         rows, cols = e["shape"]
         return a.reshape(rows, cols) if cols > 1 else a
 
-    def deq(self, name, r0=0, r1=None):
-        """Dequantise Q2_0 rows [r0, r1) to float32 (rows, cols)."""
+    def groups(self, name, r0=0, r1=None):
+        """-> (scale (n, ng) float32, codes (n, ng, GROUP) float32 in {-1,0,1})."""
         e = self.hdr[name]
-        assert e["dtype"] == "Q2_0", e["dtype"]
         rows, cols = e["shape"]
         r1 = rows if r1 is None else r1
         ng = cols // GROUP
-        b = np.frombuffer(self.raw(name), dtype=np.uint8)
-        b = b[r0 * ng * GROUP_BYTES: r1 * ng * GROUP_BYTES]
-        b = b.reshape(r1 - r0, ng, GROUP_BYTES)
-        scale = b[:, :, :2].copy().view(np.float16).astype(np.float32)
-        # unpack the 4 two-bit fields of each byte, LSB first
-        raw = b[:, :, 2:]                                      # (n, ng, 32)
-        c = np.empty((raw.shape[0], raw.shape[1], GROUP), dtype=np.float32)
-        for k in range(4):
-            c[:, :, k::4] = ((raw >> (2 * k)) & 3).astype(np.float32) - 1.0
-        return (c * scale).reshape(r1 - r0, cols)   # scale: (n, ng, 1)
+        n = r1 - r0
+        if e["dtype"] == "Q2_0":
+            b = np.frombuffer(self.raw(name), dtype=np.uint8)[: rows * ng * GROUP_BYTES]
+            b = b.reshape(rows, ng, GROUP_BYTES)[r0:r1]
+            scale = b[:, :, :2].copy().view(np.float16).astype(np.float32)
+            scale = scale.reshape(n, ng)
+            raw = b[:, :, 2:]
+            codes = np.empty((n, ng, GROUP), dtype=np.float32)
+            for k in range(4):
+                codes[:, :, k::4] = ((raw >> (2 * k)) & 3).astype(np.float32) - 1.0
+        elif e["dtype"] == "B3_128":
+            b = np.frombuffer(self.raw(name), dtype=np.uint8)[: rows * ng * B3_GROUP_BYTES]
+            b = b.reshape(rows, ng, B3_GROUP_BYTES)[r0:r1]
+            scale = b[:, :, :2].copy().view(np.float16).astype(np.float32).reshape(n, ng)
+            codes = np.empty((n, ng, GROUP), dtype=np.float32)
+            for k in range(B3_CODE_BYTES):
+                v = b[:, :, 2 + k].astype(np.uint16)
+                for i in range(TRITS_PER_BYTE):
+                    idx = k * TRITS_PER_BYTE + i
+                    if idx < GROUP:
+                        codes[:, :, idx] = (v % 3).astype(np.float32) - 1.0
+                        v //= 3
+        else:
+            raise SystemExit(f"{name}: unexpected dtype {e['dtype']}")
+        return scale, codes
+
+    def deq(self, name, r0=0, r1=None):
+        """Dequantise Q2_0 rows [r0, r1) to float32 (rows, cols)."""
+        e = self.hdr[name]
+        rows, cols = e["shape"]
+        r1 = rows if r1 is None else r1
+        scale, codes = self.groups(name, r0, r1)
+        return (codes * scale[:, :, None]).reshape(r1 - r0, cols)
 
 
 def rms(x, w):
@@ -116,17 +141,8 @@ def main():
     inv = theta ** (-(np.arange(HD // 2) / (HD // 2)))
 
     def embed_rows(tok):
-        e = bl.info("model.embed_tokens.weight")
-        ng = HID // GROUP
-        b = np.frombuffer(bl.raw("model.embed_tokens.weight"), dtype=np.uint8)
-        b = b[tok * ng * GROUP_BYTES:(tok + 1) * ng * GROUP_BYTES]
-        b = b.reshape(ng, GROUP_BYTES)
-        scale = b[:, :2].copy().view(np.float16).astype(np.float32)
-        raw = b[:, 2:]
-        c = np.empty((ng, GROUP), dtype=np.float32)
-        for k in range(4):
-            c[:, k::4] = ((raw >> (2 * k)) & 3).astype(np.float32) - 1.0
-        return (c * scale).reshape(HID)          # scale: (ng, 1)
+        scale, codes = bl.groups("model.embed_tokens.weight", tok, tok + 1)
+        return (codes * scale[:, :, None]).reshape(HID)          # scale: (ng, 1)
 
     def head_logits(h):
         out = np.empty(VOC, dtype=np.float32)

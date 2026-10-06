@@ -1,0 +1,7 @@
+EXIT=1
+# oracle: blob hidden 2560 inter 9728 layers 36 q32/kv8 x 128 vocab 151669
+--- DX L35 p4 ---
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: cannot reshape array of size 6615016 into shape (9728,20,34)
+--- oracle size ---
+83 /tmp/oracle4b.log

@@ -1,0 +1,29 @@
+{
+  "id": "bc7c68027",
+  "name": "4B oracle (padding fixed)",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~ && /home/luigi/pulsar-rpi/v/bin/python -u q2_0_ref.py bonsai4b_q2_0.bin 785,6722,315,9625,374 3 > /tmp/oracle4b.log 2>&1; echo \"EXIT=$?\"; head -1 /tmp/oracle4b.log; grep -A1 \"^DX L35 p4\" /tmp/oracle4b.log; tail -2 /tmp/oracle4b.log; echo \"DX blocks: $(grep -c \"^DX L\" /tmp/oracle4b.log)\"'",
+  "description": "Re-run the 4B oracle with the padding fix to produce the full 36-layer x 5-position reference",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10fc1-c0ef-7673-bb51-71844efa13ff-154590/bc7c68027.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791283766666,
+  "endTime": 1791283901916,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 167626,
+  "bytesWritten": 213,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 5400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
