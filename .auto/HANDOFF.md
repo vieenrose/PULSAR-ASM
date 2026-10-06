@@ -182,13 +182,31 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
 
 - 1.7B: hidden 2048, inter 6144, 28 layers, 16 q / 8 kv × 128, θ 1e6, vocab 151669.
   4B: 2560 / 9728 / 36, 32 q / 8 kv × 128, θ **5e6**.
-- Expected on the Pi at the measured ~3.9 GB/s ceiling: **~99 ms/token 1.7B**,
-  **~238 ms/token 4B**. Gemma reference: 270m 147, 1B 543 (cool box).
+- **Speed floor, measured 2026-10-06 (supersedes the bandwidth-only estimate).**
+  Peak 4-lane fp32 `fmla` on this Pi is **7.0 G fma-lanes/s** (3.9/cycle at
+  1.8 GHz - that is A72's single vector-FMA pipe, so it is the machine peak, not
+  a weak benchmark). A ternary weight still needs one add, so touching every
+  weight once costs **243 ms/token for 1.7B and 571 ms for 4B** no matter how
+  good the kernel gets. The storage numbers (376 MB → 96 ms, 880 MB → 226 ms at
+  3.93 GB/s) are *below* that, so **ternary is compute-bound, not
+  bandwidth-bound** - unlike gemma, where the opposite is true. The old line
+  here ("~99 ms/token 1.7B, ~238 ms 4B") was pure storage arithmetic and is
+  unreachable; ~250 ms and ~570 ms are the walls. Gemma reference: 270m 147,
+  1B 543 (cool box).
+- Current ternary GEMV: **3.98 ns/weight** = 0.25 G trits/s, which projects to
+  6834 ms/token and predicts the real 7079 ms within 3% - so `pw2/tgb` (probe on
+  a real layer-5 q_proj block) is a valid 20-second stand-in for a 5-minute
+  token run. That is ~60× off the FMA floor; the decode is the whole cost.
 - KV cap is now a **disclosed design constant**: 1024 positions → 151 MB per
   cache at 36 layers. 32k positions would need 268 MB per cache — do not "fix"
   this silently.
 - `Q2_0` group = 34 B (fp16 scale + 32 B of 2-bit codes, `w = (q−1)·scale`);
-  base-3 group = 28 B. A 243-entry decode table is the cheap asm route.
+  base-3 group = 28 B. The 243-entry decode table is **not** the route: the
+  partial-sum table depends on the byte's position in x, so it is 416 positions
+  × 256 entries = 425 KB per token - all L2 misses at 26 lookups per group per
+  row. The route that fits is digit extraction by magic multiply (`sum_i d_i·x_i
+  − S_g`, with x deinterleaved per token into digit-plane vectors, ~10 KB and L1
+  resident), which is ~0.4 ops/weight instead of today's ~10.
 
 ## Lessons (this session, the expensive kind)
 
