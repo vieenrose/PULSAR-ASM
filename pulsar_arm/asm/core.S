@@ -4332,8 +4332,8 @@ encode:
 0:  cmp x24, x20
     b.hs 1f                      // init done
     mov x26, x24                 // byte-start (fallback needs it)
-    ldrb w0, [x24]
-    cmp w0, #0x3C                // '<'? (control-token lead)
+    ldrb w6, [x24]
+    cmp w6, #0x3C                // '<'? (w6, NOT w0: x0 is ct_tab base!)
     b.ne ctrl_no
     // table walk: ct_tab entries (ptr,len,id); x0-x5 scratch (all dead here ✓)
     adrp x0, ct_tab
@@ -4354,9 +4354,9 @@ ctrl_entry:
 ctrl_cmp:
     cmp x2, x4
     b.hs ctrl_hit                // all matched
-    ldrb w0, [x24, x2]           // text[k]
-    ldrb w6, [x3, x2]            // lit[k] (w6, NOT w3: x3 is the base!)
-    cmp w0, w6
+    ldrb w6, [x24, x2]           // text[k] (w6 preserves x0=ct_tab, x3=lit!)
+    ldrb w7, [x3, x2]            // lit[k] (x7 free: no calls in check)
+    cmp w6, w7
     b.ne ctrl_next
     add x2, x2, #1
     b ctrl_cmp
