@@ -46,3 +46,20 @@
 - Next candidates: gemma-3-4b (hidden 2560, 34 layers, inter 10240) needs bigger
   bss and will not fit 3.8 GB in fp32 for the HF check; consider int8 weights
   or a 2-bit path only if the bus wall ever stops binding.
+- 1B CEILING MAP (2026-10-06, temp 1.0, recommended sampling): correct and clean
+  = 4-item lists with one fact each (seasons), 3-item advice (health tips),
+  2-sentence child-level explanations (gravity), translation (good morning ->
+  Bonjour!), one-sentence definitions (photosynthesis, minor stutters), a Python
+  function with docstring, 17x3=51 (then it loops). NOT correct: word problems
+  (train distance never states 120 km), sky-blue (stutter + cut), water cycle
+  (stutters), zh-TW planet facts (Mercury called the farthest planet), zh-TW
+  water cycle (invents a "negative cycle"). Practical rule: multi-item structured
+  output is the sweet spot; numeric reasoning and multi-sentence prose are not.
+- SAMPLING: the engine's sampler already matches the model card / Unsloth Gemma 3
+  guidance (temperature 1.0, top-k 64, top-p 0.95, min-p 0). Stutters ("water
+  water", "a a") are the checkpoint at temperature 1.0, not the engine - which is
+  why demo transcripts are chosen for correctness rather than rerolled.
+- CAP TUNING for demos: sampling continues past the closing line (newline tokens,
+  then a hallucinated source list). Binaries search the gen cap until the last
+  line is the model's own closing sentence, then diff the embedded transcript
+  against a fresh run byte-for-byte.
