@@ -5175,72 +5175,49 @@ file_bye:
     .align 2
 
     .section .rodata
-    .align 4
 t_lgp:      .asciz "lgp: am="
-t_at:       .asciz " lg"
-t_rp:       .asciz "="
-t_com:      .asciz " "
-t_pids:     .word 9079, 506, 50429
-
+t_atv:      .asciz " lg"
+t_eq:       .asciz "="
 
     .section .text
     .align 2
-/* lgprobe: prints argmax id+val, then LG[9079], LG[506], LG[50429].
- * Uses x0-x9. */
+/* lgprobe: argmax id+val, then LG[9079], LG[506], LG[50429]. Inline, no tables. */
 lgprobe:
     str x30, [sp, #-16]!
     adrp x19, LG
     add x19, x19, :lo12:LG
     mov x0, x19
     movz x1, #4, lsl #16         // 262144
-    bl argmax_f32                // w0 = argmax id
+    bl argmax_f32                // w0 = am id
     adrp x1, t_lgp
     add x1, x1, :lo12:t_lgp
     bl print_cstr
-    mov x3, x0                   // am id
-    bl pv                       // prints x3's value at LG
-    adrp x1, t_com
-    add x1, x1, :lo12:t_com
-    bl print_cstr
-    adrp x1, t_at
-    add x1, x1, :lo12:t_at
-    bl print_cstr
-    adrp x1, t_pids
-    add x1, x1, :lo12:t_pids
-    ldr w2, [x1]                 // 9079
-    adrp x1, t_at
-    add x1, x1, :lo12:t_at
-    bl print_cstr
-    mov x3, x2
-    bl pv
-    bl spc
-    ldr w2, [x1, #4]             // 506
-    adrp x1, t_at
-    add x1, x1, :lo12:t_at
-    bl print_cstr
-    mov x3, x2
-    bl pv
-    bl spc
-    ldr w2, [x1, #8]             // 50429
-    adrp x1, t_at
-    add x1, x1, :lo12:t_at
-    bl print_cstr
-    mov x3, x2
-    bl pv
+    mov w3, w0
+    bl pvv
+    movz w3, #0x238F             // 9079 ' Paris'
+    bl pvv
+    movz w3, #0x1FA              // 506 ' the'
+    bl pvv
+    movz w3, #0xC4CD             // 50429 'Paris'
+    bl pvv
     bl print_nl
     ldr x30, [sp], #16
     ret
-
-/* pv: prints LG[x3] (x19=base). Uses x0-x4. */
-pv:
+/* pvv: prints " lg<id>=<val>" using x19 as LG base. Uses x0-x4. */
+pvv:
     str x30, [sp, #-16]!
+    lsl x0, x3, #2
+    ldr s0, [x19, x0]
+    adrp x1, t_atv
+    add x1, x1, :lo12:t_atv
+    bl print_cstr
+    mov x0, x3
+    bl print_u64
+    adrp x1, t_eq
+    add x1, x1, :lo12:t_eq
+    bl print_cstr
     lsl x0, x3, #2
     ldr s0, [x19, x0]
     bl print_f32
     ldr x30, [sp], #16
     ret
-/* spc: print space. */
-spc:
-    adrp x0, t_com
-    add x0, x0, :lo12:t_com
-    b print_cstr
