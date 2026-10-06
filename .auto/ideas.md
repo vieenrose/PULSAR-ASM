@@ -141,3 +141,9 @@
   on stdin) + G_TOPK so the card's temp 0.5 / top_p 0.85 / top_k 20 can be used;
   (6) then the layer/position diff against /tmp/oracle_test.log (1.7B) and
   /tmp/oracle4b_b3.log (4B), and only then the ceiling-prompt hunt + GIFs.
+
+## Next session
+
+Start at `.auto/HANDOFF.md` - it holds the verified state, the six remaining
+steps with core.S line anchors, the Pi inventory, the build/regression commands
+and the lessons. Objective and gates are unchanged.
