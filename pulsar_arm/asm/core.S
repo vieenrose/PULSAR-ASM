@@ -4920,7 +4920,7 @@ q8dot:
     movi v0.4s, #0               // acc = 0
 0:  cbz w2, 1f
     ldr h1, [x1]                 // scale fp16
-    fcvt s1, h1                  // fp32 scale (A72 scalar fcvt: verified by self-test)
+    fcvt s1, h1                  // fp32 scale (s1; v1.s[0] readable ✓)
     ldr q2, [x1, #2]             // quants[0..15]
     ldr q3, [x1, #18]            // quants[16..31]
     // weights[0..7]
@@ -4998,7 +4998,7 @@ q8_test:
     adrp x1, q8t_data
     add x1, x1, :lo12:q8t_data
     mov w2, #64
-    bl q8dot                     // s0 = dot (clobbers x0-x6,v0-v7; x30 saved ✓)
+    bl q8dot                     // s0 = dot (expect -2943.0)
     fmov w0, s0                  // bits
     adrp x1, q8t_exp
     add x1, x1, :lo12:q8t_exp
@@ -5016,3 +5016,4 @@ q8_test:
     bl print_cstr
     ldr x30, [sp], #16
     ret
+
