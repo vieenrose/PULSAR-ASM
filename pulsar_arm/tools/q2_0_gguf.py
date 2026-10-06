@@ -119,12 +119,48 @@ def _hf_name(name):
     return name
 
 
-def convert(src, out):
-    g = GGUF(src)
+def tensor_lengths(g):
+    """Byte length per tensor from the header offsets (authoritative).
+
+    GGUF pads some tensors out to the file alignment, so the next tensor's
+    offset can exceed offset + computed size; the padding is never weights.
+    """
+    ents = sorted(((g.tensors[n][2], n) for n in g.order))
+    lens = {}
+    for k, (off, n) in enumerate(ents):
+        nxt = ents[k + 1][0] if k + 1 < len(ents) else None
+        mine = g.nbytes(n)
+        lens[n] = mine if nxt is None else max(mine, nxt - off)
+    return lens
+
+
+def pulsar_meta(g):
+    """Flat scalars the asm loader reads to configure the Qwen3 path.
+
+    Deliberately numeric only (no strings to parse in asm): arch_id 1 = qwen3.
+    rope_theta matters: 1e6 for 1.7B, 5e6 for 4B.
+    """
+    m = g.meta
+    return {
+        "pulsar.arch_id": 1,
+        "pulsar.hidden": m["qwen3.embedding_length"],
+        "pulsar.inter": m["qwen3.feed_forward_length"],
+        "pulsar.layers": m["qwen3.block_count"],
+        "pulsar.n_head": m["qwen3.attention.head_count"],
+        "pulsar.n_kv": m["qwen3.attention.head_count_kv"],
+        "pulsar.head_dim": m["qwen3.attention.key_length"],
+        "pulsar.vocab": g.tensors["token_embd.weight"][0][1],
+        "pulsar.eps": m["qwen3.attention.layer_norm_rms_epsilon"],
+        "pulsar.rope_theta": m["qwen3.rope.freq_base"],
+        "pulsar.ternary_group": GROUP,
+    }
+
+
+def build_header(g, lens):
     hdr, payload, offs = {}, [], 0
     for name in g.order:
         dims, tt, _ = g.tensors[name]
-        nb = g.nbytes(name)
+        nb = lens[name]
         if tt == T_Q2_0:
             rows, cols, dt = dims[1], dims[0], "Q2_0"
         elif tt == T_F32:
@@ -136,6 +172,14 @@ def convert(src, out):
             "dtype": dt, "shape": [rows, cols], "data_offsets": [offs, offs + nb]}
         payload.append((name, offs, nb))
         offs += nb
+    hdr.update(pulsar_meta(g))
+    return hdr, payload, offs
+
+
+def convert(src, out):
+    g = GGUF(src)
+    lens = tensor_lengths(g)
+    hdr, payload, offs = build_header(g, lens)
     blob = bytearray()
     for name, o, nb in payload:
         blob += g.raw(name)
