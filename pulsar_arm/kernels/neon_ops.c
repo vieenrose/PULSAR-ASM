@@ -268,3 +268,14 @@ int decode_step(float *X, float *H, float *Q, float *QN, float *KV, float *KN,
     gemv_bf16(262144, 640, emb, H, LG);
     return argmax_f32(LG, 262144);
 }
+
+/* out[i] = silu(x[i]) * mult[i] = x/(1+exp(-x)) * mult[i]  (Qwen3 SwiGLU)
+ * Sibling of gelu_mul_f32: same call shape so the layer body can swap the
+ * activation. Saturating exp makes the tails exact: -x -> +inf gives 0,
+ * -x -> -inf gives exp(+inf) = 0, so silu -> x. */
+void silu_mul_f32(float *out, const float *x, const float *mult, int n) {
+    for (int i = 0; i < n; i++) {
+        float v = x[i];
+        out[i] = (v / (1.0f + expf(-v))) * mult[i];
+    }
+}

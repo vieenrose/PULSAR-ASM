@@ -99,3 +99,28 @@
     (`lsl x9, x25, #9` assumes 128 floats = 512 B per group).
   * Lesson worth keeping: any asm routine that calls a helper must save x30
     first; core.S kernels all do, this new file did not.
+- QWEN3/TERNARY ENGINE PLAN for core.S (the next block; arch selected by the
+  blob's pulsar.arch_id, so the Gemma path must stay byte-identical):
+  1. loader: extend the dims cells with G_ARCH, G_FMT, G_NHEAD, G_NKV, G_HD,
+     G_HDB, G_QDIM(=n_head*hd), G_KVDIM, G_ROPE_THETA, G_TOPK (all already in the
+     blob header; pulsar.* scalars are numeric by design, no string parsing).
+  2. norms: fold plain w for qwen3, (1+w) for gemma3 - one branch in fold_vec.
+     q_norm/k_norm are head_dim wide (128), not HID, so FL needs two regions
+     (or an entry-size table): big = HID (input/post-attn, final), small = HD.
+  3. MLP: call silu_mul_f32 (done, PASS at 5.8e-08 vs double ref) instead of
+     gelu_mul_f32 when arch == qwen3; same call shape, no layer-body change.
+  4. attention: kv head = j / (n_head/n_kv); rope pairs = hd/2; scores over hd;
+     no sliding window (lo = 0, n = pos+1); q dim = n_head*hd, k/v = n_kv*hd;
+     both rope tables use the blob's theta (1e6 for 1.7B, 5e6 for 4B); no YaRN
+     below 8192 (document that limit); attention scale = 1/sqrt(hd).
+  5. embeddings/head: ternary GEMV row gather for the token embedding and the
+     tied head (row blocks = hd/128 groups per row).
+  6. bss for the 4B maxima: XB/FH 2560, FQ/FQN 4096, FKV/FKN/FV 1024, FAV 4096,
+     FG/FU 9728, FL ~0.8 MB, KC/VC sized to a disclosed context cap (4096
+     positions x 1024 x 4 x 2 = 33 MB; 32k positions would be 268 MB).
+  7. modes: 'i' = raw ids on stdin (decimals, whitespace separated) so Bonsai
+     can be driven without reimplementing Qwen's regex pretokenizer in asm;
+     G_TOPK flag (the sampler hardcodes 64 today; the Bonsai card wants 20).
+  8. gates: Gemma regression (bench ids byte-identical + 144-pair oracle diff)
+     AND Bonsai layer/position diff vs /tmp/oracle_test.log (1.7B, 140 blocks)
+     and /tmp/oracle4b_b3.log (4B, 180 blocks), then end-to-end ' Paris'.
