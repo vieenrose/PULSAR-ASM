@@ -3338,7 +3338,7 @@ fwd_layer0:
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     mov w0, #12
     bl wptr
     mov x2, x0                   // Wu
@@ -3352,7 +3352,7 @@ fwd_layer0:
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     adrp x0, FG
     add x0, x0, :lo12:FG
     adrp x1, FG
@@ -3393,7 +3393,7 @@ fwd_layer0:
     adrp x5, G_INTER
     add x5, x5, :lo12:G_INTER
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     mov w0, #6
     bl nptr
     mov x1, x0                   // ff
@@ -3837,7 +3837,7 @@ fwd_token:
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     add x0, x24, #10
     mov x4, #56
     mul x0, x0, x4
@@ -3854,7 +3854,7 @@ fwd_token:
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     adrp x0, FG
     add x0, x0, :lo12:FG
     adrp x1, FG
@@ -3890,7 +3890,7 @@ fwd_token:
     adrp x5, G_INTER
     add x5, x5, :lo12:G_INTER
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     mov x0, #6
     mul x0, x23, x0
     add x0, x0, #6
