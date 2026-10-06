@@ -1398,7 +1398,8 @@ file_stage_after_bench:
     adrp x2, G_MODE
     add x2, x2, :lo12:G_MODE
     mov x3, #1
-    str x3, [x2]                 // G_MODE = 1 (file = sample; temp/topp argv apply)
+    mov x3, #0
+    str x3, [x2]                 // G_MODE = 0 (file = GREEDY, matching official example)
 file_join:
     // (fall through to chat block; x0/x1 intact ✓)
 
