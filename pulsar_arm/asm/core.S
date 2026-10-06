@@ -1304,7 +1304,10 @@ file_stage:
     mov x0, x20
     bl print_u64
     bl print_nl
-    // in_norm0 values (slot2): expect 15.0625 15.875 9.8125 40.5
+    // in_norm0 values (slot2): expect 15.0625 15.875 9.8125 40.5. This print is
+    // bf16-blind and runs before pulsar.arch_id is parsed, so for a blob it shows
+    // 0 w0 0 w1 - the norms themselves fold correctly as F32 (see fold_vec), this
+    // line just cannot know the format yet.
     adrp x0, t_in0
     add x0, x0, :lo12:t_in0
     bl print_cstr
