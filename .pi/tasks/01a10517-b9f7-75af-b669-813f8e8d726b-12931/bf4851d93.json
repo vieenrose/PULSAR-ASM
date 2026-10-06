@@ -1,0 +1,28 @@
+{
+  "id": "bf4851d93",
+  "name": "Tool call after boundary fix",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/tool_official.txt > /tmp/toolfix.log 2>&1; echo EXIT=$?; tail -6 /tmp/toolfix.log | cut -c1-72'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bf4851d93.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791261810156,
+  "endTime": 1791261843788,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 130731,
+  "bytesWritten": 25,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -3506,8 +3506,8 @@ decode_test:
     adrp x21, def_prompt
     add x21, x21, :lo12:def_prompt  // prompt base (x21 survives fwd: saved)
     mov w20, #0
-0:  cmp w20, #8
-    b.hs 1f
+0:  cmp w20, #7                   // prefill prompt[0..6]; prompt[7] is fed by
+    b.hs 1f                      // the decode loop (HF boundary, no duplicate)
     adrp x0, G_pos
     add x0, x0, :lo12:G_pos
     str w20, [x0]
@@ -3521,7 +3521,7 @@ decode_test:
     adrp x1, G_t0
     add x1, x1, :lo12:G_t0
     str x0, [x1]
-    mov w20, #8                  // pos
+    mov w20, #7                  // pos (prompt[7] goes in at 7)
 2:  cmp w20, #40
     b.hs 3f
     adrp x0, G_pos
@@ -4865,7 +4865,10 @@ chat_prefill:
 chat_feed:
     mov x22, #0                  // i = 0
 chat_floop:
-    cmp x22, x21                 // i < n?
+    // prefill feeds ids[0 .. n-2]; chat_gloop feeds ids[n-1] first and samples
+    // its logits (HF boundary: no duplicated last token, no position shift).
+    sub x1, x21, #1              // n-1
+    cmp x22, x1
     b.hs chat_gen
     adrp x0, G_pos
     add x0, x0, :lo12:G_pos
