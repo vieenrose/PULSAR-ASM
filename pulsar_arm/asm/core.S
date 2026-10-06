@@ -5180,8 +5180,8 @@ t_lgp:      .asciz "lgp: am="
 t_at:       .asciz " lg"
 t_rp:       .asciz "="
 t_com:      .asciz " "
-t_ids:      .word 9079, 506, 50429
-t_nids:     .word 3
+t_pids:     .word 9079, 506, 50429
+
 
     .section .text
     .align 2
@@ -5205,8 +5205,8 @@ lgprobe:
     adrp x1, t_at
     add x1, x1, :lo12:t_at
     bl print_cstr
-    adrp x1, t_ids
-    add x1, x1, :lo12:t_ids
+    adrp x1, t_pids
+    add x1, x1, :lo12:t_pids
     ldr w2, [x1]                 // 9079
     adrp x1, t_at
     add x1, x1, :lo12:t_at
