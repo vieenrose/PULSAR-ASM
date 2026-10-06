@@ -44,10 +44,16 @@ dafd0d4 engine: SwiGLU for qwen3 (silu_mul_f32 + arch branch at the 2 call sites
 
 ## Remaining work (the demo path)
 
-1. **dtype-aware loading** — `find_tensor` (core.S:909) must also read each
-   tensor's `dtype` string from the blob header (`B3_128` vs `F32`) so ternary
-   tensors are distinguishable from bf16. Keep the 56-byte tab entry stride if
-   possible; a parallel type array is cheaper than touching every offset.
+1. **~~dtype-aware loading~~ — not needed, measured.** The 1.7B blob holds 310
+   tensors: **197 `B3_128`, all 2-D weight matrices, and 113 `F32`, all shaped
+   `[n,1]` — and those 113 are exactly the norms** (4 per layer x 28 + the final
+   `model.norm.weight`: 28x4+1 = 113). So the discriminator is free: inside an
+   `arch_id==1` blob, `shape[1] == 1` means norm (F32), everything else is
+   ternary. `find_tensor` already parses shape, so **no asm dtype parser is
+   required**; reading the `dtype` string is optional belt-and-braces. Note the
+   embedding is ternary too (`embed_tokens.weight` `[151669, 2048]` B3_128) — it
+   is a row gather, so a ternary gather, not a GEMV. Metadata also carries
+   `pulsar.ternary_group: 128` and `pulsar.pack: 1`.
 2. **wire `asm/ternary_gemv.S`** (already at C parity) into q/k/v/o, gate/up/down,
    the embedding row gather and the tied head. `gemv_bf16` (core.S:328) is the
    call shape to mirror. Prefer the mask-based add path (ternary is memory-bound).
