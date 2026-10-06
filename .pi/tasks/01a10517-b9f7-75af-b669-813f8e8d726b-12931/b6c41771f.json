@@ -1,0 +1,28 @@
+{
+  "id": "b6c41771f",
+  "name": "Logit probe n1 and n6",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S2=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && for N in 1 6; do timeout 120 ./core $S2 ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/bpe.bin < /tmp/n$N.txt > /tmp/p$N.log 2>&1; printf \"n=%s: \" $N; grep -a \"^lgp:\" /tmp/p$N.log | head -1 | cut -c1-60; done'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b6c41771f.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791263206089,
+  "endTime": 1791263208252,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 132418,
+  "bytesWritten": 364,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
