@@ -1,0 +1,3 @@
+/bin/bash: line 1:  6059 Done                    printf "Hello\n"
+      6060 Segmentation fault      | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/fcbpe.bin 1000 950 48 > /tmp/fcgreet.log 2>&1
+EXIT=139
