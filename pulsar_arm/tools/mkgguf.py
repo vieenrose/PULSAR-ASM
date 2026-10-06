@@ -7,14 +7,14 @@ Reads the 1B GGUF, resolves the needed tensors by name, writes gidx.bin:
 Order: token_embd, then per layer [attn_norm, q, q_norm, k, k_norm, v,
 output, post_attn_norm, ffn_norm, gate, up, down], then output_norm.
 Dims are GGUF order (as stored). Fails loudly on any missing tensor.
-Usage: mkgguf.py <model.gguf> <gidx.bin>
+Usage: mkgguf.py <model.gguf> <gidx.bin> [layers=26]
 """
 import json
 import struct
 import sys
 
 MAGIC = 0x4749445831323620
-LAYERS = 26
+LAYERS = int(sys.argv[3]) if len(sys.argv) > 3 else 26
 PER_LAYER = [
     "attn_norm.weight",
     "attn_q.weight",
