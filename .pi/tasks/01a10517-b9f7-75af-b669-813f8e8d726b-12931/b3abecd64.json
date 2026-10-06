@@ -1,0 +1,28 @@
+{
+  "id": "b3abecd64",
+  "name": "Instruction-following probes",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && for P in \"Say the word Paris.\" \"Repeat after me: hello.\"; do F=$(echo \"$P\" | tr \" .:?\" \"___\"); printf \"%s\\n\" \"$P\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 700 950 32 > /tmp/instr_\"$F\".log 2>&1; echo \"== $P (exit $?)\"; awk \"/chat ready/{f=1} f\" /tmp/instr_\"$F\".log | tail -n +3 | head -5 | cut -c1-50; done'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b3abecd64.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791249551121,
+  "endTime": 1791249568859,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 118641,
+  "bytesWritten": 193,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

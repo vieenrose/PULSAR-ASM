@@ -1,0 +1,28 @@
+{
+  "id": "ba6451860",
+  "name": "Chinese weather prompt run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"\\xe4\\xbb\\x8a\\xe5\\xa4\\xa9\\xe5\\xa4\\xa9\\xe6\\xb0\\xa3\\xe6\\x80\\x8e\\xe9\\xba\\xbc\\xe6\\xa8\\xa3\\xef\\xbc\\x9f\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 800 950 48 > /tmp/re_zh2.log 2>&1; echo EXIT=$?; awk \"/chat ready/{f=1} f\" /tmp/re_zh2.log | cut -c1-55 | head -10'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/ba6451860.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791249438635,
+  "endTime": 1791249450781,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 118517,
+  "bytesWritten": 143,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

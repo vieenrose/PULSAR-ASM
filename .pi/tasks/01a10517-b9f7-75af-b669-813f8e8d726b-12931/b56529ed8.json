@@ -1,0 +1,28 @@
+{
+  "id": "b56529ed8",
+  "name": "Reshoot en and zh demos",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/*/model.safetensors) && printf \"Hello\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 1000 950 48 > /tmp/re_en.log 2>&1; echo EN-EXIT=$?; printf \"\\xe8\\xab\\x8b\\xe8\\xaa\\xaa\\xe4\\xbd\\xa0\\xe5\\xa5\\xbd\\xe3\\x80\\x82\\n\" | timeout 150 ./core $S ~/PULSAR-ARM/pulsar_arm/vocab.bin 2 c ~/PULSAR-ARM/pulsar_arm/bpe.bin 1000 950 48 > /tmp/re_zh.log 2>&1; echo ZH-EXIT=$?; echo \"== EN:\"; awk \"/chat ready/{f=1} f\" /tmp/re_en.log | cut -c1-60 | head -8; echo \"== ZH:\"; awk \"/chat ready/{f=1} f\" /tmp/re_zh.log | cut -c1-60 | head -8'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b56529ed8.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791249383337,
+  "endTime": 1791249406447,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 118439,
+  "bytesWritten": 333,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

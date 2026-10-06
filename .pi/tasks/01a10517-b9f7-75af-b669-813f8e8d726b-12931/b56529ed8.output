@@ -1,0 +1,20 @@
+EN-EXIT=0
+ZH-EXIT=0
+== EN:
+chat ready (sample mode; empty line skips, EOF quits)
+> tpl: 9 105 2364 107 9259 106 107 105 4368 107 
+This is an initial message is 'best_
+
+The best _
+
+It is a.
+I
+== ZH:
+chat ready (sample mode; empty line skips, EOF quits)
+> tpl: 12 105 2364 107 239230 238458 144626 236924 106 107 1
+ 
+
+
+(இது)
+
+**
