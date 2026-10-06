@@ -1,13 +1,15 @@
-"""Render real PULSAR-ARM chat transcripts as terminal GIFs (E2B fashion).
+"""Render real PULSAR-ARM transcripts as terminal GIFs (E2B fashion).
 
 Nothing in the frames is faked: every spec below is a byte-for-byte transcript
-of a real `./core ...` run on the Pi with the HF-exact build (q_norm fix), and
-the status line carries that session's measured rate. Only pacing is libertied
-(fixed-cadence reveal), as in pulsar_asm's make_demo_gif.py.
+of a real `./core ...` run on the Pi with the HF-exact build (the q_norm fix),
+and the status line carries that session's measured rate. Lines marked `#` are
+labels, not engine output (the engine never prints them); everything else is.
+Only pacing is libertied (fixed-cadence reveal), as in pulsar_asm's
+make_demo_gif.py.
 
 Run on the Pi:
-    python3 tools/make_chat_gif.py            # all four demos
-    python3 tools/make_chat_gif.py en         # one of: en zh-cn zh-tw fc
+    python3 tools/make_chat_gif.py                    # all four demos
+    python3 tools/make_chat_gif.py en zh-tw fc-en     # any subset
 """
 import os
 import shutil
@@ -26,6 +28,8 @@ CMD_OK = "#9ece6a"
 DOC = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "doc")
 
+CHAT = "6.8 tok/s \u00b7 temp 1.0 \u00b7 3 cores"
+
 SPECS = {
     "en": dict(
         out="gemma3-270m-chat-en.gif",
@@ -38,24 +42,9 @@ SPECS = {
         response=("Gravity is a force that pulls things towards each other. "
                   "It's like a giant, invisible hug that keeps us all stuck "
                   "to the ground!"),
-        status="6.8 tok/s \u00b7 temp 1.0 \u00b7 3 cores",
+        status=CHAT,
         font=MONO, wrap="word"),
-    "zh-cn": dict(
-        out="gemma3-270m-chat-zh-cn.gif",
-        title="pulsar \u00b7 gemma-3-270m-it \u00b7 cpu",
-        cmd="$ printf '\u8bf7\u7528\u4e00\u53e5\u8bdd\u89e3\u91ca\u91cf\u5b50"
-            "\u529b\u5b66\u3002\\n' | ./core model.safetensors vocab.bin 2 c"
-            " bpe.bin 1000 950 48",
-        you="> \u8bf7\u7528\u4e00\u53e5\u8bdd\u89e3\u91ca\u91cf\u5b50\u529b\u5b66\u3002",
-        tpl="tpl: 17 105 2364 107 238350 237105 237009 76911 55118 199311 "
-            "237473 237393 236924 106 107 105 4368 107",
-        response="\u91cf\u5b50\u529b\u5b66\u63cf\u8ff0\u7684\u662f\u5fae\u89c2"
-                 "\u4e16\u754c\u548c\u91cf\u5b50\u4e16\u754c\u4e4b\u95f4\u7684"
-                 "\u76f8\u4e92\u4f5c\u7528\uff0c\u662f\u7269\u7406\u5b66\u4e2d"
-                 "\u6700\u590d\u6742\u548c\u98a0\u8986\u6027\u7684\u7406\u8bba"
-                 "\u3002",
-        status="6.8 token/s \u00b7 temp 1.0 \u00b7 3 \u6838\u5fc3",
-        font=CJK, wrap="char"),
+
     "zh-tw": dict(
         out="gemma3-270m-chat-zh-tw.gif",
         title="pulsar \u00b7 gemma-3-270m-it \u00b7 cpu",
@@ -73,12 +62,16 @@ SPECS = {
                  "\u7684\u539f\u7406\u3002",
         status="6.8 token/s \u00b7 temp 1.0 \u00b7 3 \u6838\u5fc3",
         font=CJK, wrap="char"),
-    "fc": dict(
-        out="functiongemma-toolcall.gif",
+
+    "fc-en": dict(
+        out="functiongemma-toolcall-en.gif",
         title="pulsar \u00b7 functiongemma-270m-it \u00b7 cpu",
         cmd="$ ./core model.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16"
-            " < tool.txt   # official FC example prompt (98 ids)",
+            " < tool_official.txt",
         you=None,
+        note="# prompt file = official FunctionGemma example"
+             " (developer turn + tool schema)",
+        user_note="# user turn: What's the temperature in London?",
         tpl="tpl: 98 2 105 55060 107 3048 659 496 2028 600 740 776 1292 11687 "
             "607 506 2269 5151 46 163688 236787 828 236779 4002 236779 27495 "
             "236782 7777 236787 52 81113 506 1873 4022 573 496 2238 4563 "
@@ -90,6 +83,28 @@ SPECS = {
         response="call:get_current_temperature{location:London}",
         status="file mode \u00b7 greedy \u00b7 cap 16",
         font=MONO, wrap="word"),
+
+    "fc-zh-tw": dict(
+        out="functiongemma-toolcall-zh-tw.gif",
+        title="pulsar \u00b7 functiongemma-270m-it \u00b7 cpu",
+        cmd="$ ./core model.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16"
+            " < tool_official_zhtw.txt",
+        you=None,
+        note="# \u540c\u4e00\u500b schema\uff0c\u554f\u984c\u63db\u6210"
+             " zh-TW",
+        user_note="# user turn: \u5011\u6566\u7684\u6eab\u5ea6\u662f\u591a"
+                  "\u5c11\uff1f",
+        tpl="tpl: 96 2 105 55060 107 3048 659 496 2028 600 740 776 1292 11687 "
+            "607 506 2269 5151 46 163688 236787 828 236779 4002 236779 27495 "
+            "236782 7777 236787 52 81113 506 1873 4022 573 496 2238 4563 "
+            "236761 52 236764 19031 29616 15921 29616 7125 29616 7777 236787 "
+            "52 818 3207 1463 236764 545 236761 236759 236761 5054 14322 52 "
+            "236764 2084 236787 52 35410 52 5237 15979 24845 52 7125 52 1604 "
+            "2084 236787 52 60688 52 1807 47 106 107 105 2364 107 241849 "
+            "241281 236918 190519 187330 237536 106 107 105 4368 107",
+        response="call:get_current_temperature{location:London}",
+        status="file mode \u00b7 greedy \u00b7 cap 16",
+        font=CJK, wrap="word"),
 }
 
 
@@ -127,11 +142,19 @@ def render(name, spec, out_dir=DOC):
     text_w = w - 2 * pad
     mid_px = font.getlength("model> ")
 
+    # `#`-prefixed rows are labels (never printed by the engine); everything
+    # else is the engine's own bytes.
     head = [(t, 0.0, DIM)
             for t in wrap(spec["cmd"], font, text_w, "word")]
-    you_rows = head if not spec["you"] else head + [(spec["you"], 0.0, PROMPT_COL)]
-    tpl_rows = you_rows + [(t, 0.0, DIM)
-                           for t in wrap(spec["tpl"], font, text_w, "word")]
+    you_rows = head if not spec["you"] else head + [(spec["you"], 0.0,
+                                                     PROMPT_COL)]
+    label_rows = list(you_rows)
+    for key in ("note", "user_note"):
+        if spec.get(key):
+            label_rows += [(t, 0.0, DIM)
+                           for t in wrap(spec[key], font, text_w, "word")]
+    tpl_rows = label_rows + [(t, 0.0, DIM)
+                             for t in wrap(spec["tpl"], font, text_w, "word")]
 
     full = wrap(spec["response"], font, text_w - mid_px, spec["wrap"])
     max_rows = (h - 46 - top) // lh - 3
@@ -139,8 +162,8 @@ def render(name, spec, out_dir=DOC):
     def compose(body):
         rows = tpl_rows + [("", 0.0, FG)] + body
         if len(rows) > max_rows:
-            rows = rows[:len(tpl_rows) if len(tpl_rows) <= 3 else 3] + \
-                rows[len(rows) - (max_rows - 3):]
+            keep = min(len(tpl_rows), 6)
+            rows = rows[:keep] + rows[len(rows) - (max_rows - keep):]
         return rows
 
     tmp = tempfile.mkdtemp(prefix="pulsar_demo")
@@ -184,7 +207,8 @@ def render(name, spec, out_dir=DOC):
                [(t, mid_px, FG) for t in blines[1:]]
         for f in range(2):
             frame(compose(body), spec["status"], f == 1)
-    body = [("model> " + full[0], 0.0, FG)] + [(t, mid_px, FG) for t in full[1:]]
+    body = [("model> " + full[0], 0.0, FG)] + [(t, mid_px, FG)
+                                               for t in full[1:]]
     for _ in range(3 * fps):
         frame(compose(body), spec["status"], False)
 

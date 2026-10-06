@@ -1,7 +1,7 @@
-"""Render the Chinese 270m chat demo GIFs, simplified + traditional.
+"""Render the Chinese 270m chat demo GIF (zh-TW), compat entry point.
 
-Both transcripts live in make_chat_gif.SPECS (zh-cn, zh-tw); render everything
-with `python3 tools/make_chat_gif.py`.
+The transcript lives in make_chat_gif.SPECS["zh-tw"]; render everything with
+`python3 tools/make_chat_gif.py`.
 """
 import os
 import sys
@@ -12,5 +12,4 @@ from make_chat_gif import DOC, SPECS, render  # noqa: E402
 
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else DOC
-    for name in ("zh-cn", "zh-tw"):
-        render(name, SPECS[name], out)
+    render("zh-tw", SPECS["zh-tw"], out)

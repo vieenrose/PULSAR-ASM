@@ -47,26 +47,28 @@ cd pulsar_arm/asm && as -o core.o core.S && ld -static -o core core.o
 
 Every frame is a real run on the Pi: prompt, `tpl:` ids and response are the
 engine's own bytes, and the status line carries that session's measured rate.
-Only pacing is libertied (fixed-cadence reveal, as in pulsar_asm's
-`make_demo_gif.py`).
+Lines marked `#` are labels (the engine never prints them). Only pacing is
+libertied (fixed-cadence reveal, as in pulsar_asm's `make_demo_gif.py`).
 
 ![270m chat demo](doc/gemma3-270m-chat-en.gif)
-![270m chat demo, Simplified Chinese](doc/gemma3-270m-chat-zh-cn.gif)
 ![270m chat demo, Traditional Chinese](doc/gemma3-270m-chat-zh-tw.gif)
 
 ```
 printf 'Explain gravity in two sentences for a child.\n' | ./core model.safetensors vocab.bin 2 c bpe.bin 1000 950 48
-printf '请用一句话解释量子力学。\n'             | ./core model.safetensors vocab.bin 2 c bpe.bin 1000 950 48
-printf '請用一句話解釋什麼是量子力學。\n'        | ./core model.safetensors vocab.bin 2 c bpe.bin 1000 950 48
+printf '請用一句話解釋什麼是量子力學。\n'                 | ./core model.safetensors vocab.bin 2 c bpe.bin 1000 950 48
 ```
 
-FunctionGemma-270m-it emits a real tool call on the official example prompt
-(file mode, greedy, cap 16):
+FunctionGemma-270m-it turns both an English and a Traditional-Chinese question
+into the same tool call (file mode, greedy, cap 16 — the same schema in both
+prompt files, only the user turn changes):
 
-![FunctionGemma tool call](doc/functiongemma-toolcall.gif)
+![FunctionGemma tool call, English prompt](doc/functiongemma-toolcall-en.gif)
+![FunctionGemma tool call, zh-TW prompt](doc/functiongemma-toolcall-zh-tw.gif)
 
 ```
-./core functiongemma.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16 < tool.txt
+python3 pulsar_arm/tools/fc_write.py    # -> /tmp/tool_official.txt, /tmp/tool_official_zhtw.txt
+./core functiongemma.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16 < /tmp/tool_official.txt
+./core functiongemma.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16 < /tmp/tool_official_zhtw.txt
 ```
 
 Re-render all four: `python3 pulsar_arm/tools/make_chat_gif.py` (PIL + ffmpeg).
