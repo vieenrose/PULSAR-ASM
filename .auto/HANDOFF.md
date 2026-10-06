@@ -1,6 +1,7 @@
 # HANDOFF — Bonsai (Qwen3 + ternary) runtime on the Pi 4
 
-Branch **`bonsai-rpi4`** @ `05f7469` (tracks `fork/bonsai-rpi4`), tree clean.
+Branch **`bonsai-rpi4`** @ `946dd19` (tracks `fork/bonsai-rpi4`; the `auto:` handoff
+commits land on top of it), tree clean.
 `gemma-3-rpi4` is the Gemma-only branch (tip `84e3fe0`); last Gemma-only commit
 before the Bonsai prep is `c91433a` if strict separation is ever wanted.
 
@@ -20,6 +21,8 @@ each checkpoint's **ceiling prompt** and present it in the README with a demo GI
 | Python oracle | `tools/q2_0_ref.py`, both dtypes; argmax `12095` = `' Paris'` on 1.7B **and** 4B |
 | ternary GEMV C reference | `kernels/ternary_gemv.c` — 4.4e-06…5.2e-05 vs oracle on 8 fixtures |
 | ternary GEMV asm | `asm/ternary_gemv.S` — **bit-identical to C** on 8 fixtures (`tests/test_ternary_asm.c`, `tests/mk_syn_ternary.py`, PTGV fixtures) |
+| ternary row gather asm | `embed_row_b3` in the same file — 0 bit-diff vs the C mirror and vs an independent fp64 dequantise (`tests/test_ternary_row.c`) |
+| arch dispatch in the engine | `gemv_arch` / `embed_arch`: gemma3 reaches the same kernels with the same arguments (L0 + bench ids diff-empty at every step) |
 | SwiGLU C reference | `kernels/neon_ops.c` `silu_mul_f32` — 5.8e-08 vs double reference, tails exact |
 | tokenizer front-end | `tools/qwen_ids.py` — `"The capital of France is"` → `785 6722 315 9625 374`; `--chat` emits the Qwen3 template |
 
@@ -27,6 +30,10 @@ Engine substeps landed, each with the Gemma gate green (`L0 IDENTICAL`,
 `IDS IDENTICAL`) and `bonsai_b3.bin` refusing cleanly (exit 2):
 
 ```
+946dd19 engine: ternary embedding row gather (embed_row_b3) + its test
+68dd461 engine: ternary GEMV at the tied head
+4c35949 engine: ternary GEMV at the MLP projections (gate/up/down)
+d75cae3 engine: ternary GEMV linked into the build, dispatched at q/k/v/o
 05f7469 auto: METRIC drift resolved by same-job A/B (drift, not regression)
 dafd0d4 engine: SwiGLU for qwen3 (silu_mul_f32 + arch branch at the 2 call sites)
 84e3fe0 engine: arch-dependent norm fold (plain w vs 1+w, in fold_vec)
@@ -54,9 +61,20 @@ dafd0d4 engine: SwiGLU for qwen3 (silu_mul_f32 + arch branch at the 2 call sites
    embedding is ternary too (`embed_tokens.weight` `[151669, 2048]` B3_128) — it
    is a row gather, so a ternary gather, not a GEMV. Metadata also carries
    `pulsar.ternary_group: 128` and `pulsar.pack: 1`.
-2. **wire `asm/ternary_gemv.S`** (already at C parity) into q/k/v/o, gate/up/down,
-   the embedding row gather and the tied head. `gemv_bf16` (core.S:328) is the
-   call shape to mirror. Prefer the mask-based add path (ternary is memory-bound).
+2. **~~wire `asm/ternary_gemv.S`~~ — done (commits `d75cae3..946dd19`).** Every
+   weight read in both forward bodies dispatches on `G_ARCH` now: `gemv_arch`
+   (same args as `gemv_bf16`) tail-branches to `gemv_bf16` for gemma3 and calls
+   `ternary_gemv_b3` for a blob; `embed_arch` does the same for the embedding,
+   where the ternary path is `embed_row_b3` (a row gather — a GEMV over the tied
+   table would sweep 151669 rows for one token). Row counts moved from literals
+   to cells so both arches are honest: `G_QDIM`/`G_KVDIM` default to the gemma3
+   1024/256 and the blob branch recomputes them as `n_head*head_dim` /
+   `n_kv*head_dim`; `pulsar.ternary_group != 128` now refuses (exit 2) instead
+   of mis-reading every group. **`core.S` ends with `.include "ternary_gemv.S"`**, so
+   a build needs both files in the build directory (see the recipe below) and the
+   engine assembles the same bytes the kernel test does. Still unmeasured: speed
+   — this is the reference scalar decode, and the mask-based/243-entry-table
+   path from the plan is the follow-up that decides whether ~99 ms/token holds.
 3. **attention generalisation** — `rope_half` (core.S:1680) and
    `attn_scores_f32` (core.S:1806) plus the two forward bodies (G_SQRT uses at
    1189/1349, G_HIDB at 1163/1345): kv head = `j/(n_head/n_kv)`, rope pairs
@@ -85,14 +103,24 @@ dafd0d4 engine: SwiGLU for qwen3 (silu_mul_f32 + arch branch at the 2 call sites
 - tools copies `~/q2_0_ref.py`, `~/q2_0_gguf.py`, `~/qwen_ids.py`
 - oracle logs `/tmp/oracle_test.log`, `/tmp/oracle4b_b3.log`; fixtures `/tmp/tv_*.tv`, `/tmp/syn_*.tv`
 - binaries `core_p5` (pre-arch reference), `core_arch{2..6}`, `test_tgv`, `test_silu`
+- build/gate work dir `~/pw` (used by the recipe below) with `bin_gemma.sh` /
+  `bin_bonsai.sh` wrappers and the kernel tests `test_ternary_row`, `test_tgv3`
 
-Build (the x86 box cannot assemble aarch64 — always build on the Pi):
+Build (the x86 box cannot assemble aarch64 — always build on the Pi). `core.S`
+now `.include`s `ternary_gemv.S`, so **copy both**; a missing include fails
+loudly at `as`, never silently.
 
 ```sh
-scp pulsar_arm/asm/core.S pi:core_X.S
-ssh pi 'as -o core_X.o core_X.S && ld -static -o core_X core_X.o && echo BUILD_OK'
-ssh pi './core_X $MODEL $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=$?'
-# gate: diff L0 block + bench ids vs the previous /tmp/g*.log, then grep METRIC
+PI=luigi@raspberrypi.tailf63b31.ts.net
+M=/home/luigi/.cache/huggingface/hub/models--google--gemma-3-270m-it-qat-q4_0-unquantized/snapshots/8f726c6a497fd439f0d6f726e52f8e3b439a26e5/model.safetensors
+V=/home/luigi/PULSAR-ARM/pulsar_arm
+mkdir -p pw && scp pulsar_arm/asm/core.S $PI:pw/core_X.S && scp pulsar_arm/asm/ternary_gemv.S $PI:pw/ternary_gemv.S
+ssh $PI 'cd pw && as -o core_X.o core_X.S && ld -static -o core_X core_X.o && echo BUILD_OK'
+ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
+# gate: diff L0 block + bench ids vs the previous /tmp/g*.log (ignore the timing
+# lines), then the blob refusal: ./core_X ~/bonsai_b3.bin <vocab> 2 -> exit 2
+# kernel tests: gcc -O2 -o t test_ternary_row.c ternary_gemv.c ternary_gemv.S -lm
+#               ./t  and  ./t /tmp/tv_*.tv /tmp/syn_*.tv
 ```
 
 ## Facts worth knowing
@@ -116,3 +144,10 @@ ssh pi './core_X $MODEL $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=$?'
 - Absolute ms/token are meaningless across hours: interleave both binaries in one
   job. The 170 vs 147 scare resolved as drift (`core_p5` itself read 169-170).
 - Keep commit messages honest — say when something does not pass yet.
+- **`d8`–`d15` (s8–s15) are callee-saved** in the AArch64 ABI. `embed_row_b3`
+  parked its `escale` argument in `s8`; gcc had hoisted the loop-invariant
+  `(float)escale` into `d8` and the C reference silently received the kernel's
+  leftover group scale — wrong by exactly a factor of it. Use s0–s7 in kernels,
+  or spill to a stack slot. Caught by asm-vs-C *bit*-diff, not by value tolerance.
+- A dispatcher that `bl`s instead of tail-`b`s also needs its own x30 saved
+  (`gemv_arch`/`embed_arch` do). Same class of bug as the kernel's first draft.
