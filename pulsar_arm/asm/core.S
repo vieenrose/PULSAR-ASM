@@ -5152,9 +5152,7 @@ file_gloop:
     mov w0, w23
     bl fwd_token
     bl sampler
-    cbnz x22, 0f                 // first iter only
-    bl top8_debug                // x19+ untouched by top8 (it saves them) ✓
-0:  mov w23, w0                  // tok
+    mov w23, w0                  // tok
     mov w23, w0                  // tok                  // tok
     cmp w23, #1
     b.eq file_end                // eos
@@ -5173,40 +5171,3 @@ file_bye:
 
     .section .text
     .align 2
-
-    .section .rodata
-t_top8:     .asciz "top8: "
-
-    .section .text
-    .align 2
-/* top8_debug: TKIDX[k], TKVAL[k] for k=0..7. x19/x20 bases, x21 counter. */
-top8_debug:
-    str x30, [sp, #-16]!
-    stp x19, x20, [sp, #-16]!
-    str x21, [sp, #-16]!
-    adrp x0, t_top8
-    add x0, x0, :lo12:t_top8
-    bl print_cstr
-    adrp x19, TKIDX
-    add x19, x19, :lo12:TKIDX
-    adrp x20, TKVAL
-    add x20, x20, :lo12:TKVAL
-    mov x21, #0
-0:  cmp x21, #8
-    b.hs 1f
-    ldr w0, [x19, x21, lsl #2]   // id
-    str x0, [sp, #-16]!
-    ldr s0, [x20, x21, lsl #2]   // prob (s0 survives print_u64? prints use GPRs only -> yes ✓)
-    str x0, [sp, #-16]!          // id
-    bl print_u64                 // prints use x0-x9 (no FP) -> s0 intact ✓
-    bl print_sp
-    ldr x0, [sp], #16
-    bl print_f32                 // print s0 (prob)
-    bl print_sp
-    add x21, x21, #1
-    b 0b
-1:  bl print_nl
-    ldr x21, [sp], #16
-    ldp x19, x20, [sp], #16
-    ldr x30, [sp], #16
-    ret

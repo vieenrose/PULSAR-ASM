@@ -1,0 +1,3 @@
+/bin/bash: line 1:  6378 Segmentation fault      timeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin 1000 950 < /tmp/tool_official.txt > /tmp/t3.log 2>&1
+EXIT=139
+top8: 0 0.0000000 0 0.0000000 0 0.0000000 0 0.0000000 0 0.0000000 0 0.0000000 0 0.0000000 0 0.0000000 

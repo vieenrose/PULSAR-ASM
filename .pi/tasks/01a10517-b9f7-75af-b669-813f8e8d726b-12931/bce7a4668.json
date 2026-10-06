@@ -1,0 +1,28 @@
+{
+  "id": "bce7a4668",
+  "name": "Engine top8 on FC prompt",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin 1000 950 < /tmp/tool_official.txt > /tmp/t3.log 2>&1; echo EXIT=$?; grep -a \"^top8:\" /tmp/t3.log | head -1 | cut -c1-170'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bce7a4668.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791262354667,
+  "endTime": 1791262370158,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 131400,
+  "bytesWritten": 310,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
