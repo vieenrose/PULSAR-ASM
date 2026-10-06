@@ -100,7 +100,7 @@ def main():
     base = (data_start + 31) & ~31
     # verify offset basis: first Q4_0 block's scale must be sane fp16
     # (nonzero, finite exponent). Catches wrong base/offset interpretation.
-    q0 = next(n for n in names if found[n][2] == 2)
+    q0 = next(n for n in names if found[n][2] in (2, 8))
     off0 = found[q0][0]
     b.seek(base + off0)
     sc = struct.unpack("<H", b.read(2))[0]
