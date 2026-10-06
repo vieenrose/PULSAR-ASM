@@ -5068,6 +5068,26 @@ file_run:
     mov w3, #512
     bl encode                    // w0 = n (preserves x19+ ✓)
     mov x21, x0                  // n
+    // transparency: print prefill ids (verify vs HF tokenizer)
+    adrp x0, t_tpl
+    add x0, x0, :lo12:t_tpl
+    bl print_cstr
+    mov x0, x21
+    bl print_u64
+    bl print_sp
+    adrp x22, ENC_OUT
+    add x22, x22, :lo12:ENC_OUT  // x22 free? prefill not started ✓ (x22=i later, set in file_prefill ✓ SAFE)
+    mov w23, #0                  // k (w23 free? tok set later ✓ SAFE)
+file_pl:
+    cmp w23, w21
+    b.hs file_pd
+    ldr w0, [x22, x23, lsl #2]
+    bl print_u64                 // (x21/x22/w23 safe? prints x0-x9 ✓)
+    bl print_sp
+    add w23, w23, #1
+    b file_pl
+file_pd:
+    bl print_nl
     mov x19, #0                  // pos = 0
     // capacity: n + gencap <= 480?
     adrp x0, G_GENCAP

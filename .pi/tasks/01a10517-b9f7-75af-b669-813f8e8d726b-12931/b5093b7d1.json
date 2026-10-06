@@ -1,0 +1,28 @@
+{
+  "id": "b5093b7d1",
+  "name": "Official tool-call run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm && /home/luigi/pulsar-rpi/v/bin/python -u -c \"open(\\\"/tmp/toolo.txt\\\",\\\"w\\\").write(\\\"<bos><start_of_turn>developer\\nYou are a model that can do function calling with the following functions<start_function_declaration>declaration:get_current_temperature{description:<escape>Gets the current temperature for a given location.<escape>,parameters:{properties:{location:{description:<escape>The city name, e.g. San Francisco<escape>,type:<escape>STRING<escape>}},required:[<escape>location<escape>],type:<escape>OBJECT<escape>}}<end_function_declaration><end_of_turn>\\n<start_of_turn>user\\nWhat is the temperature in London?<end_of_turn>\\n<start_of_turn>model\\n\\\")\" && wc -c /tmp/toolo.txt && cd asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/toolo.txt > /tmp/toolo.log 2>&1; echo EXIT=$?; tail -8 /tmp/toolo.log | cut -c1-70'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b5093b7d1.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791255239479,
+  "endTime": 1791255267683,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 124388,
+  "bytesWritten": 86,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
