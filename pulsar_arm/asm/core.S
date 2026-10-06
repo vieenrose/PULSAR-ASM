@@ -5011,25 +5011,25 @@ J_f:         .skip 8
     .section .text
     .align 2
 /* read_all: read stdin to INBUF until EOF/full. Returns w0 = len (0 = empty).
- * Chunk reads (single-shot, no line logic). x1=cursor, w2=len, x4=cap.
- * Uses x0-x4. Leaf (callers hold x19+ ✓). */
+ * x1=cursor, x2=COUNT (kernel count reg!), w4=len, w3=cap (reloaded per iter).
+ * Uses x0-x4. Leaf. */
 read_all:
     adrp x1, INBUF
     add x1, x1, :lo12:INBUF      // cursor
-    mov w2, #0                   // len
-    mov x4, #4095                // cap
-0:  cmp x2, x4
-    b.hs 1f                      // full -> done (x2=len, zero-extended ✓)
+    mov w4, #0                   // len
+0:  mov w3, #4095                // cap (fresh; no preservation assumptions)
+    cmp w4, w3
+    b.hs 1f                      // full -> done
     mov x0, #0                   // fd
-    sub x3, x4, x2               // remaining
+    sub x2, x3, x4               // count = cap-len (x2! kernel reads x2)
     mov x8, #63                  // read
-    svc #0                       // n (x1=cursor, x2=len, x4=cap preserved? SVC preserves x1-x7 ✓ only x0 = return)
+    svc #0                       // n (x1/x2/x4 survive? x1 proven by readline; x2(count)/x4(len) recomputed/advanced below from RETURNED n only... x4 MUST survive (len accumulates)! readline proves w-len survives SVC ✓ same pattern. x2 recomputed per iter ✓ immune.)
     cmp x0, #0
     b.le 1f                      // EOF/error -> done
     add x1, x1, x0               // cursor += n
-    add w2, w2, w0               // len += n (w0 = n < 4096 ✓ fits)
+    add w4, w4, w0               // len += n
     b 0b
-1:  mov w0, w2
+1:  mov w0, w4
     ret
 /* file_run: raw-prefill one-shot. INBUF=len via read_all; encode; prefill
  * (no bos/template; prompt carries its own controls); gen; print; exit.
@@ -5039,8 +5039,10 @@ file_run:
     stp x19, x20, [sp, #-16]!
     stp x21, x22, [sp, #-16]!
     str x23, [sp, #-16]!
-    bl read_all                  // w0 = len (uses x0-x4; x19+ safe? read_all is leaf x0-x4 ✓ SAFE)
-    cbz w0, file_bye             // empty -> exit 0
+    bl read_all                  // w0 = len
+    mov x19, x0                  // hold len (x19 free until pos set ✓)
+    cbz x19, file_bye            // empty -> exit 0
+    mov x0, x19                  // len -- WAIT x0=len (just restored ✓). But cbz AFTER prints (prints ran even for len 0 (shows 0, fine, then bye ✓).
     mov x1, x0                   // len
     adrp x0, INBUF
     add x0, x0, :lo12:INBUF

@@ -1,0 +1,28 @@
+{
+  "id": "bb91aaaa0",
+  "name": "First tool-call run",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm && /home/luigi/pulsar-rpi/v/bin/python -u -c \"open(\\\"/tmp/tool1.txt\\\",\\\"w\\\").write(\\\"<bos><start_of_turn>developer\\nYou can call these functions: get_current_temperature(location: string) - Gets the current temperature for a given location.\\n<end_of_turn>\\n<start_of_turn>user\\nWhat is the temperature in Paris?\\n<end_of_turn>\\n<start_of_turn>model\\n\\\")\" && wc -c /tmp/tool1.txt && cd asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/tool1.txt > /tmp/tool1.log 2>&1; echo EXIT=$?; tail -8 /tmp/tool1.log | cut -c1-70'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/bb91aaaa0.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791254801163,
+  "endTime": 1791254802237,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 123878,
+  "bytesWritten": 86,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
