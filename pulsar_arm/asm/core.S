@@ -1229,6 +1229,22 @@ file_stage:
     adrp x0, G_TERN
     add x0, x0, :lo12:G_TERN
     str x2, [x0]
+    mov x2, #13                  // 13 tensors per layer in a safetensors file
+    adrp x0, G_TSLOT
+    add x0, x0, :lo12:G_TSLOT
+    str x2, [x0]
+    adrp x0, WK
+    add x0, x0, :lo12:WK
+    adrp x1, wkt_g
+    add x1, x1, :lo12:wkt_g
+    mov x2, #9
+    bl tbl8
+    adrp x0, NKIND
+    add x0, x0, :lo12:NKIND
+    adrp x1, nkt_g
+    add x1, x1, :lo12:nkt_g
+    mov x2, #6
+    bl tbl8
     bl geom_cells
     // embed scale = sqrt(hidden): table for the known checkpoints, fsqrt else
     adrp x0, G_HID
@@ -1417,6 +1433,22 @@ f_anchors_fixed:
     // projection row counts from the blob geometry (1.7B: 16x128 / 8x128).
     // Qwen3 has no sliding window and every layer attends over the whole
     // context, bounded by the disclosed 1024-position cache cap.
+    mov x2, #11                  // 11 tensors per layer in a pulsar blob
+    adrp x0, G_TSLOT
+    add x0, x0, :lo12:G_TSLOT
+    str x2, [x0]
+    adrp x0, WK
+    add x0, x0, :lo12:WK
+    adrp x1, wkt_b
+    add x1, x1, :lo12:wkt_b
+    mov x2, #9
+    bl tbl8
+    adrp x0, NKIND
+    add x0, x0, :lo12:NKIND
+    adrp x1, nkt_b
+    add x1, x1, :lo12:nkt_b
+    mov x2, #6
+    bl tbl8
     mov x2, #0
     adrp x0, G_WIN
     add x0, x0, :lo12:G_WIN
@@ -1516,6 +1548,38 @@ f_grp_ok:
     ldr x0, [x1]
     bl print_u64
     bl print_nl
+    // and the tensor-table maps, so the slot arithmetic this arch will use is
+    // checkable from the log: tensors per layer, then the 7 projection kinds,
+    // then the two global slots, then the 6 norm kinds.
+    adrp x0, t_tslot
+    add x0, x0, :lo12:t_tslot
+    bl print_cstr
+    adrp x1, G_TSLOT
+    add x1, x1, :lo12:G_TSLOT
+    ldr x0, [x1]
+    bl print_u64
+    bl print_sp
+    mov x25, #0
+bsk_wk:
+    adrp x1, WK
+    add x1, x1, :lo12:WK
+    ldr x0, [x1, x25, lsl #3]
+    bl print_u64
+    bl print_sp
+    add x25, x25, #1
+    cmp x25, #9
+    b.lt bsk_wk
+    mov x25, #0
+bsk_nk:
+    adrp x1, NKIND
+    add x1, x1, :lo12:NKIND
+    ldr x0, [x1, x25, lsl #3]
+    bl print_u64
+    bl print_sp
+    add x25, x25, #1
+    cmp x25, #6
+    b.lt bsk_nk
+    bl print_nl
     adrp x0, ep_arch
     add x0, x0, :lo12:ep_arch
     bl print_cstr
@@ -1591,6 +1655,7 @@ ep_arch:      .asciz "ERROR: only the gemma3 path is implemented; this blob need
 ep_grp:       .asciz "ERROR: unsupported pulsar.ternary_group (the kernel decodes 128)\n"
 t_geom:       .asciz "blob geom q/kv/hd/group: "
 t_geom2:      .asciz "blob geom win/fullmod/cap/kvrow/kstride: "
+t_tslot:      .asciz "blob tensor slots/wk(7+2)/nkind: "
 t_lnt:        .asciz "blob ln(theta): "
 t_dims:      .asciz "dims hid/inter/layers/vocab: "
 t_embed:     .asciz "embed rows cols: "
@@ -3018,6 +3083,9 @@ G_KVROW:     .skip 8                  // KV cache row bytes (n_kv*hd*4)
 G_KSTRIDE:   .skip 8                  // KV cache layer stride bytes
 G_KVCAP:     .skip 8                  // positions kept per layer (gemma 512)
 G_GROUP:     .skip 8                  // query heads per kv head (n_head/n_kv)
+G_TSLOT:     .skip 8                  // tensors per layer in the tensor table
+WK:          .skip 9*8                // q k v o gate up down, then emb, final norm
+NKIND:       .skip 6*8                // tensor kind behind each folded norm slot
 
     .section .text
     .align 2
@@ -3064,8 +3132,8 @@ fold_norms:
     add x20, x20, :lo12:tab      // x20 = tab
     adrp x21, FL
     add x21, x21, :lo12:FL       // x21 = folded base
-    adrp x22, kkind
-    add x22, x22, :lo12:kkind    // kind table
+    adrp x22, NKIND
+    add x22, x22, :lo12:NKIND    // kind table (arch-specific, set by the loader)
     // final norm: slot1 -> FL[0]
     mov x0, #56
     add x24, x20, x0             // slot1 ptr
@@ -3093,9 +3161,11 @@ fold_norms:
     ldr x4, [x4]
     mul x0, x0, x4               // * (HID*4)
     add x1, x21, x0              // dst
-    // src + n from slot 2+13i+k
-    ldrb w3, [x22, x26]          // kind k
-    mov x0, #13
+    // src + n from slot 2 + (tensors per layer)*i + kind
+    ldr x3, [x22, x26, lsl #3]   // kind k
+    adrp x0, G_TSLOT
+    add x0, x0, :lo12:G_TSLOT
+    ldr x0, [x0]
     mul x0, x25, x0
     add x0, x0, x3
     add x0, x0, #2
@@ -3120,7 +3190,19 @@ fold_norms:
     .section .rodata
     .align 3
 d_one:       .double 1.0
-kkind:       .byte 0,1,2,7,8,12
+// Tensor-table kind maps. Both formats are layer-major with the two global
+// tensors first, but gemma3 has 13 tensors per layer (6 norms + 7 projections)
+// and the pulsar blob has 11 (4 norms + 7 projections), and the kind positions
+// inside the block differ. WK's last two entries are the ABSOLUTE slots of the
+// globals, because the safetensors table starts with the embedding and the blob
+// starts with model.norm.weight. NKIND is per folded-norm slot: gemma3's is the
+// old kkind byte table, and for qwen3 the two norm slots it has no tensor for
+// (pre_feedforward, post_feedforward) point at post_attention_layernorm, which
+// is the norm qwen3 puts in front of the MLP.
+wkt_g:       .quad 3,4,5,6,9,10,11, 0, 1
+wkt_b:       .quad 4,0,6,3,8,10,7, 1, 0
+nkt_g:       .quad 0,1,2,7,8,12
+nkt_b:       .quad 2,5,1,9,9,9
 
     .section .bss
     .align 4
@@ -3435,16 +3517,55 @@ geom_cells:
     ldr x30, [sp], #16
     ret
 
-/* wptr: w0 = slot -> x0 = data+off. Uses x0/x1. x19=data (preserved). */
-wptr:
-    mov x1, #56
-    mul x0, x0, x1
+/* wptr is gone: it took an absolute slot index, which is a safetensors-shaped
+ * assumption (and read x19 for the data base). wslot is the one address rule now. */
+/* tbl8: x0 = dst, x1 = src, x2 = count - copy a .quad table into .bss. Used by
+ * the loader for the kind maps. x0-x3 only, no calls, so x30 survives it. */
+tbl8:
+0:  cmp x2, #0
+    b.le 9f
+    ldr x3, [x1], #8
+    str x3, [x0], #8
+    sub x2, x2, #1
+    b 0b
+9:  ret
+
+/* wslot: x0 = which (0 q, 1 k, 2 v, 3 o, 4 gate, 5 up, 6 down, 7 emb, 8 final
+ * norm) -> x0 = that tensor's address in the mapped file. The layer is x23: the
+ * loop counter in fwd_token, forced to 0 in fwd_layer0, which is what lets both
+ * bodies share this. slot = 2 + G_TSLOT*layer + WK[which] for the per-layer
+ * tensors (both formats put the two globals first), and WK[7]/WK[8] carry the
+ * absolute slot for the globals. Replaces the 56-byte stride blocks and the
+ * literal layer-0 slots, which were the same numbers with 13 baked in. x0-x3. */
+wslot:
+    adrp x1, WK
+    add x1, x1, :lo12:WK
+    ldr x2, [x1, x0, lsl #3]
+    cmp x0, #6
+    b.gt 1f
+    adrp x1, G_TSLOT
+    add x1, x1, :lo12:G_TSLOT
+    ldr x1, [x1]
+    mul x1, x23, x1
+    add x2, x2, x1
+    add x2, x2, #2               // the two global tensors come first
+1:  mov x1, #56
+    mul x2, x2, x1
     adrp x1, tab
     add x1, x1, :lo12:tab
-    add x0, x1, x0               // slot addr
-    ldr x1, [x0]                 // off
-    add x0, x19, x1              // data+off
+    add x2, x1, x2
+    ldr x2, [x2]                 // data offset
+    adrp x0, G_base
+    add x0, x0, :lo12:G_base
+    ldr x0, [x0]
+    adrp x1, G_N
+    add x1, x1, :lo12:G_N
+    ldr x1, [x1]
+    add x0, x0, #8
+    add x0, x0, x1               // data base
+    add x0, x0, x2
     ret
+
 /* nptr: w0 = fldidx -> x0 = FL+idx*2560. Uses x0/x1. */
 nptr:
     adrp x1, G_HIDB
@@ -3471,12 +3592,12 @@ fwd_layer0:
     add x19, x19, x0             // x19 = data base
     mov x23, #0                  // this body is layer 0; lay_full reads x23
     // X = embed(tok)
+    mov x0, #7
+    bl wslot                     // x0 = emb (a global tensor, WK[7])
+    mov x1, x0                   // emb
     adrp x0, G_tok
     add x0, x0, :lo12:G_tok
-    ldr w2, [x0]                 // token
-    mov w0, #0
-    bl wptr                      // x0 = emb (slot0)
-    mov x1, x0                   // emb
+    ldr w2, [x0]                 // token - wslot works in x2, so read it after
     adrp x0, XB
     add x0, x0, :lo12:XB
     adrp x5, G_HID
@@ -3518,8 +3639,8 @@ fwd_layer0:
     ldr w2, [x5]
     bl print_sig
     // Q = q-proj(slot5,1024x640) . KV = k-proj(slot6,256x640)
-    mov w0, #5
-    bl wptr
+    mov x0, #0                    // q_proj
+    bl wslot
     mov x2, x0                   // Wq
     adrp x3, FH
     add x3, x3, :lo12:FH
@@ -3532,8 +3653,8 @@ fwd_layer0:
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
     bl gemv_arch
-    mov w0, #6
-    bl wptr
+    mov x0, #1                    // k_proj
+    bl wslot
     mov x2, x0                   // Wk
     adrp x3, FH
     add x3, x3, :lo12:FH
@@ -3602,8 +3723,8 @@ l0kr:
     cmp x25, x0
     b.lt 25b
     // V = v-proj(slot7,256x640) into FV
-    mov w0, #7
-    bl wptr
+    mov x0, #2                    // v_proj
+    bl wslot
     mov x2, x0                   // Wv
     adrp x3, FH
     add x3, x3, :lo12:FH
@@ -3720,8 +3841,8 @@ l0qr:
     mov w2, #1024
     bl print_sig
     // H = o-proj(slot8, 640x1024)
-    mov w0, #8
-    bl wptr
+    mov x0, #3                    // o_proj
+    bl wslot
     mov x2, x0                   // Wo
     adrp x3, FAV
     add x3, x3, :lo12:FAV
@@ -3782,8 +3903,8 @@ l0qr:
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
-    mov w0, #11
-    bl wptr
+    mov x0, #4                    // gate_proj
+    bl wslot
     mov x2, x0                   // Wg
     adrp x3, FH
     add x3, x3, :lo12:FH
@@ -3796,8 +3917,8 @@ l0qr:
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
     bl gemv_arch
-    mov w0, #12
-    bl wptr
+    mov x0, #5                    // up_proj
+    bl wslot
     mov x2, x0                   // Wu
     adrp x3, FH
     add x3, x3, :lo12:FH
@@ -3837,8 +3958,8 @@ l0qr:
     ldr w2, [x5]
     bl print_sig
     // H = down(slot13, 640x2048); H = rmsnorm_add(FL[6]); print D, X2
-    mov w0, #13
-    bl wptr
+    mov x0, #6                    // down_proj
+    bl wslot
     mov x2, x0                   // Wd
     adrp x3, FG
     add x3, x3, :lo12:FG
@@ -3940,9 +4061,10 @@ fwd_token:
     adrp x0, G_pos
     add x0, x0, :lo12:G_pos
     ldr w22, [x0]                // pos
-    // X = embed(tok): emb = data + tab[0].off
-    ldr x0, [x20]                // slot0 off
-    add x1, x19, x0              // emb
+    // X = embed(tok)
+    mov x0, #7
+    bl wslot
+    mov x1, x0                   // emb
     adrp x0, XB
     add x0, x0, :lo12:XB
     mov w2, w9                   // token
@@ -3998,17 +4120,12 @@ fwd_token:
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
-    // Q = q(slot 2+13i+3), KV = k(slot+4)
-    mov x0, #13
-    mul x0, x23, x0
-    add x0, x0, #2               // 2+13i (layer base slot)
-    mov x24, x0                  // base slot (x24: kernels keep x19+? x24 SAFE: kernels use x0-x18 max... VERIFY: gemv x13, scores x15, rest <x14. x24+ SAFE. But fwd must preserve x24 for caller? caller=driver holds tok in w19 only. x24 dead across call. NO SAVE needed... EXCEPT ABI for future. Driver recomputes. FINE.)
-    add x0, x24, #3              // q slot
-    mov x4, #56
-    mul x0, x0, x4
-    add x0, x20, x0
-    ldr x0, [x0]                 // Wq off
-    add x2, x19, x0              // Wq
+    // Q = q_proj of this layer, KV = k_proj. wslot takes the layer from x23 and
+    // the kind from WK, so the base-slot arithmetic (and x24, which only existed
+    // to hold it across the kernels) is gone.
+    mov x0, #0                   // q_proj of this layer
+    bl wslot
+    mov x2, x0                   // Wq
     adrp x3, FH
     add x3, x3, :lo12:FH
     adrp x4, FQ
@@ -4020,12 +4137,9 @@ fwd_token:
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
     bl gemv_arch
-    add x0, x24, #4              // k slot
-    mov x4, #56
-    mul x0, x0, x4
-    add x0, x20, x0
-    ldr x0, [x0]
-    add x2, x19, x0              // Wk
+    mov x0, #1                   // k_proj of this layer
+    bl wslot
+    mov x2, x0                   // Wk
     adrp x3, FH
     add x3, x3, :lo12:FH
     adrp x4, FKV
@@ -4084,12 +4198,9 @@ fwd_kvh:
     cmp x25, x0
     b.lt fwd_kvh
     // V = v-proj(slot base+5, 256x640) -> FV
-    add x0, x24, #5
-    mov x4, #56
-    mul x0, x0, x4
-    add x0, x20, x0
-    ldr x0, [x0]
-    add x2, x19, x0              // Wv
+    mov x0, #2                   // v_proj of this layer
+    bl wslot
+    mov x2, x0                   // Wv
     adrp x3, FH
     add x3, x3, :lo12:FH
     adrp x4, FV
@@ -4257,12 +4368,9 @@ fwd_kvh:
     add w25, w25, #1
     b 43b
 44: // o = gemv(FH, Wo[slot base+6], FAV)
-    add x0, x24, #6
-    mov x4, #56
-    mul x0, x0, x4
-    add x0, x20, x0
-    ldr x0, [x0]
-    add x2, x19, x0              // Wo
+    mov x0, #3                   // o_proj of this layer
+    bl wslot
+    mov x2, x0                   // Wo
     adrp x3, FAV
     add x3, x3, :lo12:FAV
     adrp x4, FH
@@ -4317,12 +4425,9 @@ fwd_kvh:
     ldr s0, [x4]
     bl rmsnorm_f32
     // G = gate(base+9), U = up(base+10)
-    add x0, x24, #9
-    mov x4, #56
-    mul x0, x0, x4
-    add x0, x20, x0
-    ldr x0, [x0]
-    add x2, x19, x0              // Wg
+    mov x0, #4                   // gate_proj of this layer
+    bl wslot
+    mov x2, x0                   // Wgate
     adrp x3, FH
     add x3, x3, :lo12:FH
     adrp x4, FG
@@ -4334,12 +4439,9 @@ fwd_kvh:
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
     bl gemv_arch
-    add x0, x24, #10
-    mov x4, #56
-    mul x0, x0, x4
-    add x0, x20, x0
-    ldr x0, [x0]
-    add x2, x19, x0              // Wu
+    mov x0, #5                   // up_proj of this layer
+    bl wslot
+    mov x2, x0                   // Wup
     adrp x3, FH
     add x3, x3, :lo12:FH
     adrp x4, FU
@@ -4370,12 +4472,9 @@ fwd_kvh:
     bl silu_mul_f32
 112:
     // H = down(base+11); H = rmsnorm_add(FL[6+6i])
-    add x0, x24, #11
-    mov x4, #56
-    mul x0, x0, x4
-    add x0, x20, x0
-    ldr x0, [x0]
-    add x2, x19, x0              // Wd
+    mov x0, #6                   // down_proj of this layer
+    bl wslot
+    mov x2, x0                   // Wdown
     adrp x3, FG
     add x3, x3, :lo12:FG
     adrp x4, FH
@@ -4424,16 +4523,16 @@ fwd_kvh:
     add x4, x4, :lo12:f_eps
     ldr s0, [x4]
     bl rmsnorm_f32
+    mov x0, #7
+    bl wslot
+    mov x2, x0                   // head table = emb (tied weights), taken before
+                                 // x0 becomes the row count below
     adrp x5, G_VOC
     add x5, x5, :lo12:G_VOC
     ldr w0, [x5]
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    adrp x2, tab
-    add x2, x2, :lo12:tab
-    ldr x2, [x2]                 // slot0 off
-    add x2, x19, x2              // head table
     adrp x3, FH
     add x3, x3, :lo12:FH
     adrp x4, LG
