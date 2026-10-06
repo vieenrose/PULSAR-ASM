@@ -1,0 +1,28 @@
+{
+  "id": "b1d31cd51",
+  "name": "Tool-call retry after fix",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/tool1.txt > /tmp/tool2.log 2>&1; echo EXIT=$?; tail -10 /tmp/tool2.log | cut -c1-70'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b1d31cd51.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791255009870,
+  "endTime": 1791255029858,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 124134,
+  "bytesWritten": 74,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

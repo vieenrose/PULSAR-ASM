@@ -4376,7 +4376,7 @@ encode:
     add x0, x0, :lo12:ct_tab
     mov w1, #0                   // entry idx
 ctrl_entry:
-    cmp w1, #4
+    cmp w1, #7
     b.hs ctrl_no                 // no match: normal path
     lsl x2, x1, #4               // idx*16
     add x2, x0, x2               // &entry
@@ -4550,6 +4550,8 @@ et17: .asciz " Hello"
 et18: .asciz "<bos>"
 et19: .asciz "<start_of_turn>Hi<end_of_turn>"
 et20: .asciz "a<eos>b"
+et21: .asciz "<escape>"
+et22: .asciz "<start_function_declaration>x<end_function_declaration>"
 
     .section .text
     .align 2
@@ -4657,6 +4659,12 @@ encode_test:
     bl enc_one
     adrp x0, et20
     add x0, x0, :lo12:et20
+    bl enc_one
+    adrp x0, et21
+    add x0, x0, :lo12:et21
+    bl enc_one
+    adrp x0, et22
+    add x0, x0, :lo12:et22
     bl enc_one
     ldr x30, [sp], #16
     ret
@@ -4990,8 +4998,11 @@ ct_bos:      .ascii "<bos>"
 ct_eos:      .ascii "<eos>"
 ct_eot:      .ascii "<end_of_turn>"
 ct_sot:      .ascii "<start_of_turn>"
+ct_sfd:      .ascii "<start_function_declaration>"
+ct_efd:      .ascii "<end_function_declaration>"
+ct_esc:      .ascii "<escape>"
     .align 3
-ct_tab:       // (ptr, len, id) x4
+ct_tab:       // (ptr, len, id) x7
     .quad ct_bos
     .word 5, 2
     .quad ct_eos
@@ -5000,6 +5011,12 @@ ct_tab:       // (ptr, len, id) x4
     .word 13, 106
     .quad ct_sot
     .word 15, 105
+    .quad ct_esc
+    .word 8, 52
+    .quad ct_efd
+    .word 26, 47
+    .quad ct_sfd
+    .word 28, 46
 
     .section .text
     .align 2
