@@ -388,6 +388,29 @@ gemv_bf16:
     b 0b
 9:  ret
 
+/* gemv_arch: arch-aware GEMV dispatch, same args as gemv_bf16
+ * (w0=M w1=K x2=W x3=x x4=y). gemma3 (G_ARCH = 0) tail-branches straight into
+ * gemv_bf16, so that path runs the instructions it always ran. A pulsar blob
+ * stores its weights as B3_128 blocks, decoded by ternary_gemv_b3, which lives
+ * in asm/ternary_gemv.S and is included at the end of this file: one source of
+ * truth, assembled into the engine and into the standalone kernel test.
+ * The ternary kernel preserves x18+ but uses x16/x17 as temps, and fwd_token
+ * holds the rope cos/sin rows in exactly those registers across these calls,
+ * so they are saved around the ternary call. */
+    .global gemv_arch
+gemv_arch:
+    adrp x8, G_ARCH
+    ldr w8, [x8]
+    cbnz w8, gvw_tern
+    b gemv_bf16
+gvw_tern:
+    str x30, [sp, #-16]!
+    stp x16, x17, [sp, #-16]!
+    bl ternary_gemv_b3
+    ldp x16, x17, [sp], #16
+    ldr x30, [sp], #16
+    ret
+
 /* ---------------- self-tests ---------------- */
 run_tests:
     str x30, [sp, #-16]!
@@ -1170,6 +1193,22 @@ file_stage:
     adrp x0, G_NLAY
     add x0, x0, :lo12:G_NLAY
     str x25, [x0]                // layers found
+    // q/k/v widths and the ternary group size: these are the literals the
+    // gemma3 forward path used before they were cells, so a safetensors run
+    // dispatches to exactly the GEMV shapes it always had. The pulsar branch
+    // below recomputes the two widths from n_head/n_kv x head_dim.
+    mov x2, #1024
+    adrp x0, G_QDIM
+    add x0, x0, :lo12:G_QDIM
+    str x2, [x0]
+    mov x2, #256
+    adrp x0, G_KVDIM
+    add x0, x0, :lo12:G_KVDIM
+    str x2, [x0]
+    mov x2, #128
+    adrp x0, G_TERN
+    add x0, x0, :lo12:G_TERN
+    str x2, [x0]
     // embed scale = sqrt(hidden): table for the known checkpoints, fsqrt else
     adrp x0, G_HID
     add x0, x0, :lo12:G_HID
@@ -1334,6 +1373,11 @@ f_anchors_fixed:
     adrp x1, G_EPS12
     add x1, x1, :lo12:G_EPS12
     bl pget
+    adrp x0, pk_grp
+    add x0, x0, :lo12:pk_grp
+    adrp x1, G_TERN
+    add x1, x1, :lo12:G_TERN
+    bl pget
     adrp x0, G_ARCH
     add x0, x0, :lo12:G_ARCH
     ldr w0, [x0]
@@ -1349,6 +1393,38 @@ f_anchors_fixed:
     adrp x0, G_SQRT
     add x0, x0, :lo12:G_SQRT
     str w2, [x0]
+    // projection row counts from the blob geometry (1.7B: 16x128 / 8x128)
+    adrp x1, G_HD
+    add x1, x1, :lo12:G_HD
+    ldr x3, [x1]
+    adrp x1, G_NHEAD
+    add x1, x1, :lo12:G_NHEAD
+    ldr x2, [x1]
+    mul x2, x2, x3
+    adrp x0, G_QDIM
+    add x0, x0, :lo12:G_QDIM
+    str x2, [x0]
+    adrp x1, G_NKV
+    add x1, x1, :lo12:G_NKV
+    ldr x2, [x1]
+    mul x2, x2, x3
+    adrp x0, G_KVDIM
+    add x0, x0, :lo12:G_KVDIM
+    str x2, [x0]
+    // ternary_gemv_b3 decodes one 128-weight / 28-byte group; a blob packed
+    // differently has to refuse, not mis-run silently.
+    adrp x1, G_TERN
+    add x1, x1, :lo12:G_TERN
+    ldr x2, [x1]
+    cmp x2, #128
+    b.eq f_grp_ok
+    adrp x0, ep_grp
+    add x0, x0, :lo12:ep_grp
+    bl print_cstr
+    mov x0, #2
+    mov x8, #SYS_EXIT
+    svc #0
+f_grp_ok:
     adrp x0, tp_arch
     add x0, x0, :lo12:tp_arch
     bl print_cstr
@@ -1426,8 +1502,10 @@ pk_hd:        .asciz "\"pulsar.head_dim\""
 pk_voc:       .asciz "\"pulsar.vocab\""
 pq_rope:      .asciz "\"pulsar.rope_theta_int\""
 pk_eps:       .asciz "\"pulsar.eps_e12\""
+pk_grp:       .asciz "\"pulsar.ternary_group\""
 tp_arch:      .asciz "pulsar blob arch_id: "
 ep_arch:      .asciz "ERROR: only the gemma3 path is implemented; this blob needs qwen3/ternary\n"
+ep_grp:       .asciz "ERROR: unsupported pulsar.ternary_group (the kernel decodes 128)\n"
 t_dims:      .asciz "dims hid/inter/layers/vocab: "
 t_embed:     .asciz "embed rows cols: "
 t_in0:       .asciz "in_norm0[0..3] = "
@@ -2609,6 +2687,9 @@ G_NKV:       .skip 8                  // qwen3: kv heads
 G_HD:        .skip 8                  // qwen3: head_dim
 G_ROPE_T:    .skip 8                  // qwen3: rope theta (int)
 G_EPS12:     .skip 8                  // qwen3: eps * 1e12 (int)
+G_QDIM:      .skip 8                  // q/o rows: gemma3 1024, qwen3 n_head*hd
+G_KVDIM:     .skip 8                  // k/v rows: gemma3 256, qwen3 n_kv*hd
+G_TERN:      .skip 8                  // pulsar.ternary_group (kernel does 128)
 
     .section .text
     .align 2
@@ -3051,11 +3132,13 @@ fwd_layer0:
     add x3, x3, :lo12:FH
     adrp x4, FQ
     add x4, x4, :lo12:FQ
-    mov w0, #1024
+    adrp x0, G_QDIM              // 1024 on gemma3, n_head*head_dim on a blob
+    add x0, x0, :lo12:G_QDIM
+    ldr w0, [x0]
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     mov w0, #6
     bl wptr
     mov x2, x0                   // Wk
@@ -3063,11 +3146,13 @@ fwd_layer0:
     add x3, x3, :lo12:FH
     adrp x4, FKV
     add x4, x4, :lo12:FKV
-    mov w0, #256
+    adrp x0, G_KVDIM             // 256 on gemma3, n_kv*head_dim on a blob
+    add x0, x0, :lo12:G_KVDIM
+    ldr w0, [x0]
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     // KN = norm(KV) with FL[3]; rope (sliding pos0)
     mov w0, #3
     bl nptr
@@ -3097,11 +3182,13 @@ fwd_layer0:
     add x3, x3, :lo12:FH
     adrp x4, FV
     add x4, x4, :lo12:FV
-    mov w0, #256
+    adrp x0, G_KVDIM
+    add x0, x0, :lo12:G_KVDIM
+    ldr w0, [x0]
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     // heads j=0..3 (w20; kernels keep x19+, print_sig keeps x20)
     mov w20, #0                  // j
 20: cmp w20, #4
@@ -3186,8 +3273,10 @@ fwd_layer0:
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w0, [x5]
-    mov w1, #1024
-    bl gemv_bf16
+    adrp x1, G_QDIM              // K = the q width (1024 on gemma3)
+    add x1, x1, :lo12:G_QDIM
+    ldr w1, [x1]
+    bl gemv_arch
     // H = rmsnorm_add(H, FL[4], H, XB); print POST, X1
     mov w0, #4
     bl nptr
@@ -3466,11 +3555,13 @@ fwd_token:
     add x3, x3, :lo12:FH
     adrp x4, FQ
     add x4, x4, :lo12:FQ
-    mov w0, #1024
+    adrp x0, G_QDIM              // 1024 on gemma3, n_head*head_dim on a blob
+    add x0, x0, :lo12:G_QDIM
+    ldr w0, [x0]
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     add x0, x24, #4              // k slot
     mov x4, #56
     mul x0, x0, x4
@@ -3481,11 +3572,13 @@ fwd_token:
     add x3, x3, :lo12:FH
     adrp x4, FKV
     add x4, x4, :lo12:FKV
-    mov w0, #256
+    adrp x0, G_KVDIM             // 256 on gemma3, n_kv*head_dim on a blob
+    add x0, x0, :lo12:G_KVDIM
+    ldr w0, [x0]
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     // KN = norm(FKV) with FL[3+6i]; rope
     mov x0, #6
     mul x0, x23, x0
@@ -3521,11 +3614,13 @@ fwd_token:
     add x3, x3, :lo12:FH
     adrp x4, FV
     add x4, x4, :lo12:FV
-    mov w0, #256
+    adrp x0, G_KVDIM
+    add x0, x0, :lo12:G_KVDIM
+    ldr w0, [x0]
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w1, [x5]
-    bl gemv_bf16
+    bl gemv_arch
     // Kcache[i][pos] = KN; Vcache[i][pos] = FV(256 floats via FKN? NO: V is in FV!)
     // cache bases: KC + i*524288 (x18 scratch: kernels keep x19+? x18 SAFE (max x15))
     lsl x0, x23, #19             // i*524288
@@ -3679,8 +3774,10 @@ fwd_token:
     adrp x5, G_HID
     add x5, x5, :lo12:G_HID
     ldr w0, [x5]
-    mov w1, #1024
-    bl gemv_bf16
+    adrp x1, G_QDIM              // K = the q width (1024 on gemma3)
+    add x1, x1, :lo12:G_QDIM
+    ldr w1, [x1]
+    bl gemv_arch
     // H = rmsnorm_add(FH, FL[4+6i], FH, XB)
     mov x0, #6
     mul x0, x23, x0
@@ -5543,3 +5640,10 @@ file_bye:
 
     .section .text
     .align 2
+
+/* The ternary GEMV lives in its own file because it is unit-tested standalone
+ * (tests/test_ternary_asm.c + tests/mk_syn_ternary.py against the fixtures from
+ * tools/mkv_ternary_gemv.py). It is included here, at the end of the text, so
+ * the engine and the kernel test assemble the same bytes: a build of the engine
+ * needs ternary_gemv.S next to this file. */
+    .include "ternary_gemv.S"
