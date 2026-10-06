@@ -11,8 +11,8 @@ Sans Mono, and WenQuanYi Zen Hei is used only for CJK glyphs (there is no
 Chinese in DejaVu), at the same size and the same line height.
 
 Run on the Pi:
-    python3 tools/make_chat_gif.py                    # all four demos
-    python3 tools/make_chat_gif.py en zh-tw fc-en     # any subset
+    python3 tools/make_chat_gif.py                          # all six demos
+    python3 tools/make_chat_gif.py 1b-en 1b-zh-tw fc-en   # any subset
 """
 import os
 import shutil
@@ -51,6 +51,31 @@ FC_SYS_LABEL = ("# system prompt, verbatim from tool_official.txt"
                 " (functions / tools are defined here):")
 
 SPECS = {
+    "1b-en": dict(
+        out="gemma3-1b-chat-en.gif",
+        title="pulsar \u00b7 gemma-3-1b-it \u00b7 cpu",
+        cmd="$ printf 'Name three colors.\\n' | ./core"
+            " gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48",
+        you="> Name three colors.",
+        tpl="tpl: 12 105 2364 107 1567 1806 7913 236761 106 107 105 4368 107",
+        response=("Okay, here are three colors:\n\n1.  Blue\n2.  Red\n3.  Green"),
+        status="1.8 tok/s \u00b7 temp 1.0 \u00b7 3 cores",
+        wrap="word"),
+
+    "1b-zh-tw": dict(
+        out="gemma3-1b-chat-zh-tw.gif",
+        title="pulsar \u00b7 gemma-3-1b-it \u00b7 cpu",
+        cmd="$ printf '\u8acb\u5217\u51fa\u4e09\u7a2e\u984f\u8272\u3002\\n'"
+            " | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin"
+            " 1000 950 48",
+        you="> \u8acb\u5217\u51fa\u4e09\u7a2e\u984f\u8272\u3002",
+        tpl="tpl: 15 105 2364 107 239230 238046 237191 237589 238396 158519"
+            " 236924 106 107 105 4368 107",
+        response="\u597d\u7684\uff0c\u9019\u4e09\u7a2e\u984f\u8272\uff1a"
+                 "\n\n1.  \u85cd\u8272\n2.  \u7da0\u8272\n3.  \u7d05\u8272",
+        status="1.8 token/s \u00b7 temp 1.0 \u00b7 3 \u6838\u5fc3",
+        wrap="char"),
+
     "en": dict(
         out="gemma3-270m-chat-en.gif",
         title="pulsar \u00b7 gemma-3-270m-it \u00b7 cpu",
@@ -167,14 +192,15 @@ def wrap(text, tx, width, mode):
     """Wrap `text` to `width` px. word = whitespace split, char = CJK script."""
     out = []
     if mode == "char":
-        line = ""
-        for ch in text:
-            if line and tx.length(line + ch) > width:
-                out.append(line)
-                line = ch
-            else:
-                line += ch
-        out.append(line)
+        for para in text.split("\n"):
+            line = ""
+            for ch in para:
+                if line and tx.length(line + ch) > width:
+                    out.append(line)
+                    line = ch
+                else:
+                    line += ch
+            out.append(line)
         return out
     for para in text.split("\n"):
         line = ""
