@@ -2650,7 +2650,10 @@ tables_test:
     bl print_cstr
     adrp x19, FL
     add x19, x19, :lo12:FL
-    add x19, x19, #2560
+    adrp x1, G_HIDB
+    add x1, x1, :lo12:G_HIDB
+    ldr x1, [x1]
+    add x19, x19, x1
     ldr s0, [x19]
     bl print_f32
     bl print_sp
@@ -2681,7 +2684,9 @@ tables_test:
     add x1, x1, x3               // emb base
     adrp x0, XB
     add x0, x0, :lo12:XB         // out
-    mov w3, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w3, [x5]
     adrp x4, G_SQRT
     add x4, x4, :lo12:G_SQRT
     ldr s0, [x4]                 // scale
@@ -2838,7 +2843,9 @@ fwd_layer0:
     mov x1, x0                   // emb
     adrp x0, XB
     add x0, x0, :lo12:XB
-    mov w3, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w3, [x5]
     adrp x4, G_SQRT
     add x4, x4, :lo12:G_SQRT
     ldr s0, [x4]
@@ -2847,7 +2854,9 @@ fwd_layer0:
     add x0, x0, :lo12:s_X
     adrp x1, XB
     add x1, x1, :lo12:XB
-    mov w2, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w2, [x5]
     bl print_sig
     // H = norm(XB) with FL[1]
     mov w0, #1
@@ -2868,7 +2877,9 @@ fwd_layer0:
     add x0, x0, :lo12:s_H
     adrp x1, FH
     add x1, x1, :lo12:FH
-    mov w2, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w2, [x5]
     bl print_sig
     // Q = q-proj(slot5,1024x640) . KV = k-proj(slot6,256x640)
     mov w0, #5
@@ -3025,7 +3036,9 @@ fwd_layer0:
     add x2, x2, :lo12:FH
     adrp x3, XB
     add x3, x3, :lo12:XB
-    mov w4, #640
+    adrp x6, G_HID
+    add x6, x6, :lo12:G_HID
+    ldr w4, [x6]
     adrp x5, f_eps
     add x5, x5, :lo12:f_eps
     ldr s0, [x5]
@@ -3034,13 +3047,17 @@ fwd_layer0:
     add x0, x0, :lo12:s_POST
     adrp x1, FH
     add x1, x1, :lo12:FH
-    mov w2, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w2, [x5]
     bl print_sig
     adrp x0, s_X1
     add x0, x0, :lo12:s_X1
     adrp x1, XB
     add x1, x1, :lo12:XB
-    mov w2, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w2, [x5]
     bl print_sig
     // H = rmsnorm(FH, FL[5], XB); G = gate(slot11); U = up(slot12)
     mov w0, #5
@@ -3099,7 +3116,9 @@ fwd_layer0:
     add x0, x0, :lo12:s_GG
     adrp x1, FG
     add x1, x1, :lo12:FG
-    mov w2, #2048
+    adrp x5, G_INTER
+    add x5, x5, :lo12:G_INTER
+    ldr w2, [x5]
     bl print_sig
     // H = down(slot13, 640x2048); H = rmsnorm_add(FL[6]); print D, X2
     mov w0, #13
@@ -3125,7 +3144,9 @@ fwd_layer0:
     add x2, x2, :lo12:FH
     adrp x3, XB
     add x3, x3, :lo12:XB
-    mov w4, #640
+    adrp x6, G_HID
+    add x6, x6, :lo12:G_HID
+    ldr w4, [x6]
     adrp x5, f_eps
     add x5, x5, :lo12:f_eps
     ldr s0, [x5]
@@ -3134,13 +3155,17 @@ fwd_layer0:
     add x0, x0, :lo12:s_D
     adrp x1, FH
     add x1, x1, :lo12:FH
-    mov w2, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w2, [x5]
     bl print_sig
     adrp x0, s_X2
     add x0, x0, :lo12:s_X2
     adrp x1, XB
     add x1, x1, :lo12:XB
-    mov w2, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w2, [x5]
     bl print_sig
     ldp x19, x20, [sp], #16
     ldr x30, [sp], #16
@@ -3205,7 +3230,9 @@ fwd_token:
     adrp x0, XB
     add x0, x0, :lo12:XB
     mov w2, w9                   // token
-    mov w3, #640
+    adrp x5, G_HID
+    add x5, x5, :lo12:G_HID
+    ldr w3, [x5]
     adrp x4, G_SQRT
     add x4, x4, :lo12:G_SQRT
     ldr s0, [x4]
@@ -3499,7 +3526,9 @@ fwd_token:
     add x2, x2, :lo12:FH
     adrp x3, XB
     add x3, x3, :lo12:XB
-    mov w4, #640
+    adrp x6, G_HID
+    add x6, x6, :lo12:G_HID
+    ldr w4, [x6]
     adrp x5, f_eps
     add x5, x5, :lo12:f_eps
     ldr s0, [x5]
@@ -3601,7 +3630,9 @@ fwd_token:
     add x2, x2, :lo12:FH
     adrp x3, XB
     add x3, x3, :lo12:XB
-    mov w4, #640
+    adrp x6, G_HID
+    add x6, x6, :lo12:G_HID
+    ldr w4, [x6]
     adrp x5, f_eps
     add x5, x5, :lo12:f_eps
     ldr s0, [x5]
