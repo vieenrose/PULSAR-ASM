@@ -5141,12 +5141,8 @@ file_gloop:
     str w19, [x0]
     mov w0, w23
     bl fwd_token
-    bl sampler                   // (file: TKIDX/TKVAL hold top-64)
-    cbnz x22, 0f                 // DEBUG first iter only
-    str x0, [sp, #-16]!          // save token (top10 clobbers x0)
-    bl top10_debug
-    ldr x0, [sp], #16            // restore token
-0:  mov w23, w0
+    bl sampler
+    mov w23, w0                  // tok
     cmp w23, #1
     b.eq file_end                // eos
     mov x0, x23
@@ -5161,42 +5157,3 @@ file_bye:
     mov x0, #0
     mov x8, #93
     svc #0
-
-    .section .rodata
-t_top10:     .asciz "top10: "
-
-    .section .text
-    .align 2
-/* top10_debug TEMP: prints TKIDX/TKVAL top-10 (id prob). Bulletproof saves. */
-top10_debug:
-    str x30, [sp, #-16]!
-    stp x19, x20, [sp, #-16]!
-    str x21, [sp, #-16]!
-    adrp x0, t_top10
-    add x0, x0, :lo12:t_top10
-    bl print_cstr
-    adrp x19, TKIDX
-    add x19, x19, :lo12:TKIDX
-    adrp x20, TKVAL
-    add x20, x20, :lo12:TKVAL
-    mov x21, #0                  // k (x19+ : print-safe ✓)
-0:  cmp x21, #10
-    b.hs 1f
-    ldr w0, [x19, x21, lsl #2]   // id
-    ldr s0, [x20, x21, lsl #2]   // prob
-    str x0, [sp, #-16]!          // save id (prints clobber x0-x9)
-    str s0, [sp, #-16]!          // save prob
-    ldr x0, [sp, #8]             // id peek
-    bl print_u64
-    bl print_sp
-    ldr s0, [sp]                 // prob peek
-    bl print_f32
-    bl print_sp
-    add sp, sp, #32              // drop id+prob
-    add x21, x21, #1
-    b 0b
-1:  bl print_nl
-    ldr x21, [sp], #16
-    ldp x19, x20, [sp], #16
-    ldr x30, [sp], #16
-    ret

@@ -1,0 +1,28 @@
+{
+  "id": "b3d656cce",
+  "name": "Tool-call with working gen",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~/PULSAR-ARM/pulsar_arm/asm && S=$(echo ~/.cache/huggingface/hub/models--google--functiongemma-270m-it/snapshots/*/model.safetensors) && timeout 200 ./core $S ~/PULSAR-ARM/pulsar_arm/fcvocab.bin 2 f ~/PULSAR-ARM/pulsar_arm/fcbpe.bin < /tmp/tool_official.txt > /tmp/toolo5.log 2>&1; echo EXIT=$?; grep -a \"^top10:\" /tmp/toolo5.log | head -1 | cut -c1-170; tail -6 /tmp/toolo5.log | cut -c1-65'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10517-b9f7-75af-b669-813f8e8d726b-12931/b3d656cce.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791257327421,
+  "endTime": 1791257367028,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 126251,
+  "bytesWritten": 233,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 500,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
