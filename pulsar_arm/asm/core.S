@@ -1486,7 +1486,7 @@ f_grp_ok:
     bl print_u64
     bl print_nl
     // and the rope constant the table builder will use, so ln_f64 is checkable
-    // from the log alone (the refusal means nothing else in this run reads it)
+    // from the log alone
     adrp x0, t_lnt
     add x0, x0, :lo12:t_lnt
     bl print_cstr
@@ -1525,6 +1525,14 @@ f_grp_ok:
     ldr x0, [x1]
     bl print_u64
     bl print_nl
+    // The qwen3/ternary path is live. Anything past arch 1 is still a format
+    // this engine cannot read, and running on it would print numbers instead of
+    // an error, which is the worst possible failure mode here.
+    adrp x0, G_ARCH
+    add x0, x0, :lo12:G_ARCH
+    ldr w0, [x0]
+    cmp w0, #1
+    b.eq f_stage_ret             // arch 1 = qwen3, ternary weights: supported
     adrp x0, ep_arch
     add x0, x0, :lo12:ep_arch
     bl print_cstr
@@ -1596,7 +1604,9 @@ pq_rope:      .asciz "\"pulsar.rope_theta_int\""
 pk_eps:       .asciz "\"pulsar.eps_e12\""
 pk_grp:       .asciz "\"pulsar.ternary_group\""
 tp_arch:      .asciz "pulsar blob arch_id: "
-ep_arch:      .asciz "ERROR: only the gemma3 path is implemented; this blob needs qwen3/ternary\n"
+ep_arch:      .asciz "ERROR: unsupported pulsar.arch_id (this engine reads 0=gemma3, 1=qwen3)\n"
+w_tok:        .asciz "WARN: token id "
+t_tokv:       .asciz " is past the vocab; using row 0, vocab "
 ep_grp:       .asciz "ERROR: unsupported pulsar.ternary_group (the kernel decodes 128)\n"
 t_geom:       .asciz "blob geom q/kv/hd/group: "
 t_geom2:      .asciz "blob geom win/fullmod/cap/kvrow/kstride: "
@@ -3016,7 +3026,8 @@ G_HID:       .skip 8                  // hidden size (270m 640 / 1B 1152)
 G_HIDB:      .skip 8                  // HID*4: FL entry stride and vector bytes
 G_INTER:     .skip 8                  // intermediate size (270m 2048 / 1B 6912)
 G_NLAY:      .skip 8                  // decoder layers (270m 18 / 1B 26)
-G_VOC:       .skip 8                  // vocab (262144 both)
+G_VOC:       .skip 8                  // vocab (262144 gemma3, 151669 qwen3-1.7B)
+G_TWAR:      .skip 8                  // warned about an out-of-range prompt id
 G_SQRT:      .skip 8                  // embed scale sqrt(HID), f32
 G_L0FOUND:   .skip 8                  // scratch: was input_layernorm found?
 G_ARCH:      .skip 8                  // pulsar.arch_id (0 gemma3, 1 qwen3)
@@ -3232,6 +3243,52 @@ XB:          .skip 2560*4
 
     .section .text
     .align 2
+/* tok_guard: keep a token id inside the embedding table.
+ * def_prompt is a gemma3 chat prompt. Fed to a qwen3 blob its 236765 is row
+ * 236765, which is 106 MB into a 376 MB mapping - so instead of failing it
+ * reads some other tensor's bytes as an embedding row and the run prints
+ * plausible-looking text built from a prompt the model never had. On a smaller
+ * blob the same id reads past the end and takes SIGBUS.
+ * A blob should be driven with a qwen prompt (raw-ids mode, next step); this
+ * only makes the mistake loud instead of fatal. w0 = id in, w0 = id out; like
+ * the print helpers it calls, it clobbers x0-x9. It has to keep x30 itself:
+ * print_* leaves its own return address there, and the first version of this
+ * helper "returned" to wherever the last print call was headed.
+ */
+tok_guard:
+    str x30, [sp, #-16]!
+    adrp x8, G_VOC
+    add x8, x8, :lo12:G_VOC
+    ldr w8, [x8]
+    cmp w0, w8
+    b.lo tg_ret
+    adrp x8, G_TWAR
+    add x8, x8, :lo12:G_TWAR
+    ldr w8, [x8]
+    cbnz w8, tg_ret                    // warn once, not 33 times
+    mov w8, #1
+    adrp x9, G_TWAR
+    add x9, x9, :lo12:G_TWAR
+    str w8, [x9]
+    str x0, [sp, #-16]!
+    adrp x0, w_tok
+    add x0, x0, :lo12:w_tok
+    bl print_cstr
+    ldr x0, [sp]
+    bl print_u64
+    adrp x0, t_tokv
+    add x0, x0, :lo12:t_tokv
+    bl print_cstr
+    adrp x0, G_VOC
+    add x0, x0, :lo12:G_VOC
+    ldr x0, [x0]
+    bl print_u64
+    bl print_nl
+    ldr x0, [sp], #16
+    mov w0, #0                         // row 0 beats reading off the mapping
+    tg_ret:
+    ldr x30, [sp], #16
+    ret
 /* tables_test: build tables, print anchors, fold norms, embed. */
 tables_test:
     str x30, [sp, #-16]!
@@ -4604,11 +4661,14 @@ decode_test:
     add x0, x0, :lo12:G_pos
     str w20, [x0]
     ldr w0, [x21, x20, lsl #2]   // prompt[i]
+    bl tok_guard                 // gemma ids are all in range, this is a no-op
     bl fwd_token                 // -> w0 (discard except last)
     add w20, w20, #1
     b 0b
 1:  // timed decode: tok = prompt[7] at pos 8..
-    ldr w19, [x21, #28]          // prompt[7] (x19 survives fwd: saved)
+    ldr w0, [x21, #28]           // prompt[7]
+    bl tok_guard
+    mov w19, w0                  // (x19 survives fwd: saved)
     mrs x0, cntvct_el0
     adrp x1, G_t0
     add x1, x1, :lo12:G_t0
