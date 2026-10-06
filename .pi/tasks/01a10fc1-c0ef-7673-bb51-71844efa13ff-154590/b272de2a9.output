@@ -1,0 +1,5 @@
+DOWNLOADED /home/luigi/.cache/huggingface/hub/models--prism-ml--Ternary-Bonsai-1.7B-gguf/snapshots/983b5dec2ff16aab79990711ba0f828a499a7e6a/Ternary-Bonsai-1.7B-Q2_0.gguf
+total 12
+drwxr-xr-x 2 luigi luigi 4096 Oct  6 18:21 .
+drwxr-xr-x 3 luigi luigi 4096 Oct  6 18:20 ..
+lrwxrwxrwx 1 luigi luigi   76 Oct  6 18:21 Ternary-Bonsai-1.7B-Q2_0.gguf -> ../../blobs/d97d94eb564590c9f0300e54d3f87bbbb25a78693d0ade9f6e177973dcb8228a

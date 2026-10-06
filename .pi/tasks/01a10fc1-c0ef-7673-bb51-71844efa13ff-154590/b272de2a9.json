@@ -1,0 +1,29 @@
+{
+  "id": "b272de2a9",
+  "name": "Download Bonsai 1.7B Q2_0",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net '/home/luigi/pulsar-rpi/v/bin/python -c \"\nfrom huggingface_hub import hf_hub_download\np = hf_hub_download(\\\"prism-ml/Ternary-Bonsai-1.7B-gguf\\\", \\\"Ternary-Bonsai-1.7B-Q2_0.gguf\\\")\nprint(\\\"DOWNLOADED\\\", p)\n\"; ls -la ~/.cache/huggingface/hub/models--prism-ml--Ternary-Bonsai-1.7B-gguf/snapshots/*/ 2>/dev/null'",
+  "description": "Fetch Ternary-Bonsai-1.7B Q2_0 GGUF (463 MB) to the Pi cache",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a10fc1-c0ef-7673-bb51-71844efa13ff-154590/b272de2a9.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791282052149,
+  "endTime": 1791282106447,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 165858,
+  "bytesWritten": 423,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
