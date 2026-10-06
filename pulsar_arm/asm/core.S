@@ -1775,6 +1775,32 @@ gelu_mul_f32:
 1:  ldr x30, [sp], #16
     ret
 
+/* silu_mul_f32(out,x0 x,x1 mult,x2 n,w3). Qwen3 SwiGLU: x/(1+exp(-x)) * mult.
+ * Mirrors gelu_mul_f32; expf_asm clobbers x9/x10 and s0-s4, so the index is
+ * saved across the call and the constants are loaded after it. */
+    .global silu_mul_f32
+silu_mul_f32:
+    str x30, [sp, #-16]!
+    mov w9, #0
+0:  cmp w9, w3
+    b.hs 1f
+    str x9, [sp, #-16]!
+    ldr s0, [x1, x9, lsl #2]     // v
+    fneg s0, s0                  // -v
+    bl expf_asm                  // s0 = exp(-v)
+    fmov s1, #1.0
+    fadd s0, s0, s1              // 1 + exp(-v)
+    ldr x9, [sp], #16
+    ldr s1, [x1, x9, lsl #2]     // v
+    fdiv s1, s1, s0              // silu(v)
+    ldr s2, [x2, x9, lsl #2]
+    fmul s1, s1, s2
+    str s1, [x0, x9, lsl #2]
+    add w9, w9, #1
+    b 0b
+1:  ldr x30, [sp], #16
+    ret
+
 /* attn_scores_f32(s,x0 q,x1 K,x2 n,w3 hd,w4 scale,s0). NEON dots, C order. */
     .global attn_scores_f32
 attn_scores_f32:
@@ -3247,7 +3273,15 @@ fwd_layer0:
     adrp x4, G_INTER
     add x4, x4, :lo12:G_INTER
     ldr w3, [x4]
+    adrp x4, G_ARCH
+    add x4, x4, :lo12:G_ARCH
+    ldr w4, [x4]
+    cbnz w4, 111f                // qwen3 -> SwiGLU
     bl gelu_mul_f32
+    b 112f
+111:
+    bl silu_mul_f32
+112:
     adrp x0, s_GG
     add x0, x0, :lo12:s_GG
     adrp x1, FG
@@ -3733,7 +3767,15 @@ fwd_token:
     adrp x4, G_INTER
     add x4, x4, :lo12:G_INTER
     ldr w3, [x4]
+    adrp x4, G_ARCH
+    add x4, x4, :lo12:G_ARCH
+    ldr w4, [x4]
+    cbnz w4, 111f                // qwen3 -> SwiGLU
     bl gelu_mul_f32
+    b 112f
+111:
+    bl silu_mul_f32
+112:
     // H = down(base+11); H = rmsnorm_add(FL[6+6i])
     add x0, x24, #11
     mov x4, #56
