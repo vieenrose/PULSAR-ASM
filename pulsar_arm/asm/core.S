@@ -705,6 +705,11 @@ _start:
     add x1, x1, :lo12:J_chat
     ldr x1, [x1]
     cbnz x1, 1f
+    // file mode? (J_f -> bpe + file_run instead of decode)
+    adrp x1, J_f
+    add x1, x1, :lo12:J_f
+    ldr x1, [x1]
+    cbnz x1, 3f
     cbz x0, 0f                   // no bpe path: skip BPE stage
     bl bpe_load
     bl encode_test
@@ -722,6 +727,16 @@ _start:
     svc #0
 2:  bl bpe_load
     bl chat                      // noreturn (exits on EOF)
+3:  // file: bpe required (x0 = bpe path or 0? x0 CLOBBERED by chat path? This label reached ONLY from J_f check above (x0 = bpe path intact? Between J_f load and here: cbnz (no clobber) ✓ x0 intact ✓).
+    cbnz x0, 4f
+    adrp x0, t_nobpe
+    add x0, x0, :lo12:t_nobpe
+    bl print_cstr
+    mov x0, #1
+    mov x8, #93
+    svc #0
+4:  bl bpe_load
+    bl file_run                  // noreturn (exits after one shot)
     mov x0, #0
     mov x8, #SYS_EXIT
     svc #0
@@ -1361,6 +1376,26 @@ file_stage_after_bench:
 8:  mov x0, x19                  // restore argc
     mov x1, x20                  // restore argv
 
+    // file mode: argv[4][0]=='f' -> J_f=1, G_MODE=0 (greedy). x0=argc,x1=argv.
+    adrp x2, J_f
+    add x2, x2, :lo12:J_f
+    mov x3, #0
+    str x3, [x2]
+    cmp x0, #5
+    b.lo file_join
+    ldr x3, [x1, #32]            // argv[4]
+    ldrb w3, [x3]
+    cmp w3, #'f'
+    b.ne file_join
+    mov x3, #1
+    str x3, [x2]                 // J_f = 1
+    adrp x2, G_MODE
+    add x2, x2, :lo12:G_MODE
+    mov x3, #0
+    str x3, [x2]                 // G_MODE = 0 (file = greedy)
+file_join:
+    // (fall through to chat block; x0/x1 intact ✓)
+
     // chat mode: argv[4][0]=='c' -> J_chat=1, G_MODE=1 (sample)
     adrp x2, J_chat
     add x2, x2, :lo12:J_chat
@@ -1377,6 +1412,7 @@ file_stage_after_bench:
     adrp x2, G_MODE
     add x2, x2, :lo12:G_MODE
     str x3, [x2]                 // G_MODE = 1 (chat samples)
+    b 11f
 5:  cmp x0, #4
     b.lo 1f
     b.lo 1f
@@ -4697,6 +4733,7 @@ t_gt:        .asciz "> "
 t_reset:     .asciz "[context full, resetting]\n"
 t_tpl:       .asciz "tpl: "
 t_nobpe:     .asciz "chat mode needs bpe.bin (argv[5])\n"
+t_toolong:   .asciz "prompt too long for context\n"
 
     .section .text
     .align 2
@@ -4966,3 +5003,123 @@ ct_tab:       // (ptr, len, id) x4
 
     .section .text
     .align 2
+
+    .section .bss
+    .align 3
+J_f:         .skip 8
+
+    .section .text
+    .align 2
+/* read_all: read stdin to INBUF until EOF/full. Returns w0 = len (0 = empty).
+ * Chunk reads (single-shot, no line logic). x1=cursor, w2=len, x4=cap.
+ * Uses x0-x4. Leaf (callers hold x19+ ✓). */
+read_all:
+    adrp x1, INBUF
+    add x1, x1, :lo12:INBUF      // cursor
+    mov w2, #0                   // len
+    mov x4, #4095                // cap
+0:  cmp x2, x4
+    b.hs 1f                      // full -> done (x2=len, zero-extended ✓)
+    mov x0, #0                   // fd
+    sub x3, x4, x2               // remaining
+    mov x8, #63                  // read
+    svc #0                       // n (x1=cursor, x2=len, x4=cap preserved? SVC preserves x1-x7 ✓ only x0 = return)
+    cmp x0, #0
+    b.le 1f                      // EOF/error -> done
+    add x1, x1, x0               // cursor += n
+    add w2, w2, w0               // len += n (w0 = n < 4096 ✓ fits)
+    b 0b
+1:  mov w0, w2
+    ret
+read_all:
+    adrp x1, INBUF
+    add x1, x1, :lo12:INBUF      // cursor
+    mov w2, #0                   // len
+    mov w3, #4095                // cap
+0:  cmp w2, w3
+    b.hs 1f                      // full
+    sub x3, x3, x2                // remaining = cap - len (x3 was cap! CLOBBERED (now remaining). Loop reuses? Next iter needs cap again! RECOMPUTE cap each iter? Use x4 for cap (fixed)? x4 free? Leaf uses x0-x4 (callers hold x19+ ✓ SAFE). FIX below: cap in x4, remaining in x3.
+    b 1f
+1:  mov w0, w2
+    ret
+
+/* file_run: raw-prefill one-shot. INBUF=len via read_all; encode; prefill
+ * (no bos/template; prompt carries its own controls); gen; print; exit.
+ * Holds x19=pos, x21=n, x22=count, x23=tok (all fwd-safe, x19+ ✓). */
+file_run:
+    str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    str x23, [sp, #-16]!
+    bl read_all                  // w0 = len (uses x0-x4; x19+ safe? read_all is leaf x0-x4 ✓ SAFE)
+    cbz w0, file_bye             // empty -> exit 0
+    mov x1, x0                   // len
+    adrp x0, INBUF
+    add x0, x0, :lo12:INBUF
+    adrp x2, ENC_OUT
+    add x2, x2, :lo12:ENC_OUT
+    mov w3, #512
+    bl encode                    // w0 = n (preserves x19+ ✓)
+    mov x21, x0                  // n
+    mov x19, #0                  // pos = 0
+    // capacity: n + gencap <= 480?
+    adrp x0, G_GENCAP
+    add x0, x0, :lo12:G_GENCAP
+    ldr x0, [x0]
+    add x0, x21, x0              // n + gencap
+    cmp x0, #480
+    b.lo file_prefill
+    adrp x0, t_toolong
+    add x0, x0, :lo12:t_toolong
+    bl print_cstr
+    mov x0, #1
+    mov x8, #93
+    svc #0
+file_prefill:
+    mov x22, #0                  // i = 0
+file_floop:
+    cmp x22, x21
+    b.hs file_gen
+    adrp x0, G_pos
+    add x0, x0, :lo12:G_pos
+    str w19, [x0]
+    adrp x0, ENC_OUT
+    add x0, x0, :lo12:ENC_OUT
+    ldr w0, [x0, x22, lsl #2]    // ids[i]
+    bl fwd_token
+    add x19, x19, #1
+    add x22, x22, #1
+    b file_floop
+file_gen:
+    adrp x0, ENC_OUT
+    add x0, x0, :lo12:ENC_OUT
+    sub x1, x21, #1
+    ldr w23, [x0, x1, lsl #2]    // tok = last (n>=1? encode of len>0 gives >=1 ✓ (each byte >=1 symbol; controls give 1). TRUST (like chat ✓).)
+    adrp x0, G_GENCAP
+    add x0, x0, :lo12:G_GENCAP
+    ldr x24, [x0]                // gencap (x24 free? file_run holds x19,x21,x22,x23. x24 NOT saved! fwd preserves x19+ (incl x24 ✓) but x24 UNSAVED across... file_run never sets x24 except here; no one else needs it. SAFE without save (like chat's x24? chat SAVES x24 (probing... chat saves x23,x24 (I added). For file_run I save x23 only. x24 used as gencap-holder (fwd preserves ✓, no calls clobber x19+ (put_surf? preserves x19+ per decode comment ✓). SAFE.)
+    mov x22, #0                  // count
+file_gloop:
+    cmp x22, x24
+    b.hs file_end
+    adrp x0, G_pos
+    add x0, x0, :lo12:G_pos
+    str w19, [x0]
+    mov w0, w23
+    bl fwd_token
+    bl sampler                   // G_MODE=0 in file mode -> greedy argmax (sampler checks G_MODE ✓)
+    mov w23, w0
+    cmp w23, #1
+    b.eq file_end                // eos
+    mov x0, x23
+    bl put_surf
+    add x19, x19, #1
+    add x22, x22, #1
+    b file_gloop
+file_end:
+    bl out_flush
+    bl print_nl
+file_bye:
+    mov x0, #0
+    mov x8, #93
+    svc #0
