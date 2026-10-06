@@ -72,6 +72,12 @@
   * tools/q2_0_ref.py: Qwen3 + Q2_0/base-3 oracle, VALIDATED (argmax ' Paris'
     = 12095 for "The capital of France is"; 1.7B: 140 DX signatures over 5
     positions; 4B reference runs the same way).
+  * REPACK VERIFIED LOSSLESS (strongest evidence): the oracle run on the
+    base-3 blob reproduces the Q2_0 run exactly - all 140 (layer, position) DX
+    signatures identical (every relative difference 0.0, which is also why the
+    reporter crashed: it assumed some difference would be non-zero) and both
+    give ARGMAX 12095 = ' Paris'. The non-zero exit code in the task log was
+    that reporter bug, not a data mismatch.
   * kernels/ternary_gemv.c: C reference, PASSES all four PTGV fixtures
     (scalar-vs-oracle 4.4e-06 .. 5.2e-05; NEON same order, ~1e-5).
   * asm/ternary_gemv.S: DRAFT, NOT PASSING. First bug found and fixed: the
