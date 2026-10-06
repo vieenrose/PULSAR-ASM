@@ -11,3 +11,18 @@
 - Prior OMP (+4.2%) and prefetch (+19%) discards were measured cross-session
   under drift; magnitudes unreliable but directions stand (bus-bound theory +
   dual-locality failure). Retry only with same-job A/B if wall assumption changes.
+- DONE 2026-10-06: HF-exact gate is now real. Root cause of every "model is
+  bad" verdict was ONE asm line (`mov w0, #2` = layer 0's q_norm for all 18
+  layers in fwd_token). Lesson: a pos-0 / layer-0 check cannot see q_norm at
+  all (softmax over one key) - always verify with tools/fwd_ref.py over a
+  multi-token sequence and diff every layer x position.
+- Reference-tool trap (cost a whole session): numpy/torch refs must scale the
+  embedding by sqrt(640) AND apply post_attention_layernorm to the attention
+  output before the residual add. Wrong refs produced a phantom "MLP bug"
+  (engine GG 184.6 vs "HF" 12.2; the true HF value is 184.6). Fixed in
+  l0_full/mlp_slot/slot_brute/gg_id/gg_w/gelu_id/l0_ref.
+- Working oracle: tools/fwd_ref.py (fp64, prints `DX L<i> p<p>` per-layer
+  residuals + top-5 logits) reproduces transformers exactly; pair it with
+  tools/perlayer_probe.patch (`patch -p0 < ...`, rebuild) to localize any
+  future divergence to a layer+position in ONE run. Both are how the q_norm
+  bug was found.

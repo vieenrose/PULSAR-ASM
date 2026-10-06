@@ -1,0 +1,58 @@
+--- pulsar_arm/asm/core.S
++++ pulsar_arm/asm/core.S
+@@ -660,6 +660,10 @@
+     ret
+ /* ---------------- entry ---------------- */
+ _start:
++    mov w0, #1
++    adrp x1, G_dbg
++    add x1, x1, :lo12:G_dbg
++    str w0, [x1]
+     adrp x0, banner
+     add x0, x0, :lo12:banner
+     bl print_cstr
+@@ -2398,6 +2402,7 @@
+ G_base:      .skip 8
+ G_N:         .skip 8
+ G_tok:       .skip 8
++G_dbg:       .skip 8
+ 
+     .section .text
+     .align 2
+@@ -2623,6 +2628,8 @@
+ s_AV:        .asciz "L0 AV "
+ s_POST:      .asciz "L0 POST "
+ s_X1:        .asciz "L0 X1 "
++s_DXL:       .asciz "DX L"
++s_DX:        .asciz "DX "
+ s_GG:        .asciz "L0 GG "
+ s_D:         .asciz "L0 D "
+ s_X2:        .asciz "L0 X2 "
+@@ -3456,6 +3463,27 @@
+     add x5, x5, :lo12:f_eps
+     ldr s0, [x5]
+     bl rmsnorm_add_f32
++    // probe: dump the residual after every layer (pairs with tools/fwd_ref.py)
++    adrp x1, G_dbg
++    add x1, x1, :lo12:G_dbg
++    ldr w1, [x1]
++    cbz w1, 101f
++    adrp x0, s_DXL
++    add x0, x0, :lo12:s_DXL
++    bl print_cstr
++    mov x0, x23
++    bl print_u64
++    bl print_sp
++    mov x0, x22
++    bl print_u64
++    bl print_nl
++    adrp x0, s_DX
++    add x0, x0, :lo12:s_DX
++    adrp x1, XB
++    add x1, x1, :lo12:XB
++    mov w2, #640
++    bl print_sig
++101:
+     add w23, w23, #1
+     b 0b
+ 90: // final norm (FL[0]) + head + argmax

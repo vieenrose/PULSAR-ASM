@@ -1,13 +1,15 @@
 """Full 18-layer numpy oracle for the asm engine (HF order, fp64).
 
 Feeds a token sequence and prints, for every layer and position, the residual
-signature in exactly the format the asm `fwd_token` debug prints:
+signature in exactly the format `tools/perlayer_probe.patch` adds to the asm
+engine (apply with `patch -p0 < tools/perlayer_probe.patch`, rebuild, run):
 
     DX L<i> p<p>
     DX max=.. v=[a,b,c,d]
 
-plus the final top-5 logits after each position. Diff against the engine's
-own DX lines to localize the first diverging layer/position.
+plus the final top-5 logits after each position. Diff the two to localize the
+first diverging layer/position in a single run - that is how the layer-0-only
+q_norm bug was found (2026-10-06).
 
 Usage: fwd_ref.py <ids,comma,separated> [n_top=5]
 """
