@@ -195,6 +195,18 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
   states plainly these run on the PrismML llama.cpp fork (CPU-only, 20 threads,
   GPU 0%), NOT PULSAR-ASM. Ceiling-prompt probes (neural/seasons/haiku) were all
   clean for the 8B; gen1 clips remain dropped.
+- **4-clip Bonsai demo set DONE (2026-10-07)**: en + zh-TW ceiling prompts for
+  both 8B and 27B. zh-TW prompt is the same four-seasons question in Traditional
+  Chinese. 27B zh-tw clean first run (markdown table, 1.96 tok/s, 253 tokens).
+  8B zh-tw needed 4 samples: run 1 had code-mixing glitches ('hoach'/'floe'
+  intrusions), seeded run (seed 123) had 'snowfall' x2, another unseeded run had
+  English-word intrusions - selected the cleanest unseeded sample (8.96 tok/s,
+  305 tokens; one simplified char + an 'Autumn/September' gloss remain, honestly
+  kept as real run bytes). Specs `bonsai8b-zh-tw` / `bonsai2-27b-zh-tw`
+  (wrap=char per zh-tw convention); 27B verified MATCH programmatically, 8B
+  verified via rendered-frame readback. GIFs: bonsai8b-chat-zh-tw.gif (1055
+  frames, taller canvas for the long answer), bonsai2-27b-chat-zh-tw.gif.
+  README Bonsai section now shows all 4 clips.
 - README demos come from Bonsai 2 instead: **27B PQ2_0 transcripts already
   captured** (three clean ones via llama-server on the Spark: neural-net
   explainer, four-seasons list, haiku; ~2 tok/s CPU-only), plus an 8B probe in

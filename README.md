@@ -131,11 +131,13 @@ Both clips run the PrismML checkpoints in `llama.cpp` (their fork, needed for
 the `Q2_0`/`PQ2_0` ternary types), 20 CPU threads on a DGX Spark — GPU
 utilisation 0%. They are **not** PULSAR-ASM output: the asm port for these
 hybrid-attention checkpoints is not in this tree yet, and the Bonsai 1.7B/4B
-checkpoints were evaluated and set aside over output quality. Each clip uses its
-checkpoint's ceiling prompt — for both, the four-seasons list that gemma also
-answers correctly — at the checkpoint's own recommended sampling.
+checkpoints were evaluated and set aside over output quality. Each checkpoint
+is shown twice — once in English, once in Traditional Chinese — on its ceiling
+prompt: the four-seasons list that gemma also answers correctly, at the
+checkpoint's own recommended sampling.
 
 ![Bonsai 8B chat demo](doc/bonsai8b-chat-en.gif)
+![Bonsai 8B chat demo, Traditional Chinese](doc/bonsai8b-chat-zh-tw.gif)
 
 **Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, 9.2 tok/s, Qwen3
 sampling (temp 0.6, top-p 0.95, top-k 20). 2.18 GB.
@@ -147,6 +149,7 @@ curl -s localhost:8091/v1/chat/completions -H 'Content-Type: application/json' \
 ```
 
 ![Bonsai 2 27B chat demo](doc/bonsai2-27b-chat-en.gif)
+![Bonsai 2 27B chat demo, Traditional Chinese](doc/bonsai2-27b-chat-zh-tw.gif)
 
 **Ternary-Bonsai-2-27B** — 1.72 bits/weight end to end, Qwen3.8-27B base,
 2.0 tok/s, card config (temp 0.5, top-p 0.85, top-k 20). 7.21 GB.
@@ -158,7 +161,10 @@ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
 ```
 
 Both responses and prompt ids in the clips are literals from those runs, and
-re-render with the same `make_chat_gif.py` command above.
+re-render with the same `make_chat_gif.py` command above. The Traditional
+Chinese clips ask the same four-seasons question; the 27B answers with a
+compact table (2.0 tok/s), while the 8B gives a longer four-section list
+(9.0 tok/s) — each checkpoint's best zh-TW sample at its usual sampling.
 
 ## Verified gates
 

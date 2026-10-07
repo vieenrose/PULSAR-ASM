@@ -221,6 +221,64 @@ SPECS = {
                   "\n4. **Winter** \u2013 Snow begins to fall and daylight hours are at their shortest."),
         status="2.0 tok/s \u00b7 temp 0.5 \u00b7 20 threads",
         wrap="word"),
+
+    "bonsai8b-zh-tw": dict(
+        out="bonsai8b-chat-zh-tw.gif",
+        title="pulsar \u00b7 Ternary-Bonsai-8B \u00b7 cpu",
+        cmd="$ curl -s localhost:8091/v1/chat/completions -H 'Content-Type: application/json' -d '{\""
+            "messages\":[{\"role\":\"user\",\"content\":\"\u8acb\u5217\u51fa\u56db\u5b63\uff0c\u4ee5"
+            "\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\u3002\"}],\"max_tokens"
+            "\":2048, \"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}'",
+        you="> \u8acb\u5217\u51fa\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\u3002",
+        tpl="prompt ids: 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 271",
+        response=("\u7576\u7136\uff01\u4ee5\u4e0b\u662f\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u6703"
+                  "\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\uff1a\n\n---\n\n### **1. \u6625\uff08Spring\uff09**  "
+                  "\n**\u6539\u8b8a\u7684\u4e8b\u7269\uff1a** **\u82b1\u958b**  \n\u6625\u5929\u662f\u82b1"
+                  "\u6735\u7efd\u653e\u7684\u5b63\u7bc0\uff0c\u6a39\u6728\u958b\u59cb\u8449\u5b50\u751f\u9577"
+                  "\uff0c\u82b1\u5349\u9010\u6f38\u958b\u51fa\u3002\u9019\u6642\u81ea\u7136\u754c\u7684\u8b8a"
+                  "\u5316\u5e36\u4f86\u65b0\u9bae\u7684\u6c23\u5473\u3001\u8272\u5f69\u548c\u65b0\u9bae\u7684"
+                  "\u958b\u59cb\u3002\n\n---\n\n### **2. \u590f\uff08Summer\uff09**  \n**\u6539\u8b8a\u7684"
+                  "\u4e8b\u7269\uff1a** **\u65e5\u7167\u6642\u9593\u9577**  \n\u590f\u5929\u662f\u65e5\u7167"
+                  "\u6642\u9593\u6700\u9577\u7684\u5b63\u7bc0\uff0c\u767d\u5929\u66f4\u52a0\u6eab\u71b1\uff0c"
+                  "\u591c\u665a\u66f4\u52a0\u6dbc\u723d\u3002\u9019\u6642\u4eba\u5011\u901a\u5e38\u6703\u9078"
+                  "\u64c7\u5916\u51fa\u6d3b\u52d5\u3001\u6e38\u6cf3\u6216\u4eab\u53d7\u967d\u5149\u3002\n\n"
+                  "---\n\n### **3. \u79cb\uff08Autumn/September\uff09**  \n**\u6539\u8b8a\u7684\u4e8b\u7269"
+                  "\uff1a** **\u8449\u5b50\u8b8a\u8272**  \n\u79cb\u662f\u8449\u5b50\u8b8a\u8272\u7684\u5b63"
+                  "\u7bc0\uff0c\u6a39\u6728\u7684\u8449\u5b50\u6703\u5f9e\u7da0\u8272\u8b8a\u6210\u9ec3\u8272"
+                  "\u3001\u6a59\u8272\u6216\u7d05\u8272\uff0c\u4e26\u9010\u6f38\u843d\u4e0b\u3002\u9019\u671f"
+                  "\u9593\u7684\u6c23\u5019\u901a\u5e38\u8f03\u6dbc\uff0c\u98a8\u529b\u8f03\u5f37\u3002\n\n"
+                  "---\n\n### **4. \u51ac\uff08Winter\uff09**  \n**\u6539\u8b8a\u7684\u4e8b\u7269\uff1a** **"
+                  "\u964d\u96ea**  \n\u51ac\u5929\u662f\u51ac\u5b63\uff0c\u6c23\u6eab\u901a\u5e38\u8f03\u4f4e"
+                  "\uff0c\u5929\u6c23\u5bd2\u51b7\uff0c\u6703\u964d\u96ea\u3002\u9019\u6642\u81ea\u7136\u754c"
+                  "\u7684\u6d3b\u52d5\u6e1b\u5c11\u4e86\uff0c\u4eba\u5011\u66f4\u591a\u5730\u9078\u64c7\u5728"
+                  "\u5bb6\u4f11\u606f\u3001\u4fdd\u6696\u3002\n\n---\n\n\u5982\u679c\u4f60\u6709\u7279\u5b9a"
+                  "\u7684\u7bc4\u570d\uff08\u6bd4\u5982\u5730\u7406\u5340\u57df\u6216\u6587\u5316\u80cc\u666f"
+                  "\uff09\uff0c\u6211\u4e5f\u53ef\u4ee5\u6839\u64da\u4e0d\u540c\u5730\u65b9\u7684\u56db\u5b63"
+                  "\u8b8a\u5316\u4f86\u8abf\u6574\u9019\u4efd\u5217\u8868\u3002\u9700\u8981\u55ce\uff1f"),
+        status="9.0 tok/s \u00b7 temp 0.6 \u00b7 20 threads",
+        wrap="char"),
+
+    "bonsai2-27b-zh-tw": dict(
+        out="bonsai2-27b-chat-zh-tw.gif",
+        title="pulsar \u00b7 Ternary-Bonsai-2-27B \u00b7 cpu",
+        cmd="$ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{\""
+            "messages\":[{\"role\":\"user\",\"content\":\"\u8acb\u5217\u51fa\u56db\u5b63\uff0c\u4ee5"
+            "\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\u3002\"}],\"max_tokens"
+            "\":2048, \"temperature\":0.5,\"top_p\":0.85,\"top_k\":20}'",
+        you="> \u8acb\u5217\u51fa\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\u3002",
+        tpl="prompt ids: 99270 115992 104647 3709 98404 98443 96681 96594 110476 127312 1710",
+        response=("# \u56db\u5b63\u53ca\u5176\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\n\n| \u5b63\u7bc0 | \u6703"
+                  "\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b |\n|------|----------------|\n| **\u6625\u5b63** | "
+                  "\u82b1\u6703**\u76db\u958b**\uff0c\u8349\u5730\u7531\u67af\u9ec3\u8f49\u70ba\u7fe0\u7da0 |"
+                  "\n| **\u590f\u5b63** | \u767d\u5929\u7684\u6642\u9593\u8b8a**\u9577**\uff0c\u65e5\u7167"
+                  "\u6642\u9593\u6700\u9577 |\n| **\u79cb\u5b63** | \u6a39\u8449\u7531\u7da0\u8f49\u70ba**"
+                  "\u9ec3\u3001\u7d05\u3001\u91d1**\u8272\uff0c\u958b\u59cb\u812b\u843d |\n| **\u51ac\u5b63"
+                  "** | \u8349\u548c\u6a39\u6728**\u67af\u840e\u6216\u843d\u8449**\uff0c\u842c\u7269\u8f49"
+                  "\u70ba\u856d\u745f |\n\n\u7c21\u55ae\u4f86\u8aaa\uff0c\u56db\u5b63\u6700\u660e\u986f\u7684"
+                  "\u8b8a\u5316\u5c31\u662f**\u690d\u7269\u7684\u72c0\u614b**\uff1a\u751f\u9577 \u2192 \u7e41"
+                  "\u76db \u2192 \u8870\u8001 \u2192 \u4f11\u7720\uff0c\u5faa\u74b0\u4e0d\u606f\u3002"),
+        status="2.0 tok/s \u00b7 temp 0.5 \u00b7 20 threads",
+        wrap="char"),
 }
 
 
