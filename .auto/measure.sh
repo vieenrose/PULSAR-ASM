@@ -19,7 +19,7 @@ done
 $SSH "$SPARK" "cat > $RDIR/bench_remote.sh" < "$LOCAL/.auto/bench_remote.sh"
 
 # 2. build + benchmark on the Spark (server-side timing excludes ssh latency)
-export OMP_NT_EXP=6  # standard threads (run #268 verdict)
+export OMP_NT_EXP=6  # standard threads (run #268 verdict: floor at 6)
 export OMP_NT_BASE=6  # baseline tracks standard
 export PRE_EXP="taskset -c 0-19"  # standard launcher
 export PRE_BASE="taskset -c 0-19"  # standard launcher
