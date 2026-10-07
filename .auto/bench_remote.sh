@@ -42,6 +42,11 @@ read D2A N2A <<< $(run_one fwd_exp 20 exp_dec2.txt $OMP_NT_EXP "$PRE_EXP")
 read D2B N2B <<< $(run_one fwd_base 20 base_dec2.txt ${OMP_NT_BASE:-16} "$PRE_BASE")
 [ "$N1B" -eq 41 ] && [ "$N1A" -eq 41 ] && [ "$N2A" -eq 41 ] && [ "$N2B" -eq 41 ] \
     || { echo "DECODE STEPS wrong: $N1B $N1A $N2A $N2B"; exit 1; }
+echo "PHASES D1B=$D1B D1A=$D1A D2A=$D2A D2B=$D2B"
+SPREAD=$(python3 -c "v=sorted([$D1B,$D1A,$D2A,$D2B]); print(v[-1]/v[0])")
+echo "SPREAD=$SPREAD"
+python3 -c "import sys; sys.exit(0 if float('$SPREAD') < 1.08 else 1)" \
+    || { echo "ABORT: phase spread $SPREAD exceeds 8% (bursty contention)"; exit 3; }
 DNS_B=$(( (D1B + D2B) / 2 )); NDS_B=$N1B
 DNS_A=$(( (D1A + D2A) / 2 )); NDS_A=$N1A
 echo "PREFILL_NS_A=$PNS_A NSTEPS_A=$NPS_A"
