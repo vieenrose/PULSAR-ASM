@@ -9,17 +9,11 @@ MODEL=$1; shift
 IDS="$*"
 LB=$HOME/bonsai2/llama.cpp/build/bin
 F="-O2 -fopenmp -march=armv8.2-a+dotprod+fp16"
-# candidate: PGO build (profile with prefill workload, then optimize)
-rm -f *.gcda
-gcc $F -fprofile-generate -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c tq_gemv_neon.c -o fwd_neon_mt.o
-gcc $F -fprofile-generate -c fwd.c -o fwd.o
-gcc -O2 -fopenmp -fprofile-generate -o fwd_exp fwd.o fwd_neon_mt.o fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm
-export OMP_NUM_THREADS=20
-# shellcheck disable=SC2086
-taskset -c 0-19 ./fwd_exp $MODEL $IDS --gen 0 > /dev/null 2>&1
-gcc $F -fprofile-use -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c tq_gemv_neon.c -o fwd_neon_mt.o
-gcc $F -fprofile-use -c fwd.c -o fwd.o
-gcc -O2 -fopenmp -fprofile-use -o fwd_exp fwd.o fwd_neon_mt.o fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm
+# candidate: standard build (PGO and LTO both measured neutral and reverted;
+# keep this block plain so A/B compares code, not build tricks)
+gcc $F -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c tq_gemv_neon.c -o fwd_neon_mt.o
+gcc $F -c fwd.c -o fwd.o
+gcc -O2 -fopenmp -o fwd_exp fwd.o fwd_neon_mt.o fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm
 # baseline: standard flags (fixed reference)
 mkdir -p base && cd base
 gcc $F -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c tq_gemv_neon.c -o fwd_neon_mt.o
