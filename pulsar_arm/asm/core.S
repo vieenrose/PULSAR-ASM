@@ -1449,6 +1449,14 @@ f_anchors_fixed:
     adrp x0, G_KVCAP
     add x0, x0, :lo12:G_KVCAP
     str x2, [x0]
+    // Bonsai's card: temp 0.5 / top-k 20 / top-p 0.85. top-k is the one that
+    // lives here rather than on the command line (it is the release's own
+    // recommendation, where temp/top-p are the demo's knobs). temp and top-p
+    // defaults stay gemma's unless the caller passes argv[6]/argv[7].
+    mov x2, #20
+    adrp x0, G_TOPK
+    add x0, x0, :lo12:G_TOPK
+    str x2, [x0]
     bl geom_cells
     // ternary_gemv_b3 decodes one 128-weight / 28-byte group; a blob packed
     // differently has to refuse, not mis-run silently.
@@ -1679,7 +1687,12 @@ file_stage_after_bench:
     ldr x3, [x1, #40]            // argv[5] bpe.bin path
     str x3, [x2]
 4:  cmp x0, #4                   // x0=argc, x1=argv intact (mode+bpe used x2/x3 only ✓)
-    // defaults (unconditional): G_TEMP=1.0, G_TOPP=0.95, G_GENCAP=128
+    // defaults (unconditional): G_TEMP=1.0, G_TOPP=0.95, G_GENCAP=128,
+    // G_TOPK=64. All four are carried from each checkpoint's own card: gemma3
+    // samples at temp 1.0 / top-k 64 / top-p 0.95, and Bonsai's card asks for
+    // temp 0.5 / top-k 20 / top-p 0.85. Only top-k differs in kind - it is baked
+    // in per-arch below, because it is a property of the release, not a knob the
+    // demo varies; temp and top-p stay on the command line for both.
     adrp x2, G_TEMP
     add x2, x2, :lo12:G_TEMP
     movz w3, #0x3F80, lsl #16
@@ -1689,6 +1702,10 @@ file_stage_after_bench:
     movz w3, #0x3333
     movk w3, #0x3F73, lsl #16
     str w3, [x2]
+    adrp x2, G_TOPK
+    add x2, x2, :lo12:G_TOPK
+    mov x3, #64
+    str x3, [x2]
     adrp x2, G_GENCAP
     add x2, x2, :lo12:G_GENCAP
     mov x3, #128
@@ -1801,6 +1818,13 @@ ids_check:
     b.ne 5f
     mov x3, #1
     str x3, [x2]                 // J_ids = 1
+    // Sample, not greedy: the demo shows each checkpoint's own recommended
+    // configuration, and Bonsai's card asks for temp 0.5 / top-k 20 / top-p
+    // 0.85 (top-k is per-arch, set in the blob branch; temp and top-p arrive
+    // on the command line exactly like the gemma demos' 1000 950).
+    adrp x2, G_MODE
+    add x2, x2, :lo12:G_MODE
+    str x3, [x2]                 // G_MODE = 1
     // fall through to the tok parse below (the old 'b 11f' pointed at a
     // label that no longer existed here -> wild jump -> segfault)
 5:  cmp x0, #4
@@ -5095,6 +5119,7 @@ vspot:
 G_MODE:      .skip 8
 G_TEMP:      .skip 8
 G_TOPP:      .skip 8
+G_TOPK:      .skip 8
 G_GENCAP:    .skip 8
 G_RNG:       .skip 8
     .align 4
@@ -5231,39 +5256,53 @@ f_neg30:     .word 0xF0D1328A            // -1e30 (sentinel)
     .section .text
     .align 2
 /* sampler: LG ready. G_MODE 0 -> argmax; else temp/topk/topp sample.
- * Returns w0 = token. Uses x0-x12,s0-s7 (no x19+). Saves lr. */
+ * Returns w0 = token. Uses x0-x12,s0-s7, plus x19 for top-k. Saves lr, x19, x20. */
 sampler:
     str x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!    // x19 = top-k: it must survive the calls below
     adrp x0, G_MODE
     add x0, x0, :lo12:G_MODE
     ldr x0, [x0]
     cbz x0, 0f                   // mode 0: greedy argmax (bit-identical path)
+    adrp x19, G_TOPK
+    add x19, x19, :lo12:G_TOPK
+    ldr x19, [x19]               // per-arch: 64 gemma3, 20 Bonsai
+    adrp x20, G_VOC
+    add x20, x20, :lo12:G_VOC
+    ldr x20, [x20]               // LG holds 262144 slots but only G_VOC of
+                                 // them are logits. Scanning the whole buffer
+                                 // reads stale memory whose max is garbage, so
+                                 // every (x-max) goes hugely negative, expf
+                                 // yields NaN, and topk_select fills nothing -
+                                 // which is exactly how the first blob sampling
+                                 // run produced token 0 forever. gemma's vocab
+                                 // IS 262144, so this is bit-identical there.
     // softmax_temp(LG, 262144, G_TEMP)
     adrp x0, LG
     add x0, x0, :lo12:LG
-    movz w1, #4, lsl #16         // 262144
+    mov w1, w20                  // over the real vocab, not the buffer
     adrp x2, G_TEMP
     add x2, x2, :lo12:G_TEMP
     ldr s0, [x2]                 // temp (x2 free here ✓)
     bl softmax_temp
-    // topk(LG, 262144, 64, TKIDX, TKVAL)
+    // topk(LG, 262144, G_TOPK, TKIDX, TKVAL)
     adrp x0, LG
     add x0, x0, :lo12:LG
-    movz w1, #4, lsl #16
-    mov w2, #64
+    mov w1, w20
+    mov w2, w19
     adrp x3, TKIDX
     add x3, x3, :lo12:TKIDX
     adrp x4, TKVAL
     add x4, x4, :lo12:TKVAL
     bl topk_select
-    // total = sum TKVAL[0..63]; cutoff = total*0.95
+    // total = sum TKVAL[0..topk-1]; cutoff = total*topp
     adrp x0, TKVAL
     add x0, x0, :lo12:TKVAL
     fmov s0, wzr                 // 0.0 (fmov from WZR is legal)
     adrp x0, TKVAL
     add x0, x0, :lo12:TKVAL
     mov w1, #0
-1:  cmp w1, #64
+1:  cmp w1, w19
     b.hs 2f
     ldr s1, [x0, x1, lsl #2]
     fadd s0, s0, s1              // total
@@ -5278,20 +5317,21 @@ sampler:
     add x0, x0, :lo12:TKVAL
     fmov s0, wzr                 // acc
     mov w1, #0                   // j
-3:  cmp w1, #64
-    b.hs 4f                      // failsafe (rounding): kept=64
+3:  cmp w1, w19
+    b.hs sel_fail                // failsafe (rounding): kept = topk
     ldr s2, [x0, x1, lsl #2]
     fadd s0, s0, s2
     fcmp s0, s1
     b.ge 4f                      // acc >= cutoff: kept=j+1, mass=s0
     add w1, w1, #1
     b 3b
-4:  cmp w1, #64
-    b.eq sel_full                // fell through (w1=64): kept=64
+sel_fail:
+4:  cmp w1, w19
+    b.eq sel_full                // fell through (w1=topk): kept=topk
     add w4, w1, #1               // hit path: kept = j+1
     b sel_go
 sel_full:
-    mov w4, #64
+    mov w4, w19
 sel_go:
     bl rng_next                  // x0 = u64 (uses x0-x2; w4/s0 safe)
     lsr x0, x0, #40              // top 24 bits
@@ -5322,11 +5362,14 @@ sel_hit:
     ldr w0, [x0, x5, lsl #2]     // token
     b 9f                         // epilogue
 0:  // greedy
+    adrp x20, G_VOC
+    add x20, x20, :lo12:G_VOC
+    ldr w1, [x20]                // same rule: vocab, not buffer length
     adrp x0, LG
     add x0, x0, :lo12:LG
-    movz w1, #4, lsl #16
     bl argmax_f32                // w0 = argmax
-9:  ldr x30, [sp], #16
+9:  ldp x19, x20, [sp], #16
+    ldr x30, [sp], #16
     ret
 
     .section .bss
