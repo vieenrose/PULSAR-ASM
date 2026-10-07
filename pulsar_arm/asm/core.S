@@ -5214,47 +5214,50 @@ softmax_temp:
 /* topk_select(probs,x0 n,w1 k,w2 idx,x3 val,x4).
  * Descending top-k via insertion. No calls (leaf). Uses x0-x9,s0-s1. */
 topk_select:
-    // init val[*] = -1e30
-    adrp x5, f_neg30
-    add x5, x5, :lo12:f_neg30
-    ldr s0, [x5]
-    mov w5, #0
-0:  cmp w5, w2
-    b.hs 1f
-    str s0, [x4, x5, lsl #2]
-    add w5, w5, #1
-    b 0b
-1:  mov w5, #0                   // i
-2:  cmp w5, w1
-    b.hs 9f
-    ldr s0, [x0, x5, lsl #2]     // v
-    mov w6, #0                   // p scan
-3:  cmp w6, w2
-    b.hs 4f                      // no slot
-    ldr s1, [x4, x6, lsl #2]
-    fcmp s0, s1
-    b.le 5f
-    b 6f                         // found p
-5:  add w6, w6, #1
-    b 3b
-6:  sub w7, w2, #1               // t = k-1; shift [p..k-2] right
-7:  cmp w7, w6
-    b.le 8f                      // t <= p: place
-    sub w8, w7, #1
-    ldr s1, [x4, x8, lsl #2]     // val[t-1]
-    str s1, [x4, x7, lsl #2]     // val[t]
-    ldr w8, [x3, x8, lsl #2]     // idx[t-1]
-    str w8, [x3, x7, lsl #2]     // idx[t]
-    sub w7, w7, #1
-    b 7b
-8:  str s0, [x4, x6, lsl #2]
-    str w5, [x3, x6, lsl #2]
-4:  add w5, w5, #1
-    b 2b
-9:  ret
+    /* x0 probs, w1 n, w2 k, x3 idx out, x4 val out.
+     *
+     * k passes over the probabilities, each taking the current best and then
+     * poisoning it (-1e30) so the next pass cannot pick it again. O(k*n) =
+     * 3M comparisons for k=20 on a 151669 vocab, a few ms against a 1.5 s
+     * token, and it is small enough to be obviously right.
+     *
+     * This replaces an insertion-based top-k that was producing empty slots:
+     * TKVAL kept coming back as its -1e30 sentinel (the sampler then picked
+     * index 0 for everything, which is what 128 "!" in a row was). The old
+     * code looked correct line by line, and a selection rewrite is cheaper
+     * than continuing to chase it. LG is consumed in the process, which is
+     * fine: nothing reads it after the sampler has its probabilities. */
+    mov  x9, x0                   // probs base
+    adrp x8, f_neg30
+    add  x8, x8, :lo12:f_neg30
+    mov  w5, #0                   // j
+tk_outer:
+    cmp  w5, w2
+    b.hs tk_done
+    ldr  s0, [x8]                 // best = sentinel
+    mov  w7, #0                   // bi
+    mov  w6, #0                   // i
+tk_inner:
+    cmp  w6, w1
+    b.hs tk_place
+    ldr  s1, [x9, x6, lsl #2]
+    fcmp s1, s0
+    b.le tk_next
+    fmov s0, s1
+    mov  w7, w6
+tk_next:
+    add  w6, w6, #1
+    b    tk_inner
+tk_place:
+    str  s0, [x4, x5, lsl #2]     // val[j]
+    str  w7, [x3, x5, lsl #2]     // idx[j]
+    ldr  s1, [x8]
+    str  s1, [x9, x7, lsl #2]     // consume probs[bi] (x7: w7 zero-extends)
+    add  w5, w5, #1
+    b    tk_outer
+tk_done:
+    ret
 
-    .section .rodata
-    .align 2
 f_neg30:     .word 0xF0D1328A            // -1e30 (sentinel)
 
     .section .text
