@@ -80,7 +80,45 @@ the file). The two FunctionGemma clips also show the system turn verbatim, i.e.
 where the tool is defined. All frames share one font size (17) and one
 typeface — DejaVu Sans Mono, with WenQuanYi Zen Hei used only for the CJK
 glyphs DejaVu lacks, at the same size and line height. Only pacing is
-libertied.
+libertied. The set opens with Bonsai — ternary checkpoints, each shown in
+English and Traditional Chinese on the same four-seasons ceiling prompt the
+gemma clips use. Those four clips run the reference runtime (note under them);
+everything after is the asm engine's own bytes on the Pi.
+
+**Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, 9.2 tok/s, Qwen3
+sampling (temp 0.6, top-p 0.95, top-k 20). 2.18 GB.
+
+![Bonsai 8B chat demo](doc/bonsai8b-chat-en.gif)
+![Bonsai 8B chat demo, Traditional Chinese](doc/bonsai8b-chat-zh-tw.gif)
+
+```sh
+llama-server -m Ternary-Bonsai-8B-PQ2_0.gguf -c 65536 -t 20 --port 8091 &
+curl -s localhost:8091/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"List the four seasons and one thing that changes in each."}],"max_tokens":2048,"temperature":0.6,"top_p":0.95,"top_k":20}'
+```
+
+**Ternary-Bonsai-2-27B** — 1.72 bits/weight end to end, Qwen3.8-27B base,
+2.0 tok/s, card config (temp 0.5, top-p 0.85, top-k 20). 7.21 GB.
+
+![Bonsai 2 27B chat demo](doc/bonsai2-27b-chat-en.gif)
+![Bonsai 2 27B chat demo, Traditional Chinese](doc/bonsai2-27b-chat-zh-tw.gif)
+
+```sh
+llama-server -m Ternary-Bonsai-2-27B-PQ2_0.gguf -c 65536 -t 20 --port 8090 &
+curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"List the four seasons and one thing that changes in each."}],"max_tokens":2048,"temperature":0.5,"top_p":0.85,"top_k":20}'
+```
+
+Both Bonsai clips run the PrismML checkpoints in `llama.cpp` (their fork,
+needed for the `Q2_0`/`PQ2_0` ternary types), 20 CPU threads on a DGX Spark —
+GPU utilisation 0%. They are **not** PULSAR-ASM output: the asm port for
+these hybrid-attention checkpoints is not in this tree yet, and the Bonsai
+1.7B/4B checkpoints were evaluated and set aside over output quality. Both
+responses and prompt ids are literals from those runs and re-render with the
+same `make_chat_gif.py` command as the gemma clips below. The Traditional
+Chinese clips ask the same four-seasons question; the 27B answers with a
+compact table (2.0 tok/s), while the 8B gives a longer four-section list
+(9.0 tok/s) — each checkpoint's best zh-TW sample at its usual sampling.
 
 **gemma-3-1b-it** — each clip uses the most complex prompt the checkpoint
 answers *correctly* (a four-item structured list, and a three-item one in
@@ -124,47 +162,6 @@ python3 pulsar_arm/tools/fc_write.py   # -> /tmp/tool_official.txt, /tmp/tool_of
 Re-render any subset with `python3 pulsar_arm/tools/make_chat_gif.py` (needs
 PIL + ffmpeg); the transcripts are literals in that file, so a re-run can only
 reproduce these frames, never invent them.
-
-### Bonsai 2 ternary checkpoints (reference runtime, CPU-only)
-
-Both clips run the PrismML checkpoints in `llama.cpp` (their fork, needed for
-the `Q2_0`/`PQ2_0` ternary types), 20 CPU threads on a DGX Spark — GPU
-utilisation 0%. They are **not** PULSAR-ASM output: the asm port for these
-hybrid-attention checkpoints is not in this tree yet, and the Bonsai 1.7B/4B
-checkpoints were evaluated and set aside over output quality. Each checkpoint
-is shown twice — once in English, once in Traditional Chinese — on its ceiling
-prompt: the four-seasons list that gemma also answers correctly, at the
-checkpoint's own recommended sampling.
-
-![Bonsai 8B chat demo](doc/bonsai8b-chat-en.gif)
-![Bonsai 8B chat demo, Traditional Chinese](doc/bonsai8b-chat-zh-tw.gif)
-
-**Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, 9.2 tok/s, Qwen3
-sampling (temp 0.6, top-p 0.95, top-k 20). 2.18 GB.
-
-```sh
-llama-server -m Ternary-Bonsai-8B-PQ2_0.gguf -c 65536 -t 20 --port 8091 &
-curl -s localhost:8091/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"List the four seasons and one thing that changes in each."}],"max_tokens":2048,"temperature":0.6,"top_p":0.95,"top_k":20}'
-```
-
-![Bonsai 2 27B chat demo](doc/bonsai2-27b-chat-en.gif)
-![Bonsai 2 27B chat demo, Traditional Chinese](doc/bonsai2-27b-chat-zh-tw.gif)
-
-**Ternary-Bonsai-2-27B** — 1.72 bits/weight end to end, Qwen3.8-27B base,
-2.0 tok/s, card config (temp 0.5, top-p 0.85, top-k 20). 7.21 GB.
-
-```sh
-llama-server -m Ternary-Bonsai-2-27B-PQ2_0.gguf -c 65536 -t 20 --port 8090 &
-curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"List the four seasons and one thing that changes in each."}],"max_tokens":2048,"temperature":0.5,"top_p":0.85,"top_k":20}'
-```
-
-Both responses and prompt ids in the clips are literals from those runs, and
-re-render with the same `make_chat_gif.py` command above. The Traditional
-Chinese clips ask the same four-seasons question; the 27B answers with a
-compact table (2.0 tok/s), while the 8B gives a longer four-section list
-(9.0 tok/s) — each checkpoint's best zh-TW sample at its usual sampling.
 
 ## Verified gates
 
