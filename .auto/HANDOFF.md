@@ -218,6 +218,13 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
   Beware two red herrings the instrumentation produced: a `kept` that looked
   like garbage was my stack-offset mislabel, and a "post = nan" reading came
   from a different call than the one being examined.
+- **4B: the forward goes bad from position 2.** Instrumenting the sampler on 4B
+  showed the FIRST sample is valid (tok=220, j=2, kept=12, val0=0.132,
+  idx0=279) and every later one reads val0 = -1e30, i.e. the softmax is looking
+  at NaN. p0 and p1 are fine (36 sane DX layers each, logits max 6.0-8.8), so
+  this is an attention/KV bug at n >= 3 that the earlier DX validation could not
+  see, because it only compared p0 and p1. Chase it by running the oracle on a
+  3-4 id prompt (see below) and diffing p2 onward.
 - **4B is NOT validated.** /tmp/oracle4b.log is garbage: every layer prints the
   same value (3.0e21) with numpy overflow warnings, i.e. the run fed an
   out-of-range prompt id and never reached the forward properly. Before any 4B
