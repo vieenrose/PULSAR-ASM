@@ -134,6 +134,73 @@ void ternary_gemv_neon(int fmt, int rows, int cols, const uint8_t *w,
     }
 }
 
+/* Q-fold GEMV: the C mirror of ternary_gemv_b3_v (asm). Same math the vectorised
+ * kernel does, in plain scalar C: x deinterleaved by digit position into planes
+ * P_j[k] = x[5k+j], folded to Q_0 = P_0 and Q_j = P_j - 3*P_{j-1}, with
+ * t_0 = v and t_j = floor(t_{j-1}/3) chained per byte so that
+ * sum(trit*x) = sum_j t_j*Q_j - S per group. Digits are exact integers here
+ * (no magic multiplies, no rint); the accumulation is fp32, in a different
+ * order from both the asm and the scalar reference, so agreement with either
+ * is ~1e-5, not bitwise. That is the point of the test below: it checks the
+ * ALGORITHM (the fold), while the asm-vs-C bit-diff checks the row gather. */
+void ternary_gemv_qfold(int rows, int cols, const uint8_t *w,
+                               const float *x, float *y) {
+    int ng = cols / GROUP;
+    int gb = 2 + B3_CODE_BYTES;
+    float *pl = malloc((size_t)ng * 5 * 32 * sizeof(float));
+    float *qp = malloc((size_t)ng * 5 * 32 * sizeof(float));
+    float *gs = malloc((size_t)ng * sizeof(float));
+    if (!pl || !qp || !gs) { free(pl); free(qp); free(gs); return; }
+    for (int g = 0; g < ng; g++) {
+        const float *xg = x + g * GROUP;
+        float s = 0.0f;
+        for (int k = 0; k < 32; k++)
+            for (int j = 0; j < 5; j++) {
+                int idx = 5 * k + j;
+                pl[((size_t)g * 5 + j) * 32 + k] =
+                    (k < 26 && idx < GROUP) ? xg[idx] : 0.0f;
+            }
+        for (int i = 0; i < GROUP; i++) s += xg[i];
+        gs[g] = s;
+        for (int k = 0; k < 32; k++) {
+            qp[((size_t)g * 5 + 0) * 32 + k] = pl[((size_t)g * 5 + 0) * 32 + k];
+            for (int j = 1; j < 5; j++)
+                qp[((size_t)g * 5 + j) * 32 + k] =
+                    pl[((size_t)g * 5 + j) * 32 + k] -
+                    3.0f * pl[((size_t)g * 5 + j - 1) * 32 + k];
+        }
+    }
+    for (int r = 0; r < rows; r++) {
+        const uint8_t *row = w + (size_t)r * ng * gb;
+        float acc = 0.0f;
+        for (int g = 0; g < ng; g++) {
+            const uint8_t *blk = row + (size_t)g * gb;
+            float scale = f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            const uint8_t *c = blk + 2;
+            float tot = 0.0f;
+            for (int q = 0; q < 4; q++) {
+                float t[8];
+                for (int l = 0; l < 8; l++) {
+                    int k = q * 8 + l;
+                    t[l] = (float)(k < 26 ? c[k] : 0);
+                }
+                float a0 = 0.0f, a1 = 0.0f;
+                for (int j = 0; j < 5; j++) {
+                    const float *pq = qp + ((size_t)g * 5 + j) * 32 + q * 8;
+                    for (int l = 0; l < 4; l++) a0 += t[l] * pq[l];
+                    for (int l = 4; l < 8; l++) a1 += t[l] * pq[l];
+                    if (j < 4)
+                        for (int l = 0; l < 8; l++) t[l] = floorf(t[l] / 3.0f);
+                }
+                tot += a0 + a1;
+            }
+            acc += scale * (tot - gs[g]);
+        }
+        y[r] = acc;
+    }
+    free(pl); free(qp); free(gs);
+}
+
 /* One row of a B3_128 matrix, dequantised - the asm embed_row_b3 mirror. The
  * token embedding is tied to the head, so the same blocks that make a GEMV for
  * the logits are a plain row read here. escale is folded into the per-group

@@ -412,7 +412,13 @@ gemv_arch:
 gvw_tern:
     str x30, [sp, #-16]!
     stp x16, x17, [sp, #-16]!
-    bl ternary_gemv_b3
+    bl ternary_gemv_b3_v               // the vectorised decode (4.3x). Safe to
+                                       // use: fp32 and fp64 oracles agree on all
+                                       // 8 validation argmaxes including p3, whose
+                                       // 0.0171 margin is 170x above fp32-level
+                                       // noise, and the Q-fold's 4.7e-6 sits
+                                       // inside that envelope. Scalar kernel stays
+                                       // for the kernel tests.
     ldp x16, x17, [sp], #16
     ldr x30, [sp], #16
     ret

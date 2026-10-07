@@ -97,6 +97,69 @@ static int run_case(const char *name, int rows, int cols, double escale, double 
     return (bitdiff || bad) ? 1 : 0;
 }
 
+void ternary_gemv_b3_v(int rows, int cols, const uint8_t *w,
+                         const float *x, float *y);
+void ternary_gemv_qfold(int rows, int cols, const uint8_t *w,
+                        const float *x, float *y);
+
+/* The vectorised kernel against its C mirror against fp64. Packs synthetic
+ * B3_128 matrices the same way run_case packs rows (every trit chosen, last
+ * byte only 3 wide), then checks the Q-fold algorithm three ways. The asm and
+ * the C mirror share the math but not the summation order, so they agree to
+ * ~1e-5, not bitwise; both should sit ~1e-6 from fp64. A failure here names the
+ * fold, not the row gather (that is run_case's job). */
+static int run_gemv_qfold(const char *name, int rows, int cols, double tol) {
+    int ng = cols / GROUP;
+    uint8_t *w = malloc((size_t)rows * ng * GB);
+    float *x = malloc((size_t)cols * sizeof(float));
+    float *ya = malloc((size_t)rows * sizeof(float));
+    float *yc = malloc((size_t)rows * sizeof(float));
+    double *want = malloc((size_t)rows * sizeof(double));
+    double *xd = malloc((size_t)cols * sizeof(double));
+    if (!w || !x || !ya || !yc || !want || !xd) { printf("oom\n"); return 1; }
+    for (int i = 0; i < cols; i++) {
+        xd[i] = ((double)(rnd() % 2001u) - 1000.0) / 500.0;
+        x[i] = (float)xd[i];
+    }
+    for (int r = 0; r < rows; r++) {
+        double acc = 0.0;
+        for (int g = 0; g < ng; g++) {
+            uint16_t hb = (uint16_t)(((rnd() & 1u) << 15) |
+                                     ((12u + rnd() % 8u) << 10) | (rnd() & 0x3ffu));
+            double s = f16_bits_to_double(hb);
+            uint8_t *blk = w + ((size_t)r * ng + g) * GB;
+            blk[0] = (uint8_t)(hb & 0xff);
+            blk[1] = (uint8_t)(hb >> 8);
+            memset(blk + 2, 0, GB - 2);
+            for (int i = 0; i < GROUP; i++) {
+                unsigned u = rnd() % 10u;
+                int t = u < 3 ? 0 : (u < 7 ? 1 : -1);
+                blk[2 + i / 5] += (uint8_t)((t + 1) * (unsigned[]){1, 3, 9, 27, 81}[i % 5]);
+                acc += (double)t * s * xd[g * GROUP + i];
+            }
+        }
+        want[r] = acc;
+    }
+    ternary_gemv_b3_v(rows, cols, w, x, ya);
+    ternary_gemv_qfold(rows, cols, w, x, yc);
+    int bad = 0;
+    double wac = 0.0, waf = 0.0, wcf = 0.0;
+    for (int r = 0; r < rows; r++) {
+        double dac = fabs((double)ya[r] - (double)yc[r]) / fmax(fabs((double)yc[r]), 1e-9);
+        double daf = fabs((double)ya[r] - want[r]) / fmax(fabs(want[r]), 1e-9);
+        double dcf = fabs((double)yc[r] - want[r]) / fmax(fabs(want[r]), 1e-9);
+        if (dac > wac) wac = dac;
+        if (daf > waf) waf = daf;
+        if (dcf > wcf) wcf = dcf;
+        if (dac > tol || daf > tol) bad++;
+    }
+    printf("%-12s rows=%2d cols=%5d ng=%2d  asm-vs-C %.2e  asm-vs-f64 %.2e"
+           "  C-vs-f64 %.2e  %s\n",
+           name, rows, cols, ng, wac, waf, wcf, bad ? "FAIL" : "ok");
+    free(w); free(x); free(ya); free(yc); free(want); free(xd);
+    return bad ? 1 : 0;
+}
+
 int main(void) {
     struct { const char *name; int rows, cols; double escale; } cases[] = {
         { "one-group", 1, 128,  1.0 },      /* exactly on the 3-trit byte */
@@ -109,6 +172,8 @@ int main(void) {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++)
         bad += run_case(cases[i].name, cases[i].rows, cases[i].cols,
                         cases[i].escale, 1e-6);
+    bad += run_gemv_qfold("qfold-256", 4, 256, 1e-4);
+    bad += run_gemv_qfold("qfold-2048", 4, 2048, 1e-4);
     printf("%s\n", bad ? "FAIL" : "PASS");
     return bad ? 1 : 0;
 }
