@@ -218,6 +218,15 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
   Beware two red herrings the instrumentation produced: a `kept` that looked
   like garbage was my stack-offset mislabel, and a "post = nan" reading came
   from a different call than the one being examined.
+- **4B: NaN is born in LAYER 0 at position 2.** A 4-id run shows p0/p1
+  finite and p2/p3 already NaN at DX L0 - the first layer, not the deep stack.
+  So it is L0's attention at n=3 (norms/rope are position-independent, the
+  embedding is a table read, so the candidates are the rope row for pos 2, the
+  score/softmax over 3 keys, and the KV row written for pos 2). Next: print the
+  L0 attention stage maxima inside fwd_token (q after rope -> scores -> softmax
+  -> AV) for tokens 0..3 and see which stage first goes NaN. This supersedes the
+  earlier "attention/KV at n>=3" note only in that it is one layer earlier and
+  therefore a much smaller search: no layer-1..35 involvement at all.
 - **4B: the forward goes bad from position 2.** Instrumenting the sampler on 4B
   showed the FIRST sample is valid (tok=220, j=2, kept=12, val0=0.132,
   idx0=279) and every later one reads val0 = -1e30, i.e. the softmax is looking
