@@ -31,9 +31,9 @@ run_one() { # $1=bin $2=gen $3=outfile $4=threads
 }
 echo "--- prefill A then B"
 read PNS_A NPS_A <<< $(run_one fwd_exp 0 exp_pre.txt $OMP_NT_EXP)
-read PNS_B NPS_B <<< $(run_one fwd_base 0 base_pre.txt 20)
+read PNS_B NPS_B <<< $(run_one fwd_base 0 base_pre.txt $OMP_NT_EXP)
 echo "--- decode B then A (reversed)"
-read DNS_B NDS_B <<< $(run_one fwd_base 20 base_dec.txt 20)
+read DNS_B NDS_B <<< $(run_one fwd_base 20 base_dec.txt $OMP_NT_EXP)
 read DNS_A NDS_A <<< $(run_one fwd_exp 20 exp_dec.txt $OMP_NT_EXP)
 echo "PREFILL_NS_A=$PNS_A NSTEPS_A=$NPS_A"
 echo "PREFILL_NS_B=$PNS_B NSTEPS_B=$NPS_B"
