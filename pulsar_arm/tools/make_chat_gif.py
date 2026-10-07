@@ -174,6 +174,53 @@ SPECS = {
         response="call:get_current_temperature{location:London}",
         status="file mode (tool_official_zhtw.txt) \u00b7 greedy \u00b7 cap 16",
         wrap="word"),
+
+    # Bonsai 2 / Ternary-Bonsai-8B-PQ2_0 on the DGX Spark, CPU only (20 threads,
+    # llama.cpp fork since Q2_0 is prism-specific upstream). Ceiling prompt is
+    # the same four-seasons list the gemma clips use - the most complex prompt
+    # this checkpoint answers correctly. Transcript and rate come from one
+    # llama-server session at the checkpoint's Qwen3-standard sampling; ids are
+    # what the server's own tokenizer produced for the prompt.
+    "bonsai8b-en": dict(
+        out="bonsai8b-chat-en.gif",
+        title="pulsar \u00b7 Ternary-Bonsai-8B \u00b7 cpu",
+        cmd="$ curl -s localhost:8091/v1/chat/completions -H"
+            " 'Content-Type: application/json' -d"
+            " '{\"messages\":[{\"role\":\"user\",\"content\":\"List the four"
+            " seasons and one thing that changes in each.\"}],\"max_tokens\":2048,"
+            " \"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}'",
+        you="> List the four seasons and one thing that changes in each.",
+        tpl="prompt ids: 151644 872 198 852 279 3040 15584 323 825 3166 429 4344"
+            " 304 1817 13 151645 198 151644 77091 198 151667 271 151668 271",
+        response=("Here are the four seasons and one thing that changes in each:"
+                  "\n\n1. **Spring** \u2013 The weather warms up and flowers begin to"
+                  " bloom.  \n2. **Summer** \u2013 Days get longer and the sun is hotter."
+                  "  \n3. **Autumn (Fall)** \u2013 Leaves change color and the weather"
+                  " cools down.  \n4. **Winter** \u2013 It gets colder and snow may fall."),
+        status="9.2 tok/s \u00b7 temp 0.6 \u00b7 20 threads",
+        wrap="word"),
+
+    # Ternary-Bonsai-2-27B (Qwen3.8-27B base) on the DGX Spark, CPU only,
+    # via the same llama.cpp fork. Same four-seasons ceiling prompt as the gemma
+    # and 8B clips. Card config here: temp 0.5 / top_p 0.85 / top_k 20. CPU was
+    # sampled at 1022-1765% while generating, i.e. genuinely multi-threaded
+    # CPU-only (GPU utilisation 0%).
+    "bonsai2-27b-en": dict(
+        out="bonsai2-27b-chat-en.gif",
+        title="pulsar \u00b7 Ternary-Bonsai-2-27B \u00b7 cpu",
+        cmd="$ curl -s localhost:8090/v1/chat/completions -H"
+            " 'Content-Type: application/json' -d"
+            " '{\"messages\":[{\"role\":\"user\",\"content\":\"List the four"
+            " seasons and one thing that changes in each.\"}],\"max_tokens\":2048,"
+            " \"temperature\":0.5,\"top_p\":0.85,\"top_k\":20}'",
+        you="> List the four seasons and one thing that changes in each.",
+        tpl="prompt ids: 826 279 2943 15127 321 799 3065 421 4203 303 1754 13",
+        response=("1. **Spring** \u2013 Flowers begin to bloom and temperatures rise."
+                  "\n2. **Summer** \u2013 Daylight hours are at their longest and temperatures peak."
+                  "\n3. **Autumn (Fall)** \u2013 Leaves change color and fall from the trees."
+                  "\n4. **Winter** \u2013 Snow begins to fall and daylight hours are at their shortest."),
+        status="2.0 tok/s \u00b7 temp 0.5 \u00b7 20 threads",
+        wrap="word"),
 }
 
 

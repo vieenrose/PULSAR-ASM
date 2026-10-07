@@ -186,6 +186,15 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
   green at `d867224`, oracle-validated argmaxes, the missing-rope_theta_int fix
   was real - but do NOT re-hunt gen1 prompts for the README. Their measured
   rates, for reference: 1.7B 1850.30 ms/token, 4B 4298.35 ms/token on the Pi.
+- **README demos SHOT (2026-10-07)**: `doc/bonsai8b-chat-en.gif` (181 frames,
+  9.2 tok/s, temp 0.6/top-p 0.95/top-k 20) and `doc/bonsai2-27b-chat-en.gif`
+  (153 frames, 2.0 tok/s, card config 0.5/0.85/20), both on the four-seasons
+  ceiling prompt, both rendered by tools/make_chat_gif.py with specs
+  `bonsai8b-en` / `bonsai2-27b-en`. Transcripts and prompt ids verified against
+  the run output programmatically (MATCH), never hand-typed. README section
+  states plainly these run on the PrismML llama.cpp fork (CPU-only, 20 threads,
+  GPU 0%), NOT PULSAR-ASM. Ceiling-prompt probes (neural/seasons/haiku) were all
+  clean for the 8B; gen1 clips remain dropped.
 - README demos come from Bonsai 2 instead: **27B PQ2_0 transcripts already
   captured** (three clean ones via llama-server on the Spark: neural-net
   explainer, four-seasons list, haiku; ~2 tok/s CPU-only), plus an 8B probe in

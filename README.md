@@ -125,6 +125,41 @@ Re-render any subset with `python3 pulsar_arm/tools/make_chat_gif.py` (needs
 PIL + ffmpeg); the transcripts are literals in that file, so a re-run can only
 reproduce these frames, never invent them.
 
+### Bonsai 2 ternary checkpoints (reference runtime, CPU-only)
+
+Both clips run the PrismML checkpoints in `llama.cpp` (their fork, needed for
+the `Q2_0`/`PQ2_0` ternary types), 20 CPU threads on a DGX Spark — GPU
+utilisation 0%. They are **not** PULSAR-ASM output: the asm port for these
+hybrid-attention checkpoints is not in this tree yet, and the Bonsai 1.7B/4B
+checkpoints were evaluated and set aside over output quality. Each clip uses its
+checkpoint's ceiling prompt — for both, the four-seasons list that gemma also
+answers correctly — at the checkpoint's own recommended sampling.
+
+![Bonsai 8B chat demo](doc/bonsai8b-chat-en.gif)
+
+**Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, 9.2 tok/s, Qwen3
+sampling (temp 0.6, top-p 0.95, top-k 20). 2.18 GB.
+
+```sh
+llama-server -m Ternary-Bonsai-8B-PQ2_0.gguf -c 65536 -t 20 --port 8091 &
+curl -s localhost:8091/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"List the four seasons and one thing that changes in each."}],"max_tokens":2048,"temperature":0.6,"top_p":0.95,"top_k":20}'
+```
+
+![Bonsai 2 27B chat demo](doc/bonsai2-27b-chat-en.gif)
+
+**Ternary-Bonsai-2-27B** — 1.72 bits/weight end to end, Qwen3.8-27B base,
+2.0 tok/s, card config (temp 0.5, top-p 0.85, top-k 20). 7.21 GB.
+
+```sh
+llama-server -m Ternary-Bonsai-2-27B-PQ2_0.gguf -c 65536 -t 20 --port 8090 &
+curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"List the four seasons and one thing that changes in each."}],"max_tokens":2048,"temperature":0.5,"top_p":0.85,"top_k":20}'
+```
+
+Both responses and prompt ids in the clips are literals from those runs, and
+re-render with the same `make_chat_gif.py` command above.
+
 ## Verified gates
 
 - **HF-exact decode.** Greedy output is identical to transformers token for
