@@ -1,12 +1,25 @@
 # PULSAR-ASM
 
-**Pure-assembly Gemma-3 inference on a Raspberry Pi 4.** Static AArch64
-binary, direct `svc` syscalls, no libc, no CRT, no third-party code. The
-tokenizer, sampler, chat REPL and the whole forward pass live in one file:
+**Ternary-model inference: Bonsai checkpoints on CPU, Gemma-3 on a Pi.**
+The demo line is Bonsai — `Ternary-Bonsai-8B` (2.18 GB) and
+`Ternary-Bonsai-2-27B` (7.21 GB) running on a DGX Spark, CPU-only, through
+the C + NEON port in `pulsar_arm/bonsai2/` (greedy streams identical to the
+reference server, token for token). The original asm engine is still here
+unchanged: pure-assembly Gemma-3 inference on a Raspberry Pi 4 — one static
+AArch64 binary, direct `svc` syscalls, no libc, no CRT, no third-party code,
+with the tokenizer, sampler, chat REPL and whole forward pass in
 `pulsar_arm/asm/core.S`.
 
-Three checkpoints run unmodified, and the engine reads its dimensions from the
-safetensors header, so one binary covers all of them:
+Two checkpoints run unmodified on the Spark port, whose dimensions come from
+the GGUF header so one binary covers each family:
+
+| checkpoint | hidden | intermediate | layers | bytes | decode |
+|---|---|---|---|---|---|
+| `Ternary-Bonsai-2-27B-PTQ1_0` | 5120 | 17408 | 64 | 7.21 GB | **~0.75 s/token** (1.3 tok/s, 20 threads) |
+| `Ternary-Bonsai-8B-PQ2_0` | 4096 | 12288 | 36 | 2.18 GB | faster (single core suffices for clips) |
+
+Three gemma checkpoints run unmodified on the Pi engine, which reads its
+dimensions from the safetensors header, so one binary covers all of them:
 
 | checkpoint | hidden | intermediate | layers | bytes/token | decode |
 |---|---|---|---|---|---|
@@ -18,10 +31,10 @@ safetensors header, so one binary covers all of them:
 
 | | |
 |---|---|
-| Target | Raspberry Pi 4, Cortex-A72 / NEON only (no SVE, no dotprod), 3 cores |
-| Engine | one static binary: `as` + `ld`, direct syscalls, zero dependencies |
+| Target | Raspberry Pi 4, Cortex-A72 / NEON only (no SVE, no dotprod), 3 cores — for gemma; DGX Spark, 20 Cortex-X925 cores, CPU-only — for Bonsai |
+| Engine | one static binary: `as` + `ld`, direct syscalls, zero dependencies (gemma); C + NEON + OpenMP in `pulsar_arm/bonsai2/` (Bonsai) |
 | Bandwidth | ~3.6–3.9 GB/s of a measured 3.93 GB/s streaming ceiling (92–98 %) |
-| Parity | greedy output identical to transformers, token for token (1B bf16, 270m fp32) |
+| Parity | greedy output identical to transformers, token for token (1B bf16, 270m fp32); greedy Bonsai streams identical to the reference server, token for token (27B 17/17, 8B 5/5), plus a full top-20 distribution match |
 | Determinism | fixed seed ⇒ byte-identical transcripts across runs |
 
 ## Quick start
@@ -48,6 +61,31 @@ python3 ../tools/mkbpe.py   <tokenizer.json> bpe.bin     # 514,906 merge rules
 
 `functiongemma-270m-it` uses its own `fcvocab.bin` / `fcbpe.bin`, built from its
 own `tokenizer.json` with the same two tools.
+
+## Bonsai quick start (aarch64 with ARMv8.2+dotprod, e.g. the Spark)
+
+```sh
+cd pulsar_arm/bonsai2
+LB=<llama.cpp>/build/bin   # fork libs, quantization helpers + oracles only
+python3 sign_extract.py Ternary-Bonsai-2-27B-PTQ1_0.gguf  # -> /tmp/sign{5120,6144,17408}.bin
+# 27B engine:
+gcc -O2 -fopenmp -march=armv8.2-a+dotprod -DTQ_XGEMV_LIB -Dmain=tq_neon_main \
+  -c tq_gemv_neon.c -o fwd_neon_mt.o
+gcc -O2 -fopenmp -march=armv8.2-a+dotprod -c fwd.c -o fwd.o
+gcc -O2 -fopenmp -o fwd fwd.o fwd_neon_mt.o fwht.S \
+  -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm
+# prompt ids from the checkpoint's own template + tokenizer:
+./tokdetok tokstr Ternary-Bonsai-2-27B-PTQ1_0.gguf <prompt words...>
+# greedy (deterministic, the reference behaviour) then sampled:
+OMP_NUM_THREADS=20 ./fwd Ternary-Bonsai-2-27B-PTQ1_0.gguf <ids...> --gen 200
+OMP_NUM_THREADS=20 ./fwd Ternary-Bonsai-2-27B-PTQ1_0.gguf <ids...> --gen 200 \
+  --sample 0.5 0.85 20 <seed> 0.05
+```
+
+The sampler follows the fork chain order (top-k → top-p → min-p on raw
+logits, temperature scale last); the server default min-p is 0.05. The 8B
+engine builds the same way from `pq2_gemv.c` + `fwd8.c` (no sign tables —
+that checkpoint carries no Hadamard transform).
 
 ## Modes and flags
 
@@ -111,9 +149,11 @@ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
 
 Both Bonsai clips run the PrismML checkpoints in `llama.cpp` (their fork,
 needed for the `Q2_0`/`PQ2_0` ternary types), 20 CPU threads on a DGX Spark —
-GPU utilisation 0%. They are **not** PULSAR-ASM output: the asm port for
-these hybrid-attention checkpoints is not in this tree yet, and the Bonsai
-1.7B/4B checkpoints were evaluated and set aside over output quality. Both
+GPU utilisation 0%. They are **not** PULSAR-ASM output yet: the four clips
+below predate the native port, which now lives in `pulsar_arm/bonsai2/` and
+reproduces the reference server token for token (greedy) — engine-native
+re-renders of these same four prompts replace them. The Bonsai 1.7B/4B
+checkpoints were evaluated and set aside over output quality. Both
 responses and prompt ids are literals from those runs and re-render with the
 same `make_chat_gif.py` command as the gemma clips below. The Traditional
 Chinese clips ask the same four-seasons question; the 27B answers with a
@@ -165,6 +205,14 @@ reproduce these frames, never invent them.
 
 ## Verified gates
 
+- **Bonsai greedy parity.** 27B: 17-token stream exact vs the reference
+  server at temp-0; 8B: 5/5 exact. Full top-20 distribution match at a
+  sampled position (19/20 same ids, same order) — the engines' logits are
+  the fork's logits, so sampling draws from the same distribution.
+- **Bonsai kernels.** PTQ1_0 decoder, FWHT-1024, full 89M-weight projection
+  and both NEON GEMVs bit-exact vs the fork (26.0 ms / 0.29 ns/w PTQ1_0,
+  7.3 ms / 0.15 ns/w PQ2_0, single pinned core); GDN and both ropes at
+  fp32-vs-op level. See `pulsar_arm/bonsai2/README.md` for the ledger.
 - **HF-exact decode.** Greedy output is identical to transformers token for
   token: 32/32 bench tokens for both 270m (fp32) and 1B (bf16), and complete
   chat transcripts — 1B answers *"The capital of France is **Paris**."* exactly
@@ -187,6 +235,12 @@ reproduce these frames, never invent them.
 
 ## Performance
 
+- **Bonsai wall.** The 27B streams ~5.9 GB/token of ternary weights;
+  single-core cost is ~7.6 s/token, OpenMP over GEMV rows brings it to
+  ~0.71 s/token on 20 cores (bit-identical tops). The NEON integer kernel
+  does 0.29 ns/weight (PTQ1_0) and 0.15 ns/weight (PQ2_0) — 5.3× and more
+  over the scalar paths, which is what makes the port practical; the float
+  path it replaced ran 153 ms per 89M-weight projection.
 - **The wall.** A numpy streaming-sum ceiling of 3.93 GB/s was measured on this
   Pi. The driver moves 536 MB/token for 270m and 2.00 GB/token for 1B, i.e.
   3.6–3.9 GB/s depending on the run — the same bus saturation at both sizes,
@@ -205,12 +259,22 @@ pulsar_arm/tools/            build-time converters (mkvocab, mkbpe, fc_write),
                              oracles (fwd_ref, l0_any, hf_greedy), the per-layer
                              debug probe patch, demo renderer
 pulsar_arm/kernels, runtime  C reference path — parity oracle only, NOT shipped
+pulsar_arm/bonsai2/          Bonsai ternary port (C + NEON, CPU-only): fwd/fwd8
+                             engines, NEON GEMVs, FWHT asm, GGUF/tokenizer
+                             tools, fork-graph oracle, own README + ledger
 pulsar_arm/tests/            parity tests (Pi-side, need torch + HF cache)
 doc/                         demo GIFs and write-ups
 ```
 
 ## Disclosures
 
+- The four Bonsai clips above run the reference runtime, not the in-tree
+  port; they are presented as the checkpoints' ceiling behaviour at their
+  own sampling, with transcripts verified programmatically against the run
+  logs (never hand-typed). Engine-native re-renders are in progress.
+- The 27B is a reasoning model: its raw stream opens inside `<think>`;
+  clips show the answer content as the server renders it (reasoning kept
+  out of frame, same convention).
 - The 1B answers multi-item and explanatory prompts (see demos); the 270m
   manages one-line factual answers and degrades beyond that — checkpoint size,
   not the engine, whose greedy path is HF-identical for both.
