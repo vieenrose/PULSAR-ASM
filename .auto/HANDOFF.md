@@ -193,10 +193,15 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
   here ("~99 ms/token 1.7B, ~238 ms 4B") was pure storage arithmetic and is
   unreachable; ~250 ms and ~570 ms are the walls. Gemma reference: 270m 147,
   1B 543 (cool box).
-- Current ternary GEMV: **3.98 ns/weight** = 0.25 G trits/s, which projects to
-  6834 ms/token and predicts the real 7079 ms within 3% - so `pw2/tgb` (probe on
-  a real layer-5 q_proj block) is a valid 20-second stand-in for a 5-minute
-  token run. That is ~60× off the FMA floor; the decode is the whole cost.
+- Ternary GEMV, done 2026-10-07 (`8deeb5e`, 3.7x end to end, 1888 ms/token).
+  Scalar was 3.98 ns/weight (pw2/tgb predicted the 7079 ms token within 3%);
+  `ternary_gemv_b3_v` (asm/ternary_gemv.S, prototype V6 in tools/) does 0.91 and
+  is wired into gemv_arch's arch-1 branch. All 8 validation argmaxes re-earned,
+  gemma byte-identical, bonsai ids identical. The fp64 oracle agrees with fp32
+  on all 8 argmaxes including p3 (margin 0.0171), which is what green-lit the
+  Q-fold's 4.7e-6. Still open: asm row-blocking (lost in C to spilling, needs a
+  hand-rolled register plan to judge), and the bit-plane repack fork (~350 ms
+  needs +425 MB resident and a README story change - user's call, deferred).
 - KV cap is now a **disclosed design constant**: 1024 positions → 151 MB per
   cache at 36 layers. 32k positions would need 268 MB per cache — do not "fix"
   this silently.
