@@ -267,6 +267,7 @@ static char *tn(int il, const char *kind, char *o) {
 
 /* plain BF16 matvec 48 outs (ssm_alpha/beta are NOT transformed) */
 static void bfgemv(const uint8_t *W, const float *x, float *y) {
+    #pragma omp parallel for schedule(static)
     for (int r = 0; r < 48; r++) {
         const uint16_t *row = (const uint16_t *)(W + (size_t)r * HID * 2);
         double s = 0;
