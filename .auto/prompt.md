@@ -48,6 +48,12 @@ prefill (21 prompt forwards) and decode (20 gen forwards), prints
 - `pulsar_arm/bonsai2/tq_xgemv.c`, `tq_gemv_int.c` — scalar references (change only with cause)
 - `.auto/measure.sh`, `.auto/checks.sh` — may gain instrumentation as needed
 
+## Hygiene (learned 2026-10-07)
+- `log_experiment` keep commits `git add -A` (sweeps in harness edits!);
+  discard-reverts do NOT cover `.auto/`. After any harness experiment,
+  manually restore `.auto/` to the intended state and commit hygiene
+  separately - never let build-flag trials leak into HEAD silently.
+
 ## Off Limits
 - `pulsar_arm/asm/*`, `pulsar_arm/tools/*` (Pi engine + gemma tooling).
 - `pulsar_arm/bonsai2/fwd8.c`, `pq2_gemv.c` (8B line — separate session if ever).
