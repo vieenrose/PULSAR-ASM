@@ -75,7 +75,7 @@ prefill (21 prompt forwards) and decode (20 gen forwards), prints
    No precision reduction anywhere without a bit-exact (or argmax-preserving
    + distribution-checked) proof first.
 2. **No benchmark gaming**: fixed prompts, fixed gen counts, fixed threads
-   (12 both sides as of run #255; 16 beat 20 by 4%, 12 beat 16 by 1.1%;
+   (16 both sides as of run #262; optimum follows traffic: 20>16 at 27GB, 16>12 at 27GB, 16>12 at 14GB;
    taskset 0-19), fixed flags
    (-O2 -fopenmp -march=armv8.2-a+dotprod+fp16; no -ffast-math ever, fp order
    preserved; -O3/mcpu-native tried runs #232 (hurts/discarded)).
