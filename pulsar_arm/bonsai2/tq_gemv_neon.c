@@ -41,6 +41,13 @@ static float h2f(uint16_t h) {
     else o = s | ((e + 112u) << 23) | (m << 13);
     float r; memcpy(&r, &o, 4); return r;
 }
+/* hw fp16 load+convert (needs +fp16): one scvtf, IEEE-exact incl subnormals,
+   bit-identical to h2f above. Kills 5 branchy scalar converts per group. */
+static inline float ld_f16(const uint8_t *p) {
+    __fp16 h;
+    memcpy(&h, p, 2);
+    return (float)h;
+}
 
 /* decode 8 trits from 8 bytes at one nn -> int8x8, exact scalar emulation */
 static inline int8x8_t dec8(const uint8_t *b, uint8_t p3) {
@@ -80,12 +87,12 @@ void tq_gemv_neon(int rows, int cols, const uint8_t *w, const float *x,
         float acc = 0.0f;
         for (int g = 0; g < ng; g++) {
             const uint8_t *blk = row + g * 28;
-            float ws = h2f((uint16_t)(blk[26] | (blk[27] << 8)));
+            float ws = ld_f16(blk + 26);
             float sum = 0.0f;
             /* kb0, kb1: pure dec16 pairs */
             for (int kb = 0; kb < 2; kb++) {
                 const uint8_t *qb = xq + (size_t)(g * 4 + kb) * 34;
-                float db = h2f((uint16_t)(qb[0] | (qb[1] << 8)));
+                float db = ld_f16(qb);
                 const int8_t *qs = (const int8_t *)(qb + 2);
                 int8x16_t t0 = dec16(blk, P3[kb * 2]);
                 int8x16_t t1 = dec16(blk, P3[kb * 2 + 1]);
@@ -97,7 +104,7 @@ void tq_gemv_neon(int rows, int cols, const uint8_t *w, const float *x,
             /* kb2: qs[0..16)@nn4 then qs[16..24)@nn0,nn1 */
             {
                 const uint8_t *qb = xq + (size_t)(g * 4 + 2) * 34;
-                float db = h2f((uint16_t)(qb[0] | (qb[1] << 8)));
+                float db = ld_f16(qb);
                 const int8_t *qs = (const int8_t *)(qb + 2);
                 int8x16_t t0 = dec16(blk, P3[4]);
                 int8x16_t t1 = vcombine_s8(dec8(blk + 16, P3[0]),
@@ -110,7 +117,7 @@ void tq_gemv_neon(int rows, int cols, const uint8_t *w, const float *x,
             /* kb3: qs[16..24)@nn2,nn3,nn4 then qh mixed */
             {
                 const uint8_t *qb = xq + (size_t)(g * 4 + 3) * 34;
-                float db = h2f((uint16_t)(qb[0] | (qb[1] << 8)));
+                float db = ld_f16(qb);
                 const int8_t *qs = (const int8_t *)(qb + 2);
                 vst1_s8(tmp, dec8(blk + 16, P3[2]));
                 vst1_s8(tmp + 8, dec8(blk + 16, P3[3]));

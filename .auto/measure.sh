@@ -19,8 +19,8 @@ ssh -o BatchMode=yes -o ConnectTimeout=20 "$SPARK" <<EOF > "$LOCAL/.auto/last_bu
 set -euo pipefail
 mkdir -p $RDIR && cd $RDIR
 LB=\$HOME/bonsai2/llama.cpp/build/bin
-gcc -O2 -fopenmp -march=armv8.2-a+dotprod -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c tq_gemv_neon.c -o fwd_neon_mt.o
-gcc -O2 -fopenmp -march=armv8.2-a+dotprod -c fwd.c -o fwd.o
+gcc -O2 -fopenmp -march=armv8.2-a+dotprod+fp16 -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c tq_gemv_neon.c -o fwd_neon_mt.o
+gcc -O2 -fopenmp -march=armv8.2-a+dotprod+fp16 -c fwd.c -o fwd.o
 gcc -O2 -fopenmp -o fwd_exp fwd.o fwd_neon_mt.o fwht.S -L\$LB -lggml-base -lggml-cpu -Wl,-rpath,\$LB -lm
 echo BUILD_OK
 export OMP_NUM_THREADS=20
