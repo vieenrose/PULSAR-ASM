@@ -12,6 +12,11 @@ tool prints is what can appear on screen.
   bonsai_ask.py --timed "..."                             # + ms/token
   bonsai_ask.py --json "..."                              # for the GIF specs
 
+Long generations over ssh are the demo's least reliable part: the first hunt
+lost 2 of 5 runs to "Connection reset by peer" when the Pi was also running a
+4B oracle. The ssh calls set ServerAliveInterval so a slow token stream is not
+mistaken for a dead peer.
+
 --timed runs the engine's own bench (mode 2), which reports ms/token on the same
 binary and weights; the demo status bars quote that number rather than a wall
 clock measured around ssh.
@@ -40,7 +45,10 @@ def run_engine(ids, host, cwd, model, vocab, temp, topp, gencap, timeout):
            f"{model} {vocab} 2 i x {temp} {topp}")
     if gencap:
         cmd += f" {gencap}"
-    out = subprocess.run(["ssh", "-o", "BatchMode=yes", host, cmd],
+    out = subprocess.run(["ssh", "-o", "BatchMode=yes",
+                          "-o", "ServerAliveInterval=30",
+                          "-o", "ServerAliveCountMax=20",
+                          host, cmd],
                          capture_output=True, text=True, timeout=timeout + 60)
     return out.stdout + out.stderr
 
@@ -61,7 +69,10 @@ def parse_text(log):
 
 def bench_ms_per_token(host, cwd, model, vocab, timeout):
     cmd = f"cd {cwd} && timeout {timeout} ./core_ids {model} {vocab} 2"
-    out = subprocess.run(["ssh", "-o", "BatchMode=yes", host, cmd],
+    out = subprocess.run(["ssh", "-o", "BatchMode=yes",
+                          "-o", "ServerAliveInterval=30",
+                          "-o", "ServerAliveCountMax=20",
+                          host, cmd],
                          capture_output=True, text=True, timeout=timeout + 60)
     m = re.search(r"ms/token:\s*([0-9.]+)", out.stdout + out.stderr)
     return float(m.group(1)) if m else None
