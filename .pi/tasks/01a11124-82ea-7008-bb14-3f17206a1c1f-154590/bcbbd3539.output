@@ -1,0 +1,6 @@
+T final_output-0           [  6144] rms=0.042416
+T final_output-0 (reshaped [  6144] rms=0.042416
+T node_63                  [  6144] rms=0.042416
+T  (reshaped)              [  6144] rms=0.042416
+T linear_attn_out-0        [  5120] rms=0.11291
+T linear_attn_out-0 (resha [  5120] rms=0.11291

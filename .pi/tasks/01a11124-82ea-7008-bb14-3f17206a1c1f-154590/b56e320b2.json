@@ -1,0 +1,27 @@
+{
+  "id": "b56e320b2",
+  "name": "greedy templated runs",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && export OMP_NUM_THREADS=20 && echo \"### GREEDY EN-TPL\"; taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 248045 846 198 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 248046 198 248045 74455 198 248068 --gen 200 2>/dev/null | grep \"^step\" | awk \"NR>21\" | sed \"s/.*top=//;s/ .*//\" | tr \"\\n\" \" \" > /tmp/en_greedy.txt; echo; wc -w < /tmp/en_greedy.txt; echo \"### GREEDY ZH-TPL\"; taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 248045 846 198 99270 115992 104647 3709 98404 98443 96681 96594 110476 127312 1710 248046 198 248045 74455 198 248068 --gen 250 2>/dev/null | grep \"^step\" | awk \"NR>20\" | sed \"s/.*top=//;s/ .*//\" | tr \"\\n\" \" \" > /tmp/zh_greedy.txt; echo; wc -w < /tmp/zh_greedy.txt; echo GREEDY_DONE' 2>&1 | head -8",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b56e320b2.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791377213732,
+  "endTime": 1791377552875,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 1219188,
+  "bytesWritten": 58,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

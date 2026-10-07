@@ -1,0 +1,27 @@
+{
+  "id": "b4eb4c941",
+  "name": "8B wide seed sweep",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && for S in 61 62 63 64; do taskset -c 3 ./fwd8 ../models/bonsai8b-PQ2_0.gguf 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 --gen 120 --sample 0.6 0.95 20 $S 0.05 2>/dev/null | grep \"^step\" | awk \"NR>23\" | sed \"s/.*top=//;s/ .*//\" | tr \"\\n\" \" \" > /tmp/y8en_s$S.txt; echo \"en$S:$(wc -w < /tmp/y8en_s$S.txt)\"; done; for S in 61 62 63 64; do taskset -c 3 ./fwd8 ../models/bonsai8b-PQ2_0.gguf 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 --gen 150 --sample 0.6 0.95 20 $S 0.05 2>/dev/null | grep \"^step\" | awk \"NR>23\" | sed \"s/.*top=//;s/ .*//\" | tr \"\\n\" \" \" > /tmp/y8zh_s$S.txt; echo \"zh$S:$(wc -w < /tmp/y8zh_s$S.txt)\"; done; echo Y8_DONE' 2>&1 | head -12",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b4eb4c941.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791386541529,
+  "endTime": 1791387847403,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 2743854,
+  "bytesWritten": 78,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

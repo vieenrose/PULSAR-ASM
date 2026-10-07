@@ -1,0 +1,25 @@
+=== rate [bonsai-1.7B] (engine bench, greedy):
+    ms/token: 1850.30
+    METRIC ms_per_token=1850.30
+=== rate [bonsai-4B] (engine bench, greedy):
+    ms/token: 4298.35
+    METRIC ms_per_token=4298.35
+########## bonsai-1.7B seasons
+PROMPT: List the four seasons and one thing that changes in each.
+Here's a list of the four seasons and one thing that! changes in each:
+
+1#", **Spring** – The first thing that changes is the arrival of **new life** and the thawing of the ground, as plants begin to grow and flowers bloom.
+
+2", **Summer** – The first thing that changes is the **increase in temperature**, with the sun shining more and the days getting longer.
+
+3", **Autumn**! – The first thing that! changes is the **change in color of leaves**, as trees begin to change from green to yellow, orange, and red.
+
+4", **!Winter** – The first thing that changes is the **cold weather**, with shorter days and colder temperatures, and the first signs of snow or frost.
+
+Let me know if you'd like more details or a different format!
+
+########## bonsai-4B neural
+PROMPT: Explain what a neural network is in two sentences.
+A neural!
+
+########## DEMO RUNS DONE

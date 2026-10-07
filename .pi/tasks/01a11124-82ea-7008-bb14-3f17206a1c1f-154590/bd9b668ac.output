@@ -1,0 +1,4 @@
+q8k delta probe: d=-0.00787402 (expect ~1/127)
+pq2-neon vs fork vec_dot (64 rows): bit-diff 64, maxrel 7.37e+03 MISMATCH
+sample: fork 52135.164062  mine 40405.742188
+full 8B ffn 12288x4096 pq2-neon: 7.4 ms (0.15 ns/w)

@@ -1,0 +1,27 @@
+{
+  "id": "b9e6abf94",
+  "name": "engine indexed L0+L3",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && taskset -c 3 ./fwd ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 --gen 0 --trace 2>/dev/null | grep -A3 \"final \\|attnout\\|gate \\[1000\\]\\|up \\[1000\\]\\|ffnout\\|qfull\\|kcur\\|vcur\\|atto\" | head -60' 2>&1 | head -65",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b9e6abf94.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791372524915,
+  "endTime": 1791372527597,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 353351,
+  "bytesWritten": 4397,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

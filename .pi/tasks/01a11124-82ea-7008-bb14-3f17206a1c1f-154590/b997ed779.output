@@ -1,0 +1,9 @@
+synced:
+total 64
+drwxrwxr-x 2 luigi luigi  4096 Oct  7 23:41 .
+drwxrwxr-x 7 luigi luigi  4096 Oct  7 23:41 ..
+-rw-rw-r-- 1 luigi luigi 21913 Oct  7 23:41 fwd.c
+-rw-rw-r-- 1 luigi luigi  8592 Oct  7 23:41 fwd_neon_mt.o
+-rw-rw-r-- 1 luigi luigi  2124 Oct  7 23:41 fwht.S
+-rw-rw-r-- 1 luigi luigi  8114 Oct  7 23:41 tq_gemv_neon.c
+-rw-rw-r-- 1 luigi luigi  6362 Oct  7 23:41 tq_xgemv.c

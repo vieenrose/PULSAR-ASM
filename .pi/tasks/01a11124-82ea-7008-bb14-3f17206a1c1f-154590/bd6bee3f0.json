@@ -1,0 +1,27 @@
+{
+  "id": "bd6bee3f0",
+  "name": "faithful-sampler reshoot sweep",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && export OMP_NUM_THREADS=20 && for S in 51 52; do echo \"### 27B-ZH seed $S\"; taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 248045 846 198 99270 115992 104647 3709 98404 98443 96681 96594 110476 127312 1710 248046 198 248045 74455 198 248068 --gen 280 --sample 0.5 0.85 20 $S 0.05 2>/dev/null | grep \"^step\" | awk \"NR>20\" | sed \"s/.*top=//;s/ .*//\" | tr \"\\n\" \" \" > /tmp/z27_s$S.txt; echo; wc -w < /tmp/z27_s$S.txt; done; for S in 51 52; do echo \"### 8B-EN seed $S\"; taskset -c 3 ./fwd8 ../models/bonsai8b-PQ2_0.gguf 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 --gen 150 --sample 0.6 0.95 20 $S 0.05 2>/dev/null | grep \"^step\" | awk \"NR>23\" | sed \"s/.*top=//;s/ .*//\" | tr \"\\n\" \" \" > /tmp/z8en_s$S.txt; echo; wc -w < /tmp/z8en_s$S.txt; done; for S in 51 52; do echo \"### 8B-ZH seed $S\"; taskset -c 3 ./fwd8 ../models/bonsai8b-PQ2_0.gguf 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 --gen 200 --sample 0.6 0.95 20 $S 0.05 2>/dev/null | grep \"^step\" | awk \"NR>23\" | sed \"s/.*top=//;s/ .*//\" | tr \"\\n\" \" \" > /tmp/z8zh_s$S.txt; echo; wc -w < /tmp/z8zh_s$S.txt; done; echo ALL_SWEEP_DONE' 2>&1 | head -14",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bd6bee3f0.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791378557608,
+  "endTime": 1791379692297,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 1463348,
+  "bytesWritten": 112,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

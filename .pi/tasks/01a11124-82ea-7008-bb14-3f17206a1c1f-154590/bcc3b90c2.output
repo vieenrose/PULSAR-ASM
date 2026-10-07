@@ -1,0 +1,4 @@
+/usr/bin/ld: cannot find -lggml-base: No such file or directory
+/usr/bin/ld: cannot find -lggml-cpu: No such file or directory
+collect2: error: ld returned 1 exit status
+BUILD_OK

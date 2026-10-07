@@ -1,0 +1,27 @@
+{
+  "id": "b06a85a24",
+  "name": "golden stream capture",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/exp && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -fopenmp -march=armv8.2-a+dotprod -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c tq_gemv_neon.c -o fwd_neon_mt.o && gcc -O2 -fopenmp -march=armv8.2-a+dotprod -c fwd.c -o fwd.o && gcc -O2 -fopenmp -o fwd_exp fwd.o fwd_neon_mt.o ../asm/fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm && echo BUILD_OK && export OMP_NUM_THREADS=20 && taskset -c 0-19 ./fwd_exp ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 248045 846 198 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 248046 198 248045 74455 198 248068 --gen 20 2>/dev/null | grep \"^step\" | sed \"s/.*top=//;s/ .*//\" && echo \"=== B:\" && taskset -c 0-19 ./fwd_exp ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 248045 846 198 7734 264 6185 36974 883 279 9117 13 248046 198 248045 74455 198 248068 --gen 10 2>/dev/null | grep \"^step\" | sed \"s/.*top=//;s/ .*//\"' 2>&1 | head -75",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b06a85a24.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791387572904,
+  "endTime": 1791387573975,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 2949239,
+  "bytesWritten": 69,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

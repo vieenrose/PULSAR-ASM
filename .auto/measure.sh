@@ -3,7 +3,7 @@
 # Emits METRIC lines. Saves step logs to .auto/last_*.txt for checks.sh.
 set -euo pipefail
 SPARK=luigi@spark
-RDIR=~/bonsai2/exp
+RDIR='~/bonsai2/exp'   # quoted: ~ must expand on the Spark (/home/luigi), not here
 LOCAL=/home/user/PULSAR-ASM
 A_IDS="248045 846 198 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 248046 198 248045 74455 198 248068"
 MODEL=../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf
@@ -18,7 +18,7 @@ done
 ssh -o BatchMode=yes -o ConnectTimeout=20 "$SPARK" <<EOF > "$LOCAL/.auto/last_build.log" 2>&1
 set -euo pipefail
 mkdir -p $RDIR && cd $RDIR
-LB=~/bonsai2/llama.cpp/build/bin
+LB=\$HOME/bonsai2/llama.cpp/build/bin
 gcc -O2 -fopenmp -march=armv8.2-a+dotprod -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c tq_gemv_neon.c -o fwd_neon_mt.o
 gcc -O2 -fopenmp -march=armv8.2-a+dotprod -c fwd.c -o fwd.o
 gcc -O2 -fopenmp -o fwd_exp fwd.o fwd_neon_mt.o fwht.S -L\$LB -lggml-base -lggml-cpu -Wl,-rpath,\$LB -lm

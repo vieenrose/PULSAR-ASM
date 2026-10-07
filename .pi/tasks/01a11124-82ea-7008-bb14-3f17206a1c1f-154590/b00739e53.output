@@ -1,0 +1,61 @@
+BUILD_OK
+llama_model_loader: loaded meta data with 49 key-value pairs and 851 tensors from ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf (version GGUF V3 (latest))
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv   0:                       general.architecture str              = qwen35
+llama_model_loader: - kv   1:                               general.type str              = model
+llama_model_loader: - kv   2:                     general.sampling.top_k i32              = 20
+llama_model_loader: - kv   3:                     general.sampling.top_p f32              = 0.950000
+llama_model_loader: - kv   4:                      general.sampling.temp f32              = 1.000000
+llama_model_loader: - kv   5:                               general.name str              = Hf
+llama_model_loader: - kv   6:                            general.version str              = v5
+llama_model_loader: - kv   7:                           general.basename str              = folded
+llama_model_loader: - kv   8:                         general.size_label str              = 27B
+llama_model_loader: - kv   9:                         qwen35.block_count u32              = 64
+llama_model_loader: - kv  10:                      qwen35.context_length u32              = 262144
+llama_model_loader: - kv  11:                    qwen35.embedding_length u32              = 5120
+llama_model_loader: - kv  12:                 qwen35.feed_forward_length u32              = 17408
+llama_model_loader: - kv  13:                qwen35.attention.head_count u32              = 24
+llama_model_loader: - kv  14:             qwen35.attention.head_count_kv u32              = 4
+llama_model_loader: - kv  15:             qwen35.rope.dimension_sections arr[i32,4]       = [11, 11, 10, 0]
+llama_model_loader: - kv  16:                      qwen35.rope.freq_base f32              = 10000000.000000
+llama_model_loader: - kv  17:    qwen35.attention.layer_norm_rms_epsilon f32              = 0.000001
+llama_model_loader: - kv  18:                qwen35.attention.key_length u32              = 256
+llama_model_loader: - kv  19:              qwen35.attention.value_length u32              = 256
+llama_model_loader: - kv  20:                     qwen35.ssm.conv_kernel u32              = 4
+llama_model_loader: - kv  21:                      qwen35.ssm.state_size u32              = 128
+llama_model_loader: - kv  22:                     qwen35.ssm.group_count u32              = 16
+llama_model_loader: - kv  23:                  qwen35.ssm.time_step_rank u32              = 48
+llama_model_loader: - kv  24:                      qwen35.ssm.inner_size u32              = 6144
+llama_model_loader: - kv  25:             qwen35.full_attention_interval u32              = 4
+llama_model_loader: - kv  26:                qwen35.rope.dimension_count u32              = 64
+llama_model_loader: - kv  27:                     prism.hadamard.version u32              = 1
+llama_model_loader: - kv  28:                  prism.hadamard.block_size u32              = 1024
+llama_model_loader: - kv  29:                   prism.hadamard.transform str              = normalized-sylvester-walsh-hadamard
+llama_model_loader: - kv  30:                        prism.hadamard.axis str              = input-last-dimension
+llama_model_loader: - kv  31:                   prism.hadamard.sign_mode str              = explicit
+llama_model_loader: - kv  32:                prism.hadamard.weight_names arr[str,401]     = ["output.weight", "blk.0.attn_qkv.wei...
+llama_model_loader: - kv  33:                 prism.hadamard.sign_widths arr[i32,3]       = [5120, 6144, 17408]
+llama_model_loader: - kv  34:                 prism.hadamard.sign_values arr[i32,28672]   = [-1, -1, -1, 1, -1, 1, 1, 1, 1, 1, 1,...
+llama_model_loader: - kv  35:        prism.hadamard.inverse_weight_names arr[str,1]       = ["token_embd.weight"]
+llama_model_loader: - kv  36:               prism.hadamard.gdn_v_grouped bool             = true
+llama_model_loader: - kv  37:                       tokenizer.ggml.model str              = gpt2
+llama_model_loader: - kv  38:                         tokenizer.ggml.pre str              = qwen35
+llama_model_loader: - kv  39:                      tokenizer.ggml.tokens arr[str,248320]  = ["!", "\"", "#", "$", "%", "&", "'", ...
+llama_model_loader: - kv  40:                  tokenizer.ggml.token_type arr[i32,248320]  = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, ...
+llama_model_loader: - kv  41:                      tokenizer.ggml.merges arr[str,247587]  = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t",...
+llama_model_loader: - kv  42:                tokenizer.ggml.eos_token_id u32              = 248046
+llama_model_loader: - kv  43:            tokenizer.ggml.padding_token_id u32              = 248044
+llama_model_loader: - kv  44:                tokenizer.ggml.bos_token_id u32              = 248044
+llama_model_loader: - kv  45:               tokenizer.ggml.add_bos_token bool             = false
+llama_model_loader: - kv  46:                    tokenizer.chat_template str              = {%- set image_count = namespace(value...
+llama_model_loader: - kv  47:               general.quantization_version u32              = 2
+llama_model_loader: - kv  48:                          general.file_type u32              = 143
+llama_model_loader: - type  f32:  353 tensors
+llama_model_loader: - type bf16:   96 tensors
+llama_model_loader: - type ptq1_0:  402 tensors
+print_info: file format = GGUF V3 (latest)
+print_info: file type   = PTQ1_0 - 1.75 bpw ternary (group 128)
+print_info: file size   = 5.53 GiB (1.77 BPW) 
+init_tokenizer: initializing tokenizer for type 2
+load: 0 unused tokens
+load: control token: 248075 '<tts_text_bos_single>' is not marked as EOG

@@ -1,0 +1,15 @@
+BUILD_OK
+tensors=851 data_start=11120992
+OFF blk.0.ffn_gate.weight = 605245792 dims=5120 x 17408
+OFF blk.0.ffn_up.weight = 624742752 dims=5120 x 17408
+OFF blk.0.ffn_down.weight = 585748832 dims=17408 x 5120
+OFF blk.0.attn_qkv.weight = 574280032 dims=5120 x 10240
+OFF blk.0.ssm_conv1d.weight = 645243424 dims=4 x 10240
+OFF token_embd.weight = 289259872 dims=5120 x 248320
+OFF output.weight = 11120992 dims=5120 x 248320
+=== MAP:
+blk.0.attn_qkv.weight                            PTQ1_0  5120x10240             off=574280032    nbytes=11468800
+blk.0.ffn_down.weight                            PTQ1_0  17408x5120             off=585748832    nbytes=19496960
+blk.0.ffn_gate.weight                            PTQ1_0  5120x17408             off=605245792    nbytes=19496960
+blk.0.ffn_up.weight                              PTQ1_0  5120x17408             off=624742752    nbytes=19496960
+blk.0.ssm_conv1d.weight                          F32     4x10240                off=645243424    nbytes=163840

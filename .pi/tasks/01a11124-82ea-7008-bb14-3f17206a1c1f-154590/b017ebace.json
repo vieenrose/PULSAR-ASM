@@ -1,0 +1,27 @@
+{
+  "id": "b017ebace",
+  "name": "full-capture engine reshoots",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && export OMP_NUM_THREADS=20 && taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 --gen 300 --sample 0.5 0.85 20 7 2>/dev/null | grep \"^step\" > /tmp/en_re.txt; taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 99270 115992 104647 3709 98404 98443 96681 96594 110476 127312 1710 --gen 350 --sample 0.5 0.85 20 7 2>/dev/null | grep \"^step\" > /tmp/zh_re.txt; wc -l /tmp/en_re.txt /tmp/zh_re.txt; echo \"=== EN gen ids:\"; awk \"NR>12 {print \\$4}\" /tmp/en_re.txt | head -3; echo \"...\"; echo \"=== ZH gen ids:\"; awk \"NR>11 {print \\$4}\" /tmp/zh_re.txt | head -3' 2>&1 | head -12",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b017ebace.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791374306355,
+  "endTime": 1791374656979,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 703619,
+  "bytesWritten": 149,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

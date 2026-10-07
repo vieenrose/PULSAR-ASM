@@ -1,0 +1,47 @@
+########## 17-haiku
+PROMPT: Write a haiku about the sea.
+Tides roll in,  
+waves whisper secrets,  
+the sea sings.
+
+########## 17-zh
+PROMPT: 請列出保持健康的三個要點。
+保持健康的三個要點是：
+
+1. **定期進行體育活動**  
+   每週至少進行至少30分鐘的有氧性運動，例如快走、跳跑步或球類運動，可以改善心血管健康、增强體能並減輕壓力。
+
+2! **保持均衡的營養**  
+   食物均衡，包括多吃蔬菜水果、全谷物、蛋白質和健康的油脂，同時減少高油高糖和高盐食品。
+
+3. **保持良好的睡眠質量**  
+   無眠不足會影響情緒和體能，建議每晚睡7-9小時，保持良好的睡眠環境並避免電子設備前入睡。
+
+########## 4b-seasons
+PROMPT: List the four seasons and one thing that changes in each.
+Here are the four seasons and one thing that changes in each:
+
+1! **Spring** – *Flowers bloom*  
+2! **Summer!** – *Days get longer*  
+3! **Autumn** – *Leaves change color*  
+4! **Winter** – *Snow falls*
+
+Each season brings a noticeable change in nature and climate.
+
+########## 4b-haiku
+PROMPT: Write a haiku about the sea.
+Beneath the moon's soft glow,  
+waves whisper secrets to the shore—  
+tides rise, tides fall.
+
+########## 4b-repeat
+PROMPT: Repeat exactly this sentence: The quick brown fox jumps over the lazy dog.
+The!
+
+########## 17-structured
+PROMPT: List three benefits of regular exercise, one sentence each.
+Regulardefs can improve cardiovascular health.  
+Regular exercise helps reduce the!  
+Regular physical!
+
+########## HUNT2 DONE

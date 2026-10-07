@@ -1,0 +1,27 @@
+{
+  "id": "b4d6c88c3",
+  "name": "OpenMP build + 20-core run",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && python3 - <<PYEOF\ns = open(\"tq_gemv_neon.c\").read()\no = \"    int ng = cols / 128;\\n    int8_t tmp[32];\\n    for (int r = 0; r < rows; r++) {\"\nassert s.count(o) == 1\nn = \"    int ng = cols / 128;\\n    int8_t tmp[32];\\n    (void)tmp;\\n    #pragma omp parallel for schedule(static)\\n    for (int r = 0; r < rows; r++) {\"\nopen(\"tq_gemv_neon.c\",\"w\").write(s.replace(o, n, 1))\nprint(\"omp pragma added\")\nPYEOF\nLB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -fopenmp -march=armv8.2-a+dotprod -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c tq_gemv_neon.c -o fwd_neon_mt.o 2>&1 | head -5 && gcc -O2 -fopenmp -o fwd_mt fwd.o fwd_neon_mt.o fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -5 && echo BUILD_OK && OMP_NUM_THREADS=20 time taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 --gen 5 2>/dev/null | grep \"^step\"' 2>&1 | head -25",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b4d6c88c3.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791373620369,
+  "endTime": 1791373662895,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 572079,
+  "bytesWritten": 990,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

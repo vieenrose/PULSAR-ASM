@@ -1,0 +1,29 @@
+{
+  "id": "b03a7d643",
+  "name": "Doubling isolation probe",
+  "command": "/tmp/probe2.sh 2>&1",
+  "description": "Isolate the token doubling: temp 0.1 (near-greedy) vs 0.5 without top-p vs 1.0, plus retries of the two dropped prompts",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b03a7d643.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791342609691,
+  "endTime": 1791343785552,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 223320,
+  "bytesWritten": 2263,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 7200,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

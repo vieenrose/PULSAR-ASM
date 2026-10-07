@@ -1,0 +1,27 @@
+{
+  "id": "bdc25bf56",
+  "name": "offset cross-check",
+  "command": "cat /tmp/fwd.c | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/fwd.c && cd ~/bonsai2/asm && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -march=armv8.2-a+dotprod -c fwd.c -o fwd.o 2>&1 | grep -i \" error\" | head -3; gcc -O2 -o fwd fwd.o fwd_neon.o fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -3 && echo BUILD_OK && DUMPOFF=1 ./fwd ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 2>/dev/null; echo \"=== MAP:\"; python3 gguf_map.py ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf blk.0. 2>/dev/null | grep -E \"ffn_gate|ffn_up|ffn_down|attn_qkv|conv1d|token_embd|output.weight\" | head -10' 2>&1 | head -22",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bdc25bf56.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791372595020,
+  "endTime": 1791372596067,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 369410,
+  "bytesWritten": 991,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "b95069e72",
+  "name": "mscale revert + revalidate",
+  "command": "cat /tmp/fwd8.c | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/fwd8.c && cd ~/bonsai2/asm && gcc -O2 -march=armv8.2-a+dotprod -c fwd8.c -o fwd8.o 2>&1 | grep -i \" error\" | head -3; LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -o fwd8 fwd8.o fwd8_pq2.o -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -3 && echo BUILD_OK && taskset -c 3 ./fwd8 ../models/bonsai8b-PQ2_0.gguf 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 --gen 5 2>&1 | grep \"^step\" | tail -6' 2>&1 | head -10",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b95069e72.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791381094367,
+  "endTime": 1791381126328,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 1902703,
+  "bytesWritten": 254,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

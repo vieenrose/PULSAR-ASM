@@ -1,0 +1,18 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/aarch64-linux-gnu/libthread_db.so.1".
+*** buffer overflow detected ***: terminated
+
+Program received signal SIGABRT, Aborted.
+__pthread_kill_implementation (threadid=281474842430656, signo=signo@entry=6, no_tid=no_tid@entry=0) at ./nptl/pthread_kill.c:44
+warning: 44	./nptl/pthread_kill.c: No such file or directory
+#0  __pthread_kill_implementation (threadid=281474842430656, signo=signo@entry=6, no_tid=no_tid@entry=0) at ./nptl/pthread_kill.c:44
+#1  0x0000fffff7c47540 in __pthread_kill_internal (signo=6, threadid=<optimized out>) at ./nptl/pthread_kill.c:78
+#2  0x0000fffff7bfcb3c in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#3  0x0000fffff7be7e00 in __GI_abort () at ./stdlib/abort.c:79
+#4  0x0000fffff7c3aac4 in __libc_message_impl (fmt=fmt@entry=0xfffff7d22c78 "*** %s ***: terminated\n") at ../sysdeps/posix/libc_fatal.c:134
+#5  0x0000fffff7cb82a8 in __GI___fortify_fail (msg=msg@entry=0xfffff7d22c28 "buffer overflow detected") at ./debug/fortify_fail.c:24
+#6  0x0000fffff7cb7ae4 in __GI___chk_fail () at ./debug/chk_fail.c:28
+#7  0x0000fffff7cb8b08 in __GI___memcpy_chk (dstpp=dstpp@entry=0xaaaaaaabfc68, srcpp=srcpp@entry=0xaaaaaaac9c68 <VCA+38928>, len=len@entry=81920, dstlen=dstlen@entry=0) at ./debug/memcpy_chk.c:27
+#8  0x0000aaaaaaaa2558 in memcpy (__len=81920, __src=0xaaaaaaac9c68 <VCA+38928>, __dest=0xaaaaaaabfc68) at /usr/include/aarch64-linux-gnu/bits/string_fortified.h:29
+#9  layer_linear (il=48) at fwd.c:248
+#10 main (argc=<optimized out>, argv=<optimized out>) at fwd.c:376

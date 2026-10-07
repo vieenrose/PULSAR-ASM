@@ -1,0 +1,27 @@
+{
+  "id": "b00739e53",
+  "name": "fork stage-rms oracle",
+  "command": "cat /tmp/dump_stage_rms.cpp | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/dump_stage_rms.cpp && cd ~/bonsai2/asm && F=~/bonsai2/llama.cpp B=~/bonsai2/llama.cpp/build && g++ -O2 -o dump_stage_rms dump_stage_rms.cpp -I$F/include -I$F/ggml/include -L$B/bin -lllama -lggml -lggml-base -Wl,-rpath,$B/bin -lm 2>&1 | head -10 && echo BUILD_OK && taskset -c 3 ./dump_stage_rms ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 2>&1 | head -60' 2>&1 | head -65",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b00739e53.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791372074835,
+  "endTime": 1791372078029,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 283837,
+  "bytesWritten": 5765,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

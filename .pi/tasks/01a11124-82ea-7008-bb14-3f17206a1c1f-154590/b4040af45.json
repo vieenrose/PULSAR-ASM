@@ -1,0 +1,29 @@
+{
+  "id": "b4040af45",
+  "name": "Bonsai 1.7B + 4B demos",
+  "command": "/tmp/gendemo.sh 2>&1",
+  "description": "Fresh demo runs: same-job rates + ceiling-prompt transcripts for Bonsai 1.7B and 4B",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b4040af45.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791361974125,
+  "endTime": 1791362714110,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 272465,
+  "bytesWritten": 1160,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 5400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

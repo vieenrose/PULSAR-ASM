@@ -1,0 +1,27 @@
+{
+  "id": "b90853c73",
+  "name": "normed face-off both sides",
+  "command": "cat /tmp/dump_stage_rms.cpp | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/dump_stage_rms.cpp && cd ~/bonsai2/asm && F=~/bonsai2/llama.cpp B=~/bonsai2/llama.cpp/build && g++ -O2 -o dump_stage_rms dump_stage_rms.cpp -I$F/include -I$F/ggml/include -L$B/bin -lllama -lggml -lggml-base -Wl,-rpath,$B/bin -lm 2>&1 | grep -i error | head -3; taskset -c 3 ./dump_stage_rms ../models/bonsai8b-PQ2_0.gguf 872 2>/dev/null | grep -A3 \"Qcur_normed-0\\|Kcur_normed-0\" | head -10; echo \"=== MINE:\"; taskset -c 3 ./fwd8 ../models/bonsai8b-PQ2_0.gguf 872 --gen 0 --trace 2>/dev/null | grep -A1 \"qnorm v8\\|knorm v8\" | head -6' 2>&1 | head -16",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b90853c73.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791381013769,
+  "endTime": 1791381017443,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 1886868,
+  "bytesWritten": 965,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

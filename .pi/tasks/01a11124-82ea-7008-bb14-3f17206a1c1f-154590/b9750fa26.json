@@ -1,0 +1,27 @@
+{
+  "id": "b9750fa26",
+  "name": "int-path validation + timing",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -DTQ_XGEMV_LIB -o tq_gemv_int tq_gemv_int.c tq_xgemv.c fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm && taskset -c 3 ./tq_gemv_int ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 11120992 594124800 64' 2>&1 | tail -8",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b9750fa26.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791369521821,
+  "endTime": 1791369522937,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 280955,
+  "bytesWritten": 207,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

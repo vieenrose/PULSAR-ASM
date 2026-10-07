@@ -1,0 +1,27 @@
+{
+  "id": "b296e9e3d",
+  "name": "normed QKV face-off",
+  "command": "cat /tmp/dump_stage_rms.cpp | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/dump_stage_rms.cpp' 2>&1; cat /tmp/fwd8.c | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/fwd8.c && cd ~/bonsai2/asm && F=~/bonsai2/llama.cpp B=~/bonsai2/llama.cpp/build && g++ -O2 -o dump_stage_rms dump_stage_rms.cpp -I$F/include -I$F/ggml/include -L$B/bin -lllama -lggml -lggml-base -Wl,-rpath,$B/bin -lm 2>&1 | grep -i error | head -3; gcc -O2 -march=armv8.2-a+dotprod -c fwd8.c -o fwd8.o 2>&1 | grep -i \" error\" | head -3; LB=$B/bin && gcc -O2 -o fwd8 fwd8.o fwd8_pq2.o -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -3 && echo BUILD_OK && taskset -c 3 ./dump_stage_rms ../models/bonsai8b-PQ2_0.gguf 872 2>/dev/null | grep -A2 \"Qcur_normed-0\\|Kcur_normed-0\\|Vcur-0 \\|embd \" | head -16' 2>&1 | head -20",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b296e9e3d.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791380976967,
+  "endTime": 1791380980666,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 1878756,
+  "bytesWritten": 585,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

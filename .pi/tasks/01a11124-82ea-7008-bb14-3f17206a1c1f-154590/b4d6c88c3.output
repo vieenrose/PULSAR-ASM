@@ -1,0 +1,19 @@
+omp pragma added
+BUILD_OK
+step 0 id_in=826 top=314 logit=9.4850 logit271=6.4933
+step 1 id_in=279 top=220 logit=10.4828 logit271=4.1535
+step 2 id_in=2943 top=1822 logit=11.0031 logit271=5.0998
+step 3 id_in=15127 top=303 logit=14.0810 logit271=11.0078
+step 4 id_in=321 top=836 logit=14.7766 logit271=8.6921
+step 5 id_in=799 top=3010 logit=14.0475 logit271=8.0644
+step 6 id_in=3065 top=421 logit=14.8281 logit271=9.7299
+step 7 id_in=421 top=8311 logit=15.6193 logit271=8.8344
+step 8 id_in=4203 top=303 logit=15.3162 logit271=11.5362
+step 9 id_in=303 top=1754 logit=15.3490 logit271=8.5812
+step 10 id_in=1754 top=3098 logit=15.5260 logit271=12.5509
+step 11 id_in=13 top=271 logit=14.8372 logit271=14.8372
+step 12 id_in=271 top=248068 logit=16.9592 logit271=5.6905
+step 13 id_in=248068 top=198 logit=20.5503 logit271=19.7825
+step 14 id_in=198 top=760 logit=22.4137 logit271=3.4437
+step 15 id_in=760 top=1156 logit=22.7296 logit271=6.3918
+step 16 id_in=1156 top=369 logit=22.5705 logit271=5.0396

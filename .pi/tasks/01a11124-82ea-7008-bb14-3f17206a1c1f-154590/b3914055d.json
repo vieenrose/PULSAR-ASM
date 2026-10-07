@@ -1,0 +1,29 @@
+{
+  "id": "b3914055d",
+  "name": "Wait for f64 oracle",
+  "command": "P=luigi@raspberrypi.tailf63b31.ts.net\nwhile ssh -o BatchMode=yes $P 'pgrep -f q2_0_ref_f64.py > /dev/null'; do sleep 60; done\necho \"=== f64 oracle finished ===\"\nssh -o BatchMode=yes $P 'grep -c \"^ARGMAX\" /tmp/oracle8_f64.log; echo \"--- f64 argmaxes\"; grep \"^ARGMAX\" /tmp/oracle8_f64.log; echo \"--- f32 argmaxes\"; grep \"^ARGMAX\" /tmp/oracle8.log; echo \"--- logit deltas f32 vs f64\"; python3 - <<\"PY\"\nimport re\ndef logits(path):\n    d={}\n    for l in open(path):\n        if not l.startswith(\"LOGITS\"): continue\n        p=int(l.split()[1][1:]); m=[(int(x.split(\":\")[0]),float(x.split(\":\")[1])) for x in l.split()[2:]]\n        d[p]=dict(m)\n    return d\na=logits(\"/tmp/oracle8.log\"); b=logits(\"/tmp/oracle8_f64.log\")\nfor p in sorted(set(a)&set(b)):\n    common=set(a[p])&set(b[p])\n    if not common: continue\n    mx=max(abs(a[p][k]-b[p][k]) for k in common)\n    print(\"p%d  max|f32-f64| over shared top-5 = %.5f\"%(p,mx))\nPY'",
+  "status": "failed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b3914055d.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791330594028,
+  "endTime": 1791344994041,
+  "exitCode": null,
+  "signal": "SIGTERM",
+  "pid": 209917,
+  "bytesWritten": 51,
+  "isAgent": false,
+  "surviveReload": false,
+  "error": "Timed out after 14400s",
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 14400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

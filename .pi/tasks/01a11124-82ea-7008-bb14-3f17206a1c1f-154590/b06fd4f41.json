@@ -1,0 +1,27 @@
+{
+  "id": "b06fd4f41",
+  "name": "extract sign tables retry",
+  "command": "cat /tmp/sign_extract.py | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/sign_extract.py && python3 ~/bonsai2/asm/sign_extract.py ~/bonsai2/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf && ls -la /tmp/sign*.bin && cmp /tmp/sign5120.bin /tmp/sign5120.bin && python3 -c \"\nimport struct\na=open(\\\"/tmp/sign5120.bin\\\",\\\"rb\\\").read()\nv=struct.unpack(\\\"<%df\\\"% (len(a)//4), a)\nprint(\\\"5120: n=%d all_pm1=%s\\\" % (len(v), all(x in (1.0,-1.0) for x in v)))\"' 2>&1 | head -12",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b06fd4f41.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791370259626,
+  "endTime": 1791370261792,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 281803,
+  "bytesWritten": 377,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

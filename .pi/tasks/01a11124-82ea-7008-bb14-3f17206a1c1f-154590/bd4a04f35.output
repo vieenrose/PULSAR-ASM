@@ -1,0 +1,22 @@
+########## 8B neural
+PROMPT: Explain what a neural network is in two sentences.
+IDS: 151644 872 198 840 20772 1128 264 29728 3922 374 304 1378 22870 13 151645 198 151644 77091 198 151667 271 151668 271
+CONTENT: 'A neural network is a computational model inspired by the structure and function of the human brain, consisting of layers of interconnected nodes or "neurons" that process information. It learns patterns from data through a process of adjusting the strength of connections between neurons, enabling it to make predictions or decisions.'
+RATE: 104.5 ms/token = 9.57 tok/s
+TOKENS: prompt 23 completion 59
+
+########## 8B seasons
+PROMPT: List the four seasons and one thing that changes in each.
+IDS: 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 271
+CONTENT: 'Here are the four seasons and one thing that changes in each:\n\n1. **Spring** – The weather warms up and flowers begin to bloom.  \n2. **Summer** – Days get longer and the sun is hotter.  \n3. **Autumn (Fall)** – Leaves change color and the weather cools down.  \n4. **Winter** – It gets colder and snow may fall.'
+RATE: 108.5 ms/token = 9.22 tok/s
+TOKENS: prompt 24 completion 82
+
+########## 8B haiku
+PROMPT: Write a haiku about the sea.
+IDS: 151644 872 198 7985 264 6386 38242 911 279 9396 13 151645 198 151644 77091 198 151667 271 151668 271
+CONTENT: 'Tides whisper to shore,  \nSalt-kissed winds carry distant dreams—  \nSea’s eternal song.'
+RATE: 109.3 ms/token = 9.15 tok/s
+TOKENS: prompt 20 completion 23
+
+########## PROBE8B3 DONE

@@ -1,0 +1,27 @@
+{
+  "id": "b5f296e7c",
+  "name": "gdb backtrace of crash",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && taskset -c 3 gdb -batch -ex run -ex bt --args ./fwd_g ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 --gen 0 2>&1 | tail -20' 2>&1 | tail -22",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b5f296e7c.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791370505893,
+  "endTime": 1791370512928,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 282131,
+  "bytesWritten": 1606,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,4 @@
+/usr/bin/ld: /tmp/cc6NSUtd.o: in function `main':
+tq_gemv_int.c:(.text.startup+0x1c8): undefined reference to `fwht1024_f32'
+collect2: error: ld returned 1 exit status
+ls: cannot access 'tq_gemv_int': No such file or directory

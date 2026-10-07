@@ -1,0 +1,29 @@
+{
+  "id": "bd4a04f35",
+  "name": "Probe Bonsai 8B v3",
+  "command": "stdbuf -oL -eL bash /tmp/probe8b3.sh 2>&1",
+  "description": "8B ceiling-prompt probes (neural, seasons, haiku) against the running server on :8091, line-buffered output",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bd4a04f35.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791366806157,
+  "endTime": 1791366840965,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 277727,
+  "bytesWritten": 1588,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 5400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

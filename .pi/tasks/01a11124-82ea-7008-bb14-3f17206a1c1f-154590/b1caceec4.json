@@ -1,0 +1,27 @@
+{
+  "id": "b1caceec4",
+  "name": "oracle v8 values L0",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && taskset -c 3 ./dump_stage_rms ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 2>/dev/null | grep -A1 \"input_embed\\|qkv_mixed-0\\|conv_output_raw-0 \\|conv_output_silu-0\\|z-0\\|final_output-0 \\|linear_attn_out-0 \\|ffn_out-0 \" | head -32' 2>&1 | head -34",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b1caceec4.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791372236414,
+  "endTime": 1791372246172,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 296533,
+  "bytesWritten": 1404,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

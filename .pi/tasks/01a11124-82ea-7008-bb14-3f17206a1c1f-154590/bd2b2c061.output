@@ -1,0 +1,4 @@
+613621760
+neon-path vs fork vec_dot (64 rows): bit-diff 0, maxrel 0.00e+00 BIT-EXACT
+sample: fork 0.603403  mine 0.603403
+full ffn_gate 17408x5120 neon-path: 25.9 ms (0.29 ns/w)  [scalar-int 139 ms / f32 153 ms]

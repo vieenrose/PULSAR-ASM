@@ -1,0 +1,27 @@
+{
+  "id": "bcf508ca6",
+  "name": "rebuild with min-p sampler",
+  "command": "cat /tmp/fwd.c | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/fwd.c && cd ~/bonsai2/asm && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -fopenmp -march=armv8.2-a+dotprod -c fwd.c -o fwd.o 2>&1 | grep -i \" error\" | head -5; gcc -O2 -fopenmp -o fwd_mt fwd.o fwd_neon_mt.o fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -3 && echo BUILD_OK' 2>&1 | head -5",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bcf508ca6.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791375577213,
+  "endTime": 1791375580596,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 917179,
+  "bytesWritten": 9,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "b67c95b45",
+  "name": "8B greedy validation",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && echo \"=== SERVER 8B temp-0:\"; curl -s -m 600 http://127.0.0.1:8091/completion -H \"Content-Type: application/json\" -d \"{\\\"prompt\\\":[151644,872,198,852,279,3040,15584,323,825,3166,429,4344,304,1817,13,151645,198,151644,77091,198,151667,271,151668],\\\"temperature\\\":0.0,\\\"n_predict\\\":5,\\\"stream\\\":false}\" | python3 -c \"import json,sys; d=json.load(sys.stdin); print(repr(d.get(\\\"content\\\",\\\"\\\")[:120]))\"; echo \"=== ENGINE 8B:\"; taskset -c 3 ./fwd8 ../models/bonsai8b-PQ2_0.gguf 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 --gen 5 2>&1 | grep \"^step\" | tail -8' 2>&1 | head -14",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b67c95b45.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791377248403,
+  "endTime": 1791377254208,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 1227884,
+  "bytesWritten": 58,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

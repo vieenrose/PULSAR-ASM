@@ -1,0 +1,27 @@
+{
+  "id": "b33715af3",
+  "name": "BOS-prepend comparison run",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && taskset -c 3 ./fwd ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 151644 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 --gen 0 2>&1 | tail -4' 2>&1 | tail -5",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b33715af3.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791370685683,
+  "endTime": 1791370784797,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 282345,
+  "bytesWritten": 171,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

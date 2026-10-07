@@ -1,0 +1,27 @@
+{
+  "id": "b3432997c",
+  "name": "full stage-rms dump",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && taskset -c 3 ./dump_stage_rms ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 2>/dev/null | grep -v \"llama_model_loader\\|print_info\\|init_tokenizer\\|load:\" | head -100' 2>&1 | head -105",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b3432997c.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791372119219,
+  "endTime": 1791372122819,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 283879,
+  "bytesWritten": 4817,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

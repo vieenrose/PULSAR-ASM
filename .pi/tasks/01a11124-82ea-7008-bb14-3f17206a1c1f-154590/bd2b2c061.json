@@ -1,0 +1,27 @@
+{
+  "id": "bd2b2c061",
+  "name": "validate up-matrix GEMV directly",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && python3 -c \"print(624742752-11120992)\" && taskset -c 3 ./tq_gemv_neon ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 11120992 613621760 64 2>&1 | head -3' 2>&1 | head -5",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bd2b2c061.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791372695776,
+  "endTime": 1791372696526,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 389623,
+  "bytesWritten": 212,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

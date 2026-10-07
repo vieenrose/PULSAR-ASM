@@ -1,0 +1,23 @@
+fwd.c: In function ‘layer_linear’:
+fwd.c:224:25: error: invalid use of void expression
+  224 | #define TW(il, kind) tw(tn(il, kind, NB))
+      |                         ^~~~~~~~~~~~~~~~
+fwd.c:237:11: note: in expansion of macro ‘TW’
+  237 |     gemvT(TW(il, "attn_qkv.weight"), QKVW, HID, SGN5120, XN, QKV);
+      |           ^~
+fwd.c:224:25: error: invalid use of void expression
+  224 | #define TW(il, kind) tw(tn(il, kind, NB))
+      |                         ^~~~~~~~~~~~~~~~
+fwd.c:238:11: note: in expansion of macro ‘TW’
+  238 |     gemvT(TW(il, "attn_gate.weight"), ZW, HID, SGN5120, XN, ZV);
+      |           ^~
+fwd.c:224:25: error: invalid use of void expression
+  224 | #define TW(il, kind) tw(tn(il, kind, NB))
+      |                         ^~~~~~~~~~~~~~~~
+fwd.c:239:12: note: in expansion of macro ‘TW’
+  239 |     bfgemv(TW(il, "ssm_beta.weight"), XN, B48);
+      |            ^~
+fwd.c:224:25: error: invalid use of void expression
+/usr/bin/ld: cannot find fwd.o: No such file or directory
+collect2: error: ld returned 1 exit status
+BUILD_OK

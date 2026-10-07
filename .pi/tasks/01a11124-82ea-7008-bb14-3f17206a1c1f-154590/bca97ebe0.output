@@ -1,0 +1,22 @@
+BUILD_OK
+tensors=851 data_start=11120992
+ xchk ffn_gate:
+  xchk row 1000 mine=0.0538606 fork=0.0538606
+  xchk row 1001 mine=0.274018 fork=0.274018
+  xchk row 1002 mine=0.0679425 fork=0.0679425
+  xchk row 1003 mine=0.0715507 fork=0.0715507
+  xchk row 1004 mine=-0.157782 fork=-0.157782
+  xchk row 1005 mine=-0.413203 fork=-0.413203
+  xchk row 1006 mine=-0.170029 fork=-0.170029
+  xchk row 1007 mine=-0.150528 fork=-0.150528
+ xchk ffn_up:
+  xchk row 1000 mine=0.0959142 fork=0.0959142
+  xchk row 1001 mine=-0.099808 fork=-0.099808
+  xchk row 1002 mine=-0.013628 fork=-0.013628
+  xchk row 1003 mine=0.0147574 fork=0.0147574
+  xchk row 1004 mine=0.14477 fork=0.14477
+  xchk row 1005 mine=1.44658 fork=1.44658
+  xchk row 1006 mine=-0.252406 fork=-0.252406
+  xchk row 1007 mine=0.0875347 fork=0.0875347
+step 0 id_in=826 top=17 logit=12.2623 logit271=11.3443
+  top5: 17:12.262 220:11.777 16:11.382 271:11.344 15:11.319

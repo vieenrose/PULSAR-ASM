@@ -1,0 +1,27 @@
+{
+  "id": "b96363e5a",
+  "name": "zh-TW ceiling probes",
+  "command": "bash /tmp/probe_zhtw.sh 2>&1",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b96363e5a.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791368778077,
+  "endTime": 1791368953291,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 279949,
+  "bytesWritten": 2206,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

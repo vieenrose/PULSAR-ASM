@@ -1,0 +1,15 @@
+0
+BUILD_OK
+tensors=851 data_start=11120992
+step 0 id_in=826 top=17 logit=12.2623
+step 1 id_in=279 top=220 logit=10.7171
+step 2 id_in=2943 top=220 logit=11.3103
+step 3 id_in=15127 top=248046 logit=11.0113
+step 4 id_in=321 top=220 logit=11.1857
+step 5 id_in=799 top=248046 logit=11.3820
+step 6 id_in=3065 top=248046 logit=11.5470
+step 7 id_in=421 top=248046 logit=11.3447
+step 8 id_in=4203 top=248046 logit=11.4552
+step 9 id_in=303 top=248046 logit=11.6954
+step 10 id_in=1754 top=248046 logit=11.5969
+step 11 id_in=13 top=248046 logit=11.6732

@@ -1,0 +1,7 @@
+BUILD_OK
+step 22 id_in=151668 top=271 logit=32.5140
+step 23 id_in=271 top=39814 logit=19.9844
+step 24 id_in=39814 top=0 logit=26.2985
+step 25 id_in=0 top=5692 logit=26.0843
+step 26 id_in=5692 top=525 logit=20.6533
+step 27 id_in=525 top=279 logit=23.7746

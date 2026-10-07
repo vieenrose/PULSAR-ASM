@@ -1,0 +1,27 @@
+########## ENGINE RESHOOT EN (temp 0.5/0.85/20 seed 7)
+step 117 id_in=466 top=9561 logit=19.5566 logit271=4.9590
+step 118 id_in=9561 top=1189 logit=18.0390 logit271=5.9357
+step 119 id_in=1189 top=3311 logit=19.1995 logit271=6.5284
+step 120 id_in=3311 top=279 logit=21.1034 logit271=5.6286
+step 121 id_in=279 top=4751 logit=22.2800 logit271=5.7569
+step 122 id_in=4751 top=13 logit=17.1164 logit271=5.9684
+step 123 id_in=13 top=248046 logit=17.9170 logit271=14.6377
+step 124 id_in=248046 top=198 logit=20.8128 logit271=9.4599
+########## ENGINE RESHOOT ZHTW (temp 0.5/0.85/20 seed 7)
+
+real	1m28.834s
+user	13m43.544s
+sys	0m11.091s
+step 353 id_in=91 top=2972 logit=21.9263 logit271=7.6958
+step 354 id_in=2972 top=97649 logit=22.1146 logit271=1.4658
+step 355 id_in=97649 top=332 logit=23.2085 logit271=4.2403
+step 356 id_in=332 top=735 logit=22.0148 logit271=6.8617
+step 357 id_in=735 top=220 logit=23.4513 logit271=6.0095
+step 358 id_in=220 top=102134 logit=25.4216 logit271=-0.9692
+step 359 id_in=102134 top=114174 logit=21.7677 logit271=1.1550
+step 360 id_in=114174 top=98167 logit=22.3297 logit271=0.7137
+########## RESHOOTS DONE
+
+real	4m21.499s
+user	39m47.389s
+sys	0m31.144s

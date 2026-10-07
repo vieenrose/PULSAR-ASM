@@ -1,0 +1,27 @@
+{
+  "id": "bb2f1e528",
+  "name": "build int-path harness",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -DTQ_XGEMV_LIB -o tq_gemv_int tq_gemv_int.c tq_xgemv.c -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -20 && ls -la tq_gemv_int && python3 gguf_info.py ~/bonsai2/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 2>/dev/null | grep -i \"ffn_gate\" | head -5' 2>&1 | head -30",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bb2f1e528.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791369468672,
+  "endTime": 1791369469490,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 280889,
+  "bytesWritten": 227,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

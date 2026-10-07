@@ -1,0 +1,27 @@
+{
+  "id": "bcbbd3539",
+  "name": "L0 op sequence dump",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && taskset -c 3 ./dump_stage_rms ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 2>/dev/null | awk \"/final_output-0/,/linear_attn_out-0 \\\\(resha/\" | grep \"^T \" | head -30' 2>&1 | head -32",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bcbbd3539.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791373040193,
+  "endTime": 1791373050934,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 460694,
+  "bytesWritten": 292,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

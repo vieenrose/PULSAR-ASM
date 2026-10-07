@@ -1,0 +1,8 @@
+widths: [5120, 6144, 17408] total values: 28672
+wrote /tmp/sign5120.bin (5120 floats)
+wrote /tmp/sign6144.bin (6144 floats)
+wrote /tmp/sign17408.bin (17408 floats)
+-rw-rw-r-- 1 luigi luigi 69632 Oct  7 18:51 /tmp/sign17408.bin
+-rw-rw-r-- 1 luigi luigi 20480 Oct  7 18:51 /tmp/sign5120.bin
+-rw-rw-r-- 1 luigi luigi 24576 Oct  7 18:51 /tmp/sign6144.bin
+5120: n=5120 all_pm1=True

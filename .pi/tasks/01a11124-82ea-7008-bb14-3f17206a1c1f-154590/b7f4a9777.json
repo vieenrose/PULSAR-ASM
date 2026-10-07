@@ -1,0 +1,27 @@
+{
+  "id": "b7f4a9777",
+  "name": "engine v8 values L0",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && taskset -c 3 ./fwd ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 --gen 0 --trace 2>/dev/null | head -22' 2>&1 | head -24",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b7f4a9777.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791372257828,
+  "endTime": 1791372260867,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 299027,
+  "bytesWritten": 1329,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

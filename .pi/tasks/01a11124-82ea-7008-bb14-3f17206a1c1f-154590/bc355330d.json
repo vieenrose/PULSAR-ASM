@@ -1,0 +1,29 @@
+{
+  "id": "bc355330d",
+  "name": "Ceiling prompt hunt",
+  "command": "/tmp/hunt.sh 2>&1",
+  "description": "Ceiling-prompt hunt: 4 probes on Bonsai 1.7B, 1 on 4B, at the card's temp 0.5 / top-k 20 / top-p 0.85",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bc355330d.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791340758050,
+  "endTime": 1791342566620,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 221261,
+  "bytesWritten": 1782,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 7200,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

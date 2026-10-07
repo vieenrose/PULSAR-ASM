@@ -1,0 +1,27 @@
+{
+  "id": "b88a0ff90",
+  "name": "seed sweep en+zh",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && export OMP_NUM_THREADS=20 && for S in 8 9 11; do echo \"########## EN seed $S\"; taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 --gen 200 --sample 0.5 0.85 20 $S 2>/dev/null | grep \"^step\" | awk \"NR>12\" | sed \"s/.*top=//;s/ .*//\" | tr \"\\n\" \" \" > /tmp/en_s$S.txt; echo; wc -w < /tmp/en_s$S.txt; done; for S in 8 9; do echo \"########## ZH seed $S\"; taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 99270 115992 104647 3709 98404 98443 96681 96594 110476 127312 1710 --gen 300 --sample 0.5 0.85 20 $S 2>/dev/null | grep \"^step\" | awk \"NR>11\" | sed \"s/.*top=//;s/ .*//\" | tr \"\\n\" \" \" > /tmp/zh_s$S.txt; echo; wc -w < /tmp/zh_s$S.txt; done; echo SWEEP_DONE' 2>&1 | head -14",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b88a0ff90.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791374734654,
+  "endTime": 1791375450693,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 775629,
+  "bytesWritten": 127,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

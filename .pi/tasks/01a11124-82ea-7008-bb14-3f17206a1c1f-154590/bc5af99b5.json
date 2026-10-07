@@ -1,0 +1,29 @@
+{
+  "id": "bc5af99b5",
+  "name": "Probe Bonsai 8B v2",
+  "command": "/tmp/probe8b2.sh 2>&1",
+  "description": "Start the 8B server on port 8091 and run its ceiling-prompt probes (neural, seasons, haiku) with rates and prompt ids",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bc5af99b5.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791366151389,
+  "endTime": 1791366746087,
+  "exitCode": null,
+  "signal": "SIGTERM",
+  "pid": 276971,
+  "bytesWritten": 382,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 5400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "b413cfa66",
+  "name": "build+run NEON kernel",
+  "command": "cat /tmp/tq_gemv_neon.c | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/tq_gemv_neon.c && cd ~/bonsai2/asm && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -march=armv8.2-a+dotprod -DTQ_XGEMV_LIB -o tq_gemv_neon tq_gemv_neon.c tq_xgemv.c fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm && taskset -c 3 ./tq_gemv_neon ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 11120992 594124800 64' 2>&1 | tail -5",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b413cfa66.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791369731362,
+  "endTime": 1791369732937,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 281171,
+  "bytesWritten": 202,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

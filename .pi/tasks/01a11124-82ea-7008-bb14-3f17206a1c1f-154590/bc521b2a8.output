@@ -1,0 +1,4 @@
+patched to fp32 accumulation
+int-path vs fork vec_dot (64 rows): bit-diff 0, maxrel 0.00e+00 BIT-EXACT
+sample: fork 0.684499  mine 0.684499
+full ffn_gate 17408x5120 int-path: 139.0 ms (1.56 ns/w)  [f32 baseline was 153 ms / 1.72 ns/w]

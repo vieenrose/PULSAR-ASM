@@ -1,0 +1,29 @@
+{
+  "id": "b20f180ef",
+  "name": "4B forward diagnosis",
+  "command": "/tmp/p4b.sh 2>&1",
+  "description": "4B diagnosis: run the greedy bench path and capture L0 signatures, generated ids and rate to see where its forward diverges",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b20f180ef.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791342628164,
+  "endTime": 1791342803117,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 223423,
+  "bytesWritten": 957,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

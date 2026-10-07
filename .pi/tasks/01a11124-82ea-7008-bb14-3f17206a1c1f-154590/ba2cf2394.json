@@ -1,0 +1,27 @@
+{
+  "id": "ba2cf2394",
+  "name": "magnitude trace single token",
+  "command": "cat /tmp/fwd.c | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/fwd.c && cd ~/bonsai2/asm && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -march=armv8.2-a+dotprod -c fwd.c -o fwd.o 2>&1 | grep -i \" error\" | head -5; gcc -O2 -o fwd fwd.o fwd_neon.o fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -5 && echo BUILD_OK && taskset -c 3 ./fwd ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 --gen 0 --trace 2>&1 | head -40' 2>&1 | head -42",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/ba2cf2394.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791370882341,
+  "endTime": 1791370898609,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 282543,
+  "bytesWritten": 189,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

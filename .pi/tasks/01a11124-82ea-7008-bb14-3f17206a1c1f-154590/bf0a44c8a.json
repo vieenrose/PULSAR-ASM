@@ -1,0 +1,29 @@
+{
+  "id": "bf0a44c8a",
+  "name": "Spark: build llama.cpp",
+  "command": "/tmp/spark_build.sh 2>&1",
+  "description": "Clone PrismML-Eng/llama.cpp on the Spark and build it CPU-only (aarch64, 20 cores)",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bf0a44c8a.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791350229592,
+  "endTime": 1791350330468,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 231081,
+  "bytesWritten": 569,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,31 @@
+BUILD_OK
+tensors=851 data_start=11120992
+  emb rms=0.0138
+  qkv rms=2.751
+  conv rms=0.06065
+  gout rms=0.0004977
+  ffn rms=0.9561
+L0 Xrms=1.005
+  qkv rms=0.945
+  conv rms=0.01793
+  gout rms=0.0001024
+  ffn rms=0.07968
+L1 Xrms=1.024
+  qkv rms=0.6831
+  conv rms=0.01147
+  gout rms=0.0001271
+  ffn rms=0.08558
+L2 Xrms=0.9924
+  atto rms=0.3514
+  ffn rms=0.0385
+L3 Xrms=2.248
+  qkv rms=0.4376
+  conv rms=0.008882
+  gout rms=4.763e-05
+  ffn rms=0.02924
+L4 Xrms=2.25
+  qkv rms=0.4643
+  conv rms=0.007812
+  gout rms=4.582e-05
+  ffn rms=0.02899
+L5 Xrms=2.249

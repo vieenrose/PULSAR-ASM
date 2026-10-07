@@ -1,0 +1,13 @@
+=== 27B seasons at card config (temp 0.5, top_p 0.85, top_k 20)
+CONTENT: '1. **Spring** – Flowers begin to bloom and temperatures rise.\n2. **Summer** – Daylight hours are at their longest and temperatures peak.\n3. **Autumn (Fall)** – Leaves change color and fall from the trees.\n4. **Winter** – Snow begins to fall and daylight hours are at their shortest.'
+RATE: 506.2 ms/token = 1.98 tok/s
+TOKENS: prompt 22 completion 165
+=== CPU samples while generating (top: PID CPU TIME CMD):
+2803476 luigi     20   0   13.3g  11.6g   5.5g R  1022   9.6 106:11.41 llama-s+
+2803476 luigi     20   0   13.3g  11.6g   5.5g R  1765   9.6 106:50.04 llama-s+
+2803476 luigi     20   0   13.5g  11.8g   5.5g R  1634   9.7 107:27.75 llama-s+
+2803476 luigi     20   0   13.5g  11.8g   5.5g R  1511   9.7 108:01.94 llama-s+
+2803476 luigi     20   0   13.5g  11.8g   5.5g S  1478   9.7 108:34.89 llama-s+
+=== 27B prompt ids from the server tokenizer:
+IDS: 826 279 2943 15127 321 799 3065 421 4203 303 1754 13
+########## RUN27B DONE

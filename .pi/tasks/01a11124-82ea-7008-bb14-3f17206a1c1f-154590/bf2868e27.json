@@ -1,0 +1,29 @@
+{
+  "id": "bf2868e27",
+  "name": "Hunt 2: demo prompts",
+  "command": "/tmp/hunt2.sh 2>&1",
+  "description": "Ceiling-prompt hunt round 2: 6 prompts at the card config (1.7B x4, 4B x3)",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bf2868e27.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791364352806,
+  "endTime": 1791365562852,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 274710,
+  "bytesWritten": 1586,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 5400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,3 @@
+BUILD_OK
+*** buffer overflow detected ***: terminated
+bash: line 1: 4164523 Aborted                 (core dumped) taskset -c 3 ./fwd ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 --gen 0

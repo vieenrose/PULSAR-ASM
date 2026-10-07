@@ -1,0 +1,5 @@
+fwd.c:366:42: error: ‘TRACE’ undeclared (first use in this function)
+BUILD_OK
+tensors=851 data_start=11120992
+step 0 id_in=826 top=15 logit=10.0691
+step 1 id_in=0 top=198 logit=10.7434

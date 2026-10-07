@@ -1,0 +1,7 @@
+/usr/bin/ld: fwd.o: in function `main':
+fwd.c:(.text.startup+0xf7c): undefined reference to `MAG'
+/usr/bin/ld: fwd.c:(.text.startup+0xf94): undefined reference to `MAG'
+/usr/bin/ld: fwd.c:(.text.startup+0x1304): undefined reference to `MAG'
+/usr/bin/ld: fwd.c:(.text.startup+0x1754): undefined reference to `MAG'
+BUILD_OK
+taskset: failed to execute ./fwd: No such file or directory

@@ -1,0 +1,27 @@
+{
+  "id": "bf210e52a",
+  "name": "post-norm input face-off",
+  "command": "cat /tmp/fwd.c | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/fwd.c && cd ~/bonsai2/asm && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -march=armv8.2-a+dotprod -c fwd.c -o fwd.o 2>&1 | grep -i \" error\" | head -3; gcc -O2 -o fwd fwd.o fwd_neon.o fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -3 && echo BUILD_OK && taskset -c 3 ./fwd ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 --gen 0 --trace 2>/dev/null | grep -A9 \"^  pn rms\" | head -12; echo \"=== ORACLE:\"; taskset -c 3 ./dump_stage_rms ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 2>/dev/null | grep -A3 \"attn_post_norm-0\" | head -5' 2>&1 | head -20",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bf210e52a.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791372652213,
+  "endTime": 1791372663495,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 380530,
+  "bytesWritten": 952,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

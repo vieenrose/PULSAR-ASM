@@ -1,0 +1,27 @@
+{
+  "id": "b7f39238d",
+  "name": "8B embed face-off",
+  "command": "cat /tmp/fwd8.c | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/fwd8.c && cd ~/bonsai2/asm && gcc -O2 -march=armv8.2-a+dotprod -c fwd8.c -o fwd8.o 2>&1 | grep -i \" error\" | head -3; LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -o fwd8 fwd8.o fwd8_pq2.o -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -3 && echo BUILD_OK && taskset -c 3 ./fwd8 ../models/bonsai8b-PQ2_0.gguf 872 --gen 0 --trace 2>/dev/null | head -14 && echo \"=== ORACLE:\" && taskset -c 3 ./dump_stage_rms ../models/bonsai8b-PQ2_0.gguf 872 2>/dev/null | grep -A9 \"input_embed\" | head -11' 2>&1 | head -30",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b7f39238d.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791380751110,
+  "endTime": 1791380754567,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 1829566,
+  "bytesWritten": 1271,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

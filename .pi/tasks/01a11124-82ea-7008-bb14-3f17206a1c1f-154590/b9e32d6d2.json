@@ -1,0 +1,27 @@
+{
+  "id": "b9e32d6d2",
+  "name": "debug build for backtrace",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && LB=~/bonsai2/llama.cpp/build/bin && gcc -g -O1 -march=armv8.2-a+dotprod -c fwd.c -o fwd_g.o 2>&1 | head -3; gcc -g -O1 -o fwd_g fwd_g.o fwd_neon.o fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | head -3; which gdb || echo NOGDB' 2>&1 | head -8",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b9e32d6d2.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791370491251,
+  "endTime": 1791370491964,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 282111,
+  "bytesWritten": 13,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "id": "b85b76d98",
+  "name": "Bonsai 2 demo set",
+  "command": "P=luigi@spark; for spec in \"seasons|List the four seasons and one thing that changes in each.|/tmp/b2ans2.json\" \"haiku|Write a haiku about the sea.|/tmp/b2ans3.json\"; do\n  name=\"${spec%%|*}\"; rest=\"${spec#*|}\"; prompt=\"${rest%%|*}\"; out=\"${rest##*|}\"\n  echo \"=== $name\"\n  ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=20 $P \"curl -s -m 1800 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"$prompt\\\"}],\\\"max_tokens\\\":2048,\\\"temperature\\\":0.5,\\\"stream\\\":false}' > $out 2>/dev/null; echo done $name\"\ndone 2>&1 | tail -4",
+  "description": "Two more Bonsai 2 demo prompts (seasons list for gen1 comparability, haiku)",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b85b76d98.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791356254487,
+  "endTime": 1791356460941,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 267106,
+  "bytesWritten": 46,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 2400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

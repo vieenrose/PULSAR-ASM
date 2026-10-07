@@ -1,0 +1,13 @@
+=== 4B engine DX (ids 151644,872), same as the oracle
+exit=0
+9288
+DX L0 p0
+DXmax=13.5271797 v=[13.5271797,-3.6841022,3.0991351,0.6417913]
+DX L1 p0
+DXmax=33.0536193 v=[33.0536193,-6.8558712,4.5375823,1.4378833]
+DX L2 p0
+DXmax=47.9439811 v=[47.9439811,-8.9014511,4.9527244,1.1297265]
+=== oracle lines so far:
+grep: /tmp/oracle4b_v2.log: No such file or directory
+ORACLE_RUNNING
+########## DX4 DONE

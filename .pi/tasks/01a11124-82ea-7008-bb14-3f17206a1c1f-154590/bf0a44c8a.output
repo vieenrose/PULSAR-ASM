@@ -1,0 +1,16 @@
+CLONED
+6bfcd79 arm: NEON vec_dot for PQ2_0 (#265)
+=== cmake (CPU only, no CUDA)
+cmake_rc=0
+-- Found OpenMP_C: -fopenmp (found version "4.5") 
+-- Found OpenMP_CXX: -fopenmp (found version "4.5") 
+-- Found OpenMP: TRUE (found version "4.5")  
+-- Generating embedded license file for target: llama-app
+=== build -j20
+build_rc=0
+[ 99%] Linking CXX executable ../bin/llama
+[ 99%] Built target llama-app
+[100%] Linking CXX executable ../bin/test-chat
+[100%] Built target test-chat
+-rwxrwxr-x 1 luigi luigi 1292640 Oct  7 13:18 build/bin/llama-cli
+########## SPARK BUILD DONE

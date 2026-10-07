@@ -1,0 +1,27 @@
+{
+  "id": "b997ed779",
+  "name": "create exp dir + sync",
+  "command": "ssh -o BatchMode=yes luigi@spark 'mkdir -p ~/bonsai2/exp && cd ~/bonsai2/exp && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -fopenmp -march=armv8.2-a+dotprod -DTQ_XGEMV_LIB -Dmain=tq_neon_main -c ../asm/tq_gemv_neon.c -o fwd_neon_mt.o 2>&1 | head -3' 2>&1 | head -5; cd /home/user/PULSAR-ASM && for f in fwd.c tq_gemv_neon.c tq_xgemv.c fwht.S; do ssh -o BatchMode=yes -o ConnectTimeout=20 luigi@spark \"cat > ~/bonsai2/exp/$f\" < pulsar_arm/bonsai2/$f; done; echo \"synced:\"; ssh -o BatchMode=yes luigi@spark 'ls -la ~/bonsai2/exp/ | head -8'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b997ed779.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791387689727,
+  "endTime": 1791387694363,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 2977412,
+  "bytesWritten": 383,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

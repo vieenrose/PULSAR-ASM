@@ -1,0 +1,16 @@
+In file included from /usr/include/string.h:548,
+                 from fwd.c:20:
+In function ‘memcpy’,
+    inlined from ‘layer_full’ at fwd.c:283:5,
+    inlined from ‘main’ at fwd.c:371:36:
+/usr/include/aarch64-linux-gnu/bits/string_fortified.h:29:10: warning: ‘__builtin_memcpy’ reading 24576 bytes from a region of size 0 [-Wstringop-overread]
+   29 |   return __builtin___memcpy_chk (__dest, __src, __len,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   30 |                                  __glibc_objsize0 (__dest));
+      |                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~
+fwd.c: In function ‘main’:
+fwd.c:211:14: note: at offset 24576 into source object ‘QF’ of size 24576
+  211 | static float QF[24 * 256], GF[24 * 256], KF[4 * 256], VF[4 * 256];
+      |              ^~
+BUILD_OK
+*** buffer overflow detected ***: terminated

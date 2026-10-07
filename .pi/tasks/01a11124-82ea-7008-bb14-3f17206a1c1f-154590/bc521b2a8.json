@@ -1,0 +1,27 @@
+{
+  "id": "bc521b2a8",
+  "name": "fp32 accumulation rerun",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && python3 - <<PYEOF\ns = open(\"tq_gemv_int.c\").read()\no1 = \"        double acc = 0;\"\nn1 = \"        float acc = 0.0f;\"\nassert s.count(o1) == 1\ns = s.replace(o1, n1, 1)\no2 = \"            acc += (double)ws * (double)sum; (void)CS;\"\nn2 = \"            acc += ws * sum; (void)CS; /* fp32 order mirrors fork generic exactly */\"\nassert s.count(o2) == 1\ns = s.replace(o2, n2, 1)\no3 = \"        y[r] = (float)acc;\"\nn3 = \"        y[r] = acc;\"\nassert s.count(o3) == 1\ns = s.replace(o3, n3, 1)\nopen(\"tq_gemv_int.c\", \"w\").write(s)\nprint(\"patched to fp32 accumulation\")\nPYEOF\nLB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -DTQ_XGEMV_LIB -o tq_gemv_int tq_gemv_int.c tq_xgemv.c fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm && taskset -c 3 ./tq_gemv_int ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 11120992 594124800 64' 2>&1 | tail -4",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bc521b2a8.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791369645663,
+  "endTime": 1791369647084,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 281093,
+  "bytesWritten": 235,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

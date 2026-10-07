@@ -1,0 +1,29 @@
+{
+  "id": "bdcedee12",
+  "name": "Probe Bonsai 8B",
+  "command": "/tmp/probe8b.sh 2>&1",
+  "description": "Wait for the Bonsai 8B PQ2_0 download, start the server, run the 4-prompt quality probe",
+  "status": "killed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bdcedee12.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791365030135,
+  "endTime": 1791366143814,
+  "exitCode": null,
+  "signal": "SIGTERM",
+  "pid": 275629,
+  "bytesWritten": 31,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 5400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

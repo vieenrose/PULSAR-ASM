@@ -1,0 +1,27 @@
+{
+  "id": "b66ab5ad5",
+  "name": "fix correction, rerun validation",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && python3 - <<PYEOF\ns = open(\"tq_gemv_int.c\").read()\nold_doc = \"\"\" * Per group of 128 (= 4 blocks of 32):\n *   contrib = w_scale * sum_b( d_b * sum_{i in b}( trit_i * xq_i ) ) - correction\n *   correction (per call, from xq only):\n *       CS = sum_b( d_b * sum_{i in b} xq_i )   so that trit = d-1 costs nothing\n *\"\"\"\nnew_doc = \"\"\" * Per group of 128 (= 4 blocks of 32):\n *   contrib = w_scale * sum_b( d_b * sum_{i in b}( trit_i * xq_i ) )\n * with trit = digit - 1 in {-1,0,+1}, dotted DIRECTLY - no correction term.\n * (An earlier revision subtracted a CS correction, theorizing a digit-based\n * dot; the fork source (quants.c generic) decodes q = xi - 1 and dots with\n * no correction, and the corrected version mismatched on all 64 probe rows.\n * CS builder kept as dead code, not called by the dot.)\n *\"\"\"\nassert s.count(old_doc) == 1\ns = s.replace(old_doc, new_doc, 1)\nold_acc = \"            acc += (double)ws * ((double)sum - (double)CS[g]);\"\nnew_acc = \"            acc += (double)ws * (double)sum; (void)CS;\"\nassert s.count(old_acc) == 1\ns = s.replace(old_acc, new_acc, 1)\nopen(\"tq_gemv_int.c\", \"w\").write(s)\nprint(\"patched\")\nPYEOF\nLB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -DTQ_XGEMV_LIB -o tq_gemv_int tq_gemv_int.c tq_xgemv.c fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm && taskset -c 3 ./tq_gemv_int ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 11120992 594124800 64' 2>&1 | tail -5",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b66ab5ad5.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791369623779,
+  "endTime": 1791369625013,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 281072,
+  "bytesWritten": 214,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

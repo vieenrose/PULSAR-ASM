@@ -1,0 +1,27 @@
+{
+  "id": "be0b3663c",
+  "name": "PQ2_0 validation retry",
+  "command": "cat /tmp/pq2_gemv.c | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/pq2_gemv.c && cd ~/bonsai2/asm && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -march=armv8.2-a+dotprod -o pq2_gemv pq2_gemv.c -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm 2>&1 | grep -i \" error\" | head -5; taskset -c 3 ./pq2_gemv ../models/bonsai8b-PQ2_0.gguf 5950560 354571000 64' 2>&1 | head -6",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/be0b3663c.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791376601114,
+  "endTime": 1791376602180,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 1103482,
+  "bytesWritten": 218,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

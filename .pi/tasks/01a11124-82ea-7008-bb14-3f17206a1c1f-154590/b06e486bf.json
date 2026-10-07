@@ -1,0 +1,28 @@
+{
+  "id": "b06e486bf",
+  "name": "Qwen oracle 8 ids",
+  "command": "ssh -o BatchMode=yes luigi@raspberrypi.tailf63b31.ts.net 'cd ~ && python3 ~/q2_0_ref.py ~/bonsai_b3.bin 2,107,1567,85096,107,304,2505,9694 > /tmp/oracle8.log 2>&1; echo oracle_exit=$?; grep -c \"^DX\" /tmp/oracle8.log; tail -3 /tmp/oracle8.log'",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b06e486bf.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791297946965,
+  "endTime": 1791299108536,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 182145,
+  "bytesWritten": 181,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 1800,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

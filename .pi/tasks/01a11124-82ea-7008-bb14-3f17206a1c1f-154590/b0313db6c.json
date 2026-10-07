@@ -1,0 +1,27 @@
+{
+  "id": "b0313db6c",
+  "name": "engine ceiling reshoots en+zh",
+  "command": "ssh -o BatchMode=yes luigi@spark 'cd ~/bonsai2/asm && export OMP_NUM_THREADS=20 && echo \"########## ENGINE RESHOOT EN (temp 0.5/0.85/20 seed 7)\" && time taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 --gen 300 --sample 0.5 0.85 20 7 2>&1 | grep -E \"^step|real|user\" | tail -8; echo \"########## ENGINE RESHOOT ZHTW (temp 0.5/0.85/20 seed 7)\" && time taskset -c 0-19 ./fwd_mt ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 99270 115992 104647 3709 98404 98443 96681 96594 110476 127312 1710 --gen 350 --sample 0.5 0.85 20 7 2>&1 | grep -E \"^step|real|user\" | tail -8; echo \"########## RESHOOTS DONE\"' 2>&1 | head -30",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b0313db6c.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791373914380,
+  "endTime": 1791374265873,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 636476,
+  "bytesWritten": 1174,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

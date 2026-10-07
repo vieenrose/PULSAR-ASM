@@ -1,0 +1,29 @@
+{
+  "id": "bdf0d41b5",
+  "name": "27B ceiling run",
+  "command": "stdbuf -oL -eL bash /tmp/run27b.sh 2>&1",
+  "description": "27B four-seasons run at card config (temp 0.5/top_p 0.85/top_k 20) with CPU sampling and the server-tokenized prompt ids",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/bdf0d41b5.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791367018316,
+  "endTime": 1791367109706,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 278158,
+  "bytesWritten": 1021,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

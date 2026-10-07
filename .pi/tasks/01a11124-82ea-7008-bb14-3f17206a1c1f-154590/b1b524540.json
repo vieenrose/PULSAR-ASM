@@ -1,0 +1,30 @@
+{
+  "id": "b1b524540",
+  "name": "Spark: download GGUFs",
+  "command": "/tmp/spark_dl.sh 2>&1",
+  "description": "Download Bonsai 2 27B PQ2_0 (7.21 GB) and PTQ1_0 (5.95 GB) GGUFs to the Spark",
+  "status": "failed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b1b524540.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791350237151,
+  "endTime": 1791353837165,
+  "exitCode": null,
+  "signal": "SIGTERM",
+  "pid": 231091,
+  "bytesWritten": 86,
+  "isAgent": false,
+  "surviveReload": false,
+  "error": "Timed out after 3600s",
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 3600,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

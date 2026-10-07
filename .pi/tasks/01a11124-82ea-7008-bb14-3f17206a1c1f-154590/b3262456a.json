@@ -1,0 +1,27 @@
+{
+  "id": "b3262456a",
+  "name": "vocab fix + 8B oracle",
+  "command": "cat /tmp/dump_stage_rms.cpp | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/dump_stage_rms.cpp && cd ~/bonsai2/asm && F=~/bonsai2/llama.cpp B=~/bonsai2/llama.cpp/build && g++ -O2 -o dump_stage_rms dump_stage_rms.cpp -I$F/include -I$F/ggml/include -L$B/bin -lllama -lggml -lggml-base -Wl,-rpath,$B/bin -lm 2>&1 | grep -i error | head -3; taskset -c 3 ./dump_stage_rms ../models/bonsai8b-PQ2_0.gguf 872 2>/dev/null | grep -A2 \"input_embed\" | head -4' 2>&1 | head -6",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b3262456a.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791380842731,
+  "endTime": 1791380846287,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 1849580,
+  "bytesWritten": 0,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

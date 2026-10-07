@@ -1,0 +1,27 @@
+{
+  "id": "b74f35348",
+  "name": "tensor map + layer-3 weights",
+  "command": "cat /tmp/gguf_map.py | ssh -o BatchMode=yes luigi@spark 'cat > ~/bonsai2/asm/gguf_map.py && python3 ~/bonsai2/asm/gguf_map.py ~/bonsai2/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 2>&1 | tail -3 && echo \"=== blk.3 (first full-attn layer):\" && python3 ~/bonsai2/asm/gguf_map.py ~/bonsai2/models/Ternary-Bonsai-2-27B-PTQ1_0.gguf blk.3 2>&1 | head -30' 2>&1 | head -40",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b74f35348.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791369979249,
+  "endTime": 1791369980261,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 281467,
+  "bytesWritten": 546,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

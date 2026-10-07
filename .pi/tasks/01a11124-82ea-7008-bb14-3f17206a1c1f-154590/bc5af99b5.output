@@ -1,0 +1,6 @@
+-rw-rw-r-- 1 luigi luigi 2182184672 Oct  7 17:35 bonsai8b-PQ2_0.gguf
+health: {"status":"ok"}
+0.01.896.440 I cmn          init: llama threadpool init, n_threads = 20
+0.02.540.354 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 65536, kv_unified = 'true'
+0.02.545.237 I srv  llama_server: model loaded
+0.02.545.244 I srv  llama_server: listening on http://127.0.0.1:8091

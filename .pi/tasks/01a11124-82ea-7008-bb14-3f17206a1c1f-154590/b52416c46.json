@@ -1,0 +1,29 @@
+{
+  "id": "b52416c46",
+  "name": "Bonsai 2 first completion",
+  "command": "P=luigi@spark; ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=20 $P 'curl -s -m 1800 http://127.0.0.1:8090/v1/chat/completions -H \"Content-Type: application/json\" -d \"{\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"Explain what a neural network is in two sentences.\\\"}],\\\"max_tokens\\\":2048,\\\"temperature\\\":0.5,\\\"stream\\\":false}\" > /tmp/b2ans1.json 2>/tmp/b2ans1.err; echo \"curl_rc=$?\"; wc -c /tmp/b2ans1.json' 2>&1 | tail -3",
+  "description": "First Bonsai 2 27B completion via server (CPU-only, medium reasoning)",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b52416c46.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791356065294,
+  "endTime": 1791356190836,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 266942,
+  "bytesWritten": 32,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 2400,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

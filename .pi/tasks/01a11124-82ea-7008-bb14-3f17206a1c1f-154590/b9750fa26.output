@@ -1,0 +1,3 @@
+int-path vs fork vec_dot (64 rows): bit-diff 64, maxrel 1.18e+02 MISMATCH
+sample: fork 0.684499  mine -0.448466
+full ffn_gate 17408x5120 int-path: 146.5 ms (1.64 ns/w)  [f32 baseline was 153 ms / 1.72 ns/w]
