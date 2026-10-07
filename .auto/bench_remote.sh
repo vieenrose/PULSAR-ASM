@@ -29,12 +29,21 @@ run_one() { # $1=bin $2=gen $3=outfile $4=threads $5=launcher-prefix
     E=$(date +%s%N)
     echo "$((E-S)) $(grep -c '^step' $3)"
 }
+# warm-up both binaries (clocks, caches, page faults settle before timing)
+run_one fwd_exp 0 /dev/null $OMP_NT_EXP "$PRE_EXP" > /dev/null
+run_one fwd_base 0 /dev/null ${OMP_NT_BASE:-16} "$PRE_BASE" > /dev/null
 echo "--- prefill A then B"
 read PNS_A NPS_A <<< $(run_one fwd_exp 0 exp_pre.txt $OMP_NT_EXP "$PRE_EXP")
 read PNS_B NPS_B <<< $(run_one fwd_base 0 base_pre.txt ${OMP_NT_BASE:-16} "$PRE_BASE")
-echo "--- decode B then A (reversed)"
-read DNS_B NDS_B <<< $(run_one fwd_base 20 base_dec.txt ${OMP_NT_BASE:-16} "$PRE_BASE")
-read DNS_A NDS_A <<< $(run_one fwd_exp 20 exp_dec.txt $OMP_NT_EXP "$PRE_EXP")
+echo "--- decode A,B,A,B (alternated, averaged)"
+read D1B N1B <<< $(run_one fwd_base 20 base_dec1.txt ${OMP_NT_BASE:-16} "$PRE_BASE")
+read D1A N1A <<< $(run_one fwd_exp 20 exp_dec1.txt $OMP_NT_EXP "$PRE_EXP")
+read D2A N2A <<< $(run_one fwd_exp 20 exp_dec2.txt $OMP_NT_EXP "$PRE_EXP")
+read D2B N2B <<< $(run_one fwd_base 20 base_dec2.txt ${OMP_NT_BASE:-16} "$PRE_BASE")
+[ "$N1B" -eq 41 ] && [ "$N1A" -eq 41 ] && [ "$N2A" -eq 41 ] && [ "$N2B" -eq 41 ] \
+    || { echo "DECODE STEPS wrong: $N1B $N1A $N2A $N2B"; exit 1; }
+DNS_B=$(( (D1B + D2B) / 2 )); NDS_B=$N1B
+DNS_A=$(( (D1A + D2A) / 2 )); NDS_A=$N1A
 echo "PREFILL_NS_A=$PNS_A NSTEPS_A=$NPS_A"
 echo "PREFILL_NS_B=$PNS_B NSTEPS_B=$NPS_B"
 echo "DECODE_NS_A=$DNS_A NSTEPS_A=$NDS_A"

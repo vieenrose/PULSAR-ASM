@@ -48,6 +48,13 @@ prefill (21 prompt forwards) and decode (20 gen forwards), prints
 - `pulsar_arm/bonsai2/tq_xgemv.c`, `tq_gemv_int.c` — scalar references (change only with cause)
 - `.auto/measure.sh`, `.auto/checks.sh` — may gain instrumentation as needed
 
+## Harness fairness (learned 2026-10-07, run #258)
+- Identical-code A/B ratios ran 0.955-0.995 (always <1): the second runner
+  benefits (clocks/cache/page warmth). Fixed with warm-up runs for both
+  binaries + ABAB alternated decode averaging. Identical code must now read
+  ~1.000; judge keeps by ratio clearly below that band.
+- Order of battle: warm-up, prefill A/B, decode B,A,B,A averaged.
+
 ## Hygiene (learned 2026-10-07)
 - `log_experiment` keep commits `git add -A` (sweeps in harness edits!);
   discard-reverts do NOT cover `.auto/`. After any harness experiment,
