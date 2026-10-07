@@ -303,6 +303,9 @@ static void layer_linear(int il, int li) {
     /* per-head L2 over 128 on q (16 heads) and k (16 heads) */
     l2_128(QH_);
     l2_128(KH_);
+    /* GDN over 48 independent heads: row-split parallel (each head owns its
+       state slice; fp order within a head unchanged -> bit-exact streams) */
+    #pragma omp parallel for schedule(static)
     for (int h = 0; h < 48; h++) {
         float beta = sigmoid(B48[h]);
         float g0 = amp[h] * softplus_g(A48[h] + dtb[h]);
