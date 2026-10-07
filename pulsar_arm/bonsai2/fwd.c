@@ -311,16 +311,16 @@ static void l2_128(float *x) {
         for (int i = 0; i < 128; i++) x[h * 128 + i] *= sc;
     }
 }
-/* MRoPE partial NEOX: pairs (j,j+32) j<32, ang = p*1e7^(-2j/64), rest verbatim */
-static void rope_apply(float *x, int heads, int pos) {
+/* MRoPE partial NEOX: pairs (j,j+32) j<32, ang = p*1e7^(-2j/64), rest verbatim.
+   Angles depend only on (pos, j): compute once per layer, share across all
+   Q+K heads (bit-identical reuse of the same cosf/sinf values). */
+static void rope_tabled(float *x, int heads, const float *C, const float *S) {
     for (int h = 0; h < heads; h++) {
         float *xh = x + h * 256;
         for (int j = 0; j < 32; j++) {
-            float ang = (float)pos * powf(1e7f, -2.0f * j / 64.0f);
-            float c = cosf(ang), s = sinf(ang);
             float a = xh[j], b = xh[j + 32];
-            xh[j] = a * c - b * s;
-            xh[j + 32] = a * s + b * c;
+            xh[j] = a * C[j] - b * S[j];
+            xh[j + 32] = a * S[j] + b * C[j];
         }
     }
 }
@@ -457,8 +457,13 @@ static void layer_full(int il, int fi) {
     for (int h = 0; h < 24; h++) rms(QF + h * 256, qnw, 256, QF + h * 256);
     float *knw = (float *)TW(il, "attn_k_norm.weight");
     for (int h = 0; h < 4; h++) rms(KF + h * 256, knw, 256, KF + h * 256);
-    rope_apply(QF, 24, NPOS);
-    rope_apply(KF, 4, NPOS);
+    float RC[32], RS[32];
+    for (int j = 0; j < 32; j++) {
+        float ang = (float)NPOS * powf(1e7f, -2.0f * j / 64.0f);
+        RC[j] = cosf(ang); RS[j] = sinf(ang);
+    }
+    rope_tabled(QF, 24, RC, RS);
+    rope_tabled(KF, 4, RC, RS);
     V8R("kcur", KF, 512); V8R("vcur", VF, 512);
     memcpy(KCA[fi][NPOS], KF, 1024 * 4);
     memcpy(VCA[fi][NPOS], VF, 1024 * 4);
