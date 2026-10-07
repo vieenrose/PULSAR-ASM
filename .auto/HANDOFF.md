@@ -1,6 +1,6 @@
 # HANDOFF — Bonsai (Qwen3 + ternary) runtime on the Pi 4
 
-Branch **`bonsai-rpi4`** @ `946dd19` (tracks `fork/bonsai-rpi4`; the `auto:` handoff
+Branch **`bonsai-aarch64`** @ `946dd19` (tracks `fork/bonsai-aarch64`; the `auto:` handoff
 commits land on top of it), tree clean.
 `gemma-3-rpi4` is the Gemma-only branch (tip `84e3fe0`); last Gemma-only commit
 before the Bonsai prep is `c91433a` if strict separation is ever wanted.
