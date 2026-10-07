@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 # fasm build artifacts (rebuilt by the test harness)
 *.bin
+.auto/log.jsonl
+.auto/last_*.txt
+.auto/last_build.log

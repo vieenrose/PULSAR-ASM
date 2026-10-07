@@ -147,3 +147,21 @@
 Start at `.auto/HANDOFF.md` - it holds the verified state, the six remaining
 steps with core.S line anchors, the Pi inventory, the build/regression commands
 and the lessons. Objective and gates are unchanged.
+
+## Spark decode session (2026-10-07, active)
+- Thread the serial glue: FWHT blocks (17 max), GDN heads (48), Q-head loop (24),
+  Q8-quant row-split, softmax — each is small alone; profiles first (gprof or
+  timers in measure.sh) before touching. Row-split reductions only (bit-exact).
+- Fused residual-add + norm epilogues (memory passes over 5120-vectors add up
+  across 64 layers × several sites; measure first).
+- Q8_K/Q8_0 quantize throughput (scalar now; NEON victims: max-search + scale).
+- FWHT in fixed point? NO without bit-exact proof vs fork op (risky, low priority).
+- Memoize transformed activations across GEMVs sharing K (fork does per-token
+  memo; our engine recomputes signs+FWHT+Q8 per projection: 6+ projections share
+  K=5120 inputs per token! cache transformed XQ per (layer-input) instead).
+  Biggest structural win candidate after threading: ~6 repeated transforms/token/layer.
+- Head GEMV (248320 rows) dominates single forwards; row-split already. Later:
+  top-k preselect needs exactness proof (min margin unknown here - survey first).
+- Prompt-parallel prefill is NOT applicable (causal incremental engine; batch
+  prefill would change numerics - forbidden by accuracy gate).
+- 8B line (fwd8/pq2) excluded from this loop; open a second session if ever.
