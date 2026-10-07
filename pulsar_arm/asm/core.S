@@ -1410,6 +1410,38 @@ f_anchors_fixed:
     adrp x1, G_ROPE_T
     add x1, x1, :lo12:G_ROPE_T
     bl pget
+    // Fall back to the float key. The 1.7B blob carries both rope_theta_int
+    // and rope_theta; the 4B carries ONLY the float one, so G_ROPE_T stayed 0,
+    // ln(0) returned -1023*ln2 = -709.09, inv[1] came out exp(709/64) = 64830,
+    // and the RoPE frequencies were garbage - which is what made the 4B emit
+    // token 0 forever and go NaN from position 2. pget parses leading digits
+    // and stops at '.', so "5000000.0" yields 5000000 exactly.
+    // gemma3 never reads the blob tables, so it has no rope key and must not
+    // be warned about: guard on arch first.
+    adrp x0, G_ARCH
+    add x0, x0, :lo12:G_ARCH
+    ldr w0, [x0]
+    cbz w0, 780f
+    adrp x0, G_ROPE_T
+    add x0, x0, :lo12:G_ROPE_T
+    ldr x0, [x0]
+    cbnz x0, 780f
+    adrp x0, pq_rope_f
+    add x0, x0, :lo12:pq_rope_f
+    adrp x1, G_ROPE_T
+    add x1, x1, :lo12:G_ROPE_T
+    bl pget
+    adrp x0, G_ROPE_T
+    add x0, x0, :lo12:G_ROPE_T
+    ldr x0, [x0]
+    cbnz x0, 780f
+    // Neither key present: say so loudly. Silence here cost hours, because a
+    // zero theta produces a plausible-looking ln, a plausible-looking inv
+    // table, and a model that just answers "!".
+    adrp x0, e_notheta
+    add x0, x0, :lo12:e_notheta
+    bl print_cstr
+780:
     adrp x0, pk_eps
     add x0, x0, :lo12:pk_eps
     adrp x1, G_EPS12
@@ -1621,6 +1653,8 @@ pk_nkv:       .asciz "\"pulsar.n_kv\""
 pk_hd:        .asciz "\"pulsar.head_dim\""
 pk_voc:       .asciz "\"pulsar.vocab\""
 pq_rope:      .asciz "\"pulsar.rope_theta_int\""
+pq_rope_f:    .asciz "\"pulsar.rope_theta\""
+e_notheta:    .asciz "WARN: blob has no pulsar.rope_theta(_int); RoPE frequencies will be wrong\n"
 pk_eps:       .asciz "\"pulsar.eps_e12\""
 pk_grp:       .asciz "\"pulsar.ternary_group\""
 tp_arch:      .asciz "pulsar blob arch_id: "
