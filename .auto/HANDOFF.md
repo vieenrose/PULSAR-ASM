@@ -178,6 +178,27 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
 #               ./t  and  ./t /tmp/tv_*.tv /tmp/syn_*.tv
 ```
 
+## Demo decisions (2026-10-07)
+- **bonsai 1.7B and 4B are DROPPED as demo material** (user decision): both
+  produce genuinely bad output (1.7B: token repetition, stray `!`/`#"`, URL
+  fragments; 4B: degenerate truncated answers like "A neural!" at the card's
+  temp 0.5 / top-k 20 / top-p 0.85). The engine work behind them stands - gates
+  green at `d867224`, oracle-validated argmaxes, the missing-rope_theta_int fix
+  was real - but do NOT re-hunt gen1 prompts for the README. Their measured
+  rates, for reference: 1.7B 1850.30 ms/token, 4B 4298.35 ms/token on the Pi.
+- README demos come from Bonsai 2 instead: **27B PQ2_0 transcripts already
+  captured** (three clean ones via llama-server on the Spark: neural-net
+  explainer, four-seasons list, haiku; ~2 tok/s CPU-only), plus an 8B probe in
+  flight (`prism-ml/Ternary-Bonsai-8B-PQ2_0`, base Qwen3-8B, 2.18 GB, needs the
+  built fork since Q2_0 is prism-specific upstream).
+- Thread-pool WIP (row-parallel gemv: clone-based workers, TPIDR_EL0 scratch,
+  sliced ranges, exit_group): reverted to keep the tree green - it assembles and
+  gemma gates IDENTICAL but the blob run SIGSEGV'd. Patch saved at
+  `~/pw/threadpool-wip.patch` on the Spark. Worth reviving for the Bonsai 2 asm
+  port (or gemma speed) - it is 582 lines and needs the GSUM/CODEBUF scratch
+  overlap fixed first (GSUM 320B at +0 collided with CODEBUF at +32; correct
+  layout is GSUM@0, CODEBUF@320, PLANE@352, QPLANE@51712 in a 128K region).
+
 ## Facts worth knowing
 
 - 1.7B: hidden 2048, inter 6144, 28 layers, 16 q / 8 kv × 128, θ 1e6, vocab 151669.
