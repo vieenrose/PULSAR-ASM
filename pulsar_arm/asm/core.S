@@ -742,6 +742,11 @@ _start:
     adrp x0, J_bpe
     add x0, x0, :lo12:J_bpe
     ldr x0, [x0]
+    // raw ids need no bpe: straight to chat, which parses ids not text
+    adrp x1, J_ids
+    add x1, x1, :lo12:J_ids
+    ldr x1, [x1]
+    cbnz x1, 6f
     // chat mode? (J_chat -> require bpe, chat INSTEAD of decode)
     adrp x1, J_chat
     add x1, x1, :lo12:J_chat
@@ -782,6 +787,7 @@ _start:
     mov x0, #0
     mov x8, #SYS_EXIT
     svc #0
+6:  bl chat                      // raw ids: noreturn (exits on EOF)
 
 /* ---------------- rodata ---------------- */
     .section .rodata
@@ -1773,12 +1779,28 @@ file_join:
     ldr x3, [x1, #32]            // argv[4]
     ldrb w3, [x3]
     cmp w3, #'c'
-    b.ne 5f
+    b.ne ids_check
     mov x3, #1
     str x3, [x2]                 // J_chat = 1
     adrp x2, G_MODE
     add x2, x2, :lo12:G_MODE
     str x3, [x2]                 // G_MODE = 1 (chat samples)
+    // raw-ids mode: argv[4][0]=='i' -> J_ids=1. Stdin is space-separated
+    // token ids (tools/qwen_ids.py pipes them); no BPE, no template, greedy
+    // (G_MODE stays 0 - sampling config is a separate step).
+ids_check:
+    adrp x2, J_ids
+    add x2, x2, :lo12:J_ids
+    mov x3, #0
+    str x3, [x2]
+    cmp x0, #5
+    b.lo 5f
+    ldr x3, [x1, #32]            // argv[4]
+    ldrb w3, [x3]
+    cmp w3, #'i'
+    b.ne 5f
+    mov x3, #1
+    str x3, [x2]                 // J_ids = 1
     // fall through to the tok parse below (the old 'b 11f' pointed at a
     // label that no longer existed here -> wild jump -> segfault)
 5:  cmp x0, #4
@@ -5900,6 +5922,7 @@ rp_out:
     .align 4
 INBUF:       .skip 4096
 J_chat:      .skip 8
+J_ids:       .skip 8                  // argv[4]=='i': stdin is decimal ids
 
     .section .rodata
 t_chat:      .asciz "chat ready (sample mode; empty line skips, EOF quits)\n"
@@ -5941,6 +5964,73 @@ readline:
 2:  mov w0, w4                   // len (0 = empty line)
     ret
 
+/* ids_parse: INBUF[w0=len] of "12 345 6789" -> ENC_OUT ids. Returns w0 = n.
+ * The demo pipeline tokenises off-engine (tools/qwen_ids.py --chat); the asm
+ * encoder is gemma's BPE and cannot do qwen's regex byte-level BPE, so the
+ * engine takes ids, not text. Each id goes through tok_guard (out-of-range
+ * warns once and clamps, same rule as the bench) - a typo'd id must be loud.
+ * State lives in x25-x28 (callee-saved, so tok_guard's x0-x9 clobbers cannot
+ * touch it); x25-x28 are saved/restored here. Skips spaces/tabs; a junk char
+ * stops the line (strict: the printed ids show exactly what was fed). */
+ids_parse:
+    str x30, [sp, #-16]!          // NOT optional: tok_guard is called with bl
+                                  // and leaves x30 pointing just after its own
+                                  // call site, so an unsaved lr here returns
+                                  // into the middle of the loop (symptom: a
+                                  // store to address 0 with the saved regs
+                                  // already restored). Same trap as tok_guard.
+    stp x25, x26, [sp, #-16]!
+    stp x27, x28, [sp, #-16]!
+    adrp x25, INBUF
+    add  x25, x25, :lo12:INBUF
+    add  x26, x25, x0              // end = base + len
+    adrp x27, ENC_OUT
+    add  x27, x27, :lo12:ENC_OUT
+    mov  x28, #0                  // n
+    mov  x1, #0                   // acc
+    mov  x2, #0                   // has-digits
+ip_loop:
+    cmp  x25, x26
+    b.hs  ip_eol
+    ldrb w0, [x25], #1
+    cmp  w0, #32
+    b.eq  ip_sep
+    cmp  w0, #9
+    b.eq  ip_sep                  // tab
+    sub  w3, w0, #'0'
+    cmp  w3, #9
+    b.hi  ip_done                 // junk: stop, partial dropped (strict)
+    cmp  x2, #7
+    b.hs  ip_done                 // 8th digit: stop (vocab < 200k, and this
+                                  // bounds acc so it cannot wrap)
+    lsl  x4, x1, #3
+    lsl  x5, x1, #1
+    add  x1, x4, x5
+    add  x1, x1, x3               // acc = acc*10 + digit
+    add  x2, x2, #1               // ndigits (0 = no partial number)
+    b    ip_loop
+ip_sep:                           // space/tab: flush a partial number
+    cbz  x2, ip_loop
+    mov  w0, w1
+    bl   tok_guard                // w0 = id (x25-x28 survive: callee-saved)
+    str  w0, [x27], #4
+    add  x28, x28, #1
+    mov  x1, #0
+    mov  x2, #0
+    b    ip_loop
+ip_eol:                           // end of line: flush, then done
+    cbz  x2, ip_done
+    mov  w0, w1
+    bl   tok_guard
+    str  w0, [x27], #4
+    add  x28, x28, #1
+ip_done:
+    mov  w0, w28
+    ldp  x27, x28, [sp], #16
+    ldp  x25, x26, [sp], #16
+    ldr  x30, [sp], #16
+    ret
+
 /* chat: interactive REPL. x19=pos, x20=turn, x21=n, x22=i/count, x23=tok. */
 chat:
     str x30, [sp, #-16]!
@@ -5971,9 +6061,41 @@ chat_next:
     cbz w0, chat_next            // line was just \r
 0:  mov x24, x0                  // hold len (both paths ✓)
 chat_enc:
-    // x24 = len (held). tpl_build assembles template into ENC_OUT.
+    // x24 = len (held). Raw ids mode parses decimals straight into ENC_OUT;
+    // otherwise the template builder assembles it. Both join at the capacity
+    // check with x21 = n.
+    adrp x0, J_ids
+    add x0, x0, :lo12:J_ids
+    ldr x0, [x0]
+    cbnz x0, chat_ids
     bl tpl_build                 // w0 = n (preserves x19+; restores x24 ✓)
     mov x21, x0                  // n
+chat_ids:
+    // (reached by branch only) raw ids: decimals from INBUF into ENC_OUT
+    mov w0, w24                  // len
+    bl ids_parse                 // w0 = n (preserves x19+)
+    mov x21, x0                  // n
+    cbz x21, chat_next           // nothing parsed: reprompt, never run n=0
+    adrp x0, t_ids
+    add x0, x0, :lo12:t_ids
+    bl print_cstr
+    mov x0, x21
+    bl print_u64
+    bl print_sp
+    adrp x22, ENC_OUT
+    add x22, x22, :lo12:ENC_OUT
+    mov w23, #0
+ids_pl:
+    cmp w23, w21
+    b.hs ids_pd
+    ldr w0, [x22, x23, lsl #2]
+    bl print_u64
+    bl print_sp
+    add w23, w23, #1
+    b ids_pl
+ids_pd:
+    bl print_nl
+    b chat_capchk
     // transparency: print "tpl: n ids..."
     adrp x0, t_tpl
     add x0, x0, :lo12:t_tpl
@@ -5994,6 +6116,7 @@ tpl_pl:
     b tpl_pl
 tpl_pd:
     bl print_nl
+chat_capchk:
     // capacity: pos + n + (turn==0) + 128 > 480?
     add x0, x19, x21             // pos + n
     cbnz x20, chat_nobos
@@ -6012,7 +6135,12 @@ chat_nobos:
     mov x20, #0
     b chat_enc                   // re-encode same line fresh (INBUF+x24 intact ✓)
 chat_prefill:
-    // bos on first turn
+    // bos on first turn - unless raw ids, which carry their own template
+    // (feeding gemma's 2 to a qwen blob is how the OOB prompt happened)
+    adrp x0, J_ids
+    add x0, x0, :lo12:J_ids
+    ldr x0, [x0]
+    cbnz x0, chat_feed
     cbnz x20, chat_feed
     adrp x0, G_pos
     add x0, x0, :lo12:G_pos
@@ -6058,23 +6186,59 @@ chat_gloop:
     bl fwd_token                 // LG set
     bl sampler                   // w0 = token (G_MODE=1 in chat → samples)
     mov w23, w0                  // tok
+    // eos is per-arch: 1 for gemma, 151643 for qwen. Breaking on the wrong
+    // one cuts answers short (or never stops - gencap is the backstop).
+    adrp x0, G_ARCH
+    add x0, x0, :lo12:G_ARCH
+    ldr w0, [x0]
+    cbz w0, eos_gemma
+    movz w0, #0x505B
+    movk w0, #0x2, lsl #16       // 151643 <|endoftext|>
+    cmp w23, w0
+    b.eq chat_end
+    movz w0, #0x505D
+    movk w0, #0x2, lsl #16       // 151645 <|im_end|> - the one ChatML
+    cmp w23, w0                  // actually ends a turn on, and the reason the
+    b.eq chat_end                // first blob run kept going past the answer
+    b eos_done
+eos_gemma:
     cmp w23, #1
     b.eq chat_end                // eos
+eos_done:
+    // raw ids print ids; surfaces need the arch's own vocab (gemma's
+    // vocab.bin cannot render qwen ids, and the detokeniser is a later step).
+    // w23 is re-sampled every iteration, so no save across prints is needed.
+    adrp x0, J_ids
+    add x0, x0, :lo12:J_ids
+    ldr x0, [x0]
+    cbnz x0, gen_id
     mov x0, x23
     bl put_surf                  // buffer (preserves x19+ ✓)
+    b gen_fed
+gen_id:
+    mov x0, x23
+    bl print_u64
+    bl print_sp
+gen_fed:
     add x19, x19, #1             // pos++
     add x22, x22, #1
     b chat_gloop
 chat_end:
-    // close model turn: feed EOT (106)
+    // close model turn: feed EOT (106) - unless raw ids, which have no
+    // template to close (106 is gemma's; qwen's template came in the pipe)
+    adrp x0, J_ids
+    add x0, x0, :lo12:J_ids
+    ldr x0, [x0]
+    cbnz x0, chat_noeot
     adrp x0, G_pos
     add x0, x0, :lo12:G_pos
     str w19, [x0]
     mov w0, #106
     bl fwd_token
     add x19, x19, #1             // pos++
-    bl out_flush
-    bl print_nl
+chat_noeot:
+    bl out_flush                   // no-op when nothing was buffered (ids mode)
+    bl print_nl                    // ends the ids line in ids mode
     add x20, x20, #1             // turn++
     b chat_next
 chat_bye:
