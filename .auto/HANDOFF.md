@@ -218,7 +218,21 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
   Beware two red herrings the instrumentation produced: a `kept` that looked
   like garbage was my stack-offset mislabel, and a "post = nan" reading came
   from a different call than the one being examined.
-- **4B: NaN is born in LAYER 0 at position 2.** A 4-id run shows p0/p1
+- **4B: FIXED (`723fe62`). Root cause was one missing header key.** The 4B blob
+  carries `pulsar.rope_theta` (5e6) but not `pulsar.rope_theta_int`, and the
+  engine only looked for the _int spelling, so G_ROPE_T stayed 0. `ln_f64(0)`
+  returns exactly -1023*ln2 = -709.0895 (exponent field zero), which made
+  inv[1] = exp(709/64) = 64830 instead of 0.78583, so every RoPE frequency was
+  garbage: first sample valid, all later ones NaN, model answering "!" forever.
+  The tell was the engine's own log line `blob ln(theta): -709.0895385`. Fixed
+  by falling back to the float key (pget stops at '.', so 5000000.0 parses
+  exactly) plus a loud warning, guarded on arch != 0 because gemma3 has no rope
+  key and never reads the blob tables. 4B now answers the four-seasons prompt
+  correctly; small stray-token artifacts ("1!") remain to look at.
+  **Lesson worth keeping: a silently-zero geometry cell produced a
+  plausible-looking ln, a plausible-looking inv table, and a model that just
+  repeated "!". Warn on missing keys instead of defaulting to 0.**
+- **4B: NaN is born in LAYER 0 at position 2.** (superseded by the fix above) A 4-id run shows p0/p1
   finite and p2/p3 already NaN at DX L0 - the first layer, not the deep stack.
   So it is L0's attention at n=3 (norms/rope are position-independent, the
   embedding is a table read, so the candidates are the rope row for pos 2, the
