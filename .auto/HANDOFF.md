@@ -193,6 +193,20 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
   here ("~99 ms/token 1.7B, ~238 ms 4B") was pure storage arithmetic and is
   unreachable; ~250 ms and ~570 ms are the walls. Gemma reference: 270m 147,
   1B 543 (cool box).
+- The demo path works end to end (2026-10-07): `2 i` takes qwen ids on stdin
+  (raw-ids mode, `3f48752`), the sampler now scopes to G_VOC instead of the
+  262144-slot buffer (`5952f1f` - it was returning token 0 forever), top-k is
+  per-arch (64 gemma3 / 20 Bonsai), end-of-turn is per-arch (1 / 151643 /
+  151645), and `tools/mkv_qwen.py` + the existing put_surf table path render
+  qwen text with no new asm decoder (`011a1ab`). Sampling config was checked
+  against the checkpoint's generation_config.json, not the card's prose:
+  temperature 0.5, top_k 20, top_p 0.85, eos 151645, repetition_penalty 1.0.
+  `tools/bonsai_ask.py` prints a transcript for the GIF specs.
+- **4B is NOT validated.** /tmp/oracle4b.log is garbage: every layer prints the
+  same value (3.0e21) with numpy overflow warnings, i.e. the run fed an
+  out-of-range prompt id and never reached the forward properly. Before any 4B
+  clip, re-run q2_0_ref.py on a 2-id in-vocab prompt and diff DX signatures the
+  way 1.7B was done.
 - Ternary GEMV, done 2026-10-07 (`8deeb5e`, 3.7x end to end, 1888 ms/token).
   Scalar was 3.98 ns/weight (pw2/tgb predicted the 7079 ms token within 3%);
   `ternary_gemv_b3_v` (asm/ternary_gemv.S, prototype V6 in tools/) does 0.91 and
