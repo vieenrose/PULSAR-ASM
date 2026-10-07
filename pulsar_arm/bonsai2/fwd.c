@@ -245,6 +245,33 @@ static void gemvS(const char *name, int rows, int K, const float *sgn,
     xform(x, K, sgn, XQ);
     s8_gemv(rows, K, W8, y, XQ);
 }
+/* shared-transform pairs/triples: one signs/FWHT/Q8 for several dots over
+   the same activation (bit-exact: xform is deterministic, dots unchanged).
+   Kinds (not TWN results: the single NB buffer can't hold two names). */
+static void gemvS2(int il, const char *k1, const char *k2,
+                   int r1, int r2, int K,
+                   const float *sgn, const float *x, float *y1, float *y2) {
+    char n1[64], n2[64];
+    sprintf(n1, "blk.%d.%s", il, k1); sprintf(n2, "blk.%d.%s", il, k2);
+    uint8_t *W1 = tw_s8(n1), *W2 = tw_s8(n2);
+    xform(x, K, sgn, XQ);
+    s8_gemv(r1, K, W1, y1, XQ);
+    s8_gemv(r2, K, W2, y2, XQ);
+}
+static void gemvS3(int il, const char *k1, const char *k2, const char *k3,
+                   int r1, int r2, int r3, int K,
+                   const float *sgn, const float *x,
+                   float *y1, float *y2, float *y3) {
+    char n1[64], n2[64], n3[64];
+    sprintf(n1, "blk.%d.%s", il, k1);
+    sprintf(n2, "blk.%d.%s", il, k2);
+    sprintf(n3, "blk.%d.%s", il, k3);
+    uint8_t *W1 = tw_s8(n1), *W2 = tw_s8(n2), *W3 = tw_s8(n3);
+    xform(x, K, sgn, XQ);
+    s8_gemv(r1, K, W1, y1, XQ);
+    s8_gemv(r2, K, W2, y2, XQ);
+    s8_gemv(r3, K, W3, y3, XQ);
+}
 
 static void rms(const float *x, const float *w, int n, float *y) {
     double s = 0;
@@ -335,8 +362,7 @@ static void bfgemv(const uint8_t *W, const float *x, float *y) {
 }
 
 static void layer_linear(int il, int li) {
-    gemvS(TWN(il, "attn_qkv.weight"), QKVW, HID, SGN5120, XN, QKV);
-    gemvS(TWN(il, "attn_gate.weight"), ZW, HID, SGN5120, XN, ZV);
+    gemvS2(il, "attn_qkv.weight", "attn_gate.weight", QKVW, ZW, HID, SGN5120, XN, QKV, ZV);
     bfgemv(TW(il, "ssm_beta.weight"), XN, B48);
     bfgemv(TW(il, "ssm_alpha.weight"), XN, A48);
     float *dtb = (float *)TW(il, "ssm_dt.bias");
@@ -398,7 +424,8 @@ static void layer_linear(int il, int li) {
 }
 
 static void layer_full(int il, int fi) {
-    gemvS(TWN(il, "attn_q.weight"), 12288, HID, SGN5120, XN, QFULL);
+    gemvS3(il, "attn_q.weight", "attn_k.weight", "attn_v.weight",
+             12288, 1024, 1024, HID, SGN5120, XN, QFULL, KF, VF);
     V8R("qfull", QFULL, 1000); V8R("qfull", QFULL, 8000);
     /* fused layout is interleaved per head: [Q0 G0 Q1 G1 ...], 256-wide
        halves - NOT first-half/second-half (graph strides nb1 = 512 elems) */
@@ -408,10 +435,8 @@ static void layer_full(int il, int fi) {
     }
     float *qnw = (float *)TW(il, "attn_q_norm.weight");
     for (int h = 0; h < 24; h++) rms(QF + h * 256, qnw, 256, QF + h * 256);
-    gemvS(TWN(il, "attn_k.weight"), 1024, HID, SGN5120, XN, KF);
     float *knw = (float *)TW(il, "attn_k_norm.weight");
     for (int h = 0; h < 4; h++) rms(KF + h * 256, knw, 256, KF + h * 256);
-    gemvS(TWN(il, "attn_v.weight"), 1024, HID, SGN5120, XN, VF);
     rope_apply(QF, 24, NPOS);
     rope_apply(KF, 4, NPOS);
     V8R("kcur", KF, 512); V8R("vcur", VF, 512);
@@ -450,8 +475,7 @@ static void layer_ffn(int il) {
     float *pnw = (float *)TW(il, "post_attention_norm.weight");
     rms(X, pnw, HID, XN);
     MAG("pn", XN, HID); V8("pn", XN);
-    gemvS(TWN(il, "ffn_gate.weight"), INTER, HID, SGN5120, XN, LG);
-    gemvS(TWN(il, "ffn_up.weight"), INTER, HID, SGN5120, XN, LU);
+    gemvS2(il, "ffn_gate.weight", "ffn_up.weight", INTER, INTER, HID, SGN5120, XN, LG, LU);
     for (int i = 0; i < INTER; i++) LU[i] = silu(LG[i]) * LU[i];
     gemvS(TWN(il, "ffn_down.weight"), HID, INTER, SGN17408, LU, FO);
     MAG("ffn", FO, HID);

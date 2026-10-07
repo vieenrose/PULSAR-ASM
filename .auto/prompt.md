@@ -14,6 +14,12 @@ bus wall — that session is closed, see git log + `.auto/log.jsonl`
 runs ≤224).
 
 ## Metrics
+- **Primary**: `decode_ms` (ms per generated token, lower is better).
+- **A/B adjudication**: every run also times the HEAD baseline in the same
+  invocation (`decode_base_ms`, order-reversed to cancel drift). Judge by
+  `decode_ratio` (=current/base) when load1 > 8 (shared box); by absolute
+  `decode_ms` when load1 <= 8. Either way the golden-stream gates must pass.
+
 - **Primary**: `decode_ms` (ms per generated token, lower is better) —
   steady-state incremental decode on prompt A + 20 gen tokens.
 - **Secondary**: `prefill_ms` (ms per prompt token, same kernel, reported
