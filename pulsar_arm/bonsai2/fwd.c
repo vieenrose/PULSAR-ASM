@@ -118,7 +118,7 @@ static int tw_idx(const char *name) {
     printf("tensor missing: %s\n", name);
     exit(1);
 }
-/* transposed s8 cache: per 128-group [128B raw trits][4B fp32 scale].
+/* transposed s8 cache: 128B raw trits/group contiguous (aligned) + dense fp16 scale tail.
    Decoded once at first use (OpenMP over rows); the per-token dot then
    streams trits with no digit decode. Same math/order as the staged path
    (bit-exact preserved). */
@@ -129,13 +129,15 @@ static void transpose_tensor(int idx) {
     int64_t K = TD0[idx], rows = TD1[idx];
     int ng = (int)(K / 128);
     uint8_t *src = G + TO[idx];
-    uint8_t *dst = malloc((size_t)rows * ng * 132);
+    /* trits contiguous 128B/group (16-aligned), fp16 scales in a dense
+       tail array: 27.0GB + 0.43GB traffic, no padding anywhere */
+    uint8_t *dst = malloc((size_t)rows * ng * 130); /* 128B trits + 2B fp16 scale */
     if (!dst) { printf("s8 malloc fail\n"); exit(1); }
     #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < rows; r++) {
         for (int g = 0; g < ng; g++) {
             const uint8_t *b = src + ((size_t)r * ng + g) * 28;
-            int8_t *o = (int8_t *)(dst + ((size_t)r * ng + g) * 132);
+            int8_t *o = (int8_t *)(dst + ((size_t)r * ng + g) * 128);
             int k = 0;
             for (int q = 0; q < 2; q++) {
                 int base = q ? 16 : 0, c = q ? 8 : 16;
@@ -150,7 +152,7 @@ static void transpose_tensor(int idx) {
                     uint8_t v = (uint8_t)(b[24 + h] * P3T[nn]);
                     o[k++] = (int8_t)(((uint16_t)v * 3) >> 8) - 1;
                 }
-            { float sc = h2f((uint16_t)(b[26] | (b[27] << 8))); memcpy(o + 128, &sc, 4); }
+            memcpy(dst + (size_t)rows * ng * 128 + ((size_t)r * ng + g) * 2, b + 26, 2);
         }
     }
     S8CACHE[idx] = dst;
