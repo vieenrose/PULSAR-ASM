@@ -202,6 +202,22 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
   against the checkpoint's generation_config.json, not the card's prose:
   temperature 0.5, top_k 20, top_p 0.85, eos 151645, repetition_penalty 1.0.
   `tools/bonsai_ask.py` prints a transcript for the GIF specs.
+- **Sampler: one open corner.** Verified with instrumentation (printing raw
+  logits, post-softmax values, top-k slots and the chosen index from inside the
+  sampler): logits are clean, softmax is correct at temp 0.5 and 1.0
+  (post-softmax max 0.54 / 0.45, peaked as expected), top-k sorts descending,
+  the top-p walk picks j=0 with v0=1.0 when the distribution is peaked, and
+  `expf_asm` only ever touches s0-s4/x9/x10 so it cannot corrupt the max or the
+  temperature held in s6/s7. Greedy (sampler bypassed entirely) produces a
+  perfect four-item answer. What does NOT add up: at temp 0.1/0.05 the run
+  degenerates into token repetition ("are are are"), and the sampled top-1 at
+  the first position does not match the greedy argmax, which it must when
+  v0 ~ 1.0. At the card's temp 0.5 the output is genuinely good - a clean haiku
+  ("Tides roll in, / waves whisper secrets, / the sea sings.") and a well-formed
+  zh-TW answer - so the demos use 0.5 and this is a corner, not a blocker.
+  Beware two red herrings the instrumentation produced: a `kept` that looked
+  like garbage was my stack-offset mislabel, and a "post = nan" reading came
+  from a different call than the one being examined.
 - **4B is NOT validated.** /tmp/oracle4b.log is garbage: every layer prints the
   same value (3.0e21) with numpy overflow warnings, i.e. the run fed an
   out-of-range prompt id and never reached the forward properly. Before any 4B
