@@ -195,6 +195,15 @@ ssh $PI "cd pw && ./core_X $M $V/vocab.bin 2 > /tmp/gX.log 2>&1; echo exit=\$?"
   states plainly these run on the PrismML llama.cpp fork (CPU-only, 20 threads,
   GPU 0%), NOT PULSAR-ASM. Ceiling-prompt probes (neural/seasons/haiku) were all
   clean for the 8B; gen1 clips remain dropped.
+- **NEON verdict (2026-10-07): CONDITION MET, 5.3x.** tq_gemv_int scalar is
+  BIT-EXACT vs fork vec_dot (fp32 accumulation order mirrored; an earlier CS
+  correction theory mismatched all 64 rows and was deleted after reading the
+  fork generic source). Scalar int 139 ms -> NEON (SDOT, X925) 26.0 ms per
+  89M-weight projection (0.29 ns/w), BIT-EXACT, same matrix/pinned core.
+  #19 CLOSED, #20 (64-layer forward) OPEN. Bonsai-2 C work lives in
+  ~/bonsai2/asm on the Spark (not in this repo); next is a full-attention
+  layer in C vs fork tensor dump, then wiring, vocab 248320, sampling A/B,
+  then engine-byte clip reshoots replace the fork-runtime GIFs.
 - **4-clip Bonsai demo set DONE (2026-10-07)**: en + zh-TW ceiling prompts for
   both 8B and 27B. zh-TW prompt is the same four-seasons question in Traditional
   Chinese. 27B zh-tw clean first run (markdown table, 1.96 tok/s, 253 tokens).
