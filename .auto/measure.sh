@@ -8,7 +8,8 @@ LOCAL=/home/user/PULSAR-ASM
 A_IDS="248045 846 198 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 248046 198 248045 74455 198 248068"
 MODEL=../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf
 
-# 1. sync sources that the loop may change
+# 1. sync sources that the loop may change (dir first: redirection can't mkdir)
+ssh -o BatchMode=yes -o ConnectTimeout=20 "$SPARK" "mkdir -p $RDIR"
 for f in fwd.c tq_gemv_neon.c tq_xgemv.c fwht.S; do
     ssh -o BatchMode=yes -o ConnectTimeout=20 "$SPARK" "cat > $RDIR/$f" < "$LOCAL/pulsar_arm/bonsai2/$f"
 done
