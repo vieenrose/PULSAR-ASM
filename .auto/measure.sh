@@ -19,9 +19,10 @@ done
 $SSH "$SPARK" "cat > $RDIR/bench_remote.sh" < "$LOCAL/.auto/bench_remote.sh"
 
 # 2. build + benchmark on the Spark (server-side timing excludes ssh latency)
-export OMP_NT_EXP=16  # experiment: candidate threads (base stays 20)
+export OMP_NT_EXP=12  # candidate threads (this experiment: 16->12)
+export OMP_NT_BASE=16  # baseline stays prior standard
 # shellcheck disable=SC2086
-$SSH "$SPARK" "OMP_NT_EXP=$OMP_NT_EXP bash $RDIR/bench_remote.sh $MODEL $A_IDS" > "$LOCAL/.auto/last_build.log" 2>&1
+$SSH "$SPARK" "OMP_NT_EXP=$OMP_NT_EXP OMP_NT_BASE=$OMP_NT_BASE bash $RDIR/bench_remote.sh $MODEL $A_IDS" > "$LOCAL/.auto/last_build.log" 2>&1
 grep -q BUILD_OK "$LOCAL/.auto/last_build.log" || { tail -5 "$LOCAL/.auto/last_build.log"; exit 1; }
 
 # 3. fetch CURRENT-tree step logs (accuracy gate runs on the candidate)
