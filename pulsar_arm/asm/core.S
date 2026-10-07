@@ -5042,10 +5042,14 @@ vocab_load:  // x0 = vocab.bin path. mmaps read-only, verifies, memcpys table.
     cmp x0, x1
     b.ne 9f
     ldr x0, [x19, #8]            // count
-    movz x1, #4, lsl #16         // 262144
+    movz x1, #4, lsl #16         // table capacity, 262144 entries
     cmp x0, x1
-    b.ne 9f
+    b.hi 9f                      // more than VTAB can hold
+    cbz x0, 9f
     str x0, [sp, #-16]!          // save count
+    // (was b.ne: an exact-262144 check. A pulsar blob's vocab is 151669, and
+    // the table is written at full capacity either way, so any count that
+    // fits is valid - entries past it are (0,0) and put_surf skips them.)
     // memcpy table (4MB) base+16 -> VTAB
     add x0, x19, #16             // src
     adrp x1, VTAB
@@ -6259,9 +6263,12 @@ eos_done:
     bl put_surf                  // buffer (preserves x19+ ✓)
     b gen_fed
 gen_id:
+    // Render through the vocab table like every other path: with the qwen
+    // vocab asset loaded this is the engine's own bytes to the screen, which
+    // is the whole point of the asm decoder. (Ids mode used to print raw ids
+    // here because gemma's vocab.bin cannot render qwen tokens.)
     mov x0, x23
-    bl print_u64
-    bl print_sp
+    bl put_surf
 gen_fed:
     add x19, x19, #1             // pos++
     add x22, x22, #1
