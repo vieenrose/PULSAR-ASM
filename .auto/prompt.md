@@ -56,7 +56,7 @@ prefill (21 prompt forwards) and decode (20 gen forwards), prints
    No precision reduction anywhere without a bit-exact (or argmax-preserving
    + distribution-checked) proof first.
 2. **No benchmark gaming**: fixed prompts, fixed gen counts, fixed threads
-   (20, taskset 0-19), fixed flags (-O2 -fopenmp -march=armv8.2-a+dotprod+fp16; +fp16 added run #226 for hw fp16 converts, still no SVE).
+   (20, taskset 0-19), fixed flags (-O3 -fopenmp -march=armv8.2-a+dotprod+fp16 -mtune=native as of run #232; no -ffast-math ever, fp order preserved).
    No prompt-dependent branches, no answer caching, no skipped layers/norms,
    no EOS-handling changes that alter measured work, no accuracy-for-speed
    trades hidden in the sampler (sampler is out of scope unless bit-identical

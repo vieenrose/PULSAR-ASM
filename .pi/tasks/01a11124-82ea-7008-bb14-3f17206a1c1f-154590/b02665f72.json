@@ -1,0 +1,27 @@
+{
+  "id": "b02665f72",
+  "name": "measure with visible output",
+  "command": "cd /home/user/PULSAR-ASM && ././.auto/measure.sh 2>&1 | tail -15",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a11124-82ea-7008-bb14-3f17206a1c1f-154590/b02665f72.output",
+  "cwd": "/home/user/PULSAR-ASM",
+  "startTime": 1791389507456,
+  "endTime": 1791389513561,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 3353778,
+  "bytesWritten": 0,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}

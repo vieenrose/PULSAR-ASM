@@ -38,7 +38,7 @@ echo "checks: held-out prompt B exact (27/27)"
 if git -C "$LOCAL" status --porcelain pulsar_arm/bonsai2/tq_gemv_neon.c pulsar_arm/bonsai2/fwht.S pulsar_arm/bonsai2/tq_xgemv.c | grep -q .; then
     echo "checks: kernel files touched - running bit-exact validation"
     OUT=$(ssh -o BatchMode=yes -o ConnectTimeout=20 "$SPARK" \
-        'cd ~/bonsai2/exp && LB=~/bonsai2/llama.cpp/build/bin && gcc -O2 -march=armv8.2-a+dotprod+fp16 -DTQ_XGEMV_LIB -o tqv tq_gemv_neon.c tq_xgemv.c fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm && taskset -c 3 ./tqv ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 11120992 594124800 64 2>&1 | head -2')
+        'cd ~/bonsai2/exp && LB=~/bonsai2/llama.cpp/build/bin && gcc -O3 -march=armv8.2-a+dotprod+fp16 -mtune=native -DTQ_XGEMV_LIB -o tqv tq_gemv_neon.c tq_xgemv.c fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm && taskset -c 3 ./tqv ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 11120992 594124800 64 2>&1 | head -2')
     echo "$OUT"
     if echo "$OUT" | grep -q BIT-EXACT; then echo "checks: kernel bit-exact"; else
         MR=$(echo "$OUT" | grep -o "maxrel [0-9.e+-]*" | head -1 | cut -d" " -f2)

@@ -43,6 +43,8 @@ void ggml_vec_dot_ptq1_0_q8_0(int n, float * s, size_t bs, const void * vx,
 static int XCHECK = 0;
 void tq_gemv_neon(int rows, int cols, const uint8_t *w, const float *x,
                   float *y, const uint8_t *xq);
+void s8_gemv(int rows, int cols, const uint8_t *w8, float *y,
+             const uint8_t *xq);
 void fwht1024_f32(float * x);
 
 #define V8(nm, v) do { if (TRACE) { printf("  %s v8:", nm); \
@@ -109,6 +111,54 @@ static uint8_t *tw(const char *name) {
         if (!strcmp(TN[i], name)) return G + TO[i];
     printf("tensor missing: %s\n", name);
     exit(1);
+}
+static int tw_idx(const char *name) {
+    for (int i = 0; i < NT; i++)
+        if (!strcmp(TN[i], name)) return i;
+    printf("tensor missing: %s\n", name);
+    exit(1);
+}
+/* transposed s8 cache: per 128-group [128B raw trits][4B fp32 scale].
+   Decoded once at first use (OpenMP over rows); the per-token dot then
+   streams trits with no digit decode. Same math/order as the staged path
+   (bit-exact preserved). */
+static uint8_t *S8CACHE[900];
+static float h2f(uint16_t h);
+static const uint8_t P3T[6] = {1, 3, 9, 27, 81, 243};
+static void transpose_tensor(int idx) {
+    int64_t K = TD0[idx], rows = TD1[idx];
+    int ng = (int)(K / 128);
+    uint8_t *src = G + TO[idx];
+    uint8_t *dst = malloc((size_t)rows * ng * 132);
+    if (!dst) { printf("s8 malloc fail\n"); exit(1); }
+    #pragma omp parallel for schedule(static)
+    for (int64_t r = 0; r < rows; r++) {
+        for (int g = 0; g < ng; g++) {
+            const uint8_t *b = src + ((size_t)r * ng + g) * 28;
+            int8_t *o = (int8_t *)(dst + ((size_t)r * ng + g) * 132);
+            int k = 0;
+            for (int q = 0; q < 2; q++) {
+                int base = q ? 16 : 0, c = q ? 8 : 16;
+                for (int nn = 0; nn < 5; nn++)
+                    for (int m = 0; m < c; m++) {
+                        uint8_t v = (uint8_t)(b[base + m] * P3T[nn]);
+                        o[k++] = (int8_t)(((uint16_t)v * 3) >> 8) - 1;
+                    }
+            }
+            for (int nn = 0; nn < 4; nn++)
+                for (int h = 0; h < 2; h++) {
+                    uint8_t v = (uint8_t)(b[24 + h] * P3T[nn]);
+                    o[k++] = (int8_t)(((uint16_t)v * 3) >> 8) - 1;
+                }
+            { float sc = h2f((uint16_t)(b[26] | (b[27] << 8))); memcpy(o + 128, &sc, 4); }
+        }
+    }
+    S8CACHE[idx] = dst;
+}
+static uint8_t *tw_s8(const char *name) {
+    int idx = tw_idx(name);
+    if (!S8CACHE[idx]) transpose_tensor(idx);
+    return S8CACHE[idx];
 }
 static void dump_off(const char *name) {
     for (int i = 0; i < NT; i++)
@@ -188,6 +238,13 @@ static void gemvT(const uint8_t *W, int rows, int K, const float *sgn,
         ncall++;
     }
 }
+/* transposed-weight path: same xform, sdot-only dot over cached s8 rows */
+static void gemvS(const char *name, int rows, int K, const float *sgn,
+                  const float *x, float *y) {
+    uint8_t *W8 = tw_s8(name);
+    xform(x, K, sgn, XQ);
+    s8_gemv(rows, K, W8, y, XQ);
+}
 
 static void rms(const float *x, const float *w, int n, float *y) {
     double s = 0;
@@ -264,6 +321,7 @@ static char *tn(int il, const char *kind, char *o) {
     return o;
 }
 #define TW(il, kind) tw(tn(il, kind, NB))
+#define TWN(il, kind) tn(il, kind, NB)  /* name only, no table lookup */
 
 /* plain BF16 matvec 48 outs (ssm_alpha/beta are NOT transformed) */
 static void bfgemv(const uint8_t *W, const float *x, float *y) {
@@ -277,8 +335,8 @@ static void bfgemv(const uint8_t *W, const float *x, float *y) {
 }
 
 static void layer_linear(int il, int li) {
-    gemvT(TW(il, "attn_qkv.weight"), QKVW, HID, SGN5120, XN, QKV);
-    gemvT(TW(il, "attn_gate.weight"), ZW, HID, SGN5120, XN, ZV);
+    gemvS(TWN(il, "attn_qkv.weight"), QKVW, HID, SGN5120, XN, QKV);
+    gemvS(TWN(il, "attn_gate.weight"), ZW, HID, SGN5120, XN, ZV);
     bfgemv(TW(il, "ssm_beta.weight"), XN, B48);
     bfgemv(TW(il, "ssm_alpha.weight"), XN, A48);
     float *dtb = (float *)TW(il, "ssm_dt.bias");
@@ -332,7 +390,7 @@ static void layer_linear(int il, int li) {
     for (int h = 0; h < 48; h++)
         for (int i = 0; i < 128; i++)
             PM[i + 128 * (h / 16) + 384 * (h % 16)] = FOUT[h * 128 + i];
-    gemvT(TW(il, "ssm_out.weight"), HID, ZW, SGN6144, PM, AO);
+    gemvS(TWN(il, "ssm_out.weight"), HID, ZW, SGN6144, PM, AO);
     V8("attnout", AO);
     V8R("attnout", AO, 1000);
     for (int i = 0; i < HID; i++) X[i] += AO[i];
@@ -340,7 +398,7 @@ static void layer_linear(int il, int li) {
 }
 
 static void layer_full(int il, int fi) {
-    gemvT(TW(il, "attn_q.weight"), 12288, HID, SGN5120, XN, QFULL);
+    gemvS(TWN(il, "attn_q.weight"), 12288, HID, SGN5120, XN, QFULL);
     V8R("qfull", QFULL, 1000); V8R("qfull", QFULL, 8000);
     /* fused layout is interleaved per head: [Q0 G0 Q1 G1 ...], 256-wide
        halves - NOT first-half/second-half (graph strides nb1 = 512 elems) */
@@ -350,10 +408,10 @@ static void layer_full(int il, int fi) {
     }
     float *qnw = (float *)TW(il, "attn_q_norm.weight");
     for (int h = 0; h < 24; h++) rms(QF + h * 256, qnw, 256, QF + h * 256);
-    gemvT(TW(il, "attn_k.weight"), 1024, HID, SGN5120, XN, KF);
+    gemvS(TWN(il, "attn_k.weight"), 1024, HID, SGN5120, XN, KF);
     float *knw = (float *)TW(il, "attn_k_norm.weight");
     for (int h = 0; h < 4; h++) rms(KF + h * 256, knw, 256, KF + h * 256);
-    gemvT(TW(il, "attn_v.weight"), 1024, HID, SGN5120, XN, VF);
+    gemvS(TWN(il, "attn_v.weight"), 1024, HID, SGN5120, XN, VF);
     rope_apply(QF, 24, NPOS);
     rope_apply(KF, 4, NPOS);
     V8R("kcur", KF, 512); V8R("vcur", VF, 512);
@@ -384,7 +442,7 @@ static void layer_full(int il, int fi) {
     for (int i = 0; i < 6144; i++) ATTO[i] *= GF[i];
     MAG("atto", ATTO, 6144);
     V8R("atto", ATTO, 1000);
-    gemvT(TW(il, "attn_output.weight"), HID, 6144, SGN6144, ATTO, AO);
+    gemvS(TWN(il, "attn_output.weight"), HID, 6144, SGN6144, ATTO, AO);
     for (int i = 0; i < HID; i++) X[i] += AO[i];
 }
 
@@ -392,10 +450,10 @@ static void layer_ffn(int il) {
     float *pnw = (float *)TW(il, "post_attention_norm.weight");
     rms(X, pnw, HID, XN);
     MAG("pn", XN, HID); V8("pn", XN);
-    gemvT(TW(il, "ffn_gate.weight"), INTER, HID, SGN5120, XN, LG);
-    gemvT(TW(il, "ffn_up.weight"), INTER, HID, SGN5120, XN, LU);
+    gemvS(TWN(il, "ffn_gate.weight"), INTER, HID, SGN5120, XN, LG);
+    gemvS(TWN(il, "ffn_up.weight"), INTER, HID, SGN5120, XN, LU);
     for (int i = 0; i < INTER; i++) LU[i] = silu(LG[i]) * LU[i];
-    gemvT(TW(il, "ffn_down.weight"), HID, INTER, SGN17408, LU, FO);
+    gemvS(TWN(il, "ffn_down.weight"), HID, INTER, SGN17408, LU, FO);
     MAG("ffn", FO, HID);
     V8("ffnout", FO);
     V8("gate", LG); V8("up", LU);
@@ -524,7 +582,7 @@ int main(int argc, char **argv) {
         }
         float *onw = (float *)tw("output_norm.weight");
         rms(X, onw, HID, XN);
-        gemvT(tw("output.weight"), VOCAB, HID, SGN5120, XN, HEAD);
+        gemvS("output.weight", VOCAB, HID, SGN5120, XN, HEAD);
         int top = argmax(HEAD, VOCAB);
         printf("step %d id_in=%d top=%d logit=%.4f logit271=%.4f\n", step, id, top, HEAD[top], HEAD[271]);
         /* top-5 */

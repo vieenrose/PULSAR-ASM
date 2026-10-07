@@ -136,6 +136,35 @@ void tq_gemv_neon(int rows, int cols, const uint8_t *w, const float *x,
     }
 }
 
+/* s8 pre-decoded GEMV: W8 holds [128B raw trits][4B fp32 scale] per group.
+   Same math and fp order as tq_gemv_neon (bit-exact), minus digit decode. */
+void s8_gemv(int rows, int cols, const uint8_t *w8, float *y,
+             const uint8_t *xq) {
+    int ng = cols / 128;
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < rows; r++) {
+        float acc = 0.0f;
+        for (int g = 0; g < ng; g++) {
+            const int8_t *tr = (const int8_t *)(w8 + ((size_t)r * ng + g) * 132);
+            float ws;
+            memcpy(&ws, tr + 128, 4);
+            float sum = 0.0f;
+            for (int kb = 0; kb < 4; kb++) {
+                const uint8_t *qb = xq + (size_t)(g * 4 + kb) * 34;
+                float db = ld_f16(qb);
+                const int8_t *qs = (const int8_t *)(qb + 2);
+                const int8_t *tt = tr + kb * 32;
+                int32x4_t a = vdotq_s32(vdupq_n_s32(0),
+                                        vld1q_s8(tt), vld1q_s8(qs));
+                a = vdotq_s32(a, vld1q_s8(tt + 16), vld1q_s8(qs + 16));
+                sum += db * (float)vaddvq_s32(a);
+            }
+            acc += ws * sum;
+        }
+        y[r] = acc;
+    }
+}
+
 /* ---- validation + timing harness (mirrors tq_gemv_int main) ---- */
 static float X[COLS], XT[COLS], YA[ROWS], YB[ROWS];
 static uint8_t XQ[(COLS / 32) * 34];
