@@ -136,8 +136,17 @@ void tq_gemv_neon(int rows, int cols, const uint8_t *w, const float *x,
     }
 }
 
-/* s8 pre-decoded GEMV: W8 holds 128B raw trits/group + fp16 scale tail.
-   Same math and fp order as tq_gemv_neon (bit-exact), minus digit decode. */
+/* nibble-packed GEMV: W8 holds 64B codes/group (2 trits/byte, sequential)
+   + fp16 scale tail. Unpack is shift/mask only, in order (no zip chains).
+   Same math and fp order (bit-exact). */
+static inline void dec32n(const uint8_t *b, int8x16_t *o0, int8x16_t *o1) {
+    uint8x16_t bb = vld1q_u8(b);
+    uint8x16_t lo = vandq_u8(bb, vdupq_n_u8(15));
+    uint8x16_t hi = vshrq_n_u8(bb, 4);
+    uint8x16_t one = vdupq_n_u8(1);
+    *o0 = vreinterpretq_s8_u8(vsubq_u8(lo, one));
+    *o1 = vreinterpretq_s8_u8(vsubq_u8(hi, one));
+}
 void s8_gemv(int rows, int cols, const uint8_t *w8, float *y,
              const uint8_t *xq) {
     int ng = cols / 128;
@@ -145,17 +154,17 @@ void s8_gemv(int rows, int cols, const uint8_t *w8, float *y,
     for (int r = 0; r < rows; r++) {
         float acc = 0.0f;
         for (int g = 0; g < ng; g++) {
-            const int8_t *tr = (const int8_t *)(w8 + ((size_t)r * ng + g) * 128);
-            float ws = ld_f16(w8 + ((size_t)rows * ng * 128 + ((size_t)r * ng + g) * 2));
+            const uint8_t *cd = w8 + ((size_t)r * ng + g) * 64;
+            float ws = ld_f16(w8 + (size_t)rows * ng * 64 + ((size_t)r * ng + g) * 2);
             float sum = 0.0f;
             for (int kb = 0; kb < 4; kb++) {
                 const uint8_t *qb = xq + (size_t)(g * 4 + kb) * 34;
                 float db = ld_f16(qb);
                 const int8_t *qs = (const int8_t *)(qb + 2);
-                const int8_t *tt = tr + kb * 32;
-                int32x4_t a = vdotq_s32(vdupq_n_s32(0),
-                                        vld1q_s8(tt), vld1q_s8(qs));
-                a = vdotq_s32(a, vld1q_s8(tt + 16), vld1q_s8(qs + 16));
+                int8x16_t t0, t1;
+                dec32n(cd + kb * 16, &t0, &t1);
+                int32x4_t a = vdotq_s32(vdupq_n_s32(0), t0, vld1q_s8(qs));
+                a = vdotq_s32(a, t1, vld1q_s8(qs + 16));
                 sum += db * (float)vaddvq_s32(a);
             }
             acc += ws * sum;

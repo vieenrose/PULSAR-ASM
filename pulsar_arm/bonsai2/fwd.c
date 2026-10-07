@@ -129,30 +129,37 @@ static void transpose_tensor(int idx) {
     int64_t K = TD0[idx], rows = TD1[idx];
     int ng = (int)(K / 128);
     uint8_t *src = G + TO[idx];
-    /* trits contiguous 128B/group (16-aligned), fp16 scales in a dense
-       tail array: 27.0GB + 0.43GB traffic, no padding anywhere */
-    uint8_t *dst = malloc((size_t)rows * ng * 130); /* 128B trits + 2B fp16 scale */
+    /* nibbles 64B/group (byte k of each 16B chunk = trits k,k+16; unpack needs no zip), fp16 scales
+       in a dense tail array: ~13.5GB + 0.43GB traffic (vs 27GB int8).
+       Unpack is shift/mask only, in order (no zip chains like 2-bit). */
+    uint8_t *dst = malloc((size_t)rows * ng * 66);
     if (!dst) { printf("s8 malloc fail\n"); exit(1); }
     #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < rows; r++) {
         for (int g = 0; g < ng; g++) {
             const uint8_t *b = src + ((size_t)r * ng + g) * 28;
-            int8_t *o = (int8_t *)(dst + ((size_t)r * ng + g) * 128);
+            uint8_t *o = dst + ((size_t)r * ng + g) * 64;
+            /* digits in order, then pack transposed: byte k of each
+               16B chunk holds trits (k, k+16) so unpack needs no zip */
+            uint8_t dg[128];
             int k = 0;
             for (int q = 0; q < 2; q++) {
                 int base = q ? 16 : 0, c = q ? 8 : 16;
                 for (int nn = 0; nn < 5; nn++)
                     for (int m = 0; m < c; m++) {
                         uint8_t v = (uint8_t)(b[base + m] * P3T[nn]);
-                        o[k++] = (int8_t)(((uint16_t)v * 3) >> 8) - 1;
+                        dg[k++] = (uint8_t)(((uint16_t)v * 3) >> 8);
                     }
             }
             for (int nn = 0; nn < 4; nn++)
                 for (int h = 0; h < 2; h++) {
                     uint8_t v = (uint8_t)(b[24 + h] * P3T[nn]);
-                    o[k++] = (int8_t)(((uint16_t)v * 3) >> 8) - 1;
+                    dg[k++] = (uint8_t)(((uint16_t)v * 3) >> 8);
                 }
-            memcpy(dst + (size_t)rows * ng * 128 + ((size_t)r * ng + g) * 2, b + 26, 2);
+            for (int c = 0; c < 4; c++)
+                for (int j = 0; j < 16; j++)
+                    o[c * 16 + j] = (uint8_t)(dg[c * 32 + j] | (dg[c * 32 + 16 + j] << 4));
+            memcpy(dst + (size_t)rows * ng * 64 + ((size_t)r * ng + g) * 2, b + 26, 2);
         }
     }
     S8CACHE[idx] = dst;
