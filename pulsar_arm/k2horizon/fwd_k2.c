@@ -124,6 +124,12 @@ static int argmax(const float *v, int n) {
 }
 
 static uint64_t RS;
+static int TRACE = 0;
+#define TRACEL(il) do { if (TRACE) { double _s = 0; \
+    for (int _i = 0; _i < HID; _i++) _s += (double)X[_i] * X[_i]; \
+    fprintf(stderr, "L%d rms=%.6g v8:", il, sqrt(_s / HID)); \
+    for (int _i = 0; _i < 8; _i++) fprintf(stderr, " %.6g", (double)X[_i]); \
+    fprintf(stderr, "\n"); } } while (0)
 static float frand01(void) {
     RS = RS * 6364136223846793005ull + 1442695040888963407ull;
     return (float)((RS >> 11) * (1.0 / 9007199254740992.0));
@@ -185,6 +191,7 @@ int main(int argc, char **argv) {
     }
     int n0 = nids;
     NPOS_TOK = 0;
+    if (getenv("K2TRACE")) TRACE = 1;
     for (int step = 0; step < n0 + gen; step++) {
         int id = step < n0 ? ids[step]
                : (STEMP > 0 ? sample_topkpp(HEAD, VOCAB, STEMP, STOPP, STopK, SMINP)
@@ -250,6 +257,7 @@ int main(int argc, char **argv) {
             }
             gemv_ref((uint16_t *)(G + LOFF[il][8]), HID, INTER, LU, FO);
             for (int i = 0; i < HID; i++) X[i] += FO[i];
+            if (step == n0 - 1) TRACEL(il);
         }
         float *onw = (float *)(G + O_NORM);
         rms(X, onw, HID, XN);
