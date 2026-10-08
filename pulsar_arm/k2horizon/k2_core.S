@@ -1484,63 +1484,132 @@ memcpy_q:
     b.lo 0b
 9:  ret
 
-/* ---------------- k2q4_gemv_batch:
- *   w0=r0, w1=r1, w2=cols, x3=w, x4=xq_base, x5=y_base, w6=B, w7=rows
- * Row-outer, token-inner: each row's Q4 bytes (<= 2880 B) are re-scanned
- * once per token but stay in L1, so DRAM weight traffic drops ~B-fold.
- * Every (row, token) is delegated to k2q4_gemv_range -> bit-exact by
- * construction. Token b: xq at xq_base+b*xqs, y at y_base+b*rows*4.
- * Saves x19-x28. */
+/* ---------------- k2q4_gemv_batch: block-outer / token-inner batched GEMV.
+ * Each 32-weight block's scale decode + nibble split is done once and
+ * reused for all B tokens; per-token accumulation order is identical to
+ * k2q4_gemv_range, so results are bit-exact. Token b: xq at xq_base+b*xqs,
+ * y at y_base+b*rows*4. Saves x19-x28; frame 144 B, accumulators at
+ * [sp,#104]. */
     .align 2
 k2q4_gemv_batch:
-    stp x29, x30, [sp, #-128]!
+    stp x29, x30, [sp, #-144]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
     stp x23, x24, [sp, #48]
     stp x25, x26, [sp, #64]
     stp x27, x28, [sp, #80]
-    /* [sp,#96] y token ptr, [sp,#104] xq token ptr, [sp,#112] b counter:
-     * k2q4_gemv_range clobbers x8-x15, so the b-loop state lives in memory */
-    mov w19, w0                     /* r0 */
-    mov w20, w1                     /* r1 */
-    mov w21, w2                     /* cols */
-    mov x22, x3                     /* w */
-    mov x23, x4                     /* xq_base */
-    mov x24, x5                     /* y_base */
-    mov w25, w6                     /* B */
-    mov w26, w7                     /* rows */
-    lsr x27, x21, #8                /* nb256 = cols/256 */
-    mov x28, #292
-    mul x27, x27, x28               /* xqs */
-    lsl x28, x26, #2                /* ystride = rows*4 */
+    mov w25, w0                     /* r */
+    mov w26, w1                     /* r1 */
+    mov w23, w2                     /* cols */
+    mov x24, x3                     /* w */
+    mov x19, x4                     /* xq_base */
+    str x5, [sp, #96]               /* y_base */
+    mov w21, w6                     /* B */
+    lsl x22, x7, #2                 /* ystride = rows*4 */
+    lsr x27, x23, #8
+    mov x9, #292
+    mul x27, x27, x9                /* xqs */
+    asr x9, x23, #5                 /* nb32 */
+    mov x10, #18
+    mul x10, x9, x10                /* rowstride */
+    madd x11, x25, x10, x24         /* rowptr (advances by rowstride/row) */
+    movi v30.16b, #15
+    movi v31.16b, #8
 .Lbg_row:
-    cmp w19, w20
+    cmp w25, w26
     b.ge .Lbg_end
-    str x24, [sp, #96]              /* y token base: callee adds r*4 */
-    str x23, [sp, #104]
-    str wzr, [sp, #112]
-.Lbg_b:
-    ldr x5, [sp, #96]               /* y = y_b + r*4 */
-    ldr x6, [sp, #104]
-    mov w0, w19
-    add w1, w19, #1
-    mov w2, w21
-    mov x3, x22
-    mov x4, xzr
-    bl k2q4_gemv_range
-    ldr x9, [sp, #96]
-    add x9, x9, x28
-    str x9, [sp, #96]
-    ldr x9, [sp, #104]
-    add x9, x9, x27
-    str x9, [sp, #104]
-    ldr w9, [sp, #112]
-    add w9, w9, #1
-    str w9, [sp, #112]
-    cmp w9, w25
-    b.ne .Lbg_b
-    add w19, w19, #1
+    add x15, sp, #104               /* 8-float accumulator array (x1 is h2f scratch) */
+    movi v4.4s, #0
+    mov x14, #0
+1:  str s4, [x15, x14, lsl #2]
+    add x14, x14, #1
+    cmp w14, w21
+    b.ne 1b
+    mov x8, xzr                     /* block index */
+.Lbg_blk:
+    ldrh w0, [x11]
+    add x11, x11, #18
+    /* inline h2f (raw fp16 scale -> s0); scratch w1-w4, s0-s1 */
+    and w1, w0, #0x3ff
+    ubfx w2, w0, #10, #5
+    and w3, w0, #0x8000
+    lsl w3, w3, #16
+    cbnz w2, 2f
+    cbz w1, 3f
+    ucvtf s0, w1
+    mov w4, #0x33800000
+    fmov s1, w4
+    fmul s0, s0, s1
+    fmov w4, s0
+    orr w4, w4, w3
+    fmov s0, w4
+    b 4f
+3:  fmov s0, wzr
+    b 4f
+2:  cmp w2, #31
+    b.ne 5f
+    mov w4, #0x7f80
+    lsl w4, w4, #16
+    orr w4, w4, w3
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s0, w4
+    b 4f
+5:  add w2, w2, #112
+    lsl w2, w2, #23
+    orr w4, w3, w2
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s0, w4
+4:  fmov s5, s0                     /* ws: decoded ONCE per block */
+    sub x4, x11, #16
+    ld1 {v0.16b}, [x4]
+    and v1.16b, v0.16b, v30.16b
+    ushr v0.16b, v0.16b, #4
+    sub v1.16b, v1.16b, v31.16b
+    sub v0.16b, v0.16b, v31.16b     /* nibbles split ONCE per block */
+    lsr x2, x8, #3
+    mov x7, #292
+    madd x12, x2, x7, x19           /* xq_base + (i>>3)*292 */
+    and x3, x8, #7
+    lsl x3, x3, #5                  /* woff = (i&7)*32 */
+    mov x14, #0                     /* b */
+.Lbg_tok:
+    ldr s6, [x12]                   /* db */
+    add x0, x12, #4
+    add x0, x0, x3
+    ld1 {v2.16b}, [x0]
+    ldr q3, [x0, #16]
+    movi v4.4s, #0
+    sdot v4.4s, v1.16b, v2.16b
+    sdot v4.4s, v0.16b, v3.16b
+    addv s2, v4.4s
+    scvtf s2, s2
+    fmul s7, s5, s6                 /* round(ws*db) — same contraction as B=1 */
+    ldr s8, [x15, x14, lsl #2]
+    fmadd s8, s7, s2, s8            /* per-token order preserved -> bit-exact */
+    str s8, [x15, x14, lsl #2]
+    add x12, x12, x27               /* next token's xq */
+    add x14, x14, #1
+    cmp w14, w21
+    b.ne .Lbg_tok
+    add x8, x8, #1
+    cmp x8, x9
+    b.ne .Lbg_blk
+    ldr x5, [sp, #96]
+    add x5, x5, x25, lsl #2         /* y_base + r*4 */
+    mov x6, x15
+    mov x14, #0
+.Lbg_st:
+    ldr s8, [x6]
+    str s8, [x5]
+    add x6, x6, #4
+    add x5, x5, x22                 /* next token's y */
+    add x14, x14, #1
+    cmp w14, w21
+    b.ne .Lbg_st
+    add w25, w25, #1
     b .Lbg_row
 .Lbg_end:
     ldp x27, x28, [sp, #80]
@@ -1548,7 +1617,7 @@ k2q4_gemv_batch:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #128
+    ldp x29, x30, [sp], #144
     ret
 
 /* ---------------- q4_gemv_dispatch_b: batched row-parallel dispatch.
