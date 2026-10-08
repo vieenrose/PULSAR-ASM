@@ -75,16 +75,25 @@ def run(it, ids, gen=400, temp=0.0, seed=7):
 
 def main():
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("IFM/K2-Horizon-0.9B",
-                                        trust_remote_code=True)
-    text = open(sys.argv[1]).read()
-    gen = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[2] == "--gen" else 400
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("prompt")
+    ap.add_argument("--gen", type=int, default=400)
+    ap.add_argument("--temp", type=float, default=0.0)
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--tok", default="IFM/K2-Horizon-0.9B")
+    ap.add_argument("--ids-out", default=None)
+    a = ap.parse_args()
+    tok = AutoTokenizer.from_pretrained(a.tok, trust_remote_code=True)
+    text = open(a.prompt).read()
     ids = tok.encode(text)
     print(f"prompt tokens: {len(ids)}", flush=True)
     it = load_interpreter("k2_meeting_q4.tflite")
-    out = run(it, ids, gen=gen)
+    out = run(it, ids, gen=a.gen, temp=a.temp, seed=a.seed)
     print("generated:", len(out), flush=True)
     print(tok.decode(out))
+    if a.ids_out:
+        open(a.ids_out, "w").write(" ".join(map(str, out)))
 
 
 if __name__ == "__main__":
