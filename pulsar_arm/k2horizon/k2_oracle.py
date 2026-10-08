@@ -36,7 +36,8 @@ def main():
     ids = tok("使用者:" + PROMPT + "\n助理:", return_tensors="pt").input_ids.to(dev)
     print("prompt ids:", ids.shape, ids[0, :8].tolist(), flush=True)
     with torch.no_grad():
-        pre = mdl(ids, output_hidden_states=True, use_cache=True)
+        pre = mdl(ids, output_hidden_states=True, use_cache=False)
+        assert pre.hidden_states is not None, "model dropped hidden_states"
         layers = [h[0, -1].float().cpu().numpy() for h in pre.hidden_states[1:]]
         logits = pre.logits[0, -1].float().cpu().numpy()
         gen_ids = mdl.generate(ids, max_new_tokens=gen, do_sample=False,
