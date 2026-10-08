@@ -53,9 +53,11 @@ PREFILL_MS=$(python3 -c "print($PNS_A/21/1e6)")
 DECODE_MS=$(python3 -c "print(($DNS_A-$PNS_A)/20/1e6)")
 DECODE_BASE_MS=$(python3 -c "print(($DNS_B-$PNS_B)/20/1e6)")
 RATIO=$(python3 -c "print(($DNS_A-$PNS_A)/($DNS_B-$PNS_B))")
+RSS_KB=$(get MAXRSS_KB)
 echo "METRIC prefill_ms=$PREFILL_MS"
 echo "METRIC decode_ms=$DECODE_MS"
 echo "METRIC decode_base_ms=$DECODE_BASE_MS"
 echo "METRIC decode_ratio=$RATIO"
+echo "METRIC rss_kb=$RSS_KB"
 echo "METRIC load1=$LOAD"
 echo "decode current ${DECODE_MS} vs base ${DECODE_BASE_MS} (ratio ${RATIO}), load ${LOAD}"

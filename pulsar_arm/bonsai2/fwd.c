@@ -163,6 +163,21 @@ static void transpose_tensor(int idx) {
         }
     }
     S8CACHE[idx] = dst;
+    /* The packed copy is dead once the cache exists: only transpose_tensor
+       ever reads it (embed reads token_embd, which is never transposed).
+       Drop it from the resident set so peak RSS is cache + KV only -- the
+       phone target. Clean file-backed private pages: if anything ever read
+       them again they re-fault from the file, so this cannot corrupt state.
+       GGUF tensor offsets are only 32B-aligned, so the range must be
+       rounded to page boundaries or madvise fails with EINVAL. */
+    {
+        long pg = sysconf(_SC_PAGESIZE);
+        uintptr_t a = (uintptr_t)src & ~(uintptr_t)(pg - 1);
+        uintptr_t e = ((uintptr_t)src + (size_t)rows * ng * 28 + pg - 1)
+                      & ~(uintptr_t)(pg - 1);
+        if (madvise((void *)a, e - a, MADV_DONTNEED) && getenv("MADV_DEBUG"))
+            fprintf(stderr, "madvise failed for %s\n", TN[idx]);
+    }
 }
 static uint8_t *tw_s8(const char *name) {
     int idx = tw_idx(name);

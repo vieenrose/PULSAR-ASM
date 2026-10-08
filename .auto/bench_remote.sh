@@ -53,4 +53,8 @@ echo "PREFILL_NS_A=$PNS_A NSTEPS_A=$NPS_A"
 echo "PREFILL_NS_B=$PNS_B NSTEPS_B=$NPS_B"
 echo "DECODE_NS_A=$DNS_A NSTEPS_A=$NDS_A"
 echo "DECODE_NS_B=$DNS_B NSTEPS_B=$NDS_B"
+# peak RSS of the candidate (phone target): one extra run, timing runs untouched
+/usr/bin/time -v $PRE_EXP ./fwd_exp $MODEL $IDS --gen 20 > /dev/null 2> rss.time
+RSS_KB=$(awk '/Maximum resident set size/{print $NF}' rss.time)
+echo "MAXRSS_KB=$RSS_KB"
 cat /proc/loadavg
