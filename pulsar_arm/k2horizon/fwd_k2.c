@@ -28,10 +28,11 @@
 #define NHEAD 32
 #define HDIM 64
 #define NKV 8
-#define VOCAB 64256
+#define VOCAB_MAX 131072   /* header-driven: base 64256, meeting-FT 69312 */
 #define CTX 1024
 
 static int NL = 28;   /* overwritten by blob header, assert-equal */
+static int VOCAB = 64256;
 static int WTYPE = 0;     /* 0 = fp16 weights, 2 = Q4_0 blocks */
 static int HEAD_KIND = 0;
 static uint8_t *G;
@@ -51,9 +52,10 @@ static void blob_load(const char *path) {
     NL = (int)h[0];
     if (NL != 28) { printf("layer count %d != 28 (static caches)\n", NL); exit(1); }
     if (h[1] != HID || h[2] != INTER || h[3] != NHEAD || h[4] != NKV ||
-        h[5] != HDIM || h[6] != VOCAB) {
+        h[5] != HDIM || h[6] == 0 || h[6] > VOCAB_MAX) {
         printf("geometry mismatch\n"); exit(1);
     }
+    VOCAB = (int)h[6];
     int npos = (int)h[8];
     WTYPE = (int)h[7];
     size_t off = 40;
@@ -137,7 +139,7 @@ static float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 static float X[HID], XN[HID], AO[HID], FO[HID];
 static float QF[NHEAD * HDIM], KF[NKV * HDIM], VF[NKV * HDIM];
 static float ATTO[NHEAD * HDIM], LG[INTER], LU[INTER];
-static float HEAD[VOCAB];
+static float HEAD[VOCAB_MAX];
 static float KCA[28][1024][8 * 64];
 static float VCA[28][1024][8 * 64];
 static int NPOS_TOK;

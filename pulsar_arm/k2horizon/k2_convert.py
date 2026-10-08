@@ -23,7 +23,7 @@ import sys
 
 import numpy as np
 
-HID, INTER, NLAYER, NHEAD, NKV, HDIM, VOCAB = 1536, 5120, 28, 32, 8, 64, 64256
+HID, INTER, NLAYER, NHEAD, NKV, HDIM = 1536, 5120, 28, 32, 8, 64
 KINDS = ["model.layers.{}.{}"]
 LAYER_TENSORS = ["input_layernorm.weight", "self_attn.q_proj.weight",
                  "self_attn.k_proj.weight", "self_attn.v_proj.weight",
@@ -106,7 +106,11 @@ def main():
             print("reading", fn, flush=True)
             part = read_sf(os.path.join(snap, fn))
             sf = {** (sf or {}), **part}
-    assert sf and len(sf) == 255, f"want 255 tensors, got {len(sf) if sf else 0}"
+    assert sf and len(sf) >= 255, f"want >=255 tensors, got {len(sf) if sf else 0}"
+    # vocab comes from the checkpoint (base 64256, meeting-FT 69312)
+    VOCAB = int(sf["model.embed_tokens.weight"].shape[0])
+    assert sf["lm_head.weight"].shape[0] == VOCAB, "head/embed vocab mismatch"
+    print(f"vocab: {VOCAB}", flush=True)
     order = []
     for il in range(NLAYER):
         for t in LAYER_TENSORS:
