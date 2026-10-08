@@ -121,7 +121,8 @@ glyphs DejaVu lacks, at the same size and line height. Only pacing is
 libertied. The set opens with Bonsai — ternary checkpoints, each shown in
 English and Traditional Chinese on the same four-seasons ceiling prompt the
 gemma clips use. Those four clips are the engines' own bytes (notes under
-them); everything after is the asm engine's own bytes on the Pi.
+them); everything after is the same asm engine's own bytes — the K2-Horizon
+pair on the phone, the gemma and FunctionGemma clips on the Pi.
 
 **Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, Qwen3
 sampling (temp 0.6, top-p 0.95, top-k 20). 2.18 GB. These two clips are
@@ -166,31 +167,35 @@ a longer four-section list (4.0 tok/s) — each checkpoint's seeded sample
 at its usual sampling, phone-shot for the 8B.
 
 **K2-Horizon-0.9B** — 0.9B dense decoder (IFM, Llama arch), plain RMS norms,
-YaRN rope, vocab 64256. Both clips are the pure-assembly engine
+YaRN rope, vocab 64256 — shown here in its **original** form and as a zh-TW
+meeting-agent **fine-tune (FT)**. Both clips are the pure-assembly engine
 (`pulsar_arm/k2horizon/k2_core.S`: `as` + `ld -static`, no libc, syscalls
 only, glibc-bit-identical `expf`/`%.4f`) on the phone's big cores, greedy,
-4-thread decode + 8-token prefill chunks. The base clip's ceiling prompt is
-the two-sentence neural explainer — seasons loops and haiku rambles under
-greedy, so they don't qualify. 13 tok/s.
+4-thread decode + 8-token prefill chunks; every frame is that run's own
+bytes.
 
-![K2-Horizon chat demo](doc/k2horizon-chat-en.gif)
+*Original* — the ceiling prompt is the two-sentence neural explainer
+(seasons loops and haiku rambles under greedy, so they don't qualify).
+13 tok/s.
+
+![K2-Horizon original chat demo](doc/k2horizon-chat-en.gif)
 
 ```sh
 adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 ... --gen 400 --threads 4 --batch 8"
 ```
 
-**K2-Horizon meeting agent (zh-TW)** — the same 0.9B fine-tuned for live
-meeting reading (NOTE/REVISE/NEXT protocol), converted from the published
-int4-QAT safetensors to our own Q4 blob and run on the same pure-asm
-engine (greedy, so the clip is exactly reproducible). The clip shows the
-full 6-turn input window verbatim so every NOTE/NEXT can be checked
-line-by-line — all five notes cite genuine timestamps and the harness
-stops the turn at NEXT. 3.2 tok/s (680-token prefill dominates: 8-token
-chunks + 4 threads cut it 2.6x). The base model given the same window
-deliberates 150 tokens without emitting one NOTE — that behavioral gap is
-what the fine-tune buys.
+*Fine-tune (FT)* — the same 0.9B trained for live meeting reading
+(NOTE/REVISE/NEXT protocol), converted from the published int4-QAT
+safetensors to our own Q4 blob and run on the same pure-asm engine (greedy,
+so the clip is exactly reproducible). The clip shows the full 6-turn input
+window verbatim so every NOTE/NEXT can be checked line-by-line — all five
+notes cite genuine timestamps and the harness stops the turn at NEXT.
+3.2 tok/s (the 680-token prefill dominates; 8-token chunks + 4 threads cut
+it 2.6x). Given the same window the original model deliberates 150 tokens
+without emitting a single NOTE — that behavioral gap is what the fine-tune
+buys.
 
-![K2-Horizon meeting demo](doc/k2horizon-meeting-zh-tw.gif)
+![K2-Horizon fine-tune meeting demo](doc/k2horizon-meeting-zh-tw.gif)
 
 ```sh
 adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob $(cat ft_ids680.txt) --gen 400 --threads 4 --batch 8"
@@ -302,6 +307,9 @@ pulsar_arm/kernels, runtime  C reference path — parity oracle only, NOT shippe
 pulsar_arm/bonsai2/          Bonsai ternary port (C + NEON, CPU-only): fwd/fwd8
                              engines, NEON GEMVs, FWHT asm, GGUF/tokenizer
                              tools, fork-graph oracle, own README + ledger
+pulsar_arm/k2horizon/        K2-Horizon-0.9B port: pure-asm runtime (k2_core.S:
+                             threaded decode + chunked prefill), Q4 converter,
+                             fine-tune conversion, oracle + eval harness
 pulsar_arm/tests/            parity tests (Pi-side, need torch + HF cache)
 doc/                         demo GIFs and write-ups
 ```
