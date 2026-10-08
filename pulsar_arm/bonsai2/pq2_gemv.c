@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <arm_neon.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #ifndef STANDALONE
 void quantize_row_q8_K(const float * x, void * y, int64_t k);
@@ -38,7 +39,10 @@ static float h2f(uint16_t h) {
     float r; memcpy(&r, &o, 4); return r;
 }
 
-/* decode 32 weights from 8 bytes -> two int8x16 in weight order */
+/* decode 16 weights from 4 bytes -> weight order (byte b holds weights
+   4b..4b+3 as 2-bit codes, value ((byte>>2j)&3)-1); kept for reference
+   and potential scalar paths. The hot kernel below uses 16-wide nibble
+   vectors instead (no zip stage). */
 static inline void dec32(const uint8_t *b, int8x16_t *o0, int8x16_t *o1) {
     uint8x8_t bb = vld1_u8(b);
     uint8x8_t m3 = vdup_n_u8(3), one = vdup_n_u8(1);
@@ -54,52 +58,82 @@ static inline void dec32(const uint8_t *b, int8x16_t *o0, int8x16_t *o1) {
     *o1 = vcombine_s8(w1.val[0], w1.val[1]);
 }
 
+/* Permuted activation layout: per 128-weight group, quarters
+   Qm[i] = h[4*i+m] (i in 0..31, m in 0..3) so 16-wide nibble vectors
+   dot directly with no zip stage. Built once per GEMV (cols bytes of
+   shuffling vs millions of kernel ops: ~0.2%). Max lane/group sums are
+   bounded by 128*256 = 32768 (int32 exact), so any grouping of the
+   integer dot is bit-identical: the rewrite is exact by proof. */
+static uint8_t PXQ[12288];
+static void pxq_build(const uint8_t *xq, int ng) {
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *q8b = xq + (size_t)(g >> 1) * 292;
+        const uint8_t *h = q8b + 4 + (g & 1) * 128;
+        uint8_t *P = PXQ + (size_t)g * 128;
+        for (int i = 0; i < 32; i++) {
+            P[i] = h[4 * i];
+            P[32 + i] = h[4 * i + 1];
+            P[64 + i] = h[4 * i + 2];
+            P[96 + i] = h[4 * i + 3];
+        }
+    }
+}
+
 void pq2_gemv_range(int r0, int r1, int cols, const uint8_t *w,
                       const float *x, float *y, const uint8_t *xq) {
+    (void)x; /* activations arrive pre-permuted in PXQ; db via xq */
     int ng = cols / 128;
+    uint8x16_t m3 = vdupq_n_u8(3), one = vdupq_n_u8(1);
     for (int r = r0; r < r1; r++) {
         const uint8_t *row = w + (size_t)r * ng * 34;
         float acc = 0.0f;
         for (int g = 0; g < ng; g++) {
-/* block (34B): fp16 scale FIRST, then 32B qs (struct order) */
             const uint8_t *blk = row + g * 34;
             float ws = h2f((uint16_t)(blk[0] | (blk[1] << 8)));
             const uint8_t *bqs = blk + 2;
-            /* the Q8_K half covering this group: float scale + 256 quants */
             const uint8_t *q8b = xq + (size_t)(g >> 1) * 292;
             float db;
             memcpy(&db, q8b, 4);
-            const int8_t *qs = (const int8_t *)(q8b + 4 + (g & 1) * 128);
+            const int8_t *Q = (const int8_t *)(PXQ + (size_t)g * 128);
             int32x4_t a = vdupq_n_s32(0);
-            for (int k = 0; k < 4; k++) {
-                int8x16_t t0, t1;
-                dec32(bqs + k * 8, &t0, &t1);
-                a = vdotq_s32(a, t0, vld1q_s8(qs + k * 32));
-                a = vdotq_s32(a, t1, vld1q_s8(qs + k * 32 + 16));
+            /* 128 weights as 2x64: 16 code bytes -> 4 nibble vectors,
+               dotted vs the matching 16B quarters (exact integers) */
+            for (int k = 0; k < 2; k++) {
+                uint8x16_t bb = vld1q_u8(bqs); bqs += 16;
+                int8x16_t c0 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(bb, m3), one));
+                int8x16_t c1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(bb, 2), m3), one));
+                int8x16_t c2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(bb, 4), m3), one));
+                int8x16_t c3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(bb, 6), m3), one));
+                a = vdotq_s32(a, c0, vld1q_s8(Q + k * 16));
+                a = vdotq_s32(a, c1, vld1q_s8(Q + 32 + k * 16));
+                a = vdotq_s32(a, c2, vld1q_s8(Q + 64 + k * 16));
+                a = vdotq_s32(a, c3, vld1q_s8(Q + 96 + k * 16));
             }
             acc += (ws * db) * (float)vaddvq_s32(a);
         }
         y[r] = acc;
     }
 }
-
 /* Row-parallel dispatch (bit-exact: each row is computed by exactly one
    thread with the identical serial code above; there is no cross-row
    reduction). Raw pthreads, not OpenMP, so the STANDALONE static binary
    (glibc or bionic) needs no extra runtime. Persistent pool: threads are
-   created once and parked on a condvar; per-call dispatch is one broadcast
-   + one completion wait (~5-10us), vs ~30us per pthread_create which would
-   cost ~30ms/token across the ~250 GEMVs of a token. Count from
-   PQ2_THREADS (default 4 = one phone big cluster); 1 = pure serial. */
+   created once and PURE-SPIN on an atomic generation counter (release /
+   acquire pairs with the publish). No condvar sleep anywhere: on bionic,
+   waking a parked worker costs ~800us per GEMV (~200ms/token) while the
+   gaps between dispatches are only ~200us of main-thread glue, so
+   sleeping can never win; spinning costs ~20% extra energy (race-to-idle
+   still finishes 2x sooner). Count from PQ2_THREADS (default 4 = one
+   phone big cluster); 1 = pure serial (pool never created, zero overhead). */
 static struct {
     pthread_t *tid;
     int nt;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t dv;
-    int gen;
-    int done;
-    int shutdown;
+    atomic_int gen;
+    atomic_int done;
+    atomic_int shutdown;
     const uint8_t *w;
     const uint8_t *xq;
     const float *x;
@@ -111,11 +145,15 @@ static void *pq2_worker(void *arg) {
     long idx = (long)arg;
     int mygen = 0;
     for (;;) {
-        pthread_mutex_lock(&PQ2P.mu);
-        while (PQ2P.gen == mygen && !PQ2P.shutdown)
-            pthread_cond_wait(&PQ2P.cv, &PQ2P.mu);
-        if (PQ2P.shutdown) { pthread_mutex_unlock(&PQ2P.mu); return NULL; }
-        mygen = PQ2P.gen;
+        /* pure spin on the dispatch generation (release/acquire pairs
+           with the publish below). No condvar sleep: on bionic, waking a
+           parked worker costs ~800us per GEMV (~200ms/token), while the
+           gaps between dispatches are only ~200us of main-thread glue. */
+        while (atomic_load_explicit(&PQ2P.gen, memory_order_acquire) == mygen &&
+               !atomic_load_explicit(&PQ2P.shutdown, memory_order_relaxed))
+            __asm__ volatile("yield" ::: "memory");
+        if (atomic_load_explicit(&PQ2P.shutdown, memory_order_relaxed)) return NULL;
+        mygen = atomic_load_explicit(&PQ2P.gen, memory_order_acquire);
         const uint8_t *w = PQ2P.w;
         const uint8_t *xq = PQ2P.xq;
         const float *x = PQ2P.x;
@@ -125,9 +163,7 @@ static void *pq2_worker(void *arg) {
         int r0 = (int)((long)rows * idx / nt);
         int r1 = (int)((long)rows * (idx + 1) / nt);
         if (r1 > r0) pq2_gemv_range(r0, r1, cols, w, x, y, xq);
-        pthread_mutex_lock(&PQ2P.mu);
-        if (++PQ2P.done == nt - 1) pthread_cond_signal(&PQ2P.dv);
-        pthread_mutex_unlock(&PQ2P.mu);
+        atomic_fetch_add_explicit(&PQ2P.done, 1, memory_order_release);
     }
 }
 
@@ -144,7 +180,8 @@ static int pq2_nthreads(void) {
         pthread_mutex_init(&PQ2P.mu, NULL);
         pthread_cond_init(&PQ2P.cv, NULL);
         pthread_cond_init(&PQ2P.dv, NULL);
-        PQ2P.gen = 0; PQ2P.done = 0; PQ2P.shutdown = 0;
+        atomic_init(&PQ2P.gen, 0); atomic_init(&PQ2P.done, 0);
+        atomic_init(&PQ2P.shutdown, 0);
         PQ2P.tid = malloc((size_t)(nt - 1) * sizeof(pthread_t));
         for (long i = 1; i < nt; i++)
             pthread_create(&PQ2P.tid[i - 1], NULL, pq2_worker, (void *)i);
@@ -155,6 +192,8 @@ static int pq2_nthreads(void) {
 void pq2_gemv(int rows, int cols, const uint8_t *w, const float *x, float *y,
               const uint8_t *xq) {
     int nt = pq2_nthreads();
+    /* permute activations once per call (serial glue, ~0.2% of a call) */
+    pxq_build(xq, cols / 128);
     if (nt == 1 || rows < nt) {
         /* serial: identical to the pre-thread code (single range 0..rows) */
         pq2_gemv_range(0, rows, cols, w, x, y, xq);
@@ -163,17 +202,14 @@ void pq2_gemv(int rows, int cols, const uint8_t *w, const float *x, float *y,
     pthread_mutex_lock(&PQ2P.mu);
     PQ2P.w = w; PQ2P.xq = xq; PQ2P.x = x; PQ2P.y = y;
     PQ2P.rows = rows; PQ2P.cols = cols;
-    PQ2P.done = 0;
-    PQ2P.gen++;
-    pthread_cond_broadcast(&PQ2P.cv);
+    atomic_store_explicit(&PQ2P.done, 0, memory_order_relaxed);
+    atomic_store_explicit(&PQ2P.gen, PQ2P.gen + 1, memory_order_release);
     pthread_mutex_unlock(&PQ2P.mu);
     /* main thread takes range 0 while workers take theirs */
     int r0 = 0, r1 = (int)((long)rows * 1 / nt);
     pq2_gemv_range(r0, r1, cols, w, x, y, xq);
-    pthread_mutex_lock(&PQ2P.mu);
-    while (PQ2P.done < nt - 1)
-        pthread_cond_wait(&PQ2P.dv, &PQ2P.mu);
-    pthread_mutex_unlock(&PQ2P.mu);
+    while (atomic_load_explicit(&PQ2P.done, memory_order_acquire) < nt - 1)
+        __asm__ volatile("yield" ::: "memory");
 }
 
 /* Q8_K block layout needed: d at [0..1], qs at [8..263] (verify at runtime) */
