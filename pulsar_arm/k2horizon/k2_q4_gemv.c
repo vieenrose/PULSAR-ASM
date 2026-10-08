@@ -74,6 +74,10 @@ void k2q4_gemv_range(int r0, int r1, int cols, const uint8_t *w,
     int nb = cols / 32;
     uint8x16_t m15 = vdupq_n_u8(15);
     int8x16_t eight = vdupq_n_s8(8);
+    /* Row-parallel: rows are independent and each row's block order is
+       unchanged, so the integer path stays bit-exact at any thread count
+       (the bonsai pq2 lesson). */
+    #pragma omp parallel for schedule(static) shared(m15, eight)
     for (int r = r0; r < r1; r++) {
         const uint8_t *row = w + (size_t)r * nb * 18;
         float acc = 0.0f;

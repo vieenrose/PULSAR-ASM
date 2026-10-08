@@ -166,36 +166,39 @@ a longer four-section list (4.0 tok/s) — each checkpoint's seeded sample
 at its usual sampling, phone-shot for the 8B.
 
 **K2-Horizon-0.9B** — 0.9B dense decoder (IFM, Llama arch), plain RMS norms,
-YaRN rope, vocab 64256. The base clip is the native engine
-(`pulsar_arm/k2horizon/`, Q4 path, Spark CPU-only, serial reference): the
-ceiling prompt is the two-sentence neural explainer (greedy) — seasons
-loops and haiku rambles under greedy, so they don't qualify. 23.3 tok/s.
+YaRN rope, vocab 64256. Both clips are the pure-assembly engine
+(`pulsar_arm/k2horizon/k2_core.S`: `as` + `ld -static`, no libc, syscalls
+only, glibc-bit-identical `expf`/`%.4f`) on the phone's big cores, greedy,
+4-thread decode + 8-token prefill chunks. The base clip's ceiling prompt is
+the two-sentence neural explainer — seasons loops and haiku rambles under
+greedy, so they don't qualify. 13 tok/s.
 
 ![K2-Horizon chat demo](doc/k2horizon-chat-en.gif)
 
 ```sh
-./fwd_k2q k2h_09_q4.blob 64018 2985 ... --gen 400  # greedy, reproducible exactly
+adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 ... --gen 400 --threads 4 --batch 8"
 ```
 
 **K2-Horizon meeting agent (zh-TW)** — the same 0.9B fine-tuned for live
-meeting reading (NOTE/REVISE/NEXT protocol), run here as the published
-LiteRT-LM int4 file through stock TFLite signatures (prefill_128+decode),
-temp 0.2, seed 7. The clip shows the full 6-turn input window verbatim
-so every NOTE/NEXT can be checked line-by-line — all five notes cite
-genuine timestamps and the harness stops the turn at NEXT. 5.5 tok/s.
-The base model given the same window deliberates 150 tokens without
-emitting one NOTE — that behavioral gap is what the fine-tune buys.
+meeting reading (NOTE/REVISE/NEXT protocol), converted from the published
+int4-QAT safetensors to our own Q4 blob and run on the same pure-asm
+engine (greedy, so the clip is exactly reproducible). The clip shows the
+full 6-turn input window verbatim so every NOTE/NEXT can be checked
+line-by-line — all five notes cite genuine timestamps and the harness
+stops the turn at NEXT. 3.2 tok/s (680-token prefill dominates: 8-token
+chunks + 4 threads cut it 2.6x). The base model given the same window
+deliberates 150 tokens without emitting one NOTE — that behavioral gap is
+what the fine-tune buys.
 
 ![K2-Horizon meeting demo](doc/k2horizon-meeting-zh-tw.gif)
 
 ```sh
-python k2_lite_driver.py prompt_ft.txt --gen 400 --temp 0.2 --seed 7 --tok ./tokenizer
+adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob $(cat ft_ids680.txt) --gen 400 --threads 4 --batch 8"
 ```
 
-Both K2 clips are real run bytes (the meeting clip keeps the model's
-opening wobble and cuts at NEXT, exactly as the eval harness does; seeds
-8 and 9 were also sampled — 8 drops the proposal, 9 ties 7) and re-render
-with the same `make_chat_gif.py` command.
+Both K2 clips are real phone bytes and re-render with the same
+`make_chat_gif.py` command. The same blobs on Spark are bit-identical to
+the scalar C reference (`neural2.txt`), including the logits.
 
 **gemma-3-1b-it** — each clip uses the most complex prompt the checkpoint
 answers *correctly* (a four-item structured list, and a three-item one in
