@@ -1,0 +1,13 @@
+The user provided a set of notes in a specific format, likely for a meeting. The task is to process these notes according to the rules given in the system prompt.
+
+ Rules:
+- Each note max 5 lines.
+- Each line max 40 characters.
+- No original text without explanation.
+- No proposals without decision.
+- No open issues without decision.
+- Only important content.
+
+The provided notes:
+S1 [1:02:15] 各位,資訊系統預算總共編列 1200 萬元,較去年增加 300 萬,請大家確認。
+S2 [1:03:02] 我建議改用線上報名,可以減少現

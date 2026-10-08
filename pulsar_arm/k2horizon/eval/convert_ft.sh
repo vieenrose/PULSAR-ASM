@@ -19,6 +19,6 @@ python3 -c "
 import struct
 h = struct.unpack('<4s9I', open('k2h_ft_q4.blob','rb').read(40))
 print('nl,hid,inter,nhead,nkv,hdim,vocab,wtype,npos =', h[1:])
-assert h[7] == 2 and h[8] == 1536 and h[6] == 69312, 'header mismatch'
+assert h[8] == 2 and h[9] == 1536 and h[7] == 69312, 'header mismatch'
 print('header OK')
 "
