@@ -25,7 +25,7 @@
 
 /* ---------------- syscalls ---------------- */
     .equ SYS_WRITE, 64
-    .equ SYS_EXIT, 93
+    .equ SYS_EXIT, 94            /* exit_group: kill spinning workers too */
     .equ SYS_OPENAT, 56
     .equ SYS_LSEEK, 62
     .equ SYS_MMAP, 222
@@ -627,7 +627,7 @@ blob_load:
     mov w0, #'\n'
     bl print_ch
     mov x0, #1
-    mov x8, #93
+    mov x8, #SYS_EXIT
     svc #0
 
 
@@ -702,7 +702,7 @@ gemvW:
     mov x5, x21
     adrp x6, b_XQQ
     add x6, x6, :lo12:b_XQQ
-    bl k2q4_gemv_range
+    bl q4_gemv_dispatch
     ldp x19, x20, [sp, #16]
     ldp x21, x22, [sp, #32]
     ldp x23, x24, [sp, #48]
@@ -1304,6 +1304,156 @@ sample_topkpp:
     ldp x29, x30, [sp], #80
     ret
 
+/* ---------------- pure-spin thread pool (row-parallel Q4 GEMV) ------------
+ * pq2 lesson: never sleep. Workers spin on an acquire-loaded generation
+ * counter; row slices are disjoint, so results are bit-exact at any thread
+ * count. clone(CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM) with .bss stacks.
+ * w0 = nthreads (1..8); call once after arg parsing. */
+    .align 2
+pool_init:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    adrp x1, g_nthreads
+    str w0, [x1, :lo12:g_nthreads]
+    mov w19, #1
+.Lpool_spawn:
+    adrp x1, g_nthreads
+    ldr w20, [x1, :lo12:g_nthreads]
+    cmp w19, w20
+    b.ge .Lpool_done
+    adrp x1, b_stacks
+    add x1, x1, :lo12:b_stacks
+    mov x2, #65536
+    madd x1, x19, x2, x1
+    add x1, x1, x2
+    sub x1, x1, #16
+    mov w0, #0x0f00                 /* CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM */
+    movk w0, #0x5, lsl #16          /* = 0x00050f00 */
+    mov x2, #0
+    mov x3, #0
+    mov x4, #0
+    mov x8, #220
+    svc #0
+    cbz x0, worker_loop             /* child: x0 == 0 */
+    add w19, w19, #1
+    b .Lpool_spawn
+.Lpool_done:
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+
+worker_loop:
+    /* worker id derived from own stack address: (sp+16)/65536 - 1 - base */
+    adrp x1, b_stacks
+    add x1, x1, :lo12:b_stacks
+    sub x2, sp, x1
+    add x2, x2, #16
+    lsr x2, x2, #16
+    sub w19, w2, #1                 /* id 1..N-1 */
+    mov w20, #0                     /* last seen gen */
+.Lw_spin:
+    adrp x2, g_gen
+    add x2, x2, :lo12:g_gen
+    ldar w2, [x2]
+    cmp w2, w20
+    b.eq .Lw_idle
+    mov w20, w2
+    adrp x1, g_nthreads
+    ldr w1, [x1, :lo12:g_nthreads]
+    adrp x2, g_task_r0
+    ldr w2, [x2, :lo12:g_task_r0]
+    adrp x3, g_task_r1
+    ldr w3, [x3, :lo12:g_task_r1]
+    sub w4, w3, w2
+    add w4, w4, w1
+    sub w4, w4, #1
+    udiv w4, w4, w1                  /* chunk = ceil(rows/N) */
+    madd w12, w19, w4, w2            /* my r0 (w12/w13: NOT arg regs x5/x6!) */
+    cmp w12, w3
+    b.ge .Lw_done                    /* empty slice */
+    add w13, w12, w4
+    cmp w13, w3
+    csel w13, w13, w3, lt            /* my r1 */
+    adrp x7, g_task_cols
+    ldr w2, [x7, :lo12:g_task_cols]
+    adrp x7, g_task_w
+    ldr x3, [x7, :lo12:g_task_w]
+    adrp x7, g_task_x
+    ldr x4, [x7, :lo12:g_task_x]
+    adrp x7, g_task_y
+    ldr x5, [x7, :lo12:g_task_y]
+    adrp x7, g_task_xq
+    ldr x6, [x7, :lo12:g_task_xq]
+    mov w0, w12
+    mov w1, w13
+    bl k2q4_gemv_range
+.Lw_done:
+    adrp x1, g_done
+    add x1, x1, :lo12:g_done
+1:  ldxr w2, [x1]
+    add w2, w2, #1
+    stlxr w3, w2, [x1]              /* RELEASE: y[] stores visible before done */
+    cbnz w3, 1b
+    b .Lw_spin
+.Lw_idle:
+    yield
+    b .Lw_spin
+
+/* q4_gemv_dispatch: same args as k2q4_gemv_range. Serial when nthreads==1
+ * (bit-identical); otherwise publish + gen++ (release) + own slice + wait. */
+    .align 2
+q4_gemv_dispatch:
+    adrp x9, g_nthreads
+    ldr w9, [x9, :lo12:g_nthreads]
+    cmp w9, #1
+    b.gt .Lq4d_par
+    b k2q4_gemv_range               /* serial tail-call */
+.Lq4d_par:
+    str x30, [sp, #-16]!            /* bl below clobbers lr; ret must return to caller */
+    adrp x10, g_task_r0
+    str w0, [x10, :lo12:g_task_r0]
+    adrp x10, g_task_r1
+    str w1, [x10, :lo12:g_task_r1]
+    adrp x10, g_task_cols
+    str w2, [x10, :lo12:g_task_cols]
+    adrp x10, g_task_w
+    str x3, [x10, :lo12:g_task_w]
+    adrp x10, g_task_x
+    str x4, [x10, :lo12:g_task_x]
+    adrp x10, g_task_y
+    str x5, [x10, :lo12:g_task_y]
+    adrp x10, g_task_xq
+    str x6, [x10, :lo12:g_task_xq]
+    adrp x10, g_done
+    str wzr, [x10, :lo12:g_done]
+    adrp x10, g_gen
+    add x10, x10, :lo12:g_gen
+    ldr w11, [x10]
+    add w11, w11, #1
+    stlr w11, [x10]                 /* release: task fields visible */
+    /* main takes slice 0 (x12/x13 scratch: x6 IS the xq argument!) */
+    sub w12, w1, w0
+    add w12, w12, w9
+    sub w12, w12, #1
+    udiv w12, w12, w9
+    add w13, w0, w12
+    cmp w13, w1
+    csel w13, w13, w1, lt
+    mov w1, w13
+    bl k2q4_gemv_range
+    /* wait for N-1 workers */
+    adrp x10, g_nthreads
+    ldr w9, [x10, :lo12:g_nthreads]
+    sub w9, w9, #1
+    adrp x10, g_done
+    add x10, x10, :lo12:g_done
+2:  ldar w11, [x10]
+    cmp w11, w9
+    b.lt 2b
+    ldr x30, [sp], #16
+    ret
+
 /* ---------------- .data ---------------- */
     .data
     .align 3
@@ -1364,6 +1514,7 @@ s_top:          .asciz " top="
 s_logit:        .asciz " logit="
 s_gen:          .asciz "--gen"
 s_sample:       .asciz "--sample"
+s_threads:      .asciz "--threads"
 s_nan:          .asciz "nan"
 s_inf:          .asciz "inf"
 s_ninf:         .asciz "-inf"
@@ -1416,6 +1567,19 @@ g_stopp:        .skip 4
 g_stemp:        .skip 4
 g_sminp:        .skip 4
 g_stopk:        .skip 4
+g_nthreads:     .skip 4
+g_gen:          .skip 4
+g_done:         .skip 4
+g_task_r0:      .skip 4
+g_task_r1:      .skip 4
+g_task_cols:    .skip 4
+    .align 3
+g_task_w:       .skip 8
+g_task_x:       .skip 8
+g_task_y:       .skip 8
+g_task_xq:      .skip 8
+    .align 6
+b_stacks:       .skip 524288            /* 8 worker stacks x 64 KiB */
     .align 12
 b_KCAbuf:       .skip 88080384            /* 28*1536*512 f32 */
 b_VCAbuf:       .skip 88080384
@@ -1561,6 +1725,11 @@ main:
     add x1, x1, :lo12:s_sample
     bl str_is
     cbnz w0, .Larg_sample
+    ldr x0, [x20, x21, lsl #3]
+    adrp x1, s_threads
+    add x1, x1, :lo12:s_threads
+    bl str_is
+    cbnz w0, .Larg_threads
     /* plain token -> id */
     ldr x0, [x20, x21, lsl #3]
     bl parse_i64
@@ -1622,6 +1791,21 @@ main:
 7:  add x21, x21, #1
 .Lsample_done:
     b .Lparse
+.Larg_threads:
+    add x21, x21, #1
+    cmp x21, x19
+    b.hs .Lusage
+    ldr x0, [x20, x21, lsl #3]
+    bl parse_i64
+    cmp w0, #1
+    b.lt .Lusage
+    cmp w0, #8
+    b.le 1f
+    mov w0, #8
+1:  adrp x2, g_nthreads
+    str w0, [x2, :lo12:g_nthreads]
+    add x21, x21, #1
+    b .Lparse
 .Lparsedone:
     cmp w22, #0
     b.eq .Lusage                     /* need at least one prompt id */
@@ -1629,6 +1813,12 @@ main:
     add x28, x24, x23                /* n0 + gen bound */
     adrp x1, g_pos
     str xzr, [x1, :lo12:g_pos]
+    /* thread pool (default 1 -> serial, bit-identical) */
+    adrp x1, g_nthreads
+    ldr w0, [x1, :lo12:g_nthreads]
+    cbnz w0, 1f
+    mov w0, #1
+1:  bl pool_init
     mov x25, xzr                     /* step */
 .Lloop:
     /* --- choose id --- */
@@ -1710,7 +1900,7 @@ main:
     add x5, x5, :lo12:b_HEAD
     adrp x6, b_XQQ
     add x6, x6, :lo12:b_XQQ
-    bl k2q4_gemv_range
+    bl q4_gemv_dispatch
     adrp x0, b_HEAD
     add x0, x0, :lo12:b_HEAD
     adrp x1, g_vocab
@@ -1769,5 +1959,5 @@ _start:
     mov x1, sp                       /* argc/argv block */
     bl main
     mov x0, #0
-    mov x8, #93                      /* SYS_EXIT */
+    mov x8, #SYS_EXIT                /* exit_group */
     svc #0
