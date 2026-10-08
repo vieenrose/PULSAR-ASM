@@ -1,0 +1,1773 @@
+/* PULSAR-ASM | pulsar_arm/k2horizon/k2_core.S
+ *
+ * Pure AArch64 assembly runtime for IFM K2-Horizon-0.9B (Q4 blobs).
+ * No C, no libc: `as` + `ld -static`, entry _start, svc syscalls only.
+ * Replaces fwd_k2.c (base) and the Python+TFLite driver (meeting FT).
+ *
+ * Bit-exactness contract vs fwd_k2q (gcc -O2 -march=armv8.2-a+dotprod+fp16):
+ *  - expf: bit-identical mirror of glibc 2.39 __expf_finite (fast poly +
+ *    table @ libm 0x7a5f0, threshold specials from probe).
+ *  - rms: f64 fmadd accumulate, fsqrt, y=(1/sqrt)*x*w (two fmul).
+ *  - Q4 GEMV: fmul(ws*db) + fmadd(acc, ...) per block, SDOT lanes.
+ *  - rope: fmul(b,S) / fnmsub(C,a,t) and fmul(b,C) / fmadd(S,a,t).
+ *  - attention: scalar fmul+fadd dot in element order, f64 expf sum,
+ *    f32 p = expf/(f32)es, fmla V-accum, strict-> max.
+ *  - SwiGLU: fneg -> expf -> fadd 1 -> fdiv g/.. -> fmul LU.
+ *  - printf: "step %d id_in=%d top=%d logit=%.4f\n" with glibc-correct
+ *    %.4f (f64 x10000 exact + frintn ties-even + signbit).
+ * Run: ./k2_core <blob> <ids...> --gen G [--sample temp topp topk seed [minp]]
+ */
+    .arch armv8.2-a
+    .arch_extension dotprod
+    .text
+    .align 2
+    .global _start
+
+/* ---------------- syscalls ---------------- */
+    .equ SYS_WRITE, 64
+    .equ SYS_EXIT, 93
+    .equ SYS_OPENAT, 56
+    .equ SYS_LSEEK, 62
+    .equ SYS_MMAP, 222
+    .equ SYS_CLOSE, 57
+
+/* ---------------- tiny print helpers (x9-x18 scratch) ---------------- */
+
+/* print_cstr: x0 = asciz address. Clobbers x0-x2,x8,x9. */
+print_cstr:
+    mov x9, x0
+0:  ldrb w1, [x9], #1
+    cbnz w1, 0b
+    sub x2, x9, x0
+    sub x2, x2, #1
+    mov x1, x0
+    mov x0, #1
+    mov x8, #SYS_WRITE
+    svc #0
+    ret
+
+/* print_u64: x0 = value. Clobbers x0-x4,x8,x9. */
+print_u64:
+    adrp x9, numbuf
+    add x9, x9, :lo12:numbuf
+    add x9, x9, #64
+    cbnz x0, 1f
+    sub x9, x9, #1
+    mov w2, #'0'
+    strb w2, [x9]
+    b 2f
+1:  mov x1, #10
+    udiv x2, x0, x1
+    msub x3, x2, x1, x0
+    add w3, w3, #'0'
+    sub x9, x9, #1
+    strb w3, [x9]
+    mov x0, x2
+    cbnz x0, 1b
+2:  adrp x1, numbuf
+    add x1, x1, :lo12:numbuf
+    add x1, x1, #64
+    sub x2, x1, x9
+    mov x1, x9
+    mov x0, #1
+    mov x8, #SYS_WRITE
+    svc #0
+    ret
+
+/* print_ch: w0 = char. */
+print_ch:
+    adrp x9, numbuf
+    add x9, x9, :lo12:numbuf
+    strb w0, [x9]
+    mov x1, x9
+    mov x2, #1
+    mov x0, #1
+    mov x8, #SYS_WRITE
+    svc #0
+    ret
+
+/* print_f32_4: s0 = value -> glibc-style "%.4f" text.
+ * Exact path: (f64)v * 10000 is exact for f32 inputs; frintn = ties-to-even
+ * (glibc %.4f confirmed ties-to-even on the dyadic k/32 grid by probe).
+ * Non-finite -> "nan"/"inf"/"-inf" like glibc. Clobbers x0-x4,x9,d0-d3. */
+print_f32_4:
+    str x30, [sp, #-16]!
+    fcmp s0, s0
+    b.vs .Lpf_nan
+    adrp x9, f_inf32
+    ldr s1, [x9, :lo12:f_inf32]
+    fcmp s0, s1
+    b.eq .Lpf_inf
+    fneg s1, s1
+    fcmp s0, s1
+    b.eq .Lpf_ninf
+    fmov w2, s0
+    tst w2, #0x80000000
+    b.eq 0f
+    mov w0, #'-'
+    bl print_ch
+    and w2, w2, #0x7fffffff
+    fmov s0, w2
+0:  fcvt d1, s0                 /* exact */
+    adrp x9, f_tenthousand
+    ldr d2, [x9, :lo12:f_tenthousand]
+    fmul d1, d1, d2             /* exact (f32 24-bit mantissa) */
+    frintn d1, d1               /* ties-to-even = glibc correct rounding */
+    fcvtzs x3, d1               /* n: KEEP in x3 across print calls */
+    mov x1, #10000
+    udiv x0, x3, x1
+    str x3, [sp, #8]
+    bl print_u64
+    ldr x3, [sp, #8]
+    mov w0, #'.'
+    bl print_ch
+    ldr x3, [sp, #8]
+    mov x1, #10000
+    udiv x2, x3, x1
+    msub x4, x2, x1, x3         /* frac */
+    mov x1, #1000
+    udiv x0, x4, x1             /* d3 */
+    add w0, w0, #'0'
+    str x4, [sp, #8]
+    bl print_ch
+    ldr x4, [sp, #8]
+    mov x1, #100
+    udiv x2, x4, x1             /* frac/100 */
+    mov x1, #10
+    udiv x0, x2, x1
+    msub x0, x0, x1, x2         /* (frac/100)%10 */
+    add w0, w0, #'0'
+    bl print_ch
+    ldr x4, [sp, #8]
+    mov x1, #10
+    udiv x2, x4, x1             /* frac/10 */
+    mov x1, #10
+    udiv x0, x2, x1
+    msub x0, x0, x1, x2         /* (frac/10)%10 */
+    add w0, w0, #'0'
+    bl print_ch
+    ldr x4, [sp, #8]
+    mov x1, #10
+    udiv x2, x4, x1
+    msub x0, x2, x1, x4         /* frac%10 */
+    add w0, w0, #'0'
+    bl print_ch
+    ldr x30, [sp], #16
+    ret
+.Lpf_nan:
+    adrp x0, s_nan
+    add x0, x0, :lo12:s_nan
+    ldr x30, [sp], #16
+    b print_cstr
+.Lpf_inf:
+    adrp x0, s_inf
+    add x0, x0, :lo12:s_inf
+    ldr x30, [sp], #16
+    b print_cstr
+.Lpf_ninf:
+    adrp x0, s_ninf
+    add x0, x0, :lo12:s_ninf
+    ldr x30, [sp], #16
+    b print_cstr
+
+/* print_nl: */
+print_nl:
+    mov w0, #'\n'
+    b print_ch
+
+/* ---------------- expf: glibc 2.39 __expf_finite mirror (s0 -> s0) ----------
+ * Fast path: d = xd*INV32LN2; n=frinta/fcvtas(d); r=d-n;
+ *   p = 1 + c1*r + (c2 + c3*r)*r*r  (c1..c3 from libm @+320,+312,+304)
+ *   scale bits = table[n&31] + (n<<47); s0 = (f32)(p * bits)
+ * Thresholds (probe-verified): x > 88.72289f -> +inf;
+ *   x < -103.97208f -> +0; [-103.97208, -103.49402) -> min subnormal;
+ *   -inf -> +0; NaN/inf -> s0+s0.
+ * Clobbers x0-x4, d0-d5, s0-s5. */
+    .align 2
+expf:
+    fmov w0, s0                     /* bits */
+    fcvt d1, s0
+    ubfx x1, x0, #20, #11
+    cmp w1, #0x42a
+    b.hi .Lexp_slow
+.Lexp_fast:
+    adrp x0, k_exp_table
+    add x0, x0, :lo12:k_exp_table
+    fmov d0, #1.0
+    ldr d3, [x0, #296]              /* 46.166241308446828 = 32/ln2 */
+    ldr d4, [x0, #304]              /* c3 */
+    ldr d2, [x0, #312]              /* c2 */
+    fmul d1, d1, d3
+    ldr d3, [x0, #320]              /* c1 */
+    frinta d5, d1
+    fcvtas x1, d1
+    fsub d1, d1, d5                 /* r */
+    and x2, x1, #0x1f
+    fmadd d2, d4, d1, d2            /* c3*r + c2 */
+    fmadd d0, d3, d1, d0            /* c1*r + 1 */
+    fmul d1, d1, d1                 /* r*r */
+    ldr x0, [x0, x2, lsl #3]
+    add x1, x0, x1, lsl #47
+    fmadd d0, d2, d1, d0            /* poly */
+    fmov d1, x1                     /* scale bits */
+    fmul d0, d0, d1
+    fcvt s0, d0
+    ret
+.Lexp_slow:
+    mov w2, #0xff80
+    lsl w2, w2, #16                 /* -inf bits */
+    cmp w0, w2
+    b.eq .Lexp_ninf
+    cmp w1, #0x7f7
+    b.hi .Lexp_naninf               /* NaN/+inf -> s0+s0 */
+    mov w2, #0x7217
+    movk w2, #0x42b1, lsl #16       /* 88.72289f */
+    fmov s2, w2
+    fcmp s0, s2
+    b.gt .Lexp_inf
+    mov w2, #0xf1b4
+    movk w2, #0xc2cf, lsl #16       /* -103.97208f */
+    fmov s2, w2
+    fcmp s0, s2
+    b.lt .Lexp_zero
+    mov w2, #0x8ecf
+    movk w2, #0xc2ce, lsl #16       /* -103.49402f */
+    fmov s2, w2
+    fcmp s0, s2
+    b.lt .Lexp_minsub
+    b .Lexp_fast
+.Lexp_ninf:
+    fmov s0, wzr
+    ret
+.Lexp_naninf:
+    fadd s0, s0, s0
+    ret
+.Lexp_inf:
+    mov w0, #0x7f80
+    lsl w0, w0, #16
+    fmov s0, w0
+    ret
+.Lexp_zero:
+    fmov s0, wzr
+    ret
+.Lexp_minsub:
+    mov w0, #1
+    fmov s0, w0
+    ret
+
+/* ---------------- h2f: fp16 bits (w0) -> f32 (s0). Mirrors fwd_k2.c h2f.
+ * e==0,m==0 -> +0.0 (sign dropped, as C does); e==0,m -> m*2^-24 | s;
+ * e==31 -> inf/nan bits; else biased-exponent rebuild. Clobbers w1-w4,s1. */
+    .align 2
+h2f:
+    and w1, w0, #0x3ff             /* m */
+    ubfx w2, w0, #10, #5           /* e */
+    and w3, w0, #0x8000            /* isolate sign FIRST (C: (h & 0x8000) << 16) */
+    lsl w3, w3, #16                /* sign -> bit31 */
+    cbnz w2, 1f
+    cbz w1, 0f                     /* e==0 m==0 -> +0.0 */
+    ucvtf s0, w1
+    mov w4, #0x33800000            /* 2^-24 */
+    fmov s1, w4
+    fmul s0, s0, s1
+    fmov w4, s0
+    orr w4, w4, w3
+    fmov s0, w4
+    ret
+0:  fmov s0, wzr
+    ret
+1:  cmp w2, #31
+    b.ne 2f
+    mov w4, #0x7f80
+    lsl w4, w4, #16                /* 0x7f800000 */
+    orr w4, w4, w3
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s0, w4
+    ret
+2:  add w2, w2, #112
+    lsl w2, w2, #23
+    orr w4, w3, w2
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s0, w4
+    ret
+
+/* ---------------- k2_q8_quant: x0=float*, x1=dst, x2=k (elems, /256).
+ * Mirrors fwd_k2.c: per 256-block max-scan, iscale=-127/max, magic
+ * nearest_int (+12582912.f bit trick), clamp <127, d=1/iscale at yb[0..4),
+ * qs at yb+4. bsums SKIPPED (never read by k2q4_gemv_range; 292-stride kept).
+ * Clobbers x0-x7, w0-w7, s0-s5. */
+    .align 2
+k2_q8_quant:
+    cbz x2, 9f
+    mov x3, #0                      /* block index */
+    lsr x8, x2, #8                  /* nb = k/256 (x2 gets clobbered below!) */
+    mov x7, #292
+0:  /* max scan over 256 */
+    mov x4, #0                      /* j */
+    fmov s2, wzr                    /* amax */
+    fmov s3, wzr                    /* max */
+1:  ldr s0, [x0, x4, lsl #2]
+    fabs s1, s0
+    fcmp s1, s2
+    b.ls 2f
+    fmov s2, s1
+    fmov s3, s0
+2:  add x4, x4, #1
+    cmp x4, #256
+    b.ne 1b
+    /* yb = x1 + block*292 */
+    madd x5, x3, x7, x1             /* yb */
+    fcmp s2, #0.0
+    b.ne 3f
+    /* zero block: d=0, qs=0 */
+    str wzr, [x5]
+    mov x4, #0
+    mov x6, #0
+4:  str x6, [x5, x4]
+    add x4, x4, #8
+    cmp x4, #264                    /* covers d(4)+qs(256) */
+    b.ne 4b
+    b 8f
+3:  /* iscale = -127/max */
+    mov w4, #0xc2fe0000
+    fmov s4, w4          /* -127.0f */
+    fdiv s4, s4, s3
+    /* qs[j] = clamp(nearest_int(iscale*x[j])) */
+    mov x4, #0
+    add x6, x5, #4                  /* qs */
+5:  ldr s0, [x0, x4, lsl #2]
+    mov w2, #0x4b40                 /* 12582912.f = 0x4B400000 */
+    lsl w2, w2, #16
+    fmov s1, w2
+    fmadd s0, s0, s4, s1             /* FUSED x*iscale + magic (gcc contracts
+                                        `iscale*x + 12582912.f` to one fmadd;
+                                        separate fmul+fadd double-rounds and
+                                        can flip near-.5 values by 1) */
+    fmov w2, s0
+    and w2, w2, #0x007fffff
+    sub w2, w2, #0x00400000         /* nearest_int */
+    mov w10, #127                   /* NOT w4: x4 = loop index j! */
+    cmp w2, #127
+    csel w2, w2, w10, lt            /* v < 127 ? v : 127 */
+    strb w2, [x6, x4]
+    add x4, x4, #1
+    cmp x4, #256
+    b.ne 5b
+    /* d = 1.0/iscale */
+    fmov s0, #1.0
+    fdiv s0, s0, s4
+    str s0, [x5]
+8:  add x3, x3, #1
+    add x0, x0, #1024
+    cmp x3, x8                      /* block < nb */
+    b.ne 0b
+9:  ret
+
+/* ---------------- k2q4_gemv_range (C signature):
+ *   w0=r0, w1=r1, w2=cols, x3=w, x4=x(unused), x5=y, x6=xq
+ * Per row: acc = sum_b fma(round(ws*db), int32 nibble-dot, acc) — mirrors
+ * the gcc contract of `acc += (ws*db)*(float)sum` into fmul+fmadd.
+ * Live across blocks: x8=row, x9=nb32, x11=rowptr, x14=b, x15=r1, x5=y,
+ * x6=xq, s4=acc, s5=ws. Clobbers x0-x4,x7,x12,x13, w0-w4, v0-v5. */
+    .align 2
+k2q4_gemv_range:
+    cmp w0, w1
+    b.ge 9f
+    asr x9, x2, #5                  /* nb32 = cols/32 */
+    mov x7, #18
+    mul x10, x9, x7                 /* row stride = nb32*18 */
+    madd x11, x0, x10, x3           /* row ptr */
+    mov x7, #292                    /* xq block stride (hoisted) */
+    mov x8, x0                      /* r */
+    mov x15, x1                     /* r1 */
+    movi v7.16b, #15
+    movi v6.16b, #8
+0:  /* ---- row ---- */
+    mov x14, #0                     /* b */
+    fmov s8, wzr                    /* row acc: reg8, immune to all integer and v0-v7 writes */
+1:  /* ---- 32-weight block ---- */
+    ldrh w0, [x11]
+    add x11, x11, #18
+    /* inline h2f (raw fp16 scale -> s0); scratch w1-w4, s0-s1 */
+    and w1, w0, #0x3ff
+    ubfx w2, w0, #10, #5
+    and w3, w0, #0x8000            /* MASK before shift: raw lsl drags exp bits up! */
+    lsl w3, w3, #16
+    cbnz w2, 2f
+    cbz w1, 3f
+    ucvtf s0, w1
+    mov w4, #0x33800000             /* 2^-24 */
+    fmov s1, w4
+    fmul s0, s0, s1
+    fmov w4, s0
+    orr w4, w4, w3
+    fmov s0, w4
+    b 4f
+3:  fmov s0, wzr
+    b 4f
+2:  cmp w2, #31
+    b.ne 5f
+    mov w4, #0x7f80
+    lsl w4, w4, #16
+    orr w4, w4, w3
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s0, w4
+    b 4f
+5:  add w2, w2, #112
+    lsl w2, w2, #23
+    orr w4, w3, w2
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s0, w4
+4:  fmov s5, s0                    /* ws (keep out of dot regs) */
+    /* xq: wb = b>>3, woff = (b&7)<<5 */
+    lsr w1, w14, #3
+    and w2, w14, #7
+    madd x3, x1, x7, x6             /* xq + wb*292 */
+    ldr s15, [x3]                   /* db (reg15 written only at entry) */
+    add x3, x3, #4
+    add x3, x3, x2, lsl #5          /* + woff */
+    sub x4, x11, #16                /* codes (rowptr-18+2) */
+    ld1 {v0.16b}, [x4]
+    and v1.16b, v0.16b, v7.16b
+    ushr v0.16b, v0.16b, #4
+    sub v1.16b, v1.16b, v6.16b      /* lo-8 */
+    sub v0.16b, v0.16b, v6.16b      /* hi-8 */
+    ld1 {v2.16b}, [x3]
+    ldr q3, [x3, #16]
+    movi v4.4s, #0
+    sdot v4.4s, v1.16b, v2.16b
+    sdot v4.4s, v0.16b, v3.16b
+    addv s2, v4.4s
+    scvtf s2, s2
+    fmul s3, s5, s15                /* round(ws*db) */
+    fmadd s8, s3, s2, s8            /* fused acc (reg8: no integer/v0-v7 writer) */
+    add x14, x14, #1                /* b++ (x14 = reg14 ≠ s8) */
+    cmp x14, x9
+    b.ne 1b
+    str s8, [x5, x8, lsl #2]
+    add x8, x8, #1
+    cmp x8, x15
+    b.ne 0b
+9:  ret
+
+/* ---------------- rms: x0=x, x1=w(norm), x2=n, x3=y.
+ * f64 fmadd accumulate, divide by n, f32 +1e-6f, fsqrt (always >0),
+ * sc=1.0f/sqrt (fdiv), y = (sc*x)*w — mirrors fwd_k2.c exactly.
+ * Clobbers x4, s0-s4, d0-d2. */
+    .align 2
+rms:
+    fmov d1, xzr
+    mov x4, #0
+0:  ldr s0, [x0, x4, lsl #2]
+    fcvt d0, s0
+    fmadd d1, d0, d0, d1
+    add x4, x4, #1
+    cmp x4, x2
+    b.ne 0b
+    scvtf d0, w2
+    fdiv d1, d1, d0                 /* s/n */
+    fcvt s0, d1
+    adrp x4, f_1em6
+    ldr s1, [x4, :lo12:f_1em6]
+    fadd s0, s0, s1                 /* + 1e-6f */
+    fsqrt s0, s0                    /* always > 0 */
+    fmov s1, #1.0
+    fdiv s1, s1, s0                 /* sc = 1/sqrt */
+    mov x4, #0
+1:  ldr s0, [x0, x4, lsl #2]
+    ldr s2, [x1, x4, lsl #2]
+    fmul s0, s1, s0
+    fmul s0, s0, s2
+    str s0, [x3, x4, lsl #2]
+    add x4, x4, #1
+    cmp x4, x2
+    b.ne 1b
+    ret
+
+/* ---------------- blob_load: x0 = path. mmap K2H1 blob, verify geometry,
+ * compute tensor offsets into globals. Error -> message + exit(1). */
+    .align 2
+blob_load:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    mov x19, x0                     /* path */
+    mov x8, #56                     /* openat */
+    mov x0, #-100                   /* AT_FDCWD */
+    mov x1, x19
+    mov x2, #0                      /* O_RDONLY */
+    svc #0
+    cmp x0, #0
+    b.lt .Lerr_open
+    mov x20, x0                     /* fd */
+    mov x8, #62                     /* lseek end */
+    mov x1, #0
+    mov x2, #2
+    svc #0
+    cmp x0, #0
+    b.le .Lerr_seek
+    mov x19, x0                     /* size */
+    mov x8, #62                     /* lseek start */
+    mov x0, x20
+    mov x1, #0
+    mov x2, #0
+    svc #0
+    mov x8, #222                    /* mmap */
+    mov x0, #0
+    mov x1, x19
+    mov x2, #1                      /* PROT_READ */
+    mov x3, #2                      /* MAP_PRIVATE */
+    mov x4, x20
+    mov x5, #0
+    svc #0
+    cmp x0, #0
+    b.lt .Lerr_mmap
+    mov x19, x0                     /* blob base */
+    mov x8, #57                     /* close */
+    mov x0, x20
+    svc #0
+    /* magic "K2H1" = 0x3148324B; header: +4 nl, +8 hid, +12 inter,
+       +16 nhead, +20 nkv, +24 hdim, +28 vocab, +32 wtype, +36 npos */
+    ldr w0, [x19]
+    mov w1, #0x324b
+    movk w1, #0x3148, lsl #16
+    cmp w0, w1
+    b.ne .Lerr_magic
+    ldp w0, w2, [x19, #4]           /* nl, hid */
+    cmp w0, #28
+    b.ne .Lerr_geom
+    cmp w2, #1536
+    b.ne .Lerr_geom
+    ldp w0, w2, [x19, #16]          /* nhead, nkv */
+    cmp w0, #32
+    b.ne .Lerr_geom
+    cmp w2, #8
+    b.ne .Lerr_geom
+    ldr w0, [x19, #24]              /* hdim */
+    cmp w0, #64
+    b.ne .Lerr_geom
+    ldr w0, [x19, #32]              /* wtype */
+    cmp w0, #2
+    b.ne .Lerr_wtype                /* asm runtime: Q4 blobs only */
+    ldr w0, [x19, #28]              /* vocab */
+    cmp w0, #131072
+    b.hi .Lerr_geom
+    adrp x1, g_vocab
+    str w0, [x1, :lo12:g_vocab]
+    ldr w0, [x19, #36]              /* npos */
+    adrp x1, g_npos
+    str w0, [x1, :lo12:g_npos]
+    adrp x1, g_blob
+    str x19, [x1, :lo12:g_blob]
+    /* offsets (Q4 layout of k2_convert.py): 28 layers x 17707008 B */
+    movz x0, #0x010e, lsl #16       /* 17707008 = 0x010E3000 */
+    movk x0, #0x3000
+    mov x1, #28
+    mul x2, x0, x1                  /* layer bytes total */
+    add x3, x19, #40                /* first layer */
+    adrp x1, g_LBASE
+    str x3, [x1, :lo12:g_LBASE]     /* layer 0 base */
+    add x4, x3, x2                  /* layer-end = O_EMB */
+    adrp x1, g_O_EMB
+    str x4, [x1, :lo12:g_O_EMB]
+    ldr w5, [x19, #28]              /* vocab */
+    mov x0, #3072                   /* HID*2 (fp16 embed row) */
+    madd x6, x5, x0, x4             /* O_NORM = O_EMB + vocab*3072 */
+    adrp x1, g_O_NORM
+    str x6, [x1, :lo12:g_O_NORM]
+    mov x7, #6144
+    add x6, x6, x7                  /* + HID*4 */
+    adrp x1, g_O_HEAD
+    str x6, [x1, :lo12:g_O_HEAD]
+    /* head bytes = (vocab*1536/32)*18 = vocab*864 */
+    mov x0, #864
+    madd x7, x5, x0, x6             /* O_COS */
+    adrp x1, g_O_COS
+    str x7, [x1, :lo12:g_O_COS]
+    ldr w0, [x19, #36]              /* npos: COS bytes = npos*32*4 */
+    lsl x0, x0, #7                  /* npos*128 */
+    add x0, x7, x0
+    adrp x1, g_O_SIN
+    str x0, [x1, :lo12:g_O_SIN]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+.Lerr_open:
+    adrp x0, m_open
+    add x0, x0, :lo12:m_open
+    b .Lfatal
+.Lerr_seek:
+    adrp x0, m_seek
+    add x0, x0, :lo12:m_seek
+    b .Lfatal
+.Lerr_mmap:
+    adrp x0, m_mmap
+    add x0, x0, :lo12:m_mmap
+    b .Lfatal
+.Lerr_magic:
+    adrp x0, m_magic
+    add x0, x0, :lo12:m_magic
+    b .Lfatal
+.Lerr_geom:
+    adrp x0, m_geom
+    add x0, x0, :lo12:m_geom
+    b .Lfatal
+.Lerr_wtype:
+    adrp x0, m_wtype
+    add x0, x0, :lo12:m_wtype
+    b .Lfatal
+
+/* .Lfatal: x0 = asciz message -> print to stderr-ish (stdout) + exit(1) */
+.Lfatal:
+    bl print_cstr
+    mov w0, #'\n'
+    bl print_ch
+    mov x0, #1
+    mov x8, #93
+    svc #0
+
+
+/* ---------------- embed: w0 = token id -> X[1536] (fp16 rows via h2f).
+ * h2f clobbers w0-w4/s0-s1 -> ptrs live in x19-x21 (saved here). */
+    .align 2
+embed:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    str x21, [sp, #32]
+    adrp x1, g_O_EMB
+    ldr x1, [x1, :lo12:g_O_EMB]
+    mov x4, #3072                    /* HID*2 (NOT a shift: 3072 != 2^11) */
+    madd x19, x0, x4, x1            /* src = O_EMB + id*3072 */
+    adrp x20, b_X
+    add x20, x20, :lo12:b_X
+    mov x21, #1536
+0:  ldrh w0, [x19], #2
+    bl h2f
+    str s0, [x20], #4
+    subs x21, x21, #1
+    b.ne 0b
+    ldr x21, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+
+/* ---------------- gemvW: w0=il, w1=k, x2=x, x3=y.
+ * w = g_LBASE + il*17707008 + koff[k]; q8_quant(x, XQQ, cols) then
+ * q4_gemv(0, rows, cols, w, x, y, XQQ). Saves x19-x24. */
+    .align 2
+gemvW:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov x19, x1                     /* k */
+    mov x20, x2                     /* x act */
+    mov x21, x3                     /* y */
+    mov x22, x0                     /* il */
+    /* w ptr = LBASE + il*17707008 + koff[k] */
+    adrp x1, g_LBASE
+    ldr x2, [x1, :lo12:g_LBASE]
+    movz x0, #0x010e, lsl #16       /* 17707008 = 0x010E3000 */
+    movk x0, #0x3000
+    madd x2, x22, x0, x2
+    adrp x1, tbl_koff
+    add x1, x1, :lo12:tbl_koff
+    ldr x0, [x1, x19, lsl #3]
+    add x24, x2, x0                 /* w */
+    adrp x1, tbl_krows
+    add x1, x1, :lo12:tbl_krows
+    ldr w23, [x1, x19, lsl #2]      /* rows */
+    adrp x1, tbl_kcols
+    add x1, x1, :lo12:tbl_kcols
+    ldr w22, [x1, x19, lsl #2]      /* cols */
+    /* q8_quant(x, XQQ, cols) */
+    mov x0, x20
+    adrp x1, b_XQQ
+    add x1, x1, :lo12:b_XQQ
+    mov w2, w22
+    bl k2_q8_quant
+    /* q4_gemv(0, rows, cols, w, x, y, XQQ) */
+    mov w0, wzr
+    mov w1, w23
+    mov w2, w22
+    mov x3, x24
+    mov x4, x20
+    mov x5, x21
+    adrp x6, b_XQQ
+    add x6, x6, :lo12:b_XQQ
+    bl k2q4_gemv_range
+    ldp x19, x20, [sp, #16]
+    ldp x21, x22, [sp, #32]
+    ldp x23, x24, [sp, #48]
+    ldp x29, x30, [sp], #64
+    ret
+
+
+/* ---------------- rope: x0 = buf (QF or KF), w1 = nheads.
+ * C/S = O_COS/O_SIN + pos*128 (per-position 32 f32 tables).
+ * Exact pair contraction (j, j+32), mirror of gcc codegen:
+ *   t  = b*Sj (fmul);   xh[j]   = fnmsub(Cj, a, t)  = Cj*a - t
+ *   t2 = b*Cj (fmul);   xh[j+32] = fmadd(Sj, a, t2) = Sj*a + t2
+ * Saves x19-x26. */
+    .align 2
+rope:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    mov x19, x0                      /* buf */
+    mov w20, w1                      /* nheads */
+    adrp x1, g_O_COS
+    ldr x2, [x1, :lo12:g_O_COS]
+    adrp x1, g_pos
+    ldr x3, [x1, :lo12:g_pos]
+    add x21, x2, x3, lsl #7          /* C = O_COS + pos*128 */
+    adrp x1, g_O_SIN
+    ldr x2, [x1, :lo12:g_O_SIN]
+    add x22, x2, x3, lsl #7          /* S */
+    mov w23, wzr                      /* h */
+.Lrope_head:
+    mov x0, #256
+    madd x24, x23, x0, x19           /* xh = buf + h*256 */
+    add x25, x24, #128               /* xh + 32 floats */
+    mov w26, wzr                      /* j */
+.Lrope_j:
+    ldr s0, [x24, x26, lsl #2]       /* a */
+    ldr s1, [x25, x26, lsl #2]       /* b */
+    ldr s2, [x21, x26, lsl #2]       /* Cj */
+    ldr s3, [x22, x26, lsl #2]       /* Sj */
+    fmul s4, s1, s3                  /* t = b*Sj */
+    fnmsub s5, s2, s0, s4            /* Cj*a - t */
+    str s5, [x24, x26, lsl #2]       /* xh[j] */
+    fmul s4, s1, s2                  /* t2 = b*Cj */
+    fmadd s5, s3, s0, s4             /* Sj*a + t2 */
+    str s5, [x25, x26, lsl #2]       /* xh[j+32] */
+    add w26, w26, #1
+    cmp w26, #32
+    b.ne .Lrope_j
+    add w23, w23, #1
+    cmp w23, w20
+    b.ne .Lrope_head
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+/* ---------------- attention: w0 = il. 32 heads, GQA kh=h>>2.
+ * scores: scalar fmul+fadd in element order (== gcc's 4-wide lane order),
+ * sc = s*0.125, strict-> mx; es f64 sum of expf; p = expf/(f32)es;
+ * o[64] zeroed then fmla (fused, as C contracts) from V rows.
+ * K/V row for (il,t) = base + (il*CTX + t)*2048; + kh*256 bytes.
+ * Saves x19-x27. */
+    .align 2
+attention:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+    mov w19, w0                      /* il */
+    adrp x1, g_pos
+    ldr x20, [x1, :lo12:g_pos]       /* pos (loop bound, inclusive) */
+    /* K/V per-layer base = g_KCA + il*3145728 (CTX=1536*512 floats*4) */
+    mov x0, #3145728
+    madd x22, x19, x0, xzr
+    adrp x1, g_KCA
+    ldr x2, [x1, :lo12:g_KCA]
+    add x22, x2, x22                 /* KCA layer base */
+    adrp x1, g_VCA
+    ldr x2, [x1, :lo12:g_VCA]
+    madd x23, x19, x0, xzr           /* il*3145728 */
+    add x23, x2, x23                 /* VCA layer base */
+    adrp x25, b_attsc
+    add x25, x25, :lo12:b_attsc      /* sc[CTX] */
+    mov w21, wzr                     /* h */
+.Lattn_head:
+    /* Q ptr = b_QF + h*256; ATTO = b_ATTO + h*256; khoff = (h>>2)<<8 */
+    adrp x1, b_QF
+    add x1, x1, :lo12:b_QF
+    mov x0, #256
+    madd x24, x21, x0, x1           /* Q head */
+    adrp x1, b_ATTO
+    add x1, x1, :lo12:b_ATTO
+    madd x26, x21, x0, x1           /* ATTO head */
+    lsr w2, w21, #2
+    lsl x2, x2, #8                   /* khoff bytes */
+    /* zero ATTO head: 256 B */
+    movi v0.2d, #0
+    stp q0, q0, [x26]
+    stp q0, q0, [x26, #32]
+    stp q0, q0, [x26, #64]
+    stp q0, q0, [x26, #96]
+    stp q0, q0, [x26, #128]
+    stp q0, q0, [x26, #160]
+    stp q0, q0, [x26, #192]
+    stp q0, q0, [x26, #224]
+    adrp x1, f_n1e30
+    ldr s11, [x1, :lo12:f_n1e30]     /* mx = -1e30f */
+    /* ---- scores: t = 0..pos ---- */
+    mov x27, xzr
+.Lattn_score_t:
+    add x9, x22, x27, lsl #11        /* KCA row */
+    add x9, x9, x2                   /* + khoff */
+    mov x10, x24                     /* Q walk */
+    fmov s4, wzr                     /* dot acc (element order) */
+    mov x11, #64
+.Lattn_score_i:
+    ldr s0, [x10], #4
+    ldr s1, [x9], #4
+    fmul s2, s0, s1
+    fadd s4, s4, s2
+    subs x11, x11, #1
+    b.ne .Lattn_score_i
+    fmov s7, #0.125
+    fmul s0, s4, s7                  /* sc = s*0.125 */
+    str s0, [x25, x27, lsl #2]
+    fcmp s0, s11
+    b.le .Lattn_score_next           /* update iff sc > mx (C: if (sc > mx)) */
+    fmov s11, s0                     /* mx = sc  (b.le also catches NaN -> keep) */
+.Lattn_score_next:
+    add x27, x27, #1
+    cmp x27, x20
+    b.ls .Lattn_score_t              /* t <= pos */
+    /* ---- es = sum expf(sc-mx) in f64 ---- */
+    fmov d10, xzr
+    mov x27, xzr
+.Lattn_es_t:
+    ldr s0, [x25, x27, lsl #2]
+    fsub s0, s0, s11
+    bl expf
+    fcvt d0, s0
+    fadd d10, d10, d0
+    add x27, x27, #1
+    cmp x27, x20
+    b.ls .Lattn_es_t
+    fcvt s10, d10                    /* (f32)es */
+    /* ---- p-loop: o += p * V ---- */
+    mov x27, xzr
+.Lattn_p_t:
+    ldr s0, [x25, x27, lsl #2]
+    fsub s0, s0, s11
+    bl expf
+    fdiv s2, s0, s10                 /* p */
+    add x9, x23, x27, lsl #11        /* VCA row */
+    lsr w3, w21, #2
+    lsl x3, x3, #8                   /* khoff (x2 dead across expf) */
+    add x9, x9, x3
+    mov x11, x26                     /* o walk */
+    dup v2.4s, v2.s[0]
+    mov x12, #16                     /* 16 x 16B = 64 floats */
+.Lattn_p_i:
+    ld1 {v0.4s}, [x11]
+    ld1 {v1.4s}, [x9]
+    fmla v0.4s, v2.4s, v1.4s
+    st1 {v0.4s}, [x11], #16
+    add x9, x9, #16
+    subs x12, x12, #1
+    b.ne .Lattn_p_i
+    add x27, x27, #1
+    cmp x27, x20
+    b.ls .Lattn_p_t
+    add w21, w21, #1
+    cmp w21, #32
+    b.ne .Lattn_head
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+
+/* ---------------- layer_forward: w0 = il. Full decoder layer.
+ * rms->qkv->rope->KV store->attn->o->resid->rms->gate/up->silu->down->resid
+ * Saves x19-x22. */
+    .align 2
+layer_forward:
+    stp x29, x30, [sp, #-48]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    mov w19, w0                      /* il */
+    adrp x1, g_LBASE
+    ldr x20, [x1, :lo12:g_LBASE]
+    movz x0, #0x010e, lsl #16       /* 17707008 = 0x010E3000 */
+    movk x0, #0x3000
+    madd x20, x19, x0, x20           /* layer base */
+    /* rms(X, in_norm, 1536, XN) */
+    adrp x0, b_X
+    add x0, x0, :lo12:b_X
+    mov x1, x20                      /* in_norm at +0 */
+    mov w2, #1536
+    adrp x3, b_XN
+    add x3, x3, :lo12:b_XN
+    bl rms
+    /* q, k, v */
+    mov w0, w19
+    mov w1, #1
+    adrp x2, b_XN
+    add x2, x2, :lo12:b_XN
+    adrp x3, b_QF
+    add x3, x3, :lo12:b_QF
+    bl gemvW
+    mov w0, w19
+    mov w1, #2
+    adrp x2, b_XN
+    add x2, x2, :lo12:b_XN
+    adrp x3, b_KF
+    add x3, x3, :lo12:b_KF
+    bl gemvW
+    mov w0, w19
+    mov w1, #3
+    adrp x2, b_XN
+    add x2, x2, :lo12:b_XN
+    adrp x3, b_VF
+    add x3, x3, :lo12:b_VF
+    bl gemvW
+    /* rope Q (32 heads), K (8 heads) */
+    adrp x0, b_QF
+    add x0, x0, :lo12:b_QF
+    mov w1, #32
+    bl rope
+    adrp x0, b_KF
+    add x0, x0, :lo12:b_KF
+    mov w1, #8
+    bl rope
+    /* KV store: KCA[il][pos] = KF; VCA[il][pos] = VF (2048 B each) */
+    mov x0, #3145728
+    madd x21, x19, x0, xzr           /* il*3145728 */
+    adrp x1, g_KCA
+    ldr x1, [x1, :lo12:g_KCA]
+    add x1, x1, x21
+    adrp x2, g_pos
+    ldr x2, [x2, :lo12:g_pos]
+    add x1, x1, x2, lsl #11          /* dst = KCA + (il layer) + pos*2048 */
+    adrp x0, b_KF
+    add x0, x0, :lo12:b_KF
+    mov x2, #64
+1:  ldp q0, q1, [x0], #32
+    stp q0, q1, [x1], #32
+    subs x2, x2, #1
+    b.ne 1b
+    adrp x1, g_VCA
+    ldr x1, [x1, :lo12:g_VCA]
+    add x1, x1, x21
+    adrp x2, g_pos
+    ldr x2, [x2, :lo12:g_pos]
+    add x1, x1, x2, lsl #11
+    adrp x0, b_VF
+    add x0, x0, :lo12:b_VF
+    mov x2, #64
+1:  ldp q0, q1, [x0], #32
+    stp q0, q1, [x1], #32
+    subs x2, x2, #1
+    b.ne 1b
+    /* attention */
+    mov w0, w19
+    bl attention
+    /* o proj + residual */
+    mov w0, w19
+    mov w1, #4
+    adrp x2, b_ATTO
+    add x2, x2, :lo12:b_ATTO
+    adrp x3, b_AO
+    add x3, x3, :lo12:b_AO
+    bl gemvW
+    adrp x0, b_X
+    add x0, x0, :lo12:b_X
+    adrp x1, b_AO
+    add x1, x1, :lo12:b_AO
+    bl vec_add1536
+    /* rms(X, post_norm) */
+    adrp x0, b_X
+    add x0, x0, :lo12:b_X
+    mov x1, x20
+    movz x7, #0x43, lsl #16         /* 4429824 = 0x439800 */
+    movk x7, #0x9800
+    add x1, x1, x7                  /* post_attention_layernorm */
+    mov w2, #1536
+    adrp x3, b_XN
+    add x3, x3, :lo12:b_XN
+    bl rms
+    /* gate, up */
+    mov w0, w19
+    mov w1, #6
+    adrp x2, b_XN
+    add x2, x2, :lo12:b_XN
+    adrp x3, b_LG
+    add x3, x3, :lo12:b_LG
+    bl gemvW
+    mov w0, w19
+    mov w1, #7
+    adrp x2, b_XN
+    add x2, x2, :lo12:b_XN
+    adrp x3, b_LU
+    add x3, x3, :lo12:b_LU
+    bl gemvW
+    /* silu: LU[i] = (LG[i] / (1.0f + expf(-LG[i]))) * LU[i] */
+    adrp x20, b_LG
+    add x20, x20, :lo12:b_LG
+    adrp x21, b_LU
+    add x21, x21, :lo12:b_LU
+    mov x22, #5120
+2:  ldr s10, [x20], #4
+    fneg s0, s10
+    bl expf
+    fmov s1, #1.0
+    fadd s0, s0, s1
+    fdiv s0, s10, s0
+    ldr s1, [x21]
+    fmul s0, s0, s1
+    str s0, [x21], #4
+    subs x22, x22, #1
+    b.ne 2b
+    /* down + residual */
+    mov w0, w19
+    mov w1, #8
+    adrp x2, b_LU
+    add x2, x2, :lo12:b_LU
+    adrp x3, b_FO
+    add x3, x3, :lo12:b_FO
+    bl gemvW
+    adrp x0, b_X
+    add x0, x0, :lo12:b_X
+    adrp x1, b_FO
+    add x1, x1, :lo12:b_FO
+    bl vec_add1536
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #48
+    ret
+
+/* ---------------- vec_add1536: x0 = dst, x1 = src. dst += src (f32, 4-wide,
+ * elementwise -> order-independent, bit-exact vs scalar fadd). */
+    .align 2
+vec_add1536:
+    mov x2, #0
+0:  ldr q0, [x0, x2]
+    ldr q1, [x1, x2]
+    fadd v0.4s, v0.4s, v1.4s
+    str q0, [x0, x2]
+    add x2, x2, #16
+    mov x4, #6144
+    cmp x2, x4
+    b.ne 0b
+    ret
+
+/* ---------------- argmax: x0 = buf, w1 = n -> w0 = index (strict >,
+ * first-max wins — mirrors C argmax). */
+    .align 2
+argmax:
+    mov w2, wzr
+    ldr s1, [x0]
+    mov x3, #1
+0:  ldr s0, [x0, x3, lsl #2]
+    fcmp s0, s1
+    b.ls 1f                          /* ordered <= -> keep old (first wins) */
+    fmov s1, s0
+    mov w2, w3
+1:  add x3, x3, #1
+    cmp x3, x1
+    b.ne 0b
+    mov w0, w2
+    ret
+
+/* ---------------- frand01 -> s0. LCG mirror of fwd_k2.c (exact u64). */
+    .align 2
+frand01:
+    adrp x1, g_RS
+    ldr x2, [x1, :lo12:g_RS]
+    movz x3, #0x7f2d
+    movk x3, #0x4c95, lsl #16
+    movk x3, #0xf42d, lsl #32
+    movk x3, #0x5851, lsl #48        /* 6364136223846793005 */
+    mul x2, x2, x3
+    movz x3, #0x814f
+    movk x3, #0xf767, lsl #16
+    movk x3, #0x7b7e, lsl #32
+    movk x3, #0x1405, lsl #48        /* 1442695040888963407 */
+    add x2, x2, x3
+    str x2, [x1, :lo12:g_RS]
+    lsr x2, x2, #11
+    ucvtf d0, x2                     /* exact: <=2^53 */
+    adrp x1, f_2pm53
+    ldr d1, [x1, :lo12:f_2pm53]
+    fmul d0, d0, d1
+    fcvt s0, d0
+    ret
+
+/* ---------------- sample_topkpp: x0=lg, w1=n, s0=temp, s1=topp, w2=topk,
+ * s3=minp -> w0 index. Mirrors fwd_k2.c: descending top-k insertion
+ * (v <= sc[k] advances -> equal keeps earlier index), then expf renorm in
+ * f64 with topp cut, then LCG draw over keep-prefix exp2 weights.
+ * minp > 0 unsupported (logf) -> fatal at parse time instead.
+ * Saves x19-x26; keeps temps in s12-s14 (safe across my expf: s0-s5 only). */
+    .align 2
+sample_topkpp:
+    stp x29, x30, [sp, #-80]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    mov x19, x0                      /* lg */
+    mov w20, w1                      /* n */
+    fmov s12, s0                     /* temp */
+    fmov s13, s1                     /* topp */
+    mov w21, w2                      /* topk */
+    fmov s14, s3                     /* minp */
+    fcmp s12, #0.0
+    b.gt 0f
+    mov x0, x19
+    mov w1, w20
+    bl argmax
+    b .Lsmp_done
+0:  /* topk clamp: <=0 || >1024 -> 1024; > n -> n */
+    cmp w21, #0
+    b.le 1f
+    cmp w21, #1024
+    b.le 2f
+1:  mov w21, #1024
+2:  cmp w21, w20
+    ble 3f
+    mov w21, w20
+3:  /* descending insertion into b_smpsc/b_smsi (keep <= topk) */
+    mov w22, wzr                     /* m */
+    mov x23, xzr                     /* i */
+.Lsmp_ins_i:
+    cmp x23, x20
+    b.hs .Lsmp_pick
+    ldr s0, [x19, x23, lsl #2]      /* v */
+    mov w24, wzr                     /* k */
+.Lsmp_ins_k:
+    cmp w24, w22
+    b.hs .Lsmp_ins_kdone
+    adrp x1, b_smpsc
+    add x1, x1, :lo12:b_smpsc
+    ldr s1, [x1, x24, lsl #2]
+    fcmp s0, s1
+    b.ls .Lsmp_ins_knext             /* v <= sc[k] -> advance (strict earlier-wins) */
+    b .Lsmp_ins_kdone
+.Lsmp_ins_knext:
+    add w24, w24, #1
+    b .Lsmp_ins_k
+.Lsmp_ins_kdone:
+    cmp w24, w21
+    b.hs .Lsmp_ins_inext             /* k >= topk -> skip element */
+    /* shift [min(m, topk-1) .. k+1] down */
+    cmp w22, w21
+    b.lt 4f
+    sub w25, w21, #1                /* start = topk-1 when m >= topk */
+    b 5f
+4:  mov w25, w22                    /* start = m */
+5:
+.Lsmp_shift:
+    cmp w25, w24
+    b.le .Lsmp_shiftdone
+    sub w26, w25, #1                /* j-1 */
+    adrp x1, b_smpsc
+    add x1, x1, :lo12:b_smpsc
+    ldr s1, [x1, x26, lsl #2]
+    str s1, [x1, x25, lsl #2]       /* sc[j] = sc[j-1] */
+    adrp x1, b_smsi
+    add x1, x1, :lo12:b_smsi
+    ldr w2, [x1, x26, lsl #2]
+    str w2, [x1, x25, lsl #2]       /* si[j] = si[j-1] */
+    sub w25, w25, #1
+    b .Lsmp_shift
+.Lsmp_shiftdone:
+    /* sc[k] = v; si[k] = i; if (m < topk) m++ */
+    adrp x1, b_smpsc
+    add x1, x1, :lo12:b_smpsc
+    str s0, [x1, x24, lsl #2]
+    adrp x1, b_smsi
+    add x1, x1, :lo12:b_smsi
+    str w23, [x1, x24, lsl #2]
+    cmp w22, w21
+    b.hs 6f
+    add w22, w22, #1
+6:
+.Lsmp_ins_inext:
+    add x23, x23, #1
+    b .Lsmp_ins_i
+    /* ---- pick ---- */
+.Lsmp_pick:
+    adrp x1, b_smpsc
+    add x1, x1, :lo12:b_smpsc
+    ldr s11, [x1]                   /* mx = sc[0] */
+    /* es = sum expf(sc[k]-mx), f64 (d8) */
+    fmov d8, xzr
+    mov w24, wzr
+.Lsmp_es:
+    cmp w24, w22
+    b.hs .Lsmp_esdone
+    adrp x1, b_smpsc
+    add x1, x1, :lo12:b_smpsc
+    ldr s0, [x1, x24, lsl #2]
+    fsub s0, s0, s11
+    bl expf
+    fcvt d0, s0
+    fadd d8, d8, d0
+    add w24, w24, #1
+    b .Lsmp_es
+.Lsmp_esdone:
+    fcvt d14, s13                    /* topp f64; d14 NOT d1: expf clobbers d0-d5! */
+    /* acc walk -> keep */
+    fmov d9, xzr
+    mov w25, w22                     /* keep = m */
+    mov w24, wzr
+.Lsmp_acc:
+    cmp w24, w22
+    b.hs .Lsmp_accdone
+    adrp x1, b_smpsc
+    add x1, x1, :lo12:b_smpsc
+    ldr s0, [x1, x24, lsl #2]
+    fsub s0, s0, s11
+    bl expf
+    fcvt d0, s0
+    fdiv d0, d0, d8
+    fadd d9, d9, d0
+    add w24, w24, #1                 /* k+1 */
+    fcmp d9, d14
+    b.ge .Lsmp_acck                  /* acc >= topp -> keep = k+1 */
+    b .Lsmp_acc
+.Lsmp_acck:
+    mov w25, w24                     /* keep = k+1 */
+    b .Lsmp_accdone
+.Lsmp_accdone:
+    /* es2 = sum_{k<keep} expf((sc[k]-mx)/temp), f64 (d10) */
+    fmov d10, xzr
+    mov w24, wzr
+.Lsmp_es2:
+    cmp w24, w25
+    b.hs .Lsmp_es2done
+    adrp x1, b_smpsc
+    add x1, x1, :lo12:b_smpsc
+    ldr s0, [x1, x24, lsl #2]
+    fsub s0, s0, s11
+    fdiv s0, s0, s12                 /* /temp (f32) */
+    bl expf
+    fcvt d0, s0
+    fadd d10, d10, d0
+    add w24, w24, #1
+    b .Lsmp_es2
+.Lsmp_es2done:
+    /* r = frand01() * es2 */
+    bl frand01
+    fcvt d0, s0
+    fmul d13, d0, d10                 /* r; d13 NOT d11: d11 would wipe mx(s11)! */
+    /* a2 walk: first k with r < a2, else k == keep-1 */
+    fmov d15, xzr          /* NOT d12: fmov d12 would wipe s12 = temp! */
+    mov w24, wzr
+.Lsmp_a2:
+    cmp w24, w25
+    b.hs .Lsmp_a2miss
+    adrp x1, b_smpsc
+    add x1, x1, :lo12:b_smpsc
+    ldr s0, [x1, x24, lsl #2]
+    fsub s0, s0, s11
+    fdiv s0, s0, s12
+    bl expf
+    fcvt d0, s0
+    fadd d15, d15, d0
+    fcmp d13, d15                    /* r < a2 ? */
+    b.lo .Lsmp_retk
+    sub w2, w25, #1
+    cmp w24, w2
+    b.eq .Lsmp_retk                  /* k == keep-1 */
+    add w24, w24, #1
+    b .Lsmp_a2
+.Lsmp_a2miss:
+    sub w24, w25, #1                 /* si[keep-1] fallback */
+.Lsmp_retk:
+    adrp x1, b_smsi
+    add x1, x1, :lo12:b_smsi
+    ldr w0, [x1, x24, lsl #2]
+.Lsmp_done:
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #80
+    ret
+
+/* ---------------- .data ---------------- */
+    .data
+    .align 3
+f_tenthousand:  .double 10000.0
+f_2pm53:        .double 1.1102230246251565e-16      /* 2^-53 (frand01) */
+    .align 2
+f_inf32:        .word 0x7f800000
+f_1em6:         .word 0x358637bd                    /* 1e-6f (rms eps) */
+f_n1e30:        .word 0xf149f2ca                    /* -1e30f (mx init) */
+    .align 3
+/* glibc 2.39 expf fast path: 32-entry u64 table @ libm 0x7a5f0, then a
+ * 40-byte gap, then 4 f64 constants at +296..+320 (offsets as expf loads). */
+k_exp_table:
+    .quad 0x3FF0000000000000
+    .quad 0x3FEFD9B0D3158574
+    .quad 0x3FEFB5586CF9890F
+    .quad 0x3FEF9301D0125B51
+    .quad 0x3FEF72B83C7D517B
+    .quad 0x3FEF54873168B9AA
+    .quad 0x3FEF387A6E756238
+    .quad 0x3FEF1E9DF51FDEE1
+    .quad 0x3FEF06FE0A31B715
+    .quad 0x3FEEF1A7373AA9CB
+    .quad 0x3FEEDEA64C123422
+    .quad 0x3FEECE086061892D
+    .quad 0x3FEEBFDAD5362A27
+    .quad 0x3FEEB42B569D4F82
+    .quad 0x3FEEAB07DD485429
+    .quad 0x3FEEA47EB03A5585
+    .quad 0x3FEEA09E667F3BCD
+    .quad 0x3FEE9F75E8EC5F74
+    .quad 0x3FEEA11473EB0187
+    .quad 0x3FEEA589994CCE13
+    .quad 0x3FEEACE5422AA0DB
+    .quad 0x3FEEB737B0CDC5E5
+    .quad 0x3FEEC49182A3F090
+    .quad 0x3FEED503B23E255D
+    .quad 0x3FEEE89F995AD3AD
+    .quad 0x3FEEFF76F2FB5E47
+    .quad 0x3FEF199BDD85529C
+    .quad 0x3FEF3720DCEF9069
+    .quad 0x3FEF5818DCFBA487
+    .quad 0x3FEF7C97337B9B5F
+    .quad 0x3FEFA4AFA2A490DA
+    .quad 0x3FEFD0765B6E4540
+    .space 40                       /* libm gap: +256..+295 */
+    /* +296 */ .quad 0x40471547652B82FE            /* 46.166241308446828 = 32/ln2 */
+    /* +304 */ .quad 0x3EBC6AF84B912394            /* 1.6938359250920212e-06 */
+    /* +312 */ .quad 0x3F2EBFCE50FAC4F3            /* 2.3459809789509004e-04 = (ln2/32)^2/2 */
+    /* +320 */ .quad 0x3F962E42FF0C52D6            /* 0.021660849396613134 = ln2/32 */
+    .align 3
+g_KCA:          .quad b_KCAbuf
+g_VCA:          .quad b_VCAbuf
+    .align 2
+s_step:         .asciz "step "
+s_idin:         .asciz " id_in="
+s_top:          .asciz " top="
+s_logit:        .asciz " logit="
+s_gen:          .asciz "--gen"
+s_sample:       .asciz "--sample"
+s_nan:          .asciz "nan"
+s_inf:          .asciz "inf"
+s_ninf:         .asciz "-inf"
+m_open:         .asciz "k2_core: open failed"
+m_seek:         .asciz "k2_core: lseek failed"
+m_mmap:         .asciz "k2_core: mmap failed"
+m_magic:        .asciz "k2_core: not a K2H1 blob"
+m_geom:         .asciz "k2_core: geometry mismatch"
+m_wtype:        .asciz "k2_core: only Q4 blobs (wtype=2) supported"
+m_minp:         .asciz "k2_core: minp>0 unsupported (logf not ported)"
+m_usage:        .asciz "usage: k2_core <k2h_q4.blob> <id...> [--gen N] [--sample temp topp topk seed [minp]]"
+    .align 3
+tbl_koff:       .quad 0, 6144, 1775616, 2217984, 2660352, 4429824, 4435968, 8859648, 13283328
+    .align 2
+tbl_krows:      .word 1536, 2048, 512, 512, 1536, 1536, 5120, 5120, 1536
+tbl_kcols:      .word 0, 1536, 1536, 1536, 2048, 0, 1536, 1536, 5120
+
+/* ---------------- .bss ---------------- */
+    .bss
+    .align 6
+b_X:            .skip 6144
+b_XN:           .skip 6144
+b_AO:           .skip 6144
+b_FO:           .skip 6144
+b_QF:           .skip 8192
+b_KF:           .skip 2048
+b_VF:           .skip 2048
+b_ATTO:         .skip 8192
+b_LG:           .skip 20480
+b_LU:           .skip 20480
+b_HEAD:         .skip 524288               /* VOCAB_MAX 131072 f32 */
+b_XQQ:          .skip 5840                 /* (5120/256)*292 */
+b_attsc:        .skip 6144                 /* attention sc[1536] */
+b_smpsc:        .skip 4096                 /* sampler sc[1024] */
+b_smsi:         .skip 4096                 /* sampler si[1024] */
+b_ids:          .skip 16384                /* 4096 ids */
+numbuf:         .skip 128
+g_blob:         .skip 8
+g_LBASE:        .skip 8
+g_O_EMB:        .skip 8
+g_O_NORM:       .skip 8
+g_O_HEAD:       .skip 8
+g_O_COS:        .skip 8
+g_O_SIN:        .skip 8
+g_pos:          .skip 8
+g_RS:           .skip 8
+g_vocab:        .skip 4
+g_npos:         .skip 4
+g_stopp:        .skip 4
+g_stemp:        .skip 4
+g_sminp:        .skip 4
+g_stopk:        .skip 4
+    .align 12
+b_KCAbuf:       .skip 88080384            /* 28*1536*512 f32 */
+b_VCAbuf:       .skip 88080384
+
+    .text
+    .align 2
+/* ---------------- string/number parsers ---------------- */
+
+/* str_is: x0 = str, x1 = expect (both asciz) -> w0 = 1/0 */
+    .align 2
+str_is:
+0:  ldrb w2, [x0], #1
+    ldrb w3, [x1], #1
+    cmp w2, w3
+    b.ne 1f
+    cbnz w2, 0b
+    mov w0, #1
+    ret
+1:  mov w0, wzr
+    ret
+
+/* parse_i64: x0 = str -> x0 = value (s64, optional sign), x1 = after */
+    .align 2
+parse_i64:
+    mov x2, #0                       /* acc */
+    mov w3, #0                       /* neg flag */
+    ldrb w4, [x0]
+    cmp w4, #'-'
+    b.ne 0f
+    mov w3, #1
+    add x0, x0, #1
+0:  ldrb w4, [x0]
+    sub w4, w4, #'0'
+    cmp w4, #9
+    b.hi 1f
+    mov x5, #10
+    madd x2, x2, x5, x4              /* acc = acc*10 + d (w4 zero-extended? w4 sub -> upper garbage!) */
+    add x0, x0, #1
+    b 0b
+1:  mov x1, x0
+    cmp w3, #0
+    csneg x0, x2, x2, eq             /* if neg: -x2 */
+    ret
+
+/* parse_u64: x0 = str -> x0 = value, x1 = after (unsigned, no sign) */
+    .align 2
+parse_u64:
+    mov x2, #0
+0:  ldrb w4, [x0]
+    sub w4, w4, #'0'
+    cmp w4, #9
+    b.hi 1f
+    mov x5, #10
+    madd x2, x2, x5, x4
+    add x0, x0, #1
+    b 0b
+1:  mov x1, x0
+    mov x0, x2
+    ret
+
+/* parse_f32: x0 = str -> s0 = value, x1 = after.
+ * decimal N[.F] -> f64 (single correctly-rounded division total/scale ==
+ * strtod for these forms) -> f32 (== atof-then-float assignment). */
+    .align 2
+parse_f32:
+    mov x2, #0                       /* int part N */
+    mov w6, #0                       /* neg */
+    ldrb w4, [x0]
+    cmp w4, #'-'
+    b.ne 0f
+    mov w6, #1
+    add x0, x0, #1
+0:  ldrb w4, [x0]
+    sub w4, w4, #'0'
+    cmp w4, #9
+    b.hi 1f
+    mov x5, #10
+    uxtw x4, w4
+    madd x2, x2, x5, x4
+    add x0, x0, #1
+    b 0b
+1:  mov x7, #1                       /* scale = 10^d */
+    mov x8, #0                       /* frac F */
+    ldrb w4, [x0]
+    cmp w4, #'.'
+    b.ne 3f
+    add x0, x0, #1
+2:  ldrb w4, [x0]
+    sub w4, w4, #'0'
+    cmp w4, #9
+    b.hi 3f
+    mov x5, #10
+    uxtw x4, w4
+    madd x8, x8, x5, x4              /* F = F*10 + d */
+    mov x5, #10
+    mul x7, x7, x5                  /* scale *= 10 */
+    add x0, x0, #1
+    b 2b
+3:  /* total = N*scale + F ; v = total/scale in f64 */
+    mul x9, x2, x7                  /* N*scale */
+    add x9, x9, x8                  /* + F */
+    ucvtf d0, x9                    /* exact for our arg forms (<2^53) */
+    ucvtf d1, x7
+    fdiv d0, d0, d1                 /* correctly rounded f64 == strtod */
+    cbz w6, 4f
+    fneg d0, d0
+4:  fcvt s0, d0                     /* == atof->float double rounding */
+    mov x1, x0
+    ret
+
+/* ---------------- main ----------------
+ * State in callee-saved regs (all my functions save/restore x19-x28):
+ *   x19 argc/il, x20 argv, x21 parse idx, x22 nids, x23 gen,
+ *   x24 n0, x25 step, x26 id_in, x27 top, x28 = n0+gen bound
+ */
+    .align 2
+main:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    ldr x19, [x1]                    /* argc — x1 = sp passed from _start */
+    add x20, x1, #8                  /* argv */
+    cmp x19, #2
+    b.lt .Lusage
+    ldr x0, [x20, #8]                /* argv[1] = blob path */
+    bl blob_load
+    /* defaults: STOPP = 1.0f (rest are 0 in BSS) */
+    adrp x1, g_stopp
+    fmov s0, #1.0
+    str s0, [x1, :lo12:g_stopp]
+    mov w22, wzr
+    mov x23, xzr
+    mov x21, #2
+.Lparse:
+    cmp x21, x19
+    b.hs .Lparsedone
+    ldr x0, [x20, x21, lsl #3]
+    adrp x1, s_gen
+    add x1, x1, :lo12:s_gen
+    bl str_is
+    cbnz w0, .Larg_gen
+    ldr x0, [x20, x21, lsl #3]
+    adrp x1, s_sample
+    add x1, x1, :lo12:s_sample
+    bl str_is
+    cbnz w0, .Larg_sample
+    /* plain token -> id */
+    ldr x0, [x20, x21, lsl #3]
+    bl parse_i64
+    adrp x2, b_ids
+    add x2, x2, :lo12:b_ids
+    str w0, [x2, w22, sxtw #2]
+    add w22, w22, #1
+    cmp w22, #4096
+    b.hs .Lusage
+    add x21, x21, #1
+    b .Lparse
+.Larg_gen:
+    add x21, x21, #1
+    cmp x21, x19
+    b.hs .Lusage
+    ldr x0, [x20, x21, lsl #3]
+    bl parse_i64
+    mov x23, x0
+    add x21, x21, #1
+    b .Lparse
+.Larg_sample:
+    add x21, x21, #1
+    add x2, x21, #4
+    cmp x2, x19
+    b.gt .Lusage                     /* need temp,topp,topk,seed */
+    ldr x0, [x20, x21, lsl #3]
+    bl parse_f32
+    adrp x2, g_stemp
+    str s0, [x2, :lo12:g_stemp]
+    add x21, x21, #1
+    ldr x0, [x20, x21, lsl #3]
+    bl parse_f32
+    adrp x2, g_stopp
+    str s0, [x2, :lo12:g_stopp]
+    add x21, x21, #1
+    ldr x0, [x20, x21, lsl #3]
+    bl parse_i64
+    adrp x2, g_stopk
+    str w0, [x2, :lo12:g_stopk]
+    add x21, x21, #1
+    ldr x0, [x20, x21, lsl #3]
+    bl parse_u64
+    adrp x2, g_RS
+    str x0, [x2, :lo12:g_RS]
+    add x21, x21, #1
+    /* optional minp (only if present and not a flag) */
+    cmp x21, x19
+    b.hs .Lsample_done
+    ldr x0, [x20, x21, lsl #3]
+    ldrb w1, [x0]
+    cmp w1, #'-'
+    b.eq .Lsample_done
+    bl parse_f32
+    fcmp s0, #0.0
+    b.ls 7f
+    adrp x0, m_minp
+    add x0, x0, :lo12:m_minp
+    b .Lfatal                        /* logf not ported; demos use minp=0 */
+7:  add x21, x21, #1
+.Lsample_done:
+    b .Lparse
+.Lparsedone:
+    cmp w22, #0
+    b.eq .Lusage                     /* need at least one prompt id */
+    mov x24, x22                     /* n0 */
+    add x28, x24, x23                /* n0 + gen bound */
+    adrp x1, g_pos
+    str xzr, [x1, :lo12:g_pos]
+    mov x25, xzr                     /* step */
+.Lloop:
+    /* --- choose id --- */
+    cmp x25, x24
+    b.hs .Lgen_id
+    adrp x1, b_ids
+    add x1, x1, :lo12:b_ids
+    ldr w26, [x1, x25, lsl #2]
+    b .Lfwd_id
+.Lgen_id:
+    adrp x1, g_stemp
+    ldr s0, [x1, :lo12:g_stemp]
+    fcmp s0, #0.0
+    b.gt .Lsample
+    adrp x0, b_HEAD
+    add x0, x0, :lo12:b_HEAD
+    adrp x1, g_vocab
+    ldr w1, [x1, :lo12:g_vocab]
+    bl argmax
+    mov w26, w0
+    b .Lappend
+.Lsample:
+    adrp x0, b_HEAD
+    add x0, x0, :lo12:b_HEAD
+    adrp x1, g_vocab
+    ldr w1, [x1, :lo12:g_vocab]
+    adrp x2, g_stemp
+    ldr s0, [x2, :lo12:g_stemp]
+    adrp x2, g_stopp
+    ldr s1, [x2, :lo12:g_stopp]
+    adrp x2, g_stopk
+    ldr w2, [x2, :lo12:g_stopk]
+    adrp x3, g_sminp
+    ldr s3, [x3, :lo12:g_sminp]
+    bl sample_topkpp
+    mov w26, w0
+.Lappend:
+    adrp x1, b_ids
+    add x1, x1, :lo12:b_ids
+    str w26, [x1, w22, sxtw #2]
+    add w22, w22, #1
+    cmp w22, #4096
+    b.hs .Lusage
+.Lfwd_id:
+    /* --- embed + 28 layers --- */
+    mov w0, w26
+    bl embed
+    mov x19, xzr                     /* il (argc dead) */
+.Lil:
+    mov w0, w19
+    bl layer_forward
+    add x19, x19, #1
+    cmp x19, #28
+    b.ne .Lil
+    /* --- final rms + head --- */
+    adrp x0, b_X
+    add x0, x0, :lo12:b_X
+    adrp x1, g_O_NORM
+    ldr x1, [x1, :lo12:g_O_NORM]
+    mov w2, #1536
+    adrp x3, b_XN
+    add x3, x3, :lo12:b_XN
+    bl rms
+    adrp x0, b_XN
+    add x0, x0, :lo12:b_XN
+    adrp x1, b_XQQ
+    add x1, x1, :lo12:b_XQQ
+    mov w2, #1536
+    bl k2_q8_quant
+    mov w0, wzr
+    adrp x1, g_vocab
+    ldr w1, [x1, :lo12:g_vocab]
+    mov w2, #1536
+    adrp x3, g_O_HEAD
+    ldr x3, [x3, :lo12:g_O_HEAD]
+    adrp x4, b_XN
+    add x4, x4, :lo12:b_XN
+    adrp x5, b_HEAD
+    add x5, x5, :lo12:b_HEAD
+    adrp x6, b_XQQ
+    add x6, x6, :lo12:b_XQQ
+    bl k2q4_gemv_range
+    adrp x0, b_HEAD
+    add x0, x0, :lo12:b_HEAD
+    adrp x1, g_vocab
+    ldr w1, [x1, :lo12:g_vocab]
+    bl argmax
+    mov w27, w0                      /* top */
+    /* --- print: step %d id_in=%d top=%d logit=%.4f\n --- */
+    adrp x0, s_step
+    add x0, x0, :lo12:s_step
+    bl print_cstr
+    mov x0, x25
+    bl print_u64
+    adrp x0, s_idin
+    add x0, x0, :lo12:s_idin
+    bl print_cstr
+    mov x0, x26
+    bl print_u64
+    adrp x0, s_top
+    add x0, x0, :lo12:s_top
+    bl print_cstr
+    mov x0, x27
+    bl print_u64
+    adrp x0, s_logit
+    add x0, x0, :lo12:s_logit
+    bl print_cstr
+    adrp x0, b_HEAD
+    add x0, x0, :lo12:b_HEAD
+    ldr s0, [x0, w27, uxtw #2]
+    bl print_f32_4
+    bl print_nl
+    /* --- EOS: step >= n0 && id_in == 1 --- */
+    cmp x25, x24
+    b.lo .Lnoeos
+    cmp w26, #1
+    b.eq .Ldone
+.Lnoeos:
+    add x25, x25, #1
+    adrp x1, g_pos
+    ldr x2, [x1, :lo12:g_pos]
+    add x2, x2, #1
+    str x2, [x1, :lo12:g_pos]
+    cmp x25, x28
+    b.lo .Lloop
+.Ldone:
+    ldp x29, x30, [sp], #16
+    ret
+
+.Lusage:
+    adrp x0, m_usage
+    add x0, x0, :lo12:m_usage
+    b .Lfatal
+
+/* ---------------- _start ---------------- */
+    .global _start
+_start:
+    mov x1, sp                       /* argc/argv block */
+    bl main
+    mov x0, #0
+    mov x8, #93                      /* SYS_EXIT */
+    svc #0
