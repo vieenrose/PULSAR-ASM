@@ -29,9 +29,11 @@ def main():
         dev = "cpu"
     tok = AutoTokenizer.from_pretrained("IFM/K2-Horizon-0.9B",
                                         trust_remote_code=True)
+    # fp32 ALWAYS: the engine is fp32 and bf16-oracle drift (~1e-2)
+    # would swamp the validation tolerance
     mdl = AutoModelForCausalLM.from_pretrained(
         "IFM/K2-Horizon-0.9B", trust_remote_code=True,
-        torch_dtype=torch.float32 if dev == "cpu" else torch.bfloat16)
+        torch_dtype=torch.float32)
     mdl = mdl.to(dev).eval()
     ids = tok("使用者:" + PROMPT + "\n助理:", return_tensors="pt").input_ids.to(dev)
     print("prompt ids:", ids.shape, ids[0, :8].tolist(), flush=True)
