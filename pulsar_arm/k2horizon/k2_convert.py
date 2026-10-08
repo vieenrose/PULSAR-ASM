@@ -96,8 +96,8 @@ def main():
         total = 0
         for k in order:
             a = sf[k]
-            short = k.split("model.layers.")[-1] if "model.layers." in k else k
-            if short in NORMS or k == "model.norm.weight":
+            # norms (any layer) go fp32; match on tensor kind suffix
+            if k == "model.norm.weight" or any(k.endswith("." + t) for t in NORMS):
                 b = a.astype(np.float32).tobytes()
             else:
                 b = a.astype(np.float16).tobytes()
