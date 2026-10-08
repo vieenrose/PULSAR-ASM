@@ -40,7 +40,7 @@ def run(it, ids, gen=400, temp=0.0, seed=7):
             m[0, 0, i, s + i + 1:] = float("-inf")
         args.update(kv)
         out = pre(**args)
-        kv = {k: np.asarray(v) for k, v in out.items()}
+        kv = {k: np.asarray(v) for k, v in out.items() if "kv_cache" in k}
     # remainder (possibly empty -> re-decode last token for first logits)
     pending = list(ids[nfull:])
     pos_next = nfull
@@ -57,7 +57,7 @@ def run(it, ids, gen=400, temp=0.0, seed=7):
         args["mask"][0, 0, 0, pos_next + 1:] = float("-inf")
         args.update(kv)
         out = dec(**args)
-        kv = {k: np.asarray(v) for k, v in out.items()}
+        kv = {k: np.asarray(v) for k, v in out.items() if "kv_cache" in k}
         logits = np.asarray(out["logits"])[0, 0]
         if temp <= 0:
             nxt = int(np.argmax(logits))
