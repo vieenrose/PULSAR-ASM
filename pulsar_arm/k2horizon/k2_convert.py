@@ -32,6 +32,11 @@ LAYER_TENSORS = ["input_layernorm.weight", "self_attn.q_proj.weight",
                  "mlp.down_proj.weight"]
 TOP_TENSORS = ["model.embed_tokens.weight", "model.norm.weight",
                "lm_head.weight"]
+# tensors to quantize under --q4 (all 2-D projections + head; embed +
+# norms stay fp16/fp32: gather is cheap, norms are tiny)
+Q4_SKIP_SUFFIX = ("model.embed_tokens.weight", "model.norm.weight",
+                  "input_layernorm.weight",
+                  "post_attention_layernorm.weight")
 NORMS = {"input_layernorm.weight", "post_attention_layernorm.weight",
          "model.norm.weight"}
 
@@ -68,8 +73,33 @@ def read_sf(path):
     return out
 
 
+def q4_0_quant(a):
+    """Q4_0 blocks (32 weights: fp16 d + 16B), mirroring ggml's
+    quantize_row_q4_0_ref EXACTLY (float32 throughout, C-cast truncation
+    toward zero, first-max-wins, nibble order low-half then high-half).
+    Returns bytes."""
+    f = np.ascontiguousarray(a, dtype=np.float32).ravel()
+    assert f.size % 32 == 0
+    out = bytearray()
+    for i in range(0, f.size, 32):
+        blk = f[i:i + 32]
+        am = np.abs(blk)
+        mx = blk[int(np.argmax(am))]
+        amax = float(am.max())
+        d = np.float32(mx) / np.float32(-8.0)
+        idv = np.float32(1.0) / d if d != 0 else np.float32(0.0)
+        out += np.float16(d).tobytes()
+        q = np.minimum(15, (blk * idv + np.float32(8.5)).astype(np.int32))
+        lo, hi = q[:16], q[16:]
+        out += bytes(int(l | (h << 4)) & 0xFF for l, h in zip(lo, hi))
+    return bytes(out)
+
+
 def main():
-    snap, blob, rope = sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None
+    snap, blob = sys.argv[1], sys.argv[2]
+    rope = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else None
+    use_q4 = "--q4" in sys.argv
+    wtype = 2 if use_q4 else 0
     sf = None
     for fn in sorted(os.listdir(snap)):
         if fn.endswith(".safetensors"):
@@ -92,13 +122,15 @@ def main():
         assert cos.shape == sin.shape == (npos, 32)
     with open(blob, "wb") as f:
         f.write(struct.pack("<4s9I", b"K2H1", NLAYER, HID, INTER, NHEAD,
-                            NKV, HDIM, VOCAB, 0, npos))
+                            NKV, HDIM, VOCAB, wtype, npos))
         total = 0
         for k in order:
             a = sf[k]
             # norms (any layer) go fp32; match on tensor kind suffix
             if k == "model.norm.weight" or any(k.endswith("." + t) for t in NORMS):
                 b = a.astype(np.float32).tobytes()
+            elif use_q4 and not k.endswith(Q4_SKIP_SUFFIX):
+                b = q4_0_quant(a)
             else:
                 b = a.astype(np.float16).tobytes()
             f.write(b)
