@@ -19,10 +19,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <arm_neon.h>
+#include <pthread.h>
 
+#ifndef STANDALONE
 void quantize_row_q8_K(const float * x, void * y, int64_t k);
 void ggml_vec_dot_pq2_0_q8_K(int n, float * s, size_t bs, const void * vx,
                              size_t bx, const void * vy, size_t by, int nrc);
+#endif
 
 #define COLS 4096
 #define ROWS 12288
@@ -51,10 +54,10 @@ static inline void dec32(const uint8_t *b, int8x16_t *o0, int8x16_t *o1) {
     *o1 = vcombine_s8(w1.val[0], w1.val[1]);
 }
 
-void pq2_gemv(int rows, int cols, const uint8_t *w, const float *x, float *y,
-              const uint8_t *xq) {
+void pq2_gemv_range(int r0, int r1, int cols, const uint8_t *w,
+                      const float *x, float *y, const uint8_t *xq) {
     int ng = cols / 128;
-    for (int r = 0; r < rows; r++) {
+    for (int r = r0; r < r1; r++) {
         const uint8_t *row = w + (size_t)r * ng * 34;
         float acc = 0.0f;
         for (int g = 0; g < ng; g++) {
@@ -80,10 +83,105 @@ void pq2_gemv(int rows, int cols, const uint8_t *w, const float *x, float *y,
     }
 }
 
+/* Row-parallel dispatch (bit-exact: each row is computed by exactly one
+   thread with the identical serial code above; there is no cross-row
+   reduction). Raw pthreads, not OpenMP, so the STANDALONE static binary
+   (glibc or bionic) needs no extra runtime. Persistent pool: threads are
+   created once and parked on a condvar; per-call dispatch is one broadcast
+   + one completion wait (~5-10us), vs ~30us per pthread_create which would
+   cost ~30ms/token across the ~250 GEMVs of a token. Count from
+   PQ2_THREADS (default 4 = one phone big cluster); 1 = pure serial. */
+static struct {
+    pthread_t *tid;
+    int nt;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pthread_cond_t dv;
+    int gen;
+    int done;
+    int shutdown;
+    const uint8_t *w;
+    const uint8_t *xq;
+    const float *x;
+    float *y;
+    int rows, cols;
+} PQ2P = { .nt = -1 };
+
+static void *pq2_worker(void *arg) {
+    long idx = (long)arg;
+    int mygen = 0;
+    for (;;) {
+        pthread_mutex_lock(&PQ2P.mu);
+        while (PQ2P.gen == mygen && !PQ2P.shutdown)
+            pthread_cond_wait(&PQ2P.cv, &PQ2P.mu);
+        if (PQ2P.shutdown) { pthread_mutex_unlock(&PQ2P.mu); return NULL; }
+        mygen = PQ2P.gen;
+        const uint8_t *w = PQ2P.w;
+        const uint8_t *xq = PQ2P.xq;
+        const float *x = PQ2P.x;
+        float *y = PQ2P.y;
+        int rows = PQ2P.rows, cols = PQ2P.cols, nt = PQ2P.nt;
+        pthread_mutex_unlock(&PQ2P.mu);
+        int r0 = (int)((long)rows * idx / nt);
+        int r1 = (int)((long)rows * (idx + 1) / nt);
+        if (r1 > r0) pq2_gemv_range(r0, r1, cols, w, x, y, xq);
+        pthread_mutex_lock(&PQ2P.mu);
+        if (++PQ2P.done == nt - 1) pthread_cond_signal(&PQ2P.dv);
+        pthread_mutex_unlock(&PQ2P.mu);
+    }
+}
+
+static int pq2_nthreads(void) {
+    if (PQ2P.nt >= 0) return PQ2P.nt;
+    int nt = 4;
+    const char *e = getenv("PQ2_THREADS");
+    if (!e) e = getenv("OMP_NUM_THREADS");
+    if (e && atoi(e) > 0) nt = atoi(e);
+    if (nt < 1) nt = 1;
+    if (nt > 32) nt = 32;
+    PQ2P.nt = nt;
+    if (nt > 1) {
+        pthread_mutex_init(&PQ2P.mu, NULL);
+        pthread_cond_init(&PQ2P.cv, NULL);
+        pthread_cond_init(&PQ2P.dv, NULL);
+        PQ2P.gen = 0; PQ2P.done = 0; PQ2P.shutdown = 0;
+        PQ2P.tid = malloc((size_t)(nt - 1) * sizeof(pthread_t));
+        for (long i = 1; i < nt; i++)
+            pthread_create(&PQ2P.tid[i - 1], NULL, pq2_worker, (void *)i);
+    }
+    return nt;
+}
+
+void pq2_gemv(int rows, int cols, const uint8_t *w, const float *x, float *y,
+              const uint8_t *xq) {
+    int nt = pq2_nthreads();
+    if (nt == 1 || rows < nt) {
+        /* serial: identical to the pre-thread code (single range 0..rows) */
+        pq2_gemv_range(0, rows, cols, w, x, y, xq);
+        return;
+    }
+    pthread_mutex_lock(&PQ2P.mu);
+    PQ2P.w = w; PQ2P.xq = xq; PQ2P.x = x; PQ2P.y = y;
+    PQ2P.rows = rows; PQ2P.cols = cols;
+    PQ2P.done = 0;
+    PQ2P.gen++;
+    pthread_cond_broadcast(&PQ2P.cv);
+    pthread_mutex_unlock(&PQ2P.mu);
+    /* main thread takes range 0 while workers take theirs */
+    int r0 = 0, r1 = (int)((long)rows * 1 / nt);
+    pq2_gemv_range(r0, r1, cols, w, x, y, xq);
+    pthread_mutex_lock(&PQ2P.mu);
+    while (PQ2P.done < nt - 1)
+        pthread_cond_wait(&PQ2P.dv, &PQ2P.mu);
+    pthread_mutex_unlock(&PQ2P.mu);
+}
+
 /* Q8_K block layout needed: d at [0..1], qs at [8..263] (verify at runtime) */
 static float X[COLS], YA[ROWS], YB[ROWS];
 static uint8_t XQ[(COLS / 256) * 292];
 
+/* self-test harness: needs libggml, compiled out of the standalone build */
+#ifndef STANDALONE
 int main(int argc, char **argv) {
     const char *path = argv[1];
     long ds = atol(argv[2]), off = atol(argv[3]);
@@ -132,3 +230,4 @@ int main(int argc, char **argv) {
            ROWS, COLS, bt * 1e3, bt * 1e9 / ((double)ROWS * COLS));
     return 0;
 }
+#endif
