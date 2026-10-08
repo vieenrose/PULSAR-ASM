@@ -1387,7 +1387,20 @@ worker_loop:
     ldr x6, [x7, :lo12:g_task_xq]
     mov w0, w12
     mov w1, w13
+    adrp x7, g_task_B
+    ldr w7, [x7, :lo12:g_task_B]
+    cmp w7, #1
+    b.gt .Lw_batch
     bl k2q4_gemv_range
+    b .Lw_done
+.Lw_batch:
+    adrp x7, g_task_rows
+    ldr w7, [x7, :lo12:g_task_rows]
+    mov x5, x4                      /* y_base (g_task_x) */
+    mov x4, x6                      /* xq_base (g_task_xq) */
+    adrp x8, g_task_B
+    ldr w6, [x8, :lo12:g_task_B]
+    bl k2q4_gemv_batch
 .Lw_done:
     adrp x1, g_done
     add x1, x1, :lo12:g_done
@@ -1425,6 +1438,9 @@ q4_gemv_dispatch:
     str x5, [x10, :lo12:g_task_y]
     adrp x10, g_task_xq
     str x6, [x10, :lo12:g_task_xq]
+    adrp x10, g_task_B
+    mov w11, #1                     /* scalar task: workers take the B=1 path */
+    str w11, [x10, :lo12:g_task_B]
     adrp x10, g_done
     str wzr, [x10, :lo12:g_done]
     adrp x10, g_gen
@@ -1452,6 +1468,527 @@ q4_gemv_dispatch:
     cmp w11, w9
     b.lt 2b
     ldr x30, [sp], #16
+    ret
+
+
+/* ---------------- memcpy_q: x0=dst, x1=src, w2=bytes (multiple of 16).
+ * Clobbers x2,x3,v0. */
+    .align 2
+memcpy_q:
+    cbz w2, 9f
+    mov x3, xzr
+0:  ldr q0, [x1, x3]
+    str q0, [x0, x3]
+    add x3, x3, #16
+    cmp x3, x2
+    b.lo 0b
+9:  ret
+
+/* ---------------- k2q4_gemv_batch:
+ *   w0=r0, w1=r1, w2=cols, x3=w, x4=xq_base, x5=y_base, w6=B, w7=rows
+ * Row-outer, token-inner: each row's Q4 bytes (<= 2880 B) are re-scanned
+ * once per token but stay in L1, so DRAM weight traffic drops ~B-fold.
+ * Every (row, token) is delegated to k2q4_gemv_range -> bit-exact by
+ * construction. Token b: xq at xq_base+b*xqs, y at y_base+b*rows*4.
+ * Saves x19-x28. */
+    .align 2
+k2q4_gemv_batch:
+    stp x29, x30, [sp, #-128]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+    /* [sp,#96] y token ptr, [sp,#104] xq token ptr, [sp,#112] b counter:
+     * k2q4_gemv_range clobbers x8-x15, so the b-loop state lives in memory */
+    mov w19, w0                     /* r0 */
+    mov w20, w1                     /* r1 */
+    mov w21, w2                     /* cols */
+    mov x22, x3                     /* w */
+    mov x23, x4                     /* xq_base */
+    mov x24, x5                     /* y_base */
+    mov w25, w6                     /* B */
+    mov w26, w7                     /* rows */
+    lsr x27, x21, #8                /* nb256 = cols/256 */
+    mov x28, #292
+    mul x27, x27, x28               /* xqs */
+    lsl x28, x26, #2                /* ystride = rows*4 */
+.Lbg_row:
+    cmp w19, w20
+    b.ge .Lbg_end
+    str x24, [sp, #96]              /* y token base: callee adds r*4 */
+    str x23, [sp, #104]
+    str wzr, [sp, #112]
+.Lbg_b:
+    ldr x5, [sp, #96]               /* y = y_b + r*4 */
+    ldr x6, [sp, #104]
+    mov w0, w19
+    add w1, w19, #1
+    mov w2, w21
+    mov x3, x22
+    mov x4, xzr
+    bl k2q4_gemv_range
+    ldr x9, [sp, #96]
+    add x9, x9, x28
+    str x9, [sp, #96]
+    ldr x9, [sp, #104]
+    add x9, x9, x27
+    str x9, [sp, #104]
+    ldr w9, [sp, #112]
+    add w9, w9, #1
+    str w9, [sp, #112]
+    cmp w9, w25
+    b.ne .Lbg_b
+    add w19, w19, #1
+    b .Lbg_row
+.Lbg_end:
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #128
+    ret
+
+/* ---------------- q4_gemv_dispatch_b: batched row-parallel dispatch.
+ *   w0=r0, w1=r1, w2=cols, x3=w, x4=xq_base, x5=y_base, w6=B, w7=rows
+ * Same pool protocol as q4_gemv_dispatch (release publish, acquire wait).
+ * Saves x30. Clobbers x9-x13. */
+    .align 2
+q4_gemv_dispatch_b:
+    adrp x9, g_nthreads
+    ldr w9, [x9, :lo12:g_nthreads]
+    cmp w9, #1
+    b.gt .Lq4bd_par
+    b k2q4_gemv_batch
+.Lq4bd_par:
+    str x30, [sp, #-16]!
+    adrp x10, g_task_r0
+    str w0, [x10, :lo12:g_task_r0]
+    adrp x10, g_task_r1
+    str w1, [x10, :lo12:g_task_r1]
+    adrp x10, g_task_cols
+    str w2, [x10, :lo12:g_task_cols]
+    adrp x10, g_task_w
+    str x3, [x10, :lo12:g_task_w]
+    adrp x10, g_task_x
+    str x5, [x10, :lo12:g_task_x]   /* y_base */
+    adrp x10, g_task_xq
+    str x4, [x10, :lo12:g_task_xq]  /* xq_base */
+    adrp x10, g_task_B
+    str w6, [x10, :lo12:g_task_B]
+    adrp x10, g_task_rows
+    str w7, [x10, :lo12:g_task_rows]
+    adrp x10, g_done
+    str wzr, [x10, :lo12:g_done]
+    adrp x10, g_gen
+    add x10, x10, :lo12:g_gen
+    ldar w11, [x10]
+    add w11, w11, #1
+    stlr w11, [x10]
+    sub w12, w1, w0
+    add w12, w12, w9
+    sub w12, w12, #1
+    udiv w12, w12, w9
+    add w13, w0, w12
+    cmp w13, w1
+    csel w13, w13, w1, lt
+    mov w1, w13
+    bl k2q4_gemv_batch
+    adrp x10, g_nthreads
+    ldr w9, [x10, :lo12:g_nthreads]
+    sub w9, w9, #1
+    adrp x10, g_done
+    add x10, x10, :lo12:g_done
+2:  ldar w11, [x10]
+    cmp w11, w9
+    b.lt 2b
+    ldr x30, [sp], #16
+    ret
+
+/* ---------------- gemvW_batch: w0=il, w1=k, x2=XB, x3=YB, w4=B.
+ * Quantizes B token activations into b_XQQB then dispatches the batched
+ * GEMV over the same rows/cols tables as gemvW. Saves x19-x28. */
+    .align 2
+gemvW_batch:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+    mov w19, w1                     /* k */
+    mov x20, x2                     /* XB */
+    mov x21, x3                     /* YB */
+    mov w22, w0                     /* il */
+    mov w23, w4                     /* B */
+    adrp x1, g_LBASE
+    ldr x2, [x1, :lo12:g_LBASE]
+    movz x0, #0x010e, lsl #16
+    movk x0, #0x3000
+    madd x2, x22, x0, x2
+    adrp x1, tbl_koff
+    add x1, x1, :lo12:tbl_koff
+    ldr x0, [x1, x19, lsl #3]
+    add x24, x2, x0                 /* w */
+    adrp x1, tbl_krows
+    add x1, x1, :lo12:tbl_krows
+    ldr w25, [x1, x19, lsl #2]      /* rows */
+    adrp x1, tbl_kcols
+    add x1, x1, :lo12:tbl_kcols
+    ldr w26, [x1, x19, lsl #2]      /* cols */
+    lsr x28, x26, #8
+    mov x9, #292
+    mul x28, x28, x9                /* xqs */
+    lsl x11, x26, #2                /* cols*4 (x10 is clobbered by q8_quant!) */
+    adrp x27, b_XQQB
+    add x27, x27, :lo12:b_XQQB
+    mov w9, wzr                     /* b */
+1:  mov x0, x20
+    mov x1, x27
+    mov w2, w26
+    bl k2_q8_quant
+    add x20, x20, x11
+    add x27, x27, x28
+    add w9, w9, #1
+    cmp w9, w23
+    b.ne 1b
+    mov w0, wzr
+    mov w1, w25
+    mov w2, w26
+    mov x3, x24
+    adrp x4, b_XQQB
+    add x4, x4, :lo12:b_XQQB
+    mov x5, x21
+    mov w6, w23
+    mov w7, w25
+    bl q4_gemv_dispatch_b
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+
+/* ---------------- head_batch: w0=B. final rms + q8_quant + batched head
+ * GEMV (rows=vocab) -> b_HEADB[token*vocab]. Saves x19-x24. */
+    .align 2
+head_batch:
+    stp x29, x30, [sp, #-64]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    mov w19, w0                     /* B */
+    mov x20, xzr                    /* b */
+    mov x21, xzr                    /* byte offset */
+1:  adrp x0, b_XB
+    add x0, x0, :lo12:b_XB
+    add x0, x0, x21
+    adrp x1, g_O_NORM
+    ldr x1, [x1, :lo12:g_O_NORM]
+    mov w2, #1536
+    adrp x3, b_XNB
+    add x3, x3, :lo12:b_XNB
+    add x3, x3, x21
+    bl rms
+    mov x9, #6144
+    add x21, x21, x9
+    add x20, x20, #1
+    cmp w20, w19
+    b.ne 1b
+    mov x20, xzr                    /* b */
+    mov x21, xzr                    /* XN offset */
+    mov x22, xzr                    /* xq offset (6*292 = 1752) */
+2:  adrp x0, b_XNB
+    add x0, x0, :lo12:b_XNB
+    add x0, x0, x21
+    adrp x1, b_XQQB
+    add x1, x1, :lo12:b_XQQB
+    add x1, x1, x22
+    mov w2, #1536
+    bl k2_q8_quant
+    mov x9, #6144
+    add x21, x21, x9
+    add x22, x22, #1752
+    add x20, x20, #1
+    cmp w20, w19
+    b.ne 2b
+    mov w0, wzr
+    adrp x1, g_vocab
+    ldr w1, [x1, :lo12:g_vocab]
+    mov w2, #1536
+    adrp x3, g_O_HEAD
+    ldr x3, [x3, :lo12:g_O_HEAD]
+    adrp x4, b_XQQB
+    add x4, x4, :lo12:b_XQQB
+    adrp x5, b_HEADB
+    add x5, x5, :lo12:b_HEADB
+    mov w6, w19
+    adrp x7, g_vocab
+    ldr w7, [x7, :lo12:g_vocab]
+    bl q4_gemv_dispatch_b
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #64
+    ret
+
+/* ---------------- layer_forward_batch: w0=il, w1=B. Batched decoder layer.
+ * Norms/rope/attention/silu stay per-token (cheap, sequential semantics);
+ * the 7 projections run as batched GEMVs. g_pos must be pos0 on entry;
+ * it is set to pos0+b for each token's attention and left at pos0+B.
+ * Saves x19-x28. */
+    .align 2
+layer_forward_batch:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+    mov w19, w0                     /* il */
+    mov w20, w1                     /* B */
+    adrp x1, g_LBASE
+    ldr x21, [x1, :lo12:g_LBASE]
+    movz x0, #0x010e, lsl #16
+    movk x0, #0x3000
+    madd x21, x19, x0, x21          /* layer base */
+    adrp x1, g_pos
+    ldr x28, [x1, :lo12:g_pos]      /* pos0 */
+    /* 1. rms per token */
+    mov x27, xzr                    /* b */
+    mov x22, xzr                    /* X offset */
+1:  adrp x0, b_XB
+    add x0, x0, :lo12:b_XB
+    add x0, x0, x22
+    mov x1, x21
+    mov w2, #1536
+    adrp x3, b_XNB
+    add x3, x3, :lo12:b_XNB
+    add x3, x3, x22
+    bl rms
+    mov x9, #6144
+    add x22, x22, x9
+    add x27, x27, #1
+    cmp w27, w20
+    b.ne 1b
+    /* 2. q,k,v batched */
+    mov w0, w19
+    mov w1, #1
+    adrp x2, b_XNB
+    add x2, x2, :lo12:b_XNB
+    adrp x3, b_QFB
+    add x3, x3, :lo12:b_QFB
+    mov w4, w20
+    bl gemvW_batch
+    mov w0, w19
+    mov w1, #2
+    adrp x2, b_XNB
+    add x2, x2, :lo12:b_XNB
+    adrp x3, b_KFB
+    add x3, x3, :lo12:b_KFB
+    mov w4, w20
+    bl gemvW_batch
+    mov w0, w19
+    mov w1, #3
+    adrp x2, b_XNB
+    add x2, x2, :lo12:b_XNB
+    adrp x3, b_VFB
+    add x3, x3, :lo12:b_VFB
+    mov w4, w20
+    bl gemvW_batch
+    /* 3. rope + KV store per token */
+    mov x27, xzr                    /* b */
+    mov x23, xzr                    /* QF offset (8192) */
+    mov x24, xzr                    /* KF offset (2048) */
+2:  add x9, x28, x27               /* g_pos = pos0 + b (rope reads it) */
+    adrp x1, g_pos
+    str x9, [x1, :lo12:g_pos]
+    adrp x0, b_QFB
+    add x0, x0, :lo12:b_QFB
+    add x0, x0, x23
+    mov w1, #32
+    bl rope
+    adrp x0, b_KFB
+    add x0, x0, :lo12:b_KFB
+    add x0, x0, x24
+    mov w1, #8
+    bl rope
+    mov x9, #3145728
+    madd x9, x19, x9, xzr
+    add x10, x28, x27               /* pos0 + b */
+    adrp x2, g_KCA
+    ldr x2, [x2, :lo12:g_KCA]
+    add x2, x2, x9
+    add x2, x2, x10, lsl #11        /* dst = KCA[layer][pos] */
+    adrp x1, b_KFB
+    add x1, x1, :lo12:b_KFB
+    add x1, x1, x24                 /* src = KFB token */
+    mov x0, x2
+    mov w2, #2048
+    bl memcpy_q
+    adrp x2, g_VCA
+    ldr x2, [x2, :lo12:g_VCA]
+    add x2, x2, x9
+    add x2, x2, x10, lsl #11
+    adrp x1, b_VFB
+    add x1, x1, :lo12:b_VFB
+    add x1, x1, x24
+    mov x0, x2
+    mov w2, #2048
+    bl memcpy_q
+    add x23, x23, #8192
+    add x24, x24, #2048
+    add x27, x27, #1
+    cmp w27, w20
+    b.ne 2b
+    /* 4. attention per token (copy Q into b_QF, result back from b_ATTO) */
+    mov x27, xzr                    /* b */
+    mov x23, xzr                    /* offset */
+3:  adrp x0, b_QF
+    add x0, x0, :lo12:b_QF
+    adrp x1, b_QFB
+    add x1, x1, :lo12:b_QFB
+    add x1, x1, x23
+    mov w2, #8192
+    bl memcpy_q
+    add x9, x28, x27
+    adrp x1, g_pos
+    str x9, [x1, :lo12:g_pos]
+    mov w0, w19
+    bl attention
+    adrp x0, b_ATTOB
+    add x0, x0, :lo12:b_ATTOB
+    add x0, x0, x23
+    adrp x1, b_ATTO
+    add x1, x1, :lo12:b_ATTO
+    mov w2, #8192
+    bl memcpy_q
+    add x23, x23, #8192
+    add x27, x27, #1
+    cmp w27, w20
+    b.ne 3b
+    /* 5. o proj + residual */
+    mov w0, w19
+    mov w1, #4
+    adrp x2, b_ATTOB
+    add x2, x2, :lo12:b_ATTOB
+    adrp x3, b_AOB
+    add x3, x3, :lo12:b_AOB
+    mov w4, w20
+    bl gemvW_batch
+    mov x27, xzr
+    mov x22, xzr
+4:  adrp x0, b_XB
+    add x0, x0, :lo12:b_XB
+    add x0, x0, x22
+    adrp x1, b_AOB
+    add x1, x1, :lo12:b_AOB
+    add x1, x1, x22
+    bl vec_add1536
+    mov x9, #6144
+    add x22, x22, x9
+    add x27, x27, #1
+    cmp w27, w20
+    b.ne 4b
+    /* 6. post rms */
+    mov x27, xzr
+    mov x22, xzr
+5:  adrp x0, b_XB
+    add x0, x0, :lo12:b_XB
+    add x0, x0, x22
+    mov x1, x21
+    movz x7, #0x43, lsl #16
+    movk x7, #0x9800
+    add x1, x1, x7
+    mov w2, #1536
+    adrp x3, b_XNB
+    add x3, x3, :lo12:b_XNB
+    add x3, x3, x22
+    bl rms
+    mov x9, #6144
+    add x22, x22, x9
+    add x27, x27, #1
+    cmp w27, w20
+    b.ne 5b
+    /* 7. gate, up */
+    mov w0, w19
+    mov w1, #6
+    adrp x2, b_XNB
+    add x2, x2, :lo12:b_XNB
+    adrp x3, b_LGB
+    add x3, x3, :lo12:b_LGB
+    mov w4, w20
+    bl gemvW_batch
+    mov w0, w19
+    mov w1, #7
+    adrp x2, b_XNB
+    add x2, x2, :lo12:b_XNB
+    adrp x3, b_LUB
+    add x3, x3, :lo12:b_LUB
+    mov w4, w20
+    bl gemvW_batch
+    /* 8. silu per token */
+    mov x27, xzr                    /* b */
+6:  mov x9, #20480
+    adrp x23, b_LGB
+    add x23, x23, :lo12:b_LGB
+    madd x23, x27, x9, x23
+    adrp x24, b_LUB
+    add x24, x24, :lo12:b_LUB
+    madd x24, x27, x9, x24
+    mov x22, #5120
+7:  ldr s10, [x23], #4
+    fneg s0, s10
+    bl expf
+    fmov s1, #1.0
+    fadd s0, s0, s1
+    fdiv s0, s10, s0
+    ldr s1, [x24]
+    fmul s0, s0, s1
+    str s0, [x24], #4
+    subs x22, x22, #1
+    b.ne 7b
+    add x27, x27, #1
+    cmp w27, w20
+    b.ne 6b
+    /* 9. down + residual */
+    mov w0, w19
+    mov w1, #8
+    adrp x2, b_LUB
+    add x2, x2, :lo12:b_LUB
+    adrp x3, b_FOB
+    add x3, x3, :lo12:b_FOB
+    mov w4, w20
+    bl gemvW_batch
+    mov x27, xzr
+    mov x22, xzr
+8:  adrp x0, b_XB
+    add x0, x0, :lo12:b_XB
+    add x0, x0, x22
+    adrp x1, b_FOB
+    add x1, x1, :lo12:b_FOB
+    add x1, x1, x22
+    bl vec_add1536
+    mov x9, #6144
+    add x22, x22, x9
+    add x27, x27, #1
+    cmp w27, w20
+    b.ne 8b
+    /* restore g_pos = pos0: the next layer reads it as its own base */
+    adrp x1, g_pos
+    str x28, [x1, :lo12:g_pos]
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
     ret
 
 /* ---------------- .data ---------------- */
@@ -1515,6 +2052,7 @@ s_logit:        .asciz " logit="
 s_gen:          .asciz "--gen"
 s_sample:       .asciz "--sample"
 s_threads:      .asciz "--threads"
+s_batch:        .asciz "--batch"
 s_nan:          .asciz "nan"
 s_inf:          .asciz "inf"
 s_ninf:         .asciz "-inf"
@@ -1547,6 +2085,18 @@ b_LG:           .skip 20480
 b_LU:           .skip 20480
 b_HEAD:         .skip 524288               /* VOCAB_MAX 131072 f32 */
 b_XQQ:          .skip 5840                 /* (5120/256)*292 */
+b_XB:           .skip 49152                /* 8 x 1536 f32 */
+b_XNB:          .skip 49152
+b_AOB:          .skip 49152
+b_FOB:          .skip 49152
+b_QFB:          .skip 65536                /* 8 x 2048 f32 */
+b_KFB:          .skip 16384                /* 8 x 512 f32 */
+b_VFB:          .skip 16384
+b_ATTOB:        .skip 65536
+b_LGB:          .skip 163840               /* 8 x 5120 f32 */
+b_LUB:          .skip 163840
+b_XQQB:         .skip 46720                /* 8 x 5840 */
+b_HEADB:        .skip 4194304              /* 8 x 131072 f32 */
 b_attsc:        .skip 6144                 /* attention sc[1536] */
 b_smpsc:        .skip 4096                 /* sampler sc[1024] */
 b_smsi:         .skip 4096                 /* sampler si[1024] */
@@ -1560,6 +2110,10 @@ g_O_HEAD:       .skip 8
 g_O_COS:        .skip 8
 g_O_SIN:        .skip 8
 g_pos:          .skip 8
+g_batch:        .skip 4                    /* prefill chunk size (1 = off) */
+g_task_B:       .skip 4
+g_task_rows:    .skip 4
+    .align 3                        /* g_RS is loaded with 64-bit ldr */
 g_RS:           .skip 8
 g_vocab:        .skip 4
 g_npos:         .skip 4
@@ -1578,7 +2132,7 @@ g_task_w:       .skip 8
 g_task_x:       .skip 8
 g_task_y:       .skip 8
 g_task_xq:      .skip 8
-    .align 6
+    .align 16                       /* 64 KiB: worker id = (sp-base)>>16 */
 b_stacks:       .skip 524288            /* 8 worker stacks x 64 KiB */
     .align 12
 b_KCAbuf:       .skip 88080384            /* 28*1536*512 f32 */
@@ -1730,6 +2284,11 @@ main:
     add x1, x1, :lo12:s_threads
     bl str_is
     cbnz w0, .Larg_threads
+    ldr x0, [x20, x21, lsl #3]
+    adrp x1, s_batch
+    add x1, x1, :lo12:s_batch
+    bl str_is
+    cbnz w0, .Larg_batch
     /* plain token -> id */
     ldr x0, [x20, x21, lsl #3]
     bl parse_i64
@@ -1806,6 +2365,22 @@ main:
     str w0, [x2, :lo12:g_nthreads]
     add x21, x21, #1
     b .Lparse
+.Larg_batch:
+    add x21, x21, #1
+    cmp x21, x19
+    b.hs .Lusage
+    ldr x0, [x20, x21, lsl #3]
+    bl parse_i64
+    cmp w0, #1
+    b.lt .Lusage
+    cmp w0, #8
+    b.le .Lbatch_clamp
+    mov w0, #8
+.Lbatch_clamp:
+    adrp x2, g_batch
+    str w0, [x2, :lo12:g_batch]
+    add x21, x21, #1
+    b .Lparse
 .Lparsedone:
     cmp w22, #0
     b.eq .Lusage                     /* need at least one prompt id */
@@ -1820,6 +2395,10 @@ main:
     mov w0, #1
 1:  bl pool_init
     mov x25, xzr                     /* step */
+    adrp x1, g_batch
+    ldr w9, [x1, :lo12:g_batch]
+    cmp w9, #1
+    b.gt .Lchunk                     /* batched prefill enabled */
 .Lloop:
     /* --- choose id --- */
     cmp x25, x24
@@ -1862,6 +2441,118 @@ main:
     add w22, w22, #1
     cmp w22, #4096
     b.hs .Lusage
+    b .Lfwd_id
+/* ---- batched prefill: process min(g_batch, n0-step) prompt tokens ---- */
+.Lchunk:
+    cmp x25, x24
+    b.hs .Lloop                      /* generation phase -> single-token path */
+    sub x9, x24, x25
+    adrp x1, g_batch
+    ldr w10, [x1, :lo12:g_batch]
+    cmp w10, #1
+    b.lt 7f
+    cmp x10, x9
+    csel x10, x10, x9, lt
+    b 8f
+7:  mov x10, x9
+8:  mov x20, x10                     /* B */
+    /* embed each token into b_XB (x22 = n0: never clobber it here) */
+    mov x21, xzr
+9:  adrp x1, b_ids
+    add x1, x1, :lo12:b_ids
+    add x2, x25, x21
+    ldr w0, [x1, x2, lsl #2]
+    bl embed
+    mov x9, #6144
+    mul x9, x21, x9
+    adrp x0, b_XB
+    add x0, x0, :lo12:b_XB
+    add x0, x0, x9
+    adrp x1, b_X
+    add x1, x1, :lo12:b_X
+    mov w2, #6144
+    bl memcpy_q
+    add x21, x21, #1
+    cmp w21, w20
+    b.ne 9b
+    adrp x1, g_pos
+    str x25, [x1, :lo12:g_pos]
+    mov x19, xzr                     /* il */
+10: mov w0, w19
+    mov w1, w20
+    bl layer_forward_batch
+    add x19, x19, #1
+    cmp x19, #28
+    b.ne 10b
+    mov w0, w20
+    bl head_batch
+    /* per-token top + print (prompt steps: EOS cannot trigger) */
+    mov x21, xzr                     /* b */
+11: adrp x1, g_vocab
+    ldr w9, [x1, :lo12:g_vocab]
+    lsl x9, x9, #2
+    mul x9, x21, x9                  /* logits offset = b*vocab*4 */
+    adrp x0, b_HEADB
+    add x0, x0, :lo12:b_HEADB
+    add x0, x0, x9
+    adrp x1, g_vocab
+    ldr w1, [x1, :lo12:g_vocab]
+    bl argmax
+    mov w27, w0
+    adrp x1, b_ids
+    add x1, x1, :lo12:b_ids
+    add x2, x25, x21
+    ldr w26, [x1, x2, lsl #2]
+    adrp x0, s_step
+    add x0, x0, :lo12:s_step
+    bl print_cstr
+    add x0, x25, x21
+    bl print_u64
+    adrp x0, s_idin
+    add x0, x0, :lo12:s_idin
+    bl print_cstr
+    mov x0, x26
+    bl print_u64
+    adrp x0, s_top
+    add x0, x0, :lo12:s_top
+    bl print_cstr
+    mov x0, x27
+    bl print_u64
+    adrp x0, s_logit
+    add x0, x0, :lo12:s_logit
+    bl print_cstr
+    adrp x1, g_vocab
+    ldr w9, [x1, :lo12:g_vocab]
+    lsl x9, x9, #2
+    mul x9, x21, x9
+    adrp x0, b_HEADB
+    add x0, x0, :lo12:b_HEADB
+    add x0, x0, x9
+    ldr s0, [x0, w27, uxtw #2]
+    bl print_f32_4
+    bl print_nl
+    add x21, x21, #1
+    cmp w21, w20
+    b.ne 11b
+    /* hand the last chunk token's logits to the single-token generation
+     * path (it argmaxes b_HEAD) */
+    adrp x1, g_vocab
+    ldr w9, [x1, :lo12:g_vocab]     /* w: g_vocab is 4 bytes */
+    lsl x9, x9, #2
+    sub x10, x20, #1
+    mul x10, x10, x9
+    adrp x0, b_HEAD
+    add x0, x0, :lo12:b_HEAD
+    adrp x1, b_HEADB
+    add x1, x1, :lo12:b_HEADB
+    add x1, x1, x10
+    mov x2, x9
+    bl memcpy_q
+    add x25, x25, x20
+    adrp x1, g_pos
+    str x25, [x1, :lo12:g_pos]
+    b .Lchunk
+
 .Lfwd_id:
     /* --- embed + 28 layers --- */
     mov w0, w26
