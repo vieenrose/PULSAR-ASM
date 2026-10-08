@@ -247,9 +247,13 @@ SPECS = {
         title="pulsar \u00b7 K2 meeting agent \u00b7 cpu",
         cmd="$ python k2_lite_driver.py prompt_ft.txt --gen 400 --temp 0.2"
             " --seed 7 --tok ./tokenizer  # LiteRT-LM q4, prefill_128+decode",
-        you="> S1 [1:02:15] \u5404\u4f4d,\u8cc7\u8a0a\u7cfb\u7d71\u9810\u7b97"
-            "\u7e3d\u5171\u7de8\u5217 1200 \u842c\u5143\u2026\uFF08\u516d\u8f49\u7a97\u53e3\uFF09",
-        tpl="prompt_ft.txt: system prompt + 6-turn window = 680 ids",
+        you="> S1 [1:02:15] \u5404\u4f4d,\u8cc7\u8a0a\u7cfb\u7d71\u9810\u7b97\u7e3d\u5171\u7de8\u5217 1200 \u842c\u5143,\u8f03\u53bb\u5e74\u589e\u52a0 300 \u842c,\u8acb\u5927\u5bb6\u78ba\u8a8d\u3002\n"
+            "> S2 [1:03:02] \u6211\u5efa\u8b70\u6539\u7528\u7dda\u4e0a\u5831\u540d,\u53ef\u4ee5\u6e1b\u5c11\u73fe\u5834\u6392\u968a\u7684\u4eba\u529b,\u5927\u6982\u80fd\u7701 80 \u842c\u5de6\u53f3\u3002\n"
+            "> S3 [1:03:40] \u7dda\u4e0a\u5831\u540d\u4e4b\u524d\u8a66\u904e,\u9577\u8f29\u53ef\u80fd\u4e0d\u6703\u7528,\u9019\u500b\u8981\u518d\u8a55\u4f30\u770b\u770b\u3002\n"
+            "> S1 [1:04:10] \u597d,\u90a3\u9810\u7b97\u6848\u5c31\u7167\u6848\u901a\u904e\u3002\u4e3b\u8fa6\u55ae\u4f4d\u8acb\u5728\u5169\u9031\u5167\u63d0\u51fa\u66f8\u9762\u5831\u544a\u3002\n"
+            "> S2 [1:05:33] \u5831\u544a\u6211\u4f86\u8ca0\u8cac,\u4e0b\u9031\u4e94\u4ee5\u524d\u4ea4\u3002\u53e6\u5916\u4e0b\u6b21\u958b\u6703\u6642\u9593\u8a02\u5728 3 \u6708 15 \u865f\u4e0b\u5348\u5169\u9ede\u3002\n"
+            "> S3 [1:06:20] \u6563\u6703\u524d\u63d0\u9192\u4e00\u4e0b,\u5834\u5730\u8cbb\u9084\u6c92\u4ed8,\u7e3d\u5171 5 \u842c\u5143,\u9019\u7b46\u8981\u8d95\u5feb\u8655\u7406\u3002",
+        tpl="system: NOTE/REVISE/NEXT \u5340\u5bf8 (1686B) + 6-turn window \u2014 680 ids total",
         response="1 [1:05:20] \u4e0b\u6703\u6642\u9593 \uff1a\uff0c \u5b89\u6392\u8207\u7e73\u6e05 \u5171 8,, \u4e94\u9810\u7b97\u8acb arrange\nNNistant\n\n\nNOT\nNOTE [1:02:15] (NUMBER) \u8cc7\u8a0a\u7cfb\u7d71\u9810\u7b97\u7e3d\u5171\u7de8\u5217 1200 \u842c\u5143\uff0c\u8f03\u53bb\u5e74\u589e\u52a0 300 \u842c\u5143\nNOTE [1:03:02] (PROPOSAL) \u5efa\u8b70\u6539\u7528\u7dda\u4e0a\u5831\u540d\uff0c\u53ef\u6e1b\u5c11\u73fe\u5834\u6392\u968a\u7684\u4eba\u529b\uff0c\u7d04\u7701 80 \u842c\u5de6\u53f3\nNOTE [1:04:10] (DECISION) \u9810\u7b97\u6848\u7167\u6848\u901a\u904e\nNOTE [1:05:33] (ACTION) S2 \u8ca0\u8cac\u4e0b\u9031\u4e94\u524d\u63d0\u51fa\u66f8\u9762\u5831\u544a\nNOTE [1:06:20] (OPEN-ISSUE) \u5834\u5730\u8cbb 5 \u842c\u5143\u5c1a\u672a\u4ed8\uff0c\u9700\u8655\u7406\nNEXT",
         status="5.5 tok/s \u00b7 temp 0.2 \u00b7 LiteRT-LM q4",
         wrap="char"),
@@ -347,8 +351,14 @@ def render(name, spec, out_dir=DOC):
                          for t in wrap(spec["sys_label"], tx, text_w, "word")]
                       + [(t, 0.0, FG)
                          for t in wrap(spec["sys_prompt"], tx, text_w, "word")])
-    you_rows = stages[-1] if not spec["you"] \
-        else stages[-1] + [(spec["you"], 0.0, PROMPT_COL)]
+    if not spec["you"]:
+        you_rows = stages[-1]
+    else:
+        # multi-line user turn (e.g. 6-turn meeting window) — wrap per line
+        you_wrapped = []
+        for para in spec["you"].split("\n"):
+            you_wrapped.extend(wrap(para, tx, text_w, "char") or [""])
+        you_rows = stages[-1] + [(t, 0.0, PROMPT_COL) for t in you_wrapped]
     stages.append(you_rows)
     tpl_rows = you_rows + [(t, 0.0, DIM)
                            for t in wrap(spec["tpl"], tx, text_w, "word")]

@@ -180,8 +180,9 @@ loops and haiku rambles under greedy, so they don't qualify. 23.3 tok/s.
 **K2-Horizon meeting agent (zh-TW)** — the same 0.9B fine-tuned for live
 meeting reading (NOTE/REVISE/NEXT protocol), run here as the published
 LiteRT-LM int4 file through stock TFLite signatures (prefill_128+decode),
-temp 0.2, seed 7. Five of five notes check out against the transcript
-(all cited times genuine); the harness stops the turn at NEXT. 5.5 tok/s.
+temp 0.2, seed 7. The clip shows the full 6-turn input window verbatim
+so every NOTE/NEXT can be checked line-by-line — all five notes cite
+genuine timestamps and the harness stops the turn at NEXT. 5.5 tok/s.
 The base model given the same window deliberates 150 tokens without
 emitting one NOTE — that behavioral gap is what the fine-tune buys.
 
