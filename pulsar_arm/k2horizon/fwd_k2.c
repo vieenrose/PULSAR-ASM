@@ -32,8 +32,13 @@
 #define CTX 512
 
 static int NL = 28;   /* overwritten by blob header, assert-equal */
+static int WTYPE = 0;     /* 0 = fp16 weights, 2 = Q4_0 blocks */
+static int HEAD_KIND = 0;
 static uint8_t *G;
-static size_t LOFF[28][9];   /* per-layer tensor offsets */
+/* per-layer tensor descriptors: byte offset, rows, cols, kind
+   (0 = fp16, 1 = fp32 norm, 2 = Q4_0). Row stride derives from kind. */
+static size_t LOFF[28][9];
+static int LROWS[28][9], LCOLS[28][9], LKIND[28][9];
 static size_t O_EMB, O_NORM, O_HEAD, O_COS, O_SIN;
 static int NPOS;
 
@@ -50,23 +55,33 @@ static void blob_load(const char *path) {
         printf("geometry mismatch\n"); exit(1);
     }
     int npos = (int)h[8];
+    WTYPE = (int)h[7];
     size_t off = 40;
-    size_t per_layer_rows[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-    /* cols per tensor kind */
-    size_t showc[9] = {0, HID, HID, HID, NHEAD * HDIM, 0, HID, HID, INTER};
     size_t showr[9] = {HID, NHEAD * HDIM, NKV * HDIM, NKV * HDIM, HID,
                        HID, INTER, INTER, HID};
-    (void)per_layer_rows;
+    size_t showc[9] = {0, HID, HID, HID, NHEAD * HDIM, 0, HID, HID, INTER};
     for (int il = 0; il < NL; il++) {
         for (int k = 0; k < 9; k++) {
+            int is_norm = (k == 0 || k == 5);
+            int kind = is_norm ? 1 : (WTYPE == 2 ? 2 : 0);
+            size_t n = showr[k] * (is_norm ? 1 : showc[k]);
+            size_t stride;
+            if (kind == 1) stride = n * 4;
+            else if (kind == 2) stride = (n / 32) * 18;
+            else stride = n * 2;
             LOFF[il][k] = off;
-            size_t n = showr[k] * (k == 0 || k == 5 ? 1 : showc[k]);
-            off += (k == 0 || k == 5) ? n * 4 : n * 2;
+            LROWS[il][k] = (int)showr[k];
+            LCOLS[il][k] = is_norm ? 0 : (int)showc[k];
+            LKIND[il][k] = kind;
+            off += stride;
         }
     }
-    O_EMB = off; off += (size_t)VOCAB * HID * 2;
+    O_EMB = off; off += (size_t)VOCAB * HID * 2;   /* embed always fp16 */
     O_NORM = off; off += HID * 4;
-    O_HEAD = off; off += (size_t)VOCAB * HID * 2;
+    O_HEAD = off;
+    HEAD_KIND = (WTYPE == 2) ? 2 : 0;
+    off += (WTYPE == 2) ? ((size_t)VOCAB * HID / 32) * 18
+                        : (size_t)VOCAB * HID * 2;
     O_COS = off; off += (size_t)npos * 32 * 4;
     O_SIN = off;
     NPOS = npos;
@@ -85,7 +100,23 @@ static float h2f(uint16_t h) {
     float r; memcpy(&r, &o, 4); return r;
 }
 
-/* reference GEMV: out[r] = sum_c h2f(W[r*cols+c]) * x[c] */
+/* GEMV dispatch: fp16 reference (wtype 0, oracle validation) vs Q4 integer
+   path (wtype 2, via Q8_K activations). XQQ sized for max cols (5120). */
+void k2q4_gemv_range(int r0, int r1, int cols, const uint8_t *w,
+                      const float *x, float *y, const uint8_t *xq);
+void k2_q8_quant(const float *x, uint8_t *yv, int64_t k);
+static void gemv_ref(const uint16_t *W, int rows, int cols, const float *x, float *y);
+static uint8_t XQQ[(5120 / 256) * 292];
+static void gemvW(int il, int k, const float *x, float *y) {
+    const uint8_t *W = G + LOFF[il][k];
+    int rows = LROWS[il][k], cols = LCOLS[il][k];
+    if (LKIND[il][k] == 2) {
+        k2_q8_quant(x, XQQ, cols);
+        k2q4_gemv_range(0, rows, cols, W, x, y, XQQ);
+    } else {
+        gemv_ref((const uint16_t *)W, rows, cols, x, y);
+    }
+}
 static void gemv_ref(const uint16_t *W, int rows, int cols, const float *x, float *y) {
     for (int r = 0; r < rows; r++) {
         double acc = 0;
@@ -201,9 +232,9 @@ int main(int argc, char **argv) {
         for (int il = 0; il < NL; il++) {
             float *anw = (float *)(G + LOFF[il][0]);
             rms(X, anw, HID, XN);
-            gemv_ref((uint16_t *)(G + LOFF[il][1]), NHEAD * HDIM, HID, XN, QF);
-            gemv_ref((uint16_t *)(G + LOFF[il][2]), NKV * HDIM, HID, XN, KF);
-            gemv_ref((uint16_t *)(G + LOFF[il][3]), NKV * HDIM, HID, XN, VF);
+            gemvW(il, 1, XN, QF);
+            gemvW(il, 2, XN, KF);
+            gemvW(il, 3, XN, VF);
             /* NeoX rope, pairs (j, j+32) of each 64-head */
             const float *C = COS + (size_t)NPOS_TOK * 32;
             const float *S = SIN + (size_t)NPOS_TOK * 32;
@@ -245,23 +276,28 @@ int main(int argc, char **argv) {
                     for (int i = 0; i < HDIM; i++) o[i] += p * Vt[i];
                 }
             }
-            gemv_ref((uint16_t *)(G + LOFF[il][4]), HID, NHEAD * HDIM, ATTO, AO);
+            gemvW(il, 4, ATTO, AO);
             for (int i = 0; i < HID; i++) X[i] += AO[i];
             float *pnw = (float *)(G + LOFF[il][5]);
             rms(X, pnw, HID, XN);
-            gemv_ref((uint16_t *)(G + LOFF[il][6]), INTER, HID, XN, LG);
-            gemv_ref((uint16_t *)(G + LOFF[il][7]), INTER, HID, XN, LU);
+            gemvW(il, 6, XN, LG);
+            gemvW(il, 7, XN, LU);
             for (int i = 0; i < INTER; i++) {
                 float g = LG[i];
                 LU[i] = (g / (1.0f + expf(-g))) * LU[i];
             }
-            gemv_ref((uint16_t *)(G + LOFF[il][8]), HID, INTER, LU, FO);
+            gemvW(il, 8, LU, FO);
             for (int i = 0; i < HID; i++) X[i] += FO[i];
             if (step == n0 - 1) TRACEL(il);
         }
         float *onw = (float *)(G + O_NORM);
         rms(X, onw, HID, XN);
-        gemv_ref((uint16_t *)(G + O_HEAD), VOCAB, HID, XN, HEAD);
+        if (HEAD_KIND == 2) {
+            k2_q8_quant(XN, XQQ, HID);
+            k2q4_gemv_range(0, VOCAB, HID, G + O_HEAD, XN, HEAD, XQQ);
+        } else {
+            gemv_ref((const uint16_t *)(G + O_HEAD), VOCAB, HID, XN, HEAD);
+        }
         int top = argmax(HEAD, VOCAB);
         printf("step %d id_in=%d top=%d logit=%.4f\n", step, id, top, HEAD[top]);
         fflush(stdout);
