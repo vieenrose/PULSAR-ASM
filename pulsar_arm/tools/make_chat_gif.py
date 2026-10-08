@@ -183,21 +183,13 @@ SPECS = {
     # what the server's own tokenizer produced for the prompt.
     "bonsai8b-en": dict(
         out="bonsai8b-chat-en.gif",
-        title="pulsar \u00b7 Ternary-Bonsai-8B \u00b7 cpu",
-        cmd="$ curl -s localhost:8091/v1/chat/completions -H"
-            " 'Content-Type: application/json' -d"
-            " '{\"messages\":[{\"role\":\"user\",\"content\":\"List the four"
-            " seasons and one thing that changes in each.\"}],\"max_tokens\":2048,"
-            " \"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}'",
+        title="pulsar \u00b7 Ternary-Bonsai-8B \u00b7 phone cpu",
+        cmd="$ adb shell \"cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.6 0.95 20 7\"",
         you="> List the four seasons and one thing that changes in each.",
         tpl="prompt ids: 151644 872 198 852 279 3040 15584 323 825 3166 429 4344"
             " 304 1817 13 151645 198 151644 77091 198 151667 271 151668 271",
-        response=("Here are the four seasons and one thing that changes in each:"
-                  "\n\n1. **Spring** \u2013 The weather warms up and flowers begin to"
-                  " bloom.  \n2. **Summer** \u2013 Days get longer and the sun is hotter."
-                  "  \n3. **Autumn (Fall)** \u2013 Leaves change color and the weather"
-                  " cools down.  \n4. **Winter** \u2013 It gets colder and snow may fall."),
-        status="9.2 tok/s \u00b7 temp 0.6 \u00b7 20 threads",
+        response=("Here are the four seasons and one thing that changes in each:\n\n1. **Spring** \u2013 Plants bloom and flowers appear.  \n2. **Summer** \u2013 The weather is warm and sunny.  \n3. **Autumn** \u2013 Leaves change color and fall from trees.  \n4. **Winter** \u2013 It snows and the weather is cold."),
+        status="4.7 tok/s \u00b7 temp 0.6 \u00b7 SD855, 4 threads",
         wrap="word"),
 
     # Ternary-Bonsai-2-27B (Qwen3.8-27B base) on the DGX Spark, CPU only,
@@ -208,76 +200,31 @@ SPECS = {
     "bonsai2-27b-en": dict(
         out="bonsai2-27b-chat-en.gif",
         title="pulsar \u00b7 Ternary-Bonsai-2-27B \u00b7 cpu",
-        cmd="$ curl -s localhost:8090/v1/chat/completions -H"
-            " 'Content-Type: application/json' -d"
-            " '{\"messages\":[{\"role\":\"user\",\"content\":\"List the four"
-            " seasons and one thing that changes in each.\"}],\"max_tokens\":2048,"
-            " \"temperature\":0.5,\"top_p\":0.85,\"top_k\":20}'",
+        cmd="$ ./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 --gen 400 --sample 0.5 0.85 20 7",
         you="> List the four seasons and one thing that changes in each.",
         tpl="prompt ids: 826 279 2943 15127 321 799 3065 421 4203 303 1754 13",
-        response=("1. **Spring** \u2013 Flowers begin to bloom and temperatures rise."
-                  "\n2. **Summer** \u2013 Daylight hours are at their longest and temperatures peak."
-                  "\n3. **Autumn (Fall)** \u2013 Leaves change color and fall from the trees."
-                  "\n4. **Winter** \u2013 Snow begins to fall and daylight hours are at their shortest."),
-        status="2.0 tok/s \u00b7 temp 0.5 \u00b7 20 threads",
+        response=("\n\n<think>\n\n</think>\n\nHere are the four seasons and one key change that occurs in each:\n\n1.  **Spring** \u2013 The temperature rises, and dormant plants begin to bud and bloom.\n2.  **Summer** \u2013 The days are at their longest, and temperatures are typically at their highest.\n3.  **Autumn (Fall)** \u2013 Leaves change color and fall from trees, and temperatures begin to drop.\n4.  **Winter** \u2013 Temperatures are at their lowest, and many areas experience snow or ice."),
+        status="7.9 tok/s \u00b7 temp 0.5 \u00b7 8 threads",
         wrap="word"),
 
     "bonsai8b-zh-tw": dict(
         out="bonsai8b-chat-zh-tw.gif",
-        title="pulsar \u00b7 Ternary-Bonsai-8B \u00b7 cpu",
-        cmd="$ curl -s localhost:8091/v1/chat/completions -H 'Content-Type: application/json' -d '{\""
-            "messages\":[{\"role\":\"user\",\"content\":\"\u8acb\u5217\u51fa\u56db\u5b63\uff0c\u4ee5"
-            "\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\u3002\"}],\"max_tokens"
-            "\":2048, \"temperature\":0.6,\"top_p\":0.95,\"top_k\":20}'",
+        title="pulsar \u00b7 Ternary-Bonsai-8B \u00b7 phone cpu",
+        cmd="$ adb shell \"cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.6 0.95 20 123\"",
         you="> \u8acb\u5217\u51fa\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\u3002",
         tpl="prompt ids: 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 271",
-        response=("\u7576\u7136\uff01\u4ee5\u4e0b\u662f\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u6703"
-                  "\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\uff1a\n\n---\n\n### **1. \u6625\uff08Spring\uff09**  "
-                  "\n**\u6539\u8b8a\u7684\u4e8b\u7269\uff1a** **\u82b1\u958b**  \n\u6625\u5929\u662f\u82b1"
-                  "\u6735\u7efd\u653e\u7684\u5b63\u7bc0\uff0c\u6a39\u6728\u958b\u59cb\u8449\u5b50\u751f\u9577"
-                  "\uff0c\u82b1\u5349\u9010\u6f38\u958b\u51fa\u3002\u9019\u6642\u81ea\u7136\u754c\u7684\u8b8a"
-                  "\u5316\u5e36\u4f86\u65b0\u9bae\u7684\u6c23\u5473\u3001\u8272\u5f69\u548c\u65b0\u9bae\u7684"
-                  "\u958b\u59cb\u3002\n\n---\n\n### **2. \u590f\uff08Summer\uff09**  \n**\u6539\u8b8a\u7684"
-                  "\u4e8b\u7269\uff1a** **\u65e5\u7167\u6642\u9593\u9577**  \n\u590f\u5929\u662f\u65e5\u7167"
-                  "\u6642\u9593\u6700\u9577\u7684\u5b63\u7bc0\uff0c\u767d\u5929\u66f4\u52a0\u6eab\u71b1\uff0c"
-                  "\u591c\u665a\u66f4\u52a0\u6dbc\u723d\u3002\u9019\u6642\u4eba\u5011\u901a\u5e38\u6703\u9078"
-                  "\u64c7\u5916\u51fa\u6d3b\u52d5\u3001\u6e38\u6cf3\u6216\u4eab\u53d7\u967d\u5149\u3002\n\n"
-                  "---\n\n### **3. \u79cb\uff08Autumn/September\uff09**  \n**\u6539\u8b8a\u7684\u4e8b\u7269"
-                  "\uff1a** **\u8449\u5b50\u8b8a\u8272**  \n\u79cb\u662f\u8449\u5b50\u8b8a\u8272\u7684\u5b63"
-                  "\u7bc0\uff0c\u6a39\u6728\u7684\u8449\u5b50\u6703\u5f9e\u7da0\u8272\u8b8a\u6210\u9ec3\u8272"
-                  "\u3001\u6a59\u8272\u6216\u7d05\u8272\uff0c\u4e26\u9010\u6f38\u843d\u4e0b\u3002\u9019\u671f"
-                  "\u9593\u7684\u6c23\u5019\u901a\u5e38\u8f03\u6dbc\uff0c\u98a8\u529b\u8f03\u5f37\u3002\n\n"
-                  "---\n\n### **4. \u51ac\uff08Winter\uff09**  \n**\u6539\u8b8a\u7684\u4e8b\u7269\uff1a** **"
-                  "\u964d\u96ea**  \n\u51ac\u5929\u662f\u51ac\u5b63\uff0c\u6c23\u6eab\u901a\u5e38\u8f03\u4f4e"
-                  "\uff0c\u5929\u6c23\u5bd2\u51b7\uff0c\u6703\u964d\u96ea\u3002\u9019\u6642\u81ea\u7136\u754c"
-                  "\u7684\u6d3b\u52d5\u6e1b\u5c11\u4e86\uff0c\u4eba\u5011\u66f4\u591a\u5730\u9078\u64c7\u5728"
-                  "\u5bb6\u4f11\u606f\u3001\u4fdd\u6696\u3002\n\n---\n\n\u5982\u679c\u4f60\u6709\u7279\u5b9a"
-                  "\u7684\u7bc4\u570d\uff08\u6bd4\u5982\u5730\u7406\u5340\u57df\u6216\u6587\u5316\u80cc\u666f"
-                  "\uff09\uff0c\u6211\u4e5f\u53ef\u4ee5\u6839\u64da\u4e0d\u540c\u5730\u65b9\u7684\u56db\u5b63"
-                  "\u8b8a\u5316\u4f86\u8abf\u6574\u9019\u4efd\u5217\u8868\u3002\u9700\u8981\u55ce\uff1f"),
-        status="9.0 tok/s \u00b7 temp 0.6 \u00b7 20 threads",
+        response=("\u7576\u7136\u53ef\u4ee5\uff01\u4ee5\u4e0b\u662f\u56db\u5b63\u4ee5\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\uff1a\n\n---\n\n### **1. \u6625\u5b63**  \n**\u6539\u8b8a\u7684\u4e8b\uff1a** **\u82b1\u958b**  \n\u6625\u5929\u662f\u82b1\u6735\u7efd\u653e\u7684\u5b63\u7bc0\uff0c\u6a39\u6728\u3001\u82b1\u8349\u9010\u6f38\u958b\u51fa\u65b0\u82bd\uff0c\u8272\u5f69\u8b8a\u5f97\u9bae\u7f8e\uff0c\u70ba\u81ea\u7136\u754c\u5e36\u4f86\u52c3\u52c3\u7684\u8272\u5f69\u8207\u751f\u547d\u3002\n\n---\n\n### **2. \u590f\u5b63**  \n**\u6539\u8b8a\u7684\u4e8b\uff1a** **\u8449\u5b50\u8b8a\u7da0**  \n\u590f\u5929\u662f\u690d\u7269\u6700\u6d3b\u8e8d\u7684\u6642\u671f\uff0c\u8449\u5b50\u5728\u967d\u5149\u4e0b\u8f49\u8b8a\u6210\u6df1\u7da0\uff0c\u70ba\u751f\u614b\u7cfb\u7d71\u63d0\u4f9b\u5927\u91cf\u7684\u98df\u7269\u8207\u6c27\u6c23\u3002\n\n---\n\n### **3. \u79cb\u5b63**  \n**\u6539\u8b8a\u7684\u4e8b\uff1a** **\u8449\u5b50\u8b8a\u8272**  \n\u79cb\u5929\uff0c\u8449\u5b50\u9010\u6f38\u6539\u8b8a\u70ba\u9ec3\u3001\u7d05\u3001\u6a59\u7b49\u8272\u5f69\uff0c\u9019\u662f\u690d\u7269\u6e96\u5099\u904e\u51ac\u7684\u904e\u7a0b\uff0c\u4e5f\u662f\u81ea\u7136\u754c\u4e2d\u6700\u7f8e\u7684\u666f\u89c0\u4e4b\u4e00\u3002\n\n---\n\n### **4. \u51ac\u5b63**  \n**\u6539\u8b8a\u7684\u4e8b\uff1a** **\u8449\u5b50\u843d\u4e0b**  \n\u51ac\u5929\uff0c\u690d\u7269\u70ba\u4e86\u7bc0\u7701\u80fd\u91cf\u800c\u6389\u4e0b\u8449\u5b50\uff0c\u6a39\u6728\u9032\u5165\u4f11\u7720\u72c0\u614b\uff0c\u70ba\u4f86\u5e74\u7684\u65b0\u751f\u6e96\u5099\u571f\u58e4\u8207\u8cc7\u6e90\u3002\n\n---\n\n\u5982\u679c\u4f60\u6709\u7279\u5b9a\u7684\u74b0\u5883\uff08\u5982\u57ce\u5e02\u3001\u68ee\u6797\u3001\u8fb2\u5834\uff09\u6216\u60f3\u4e86\u89e3\u5176\u4ed6\u65b9\u9762\uff08\u5982\u6c23\u5019\u3001\u6587\u5316\u3001\u751f\u7269\u6d3b\u52d5\uff09\u7684\u8b8a\u5316\uff0c\u6211\u4e5f\u53ef\u4ee5\u9032\u4e00\u6b65\u8aaa\u660e\uff01"),
+        status="4.0 tok/s \u00b7 temp 0.6 \u00b7 SD855, 4 threads",
         wrap="char"),
 
     "bonsai2-27b-zh-tw": dict(
         out="bonsai2-27b-chat-zh-tw.gif",
         title="pulsar \u00b7 Ternary-Bonsai-2-27B \u00b7 cpu",
-        cmd="$ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' -d '{\""
-            "messages\":[{\"role\":\"user\",\"content\":\"\u8acb\u5217\u51fa\u56db\u5b63\uff0c\u4ee5"
-            "\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\u3002\"}],\"max_tokens"
-            "\":2048, \"temperature\":0.5,\"top_p\":0.85,\"top_k\":20}'",
+        cmd="$ ./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 99270 115992 104647 3709 98404 98443 96681 96594 110476 127312 1710 --gen 400 --sample 0.5 0.85 20 123",
         you="> \u8acb\u5217\u51fa\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\u3002",
         tpl="prompt ids: 99270 115992 104647 3709 98404 98443 96681 96594 110476 127312 1710",
-        response=("# \u56db\u5b63\u53ca\u5176\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\n\n| \u5b63\u7bc0 | \u6703"
-                  "\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b |\n|------|----------------|\n| **\u6625\u5b63** | "
-                  "\u82b1\u6703**\u76db\u958b**\uff0c\u8349\u5730\u7531\u67af\u9ec3\u8f49\u70ba\u7fe0\u7da0 |"
-                  "\n| **\u590f\u5b63** | \u767d\u5929\u7684\u6642\u9593\u8b8a**\u9577**\uff0c\u65e5\u7167"
-                  "\u6642\u9593\u6700\u9577 |\n| **\u79cb\u5b63** | \u6a39\u8449\u7531\u7da0\u8f49\u70ba**"
-                  "\u9ec3\u3001\u7d05\u3001\u91d1**\u8272\uff0c\u958b\u59cb\u812b\u843d |\n| **\u51ac\u5b63"
-                  "** | \u8349\u548c\u6a39\u6728**\u67af\u840e\u6216\u843d\u8449**\uff0c\u842c\u7269\u8f49"
-                  "\u70ba\u856d\u745f |\n\n\u7c21\u55ae\u4f86\u8aaa\uff0c\u56db\u5b63\u6700\u660e\u986f\u7684"
-                  "\u8b8a\u5316\u5c31\u662f**\u690d\u7269\u7684\u72c0\u614b**\uff1a\u751f\u9577 \u2192 \u7e41"
-                  "\u76db \u2192 \u8870\u8001 \u2192 \u4f11\u7720\uff0c\u5faa\u74b0\u4e0d\u606f\u3002"),
-        status="2.0 tok/s \u00b7 temp 0.5 \u00b7 20 threads",
+        response=("\n\n<think>\n\u7528\u6237\u8981\u6c42\u5217\u51fa\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u4f1a\u6539\u53d8\u7684\u4e00\u4ef6\u4e8b\u3002\u8fd9\u662f\u4e00\u4e2a\u7b80\u5355\u7684\u77e5\u8bc6\u6027\u95ee\u9898\u3002\n\n\u56db\u5b63\uff1a\u6625\u3001\u590f\u3001\u79cb\u3001\u51ac\n\n\u6bcf\u4e00\u5b63\u4f1a\u6539\u53d8\u7684\u4e00\u4ef6\u4e8b\uff0c\u6211\u53ef\u4ee5\u4ece\u81ea\u7136\u73b0\u8c61\u3001\u6c14\u5019\u3001\u690d\u7269\u3001\u52a8\u7269\u884c\u4e3a\u7b49\u65b9\u9762\u6765\u8003\u8651\uff1a\n\n- \u6625\u5929\uff1a\u6c14\u6e29\u56de\u5347\uff0c\u690d\u7269\u53d1\u82bd/\u5f00\u82b1\n- \u590f\u5929\uff1a\u65e5\u7167\u65f6\u95f4\u53d8\u957f\uff0c\u6c14\u6e29\u5347\u9ad8\n- \u79cb\u5929\uff1a\u6811\u53f6\u53d8\u9ec4/\u843d\u53f6\n- \u51ac\u5929\uff1a\u6c14\u6e29\u4e0b\u964d\uff0c\u53ef\u80fd\u964d\u96ea\n\n\u6211\u9009\u62e9\u6bcf\u5b63\u4e00\u4e2a\u6700\u5178\u578b\u3001\u6700\u76f4\u89c2\u7684\u53d8\u5316\uff1a\n- \u6625\uff1a\u690d\u7269\u53d1\u82bd\u3001\u5f00\u82b1\n- \u590f\uff1a\u65e5\u7167\u65f6\u95f4\u53d8\u957f\uff08\u6216\u6c14\u6e29\u5347\u9ad8\uff09\n- \u79cb\uff1a\u6811\u53f6\u53d8\u8272\u3001\u843d\u53f6\n- \u51ac\uff1a\u6c14\u6e29\u4e0b\u964d\u3001\u964d\u96ea\n\n\u6211\u9009\u62e9\u6bd4\u8f83\u6709\u753b\u9762\u611f\u4e14\u660e\u786e\u7684\uff1a\n- \u6625\uff1a\u690d\u7269\u4ece\u82bd\u53d8\u5230\u5f00\u82b1\n- \u590f\uff1a\u767d\u5929\u53d8\u957f\uff08\u65e5\u7167\u65f6\u95f4\u589e\u52a0\uff09\n- \u79cb\uff1a\u6811\u53f6\u7531\u7eff\u53d8\u9ec4\u518d\u843d\u53f6\n- \u51ac\uff1a\u5929\u7a7a\u4ece\u6674\u6717\u53d8\u4e3a\u591a\u96ea\uff08\u6216\u6c14\u6e29\u663e\u8457\u4e0b\u964d\uff09\n\n\u8ba9\u6211\u7b80\u6d01\u6e05\u6670\u5730\u56de\u7b54\u3002\n</think>\n\n## \u56db\u5b63\u53ca\u5176\u53d8\u5316\n\n| \u5b63 | \u4ee3\u8868\u53d8\u5316 |\n|---|---|\n| **\u6625** | \u690d\u7269\u53d1\u82bd\u3001\u5f00\u82b1\uff0c\u5927\u5730\u7531\u67af\u8f6c\u7eff |\n| **\u590f** | \u65e5\u7167\u65f6\u95f4\u53d8\u957f\uff0c\u767d\u5929\u9010\u6e10\u5ef6\u957f |\n| **\u79cb** | \u6811\u53f6\u7531\u7eff\u8f6c\u9ec4\u3001\u7ea2\uff0c\u7ee7\u800c\u98d8\u843d |\n| **\u51ac** | \u6c14\u6e29\u9aa4\u964d\uff0c\u5929\u7a7a\u5f00\u59cb\u964d\u96ea |\n\n> \u7b80\u5355\u8bf4\uff1a\u6625\u662f**\u751f**\uff0c\u590f\u662f**\u957f**\uff0c\u79cb\u662f**\u843d**\uff0c\u51ac\u662f**\u85cf**\u2014\u2014\u81ea\u7136\u4ee5\u8fd9\u56db\u4ef6\u4e8b\u6807\u8bb0\u65f6\u95f4\u7684\u6d41\u8f6c\u3002"),
+        status="7.5 tok/s \u00b7 temp 0.5 \u00b7 8 threads",
         wrap="char"),
 }
 

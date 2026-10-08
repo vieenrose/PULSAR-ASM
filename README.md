@@ -15,8 +15,8 @@ the GGUF header so one binary covers each family:
 
 | checkpoint | hidden | intermediate | layers | bytes | decode |
 |---|---|---|---|---|---|
-| `Ternary-Bonsai-2-27B-PTQ1_0` | 5120 | 17408 | 64 | 7.21 GB | **~0.75 s/token** (1.3 tok/s, 20 threads) |
-| `Ternary-Bonsai-8B-PQ2_0` | 4096 | 12288 | 36 | 2.18 GB | faster (single core suffices for clips) |
+| `Ternary-Bonsai-2-27B-PTQ1_0` | 5120 | 17408 | 64 | 5.95 GB | **~0.10 s/token** (9.7 tok/s decode, 8 threads) |
+| `Ternary-Bonsai-8B-PQ2_0` | 4096 | 12288 | 36 | 2.18 GB | **~35 ms/token** (28 tok/s, 6 threads; ~0.21 s/token on a phone) |
 
 Three gemma checkpoints run unmodified on the Pi engine, which reads its
 dimensions from the safetensors header, so one binary covers all of them:
@@ -120,45 +120,50 @@ typeface — DejaVu Sans Mono, with WenQuanYi Zen Hei used only for the CJK
 glyphs DejaVu lacks, at the same size and line height. Only pacing is
 libertied. The set opens with Bonsai — ternary checkpoints, each shown in
 English and Traditional Chinese on the same four-seasons ceiling prompt the
-gemma clips use. Those four clips run the reference runtime (note under them);
-everything after is the asm engine's own bytes on the Pi.
+gemma clips use. Those four clips are the engines' own bytes (notes under
+them); everything after is the asm engine's own bytes on the Pi.
 
-**Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, 9.2 tok/s, Qwen3
-sampling (temp 0.6, top-p 0.95, top-k 20). 2.18 GB.
+**Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, Qwen3
+sampling (temp 0.6, top-p 0.95, top-k 20). 2.18 GB. These two clips are
+the native engine (`pulsar_arm/bonsai2/`), running on a phone — Galaxy
+Note 10+ (Snapdragon 855), 4 big cores, no GPU: 4.7 tok/s en, 4.0 tok/s
+zh-TW. The same seeds rerun byte-identical on the Spark, so the
+transcripts below are both machines' bytes at once.
 
 ![Bonsai 8B chat demo](doc/bonsai8b-chat-en.gif)
 ![Bonsai 8B chat demo, Traditional Chinese](doc/bonsai8b-chat-zh-tw.gif)
 
 ```sh
-llama-server -m Ternary-Bonsai-8B-PQ2_0.gguf -c 65536 -t 20 --port 8091 &
-curl -s localhost:8091/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"List the four seasons and one thing that changes in each."}],"max_tokens":2048,"temperature":0.6,"top_p":0.95,"top_k":20}'
+adb shell "cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 ... --gen 400 --sample 0.6 0.95 20 7"  # en
+adb shell "cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 ... --gen 400 --sample 0.6 0.95 20 123"  # zh-TW
 ```
 
 **Ternary-Bonsai-2-27B** — 1.72 bits/weight end to end, Qwen3.8-27B base,
-2.0 tok/s, card config (temp 0.5, top-p 0.85, top-k 20). 7.21 GB.
+card config (temp 0.5, top-p 0.85, top-k 20). 5.95 GB PTQ1_0. These two
+clips are the native engine too, on the DGX Spark CPU-only, 8 threads:
+7.9 tok/s en, 7.5 tok/s zh-TW.
 
 ![Bonsai 2 27B chat demo](doc/bonsai2-27b-chat-en.gif)
 ![Bonsai 2 27B chat demo, Traditional Chinese](doc/bonsai2-27b-chat-zh-tw.gif)
 
 ```sh
-llama-server -m Ternary-Bonsai-2-27B-PQ2_0.gguf -c 65536 -t 20 --port 8090 &
-curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"List the four seasons and one thing that changes in each."}],"max_tokens":2048,"temperature":0.5,"top_p":0.85,"top_k":20}'
+./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 ... --gen 400 --sample 0.5 0.85 20 7  # en
+./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 99270 115992 ... --gen 400 --sample 0.5 0.85 20 123  # zh-TW
 ```
 
-Both Bonsai clips run the PrismML checkpoints in `llama.cpp` (their fork,
-needed for the `Q2_0`/`PQ2_0` ternary types), 20 CPU threads on a DGX Spark —
-GPU utilisation 0%. They are **not** PULSAR-ASM output yet: the four clips
-below predate the native port, which now lives in `pulsar_arm/bonsai2/` and
-reproduces the reference server token for token (greedy) — engine-native
-re-renders of these same four prompts replace them. The Bonsai 1.7B/4B
+All four Bonsai clips are PULSAR-ASM engine bytes end to end (the
+predecessor set ran the PrismML `llama.cpp` fork and is superseded): the
+27B engine reproduces the fork server token for token at temp 0 (20/20 on
+the probe prompt), the 8B phone binary reproduces the Spark engine
+bit-for-bit including logits, and every clip reruns deterministically
+from the seeded command shown in its title card. The Bonsai 1.7B/4B
 checkpoints were evaluated and set aside over output quality. Both
 responses and prompt ids are literals from those runs and re-render with the
 same `make_chat_gif.py` command as the gemma clips below. The Traditional
 Chinese clips ask the same four-seasons question; the 27B answers with a
-compact table (2.0 tok/s), while the 8B gives a longer four-section list
-(9.0 tok/s) — each checkpoint's best zh-TW sample at its usual sampling.
+compact table (7.5 tok/s) including its reasoning trace, while the 8B gives
+a longer four-section list (4.0 tok/s) — each checkpoint's seeded sample
+at its usual sampling, phone-shot for the 8B.
 
 **gemma-3-1b-it** — each clip uses the most complex prompt the checkpoint
 answers *correctly* (a four-item structured list, and a three-item one in
