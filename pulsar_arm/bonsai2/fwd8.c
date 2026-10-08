@@ -37,7 +37,53 @@
 #define YARN_ORIG 16384
 #define FREQ_BASE 1000000.0f
 
+#ifndef STANDALONE
 void quantize_row_q8_K(const float * x, void * y, int64_t k);
+#endif
+/* Self-contained q8_K activation quantizer: textually identical to the
+   fork's quantize_row_q8_K_ref + nearest_int (and the arm arch file just
+   forwards to the ref), so the engine links no libggml on Android.
+   Verified byte-for-byte against the library on random and real data. */
+static inline int nearest_int(float fval) {
+    float val = fval + 12582912.f;
+    int i; memcpy(&i, &val, sizeof(int));
+    return (i & 0x007fffff) - 0x00400000;
+}
+static void q8_K_quant(const float *x, uint8_t *yv, int64_t k) {
+    const int nb = (int)(k / 256);
+    for (int i = 0; i < nb; i++) {
+        float max = 0, amax = 0;
+        for (int j = 0; j < 256; ++j) {
+            float ax = fabsf(x[j]);
+            if (ax > amax) { amax = ax; max = x[j]; }
+        }
+        uint8_t *yb = yv + (size_t)i * 292;
+        int8_t *qs = (int8_t *)(yb + 4);
+        int16_t *bsums = (int16_t *)(yb + 4 + 256);
+        if (!amax) {
+            /* the fork zeroes only d and qs here, leaving bsums stale; the
+               kernel never reads bsums, but matching it exactly is what makes
+               the byte-for-byte verification against the library meaningful */
+            memset(yb, 0, 4);
+            memset(yb + 4, 0, 256);
+            x += 256;
+            continue;
+        }
+        const float iscale = -127.f / max;
+        for (int j = 0; j < 256; ++j) {
+            int v = nearest_int(iscale * x[j]);
+            qs[j] = (int8_t)(v < 127 ? v : 127);   /* MIN(127, v) */
+        }
+        for (int j = 0; j < 16; ++j) {
+            int sum = 0;
+            for (int ii = 0; ii < 16; ++ii) sum += qs[j * 16 + ii];
+            bsums[j] = (int16_t)sum;
+        }
+        float d = 1.0f / iscale;
+        memcpy(yb, &d, 4);
+        x += 256;
+    }
+}
 void pq2_gemv(int rows, int cols, const uint8_t *w, const float *x, float *y,
               const uint8_t *xq);
 
@@ -130,7 +176,7 @@ static void dec_row(const uint8_t *W, int row, int cols, float *o) {
 
 static uint8_t *XQ;   /* (12288/256)*292 max */
 static void gemvP(const uint8_t *W, int rows, int K, const float *x, float *y) {
-    quantize_row_q8_K(x, XQ, K);
+    q8_K_quant(x, XQ, K);
     pq2_gemv(rows, K, W, x, y, XQ);
 }
 

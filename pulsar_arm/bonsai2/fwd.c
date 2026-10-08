@@ -37,9 +37,11 @@
 #define ZW 6144
 #define CTX 512
 
+#ifndef STANDALONE
 void quantize_row_q8_0(const float * x, void * y, int64_t k);
 void ggml_vec_dot_ptq1_0_q8_0(int n, float * s, size_t bs, const void * vx,
                               size_t bx, const void * vy, size_t by, int nrc);
+#endif
 static int XCHECK = 0;
 void tq_gemv_neon(int rows, int cols, const uint8_t *w, const float *x,
                   float *y, const uint8_t *xq);
@@ -240,14 +242,58 @@ static void load_sign(const char *path, float **o, int n) {
     fclose(f);
 }
 
+/* Self-contained q8_0 activation quantizer: textually identical to ggml's
+   quantize_row_q8_0_ref + ggml_compute_fp32_to_fp16 so the engine links no
+   libggml (needed to run on Android, which has no ggml build). Verified
+   byte-for-byte against the library on random and real activations. */
+static inline uint32_t f32bits(float f) { uint32_t w; memcpy(&w, &f, 4); return w; }
+static inline float bitsf32(uint32_t w) { float f; memcpy(&f, &w, 4); return f; }
+/* ggml_compute_fp32_to_fp16: branch-free round-to-nearest-even */
+static inline uint16_t gp16(float f) {
+    const float scale_to_inf = 0x1.0p+112f;
+    const float scale_to_zero = 0x1.0p-110f;
+    float base = (fabsf(f) * scale_to_inf) * scale_to_zero;
+    const uint32_t w = f32bits(f);
+    const uint32_t shl1_w = w + w;
+    const uint32_t sign = w & 0x80000000u;
+    uint32_t bias = shl1_w & 0xFF000000u;
+    if (bias < 0x71000000u) bias = 0x71000000u;
+    base = bitsf32((bias >> 1) + 0x07800000u) + base;
+    const uint32_t bits = f32bits(base);
+    const uint32_t exp_bits = (bits >> 13) & 0x00007C00u;
+    const uint32_t mantissa_bits = bits & 0x00000FFFu;
+    const uint32_t nonsign = exp_bits + mantissa_bits;
+    return (uint16_t)((sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign));
+}
+static void q8_0_quant(const float *x, uint8_t *y, int K) {
+    int nb = K / 32;
+    for (int i = 0; i < nb; i++) {
+        const float *xb = x + (size_t)i * 32;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            const float v = fabsf(xb[j]);
+            amax = (amax > v) ? amax : v;   /* ggml MAX() order, NaN-exact */
+        }
+        const float d = amax / 127.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        const uint16_t h = gp16(d);
+        y[(size_t)i * 34] = (uint8_t)(h & 0xffu);
+        y[(size_t)i * 34 + 1] = (uint8_t)(h >> 8);
+        for (int j = 0; j < 32; j++) y[(size_t)i * 34 + 2 + j] = (int8_t)roundf(xb[j] * id);
+    }
+}
+
 /* activation transform: x * signs -> FWHT/1024 -> Q8 (mirrors build_lora_mm) */
 static uint8_t *XQ;   /* max (248320/32)*34 */
 static float *TT;     /* max 248320 */
 static void xform(const float *x, int K, const float *sgn, uint8_t *xq) {
     for (int i = 0; i < K; i++) TT[i] = x[i] * sgn[i];
     for (int b = 0; b < K / 1024; b++) fwht1024_f32(TT + b * 1024);
-    quantize_row_q8_0(TT, xq, K);
+    q8_0_quant(TT, xq, K);
 }
+/* --xcheck reference: needs libggml, so it is compiled out of the
+   standalone (Android) build. gemvT is not on any forward path. */
+#ifndef STANDALONE
 static void gemvT(const uint8_t *W, int rows, int K, const float *sgn,
                   const float *x, float *y) {
     xform(x, K, sgn, XQ);
@@ -267,6 +313,7 @@ static void gemvT(const uint8_t *W, int rows, int K, const float *sgn,
         ncall++;
     }
 }
+#endif
 /* transposed-weight path: same xform, sdot-only dot over cached s8 rows */
 static void gemvS(const char *name, int rows, int K, const float *sgn,
                   const float *x, float *y) {

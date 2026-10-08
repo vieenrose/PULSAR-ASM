@@ -192,6 +192,9 @@ static uint8_t XQ[(COLS / 32) * 34];
 
 extern void fwht1024_f32(float * x);
 
+/* self-test harness: needs libggml, so it is compiled out of the standalone
+   (Android) build, which only wants the kernels from this file */
+#ifndef STANDALONE
 int main(int argc, char **argv) {
     const char *path = argv[1];
     long ds = atol(argv[2]), off = atol(argv[3]);
@@ -239,3 +242,4 @@ int main(int argc, char **argv) {
     free(sgn);
     return 0;
 }
+#endif
