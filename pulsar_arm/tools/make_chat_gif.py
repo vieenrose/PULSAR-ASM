@@ -127,7 +127,11 @@ SPECS = {
             "\u91cf\u5b50\u529b\u5b78\u3002",
         tpl="tpl: 19 105 2364 107 239230 237105 122100 238360 185411 26549 "
             "237026 199311 237473 238432 236924 106 107 105 4368 107",
-        response="NOTE [1:02:15] (NUMBER) 資訊系統預算總額 1200 萬元\nNOTE [1:03:02] (PROPOSAL) 建議改用線上報名，減少現場排隊約 80 萬左右\nNOTE [1:04:10] (DECISION) 預算案照案通過\nNOTE [1:05:33] (ACTION) 報告負責人下週五前交書面報告\nNOTE [1:06:20] (OPEN-ISSUE) 場地費 5 萬元尚未付，需儘速處理\nNEXT",
+        response="\u91cf\u5b50\u529b\u5b78\u662f\u6307\u5728\u7269\u7406\u5b78"
+                 "\u4e2d\uff0c\u63cf\u8ff0\u548c\u89e3\u91cb\u5fae\u89a5\u4e16"
+                 "\u754c\u7684\u7c92\u5b50\u548c\u5b83\u5011\u7684\u76f8\u4e92"
+                 "\u4f5c\u7528\uff0c\u4e26\u95dc\u91cb\u91cf\u5b50\u529b\u5b78"
+                 "\u7684\u539f\u7406\u3002",
         status=CHAT_TW, wrap="char"),
 
     "fc-en": dict(
@@ -259,6 +263,23 @@ SPECS = {
         response="1 [1:05:20] \u4e0b\u6703\u6642\u9593 \uff1a\uff0c \u5b89\u6392\u8207\u7e73\u6e05 \u5171 8,, \u4e94\u9810\u7b97\u8acb arrange\nNNistant\n\n\nNOT\nNOTE [1:02:15] (NUMBER) \u8cc7\u8a0a\u7cfb\u7d71\u9810\u7b97\u7e3d\u5171\u7de8\u5217 1200 \u842c\u5143\uff0c\u8f03\u53bb\u5e74\u589e\u52a0 300 \u842c\u5143\nNOTE [1:03:02] (PROPOSAL) \u5efa\u8b70\u6539\u7528\u7dda\u4e0a\u5831\u540d\uff0c\u53ef\u6e1b\u5c11\u73fe\u5834\u6392\u968a\u7684\u4eba\u529b\uff0c\u7d04\u7701 80 \u842c\u5de6\u53f3\nNOTE [1:04:10] (DECISION) \u9810\u7b97\u6848\u7167\u6848\u901a\u904e\nNOTE [1:05:33] (ACTION) S2 \u8ca0\u8cac\u4e0b\u9031\u4e94\u524d\u63d0\u51fa\u66f8\u9762\u5831\u544a\nNOTE [1:06:20] (OPEN-ISSUE) \u5834\u5730\u8cbb 5 \u842c\u5143\u5c1a\u672a\u4ed8\uff0c\u9700\u8655\u7406\nNEXT",
         status="3.2 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
         wrap="char"),
+
+    # ---- one GIF per model: English and zh-TW side by side ----
+    "bonsai8b-chat": dict(
+        out="bonsai8b-chat-en-zh.gif",
+        panes=("bonsai8b-en", "bonsai8b-zh-tw")),
+    "bonsai2-27b-chat": dict(
+        out="bonsai2-27b-chat-en-zh.gif",
+        panes=("bonsai2-27b-en", "bonsai2-27b-zh-tw")),
+    "1b-chat": dict(
+        out="gemma3-1b-chat-en-zh.gif",
+        panes=("1b-en", "1b-zh-tw")),
+    "270m-chat": dict(
+        out="gemma3-270m-chat-en-zh.gif",
+        panes=("en", "zh-tw")),
+    "fc-toolcall": dict(
+        out="functiongemma-toolcall-en-zh.gif",
+        panes=("fc-en", "fc-zh-tw")),
 }
 
 
@@ -338,13 +359,14 @@ def wrap(text, tx, width, mode):
     return out
 
 
-def render(name, spec, out_dir=DOC):
-    w, h = 1100, 560
-    tx = Text()
-    pad, top = 26, 62
-    text_w = w - 2 * pad
-    mid_px = tx.length("model> ")
+W, H = 1100, 560          # one pane
+PAD, TOP, FPS, GAP = 26, 62, 14, 14
 
+
+def _plan(spec, tx, h=None):
+    """Frame descriptors for one pane: list of (rows, status, cursor)."""
+    text_w = W - 2 * PAD
+    mid_px = tx.length("model> ")
     head = [(t, 0.0, DIM) for t in wrap(spec["cmd"], tx, text_w, "word")]
     stages = [head]
     if spec.get("sys_prompt"):
@@ -356,7 +378,7 @@ def render(name, spec, out_dir=DOC):
     if not spec["you"]:
         you_rows = stages[-1]
     else:
-        # multi-line user turn (e.g. 6-turn meeting window) — wrap per line
+        # multi-line user turn (e.g. 6-turn meeting window) - wrap per line
         you_wrapped = []
         for para in spec["you"].split("\n"):
             you_wrapped.extend(wrap(para, tx, text_w, "char") or [""])
@@ -367,9 +389,11 @@ def render(name, spec, out_dir=DOC):
 
     full = wrap(spec["response"], tx, text_w - mid_px, spec["wrap"])
     # the 270m canvas, enlarged only if a transcript needs the room (the FC
-    # clips show the whole tool schema)
-    h = max(h, top + (len(tpl_rows) + 1 + len(full)) * LH + 46 + 8)
-    available = (h - 46 - top) // LH      # rows that fit above the status bar
+    # clips show the whole tool schema); a pair forces both panes to one h so
+    # the status bars line up.
+    if h is None:
+        h = max(H, TOP + (len(tpl_rows) + 1 + len(full)) * LH + 46 + 8)
+    available = (h - 46 - TOP) // LH      # rows that fit above the status bar
 
     def compose(body):
         rows = tpl_rows + [("", 0.0, FG)] + body
@@ -378,34 +402,12 @@ def render(name, spec, out_dir=DOC):
             rows = rows[:keep] + rows[len(rows) - (available - keep):]
         return rows
 
-    tmp = tempfile.mkdtemp(prefix="pulsar_demo")
-    img = Image.new("RGB", (w, h), BG)
-    d = ImageDraw.Draw(img)
-
-    def frame(rows, status, cursor):
-        d.rectangle([0, 0, w, h], fill=BG)
-        d.rounded_rectangle([10, 10, w - 10, 44], 8, outline="#242a38", width=1)
-        for i, c in enumerate(("#f7768e", "#e0af68", CMD_OK)):
-            d.ellipse([26 + i * 22, 22, 40 + i * 22, 36], fill=c)
-        tx.draw(d, (150, 19), spec["title"], DIM)
-        y = top
-        for text, xoff, col in rows:
-            if text:
-                tx.draw(d, (pad + xoff, y), text, col)
-            y += LH
-        if cursor and rows:
-            text, xoff, _ = rows[-1]
-            tx.draw(d, (pad + xoff + tx.length(text), y - LH), "\u2588", FG)
-        d.line([pad, h - 46, w - pad, h - 46], fill="#242a38", width=1)
-        tx.draw(d, (pad, h - 38), status, DIM)
-        img.save(os.path.join(tmp, f"f{len(os.listdir(tmp)):04d}.png"))
-
-    fps = 14
-    for _ in range(fps):
-        frame(head + [("", 0.0, FG)], "loading engine", False)
+    frames = []
+    for _ in range(FPS):
+        frames.append((head + [("", 0.0, FG)], "loading engine", False))
     for st in stages[1:]:
-        for _ in range(fps // 2):
-            frame(st + [("", 0.0, FG)], "prefill", False)
+        for _ in range(FPS // 2):
+            frames.append((st + [("", 0.0, FG)], "prefill", False))
 
     units = spec["response"].split(" ") if spec["wrap"] == "word" \
         else list(spec["response"])
@@ -416,14 +418,52 @@ def render(name, spec, out_dir=DOC):
         body = [("model> " + blines[0], 0.0, FG)] + \
                [(t, mid_px, FG) for t in blines[1:]]
         for f in range(2):
-            frame(compose(body), spec["status"], f == 1)
+            frames.append((compose(body), spec["status"], f == 1))
     body = [("model> " + full[0], 0.0, FG)] + [(t, mid_px, FG)
                                                for t in full[1:]]
-    for _ in range(3 * fps):
-        frame(compose(body), spec["status"], False)
+    for _ in range(3 * FPS):
+        frames.append((compose(body), spec["status"], False))
+    return frames, h
 
+
+def _draw_pane(d, tx, spec, fr, x0, w, h):
+    rows, status, cursor = fr
+    d.rounded_rectangle([x0 + 10, 10, x0 + w - 10, 44], 8,
+                        outline="#242a38", width=1)
+    for i, c in enumerate(("#f7768e", "#e0af68", CMD_OK)):
+        d.ellipse([x0 + 26 + i * 22, 22, x0 + 40 + i * 22, 36], fill=c)
+    tx.draw(d, (x0 + 150, 19), spec["title"], DIM)
+    y = TOP
+    for text, xoff, col in rows:
+        if text:
+            tx.draw(d, (x0 + PAD + xoff, y), text, col)
+        y += LH
+    if cursor and rows:
+        text, xoff, _ = rows[-1]
+        tx.draw(d, (x0 + PAD + xoff + tx.length(text), y - LH), "\u2588", FG)
+    d.line([x0 + PAD, h - 46, x0 + w - PAD, h - 46], fill="#242a38", width=1)
+    tx.draw(d, (x0 + PAD, h - 38), status, DIM)
+
+
+def _emit(name, spec, panes, w, h, out_dir, tx):
+    """panes: [(spec, frames)] drawn left to right; the shorter pane is
+    resampled onto the longer timeline so both finish together (pacing is the
+    one liberty this renderer takes)."""
+    tmp = tempfile.mkdtemp(prefix="pulsar_demo")
+    img = Image.new("RGB", (w, h), BG)
+    d = ImageDraw.Draw(img)
+    n = max(len(f) for _, f in panes)
+    for i in range(n):
+        d.rectangle([0, 0, w, h], fill=BG)
+        x0 = 0
+        for pspec, frames in panes:
+            j = (i if len(frames) == n else
+                 min(len(frames) - 1, round(i * (len(frames) - 1) / (n - 1))))
+            _draw_pane(d, tx, pspec, frames[j], x0, W, h)
+            x0 += W + GAP
+        img.save(os.path.join(tmp, f"f{i:04d}.png"))
     out = os.path.join(out_dir, spec["out"])
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(FPS),
                     "-i", os.path.join(tmp, "f%04d.png"),
                     "-vf", "split[s0][s1];[s0]palettegen=stats_mode=diff[pal];"
                     "[s1][pal]paletteuse=dither=bayer:bayer_scale=4",
@@ -432,13 +472,32 @@ def render(name, spec, out_dir=DOC):
     print(f"{name}: {out} ({os.path.getsize(out)/1e6:.2f} MB)")
 
 
+def render(name, spec, out_dir=DOC):
+    tx = Text()
+    frames, h = _plan(spec, tx)
+    _emit(name, spec, [(spec, frames)], W, h, out_dir, tx)
+
+
+def render_pair(name, spec, out_dir=DOC):
+    tx = Text()
+    subs = [SPECS[k] for k in spec["panes"]]
+    h = max(_plan(sp, tx)[1] for sp in subs)
+    panes = [(sp, _plan(sp, tx, h=h)[0]) for sp in subs]
+    w = len(subs) * W + (len(subs) - 1) * GAP
+    _emit(name, spec, panes, w, h, out_dir, tx)
+
+
 def main():
     names = sys.argv[1:] or list(SPECS)
     for n in names:
         if n not in SPECS:
             sys.exit(f"unknown spec {n!r}; choose from {', '.join(SPECS)}")
     for n in names:
-        render(n, SPECS[n])
+        spec = SPECS[n]
+        if spec.get("panes"):
+            render_pair(n, spec)
+        else:
+            render(n, spec)
 
 
 if __name__ == "__main__":

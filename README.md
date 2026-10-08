@@ -110,133 +110,116 @@ against HF, and every run prints its prefill ids as `tpl:` for transparency.
 
 ## Demos
 
-Real runs, nothing re-typed: prompt, `tpl:` ids and response are the engine's
-own bytes, the status bar carries that session's measured rate, and the amber
-`>` line is the user turn (in the FunctionGemma clips it is the user message
-inside the prompt file — file mode does not echo it, so the status bar names
-the file). The two FunctionGemma clips also show the system turn verbatim, i.e.
-where the tool is defined. All frames share one font size (17) and one
-typeface — DejaVu Sans Mono, with WenQuanYi Zen Hei used only for the CJK
-glyphs DejaVu lacks, at the same size and line height. Only pacing is
-libertied. The set opens with Bonsai — ternary checkpoints, each shown in
-English and Traditional Chinese on the same four-seasons ceiling prompt the
-gemma clips use. Those four clips are the engines' own bytes (notes under
-them); everything after is the same asm engine's own bytes — the K2-Horizon
-pair on the phone, the gemma and FunctionGemma clips on the Pi.
+Every frame is a real run: prompt, `tpl:` ids and response are the engine's own
+bytes, and the status bar carries that session's measured rate. The amber `>`
+line is the user turn — in the FunctionGemma clips it is the user message
+inside the prompt file, which file mode does not echo, and those two panes also
+show the system turn verbatim, i.e. where the tool is defined.
 
-**Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, Qwen3
-sampling (temp 0.6, top-p 0.95, top-k 20). 2.18 GB. These two clips are
-the native engine (`pulsar_arm/bonsai2/`), running on a phone — Galaxy
-Note 10+ (Snapdragon 855), 4 big cores, no GPU: 4.7 tok/s en, 4.0 tok/s
-zh-TW. The same seeds rerun byte-identical on the Spark, so the
-transcripts below are both machines' bytes at once.
-
-![Bonsai 8B chat demo](doc/bonsai8b-chat-en.gif)
-![Bonsai 8B chat demo, Traditional Chinese](doc/bonsai8b-chat-zh-tw.gif)
-
-```sh
-adb shell "cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 ... --gen 400 --sample 0.6 0.95 20 7"  # en
-adb shell "cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 ... --gen 400 --sample 0.6 0.95 20 123"  # zh-TW
-```
-
-**Ternary-Bonsai-2-27B** — 1.72 bits/weight end to end, Qwen3.8-27B base,
-card config (temp 0.5, top-p 0.85, top-k 20). 5.95 GB PTQ1_0. These two
-clips are the native engine too, on the DGX Spark CPU-only, 8 threads:
-7.9 tok/s en, 7.5 tok/s zh-TW.
-
-![Bonsai 2 27B chat demo](doc/bonsai2-27b-chat-en.gif)
-![Bonsai 2 27B chat demo, Traditional Chinese](doc/bonsai2-27b-chat-zh-tw.gif)
-
-```sh
-./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 ... --gen 400 --sample 0.5 0.85 20 7  # en
-./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 99270 115992 ... --gen 400 --sample 0.5 0.85 20 123  # zh-TW
-```
-
-All four Bonsai clips are PULSAR-ASM engine bytes end to end (the
-predecessor set ran the PrismML `llama.cpp` fork and is superseded): the
-27B engine reproduces the fork server token for token at temp 0 (20/20 on
-the probe prompt), the 8B phone binary reproduces the Spark engine
-bit-for-bit including logits, and every clip reruns deterministically
-from the seeded command shown in its title card. The Bonsai 1.7B/4B
-checkpoints were evaluated and set aside over output quality. Both
-responses and prompt ids are literals from those runs and re-render with the
-same `make_chat_gif.py` command as the gemma clips below. The Traditional
-Chinese clips ask the same four-seasons question; the 27B answers with a
-compact table (7.5 tok/s) including its reasoning trace, while the 8B gives
-a longer four-section list (4.0 tok/s) — each checkpoint's seeded sample
-at its usual sampling, phone-shot for the 8B.
+Each checkpoint gets **one GIF with both language runs side by side** (English
+left, Traditional Chinese right); the panes share a timeline, and only pacing
+is libertied. All clips share one font size and one typeface — DejaVu Sans
+Mono, with WenQuanYi Zen Hei used only for the CJK glyphs DejaVu lacks, at the
+same size and line height.
 
 **K2-Horizon-0.9B** — 0.9B dense decoder (IFM, Llama arch), plain RMS norms,
-YaRN rope, vocab 64256 — shown here in its **original** form and as a zh-TW
+YaRN rope, vocab 64256; shown in its **original** form and as a zh-TW
 meeting-agent **fine-tune (FT)**. Both clips are the pure-assembly engine
-(`pulsar_arm/k2horizon/k2_core.S`: `as` + `ld -static`, no libc, syscalls
-only, glibc-bit-identical `expf`/`%.4f`) on the phone's big cores, greedy,
-4-thread decode + 8-token prefill chunks; every frame is that run's own
-bytes.
+(`pulsar_arm/k2horizon/k2_core.S` — `as` + `ld -static`, no libc, syscalls
+only, glibc-bit-identical `expf`/`%.4f`) on the phone's big cores: greedy,
+4-thread decode, 8-token prefill chunks.
 
-*Original* — the ceiling prompt is the two-sentence neural explainer
-(seasons loops and haiku rambles under greedy, so they don't qualify).
-13 tok/s.
+*Original* — the ceiling prompt is the two-sentence neural explainer (seasons
+loops and haiku rambles under greedy, so they don't qualify). 13 tok/s decode;
+its 21-token prompt costs about a second.
 
-![K2-Horizon original chat demo](doc/k2horizon-chat-en.gif)
+![K2-Horizon original](doc/k2horizon-chat-en.gif)
 
 ```sh
 adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 ... --gen 400 --threads 4 --batch 8"
 ```
 
 *Fine-tune (FT)* — the same 0.9B trained for live meeting reading
-(NOTE/REVISE/NEXT protocol), converted from the published int4-QAT
-safetensors to our own Q4 blob and run on the same pure-asm engine (greedy,
-so the clip is exactly reproducible). The clip shows the full 6-turn input
-window verbatim so every NOTE/NEXT can be checked line-by-line — all five
-notes cite genuine timestamps and the harness stops the turn at NEXT.
-3.2 tok/s (the 680-token prefill dominates; 8-token chunks + 4 threads cut
-it 2.6x). Given the same window the original model deliberates 150 tokens
-without emitting a single NOTE — that behavioral gap is what the fine-tune
-buys.
+(NOTE/REVISE/NEXT), converted from the published int4-QAT safetensors to our
+own Q4 blob and run on the same engine. The clip shows the full 6-turn window
+verbatim, so every NOTE can be checked line by line: all five cite genuine
+timestamps and the turn stops at NEXT. The 680-token prefill dominates (67 s
+of the 185 s run; decode averages 3.2 tok/s over positions 680–1080). Given the
+same window the original model deliberates 150 tokens without emitting a single
+NOTE — that behavioral gap is what the fine-tune buys.
 
-![K2-Horizon fine-tune meeting demo](doc/k2horizon-meeting-zh-tw.gif)
+![K2-Horizon fine-tune](doc/k2horizon-meeting-zh-tw.gif)
 
 ```sh
 adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob $(cat ft_ids680.txt) --gen 400 --threads 4 --batch 8"
 ```
 
-Both K2 clips are real phone bytes and re-render with the same
-`make_chat_gif.py` command. The same blobs on Spark are bit-identical to
-the scalar C reference (`neural2.txt`), including the logits.
+Both K2 blobs are bit-identical on Spark to the scalar C reference
+(`neural2.txt`), logits included.
 
-**gemma-3-1b-it** — each clip uses the most complex prompt the checkpoint
-answers *correctly* (a four-item structured list, and a three-item one in
-zh-TW), both complete and clean end to end:
+**Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, Qwen3 sampling
+(temp 0.6, top-p 0.95, top-k 20), 2.18 GB. Native engine
+(`pulsar_arm/bonsai2/`) on the same phone — 4 big cores, no GPU: 4.7 tok/s en,
+4.0 tok/s zh-TW. The same seeds rerun byte-identical on the Spark, so the clip
+is both machines' bytes at once.
 
-![1B chat demo](doc/gemma3-1b-chat-en.gif)
-![1B chat demo, Traditional Chinese](doc/gemma3-1b-chat-zh-tw.gif)
+![Bonsai 8B chat, en | zh-TW](doc/bonsai8b-chat-en-zh.gif)
+
+```sh
+adb shell "cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 ... --gen 400 --sample 0.6 0.95 20 7"    # en
+adb shell "cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 ... --gen 400 --sample 0.6 0.95 20 123"  # zh-TW
+```
+
+**Ternary-Bonsai-2-27B** — 1.72 bits/weight end to end, Qwen3.8-27B base, card
+config (temp 0.5, top-p 0.85, top-k 20), 5.95 GB PTQ1_0. Native engine on the
+DGX Spark CPU-only, 8 threads: 7.9 tok/s en, 7.5 tok/s zh-TW. This is the one
+clip that stays off the phone — the 27B streams 5.9 GB per token and needs the
+Spark's 20 cores.
+
+![Bonsai 2 27B chat, en | zh-TW](doc/bonsai2-27b-chat-en-zh.gif)
+
+```sh
+./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 ... --gen 400 --sample 0.5 0.85 20 7      # en
+./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 99270 115992 ... --gen 400 --sample 0.5 0.85 20 123  # zh-TW
+```
+
+Both Bonsai clips are PULSAR-ASM engine bytes end to end (the predecessor set
+ran the PrismML `llama.cpp` fork and is superseded): the 27B reproduces the fork
+server token for token at temp 0 (20/20 on the probe prompt), the 8B phone
+binary reproduces the Spark engine bit-for-bit including logits, and both rerun
+deterministically from the seeded command in the title card. The 1.7B/4B
+checkpoints were evaluated and set aside over output quality. The zh-TW panes
+ask the same four-seasons question: the 27B answers with a compact table
+including its reasoning trace, the 8B with a longer four-section list.
+
+**gemma-3-1b-it** — the most complex prompt the checkpoint answers *correctly*
+in each language (a four-item structured list; a three-item one in zh-TW), both
+complete and clean:
+
+![1B chat, en | zh-TW](doc/gemma3-1b-chat-en-zh.gif)
 
 ```sh
 printf 'List the four seasons and one thing that changes in each.\n' | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 123
 printf '請列出保持健康的三個要點。\n'                                | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 172
 ```
 
-The gen caps above are tuned to end on the model's closing line (123 for the
-English clip, 172 for the zh-TW one); the sampler is the checkpoint's
-recommended configuration — temperature 1.0, top-k 64, top-p 0.95 — which is
-what the engine implements.
+The gen caps end each run on the model's closing line; the sampler is the
+checkpoint's recommended configuration (temperature 1.0, top-k 64, top-p 0.95),
+which is what the engine implements.
 
 **gemma-3-270m-it** — same binary, 18 layers:
 
-![270m chat demo](doc/gemma3-270m-chat-en.gif)
-![270m chat demo, Traditional Chinese](doc/gemma3-270m-chat-zh-tw.gif)
+![270m chat, en | zh-TW](doc/gemma3-270m-chat-en-zh.gif)
 
 ```sh
 printf 'Explain gravity in two sentences for a child.\n' | ./core gemma-3-270m-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48
 printf '請用一句話解釋什麼是量子力學。\n'                 | ./core gemma-3-270m-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48
 ```
 
-**FunctionGemma-270m-it** — both an English and a Traditional-Chinese question
-become the same tool call (one schema, only the user turn differs):
+**FunctionGemma-270m-it** — an English and a Traditional-Chinese question
+become the same tool call (one schema; only the user turn differs):
 
-![FunctionGemma tool call, English prompt](doc/functiongemma-toolcall-en.gif)
-![FunctionGemma tool call, zh-TW prompt](doc/functiongemma-toolcall-zh-tw.gif)
+![FunctionGemma tool call, en | zh-TW](doc/functiongemma-toolcall-en-zh.gif)
 
 ```sh
 python3 pulsar_arm/tools/fc_write.py   # -> /tmp/tool_official.txt, /tmp/tool_official_zhtw.txt
@@ -244,8 +227,8 @@ python3 pulsar_arm/tools/fc_write.py   # -> /tmp/tool_official.txt, /tmp/tool_of
 ./core functiongemma.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16 < /tmp/tool_official_zhtw.txt
 ```
 
-Re-render any subset with `python3 pulsar_arm/tools/make_chat_gif.py` (needs
-PIL + ffmpeg); the transcripts are literals in that file, so a re-run can only
+Re-render any subset with `python3 pulsar_arm/tools/make_chat_gif.py` (needs PIL
++ ffmpeg); the transcripts are literals in that file, so a re-run can only
 reproduce these frames, never invent them.
 
 ## Verified gates
@@ -316,10 +299,12 @@ doc/                         demo GIFs and write-ups
 
 ## Disclosures
 
-- The four Bonsai clips above run the reference runtime, not the in-tree
-  port; they are presented as the checkpoints' ceiling behaviour at their
-  own sampling, with transcripts verified programmatically against the run
-  logs (never hand-typed). Engine-native re-renders are in progress.
+- Every demo clip is the in-tree engine's own bytes (no reference runtime):
+  transcripts are verified programmatically against the run logs, never
+  hand-typed. The K2, Bonsai 8B and Bonsai 27B clips are phone (SD855, big
+  cores) and Spark shots; the gemma and FunctionGemma series is still the
+  Pi's bytes, because that checkpoint set is no longer on any reachable
+  machine — their re-shoot is pending, not abandoned.
 - The 27B is a reasoning model: its raw stream opens inside `<think>`;
   clips show the answer content as the server renders it (reasoning kept
   out of frame, same convention).
