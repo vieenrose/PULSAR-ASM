@@ -29,7 +29,7 @@
 #define HDIM 64
 #define NKV 8
 #define VOCAB 64256
-#define CTX 512
+#define CTX 1024
 
 static int NL = 28;   /* overwritten by blob header, assert-equal */
 static int WTYPE = 0;     /* 0 = fp16 weights, 2 = Q4_0 blocks */
@@ -138,8 +138,8 @@ static float X[HID], XN[HID], AO[HID], FO[HID];
 static float QF[NHEAD * HDIM], KF[NKV * HDIM], VF[NKV * HDIM];
 static float ATTO[NHEAD * HDIM], LG[INTER], LU[INTER];
 static float HEAD[VOCAB];
-static float KCA[28][512][8 * 64];
-static float VCA[28][512][8 * 64];
+static float KCA[28][1024][8 * 64];
+static float VCA[28][1024][8 * 64];
 static int NPOS_TOK;
 
 static void embed(int id) {
