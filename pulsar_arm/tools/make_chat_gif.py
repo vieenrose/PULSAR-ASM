@@ -226,6 +226,33 @@ SPECS = {
         response=("\n\n<think>\n\u7528\u6237\u8981\u6c42\u5217\u51fa\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u4f1a\u6539\u53d8\u7684\u4e00\u4ef6\u4e8b\u3002\u8fd9\u662f\u4e00\u4e2a\u7b80\u5355\u7684\u77e5\u8bc6\u6027\u95ee\u9898\u3002\n\n\u56db\u5b63\uff1a\u6625\u3001\u590f\u3001\u79cb\u3001\u51ac\n\n\u6bcf\u4e00\u5b63\u4f1a\u6539\u53d8\u7684\u4e00\u4ef6\u4e8b\uff0c\u6211\u53ef\u4ee5\u4ece\u81ea\u7136\u73b0\u8c61\u3001\u6c14\u5019\u3001\u690d\u7269\u3001\u52a8\u7269\u884c\u4e3a\u7b49\u65b9\u9762\u6765\u8003\u8651\uff1a\n\n- \u6625\u5929\uff1a\u6c14\u6e29\u56de\u5347\uff0c\u690d\u7269\u53d1\u82bd/\u5f00\u82b1\n- \u590f\u5929\uff1a\u65e5\u7167\u65f6\u95f4\u53d8\u957f\uff0c\u6c14\u6e29\u5347\u9ad8\n- \u79cb\u5929\uff1a\u6811\u53f6\u53d8\u9ec4/\u843d\u53f6\n- \u51ac\u5929\uff1a\u6c14\u6e29\u4e0b\u964d\uff0c\u53ef\u80fd\u964d\u96ea\n\n\u6211\u9009\u62e9\u6bcf\u5b63\u4e00\u4e2a\u6700\u5178\u578b\u3001\u6700\u76f4\u89c2\u7684\u53d8\u5316\uff1a\n- \u6625\uff1a\u690d\u7269\u53d1\u82bd\u3001\u5f00\u82b1\n- \u590f\uff1a\u65e5\u7167\u65f6\u95f4\u53d8\u957f\uff08\u6216\u6c14\u6e29\u5347\u9ad8\uff09\n- \u79cb\uff1a\u6811\u53f6\u53d8\u8272\u3001\u843d\u53f6\n- \u51ac\uff1a\u6c14\u6e29\u4e0b\u964d\u3001\u964d\u96ea\n\n\u6211\u9009\u62e9\u6bd4\u8f83\u6709\u753b\u9762\u611f\u4e14\u660e\u786e\u7684\uff1a\n- \u6625\uff1a\u690d\u7269\u4ece\u82bd\u53d8\u5230\u5f00\u82b1\n- \u590f\uff1a\u767d\u5929\u53d8\u957f\uff08\u65e5\u7167\u65f6\u95f4\u589e\u52a0\uff09\n- \u79cb\uff1a\u6811\u53f6\u7531\u7eff\u53d8\u9ec4\u518d\u843d\u53f6\n- \u51ac\uff1a\u5929\u7a7a\u4ece\u6674\u6717\u53d8\u4e3a\u591a\u96ea\uff08\u6216\u6c14\u6e29\u663e\u8457\u4e0b\u964d\uff09\n\n\u8ba9\u6211\u7b80\u6d01\u6e05\u6670\u5730\u56de\u7b54\u3002\n</think>\n\n## \u56db\u5b63\u53ca\u5176\u53d8\u5316\n\n| \u5b63 | \u4ee3\u8868\u53d8\u5316 |\n|---|---|\n| **\u6625** | \u690d\u7269\u53d1\u82bd\u3001\u5f00\u82b1\uff0c\u5927\u5730\u7531\u67af\u8f6c\u7eff |\n| **\u590f** | \u65e5\u7167\u65f6\u95f4\u53d8\u957f\uff0c\u767d\u5929\u9010\u6e10\u5ef6\u957f |\n| **\u79cb** | \u6811\u53f6\u7531\u7eff\u8f6c\u9ec4\u3001\u7ea2\uff0c\u7ee7\u800c\u98d8\u843d |\n| **\u51ac** | \u6c14\u6e29\u9aa4\u964d\uff0c\u5929\u7a7a\u5f00\u59cb\u964d\u96ea |\n\n> \u7b80\u5355\u8bf4\uff1a\u6625\u662f**\u751f**\uff0c\u590f\u662f**\u957f**\uff0c\u79cb\u662f**\u843d**\uff0c\u51ac\u662f**\u85cf**\u2014\u2014\u81ea\u7136\u4ee5\u8fd9\u56db\u4ef6\u4e8b\u6807\u8bb0\u65f6\u95f4\u7684\u6d41\u8f6c\u3002"),
         status="7.5 tok/s \u00b7 temp 0.5 \u00b7 8 threads",
         wrap="char"),
+    # K2-Horizon-0.9B base (Q4, native engine on Spark CPU): ceiling prompt
+    # is the two-sentence neural explainer (greedy) - seasons loops and
+    # haiku rambles under greedy. 195 tokens, reproducible exactly.
+    "k2base-neural": dict(
+        out="k2horizon-chat-en.gif",
+        title="pulsar \u00b7 K2-Horizon-0.9B \u00b7 cpu",
+        cmd="$ ./fwd_k2q k2h_09_q4.blob 64018 2985 200 21127 542 1426 265 30066 4318 394 316 1662 37398 15 64019 64018 612 10102 200 64029 200 --gen 400",
+        you="> Explain what a neural network is in two sentences.",
+        tpl="prompt ids: 64018 2985 200 21127 542 1426 265 30066 4318 394 316 1662 37398 15 64019 64018 612 10102 200 64029 200",
+        response="The user wants an explanation of what a neural network is in two sentences. This is a straightforward request. I should provide a concise definition of neural networks, likely in the context of machine learning, explaining their structure and function. Two sentences is quite short, so I need to be concise but informative. Something like: \"A neural network is a computational model inspired by the brain's structure and function, consisting of layers of interconnected nodes that process inputs through weighted connections to produce outputs, and it is commonly used in machine learning for tasks like image recognition, natural language processing, and predictive modeling.\" That's two sentences. Let me make sure it's clear and accurate.\n</ifm|think>\nA neural network is a computational model inspired by the brain's structure and function, consisting of layers of interconnected nodes that process inputs through weighted connections to produce outputs, and it is commonly used in machine learning for tasks like image recognition, natural language processing, and predictive modeling.",
+        status="23.3 tok/s \u00b7 greedy \u00b7 1 thread",
+        wrap="word"),
+    # K2 meeting agent (fine-tune, LiteRT-LM q4 int4-QAT, stock signatures
+    # driven manually): temp 0.2 seed 7. 5/5 notes verifiable, all cited
+    # times genuine; harness stops at NEXT (ramble loop after is cut).
+    # Seeds 8 (drops PROPOSAL) and 9 (ties 7) also sampled; 7 verified.
+    "k2ft-meeting": dict(
+        out="k2horizon-meeting-zh-tw.gif",
+        title="pulsar \u00b7 K2 meeting agent \u00b7 cpu",
+        cmd="$ python k2_lite_driver.py prompt_ft.txt --gen 400 --temp 0.2"
+            " --seed 7 --tok ./tokenizer  # LiteRT-LM q4, prefill_128+decode",
+        you="> S1 [1:02:15] \u5404\u4f4d,\u8cc7\u8a0a\u7cfb\u7d71\u9810\u7b97"
+            "\u7e3d\u5171\u7de8\u5217 1200 \u842c\u5143\u2026\uFF08\u516d\u8f49\u7a97\u53e3\uFF09",
+        tpl="prompt_ft.txt: system prompt + 6-turn window = 680 ids",
+        response="1 [1:05:20] \u4e0b\u6703\u6642\u9593 \uff1a\uff0c \u5b89\u6392\u8207\u7e73\u6e05 \u5171 8,, \u4e94\u9810\u7b97\u8acb arrange\nNNistant\n\n\nNOT\nNOTE [1:02:15] (NUMBER) \u8cc7\u8a0a\u7cfb\u7d71\u9810\u7b97\u7e3d\u5171\u7de8\u5217 1200 \u842c\u5143\uff0c\u8f03\u53bb\u5e74\u589e\u52a0 300 \u842c\u5143\nNOTE [1:03:02] (PROPOSAL) \u5efa\u8b70\u6539\u7528\u7dda\u4e0a\u5831\u540d\uff0c\u53ef\u6e1b\u5c11\u73fe\u5834\u6392\u968a\u7684\u4eba\u529b\uff0c\u7d04\u7701 80 \u842c\u5de6\u53f3\nNOTE [1:04:10] (DECISION) \u9810\u7b97\u6848\u7167\u6848\u901a\u904e\nNOTE [1:05:33] (ACTION) S2 \u8ca0\u8cac\u4e0b\u9031\u4e94\u524d\u63d0\u51fa\u66f8\u9762\u5831\u544a\nNOTE [1:06:20] (OPEN-ISSUE) \u5834\u5730\u8cbb 5 \u842c\u5143\u5c1a\u672a\u4ed8\uff0c\u9700\u8655\u7406\nNEXT",
+        status="5.5 tok/s \u00b7 temp 0.2 \u00b7 LiteRT-LM q4",
+        wrap="char"),
 }
 
 
