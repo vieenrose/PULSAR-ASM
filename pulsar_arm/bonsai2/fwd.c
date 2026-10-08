@@ -129,16 +129,18 @@ static void transpose_tensor(int idx) {
     int64_t K = TD0[idx], rows = TD1[idx];
     int ng = (int)(K / 128);
     uint8_t *src = G + TO[idx];
-    /* nibbles 64B/group (byte k of each 16B chunk = trits k,k+16; unpack needs no zip), fp16 scales
-       in a dense tail array: ~13.5GB + 0.43GB traffic (vs 27GB int8).
-       Unpack is shift/mask only, in order (no zip chains like 2-bit). */
-    uint8_t *dst = malloc((size_t)rows * ng * 66);
+    /* 2-bit codes, 32B/group (byte j of each 16B chunk carries trits j, 16+j,
+       32+j, 48+j in its four 2-bit fields), fp16 scales in a dense tail
+       array: 6.65GB vs 12.9GB for nibbles, 25.9GB for int8.
+       Unpack is shift/mask only, in order (no zip chains like the old
+       2-bit attempt, which predates the transposed layout). */
+    uint8_t *dst = malloc((size_t)rows * ng * 34);
     if (!dst) { printf("s8 malloc fail\n"); exit(1); }
     #pragma omp parallel for schedule(static)
     for (int64_t r = 0; r < rows; r++) {
         for (int g = 0; g < ng; g++) {
             const uint8_t *b = src + ((size_t)r * ng + g) * 28;
-            uint8_t *o = dst + ((size_t)r * ng + g) * 64;
+            uint8_t *o = dst + ((size_t)r * ng + g) * 32;
             /* digits in order, then pack transposed: byte k of each
                16B chunk holds trits (k, k+16) so unpack needs no zip */
             uint8_t dg[128];
@@ -156,10 +158,13 @@ static void transpose_tensor(int idx) {
                     uint8_t v = (uint8_t)(b[24 + h] * P3T[nn]);
                     dg[k++] = (uint8_t)(((uint16_t)v * 3) >> 8);
                 }
-            for (int c = 0; c < 4; c++)
+            for (int p = 0; p < 2; p++)
                 for (int j = 0; j < 16; j++)
-                    o[c * 16 + j] = (uint8_t)(dg[c * 32 + j] | (dg[c * 32 + 16 + j] << 4));
-            memcpy(dst + (size_t)rows * ng * 64 + ((size_t)r * ng + g) * 2, b + 26, 2);
+                    o[p * 16 + j] = (uint8_t)(dg[p * 64 + j]
+                        | (dg[p * 64 + 16 + j] << 2)
+                        | (dg[p * 64 + 32 + j] << 4)
+                        | (dg[p * 64 + 48 + j] << 6));
+            memcpy(dst + (size_t)rows * ng * 32 + ((size_t)r * ng + g) * 2, b + 26, 2);
         }
     }
     S8CACHE[idx] = dst;

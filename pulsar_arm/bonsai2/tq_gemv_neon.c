@@ -136,16 +136,17 @@ void tq_gemv_neon(int rows, int cols, const uint8_t *w, const float *x,
     }
 }
 
-/* nibble-packed GEMV: W8 holds 64B codes/group (2 trits/byte, sequential)
-   + fp16 scale tail. Unpack is shift/mask only, in order (no zip chains).
-   Same math and fp order (bit-exact). */
-static inline void dec32n(const uint8_t *b, int8x16_t *o0, int8x16_t *o1) {
+/* nibble/2-bit unpack: one 16B load -> four in-order int8x16 of trits.
+   Byte j of a chunk carries trits j, 16+j, 32+j, 48+j in its four 2-bit
+   fields, so a 64-trit chunk needs no zip, only shift/mask/sub. */
+static inline void dec64n(const uint8_t *b, int8x16_t *o0, int8x16_t *o1,
+                          int8x16_t *o2, int8x16_t *o3) {
     uint8x16_t bb = vld1q_u8(b);
-    uint8x16_t lo = vandq_u8(bb, vdupq_n_u8(15));
-    uint8x16_t hi = vshrq_n_u8(bb, 4);
-    uint8x16_t one = vdupq_n_u8(1);
-    *o0 = vreinterpretq_s8_u8(vsubq_u8(lo, one));
-    *o1 = vreinterpretq_s8_u8(vsubq_u8(hi, one));
+    uint8x16_t m3 = vdupq_n_u8(3), one = vdupq_n_u8(1);
+    *o0 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(bb, m3), one));
+    *o1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(bb, 2), m3), one));
+    *o2 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(bb, 4), m3), one));
+    *o3 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(vshrq_n_u8(bb, 6), m3), one));
 }
 void s8_gemv(int rows, int cols, const uint8_t *w8, float *y,
              const uint8_t *xq) {
@@ -154,18 +155,30 @@ void s8_gemv(int rows, int cols, const uint8_t *w8, float *y,
     for (int r = 0; r < rows; r++) {
         float acc = 0.0f;
         for (int g = 0; g < ng; g++) {
-            const uint8_t *cd = w8 + ((size_t)r * ng + g) * 64;
-            float ws = ld_f16(w8 + (size_t)rows * ng * 64 + ((size_t)r * ng + g) * 2);
+            const uint8_t *cd = w8 + ((size_t)r * ng + g) * 32;
+            float ws = ld_f16(w8 + (size_t)rows * ng * 32 + ((size_t)r * ng + g) * 2);
             float sum = 0.0f;
-            for (int kb = 0; kb < 4; kb++) {
-                const uint8_t *qb = xq + (size_t)(g * 4 + kb) * 34;
-                float db = ld_f16(qb);
-                const int8_t *qs = (const int8_t *)(qb + 2);
-                int8x16_t t0, t1;
-                dec32n(cd + kb * 16, &t0, &t1);
-                int32x4_t a = vdotq_s32(vdupq_n_s32(0), t0, vld1q_s8(qs));
-                a = vdotq_s32(a, t1, vld1q_s8(qs + 16));
-                sum += db * (float)vaddvq_s32(a);
+            /* two 16B loads per group; each covers two kb chunks (64 trits),
+               emitted in kb order so the fp accumulation order is unchanged */
+            for (int p = 0; p < 2; p++) {
+                int8x16_t t0, t1, t2, t3;
+                dec64n(cd + p * 16, &t0, &t1, &t2, &t3);
+                const uint8_t *qb0 = xq + (size_t)(g * 4 + p * 2) * 34;
+                const uint8_t *qb1 = qb0 + 34;
+                {
+                    float db = ld_f16(qb0);
+                    const int8_t *qs = (const int8_t *)(qb0 + 2);
+                    int32x4_t a = vdotq_s32(vdupq_n_s32(0), t0, vld1q_s8(qs));
+                    a = vdotq_s32(a, t1, vld1q_s8(qs + 16));
+                    sum += db * (float)vaddvq_s32(a);
+                }
+                {
+                    float db = ld_f16(qb1);
+                    const int8_t *qs = (const int8_t *)(qb1 + 2);
+                    int32x4_t a = vdotq_s32(vdupq_n_s32(0), t2, vld1q_s8(qs));
+                    a = vdotq_s32(a, t3, vld1q_s8(qs + 16));
+                    sum += db * (float)vaddvq_s32(a);
+                }
             }
             acc += ws * sum;
         }
