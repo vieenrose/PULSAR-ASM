@@ -77,3 +77,29 @@ land well under 100 ms/tok (8B PQ2_0 does 192 ms at 4× the weights).
 - Cross-machine claims need LOGITS (tops-only hid the stale-object split).
 - Same-job benchmark discipline, thermal cooldowns on the phone.
 - Static glibc binary runs on Android; pthreads pool + pure spin.
+
+## Engine status (asm runtime, k2_core.S)
+
+`as` + `ld -static`, `_start`, svc syscalls only; no libc, no libggml.
+Greedy and sampled streams are byte-identical to the scalar C reference
+(`neural2.txt`, 121 steps) and to each other across every knob below.
+
+- `--threads N` (1..8, default 1): row-parallel Q4 GEMV over a pure-spin
+  worker pool (`clone(CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM)` + .bss
+  stacks, workers spin on an acquire-loaded generation counter; the done
+  counter uses `ldxr`/`stlxr` so worker stores are visible before main
+  proceeds; `exit_group` so workers die with the process). Row slices are
+  disjoint, so results are bit-exact at any N.
+- `--batch N` (1..8, default 1): chunked prefill. `k2q4_gemv_batch` is
+  block-outer/token-inner — each 32-weight block's fp16 scale decode and
+  nibble split are done once and reused for all B tokens — so DRAM weight
+  traffic drops ~B-fold and the per-block instruction count drops ~B-fold.
+  Per-token accumulation order is unchanged (fmul ws*db then fmadd), so
+  results stay bit-exact. Norms, rope, attention and silu stay per-token.
+
+Spark (taskset 0-19), FT 680-token meeting prefill + 20 gen:
+t=1 b=1 36.4 s | t=1 b=8 21.5 s | t=8 b=1 16.7 s | t=8 b=8 9.5 s (3.8x).
+Base 221-step decode: t=1 43.3 | t=4 14.2 | t=8 9.9 ms/step (4.4x).
+Phone (SD855, taskset f0): base clip 216 steps 16 s (13 tok/s); meeting
+clip 1080 steps 187 s (680-token prefill dominates; batching + 4 threads
+cut it 2.6x).
