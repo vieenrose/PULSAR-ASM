@@ -52,13 +52,15 @@ def read_sf(path):
             f.seek(base + off0)
             raw = f.read(off1 - off0)
             dt = {"F16": np.float16, "BF16": None, "F32": np.float32}[dtype]
-            if dt is None:  # BF16 -> upcast via struct (numpy>=2 has ml_dtypes? no: manual)
-                u = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
-                s = (u >> 15).astype(np.uint32)
-                e = ((u >> 7) & 0xFF).astype(np.int32)
-                m = (u & 0x7F).astype(np.uint32)
-                # subnormals flush to zero (weights never use them); normal path
-                f32 = (s << 31) | (((e - 127 + 127).clip(0, 255)) << 23) | (m << 16)
+            if dt is None:  # BF16 -> fp32, all-unsigned (NumPy2 NEP50
+                # promotes uint32|int32 to int64, which would double view)
+                u32 = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
+                s = (u32 >> np.uint32(15)) << np.uint32(31)
+                eraw = (u32 >> np.uint32(7)) & np.uint32(0xFF)
+                m = (u32 & np.uint32(0x7F)) << np.uint32(16)
+                z = eraw == np.uint32(0)
+                f32 = (s | np.where(z, np.uint32(0), eraw << np.uint32(23))
+                         | np.where(z, np.uint32(0), m)).astype(np.uint32)
                 arr = f32.view(np.float32).reshape(shape)
             else:
                 arr = np.frombuffer(raw, dtype=dt).reshape(shape).copy()
@@ -89,7 +91,7 @@ def main():
         npos = cos.shape[0]
         assert cos.shape == sin.shape == (npos, 32)
     with open(blob, "wb") as f:
-        f.write(struct.pack("<4s8I", b"K2H1", NLAYER, HID, INTER, NHEAD,
+        f.write(struct.pack("<4s9I", b"K2H1", NLAYER, HID, INTER, NHEAD,
                             NKV, HDIM, VOCAB, 0, npos))
         total = 0
         for k in order:
