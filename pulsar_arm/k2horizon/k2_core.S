@@ -891,6 +891,196 @@ attention:
     ldp x29, x30, [sp], #96
     ret
 
+/* ---------------- attention_range: w0=il, w1=h0, w2=h1, x3=Q, x4=ATTO,
+ * x5=sc. One decoder layer's attention over heads [h0, h1). Body is the
+ * validated `attention` loop with buffer pointers as arguments (Q/ATTO heads
+ * as running pointers, h1 on the stack); per-head arithmetic is untouched,
+ * so any head slice is bit-identical to the serial run. Saves x19-x27. */
+    .align 2
+attention_range:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    str x27, [sp, #80]
+    mov w19, w0                     /* il */
+    mov w21, w1                     /* h */
+    str w2, [sp, #88]               /* h1 */
+    mov x0, #256
+    madd x24, x21, x0, x3           /* Q head for h0 */
+    madd x26, x21, x0, x4           /* ATTO head for h0 */
+    mov x25, x5                     /* sc (private per participant) */
+    adrp x1, g_pos
+    ldr x20, [x1, :lo12:g_pos]       /* pos (loop bound, inclusive) */
+    /* K/V per-layer base = g_KCA + il*3145728 (CTX=1536*512 floats*4) */
+    mov x0, #3145728
+    madd x22, x19, x0, xzr
+    adrp x1, g_KCA
+    ldr x2, [x1, :lo12:g_KCA]
+    add x22, x2, x22                 /* KCA layer base */
+    adrp x1, g_VCA
+    ldr x2, [x1, :lo12:g_VCA]
+    madd x23, x19, x0, xzr           /* il*3145728 */
+    add x23, x2, x23                 /* VCA layer base */
+.LattnR_head:
+    /* khoff = (h>>2)<<8 */
+    lsr w2, w21, #2
+    lsl x2, x2, #8                   /* khoff bytes */
+    /* zero ATTO head: 256 B */
+    movi v0.2d, #0
+    stp q0, q0, [x26]
+    stp q0, q0, [x26, #32]
+    stp q0, q0, [x26, #64]
+    stp q0, q0, [x26, #96]
+    stp q0, q0, [x26, #128]
+    stp q0, q0, [x26, #160]
+    stp q0, q0, [x26, #192]
+    stp q0, q0, [x26, #224]
+    adrp x1, f_n1e30
+    ldr s11, [x1, :lo12:f_n1e30]     /* mx = -1e30f */
+    /* ---- scores: t = 0..pos ---- */
+    mov x27, xzr
+.LattnR_score_t:
+    add x9, x22, x27, lsl #11        /* KCA row */
+    add x9, x9, x2                   /* + khoff */
+    mov x10, x24                     /* Q walk */
+    fmov s4, wzr                     /* dot acc (element order) */
+    mov x11, #64
+.LattnR_score_i:
+    ldr s0, [x10], #4
+    ldr s1, [x9], #4
+    fmul s2, s0, s1
+    fadd s4, s4, s2
+    subs x11, x11, #1
+    b.ne .LattnR_score_i
+    fmov s7, #0.125
+    fmul s0, s4, s7                  /* sc = s*0.125 */
+    str s0, [x25, x27, lsl #2]
+    fcmp s0, s11
+    b.le .LattnR_score_next          /* update iff sc > mx (C: if (sc > mx)) */
+    fmov s11, s0                     /* mx = sc  (b.le also catches NaN -> keep) */
+.LattnR_score_next:
+    add x27, x27, #1
+    cmp x27, x20
+    b.ls .LattnR_score_t             /* t <= pos */
+    /* ---- es = sum expf(sc-mx) in f64 ---- */
+    fmov d10, xzr
+    mov x27, xzr
+.LattnR_es_t:
+    ldr s0, [x25, x27, lsl #2]
+    fsub s0, s0, s11
+    bl expf
+    str s0, [x25, x27, lsl #2]      /* stash e: the p-loop reloads it, no 2nd expf */
+    fcvt d0, s0
+    fadd d10, d10, d0
+    add x27, x27, #1
+    cmp x27, x20
+    b.ls .LattnR_es_t
+    fcvt s10, d10                    /* (f32)es */
+    /* ---- p-loop: o += p * V ---- */
+    mov x27, xzr
+.LattnR_p_t:
+    ldr s2, [x25, x27, lsl #2]       /* e (stashed; bit-identical, no expf) */
+    fdiv s2, s2, s10                 /* p */
+    add x9, x23, x27, lsl #11        /* VCA row */
+    lsr w3, w21, #2
+    lsl x3, x3, #8                   /* khoff (x2 dead across expf) */
+    add x9, x9, x3
+    mov x11, x26                     /* o walk */
+    dup v2.4s, v2.s[0]
+    mov x12, #16                     /* 16 x 16B = 64 floats */
+.LattnR_p_i:
+    ld1 {v0.4s}, [x11]
+    ld1 {v1.4s}, [x9]
+    fmla v0.4s, v2.4s, v1.4s
+    st1 {v0.4s}, [x11], #16
+    add x9, x9, #16
+    subs x12, x12, #1
+    b.ne .LattnR_p_i
+    add x27, x27, #1
+    cmp x27, x20
+    b.ls .LattnR_p_t
+    add x24, x24, #256               /* next Q head */
+    add x26, x26, #256               /* next ATTO head */
+    add w21, w21, #1
+    ldr w0, [sp, #88]                /* h1 */
+    cmp w21, w0
+    b.ne .LattnR_head
+    ldr x27, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+
+/* ---------------- attn_dispatch: w0=il, w1=h0, w2=h1, x3=Q, x4=ATTO.
+ * Row-parallel attention over the pool (same protocol as the GEMV
+ * dispatchers). Each head's work is independent (private sc slot), so any
+ * thread count is bit-exact. Saves x30. Clobbers x9-x13. */
+    .align 2
+attn_dispatch:
+    adrp x9, g_nthreads
+    ldr w9, [x9, :lo12:g_nthreads]
+    cmp w9, #1
+    b.gt .Lad_par
+    adrp x5, b_attSC
+    add x5, x5, :lo12:b_attSC
+    b attention_range
+.Lad_par:
+    str x30, [sp, #-32]!
+    str x3, [sp, #8]
+    str x4, [sp, #16]
+    str w0, [sp, #24]
+    adrp x10, g_task_r0
+    str w1, [x10, :lo12:g_task_r0]
+    adrp x10, g_task_r1
+    str w2, [x10, :lo12:g_task_r1]
+    adrp x10, g_task_x
+    str x3, [x10, :lo12:g_task_x]   /* Q */
+    adrp x10, g_task_y
+    str x4, [x10, :lo12:g_task_y]   /* ATTO */
+    adrp x10, g_task_il
+    ldr w11, [sp, #24]
+    str w11, [x10, :lo12:g_task_il]
+    adrp x10, g_task_kind
+    mov w11, #2
+    str w11, [x10, :lo12:g_task_kind]  /* kind 2 = attention */
+    adrp x10, g_done
+    str wzr, [x10, :lo12:g_done]
+    adrp x10, g_gen
+    add x10, x10, :lo12:g_gen
+    ldar w11, [x10]
+    add w11, w11, #1
+    stlr w11, [x10]
+    /* main takes slice 0: [h0, min(h0+chunk, h1)) */
+    sub w12, w2, w1
+    add w12, w12, w9
+    sub w12, w12, #1
+    udiv w12, w12, w9
+    add w13, w1, w12
+    cmp w13, w2
+    csel w13, w13, w2, lt
+    ldr w0, [sp, #24]               /* il */
+    mov w2, w13                     /* my_h1 (w1 still h0) */
+    ldr x3, [sp, #8]                /* Q */
+    ldr x4, [sp, #16]               /* ATTO */
+    adrp x5, b_attSC
+    add x5, x5, :lo12:b_attSC       /* main uses slot 0 */
+    bl attention_range
+    adrp x10, g_nthreads
+    ldr w9, [x10, :lo12:g_nthreads]
+    sub w9, w9, #1
+    adrp x10, g_done
+    add x10, x10, :lo12:g_done
+2:  ldar w11, [x10]
+    cmp w11, w9
+    b.lt 2b
+    ldr x30, [sp], #32
+    ret
+
 /* ---------------- layer_forward: w0 = il. Full decoder layer.
  * rms->qkv->rope->KV store->attn->o->resid->rms->gate/up->silu->down->resid
  * Saves x19-x22. */
@@ -974,9 +1164,15 @@ layer_forward:
     stp q0, q1, [x1], #32
     subs x2, x2, #1
     b.ne 1b
-    /* attention */
+    /* attention (row-parallel over the 32 heads) */
     mov w0, w19
-    bl attention
+    mov w1, wzr
+    mov w2, #32
+    adrp x3, b_QF
+    add x3, x3, :lo12:b_QF
+    adrp x4, b_ATTO
+    add x4, x4, :lo12:b_ATTO
+    bl attn_dispatch
     /* o proj + residual */
     mov w0, w19
     mov w1, #4
@@ -1384,6 +1580,10 @@ worker_loop:
     ldr x5, [x7, :lo12:g_task_y]
     adrp x7, g_task_xq
     ldr x6, [x7, :lo12:g_task_xq]
+    adrp x7, g_task_kind
+    ldr w7, [x7, :lo12:g_task_kind]
+    cmp w7, #2
+    b.eq .Lw_attn
     mov w0, w12
     mov w1, w13
     adrp x7, g_task_B
@@ -1400,6 +1600,21 @@ worker_loop:
     adrp x8, g_task_B
     ldr w6, [x8, :lo12:g_task_B]
     bl k2q4_gemv_batch
+    b .Lw_done
+.Lw_attn:
+    mov w1, w12                     /* my_h0 */
+    mov w2, w13                     /* my_h1 */
+    adrp x7, g_task_il
+    ldr w0, [x7, :lo12:g_task_il]   /* il */
+    adrp x7, g_task_x
+    ldr x3, [x7, :lo12:g_task_x]    /* Q */
+    adrp x7, g_task_y
+    ldr x4, [x7, :lo12:g_task_y]    /* ATTO */
+    adrp x7, b_attSC
+    add x7, x7, :lo12:b_attSC
+    mov x8, #6144
+    madd x5, x19, x8, x7            /* sc = slot[id] */
+    bl attention_range
 .Lw_done:
     adrp x1, g_done
     add x1, x1, :lo12:g_done
@@ -1440,6 +1655,8 @@ q4_gemv_dispatch:
     adrp x10, g_task_B
     mov w11, #1                     /* scalar task: workers take the B=1 path */
     str w11, [x10, :lo12:g_task_B]
+    adrp x10, g_task_kind
+    str wzr, [x10, :lo12:g_task_kind]  /* kind 0 = scalar GEMV */
     adrp x10, g_done
     str wzr, [x10, :lo12:g_done]
     adrp x10, g_gen
@@ -1648,6 +1865,9 @@ q4_gemv_dispatch_b:
     str w6, [x10, :lo12:g_task_B]
     adrp x10, g_task_rows
     str w7, [x10, :lo12:g_task_rows]
+    adrp x10, g_task_kind
+    mov w11, #1
+    str w11, [x10, :lo12:g_task_kind]  /* kind 1 = batched GEMV */
     adrp x10, g_done
     str wzr, [x10, :lo12:g_done]
     adrp x10, g_gen
@@ -1915,28 +2135,22 @@ layer_forward_batch:
     add x27, x27, #1
     cmp w27, w20
     b.ne 2b
-    /* 4. attention per token (copy Q into b_QF, result back from b_ATTO) */
+    /* 4. attention per token (row-parallel; Q/ATTO straight from batch bufs) */
     mov x27, xzr                    /* b */
     mov x23, xzr                    /* offset */
-3:  adrp x0, b_QF
-    add x0, x0, :lo12:b_QF
-    adrp x1, b_QFB
-    add x1, x1, :lo12:b_QFB
-    add x1, x1, x23
-    mov w2, #8192
-    bl memcpy_q
-    add x9, x28, x27
+3:  add x9, x28, x27
     adrp x1, g_pos
     str x9, [x1, :lo12:g_pos]
     mov w0, w19
-    bl attention
-    adrp x0, b_ATTOB
-    add x0, x0, :lo12:b_ATTOB
-    add x0, x0, x23
-    adrp x1, b_ATTO
-    add x1, x1, :lo12:b_ATTO
-    mov w2, #8192
-    bl memcpy_q
+    mov w1, wzr
+    mov w2, #32
+    adrp x3, b_QFB
+    add x3, x3, :lo12:b_QFB
+    add x3, x3, x23
+    adrp x4, b_ATTOB
+    add x4, x4, :lo12:b_ATTOB
+    add x4, x4, x23
+    bl attn_dispatch
     add x23, x23, #8192
     add x27, x27, #1
     cmp w27, w20
@@ -2181,6 +2395,11 @@ g_pos:          .skip 8
 g_batch:        .skip 4                    /* prefill chunk size (1 = off) */
 g_task_B:       .skip 4
 g_task_rows:    .skip 4
+g_task_kind:    .skip 4                    /* 0/1 = GEMV, 2 = attention */
+g_task_il:      .skip 4
+    .align 3
+g_task_sc:      .skip 8                    /* (unused: sc is per-participant) */
+b_attSC:        .skip 49152                /* 8 x 1536-f32 private score bufs */
     .align 3                        /* g_RS is loaded with 64-bit ldr */
 g_RS:           .skip 8
 g_vocab:        .skip 4
