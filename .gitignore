@@ -5,3 +5,4 @@ __pycache__/
 .auto/log.jsonl
 .auto/last_*.txt
 .auto/last_build.log
+.pi/tasks/
