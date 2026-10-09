@@ -1708,7 +1708,7 @@ memcpy_q:
  * [sp,#104]. */
     .align 2
 k2q4_gemv_batch:
-    stp x29, x30, [sp, #-144]!
+    stp x29, x30, [sp, #-128]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -1717,36 +1717,44 @@ k2q4_gemv_batch:
     stp x27, x28, [sp, #80]
     mov w25, w0                     /* r */
     mov w26, w1                     /* r1 */
-    mov w23, w2                     /* cols */
     mov x24, x3                     /* w */
     mov x19, x4                     /* xq_base */
-    str x5, [sp, #96]               /* y_base */
+    mov x20, x5                     /* y_base */
     mov w21, w6                     /* B */
     lsl x22, x7, #2                 /* ystride = rows*4 */
-    lsr x27, x23, #8
+    lsr x27, x2, #8
     mov x9, #292
     mul x27, x27, x9                /* xqs */
-    asr x9, x23, #5                 /* nb32 */
+    asr x9, x2, #5                  /* nb32 */
     mov x10, #18
     mul x10, x9, x10                /* rowstride */
-    madd x11, x25, x10, x24         /* rowptr (advances by rowstride/row) */
+    madd x11, x25, x10, x24         /* rowptr */
+    mov x28, x9                     /* nb32 (x9 dies below) */
     movi v30.16b, #15
     movi v31.16b, #8
 .Lbg_row:
     cmp w25, w26
     b.ge .Lbg_end
-    add x15, sp, #104               /* 8-float accumulator array (x1 is h2f scratch) */
-    movi v4.4s, #0
-    mov x14, #0
-1:  str s4, [x15, x14, lsl #2]
-    add x14, x14, #1
-    cmp w14, w21
-    b.ne 1b
-    mov x8, xzr                     /* block index */
+    mov x8, x19
+    add x9, x8, x27
+    add x10, x9, x27
+    add x12, x10, x27
+    add x13, x12, x27
+    add x14, x13, x27
+    add x15, x14, x27
+    add x16, x15, x27
+    movi v16.4s, #0
+    movi v17.4s, #0
+    movi v18.4s, #0
+    movi v19.4s, #0
+    movi v20.4s, #0
+    movi v21.4s, #0
+    movi v22.4s, #0
+    movi v23.4s, #0
+    mov x6, xzr                     /* block index */
 .Lbg_blk:
     ldrh w0, [x11]
     add x11, x11, #18
-    /* inline h2f (raw fp16 scale -> s0); scratch w1-w4, s0-s1 */
     and w1, w0, #0x3ff
     ubfx w2, w0, #10, #5
     and w3, w0, #0x8000
@@ -1785,15 +1793,14 @@ k2q4_gemv_batch:
     ushr v0.16b, v0.16b, #4
     sub v1.16b, v1.16b, v31.16b
     sub v0.16b, v0.16b, v31.16b     /* nibbles split ONCE per block */
-    lsr x2, x8, #3
+    lsr x2, x6, #3
     mov x7, #292
-    madd x12, x2, x7, x19           /* xq_base + (i>>3)*292 */
-    and x3, x8, #7
-    lsl x3, x3, #5                  /* woff = (i&7)*32 */
-    mov x14, #0                     /* b */
-.Lbg_tok:
-    ldr s6, [x12]                   /* db */
-    add x0, x12, #4
+    madd x2, x2, x7, xzr            /* wb*292 (db base offset) */
+    and x3, x6, #7
+    lsl x3, x3, #5                  /* woff (qs offset; db does NOT add it) */
+    add x0, x8, x2
+    ldr s6, [x0]
+    add x0, x0, #4
     add x0, x0, x3
     ld1 {v2.16b}, [x0]
     ldr q3, [x0, #16]
@@ -1802,29 +1809,124 @@ k2q4_gemv_batch:
     sdot v4.4s, v0.16b, v3.16b
     addv s2, v4.4s
     scvtf s2, s2
-    fmul s7, s5, s6                 /* round(ws*db) — same contraction as B=1 */
-    ldr s8, [x15, x14, lsl #2]
-    fmadd s8, s7, s2, s8            /* per-token order preserved -> bit-exact */
-    str s8, [x15, x14, lsl #2]
-    add x12, x12, x27               /* next token's xq */
-    add x14, x14, #1
-    cmp w14, w21
-    b.ne .Lbg_tok
-    add x8, x8, #1
-    cmp x8, x9
+    fmul s7, s5, s6
+    fmadd s16, s7, s2, s16
+    add x0, x9, x2
+    ldr s6, [x0]
+    add x0, x0, #4
+    add x0, x0, x3
+    ld1 {v2.16b}, [x0]
+    ldr q3, [x0, #16]
+    movi v4.4s, #0
+    sdot v4.4s, v1.16b, v2.16b
+    sdot v4.4s, v0.16b, v3.16b
+    addv s2, v4.4s
+    scvtf s2, s2
+    fmul s7, s5, s6
+    fmadd s17, s7, s2, s17
+    add x0, x10, x2
+    ldr s6, [x0]
+    add x0, x0, #4
+    add x0, x0, x3
+    ld1 {v2.16b}, [x0]
+    ldr q3, [x0, #16]
+    movi v4.4s, #0
+    sdot v4.4s, v1.16b, v2.16b
+    sdot v4.4s, v0.16b, v3.16b
+    addv s2, v4.4s
+    scvtf s2, s2
+    fmul s7, s5, s6
+    fmadd s18, s7, s2, s18
+    add x0, x12, x2
+    ldr s6, [x0]
+    add x0, x0, #4
+    add x0, x0, x3
+    ld1 {v2.16b}, [x0]
+    ldr q3, [x0, #16]
+    movi v4.4s, #0
+    sdot v4.4s, v1.16b, v2.16b
+    sdot v4.4s, v0.16b, v3.16b
+    addv s2, v4.4s
+    scvtf s2, s2
+    fmul s7, s5, s6
+    fmadd s19, s7, s2, s19
+    add x0, x13, x2
+    ldr s6, [x0]
+    add x0, x0, #4
+    add x0, x0, x3
+    ld1 {v2.16b}, [x0]
+    ldr q3, [x0, #16]
+    movi v4.4s, #0
+    sdot v4.4s, v1.16b, v2.16b
+    sdot v4.4s, v0.16b, v3.16b
+    addv s2, v4.4s
+    scvtf s2, s2
+    fmul s7, s5, s6
+    fmadd s20, s7, s2, s20
+    add x0, x14, x2
+    ldr s6, [x0]
+    add x0, x0, #4
+    add x0, x0, x3
+    ld1 {v2.16b}, [x0]
+    ldr q3, [x0, #16]
+    movi v4.4s, #0
+    sdot v4.4s, v1.16b, v2.16b
+    sdot v4.4s, v0.16b, v3.16b
+    addv s2, v4.4s
+    scvtf s2, s2
+    fmul s7, s5, s6
+    fmadd s21, s7, s2, s21
+    add x0, x15, x2
+    ldr s6, [x0]
+    add x0, x0, #4
+    add x0, x0, x3
+    ld1 {v2.16b}, [x0]
+    ldr q3, [x0, #16]
+    movi v4.4s, #0
+    sdot v4.4s, v1.16b, v2.16b
+    sdot v4.4s, v0.16b, v3.16b
+    addv s2, v4.4s
+    scvtf s2, s2
+    fmul s7, s5, s6
+    fmadd s22, s7, s2, s22
+    add x0, x16, x2
+    ldr s6, [x0]
+    add x0, x0, #4
+    add x0, x0, x3
+    ld1 {v2.16b}, [x0]
+    ldr q3, [x0, #16]
+    movi v4.4s, #0
+    sdot v4.4s, v1.16b, v2.16b
+    sdot v4.4s, v0.16b, v3.16b
+    addv s2, v4.4s
+    scvtf s2, s2
+    fmul s7, s5, s6
+    fmadd s23, s7, s2, s23
+    add x6, x6, #1
+    cmp x6, x28
     b.ne .Lbg_blk
-    ldr x5, [sp, #96]
-    add x5, x5, x25, lsl #2         /* y_base + r*4 */
-    mov x6, x15
+    /* spill acc to stack, then store s<B */
+    add x1, sp, #96
+    str s16, [x1, #0]
+    str s17, [x1, #4]
+    str s18, [x1, #8]
+    str s19, [x1, #12]
+    str s20, [x1, #16]
+    str s21, [x1, #20]
+    str s22, [x1, #24]
+    str s23, [x1, #28]
+    add x5, x20, x25, lsl #2        /* y_base + r*4 */
     mov x14, #0
+    mov x6, x22                     /* ystride */
 .Lbg_st:
-    ldr s8, [x6]
-    str s8, [x5]
-    add x6, x6, #4
-    add x5, x5, x22                 /* next token's y */
-    add x14, x14, #1
     cmp w14, w21
-    b.ne .Lbg_st
+    b.ge .Lbg_stend
+    ldr s8, [x1, x14, lsl #2]
+    str s8, [x5]
+    add x5, x5, x6
+    add x14, x14, #1
+    b .Lbg_st
+.Lbg_stend:
     add w25, w25, #1
     b .Lbg_row
 .Lbg_end:
@@ -1833,7 +1935,7 @@ k2q4_gemv_batch:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #144
+    ldp x29, x30, [sp], #128
     ret
 
 /* ---------------- q4_gemv_dispatch_b: batched row-parallel dispatch.
@@ -1859,6 +1961,8 @@ q4_gemv_dispatch_b:
     str x3, [x10, :lo12:g_task_w]
     adrp x10, g_task_x
     str x5, [x10, :lo12:g_task_x]   /* y_base */
+    adrp x10, g_task_y
+    str x5, [x10, :lo12:g_task_y]   /* y_base too: B==1 workers use scalar kernel */
     adrp x10, g_task_xq
     str x4, [x10, :lo12:g_task_xq]  /* xq_base */
     adrp x10, g_task_B
