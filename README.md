@@ -1,22 +1,29 @@
 # PULSAR-ASM
 
-**Ternary-model inference: Bonsai checkpoints on CPU, Gemma-3 on a Pi.**
-The demo line is Bonsai — `Ternary-Bonsai-8B` (2.18 GB) and
-`Ternary-Bonsai-2-27B` (7.21 GB) running on a DGX Spark, CPU-only, through
-the C + NEON port in `pulsar_arm/bonsai2/` (greedy streams identical to the
-reference server, token for token). The original asm engine is still here
-unchanged: pure-assembly Gemma-3 inference on a Raspberry Pi 4 — one static
-AArch64 binary, direct `svc` syscalls, no libc, no CRT, no third-party code,
-with the tokenizer, sampler, chat REPL and whole forward pass in
-`pulsar_arm/asm/core.S`.
+**Inference hardware for every demo below: a Samsung Galaxy Note 10+
+(Snapdragon 855, 4 big cores, CPU-only) — except `Ternary-Bonsai-2-27B`
+(5.95 GB), which streams 5.9 GB per token and runs on the DGX Spark's 20
+Cortex-X925 cores, CPU-only.** The gemma-3 and FunctionGemma panes are the one
+carve-out: still the Pi's bytes, because that checkpoint set is no longer on
+any reachable machine — their Note10+ re-shoot is pending, not abandoned.
 
-Two checkpoints run unmodified on the Spark port, whose dimensions come from
-the GGUF header so one binary covers each family:
+K2-Horizon-0.9B runs on the phone too, through the pure-assembly runtime in
+`pulsar_arm/k2horizon/` (greedy streams identical to the scalar C reference,
+token for token, logits included):
+
+| checkpoint | hidden | intermediate | layers | bytes | decode (phone) |
+|---|---|---|---|---|---|
+| `k2h_09_q4` (original) | 1536 | 5120 | 28 | 749 MB | **~62 ms/token** (4-thread decode, short context) |
+| `k2h_ft_q4` (meeting-agent FT) | 1536 | 5120 | 28 | 769 MB | same engine; long-context cost in demos |
+
+Two Bonsai checkpoints run on the C + NEON port in `pulsar_arm/bonsai2/`
+(greedy streams identical to the reference server, token for token), with
+dimensions coming from the GGUF header so one binary covers each family:
 
 | checkpoint | hidden | intermediate | layers | bytes | decode |
 |---|---|---|---|---|---|
-| `Ternary-Bonsai-2-27B-PTQ1_0` | 5120 | 17408 | 64 | 5.95 GB | **~0.10 s/token** (9.7 tok/s decode, 8 threads) |
-| `Ternary-Bonsai-8B-PQ2_0` | 4096 | 12288 | 36 | 2.18 GB | **~35 ms/token** (28 tok/s, 6 threads; ~0.21 s/token on a phone) |
+| `Ternary-Bonsai-2-27B-PTQ1_0` | 5120 | 17408 | 64 | 5.95 GB | **~0.10 s/token** (9.7 tok/s decode, 8 threads, Spark) |
+| `Ternary-Bonsai-8B-PQ2_0` | 4096 | 12288 | 36 | 2.18 GB | **~35 ms/token** (28 tok/s, 6 threads Spark; 4.7 tok/s phone) |
 
 Three gemma checkpoints run unmodified on the Pi engine, which reads its
 dimensions from the safetensors header, so one binary covers all of them:
@@ -31,8 +38,8 @@ dimensions from the safetensors header, so one binary covers all of them:
 
 | | |
 |---|---|
-| Target | Raspberry Pi 4, Cortex-A72 / NEON only (no SVE, no dotprod), 3 cores — for gemma; DGX Spark, 20 Cortex-X925 cores, CPU-only — for Bonsai |
-| Engine | one static binary: `as` + `ld`, direct syscalls, zero dependencies (gemma); C + NEON + OpenMP in `pulsar_arm/bonsai2/` (Bonsai) |
+| Target | Samsung Galaxy Note 10+, Snapdragon 855 / 4 big cores, CPU-only — every demo except the 27B; DGX Spark, 20 Cortex-X925 cores, CPU-only — for the 27B (gemma panes still Pi-shot, re-shoot pending) |
+| Engine | one static binary: `as` + `ld`, direct syscalls, zero dependencies (K2-Horizon `k2_core.S`, gemma `core.S`); C + NEON + OpenMP in `pulsar_arm/bonsai2/` (Bonsai) |
 | Bandwidth | ~3.6–3.9 GB/s of a measured 3.93 GB/s streaming ceiling (92–98 %) |
 | Parity | greedy output identical to transformers, token for token (1B bf16, 270m fp32); greedy Bonsai streams identical to the reference server, token for token (27B 17/17, 8B 5/5), plus a full top-20 distribution match |
 | Determinism | fixed seed ⇒ byte-identical transcripts across runs |
@@ -112,47 +119,45 @@ against HF, and every run prints its prefill ids as `tpl:` for transparency.
 
 Every frame is a real run: prompt, `tpl:` ids and response are the engine's own
 bytes, and the status bar carries that session's measured rate. The amber `>`
-line is the user turn — in the FunctionGemma clips it is the user message
-inside the prompt file, which file mode does not echo, and those two panes also
+line is the user turn — in the FunctionGemma panes it is the user message
+inside the prompt file, which file mode does not echo, and those panes also
 show the system turn verbatim, i.e. where the tool is defined.
 
-Each checkpoint gets **one GIF with both language runs side by side** (English
-left, Traditional Chinese right); the panes share a timeline, and only pacing
+Each model gets **one GIF**: English left, Traditional Chinese right (for K2,
+original left and fine-tune right); the panes share a timeline, and only pacing
 is libertied. All clips share one font size and one typeface — DejaVu Sans
 Mono, with WenQuanYi Zen Hei used only for the CJK glyphs DejaVu lacks, at the
 same size and line height.
 
 **K2-Horizon-0.9B** — 0.9B dense decoder (IFM, Llama arch), plain RMS norms,
 YaRN rope, vocab 64256; shown in its **original** form and as a zh-TW
-meeting-agent **fine-tune (FT)**. Both clips are the pure-assembly engine
+meeting-agent **fine-tune (FT)**. Both runs are the pure-assembly engine
 (`pulsar_arm/k2horizon/k2_core.S` — `as` + `ld -static`, no libc, syscalls
 only, glibc-bit-identical `expf`/`%.4f`) on the phone's big cores: greedy,
 4-thread decode, 8-token prefill chunks.
 
-*Original* — the ceiling prompt is the two-sentence neural explainer (seasons
-loops and haiku rambles under greedy, so they don't qualify). 13 tok/s decode;
-its 21-token prompt costs about a second.
-
-![K2-Horizon original](doc/k2horizon-chat-en.gif)
+*Original* (left) — the ceiling prompt is the two-sentence neural explainer
+(seasons loops and haiku rambles under greedy, so they don't qualify).
+13 tok/s decode; its 21-token prompt costs about a second.
 
 ```sh
 adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 ... --gen 400 --threads 4 --batch 8"
 ```
 
-*Fine-tune (FT)* — the same 0.9B trained for live meeting reading
+*Fine-tune (FT)* (right) — the same 0.9B trained for live meeting reading
 (NOTE/REVISE/NEXT), converted from the published int4-QAT safetensors to our
-own Q4 blob and run on the same engine. The clip shows the full 6-turn window
+own Q4 blob and run on the same engine. The run shows the full 6-turn window
 verbatim, so every NOTE can be checked line by line: all five cite genuine
 timestamps and the turn stops at NEXT. The 680-token prefill dominates (67 s
 of the 185 s run; decode averages 3.2 tok/s over positions 680–1080). Given the
 same window the original model deliberates 150 tokens without emitting a single
 NOTE — that behavioral gap is what the fine-tune buys.
 
-![K2-Horizon fine-tune](doc/k2horizon-meeting-zh-tw.gif)
-
 ```sh
 adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob $(cat ft_ids680.txt) --gen 400 --threads 4 --batch 8"
 ```
+
+![K2-Horizon original | fine-tune](doc/k2horizon-original-ft.gif)
 
 Both K2 blobs are bit-identical on Spark to the scalar C reference
 (`neural2.txt`), logits included.
@@ -227,9 +232,11 @@ python3 pulsar_arm/tools/fc_write.py   # -> /tmp/tool_official.txt, /tmp/tool_of
 ./core functiongemma.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16 < /tmp/tool_official_zhtw.txt
 ```
 
-Re-render any subset with `python3 pulsar_arm/tools/make_chat_gif.py` (needs PIL
-+ ffmpeg); the transcripts are literals in that file, so a re-run can only
-reproduce these frames, never invent them.
+The gemma and FunctionGemma panes above are still the Pi's bytes (their Note10+
+re-shoot is pending the checkpoint files). Re-render any subset with
+`python3 pulsar_arm/tools/make_chat_gif.py` (needs PIL + ffmpeg); the
+transcripts are literals in that file, so a re-run can only reproduce these
+frames, never invent them.
 
 ## Verified gates
 

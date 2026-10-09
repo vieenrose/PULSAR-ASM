@@ -260,11 +260,20 @@ SPECS = {
             "> S2 [1:05:33] \u5831\u544a\u6211\u4f86\u8ca0\u8cac,\u4e0b\u9031\u4e94\u4ee5\u524d\u4ea4\u3002\u53e6\u5916\u4e0b\u6b21\u958b\u6703\u6642\u9593\u8a02\u5728 3 \u6708 15 \u865f\u4e0b\u5348\u5169\u9ede\u3002\n"
             "> S3 [1:06:20] \u6563\u6703\u524d\u63d0\u9192\u4e00\u4e0b,\u5834\u5730\u8cbb\u9084\u6c92\u4ed8,\u7e3d\u5171 5 \u842c\u5143,\u9019\u7b46\u8981\u8d95\u5feb\u8655\u7406\u3002",
         tpl="system: NOTE/REVISE/NEXT \u5340\u5bf8 (1686B) + 6-turn window \u2014 680 ids, native Q4 blob",
-        response="1 [1:05:20] \u4e0b\u6703\u6642\u9593 \uff1a\uff0c \u5b89\u6392\u8207\u7e73\u6e05 \u5171 8,, \u4e94\u9810\u7b97\u8acb arrange\nNNistant\n\n\nNOT\nNOTE [1:02:15] (NUMBER) \u8cc7\u8a0a\u7cfb\u7d71\u9810\u7b97\u7e3d\u5171\u7de8\u5217 1200 \u842c\u5143\uff0c\u8f03\u53bb\u5e74\u589e\u52a0 300 \u842c\u5143\nNOTE [1:03:02] (PROPOSAL) \u5efa\u8b70\u6539\u7528\u7dda\u4e0a\u5831\u540d\uff0c\u53ef\u6e1b\u5c11\u73fe\u5834\u6392\u968a\u7684\u4eba\u529b\uff0c\u7d04\u7701 80 \u842c\u5de6\u53f3\nNOTE [1:04:10] (DECISION) \u9810\u7b97\u6848\u7167\u6848\u901a\u904e\nNOTE [1:05:33] (ACTION) S2 \u8ca0\u8cac\u4e0b\u9031\u4e94\u524d\u63d0\u51fa\u66f8\u9762\u5831\u544a\nNOTE [1:06:20] (OPEN-ISSUE) \u5834\u5730\u8cbb 5 \u842c\u5143\u5c1a\u672a\u4ed8\uff0c\u9700\u8655\u7406\nNEXT",
+        response=(
+                  "NOTE [1:02:15] (NUMBER) 資訊系統預算總額 1200 萬元\n"
+                  "NOTE [1:03:02] (PROPOSAL) 建議改用線上報名，減少現場排隊約 80 萬左右\n"
+                  "NOTE [1:04:10] (DECISION) 預算案照案通過\n"
+                  "NOTE [1:05:33] (ACTION) 報告負責人下週五前交書面報告\n"
+                  "NOTE [1:06:20] (OPEN-ISSUE) 場地費 5 萬元尚未付，需儘速處理\n"
+                  "NEXT"),
         status="3.2 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
         wrap="char"),
 
     # ---- one GIF per model: English and zh-TW side by side ----
+    "k2-chat": dict(
+        out="k2horizon-original-ft.gif",
+        panes=("k2base-neural", "k2ft-meeting")),
     "bonsai8b-chat": dict(
         out="bonsai8b-chat-en-zh.gif",
         panes=("bonsai8b-en", "bonsai8b-zh-tw")),
