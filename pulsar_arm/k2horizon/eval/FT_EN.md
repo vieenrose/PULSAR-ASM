@@ -1,3 +1,9 @@
+Decision: the FT demo stays zh-TW-only — these weights were trained
+specifically on a Traditional Chinese meeting corpus, and the English
+probe below degrades off-corpus (3/5 with converted millions; 5/5 only
+with 萬 figures kept, content code-mixed). This file keeps the negative
+result and both fixtures for the record; no English FT clip is shipped.
+
 # FT meeting agent: English window (greedy, native Q4 engine)
 
 Same system prompt + few-shot examples as the zh run; the 6-turn window

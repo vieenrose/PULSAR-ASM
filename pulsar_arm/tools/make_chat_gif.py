@@ -259,17 +259,6 @@ SPECS = {
         response="The user wants me to provide the four seasons in Traditional Chinese. I need to provide just the four names, no explanation.\n\nThe four seasons in Traditional Chinese are:\n春 (Chun) - Spring\n夏 (Hong) - Summer\n秋 (Qiu) - Autumn\n冬 (Gan) - Winter\n\nI should provide just these four names, no explanation.\n</ifm|think>\n春\n夏\n秋\n冬",
         status="19 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
         wrap="word"),
-    "k2ft-en": dict(
-        out="k2horizon-meeting-en.gif",
-        title="pulsar \u00b7 K2 meeting agent \u00b7 phone cpu",
-        cmd="$ adb shell \"cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob"
-            " $(cat ft_ids_enB.txt) --gen 400 --threads 4 --batch 8\""
-            "  # native asm engine, greedy",
-        you="> S1 [1:02:15] Everyone, the information system budget is listed at 1200 萬 yuan in total, 300 萬 more than last year. Please confirm.\n> S2 [1:03:02] I suggest changing to online registration, which can reduce the manpower for on-site queuing, saving about 80 萬.\n> S3 [1:03:40] Online registration was tried before; elderly people may not use it. This needs to be evaluated again.\n> S1 [1:04:10] OK, then the budget case is approved as proposed. The organizing unit, please submit a written report within two weeks.\n> S2 [1:05:33] I will be responsible for the report, due before next Friday. Also, the next meeting time is set for March 15 at 2 PM.\n> S3 [1:06:20] Before adjournment, a reminder: the venue fee has not been paid, 5 萬 in total. This needs to be handled quickly.",
-        tpl="system: NOTE/REVISE/NEXT \u5340\u5bf8 (1686B) + 6-turn window \u2014 698 ids, native Q4 blob; window keeps \u842c figures",
-        response="NOTE [1:02:15] (NUMBER) Information system budget 1200 萬, 300 萬 more than last year\nNOTE [1:03:02] (PROPOSAL) S1 suggests online registration, saving about 80 萬\nNOTE [1:04:10] (DECISION) Budget case is approved as proposed\nNOTE [1:05:33] (ACTION) S2 will be responsible for the written report due before next Friday\nNOTE [1:06:20] (OPEN-ISSUE) Venue fee 5 萬未付，需儘快處理\nNEXT",
-        status="4.3 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
-        wrap="char"),
     "k2ft-meeting": dict(
         out="k2horizon-meeting-zh-tw.gif",
         title="pulsar \u00b7 K2 meeting agent \u00b7 phone cpu",
@@ -282,7 +271,7 @@ SPECS = {
             "> S1 [1:04:10] \u597d,\u90a3\u9810\u7b97\u6848\u5c31\u7167\u6848\u901a\u904e\u3002\u4e3b\u8fa6\u55ae\u4f4d\u8acb\u5728\u5169\u9031\u5167\u63d0\u51fa\u66f8\u9762\u5831\u544a\u3002\n"
             "> S2 [1:05:33] \u5831\u544a\u6211\u4f86\u8ca0\u8cac,\u4e0b\u9031\u4e94\u4ee5\u524d\u4ea4\u3002\u53e6\u5916\u4e0b\u6b21\u958b\u6703\u6642\u9593\u8a02\u5728 3 \u6708 15 \u865f\u4e0b\u5348\u5169\u9ede\u3002\n"
             "> S3 [1:06:20] \u6563\u6703\u524d\u63d0\u9192\u4e00\u4e0b,\u5834\u5730\u8cbb\u9084\u6c92\u4ed8,\u7e3d\u5171 5 \u842c\u5143,\u9019\u7b46\u8981\u8d95\u5feb\u8655\u7406\u3002",
-        tpl="system: NOTE/REVISE/NEXT \u5340\u5bf8 (1686B) + 6-turn window \u2014 680 ids, native Q4 blob",
+        tpl="system: NOTE/REVISE/NEXT \u5340\u5206 (1686B) + 6-turn window \u2014 680 ids, native Q4 blob",
         response=(
                   "NOTE [1:02:15] (NUMBER) 資訊系統預算總額 1200 萬元\n"
                   "NOTE [1:03:02] (PROPOSAL) 建議改用線上報名，減少現場排隊約 80 萬左右\n"
@@ -293,13 +282,10 @@ SPECS = {
         status="3.2 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
         wrap="char"),
 
-    # ---- one GIF per model: English and zh-TW side by side ----
+    # ---- one GIF per model: English over zh-TW (stacked) ----
     "k2-original": dict(
         out="k2horizon-original-en-zh.gif",
         panes=("k2base-neural", "k2base-zh")),
-    "k2-meeting": dict(
-        out="k2horizon-meeting-en-zh.gif",
-        panes=("k2ft-en", "k2ft-meeting")),
     "bonsai8b-chat": dict(
         out="bonsai8b-chat-en-zh.gif",
         panes=("bonsai8b-en", "bonsai8b-zh-tw")),

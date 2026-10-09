@@ -151,23 +151,23 @@ adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 
 
 ![K2-Horizon original, en over zh-TW](doc/k2horizon-original-en-zh.gif)
 
-*Fine-tune (FT)* — the same 0.9B trained for live meeting reading
-(NOTE/REVISE/NEXT), converted from the published int4-QAT safetensors to our
-own Q4 blob and run on the same engine, on the same 6-turn window in English
-and in Traditional Chinese. Each run shows its full input window verbatim, so
-every NOTE can be checked line by line: all five cite genuine timestamps and
-the turn stops at NEXT. The ~700-token prefill dominates (67–71 s; decode 3.2
-tok/s zh, 4.3 tok/s en over positions ~700–1100). The English window keeps the
-source's 萬 figures — with converted millions the model drops to 3/5. Given
-the same window the original model deliberates 150 tokens without emitting a
-single NOTE — that behavioral gap is what the fine-tune buys.
+*Fine-tune (FT)* — zh-TW only: the weights were trained specifically on a
+Traditional Chinese meeting corpus, so this demo stays with the language they
+know. The same 0.9B trained for live meeting reading (NOTE/REVISE/NEXT),
+converted from the published int4-QAT safetensors to our own Q4 blob and run
+on the same engine. The run shows the full 6-turn window verbatim, so every
+NOTE can be checked line by line: all five cite genuine timestamps and the
+turn stops at NEXT. The 680-token prefill dominates (67 s of the 185 s run;
+decode averages 3.2 tok/s over positions 680–1080). An English window was
+tried and dropped — these weights degrade off-corpus. Given the same window
+the original model deliberates 150 tokens without emitting a single NOTE —
+that behavioral gap is what the fine-tune buys.
 
 ```sh
-adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob $(cat ft_ids_enB.txt) --gen 400 --threads 4 --batch 8"   # en
-adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob $(cat ft_ids680.txt) --gen 400 --threads 4 --batch 8"    # zh
+adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob $(cat ft_ids680.txt) --gen 400 --threads 4 --batch 8"
 ```
 
-![K2-Horizon fine-tune, en over zh-TW](doc/k2horizon-meeting-en-zh.gif)
+![K2-Horizon fine-tune](doc/k2horizon-meeting-zh-tw.gif)
 
 Both K2 blobs are bit-identical on Spark to the scalar C reference
 (`neural2.txt`), logits included.
