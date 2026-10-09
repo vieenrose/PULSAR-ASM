@@ -379,6 +379,8 @@ k2q4_gemv_range:
     mov x7, #18
     mul x10, x9, x7                 /* row stride = nb32*18 */
     madd x11, x0, x10, x3           /* row ptr */
+    adrp x10, g_task_sc
+    ldr x10, [x10, :lo12:g_task_sc]  /* sc_base (x10 dead after rowptr) */
     mov x7, #292                    /* xq block stride (hoisted) */
     mov x8, x0                      /* r */
     mov x15, x1                     /* r1 */
@@ -388,41 +390,11 @@ k2q4_gemv_range:
     mov x14, #0                     /* b */
     fmov s8, wzr                    /* row acc: reg8, immune to all integer and v0-v7 writes */
 1:  /* ---- 32-weight block ---- */
-    ldrh w0, [x11]
     add x11, x11, #18
-    /* inline h2f (raw fp16 scale -> s0); scratch w1-w4, s0-s1 */
-    and w1, w0, #0x3ff
-    ubfx w2, w0, #10, #5
-    and w3, w0, #0x8000            /* MASK before shift: raw lsl drags exp bits up! */
-    lsl w3, w3, #16
-    cbnz w2, 2f
-    cbz w1, 3f
-    ucvtf s0, w1
-    mov w4, #0x33800000             /* 2^-24 */
-    fmov s1, w4
-    fmul s0, s0, s1
-    fmov w4, s0
-    orr w4, w4, w3
-    fmov s0, w4
-    b 4f
-3:  fmov s0, wzr
-    b 4f
-2:  cmp w2, #31
-    b.ne 5f
-    mov w4, #0x7f80
-    lsl w4, w4, #16
-    orr w4, w4, w3
-    lsl w1, w1, #13
-    orr w4, w4, w1
-    fmov s0, w4
-    b 4f
-5:  add w2, w2, #112
-    lsl w2, w2, #23
-    orr w4, w3, w2
-    lsl w1, w1, #13
-    orr w4, w4, w1
-    fmov s0, w4
-4:  fmov s5, s0                    /* ws (keep out of dot regs) */
+    madd x0, x8, x9, x14            /* r*nb32 + b */
+    lsl x0, x0, #2
+    add x0, x10, x0
+    ldr s5, [x0]                    /* ws (precomputed; bit-identical) */
     /* xq: wb = b>>3, woff = (b&7)<<5 */
     lsr w1, w14, #3
     and w2, w14, #7
@@ -657,6 +629,20 @@ embed:
     ret
 
 
+/* ---------------- sc_lookup: w0=il, w1=k -> x0 = sc_base.
+ * b_SC + il*3932160 + scoff[k] (tbl_scoff, byte offsets). Uses x0-x3 only. */
+    .align 2
+sc_lookup:
+    adrp x2, b_SC
+    add x2, x2, :lo12:b_SC
+    movz x3, #0x003c, lsl #16          /* 3932160/layer */
+    madd x2, x0, x3, x2
+    adrp x3, tbl_scoff
+    add x3, x3, :lo12:tbl_scoff
+    ldr x0, [x3, x1, lsl #3]
+    add x0, x2, x0
+    ret
+
 /* ---------------- gemvW: w0=il, w1=k, x2=x, x3=y.
  * w = g_LBASE + il*17707008 + koff[k]; q8_quant(x, XQQ, cols) then
  * q4_gemv(0, rows, cols, w, x, y, XQQ). Saves x19-x24. */
@@ -681,6 +667,16 @@ gemvW:
     add x1, x1, :lo12:tbl_koff
     ldr x0, [x1, x19, lsl #3]
     add x24, x2, x0                 /* w */
+    adrp x0, b_SC
+    add x0, x0, :lo12:b_SC
+    movz x1, #0x003c, lsl #16          /* 3932160/layer */
+    madd x0, x22, x1, x0
+    adrp x1, tbl_scoff
+    add x1, x1, :lo12:tbl_scoff
+    ldr x2, [x1, x19, lsl #3]
+    add x0, x0, x2
+    adrp x1, g_task_sc
+    str x0, [x1, :lo12:g_task_sc]    /* publish sc_base */
     adrp x1, tbl_krows
     add x1, x1, :lo12:tbl_krows
     ldr w23, [x1, x19, lsl #2]      /* rows */
@@ -1708,7 +1704,7 @@ memcpy_q:
  * [sp,#104]. */
     .align 2
 k2q4_gemv_batch:
-    stp x29, x30, [sp, #-192]!
+    stp x29, x30, [sp, #-208]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -1717,7 +1713,7 @@ k2q4_gemv_batch:
     stp x27, x28, [sp, #80]
     mov w25, w0                     /* r */
     mov w26, w1                     /* r1 */
-    mov x24, x3                     /* w */
+    str x3, [sp, #192]              /* w to stack (x17/x24 are sc ptrs now) */
     mov x19, x4                     /* xq_base */
     mov x20, x5                     /* y_base */
     mov w21, w6                     /* B */
@@ -1726,9 +1722,6 @@ k2q4_gemv_batch:
     mov x9, #292
     mul x27, x27, x9                /* xqs */
     asr x9, x2, #5                  /* nb32 */
-    mov x10, #18
-    mul x10, x9, x10                /* rowstride */
-    mov x17, x10                    /* rowstride (x10 dies: slot base) */
     mov x28, x9                     /* nb32 */
     movi v4.16b, #15
     str q4, [sp, #160]              /* mask15 to stack (v30/v31 are acc now) */
@@ -1737,15 +1730,32 @@ k2q4_gemv_batch:
 .Lbg_row:
     cmp w25, w26
     b.ge .Lbg_end
-    madd x11, x25, x17, x24         /* rowptr0 = w + r*stride */
+    ldr x0, [sp, #192]              /* w */
+    lsl x1, x28, #4
+    add x1, x1, x28, lsl #1         /* rowstride = nb32*18 */
+    madd x11, x25, x1, x0           /* rowptr0 */
     add w14, w25, #1
     cmp w14, w26
     b.lt .Lbg_pair
     mov x23, x11                    /* single: row1 = row0 (dup read, store skips) */
     b .Lbg_setup
 .Lbg_pair:
-    add x23, x11, x17               /* rowptr1 = rowptr0 + rowstride */
+    add x23, x11, x1                /* rowptr1 (x1=stride intact) */
 .Lbg_setup:
+    adrp x0, g_task_sc
+    ldr x0, [x0, :lo12:g_task_sc]   /* sc_base */
+    lsl x1, x28, #2                   /* nb32*4 */
+    madd x17, x25, x28, xzr
+    lsl x17, x17, #2
+    add x17, x0, x17                  /* sc0 = base + r*nb32*4 */
+    add w0, w25, #1
+    cmp w0, w26
+    b.lt .Lbg_scPair
+    mov x24, x17                      /* single: dup */
+    b .Lbg_scDone
+.Lbg_scPair:
+    add x24, x17, x1                  /* sc1 = sc0 + nb32*4 */
+.Lbg_scDone:
     mov x8, x19
     add x9, x8, x27
     add x10, x9, x27
@@ -1772,41 +1782,13 @@ k2q4_gemv_batch:
     movi v31.4s, #0
     mov x6, xzr                     /* block index */
 .Lbg_blk:
-    ldrh w0, [x11]
     add x11, x11, #18
-    and w1, w0, #0x3ff
-    ubfx w2, w0, #10, #5
-    and w3, w0, #0x8000
-    lsl w3, w3, #16
-    cbnz w2, 2f
-    cbz w1, 3f
-    ucvtf s0, w1
-    mov w4, #0x33800000
-    fmov s1, w4
-    fmul s0, s0, s1
-    fmov w4, s0
-    orr w4, w4, w3
-    fmov s0, w4
-    b 4f
-3:  fmov s0, wzr
-    b 4f
-2:  cmp w2, #31
-    b.ne 5f
-    mov w4, #0x7f80
-    lsl w4, w4, #16
-    orr w4, w4, w3
-    lsl w1, w1, #13
-    orr w4, w4, w1
-    fmov s0, w4
-    b 4f
-5:  add w2, w2, #112
-    lsl w2, w2, #23
-    orr w4, w3, w2
-    lsl w1, w1, #13
-    orr w4, w4, w1
-    fmov s0, w4
-4:  fmov s5, s0                     /* ws0 */
-    ldr q4, [sp, #160]              /* mask15 (v4 dead: slots done, h2f used s0/s1) */
+    add x23, x23, #18
+    ldr s5, [x17]                     /* ws0 (precomputed) */
+    ldr s10, [x24]                    /* ws1 (precomputed) */
+    add x17, x17, #4
+    add x24, x24, #4
+    ldr q4, [sp, #160]              /* mask15 */
     ldr q7, [sp, #176]              /* mask8 */
     sub x4, x11, #16
     ld1 {v0.16b}, [x4]
@@ -1814,40 +1796,12 @@ k2q4_gemv_batch:
     ushr v0.16b, v0.16b, #4
     sub v1.16b, v1.16b, v7.16b
     sub v0.16b, v0.16b, v7.16b      /* nibbles row 0 */
-    ldrh w0, [x23]
-    add x23, x23, #18
-    and w1, w0, #0x3ff
-    ubfx w2, w0, #10, #5
-    and w3, w0, #0x8000
-    lsl w3, w3, #16
-    cbnz w2, 6f
-    cbz w1, 7f
-    ucvtf s4, w1
-    mov w4, #0x33800000
-    fmov s6, w4
-    fmul s4, s4, s6
-    fmov w4, s4
-    orr w4, w4, w3
-    fmov s4, w4
-    b 8f
-7:  fmov s4, wzr
-    b 8f
-6:  cmp w2, #31
-    b.ne 9f
-    mov w4, #0x7f80
-    lsl w4, w4, #16
-    orr w4, w4, w3
-    lsl w1, w1, #13
-    orr w4, w4, w1
-    fmov s4, w4
-    b 8f
-9:  add w2, w2, #112
-    lsl w2, w2, #23
-    orr w4, w3, w2
-    lsl w1, w1, #13
-    orr w4, w4, w1
-    fmov s4, w4
-8:  fmov s10, s4                    /* ws1 (s4/s6 dead after; v0/v1 preserved) */
+    sub x4, x23, #16
+    ld1 {v6.16b}, [x4]
+    and v2.16b, v6.16b, v4.16b
+    ushr v3.16b, v6.16b, #4
+    sub v2.16b, v2.16b, v7.16b
+    sub v3.16b, v3.16b, v7.16b      /* nibbles row 1 */                    /* ws1 (s4/s6 dead after; v0/v1 preserved) */
     ldr q4, [sp, #160]              /* mask15 (v4 dead here) */
     ldr q7, [sp, #176]              /* mask8 (v7 dead here) */
     sub x4, x23, #16
@@ -2076,7 +2030,7 @@ k2q4_gemv_batch:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #192
+    ldp x29, x30, [sp], #208
     ret
 
 /* ---------------- q4_gemv_dispatch_b: batched row-parallel dispatch.
@@ -2166,6 +2120,16 @@ gemvW_batch:
     add x1, x1, :lo12:tbl_koff
     ldr x0, [x1, x19, lsl #3]
     add x24, x2, x0                 /* w */
+    adrp x0, b_SC
+    add x0, x0, :lo12:b_SC
+    movz x1, #0x003c, lsl #16          /* 3932160/layer */
+    madd x0, x22, x1, x0
+    adrp x1, tbl_scoff
+    add x1, x1, :lo12:tbl_scoff
+    ldr x2, [x1, x19, lsl #3]
+    add x0, x0, x2
+    adrp x1, g_task_sc
+    str x0, [x1, :lo12:g_task_sc]    /* publish sc_base */
     adrp x1, tbl_krows
     add x1, x1, :lo12:tbl_krows
     ldr w25, [x1, x19, lsl #2]      /* rows */
@@ -2250,6 +2214,12 @@ head_batch:
     add x20, x20, #1
     cmp w20, w19
     b.ne 2b
+    adrp x0, b_SC
+    add x0, x0, :lo12:b_SC
+    movz x1, #0x0690, lsl #16          /* +110100480 (head) */
+    add x0, x0, x1
+    adrp x1, g_task_sc
+    str x0, [x1, :lo12:g_task_sc]    /* publish head sc_base */
     mov w0, wzr
     adrp x1, g_vocab
     ldr w1, [x1, :lo12:g_vocab]
@@ -2518,6 +2488,149 @@ layer_forward_batch:
     ldp x29, x30, [sp], #96
     ret
 
+/* ---------------- sc_init: precompute f32 scales for all Q4 matrices.
+ * Runs once after blob_load (needs LBASE/vocab). For each layer (28) and each
+ * real matrix k in {1,2,3,4,6,7,8}, decodes every block's fp16 scale with the
+ * exact inline h2f (bit-identical by construction: same ops, same order) into
+ * b_SC; head scales follow layer 27. Layout: sc = b_SC + il*3932160 + scoff[k]
+ * + (r*nb32 + b)*4. Saves x19-x28. One-time cost, counted honestly. */
+    .align 2
+sc_init:
+    stp x29, x30, [sp, #-96]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+    adrp x19, b_SC
+    add x19, x19, :lo12:b_SC
+    adrp x20, g_LBASE
+    ldr x20, [x20, :lo12:g_LBASE]
+    mov w21, wzr                     /* il */
+.Lsc_il:
+    cmp w21, #28
+    b.ge .Lsc_head
+    mov w22, #1                      /* k */
+.Lsc_k:
+    cmp w22, #9
+    b.ge .Lsc_nextil
+    cmp w22, #5
+    b.eq .Lsc_nextk
+    adrp x0, tbl_kcols
+    add x0, x0, :lo12:tbl_kcols
+    ldr w0, [x0, x22, lsl #2]
+    cbz w0, .Lsc_nextk               /* k=0: cols 0 */
+    /* wptr = LBASE + il*17707008 + koff[k] */
+    movz x0, #0x010e, lsl #16
+    movk x0, #0x3000
+    madd x0, x21, x0, x20
+    adrp x1, tbl_koff
+    add x1, x1, :lo12:tbl_koff
+    ldr x2, [x1, x22, lsl #3]
+    add x23, x0, x2                  /* wptr */
+    adrp x0, tbl_krows
+    add x0, x0, :lo12:tbl_krows
+    ldr w26, [x0, x22, lsl #2]       /* rows */
+    adrp x0, tbl_kcols
+    add x0, x0, :lo12:tbl_kcols
+    ldr w0, [x0, x22, lsl #2]
+    lsr w24, w0, #5                  /* nb32 */
+    /* scdst = b_SC + il*3932160 + scoff[k] */
+    movz x0, #0x003c, lsl #16        /* 3932160 = 0x3C0000 */
+    madd x0, x21, x0, x19
+    adrp x1, tbl_scoff
+    add x1, x1, :lo12:tbl_scoff
+    ldr x2, [x1, x22, lsl #3]
+    add x25, x0, x2                  /* scdst */
+    bl .Lsc_mat
+.Lsc_nextk:
+    add w22, w22, #1
+    b .Lsc_k
+.Lsc_nextil:
+    add w21, w21, #1
+    b .Lsc_il
+.Lsc_head:
+    adrp x0, g_O_HEAD
+    ldr x23, [x0, :lo12:g_O_HEAD]    /* wptr */
+    adrp x0, g_vocab
+    ldr w26, [x0, :lo12:g_vocab]     /* rows */
+    mov w24, #48                     /* nb32 (cols 1536) */
+    movz x0, #0x0690, lsl #16        /* 110100480 = 0x6900000 */
+    add x25, x19, x0                 /* scdst */
+    bl .Lsc_mat
+    ldp x27, x28, [sp, #80]
+    ldp x25, x26, [sp, #64]
+    ldp x23, x24, [sp, #48]
+    ldp x21, x22, [sp, #32]
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #96
+    ret
+/* .Lsc_mat: decode all scales of one matrix. In: x23=wptr, w26=rows,
+ * w24=nb32, x25=scdst. Uses x0-x11, w10/w11, s0/s1. Preserves x19-x28. */
+.Lsc_mat:
+    mov x27, x23                     /* wrow */
+    mov x28, x25                     /* scrow */
+    mov w10, wzr                     /* r */
+.Lsc_r:
+    cmp w10, w26
+    b.ge .Lsc_ret
+    mov x6, x27                      /* wblk */
+    mov x7, x28                      /* scblk */
+    mov w11, wzr                     /* b */
+.Lsc_b:
+    ldrh w0, [x6]
+    and w1, w0, #0x3ff
+    ubfx w2, w0, #10, #5
+    and w3, w0, #0x8000
+    lsl w3, w3, #16
+    cbnz w2, .Lsch2
+    cbz w1, .Lsch3
+    ucvtf s0, w1
+    mov w4, #0x33800000
+    fmov s1, w4
+    fmul s0, s0, s1
+    fmov w4, s0
+    orr w4, w4, w3
+    fmov s0, w4
+    b .Lsch4
+.Lsch3:
+    fmov s0, wzr
+    b .Lsch4
+.Lsch2:
+    cmp w2, #31
+    b.ne .Lsch5
+    mov w4, #0x7f80
+    lsl w4, w4, #16
+    orr w4, w4, w3
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s0, w4
+    b .Lsch4
+.Lsch5:
+    add w2, w2, #112
+    lsl w2, w2, #23
+    orr w4, w3, w2
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s0, w4
+.Lsch4:
+    str s0, [x7]
+    add x6, x6, #18
+    add x7, x7, #4
+    add w11, w11, #1
+    cmp w11, w24
+    b.ne .Lsc_b
+    mov x0, #18
+    mul x0, x24, x0
+    add x27, x27, x0                 /* wrow += rowstride */
+    lsl x0, x24, #2
+    add x28, x28, x0                 /* scrow += nb32*4 */
+    add w10, w10, #1
+    b .Lsc_r
+.Lsc_ret:
+    ret
+
 /* ---------------- .data ---------------- */
     .data
     .align 3
@@ -2594,6 +2707,8 @@ m_usage:        .asciz "usage: k2_core <k2h_q4.blob> <id...> [--gen N] [--sample
     .align 3
 tbl_koff:       .quad 0, 6144, 1775616, 2217984, 2660352, 4429824, 4435968, 8859648, 13283328
     .align 2
+tbl_scoff:      .quad 0, 0, 393216, 491520, 589824, 983040, 983040, 1966080, 2949120
+    /* per-matrix f32-scale byte offsets within a layer (k=0,5 unused) */
 tbl_krows:      .word 1536, 2048, 512, 512, 1536, 1536, 5120, 5120, 1536
 tbl_kcols:      .word 0, 1536, 1536, 1536, 2048, 0, 1536, 1536, 5120
 
@@ -2643,8 +2758,10 @@ g_task_rows:    .skip 4
 g_task_kind:    .skip 4                    /* 0/1 = GEMV, 2 = attention */
 g_task_il:      .skip 4
     .align 3
-g_task_sc:      .skip 8                    /* (unused: sc is per-participant) */
+g_task_sc:      .skip 8                    /* sc_base for GEMV kernels */
 b_attSC:        .skip 49152                /* 8 x 1536-f32 private score bufs */
+    .align 12
+b_SC:           .skip 134217728              /* 128MB precomputed f32 scales */
     .align 3                        /* g_RS is loaded with 64-bit ldr */
 g_RS:           .skip 8
 g_vocab:        .skip 4
@@ -2920,6 +3037,7 @@ main:
     add x28, x24, x23                /* n0 + gen bound */
     adrp x1, g_pos
     str xzr, [x1, :lo12:g_pos]
+    bl sc_init                       /* precompute f32 scales (once) */
     /* thread pool (default 1 -> serial, bit-identical) */
     adrp x1, g_nthreads
     ldr w0, [x1, :lo12:g_nthreads]
@@ -3111,6 +3229,12 @@ main:
     add x1, x1, :lo12:b_XQQ
     mov w2, #1536
     bl k2_q8_quant
+    adrp x0, b_SC
+    add x0, x0, :lo12:b_SC
+    movz x1, #0x0690, lsl #16          /* +110100480 (head) */
+    add x0, x0, x1
+    adrp x1, g_task_sc
+    str x0, [x1, :lo12:g_task_sc]    /* publish head sc_base */
     mov w0, wzr
     adrp x1, g_vocab
     ldr w1, [x1, :lo12:g_vocab]
