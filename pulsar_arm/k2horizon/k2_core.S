@@ -850,6 +850,7 @@ attention:
     ldr s0, [x25, x27, lsl #2]
     fsub s0, s0, s11
     bl expf
+    str s0, [x25, x27, lsl #2]      /* stash e: the p-loop reloads it, no 2nd expf */
     fcvt d0, s0
     fadd d10, d10, d0
     add x27, x27, #1
@@ -859,10 +860,8 @@ attention:
     /* ---- p-loop: o += p * V ---- */
     mov x27, xzr
 .Lattn_p_t:
-    ldr s0, [x25, x27, lsl #2]
-    fsub s0, s0, s11
-    bl expf
-    fdiv s2, s0, s10                 /* p */
+    ldr s2, [x25, x27, lsl #2]       /* e (stashed; bit-identical, no expf) */
+    fdiv s2, s2, s10                 /* p */
     add x9, x23, x27, lsl #11        /* VCA row */
     lsr w3, w21, #2
     lsl x3, x3, #8                   /* khoff (x2 dead across expf) */
