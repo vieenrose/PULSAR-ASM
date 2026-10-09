@@ -229,8 +229,8 @@ SPECS = {
     # K2-Horizon-0.9B base (Q4, native engine on the Galaxy Note 10+ SD855,
     # serial, big cores): ceiling prompt is the two-sentence neural explainer
     # (greedy) - seasons loops and haiku rambles under greedy. 216 steps,
-    # byte-identical to the Spark run including logits (phone shot per
-    # reshoot scope); 28.2s total = 7.7 tok/s.
+    # byte-identical to the Spark run including logits; 11s total = 19.6 tok/s
+    # on the optimized engine (row-blocked GEMV, threaded attention).
     "k2base-neural": dict(
         out="k2horizon-chat-en.gif",
         title="pulsar \u00b7 K2-Horizon-0.9B \u00b7 phone cpu",
@@ -241,7 +241,7 @@ SPECS = {
             " (id 64029), so generation starts inside the think block and"
             " only the closer </ifm|think> is generated",
         response="The user wants an explanation of what a neural network is in two sentences. This is a straightforward request. I should provide a concise definition of neural networks, likely in the context of machine learning, explaining their structure and function. Two sentences is quite short, so I need to be concise but informative. Something like: \"A neural network is a computational model inspired by the brain's structure and function, consisting of layers of interconnected nodes that process inputs through weighted connections to produce outputs, and it is commonly used in machine learning for tasks like image recognition, natural language processing, and predictive modeling.\" That's two sentences. Let me make sure it's clear and accurate.\n</ifm|think>\nA neural network is a computational model inspired by the brain's structure and function, consisting of layers of interconnected nodes that process inputs through weighted connections to produce outputs, and it is commonly used in machine learning for tasks like image recognition, natural language processing, and predictive modeling.",
-        status="13 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
+        status="20 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
         wrap="word"),
     # K2 meeting agent (fine-tune, LiteRT-LM q4 int4-QAT, stock signatures
     # driven manually): temp 0.2 seed 7. 5/5 notes verifiable, all cited
@@ -257,7 +257,7 @@ SPECS = {
             " (id 64029), so generation starts inside the think block and"
             " only the closer </ifm|think> is generated",
         response="The user wants me to provide the four seasons in Traditional Chinese. I need to provide just the four names, no explanation.\n\nThe four seasons in Traditional Chinese are:\n春 (Chun) - Spring\n夏 (Hong) - Summer\n秋 (Qiu) - Autumn\n冬 (Gan) - Winter\n\nI should provide just these four names, no explanation.\n</ifm|think>\n春\n夏\n秋\n冬",
-        status="19 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
+        status="23 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
         wrap="word"),
     "k2ft-meeting": dict(
         out="k2horizon-meeting-zh-tw.gif",
@@ -279,7 +279,7 @@ SPECS = {
                   "NOTE [1:05:33] (ACTION) 報告負責人下週五前交書面報告\n"
                   "NOTE [1:06:20] (OPEN-ISSUE) 場地費 5 萬元尚未付，需儘速處理\n"
                   "NEXT"),
-        status="3.2 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
+        status="8.9 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
         wrap="char"),
 
     # ---- one GIF per model: English over zh-TW (stacked) ----

@@ -13,7 +13,7 @@ token for token, logits included):
 
 | checkpoint | hidden | intermediate | layers | bytes | decode (phone) |
 |---|---|---|---|---|---|
-| `k2h_09_q4` (original) | 1536 | 5120 | 28 | 749 MB | **~62 ms/token** (4-thread decode, short context) |
+| `k2h_09_q4` (original) | 1536 | 5120 | 28 | 749 MB | **~51 ms/token** (4-thread decode, short context) |
 | `k2h_ft_q4` (meeting-agent FT) | 1536 | 5120 | 28 | 769 MB | same engine; long-context cost in demos |
 
 Two Bonsai checkpoints run on the C + NEON port in `pulsar_arm/bonsai2/`
@@ -141,8 +141,8 @@ only, glibc-bit-identical `expf`/`%.4f`) on the phone's big cores: greedy,
 English (seasons loops and haiku rambles under greedy, so they don't
 qualify), and the four season names in Traditional Chinese — the strongest zh
 prompt the base model answers correctly (twelve greedy probes; everything
-longer loops, errs, or never answers). 13 tok/s en, 19 tok/s zh; both prompts
-cost about a second.
+longer loops, errs, or never answers). 20 tok/s en, 23 tok/s zh; both prompts
+prefill in about a second.
 
 ```sh
 adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 ... --gen 400 --threads 4 --batch 8"   # en
@@ -157,8 +157,8 @@ know. The same 0.9B trained for live meeting reading (NOTE/REVISE/NEXT),
 converted from the published int4-QAT safetensors to our own Q4 blob and run
 on the same engine. The run shows the full 6-turn window verbatim, so every
 NOTE can be checked line by line: all five cite genuine timestamps and the
-turn stops at NEXT. The 680-token prefill dominates (67 s of the 185 s run;
-decode averages 3.2 tok/s over positions 680–1080). An English window was
+turn stops at NEXT. The 680-token prefill takes ~25 s of the 69 s run;
+decode averages 8.9 tok/s over positions 680–1080. An English window was
 tried and dropped — these weights degrade off-corpus. Given the same window
 the original model deliberates 150 tokens without emitting a single NOTE —
 that behavioral gap is what the fine-tune buys.
