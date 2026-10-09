@@ -247,6 +247,29 @@ SPECS = {
     # driven manually): temp 0.2 seed 7. 5/5 notes verifiable, all cited
     # times genuine; harness stops at NEXT (ramble loop after is cut).
     # Seeds 8 (drops PROPOSAL) and 9 (ties 7) also sampled; 7 verified.
+    "k2base-zh": dict(
+        out="k2horizon-zh-tw.gif",
+        title="pulsar \u00b7 K2-Horizon-0.9B \u00b7 phone cpu",
+        cmd="$ adb shell \"cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 200 2226 294 3957 29181 316 43658 10627 13 1546 294 3957 8045 13 1026 28045 15 64019 64018 612 10102 200 64029 200 --gen 200 --threads 4 --batch 8\"",
+        you="> Name the four seasons in Traditional Chinese, only the four names, no explanation.",
+        tpl="prompt ids: 64018 2985 200 2226 294 3957 29181 316 43658 10627 13 1546 294 3957 8045 13 1026 28045 15 64019 64018 612 10102 200 64029 200"
+            " \u2014 IFM chat template ends with assistant\\n<ifm|think>\\n"
+            " (id 64029), so generation starts inside the think block and"
+            " only the closer </ifm|think> is generated",
+        response="The user wants me to provide the four seasons in Traditional Chinese. I need to provide just the four names, no explanation.\n\nThe four seasons in Traditional Chinese are:\n春 (Chun) - Spring\n夏 (Hong) - Summer\n秋 (Qiu) - Autumn\n冬 (Gan) - Winter\n\nI should provide just these four names, no explanation.\n</ifm|think>\n春\n夏\n秋\n冬",
+        status="19 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
+        wrap="word"),
+    "k2ft-en": dict(
+        out="k2horizon-meeting-en.gif",
+        title="pulsar \u00b7 K2 meeting agent \u00b7 phone cpu",
+        cmd="$ adb shell \"cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob"
+            " $(cat ft_ids_enB.txt) --gen 400 --threads 4 --batch 8\""
+            "  # native asm engine, greedy",
+        you="> S1 [1:02:15] Everyone, the information system budget is listed at 1200 萬 yuan in total, 300 萬 more than last year. Please confirm.\n> S2 [1:03:02] I suggest changing to online registration, which can reduce the manpower for on-site queuing, saving about 80 萬.\n> S3 [1:03:40] Online registration was tried before; elderly people may not use it. This needs to be evaluated again.\n> S1 [1:04:10] OK, then the budget case is approved as proposed. The organizing unit, please submit a written report within two weeks.\n> S2 [1:05:33] I will be responsible for the report, due before next Friday. Also, the next meeting time is set for March 15 at 2 PM.\n> S3 [1:06:20] Before adjournment, a reminder: the venue fee has not been paid, 5 萬 in total. This needs to be handled quickly.",
+        tpl="system: NOTE/REVISE/NEXT \u5340\u5bf8 (1686B) + 6-turn window \u2014 698 ids, native Q4 blob; window keeps \u842c figures",
+        response="NOTE [1:02:15] (NUMBER) Information system budget 1200 萬, 300 萬 more than last year\nNOTE [1:03:02] (PROPOSAL) S1 suggests online registration, saving about 80 萬\nNOTE [1:04:10] (DECISION) Budget case is approved as proposed\nNOTE [1:05:33] (ACTION) S2 will be responsible for the written report due before next Friday\nNOTE [1:06:20] (OPEN-ISSUE) Venue fee 5 萬未付，需儘快處理\nNEXT",
+        status="4.3 tok/s \u00b7 greedy \u00b7 SD855 big cores, pure-asm engine",
+        wrap="char"),
     "k2ft-meeting": dict(
         out="k2horizon-meeting-zh-tw.gif",
         title="pulsar \u00b7 K2 meeting agent \u00b7 phone cpu",
@@ -271,9 +294,12 @@ SPECS = {
         wrap="char"),
 
     # ---- one GIF per model: English and zh-TW side by side ----
-    "k2-chat": dict(
-        out="k2horizon-original-ft.gif",
-        panes=("k2base-neural", "k2ft-meeting")),
+    "k2-original": dict(
+        out="k2horizon-original-en-zh.gif",
+        panes=("k2base-neural", "k2base-zh")),
+    "k2-meeting": dict(
+        out="k2horizon-meeting-en-zh.gif",
+        panes=("k2ft-en", "k2ft-meeting")),
     "bonsai8b-chat": dict(
         out="bonsai8b-chat-en-zh.gif",
         panes=("bonsai8b-en", "bonsai8b-zh-tw")),

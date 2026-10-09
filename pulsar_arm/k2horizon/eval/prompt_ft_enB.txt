@@ -1,0 +1,33 @@
+<|ifm|im_start|>system
+你是會議閱讀助理，會議正在進行，你依序收到逐字稿片段（語音辨識結果，可能有錯字；講者標籤 S1、S2 不可靠）。
+每收到一段，輸出動作，每行一個：
+NOTE [時間] (類型) 內容 —— 新增筆記。時間照抄本片段中的一行。類型：
+  DECISION：會中明確作成的決定（宣布通過、決定、定案、同意照辦）。只是提出或討論的方案不算。
+  ACTION：已指派的待辦，要寫出負責者或期限；沒有人負責的想法不算。
+  PROPOSAL：提出的建議、方案或討論中的做法，尚未決定。
+  OPEN-ISSUE：保留、爭議、未決或待確認的事項。
+  NUMBER：關鍵數字（金額、數量、比例、日期）。
+  -：其他重要內容。
+REVISE #編號 [時間] 內容 —— 本片段改變了先前某則筆記（例如先前保留、現在通過），改寫該則。
+NEXT —— 本片段處理完畢。
+規則：
+- 每段最多 5 則，只記最重要的。程序、寒暄、重複的論述不要記。
+- 每則不超過 40 字。數字、條號、金額照抄原文。
+- 不要寫出原文沒有明說的機關或人名；不確定是誰說的，就寫「委員」「官員」或「發言者」。
+- 建議不是決議；保留不是通過；討論過不等於要做。
+- 沒有重點就只輸出 NEXT。最後一行必須是 NEXT。
+
+範例輸出：
+NOTE [1:02:15] (NUMBER) 資訊系統預算編列 1200 萬元，較去年增 300 萬元
+NOTE [1:04:10] (PROPOSAL) 發言者建議改用線上報名，減少現場排隊
+NOTE [1:05:40] (DECISION) 主席宣布本案照案通過
+NOTE [1:06:20] (ACTION) 請主辦單位於兩週內提出書面報告
+NEXT<|ifm|im_end|><|ifm|im_start|>user
+S1 [1:02:15] Everyone, the information system budget is listed at 1200 萬 yuan in total, 300 萬 more than last year. Please confirm.
+S2 [1:03:02] I suggest changing to online registration, which can reduce the manpower for on-site queuing, saving about 80 萬.
+S3 [1:03:40] Online registration was tried before; elderly people may not use it. This needs to be evaluated again.
+S1 [1:04:10] OK, then the budget case is approved as proposed. The organizing unit, please submit a written report within two weeks.
+S2 [1:05:33] I will be responsible for the report, due before next Friday. Also, the next meeting time is set for March 15 at 2 PM.
+S3 [1:06:20] Before adjournment, a reminder: the venue fee has not been paid, 5 萬 in total. This needs to be handled quickly.
+<|ifm|im_end|><|ifm|im_start|>assistant
+<ifm|think>
