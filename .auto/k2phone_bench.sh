@@ -3,7 +3,7 @@
 # Workload: 680-id FT meeting prompt + 400 greedy gen, --threads 4 --batch 8,
 # taskset f0 (big cores), Galaxy Note 10+. Binary must already be deployed
 # as /data/local/tmp/k2_core with k2h_ft_q4.blob + ft_ids680.txt present.
-# Prints METRIC lines for run_experiment/log_experiment.
+# Meter is tokens/sec (higher is better); ms kept for reference.
 set -u
 OUT=${1:-/tmp/k2b}
 IDS=$(cat /tmp/ft_ids680.txt)
@@ -37,10 +37,17 @@ if ! diff <(grep ^step $OUT.full.txt) <(grep ^step $GOLDEN) > /dev/null; then
 fi
 echo "GATE OK: 1080 steps bit-identical"
 
-DEC_PT=$(python3 -c "print(f'{(($TOTAL_MS - $PRE_MS) / 400):.1f}')")
+TOK_S=$(python3 -c "print(f'{(1080 / ($TOTAL_MS / 1000)):.2f}')")
+PRE_TS=$(python3 -c "print(f'{(680 / ($PRE_MS / 1000)):.2f}')")
+DEC_TS=$(python3 -c "print(f'{(400 / (($TOTAL_MS - $PRE_MS) / 1000)):.2f}')")
+DEC_MS=$(python3 -c "print(f'{(($TOTAL_MS - $PRE_MS) / 400):.1f}')")
 T1=$(bigtemp); echo "temp_post_mC=$T1"
+echo "METER: ${TOK_S} tok/s overall | ${PRE_TS} tok/s prefill | ${DEC_TS} tok/s decode"
+echo "METRIC tok_s=$TOK_S"
+echo "METRIC prefill_tok_s=$PRE_TS"
+echo "METRIC decode_tok_s=$DEC_TS"
 echo "METRIC total_ms=$TOTAL_MS"
 echo "METRIC prefill_ms=$PRE_MS"
-echo "METRIC decode_ms_per_tok=$DEC_PT"
+echo "METRIC decode_ms_per_tok=$DEC_MS"
 echo "METRIC temp_mC=$T1"
 echo "METRIC steps=$STEPS"
