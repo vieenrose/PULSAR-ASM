@@ -170,3 +170,27 @@ and the lessons. Objective and gates are unchanged.
   Measured dead ends: little cores (taskset ff, 8 threads) 2.2x SLOWER (165.7s vs 76.7s, barrier stragglers + heat) — 4 big cores optimal, do not revisit. B=16 dead (needs 16 acc + 16 bases; SIMD+GPR pressure forces stack traffic that erases the gain). 4-row blocking dead (same pressure). Score/es/p attention at bit-exact floor (threaded+fused+vectorized; score loop latency-bound by IEEE order). Glue (norms/silu/rope/quant/copies) ~2% total; rms reductions + silu expf + q8 max-scan cannot parallelize/vectorize bit-exactly — skip. THP/prefetch considered, skipped (4.14 file mappings unlikely to merge; TLB cost ~1%). Unrolled scalar GEMV considered, skipped (~2%). Head skip for intermediate prefill tokens: breaks the step-line golden (verification), never.
   Roofline (phone memcpy 20.3 GB/s; FT weights ~545MB/tok): decode-short floor ~27ms (at 62ms); decode-long and prefill dominated by attention instructions + sustained thermal clocks, not bandwidth. Remaining bit-exact headroom ~10-15% via heroic micro-opts only. Further gains need more cores (worse here), new ISA, or relaxing bit-exactness (forbidden: demo bytes + Spark parity depend on it).
   Method lessons: phone component split (prefill vs decode) swings +-10% anticorrelated run to run (thermal/DVFS) while TOTAL holds +-1% — judge ONLY by total; single-run secondaries mislead (nearly chased alignment ghosts). Cool to <=38C big-core temp before timed runs; airplane mode + screen off; keep harness frozen mid-session. log_experiment keep sweeps git add -A: split history hygiene manually (0b1ce6d incident).
+
+## K2-FT PHONE LOOP: DECLARED PRACTICAL BIT-EXACT LIMIT (2026-10-09)
+Final: 5.89 -> 15.37 tok/s (+161%), 1080/1080 steps bit-identical. HEAD=exp#6.
+Keeps (4): exp1 expf-fusion (+3.6%), exp3 threaded-attention (+98%),
+exp4 unrolled-batch-GEMV (+4.8%), exp6 2-row-blocking (+21%).
+Discards (8), each proving a mechanism: exp2 score-vectorize (dup bypass >=
+scalar, latency floor); exp5 alignment (+-1.5% lottery); exp7 sleeping-pool
+(-4.6%, DVFS needs 100% spin); exp8 scalar-unroll (-3.8%, frontend effects);
+exp9 THP (-7%, khugepaged steals bandwidth); exp10 q8-NEON (-5.2%, frontend
+swamps ALU); exp11 rope-NEON (-1.4%, true ~0%); exp12 memoize-quants (-6.6%,
+noise/alignment, true +0.12% unmeasurable).
+Dead without trial (measured or proven elsewhere): little cores (2.2x worse),
+B=16 + 4-row blocking (register pressure), fdiv/reciprocal + f64->f32 + fast
+exp (bit-exact forbids), head shortcut (margins too small per bonsai survey),
+prompt/caching/batch/thread/config gaming (forbidden).
+Remaining ideas all <=0.12% (100-700x below +-7% phone noise): silu-mul
+(0.06%, expf-call overhead eats SIMD savings), q8-max (0.007%), sampler
+(0.01%), fused-norm (L1-resident, ~0%), KV-relayout (~0.3%, high risk).
+Phone variance +-7% (thermal/cache/background); judge by total only
+(prefill/decode secondaries anticorrelate +-10%).
+To unlock more: (a) fp32-close attention (real vectorization), (b) cooled or
+bigger hardware (sustained 1.71GHz thermal cap binds), (c) new workload/config.
+Engine + phone binary both at exp#6, gate green. Loop converged; do not revive
+discards without a changed assumption.
