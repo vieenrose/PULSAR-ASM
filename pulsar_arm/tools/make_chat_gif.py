@@ -435,14 +435,15 @@ def _plan(spec, tx, h=None):
     return frames, h
 
 
-def _draw_pane(d, tx, spec, fr, x0, w, h):
+def _draw_pane(d, tx, spec, fr, x0, y0, w, h):
     rows, status, cursor = fr
-    d.rounded_rectangle([x0 + 10, 10, x0 + w - 10, 44], 8,
+    d.rounded_rectangle([x0 + 10, y0 + 10, x0 + w - 10, y0 + 44], 8,
                         outline="#242a38", width=1)
     for i, c in enumerate(("#f7768e", "#e0af68", CMD_OK)):
-        d.ellipse([x0 + 26 + i * 22, 22, x0 + 40 + i * 22, 36], fill=c)
-    tx.draw(d, (x0 + 150, 19), spec["title"], DIM)
-    y = TOP
+        d.ellipse([x0 + 26 + i * 22, y0 + 22, x0 + 40 + i * 22, y0 + 36],
+                  fill=c)
+    tx.draw(d, (x0 + 150, y0 + 19), spec["title"], DIM)
+    y = y0 + TOP
     for text, xoff, col in rows:
         if text:
             tx.draw(d, (x0 + PAD + xoff, y), text, col)
@@ -450,26 +451,25 @@ def _draw_pane(d, tx, spec, fr, x0, w, h):
     if cursor and rows:
         text, xoff, _ = rows[-1]
         tx.draw(d, (x0 + PAD + xoff + tx.length(text), y - LH), "\u2588", FG)
-    d.line([x0 + PAD, h - 46, x0 + w - PAD, h - 46], fill="#242a38", width=1)
-    tx.draw(d, (x0 + PAD, h - 38), status, DIM)
+    d.line([x0 + PAD, y0 + h - 46, x0 + w - PAD, y0 + h - 46],
+           fill="#242a38", width=1)
+    tx.draw(d, (x0 + PAD, y0 + h - 38), status, DIM)
 
 
 def _emit(name, spec, panes, w, h, out_dir, tx):
-    """panes: [(spec, frames)] drawn left to right; the shorter pane is
-    resampled onto the longer timeline so both finish together (pacing is the
-    one liberty this renderer takes)."""
+    """panes: [(spec, frames, x0, y0, ph)] stacked or tiled; the shorter pane
+    is resampled onto the longer timeline so both finish together (pacing is
+    the one liberty this renderer takes)."""
     tmp = tempfile.mkdtemp(prefix="pulsar_demo")
     img = Image.new("RGB", (w, h), BG)
     d = ImageDraw.Draw(img)
-    n = max(len(f) for _, f in panes)
+    n = max(len(f) for _, f, _, _, _ in panes)
     for i in range(n):
         d.rectangle([0, 0, w, h], fill=BG)
-        x0 = 0
-        for pspec, frames in panes:
+        for pspec, frames, x0, y0, ph in panes:
             j = (i if len(frames) == n else
                  min(len(frames) - 1, round(i * (len(frames) - 1) / (n - 1))))
-            _draw_pane(d, tx, pspec, frames[j], x0, W, h)
-            x0 += W + GAP
+            _draw_pane(d, tx, pspec, frames[j], x0, y0, W, ph)
         img.save(os.path.join(tmp, f"f{i:04d}.png"))
     out = os.path.join(out_dir, spec["out"])
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(FPS),
@@ -484,16 +484,20 @@ def _emit(name, spec, panes, w, h, out_dir, tx):
 def render(name, spec, out_dir=DOC):
     tx = Text()
     frames, h = _plan(spec, tx)
-    _emit(name, spec, [(spec, frames)], W, h, out_dir, tx)
+    _emit(name, spec, [(spec, frames, 0, 0, h)], W, h, out_dir, tx)
 
 
 def render_pair(name, spec, out_dir=DOC):
+    # stacked: first pane on top; each keeps its own height, so the shorter
+    # transcript leaves no dead room and both status bars sit under content.
     tx = Text()
     subs = [SPECS[k] for k in spec["panes"]]
-    h = max(_plan(sp, tx)[1] for sp in subs)
-    panes = [(sp, _plan(sp, tx, h=h)[0]) for sp in subs]
-    w = len(subs) * W + (len(subs) - 1) * GAP
-    _emit(name, spec, panes, w, h, out_dir, tx)
+    y0, panes = 0, []
+    for sp in subs:
+        frames, h = _plan(sp, tx)
+        panes.append((sp, frames, 0, y0, h))
+        y0 += h + GAP
+    _emit(name, spec, panes, W, y0 - GAP, out_dir, tx)
 
 
 def main():

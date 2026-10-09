@@ -123,11 +123,11 @@ line is the user turn — in the FunctionGemma panes it is the user message
 inside the prompt file, which file mode does not echo, and those panes also
 show the system turn verbatim, i.e. where the tool is defined.
 
-Each model gets **one GIF**: English left, Traditional Chinese right (for K2,
-original left and fine-tune right); the panes share a timeline, and only pacing
-is libertied. All clips share one font size and one typeface — DejaVu Sans
-Mono, with WenQuanYi Zen Hei used only for the CJK glyphs DejaVu lacks, at the
-same size and line height.
+Each model gets **one GIF with both language runs stacked**: English above,
+Traditional Chinese below; K2-Horizon keeps two GIFs, original then fine-tune.
+The panes share a timeline, and only pacing is libertied. All clips share one
+font size and one typeface — DejaVu Sans Mono, with WenQuanYi Zen Hei used
+only for the CJK glyphs DejaVu lacks, at the same size and line height.
 
 **K2-Horizon-0.9B** — 0.9B dense decoder (IFM, Llama arch), plain RMS norms,
 YaRN rope, vocab 64256; shown in its **original** form and as a zh-TW
@@ -136,7 +136,7 @@ meeting-agent **fine-tune (FT)**. Both runs are the pure-assembly engine
 only, glibc-bit-identical `expf`/`%.4f`) on the phone's big cores: greedy,
 4-thread decode, 8-token prefill chunks.
 
-*Original* (left) — the ceiling prompt is the two-sentence neural explainer
+*Original* — the ceiling prompt is the two-sentence neural explainer
 (seasons loops and haiku rambles under greedy, so they don't qualify).
 13 tok/s decode; its 21-token prompt costs about a second.
 
@@ -144,7 +144,9 @@ only, glibc-bit-identical `expf`/`%.4f`) on the phone's big cores: greedy,
 adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 ... --gen 400 --threads 4 --batch 8"
 ```
 
-*Fine-tune (FT)* (right) — the same 0.9B trained for live meeting reading
+![K2-Horizon original](doc/k2horizon-chat-en.gif)
+
+*Fine-tune (FT)* — the same 0.9B trained for live meeting reading
 (NOTE/REVISE/NEXT), converted from the published int4-QAT safetensors to our
 own Q4 blob and run on the same engine. The run shows the full 6-turn window
 verbatim, so every NOTE can be checked line by line: all five cite genuine
@@ -157,7 +159,7 @@ NOTE — that behavioral gap is what the fine-tune buys.
 adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob $(cat ft_ids680.txt) --gen 400 --threads 4 --batch 8"
 ```
 
-![K2-Horizon original | fine-tune](doc/k2horizon-original-ft.gif)
+![K2-Horizon fine-tune](doc/k2horizon-meeting-zh-tw.gif)
 
 Both K2 blobs are bit-identical on Spark to the scalar C reference
 (`neural2.txt`), logits included.
@@ -168,7 +170,7 @@ Both K2 blobs are bit-identical on Spark to the scalar C reference
 4.0 tok/s zh-TW. The same seeds rerun byte-identical on the Spark, so the clip
 is both machines' bytes at once.
 
-![Bonsai 8B chat, en | zh-TW](doc/bonsai8b-chat-en-zh.gif)
+![Bonsai 8B chat, en over zh-TW](doc/bonsai8b-chat-en-zh.gif)
 
 ```sh
 adb shell "cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 ... --gen 400 --sample 0.6 0.95 20 7"    # en
@@ -181,7 +183,7 @@ DGX Spark CPU-only, 8 threads: 7.9 tok/s en, 7.5 tok/s zh-TW. This is the one
 clip that stays off the phone — the 27B streams 5.9 GB per token and needs the
 Spark's 20 cores.
 
-![Bonsai 2 27B chat, en | zh-TW](doc/bonsai2-27b-chat-en-zh.gif)
+![Bonsai 2 27B chat, en over zh-TW](doc/bonsai2-27b-chat-en-zh.gif)
 
 ```sh
 ./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 ... --gen 400 --sample 0.5 0.85 20 7      # en
@@ -201,7 +203,7 @@ including its reasoning trace, the 8B with a longer four-section list.
 in each language (a four-item structured list; a three-item one in zh-TW), both
 complete and clean:
 
-![1B chat, en | zh-TW](doc/gemma3-1b-chat-en-zh.gif)
+![1B chat, en over zh-TW](doc/gemma3-1b-chat-en-zh.gif)
 
 ```sh
 printf 'List the four seasons and one thing that changes in each.\n' | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 123
@@ -214,7 +216,7 @@ which is what the engine implements.
 
 **gemma-3-270m-it** — same binary, 18 layers:
 
-![270m chat, en | zh-TW](doc/gemma3-270m-chat-en-zh.gif)
+![270m chat, en over zh-TW](doc/gemma3-270m-chat-en-zh.gif)
 
 ```sh
 printf 'Explain gravity in two sentences for a child.\n' | ./core gemma-3-270m-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48
@@ -224,7 +226,7 @@ printf '請用一句話解釋什麼是量子力學。\n'                 | ./cor
 **FunctionGemma-270m-it** — an English and a Traditional-Chinese question
 become the same tool call (one schema; only the user turn differs):
 
-![FunctionGemma tool call, en | zh-TW](doc/functiongemma-toolcall-en-zh.gif)
+![FunctionGemma tool call, en over zh-TW](doc/functiongemma-toolcall-en-zh.gif)
 
 ```sh
 python3 pulsar_arm/tools/fc_write.py   # -> /tmp/tool_official.txt, /tmp/tool_official_zhtw.txt
