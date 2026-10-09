@@ -1708,7 +1708,7 @@ memcpy_q:
  * [sp,#104]. */
     .align 2
 k2q4_gemv_batch:
-    stp x29, x30, [sp, #-128]!
+    stp x29, x30, [sp, #-192]!
     mov x29, sp
     stp x19, x20, [sp, #16]
     stp x21, x22, [sp, #32]
@@ -1728,13 +1728,24 @@ k2q4_gemv_batch:
     asr x9, x2, #5                  /* nb32 */
     mov x10, #18
     mul x10, x9, x10                /* rowstride */
-    madd x11, x25, x10, x24         /* rowptr */
-    mov x28, x9                     /* nb32 (x9 dies below) */
-    movi v30.16b, #15
-    movi v31.16b, #8
+    mov x17, x10                    /* rowstride (x10 dies: slot base) */
+    mov x28, x9                     /* nb32 */
+    movi v4.16b, #15
+    str q4, [sp, #160]              /* mask15 to stack (v30/v31 are acc now) */
+    movi v4.16b, #8
+    str q4, [sp, #176]              /* mask8 to stack */
 .Lbg_row:
     cmp w25, w26
     b.ge .Lbg_end
+    madd x11, x25, x17, x24         /* rowptr0 = w + r*stride */
+    add w14, w25, #1
+    cmp w14, w26
+    b.lt .Lbg_pair
+    mov x23, x11                    /* single: row1 = row0 (dup read, store skips) */
+    b .Lbg_setup
+.Lbg_pair:
+    add x23, x11, x17               /* rowptr1 = rowptr0 + rowstride */
+.Lbg_setup:
     mov x8, x19
     add x9, x8, x27
     add x10, x9, x27
@@ -1751,6 +1762,14 @@ k2q4_gemv_batch:
     movi v21.4s, #0
     movi v22.4s, #0
     movi v23.4s, #0
+    movi v24.4s, #0
+    movi v25.4s, #0
+    movi v26.4s, #0
+    movi v27.4s, #0
+    movi v28.4s, #0
+    movi v29.4s, #0
+    movi v30.4s, #0
+    movi v31.4s, #0
     mov x6, xzr                     /* block index */
 .Lbg_blk:
     ldrh w0, [x11]
@@ -1786,126 +1805,226 @@ k2q4_gemv_batch:
     lsl w1, w1, #13
     orr w4, w4, w1
     fmov s0, w4
-4:  fmov s5, s0                     /* ws: decoded ONCE per block */
+4:  fmov s5, s0                     /* ws0 */
+    ldr q4, [sp, #160]              /* mask15 (v4 dead: slots done, h2f used s0/s1) */
+    ldr q7, [sp, #176]              /* mask8 */
     sub x4, x11, #16
     ld1 {v0.16b}, [x4]
-    and v1.16b, v0.16b, v30.16b
+    and v1.16b, v0.16b, v4.16b
     ushr v0.16b, v0.16b, #4
-    sub v1.16b, v1.16b, v31.16b
-    sub v0.16b, v0.16b, v31.16b     /* nibbles split ONCE per block */
+    sub v1.16b, v1.16b, v7.16b
+    sub v0.16b, v0.16b, v7.16b      /* nibbles row 0 */
+    ldrh w0, [x23]
+    add x23, x23, #18
+    and w1, w0, #0x3ff
+    ubfx w2, w0, #10, #5
+    and w3, w0, #0x8000
+    lsl w3, w3, #16
+    cbnz w2, 6f
+    cbz w1, 7f
+    ucvtf s4, w1
+    mov w4, #0x33800000
+    fmov s6, w4
+    fmul s4, s4, s6
+    fmov w4, s4
+    orr w4, w4, w3
+    fmov s4, w4
+    b 8f
+7:  fmov s4, wzr
+    b 8f
+6:  cmp w2, #31
+    b.ne 9f
+    mov w4, #0x7f80
+    lsl w4, w4, #16
+    orr w4, w4, w3
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s4, w4
+    b 8f
+9:  add w2, w2, #112
+    lsl w2, w2, #23
+    orr w4, w3, w2
+    lsl w1, w1, #13
+    orr w4, w4, w1
+    fmov s4, w4
+8:  fmov s10, s4                    /* ws1 (s4/s6 dead after; v0/v1 preserved) */
+    ldr q4, [sp, #160]              /* mask15 (v4 dead here) */
+    ldr q7, [sp, #176]              /* mask8 (v7 dead here) */
+    sub x4, x23, #16
+    ld1 {v6.16b}, [x4]
+    and v2.16b, v6.16b, v4.16b
+    ushr v3.16b, v6.16b, #4
+    sub v2.16b, v2.16b, v7.16b
+    sub v3.16b, v3.16b, v7.16b      /* nibbles row 1 -> v2=lo, v3=hi */
     lsr x2, x6, #3
     mov x7, #292
     madd x2, x2, x7, xzr            /* wb*292 (db base offset) */
     and x3, x6, #7
-    lsl x3, x3, #5                  /* woff (qs offset; db does NOT add it) */
+    lsl x3, x3, #5                  /* woff */
     add x0, x8, x2
-    ldr s6, [x0]
+    ldr s8, [x0]
     add x0, x0, #4
     add x0, x0, x3
-    ld1 {v2.16b}, [x0]
-    ldr q3, [x0, #16]
+    ld1 {v6.16b}, [x0]
+    ldr q7, [x0, #16]
     movi v4.4s, #0
-    sdot v4.4s, v1.16b, v2.16b
-    sdot v4.4s, v0.16b, v3.16b
-    addv s2, v4.4s
-    scvtf s2, s2
-    fmul s7, s5, s6
-    fmadd s16, s7, s2, s16
+    sdot v4.4s, v1.16b, v6.16b
+    sdot v4.4s, v0.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s5, s8
+    fmadd s16, s9, s4, s16
+    movi v4.4s, #0
+    sdot v4.4s, v2.16b, v6.16b
+    sdot v4.4s, v3.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s10, s8
+    fmadd s24, s9, s4, s24
     add x0, x9, x2
-    ldr s6, [x0]
+    ldr s8, [x0]
     add x0, x0, #4
     add x0, x0, x3
-    ld1 {v2.16b}, [x0]
-    ldr q3, [x0, #16]
+    ld1 {v6.16b}, [x0]
+    ldr q7, [x0, #16]
     movi v4.4s, #0
-    sdot v4.4s, v1.16b, v2.16b
-    sdot v4.4s, v0.16b, v3.16b
-    addv s2, v4.4s
-    scvtf s2, s2
-    fmul s7, s5, s6
-    fmadd s17, s7, s2, s17
+    sdot v4.4s, v1.16b, v6.16b
+    sdot v4.4s, v0.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s5, s8
+    fmadd s17, s9, s4, s17
+    movi v4.4s, #0
+    sdot v4.4s, v2.16b, v6.16b
+    sdot v4.4s, v3.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s10, s8
+    fmadd s25, s9, s4, s25
     add x0, x10, x2
-    ldr s6, [x0]
+    ldr s8, [x0]
     add x0, x0, #4
     add x0, x0, x3
-    ld1 {v2.16b}, [x0]
-    ldr q3, [x0, #16]
+    ld1 {v6.16b}, [x0]
+    ldr q7, [x0, #16]
     movi v4.4s, #0
-    sdot v4.4s, v1.16b, v2.16b
-    sdot v4.4s, v0.16b, v3.16b
-    addv s2, v4.4s
-    scvtf s2, s2
-    fmul s7, s5, s6
-    fmadd s18, s7, s2, s18
+    sdot v4.4s, v1.16b, v6.16b
+    sdot v4.4s, v0.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s5, s8
+    fmadd s18, s9, s4, s18
+    movi v4.4s, #0
+    sdot v4.4s, v2.16b, v6.16b
+    sdot v4.4s, v3.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s10, s8
+    fmadd s26, s9, s4, s26
     add x0, x12, x2
-    ldr s6, [x0]
+    ldr s8, [x0]
     add x0, x0, #4
     add x0, x0, x3
-    ld1 {v2.16b}, [x0]
-    ldr q3, [x0, #16]
+    ld1 {v6.16b}, [x0]
+    ldr q7, [x0, #16]
     movi v4.4s, #0
-    sdot v4.4s, v1.16b, v2.16b
-    sdot v4.4s, v0.16b, v3.16b
-    addv s2, v4.4s
-    scvtf s2, s2
-    fmul s7, s5, s6
-    fmadd s19, s7, s2, s19
+    sdot v4.4s, v1.16b, v6.16b
+    sdot v4.4s, v0.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s5, s8
+    fmadd s19, s9, s4, s19
+    movi v4.4s, #0
+    sdot v4.4s, v2.16b, v6.16b
+    sdot v4.4s, v3.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s10, s8
+    fmadd s27, s9, s4, s27
     add x0, x13, x2
-    ldr s6, [x0]
+    ldr s8, [x0]
     add x0, x0, #4
     add x0, x0, x3
-    ld1 {v2.16b}, [x0]
-    ldr q3, [x0, #16]
+    ld1 {v6.16b}, [x0]
+    ldr q7, [x0, #16]
     movi v4.4s, #0
-    sdot v4.4s, v1.16b, v2.16b
-    sdot v4.4s, v0.16b, v3.16b
-    addv s2, v4.4s
-    scvtf s2, s2
-    fmul s7, s5, s6
-    fmadd s20, s7, s2, s20
+    sdot v4.4s, v1.16b, v6.16b
+    sdot v4.4s, v0.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s5, s8
+    fmadd s20, s9, s4, s20
+    movi v4.4s, #0
+    sdot v4.4s, v2.16b, v6.16b
+    sdot v4.4s, v3.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s10, s8
+    fmadd s28, s9, s4, s28
     add x0, x14, x2
-    ldr s6, [x0]
+    ldr s8, [x0]
     add x0, x0, #4
     add x0, x0, x3
-    ld1 {v2.16b}, [x0]
-    ldr q3, [x0, #16]
+    ld1 {v6.16b}, [x0]
+    ldr q7, [x0, #16]
     movi v4.4s, #0
-    sdot v4.4s, v1.16b, v2.16b
-    sdot v4.4s, v0.16b, v3.16b
-    addv s2, v4.4s
-    scvtf s2, s2
-    fmul s7, s5, s6
-    fmadd s21, s7, s2, s21
+    sdot v4.4s, v1.16b, v6.16b
+    sdot v4.4s, v0.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s5, s8
+    fmadd s21, s9, s4, s21
+    movi v4.4s, #0
+    sdot v4.4s, v2.16b, v6.16b
+    sdot v4.4s, v3.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s10, s8
+    fmadd s29, s9, s4, s29
     add x0, x15, x2
-    ldr s6, [x0]
+    ldr s8, [x0]
     add x0, x0, #4
     add x0, x0, x3
-    ld1 {v2.16b}, [x0]
-    ldr q3, [x0, #16]
+    ld1 {v6.16b}, [x0]
+    ldr q7, [x0, #16]
     movi v4.4s, #0
-    sdot v4.4s, v1.16b, v2.16b
-    sdot v4.4s, v0.16b, v3.16b
-    addv s2, v4.4s
-    scvtf s2, s2
-    fmul s7, s5, s6
-    fmadd s22, s7, s2, s22
+    sdot v4.4s, v1.16b, v6.16b
+    sdot v4.4s, v0.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s5, s8
+    fmadd s22, s9, s4, s22
+    movi v4.4s, #0
+    sdot v4.4s, v2.16b, v6.16b
+    sdot v4.4s, v3.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s10, s8
+    fmadd s30, s9, s4, s30
     add x0, x16, x2
-    ldr s6, [x0]
+    ldr s8, [x0]
     add x0, x0, #4
     add x0, x0, x3
-    ld1 {v2.16b}, [x0]
-    ldr q3, [x0, #16]
+    ld1 {v6.16b}, [x0]
+    ldr q7, [x0, #16]
     movi v4.4s, #0
-    sdot v4.4s, v1.16b, v2.16b
-    sdot v4.4s, v0.16b, v3.16b
-    addv s2, v4.4s
-    scvtf s2, s2
-    fmul s7, s5, s6
-    fmadd s23, s7, s2, s23
+    sdot v4.4s, v1.16b, v6.16b
+    sdot v4.4s, v0.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s5, s8
+    fmadd s23, s9, s4, s23
+    movi v4.4s, #0
+    sdot v4.4s, v2.16b, v6.16b
+    sdot v4.4s, v3.16b, v7.16b
+    addv s4, v4.4s
+    scvtf s4, s4
+    fmul s9, s10, s8
+    fmadd s31, s9, s4, s31
     add x6, x6, #1
     cmp x6, x28
     b.ne .Lbg_blk
-    /* spill acc to stack, then store s<B */
+    /* spill 16 acc, then store rr<nrows, s<B */
     add x1, sp, #96
     str s16, [x1, #0]
     str s17, [x1, #4]
@@ -1915,19 +2034,41 @@ k2q4_gemv_batch:
     str s21, [x1, #20]
     str s22, [x1, #24]
     str s23, [x1, #28]
-    add x5, x20, x25, lsl #2        /* y_base + r*4 */
-    mov x14, #0
-    mov x6, x22                     /* ystride */
+    str s24, [x1, #32]
+    str s25, [x1, #36]
+    str s26, [x1, #40]
+    str s27, [x1, #44]
+    str s28, [x1, #48]
+    str s29, [x1, #52]
+    str s30, [x1, #56]
+    str s31, [x1, #60]
+    add x7, x20, x25, lsl #2        /* y_base + r*4 */
+    add w14, w25, #1
+    cmp w14, w26
+    cset w15, lt
+    add w15, w15, #1                /* nrows = 1 + (r+1 < r1) */
+    mov x14, #0                     /* rr */
+.Lbg_rr:
+    cmp w14, w15
+    b.ge .Lbg_rend
+    lsl x0, x14, #2
+    add x5, x7, x0                  /* + rr*4 */
+    lsl x0, x14, #5                 /* rr*32: spill offset */
+    add x0, x1, x0
+    mov x6, #0                      /* s */
 .Lbg_st:
-    cmp w14, w21
+    cmp w6, w21
     b.ge .Lbg_stend
-    ldr s8, [x1, x14, lsl #2]
+    ldr s8, [x0, x6, lsl #2]
     str s8, [x5]
-    add x5, x5, x6
-    add x14, x14, #1
+    add x5, x5, x22                 /* + ystride */
+    add x6, x6, #1
     b .Lbg_st
 .Lbg_stend:
-    add w25, w25, #1
+    add x14, x14, #1
+    b .Lbg_rr
+.Lbg_rend:
+    add w25, w25, w15               /* r += nrows */
     b .Lbg_row
 .Lbg_end:
     ldp x27, x28, [sp, #80]
@@ -1935,7 +2076,7 @@ k2q4_gemv_batch:
     ldp x23, x24, [sp, #48]
     ldp x21, x22, [sp, #32]
     ldp x19, x20, [sp, #16]
-    ldp x29, x30, [sp], #128
+    ldp x29, x30, [sp], #192
     ret
 
 /* ---------------- q4_gemv_dispatch_b: batched row-parallel dispatch.
