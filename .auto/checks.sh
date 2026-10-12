@@ -1,52 +1,18 @@
 #!/bin/bash
-# Accuracy gate: greedy streams must equal frozen goldens EXACTLY.
-# - Prompt A: reuse measure.sh's saved decode log (41 steps).
-# - Prompt B (held-out): run the just-built loop binary on the Spark.
-# - If kernel files changed vs HEAD, re-run the NEON bit-exact validation.
-set -euo pipefail
-SPARK=luigi@spark
-LOCAL=/home/user/PULSAR-ASM
-B_IDS="248045 846 198 7734 264 6185 36974 883 279 9117 13 248046 198 248045 74455 198 248068"
-MODEL=../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf
-
-tops() { grep '^step' "$1" | sed 's/.*top=//;s/ .*//'; }
-
-# A: 41 steps from the measured run
-A_N=$(tops "$LOCAL/.auto/last_decode.txt" | wc -l)
-[ "$A_N" -eq 41 ] || { echo "CHECKS: A has $A_N tops, want 41"; exit 1; }
-if ! diff <(tops "$LOCAL/.auto/last_decode.txt") "$LOCAL/.auto/golden_A.txt" > /dev/null; then
-    echo "CHECKS FAILED: prompt-A stream differs from golden"
-    diff <(tops "$LOCAL/.auto/last_decode.txt") "$LOCAL/.auto/golden_A.txt" | head -5
-    exit 1
-fi
-echo "checks: prompt A exact (41/41)"
-
-# B: held-out prompt, fresh run of the same binary
-ssh -o BatchMode=yes -o ConnectTimeout=20 "$SPARK" \
-    "cd ~/bonsai2/exp && OMP_NUM_THREADS=20 taskset -c 0-19 ./fwd_exp $MODEL $B_IDS --gen 10 2>/dev/null | grep '^step'" \
-    > "$LOCAL/.auto/last_B.txt"
-B_N=$(grep -c '^step' "$LOCAL/.auto/last_B.txt")
-[ "$B_N" -eq 27 ] || { echo "CHECKS: B has $B_N steps, want 27"; exit 1; }
-if ! diff <(tops "$LOCAL/.auto/last_B.txt") "$LOCAL/.auto/golden_B.txt" > /dev/null; then
-    echo "CHECKS FAILED: held-out prompt-B stream differs from golden"
-    diff <(tops "$LOCAL/.auto/last_B.txt") "$LOCAL/.auto/golden_B.txt" | head -5
-    exit 1
-fi
-echo "checks: held-out prompt B exact (27/27)"
-
-# Kernel regression: if GEMV/FWHT sources changed, bit-exactness must hold
-if git -C "$LOCAL" status --porcelain pulsar_arm/bonsai2/tq_gemv_neon.c pulsar_arm/bonsai2/fwht.S pulsar_arm/bonsai2/tq_xgemv.c | grep -q .; then
-    echo "checks: kernel files touched - running bit-exact validation"
-    OUT=$(ssh -o BatchMode=yes -o ConnectTimeout=20 "$SPARK" \
-        'cd ~/bonsai2/exp && LB=~/bonsai2/llama.cpp/build/bin && gcc -O3 -march=armv8.2-a+dotprod+fp16 -mtune=native -DTQ_XGEMV_LIB -o tqv tq_gemv_neon.c tq_xgemv.c fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm && taskset -c 3 ./tqv ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 11120992 594124800 64 2>&1 | head -2')
-    echo "$OUT"
-    if echo "$OUT" | grep -q BIT-EXACT; then echo "checks: kernel bit-exact"; else
-        MR=$(echo "$OUT" | grep -o "maxrel [0-9.e+-]*" | head -1 | cut -d" " -f2)
-        python3 -c "import sys; sys.exit(0 if float('$MR') < 1e-6 else 1)" \
-            || { echo "CHECKS FAILED: kernel diverged (maxrel $MR)"; exit 1; }
-        echo "checks: kernel fp32-close (maxrel $MR, reassociation allowed)"
-    fi
-else
-    echo "checks: kernels untouched - bit-exact check skipped"
-fi
-echo "ALL CHECKS PASSED"
+# Accuracy gate for K2-0.9B Nano loop: run the LAST-BUILT /tmp/k2_exp on the
+# held-out ZH prompt (26 ids, gen 100, threads 1) on the Nano; stream must be
+# bit-identical to .auto/k2nano_golden_zh.txt. (Phone/27B gate preserved in
+# checks_bonsai_phone.sh.)
+set -u
+PEER=picard@picard-desktop
+ZH="64018 2985 200 2226 294 3957 29181 316 43658 10627 13 1546 294 3957 8045 13 1026 28045 15 64019 64018 612 10102 200 64029 200"
+GOLDEN=/home/user/PULSAR-ASM/.auto/k2nano_golden_zh.txt
+TMP=$(mktemp -d); trap 'rm -rf $TMP' EXIT
+timeout 300 ssh -o BatchMode=yes $PEER \
+  "cd /tmp && ./k2_exp k2h_09_q4.blob $ZH --gen 100 --threads 1 --batch 8 > /tmp/zh_check.txt 2>&1; echo rc=\$?" \
+  > $TMP/rc.txt 2>&1
+grep -q "rc=0" $TMP/rc.txt || { echo "CHECKS FAIL: run rc!=0"; cat $TMP/rc.txt; exit 4; }
+timeout 60 ssh -o BatchMode=yes $PEER 'grep "^step " /tmp/zh_check.txt' > $TMP/steps.txt
+if [ "$(wc -l < $TMP/steps.txt)" != "114" ]; then echo "CHECKS FAIL: step count"; exit 4; fi
+diff $TMP/steps.txt $GOLDEN > $TMP/diff.txt 2>&1 || { echo "CHECKS FAIL: ZH stream differs"; head -5 $TMP/diff.txt; exit 4; }
+echo "CHECKS OK: ZH 114/114 bit-exact"
