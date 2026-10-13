@@ -1,7 +1,7 @@
 #!/bin/bash
-# .auto/nano_bench.sh — autoresearch harness for the Jetson Nano exact-PQ2 8B
-# engine (branch bonsai-jetson-nano). Syncs sources, builds, runs the fixed
-# prompt, prints METRIC lines.
+# .auto/nano_bench.sh — autoresearch harness for the Jetson Nano Q1_0 (true
+# 1-bit) 8B engine (branch bonsai-jetson-nano). Syncs sources, builds, runs
+# the fixed prompt, prints METRIC lines.
 #
 # Metrics
 #   decode_ms_per_tok  PRIMARY  marginal per-token forward time (gen steps)
@@ -20,7 +20,7 @@ NANO=${NANO:-pesi@100.70.245.36}
 REPO=/home/louis/PULSAR-ASM
 SRC=$REPO/pulsar_arm/bonsai2
 R=/home/pesi/exp
-MODEL=/home/pesi/b8.gguf
+MODEL=/home/pesi/b8q1.gguf
 # Prompt A (fixed, never tuned): chatml four-seasons, 20 prompt ids.
 IDS="151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 624 151645 198 151644 77091 198"
 GEN=${GEN:-24}
@@ -28,21 +28,21 @@ GEN=${GEN:-24}
 mkdir -p "$REPO/.auto"
 
 scp -q -o ConnectTimeout=25 \
-  "$SRC/fwd8.c" "$SRC/pq2_swar_sm53.cu" "$SRC/pq2_wrap.h" "$SRC/pq2_host.c" \
-  "$SRC/pq2_fwd8_glue.c" "$SRC/pq2_fwd8_shim.h" "$SRC/pq2_parity.c" \
+  "$SRC/fwd8.c" "$SRC/pq1_swar_sm53.cu" "$SRC/pq1_wrap.h" "$SRC/pq1_host.c" \
+  "$SRC/pq1_fwd8_glue.c" "$SRC/pq1_fwd8_shim.h" "$SRC/pq1_parity.c" \
   "$NANO:$R/" || { echo "SCP FAILED"; exit 1; }
 
 BUILD=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && export PATH=/usr/local/cuda-10.2/bin:\$PATH \
   CUDAINC=/usr/local/cuda-10.2/targets/aarch64-linux/include && set -o pipefail && \
-  rm -f fwd8_engine pq2_parity fwd8_engine.o pq2_glue.o pq2_swar_sm53.o && \
+  rm -f fwd8_q1 pq1_parity fwd8_q1.o pq1_glue.o pq1_swar_sm53.o && \
   t0=\$(date +%s) && \
-  nvcc -gencode arch=compute_53,code=sm_53 -O3 -maxrregcount=48 --use_fast_math -Xptxas -O3,-dlcm=ca -std=c++11 -c pq2_swar_sm53.cu -o pq2_swar_sm53.o 2>&1 | head -n5 && \
-  gcc -O2 -fopenmp -mcpu=cortex-a57 -ffp-contract=off -DSTANDALONE -DPQ2_REAL_CUDA -DPQ2_HIST -c pq2_host.c -o pq2_host.o 2>&1 | head -n3 && \
-  gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ2_USE_CUDA -DBQ1_TIME -DPQ2_HIST -include $R/pq2_fwd8_shim.h -c fwd8.c -o fwd8_engine.o 2>&1 | grep -e ' error' | head -n3; \
-  gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ2_USE_CUDA -DPQ2_HIST -I\$CUDAINC -c pq2_fwd8_glue.c -o pq2_glue.o 2>&1 | grep -e ' error' | head -n3 || true; \
-  gcc -O2 -fopenmp -mcpu=cortex-a57 -ffp-contract=off -DSTANDALONE -DPQ2_REAL_CUDA -I\$CUDAINC -c pq2_parity.c -o pq2_parity.o 2>&1 | grep -e ' error' | head -n3 || true; \
-  g++ fwd8_engine.o pq2_host.o pq2_glue.o pq2_swar_sm53.o -o fwd8_engine -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm -fopenmp 2>&1 | head -n3 && \
-  g++ pq2_host.o pq2_parity.o pq2_swar_sm53.o -o pq2_parity -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm 2>&1 | head -n3 && \
+  nvcc -gencode arch=compute_53,code=sm_53 -O3 -maxrregcount=48 --use_fast_math -Xptxas -O3,-dlcm=ca -std=c++11 -c pq1_swar_sm53.cu -o pq1_swar_sm53.o 2>&1 | head -n5 && \
+  gcc -O2 -fopenmp -mcpu=cortex-a57 -ffp-contract=off -DSTANDALONE -DPQ1_REAL_CUDA  -c pq1_host.c -o pq1_host.o 2>&1 | head -n3 && \
+  gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ1_USE_CUDA -DBQ1_TIME  -include $R/pq1_fwd8_shim.h -c fwd8.c -o fwd8_q1.o 2>&1 | grep -e ' error' | head -n3; \
+  gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ1_USE_CUDA  -I\$CUDAINC -c pq1_fwd8_glue.c -o pq1_glue.o 2>&1 | grep -e ' error' | head -n3 || true; \
+  gcc -O2 -fopenmp -mcpu=cortex-a57 -ffp-contract=off -DSTANDALONE -DPQ1_REAL_CUDA -I\$CUDAINC -c pq1_parity.c -o pq1_parity.o 2>&1 | grep -e ' error' | head -n3 || true; \
+  g++ fwd8_q1.o pq1_host.o pq1_glue.o pq1_swar_sm53.o -o fwd8_q1 -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm -fopenmp 2>&1 | head -n3 && \
+  g++ pq1_host.o pq1_parity.o pq1_swar_sm53.o -o pq1_parity -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm 2>&1 | head -n3 && \
   echo BUILT && echo \$((\$(date +%s)-t0))" 2>&1)
 echo "$BUILD" | grep -q BUILT || { echo "BUILD FAILED"; echo "$BUILD" | head -n 20; exit 1; }
 BUILD_S=$(echo "$BUILD" | tail -n1)
@@ -50,7 +50,7 @@ BUILD_S=$(echo "$BUILD" | tail -n1)
 # GPU clock witness (contention on this board changes results; never tuned).
 CLK=$(ssh -o ConnectTimeout=25 "$NANO" "cat /sys/devices/gpu.0/devfreq/57000000.gpu/cur_freq 2>/dev/null || echo 0" 2>/dev/null)
 
-ssh -o ConnectTimeout=25 "$NANO" "cd $R && OMP_NUM_THREADS=4 BQ1_TRACE=0 PQ2_STATS=1 timeout 1200 /usr/bin/time -v ./fwd8_engine $MODEL $IDS --gen $GEN > run.log 2> time.log; echo RC=\$?" > "$REPO/.auto/last_nano_run.txt" 2>&1
+ssh -o ConnectTimeout=25 "$NANO" "cd $R && OMP_NUM_THREADS=4 BQ1_TRACE=0 PQ1_STATS=1 timeout 1200 /usr/bin/time -v ./fwd8_q1 $MODEL $IDS --gen $GEN > run.log 2> time.log; echo RC=\$?" > "$REPO/.auto/last_nano_run.txt" 2>&1
 RC=$(grep -o 'RC=[0-9-]*' "$REPO/.auto/last_nano_run.txt" | head -n1 | cut -d= -f2)
 HWM=$(ssh -o ConnectTimeout=25 "$NANO" "awk '/Maximum resident set size/{print \$NF}' $R/time.log" 2>/dev/null)
 ssh -o ConnectTimeout=25 "$NANO" "cat $R/run.log" > "$REPO/.auto/last_run_log.txt" 2>&1
@@ -85,7 +85,7 @@ echo "METRIC prefill_ms_per_tok=$PRE"
 echo "METRIC decode_tps=$(python3 -c "print(f'{1000.0/float(\"$DEC\"):.4f}')")"
 echo "METRIC prefill_tps=$(python3 -c "print(f'{1000.0/float(\"$PRE\"):.4f}')")"
 echo "METRIC peak_rss_mb=$(( ${HWM:-0} / 1024 ))"
-GPU=$(grep -o 'PQ2GPU.*' "$REPO/.auto/last_nano_time.txt" 2>/dev/null | tail -n1)
+GPU=$(grep -o 'PQ1GPU.*' "$REPO/.auto/last_nano_time.txt" 2>/dev/null | tail -n1)
 gv() { echo "$GPU" | sed -n "s/.*$1=\([0-9.]*\).*/\1/p"; }
 echo "METRIC gpu_used_mb=$(gv used_mb)"
 echo "METRIC gpu_arena_mb=$(gv arena_mb)"
