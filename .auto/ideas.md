@@ -292,3 +292,10 @@ discards without a changed assumption.
   (c) small-grid latency sense: 512-row calls at 1GB/s vs 5120-row at 2.1GB/s —
   investigate ILP (2 iters interleaved per thread?) or (d) fuse host per-call sync
   (196 drains/token) via double-buffered async pipeline.
+
+## Exp9 (run #38) f3-kernel postmortem (2026-10-13)
+- f3 (3-seg row-fusion kernel, v12 body + routed bases) NEVER produced correct output despite: loop proven identical by mechanical diff, setup math verified by hand 6x, params proven (15-slot echo kernel bit-exact 37382.0), inputs proven (single-kernel oracle bit-exact on same values), stores proven landing (canary). Minimal-correct variants (V-A: no branches; V-D: 6 loads, 64 regs = v12) failed BIT-IDENTICALLY. Verdict: R440/ptxas-6.4 miscompiles correct PTX in multi-entry modules (same class as v14 shfl delivering ~0). Do NOT revive f3-style custom kernels without a standalone tiny-harness proof first.
+- Real bug found in f3 text anyway (hoist retarget): 2-temp pointer math collapsed 16s (added 4q twice, dropped 16s). Generators: never merge two live temporaries into one reg across unconsumed values; the row-block differential self-check (v14) doesn't catch setup-offset bugs (it covers nibble/dot code, not pointer math).
+- xq-compare lesson: per-292B-block trailing [260..292) is quantizer-skipped stale bsums (kernel-invisible); full-memcmp across member calls is FLAKY (stale padding varies). Masked compare (64B header + [0..260)/block) is the correct fusion gate.
+- Tegra unified-memory fragmentation: 7.8MB cuMemAlloc failed mid-run (after 467MB repack churn) but 13MB pre-allocated early at init succeeds. Pre-allocate all device regions early; fill lazily.
+- Fusion-via-LAYOUT (Exp9b) is the surviving design: fused W/SC regions (DtoD) + proven single kernel. Zero PTX risk.
