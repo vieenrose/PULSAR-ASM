@@ -299,3 +299,42 @@ discards without a changed assumption.
 - xq-compare lesson: per-292B-block trailing [260..292) is quantizer-skipped stale bsums (kernel-invisible); full-memcmp across member calls is FLAKY (stale padding varies). Masked compare (64B header + [0..260)/block) is the correct fusion gate.
 - Tegra unified-memory fragmentation: 7.8MB cuMemAlloc failed mid-run (after 467MB repack churn) but 13MB pre-allocated early at init succeeds. Pre-allocate all device regions early; fill lazily.
 - Fusion-via-LAYOUT (Exp9b) is the surviving design: fused W/SC regions (DtoD) + proven single kernel. Zero PTX risk.
+
+## Run #40 quoting postmortem (2026-10-13) — READ BEFORE ANY HAND SSH RUN
+- Hand ssh runs used "$EN" (QUOTED: one space-separated argv string -> binary sees a 1-token prompt -> 1-echo streams that NEVER match golden). The bench uses unquoted $EN (21 separate argv ids -> 21 echoes -> golden). ALWAYS replicate bench argv style (unquoted) in hand runs; never quote $EN. This artifact voided: vrabal, bisA/B/C, ref200, k2_base probes, gen-quirk theory, consumer/uninit/layout/OOM/stuck-bit theories (ALL built on 1-token-prompt data).
+- #38 (v15b, bench args): the ONLY genuine post-v12 divergence (per-layer regions bug — real).
+- Smoke data (fusion engages, self-checks pass) REMAINS VALID (checks are self-consistent within a run, prompt-independent).
+- k2_base was never validly stream-tested (all probes quoted); it is timing-baseline-only (never gated) — do not use its stream as an oracle.
+
+## Exp9 CLOSED (run #41 checks_failed): call-buffering fusion is design-dead
+- Proof: same ordinal 5120-call sees scb=0bf326216 (garbage) under fusion vs the same valid shared scb 6x under v12 (v12-snoop). Sequences demonstrably differ => model consumes member-y (or its derivatives) between member calls (RoPE/cache between q,k,v; SiLU between up/gate suspected). Buffering delays compute to group completion => violates call->compute->read contract. All value paths verified exact (11k launch checks, flush-vs-single check, mask==CPU-read-set, PTX identical) => pure timing/contract bug, invisible to value checks.
+- Lessons: (1) ANY fusion must preserve per-call y-timing (compute+sync before return). (2) Self-checks that compare final values CANNOT catch timing violations; need sequence-level oracles (step streams only). (3) Flush path (unverified, no checks) is where prefill diverged first; future designs must check EVERY path or eliminate contingencies. (4) v15b's layer-regions bug (build once, reuse across 28 layers) vs v15c's per-layer rebuild: per-layer is required (tensors are per-layer); amortizes to zero only if sources stabilize (they didn't in prefill (monotonic advance), would in decode).
+- BANKED (timing-safe): CUDA-graphs replay (capture per-shape graphs once, replay per call: same y-timing as singles, ~5us replay vs ~25us launch; R440 supports graphs (r410+)). Effort: capture machinery for 7 shapes + head. Next-loop candidate.
+- Banked: persistent work-queue kernel with sync-before-return (preserves contract; saves launch (~25us->~3us/call ~ 4ms/token ~1.5%); needs PTX spin-loop around v12 body (asm risk)).
+
+## Exp12 (next): occupancy without extra waves at 4 rows (from #42/#43)
+- #42 v16 8-row: 512T (-14.5%). #43 v17 2-row: 1536T but 2x waves (-1.9%). Tradeoff balanced at 2-4 rows.
+- Proposal: keep v12's 4-row shape/grids (32 rows/block, same waves) but cut per-block cost: pack shbuf 16KB->~10-12KB (sc slots use only 8 of 64 entries/row; dot uses 32 of 64) + trim regs 64->~48 via temp reuse => 4-5 blocks (1024-1280T) at SAME wave count. Predicted +5-10% if latency-bound.
+- Tool fix: /tmp/regprobe.c reads attr id 8 (MAX_DYNAMIC_SHARED_SIZE_BYTES) mislabeled as SHARED_SIZE_BYTES (real id is 1). True static smem = 49152 - reported. v12/v16/v17 static = 16/16/8KB confirmed via ptxas -v. Anyone using regprobe shared numbers must reinterpret.
+
+## Occupancy direction CLOSED (from #44 + calculator + nvprof-blocked)
+- v18 (8KB decl, same 64 regs): occupancy-calculator says 4 blocks fit (64*256*4=65536 exact, 8KB*4=32KB<=48KB, 32 warps<=64) => v18 ran at 0.5 vs v12 0.375, yet tied 269 vs 268ms.
+- Conclusion: kernel is NOT latency-bound above ~768 threads; v16 (512T) was below the knee, v12 already at it. More occupancy cannot help. Do NOT pursue further block/occupancy variants.
+- nvprof hardware counters are permission-blocked on Nano (ERR_NVGPUCTRPERM, no passwordless sudo) => no achieved_occupancy/stalled measurements possible. API-trace timing still works.
+- Remaining levers: (a) fewer BYTES per token (bigger quant groups = accuracy risk; fewer GEMV calls = fusion/CUDA-graphs), (b) launch+staging overhead ~50-64us/call x ~200 calls (~4-5%: CUDA-graph replay of decode sequence, banked), (c) effective-BW anomalies (why ~3.4GB/s on coalesced streams? revisit K2PROFILE class breakdown in b38 before theorizing).
+- v18 one-liner (shbuf[4096]->[2048] in gen_v12.py line 19) is safe/bit-exact and kept 4-block occupancy; reapply on top of any future v12-derived kernel for free.
+
+## Geometry ridge CONFIRMED, stop reshaping (from #42-#45)
+- Rows/warp: 2 (v17, -1.9% tie) / 4 (v12 HEAD) / 8 (v16, -14.5%). Rows/block: 16 (v17 tie) / 32 (v12) / 64 (v19, -10%).
+- v12 (4 rows/warp, 32 rows/block, 8 warps) is a tuned optimum in EVERY direction. Halving waves at same work/thread LOSES => wave fixed-cost does not dominate; fill/drain + resident-parallelism balance favors 32-row waves.
+- Exp14 sketch (needs K2PROFILE per-class exec first, .auto/k2_prof.c): CLASS-SPECIFIC dispatch - small k/v GEMVs (512 rows, 16 blocks, tail-heavy) vs large up/head (160-1000 blocks) may want different geometries; one hetero kernel pair, each proven-shaped. Do NOT attempt without per-class numbers showing >5% addressable.
+- Fallback if Exp14 unmotivated: CUDA-graph replay of decode GEMV sequence (~4-5% launch overhead). Big change; only with no better idea.
+
+## LOOP CONVERGED on v12 @ 3.73 tok/s (after #46, 21 experiments)
+- Geometry ridge: 2-row tie, 8-row -14.5%, 64-rowblock -10% (avg AND head-only). v12 shape optimal everywhere.
+- Occupancy knee at 768T; bytes-bound above. Clocks already maxed (podgov). No thermal issue. Overhead ~4% but CPU-serial (graphs ~0.4% only).
+- Do NOT retry geometry/occupancy/fusion-launch ideas without changed assumptions.
+- If resumed: structural work only (prefill batching needs engine batch support; quant-group changes need accuracy qualification) or micro-levers (zero-copy xq ~1%, async DtoH ~0.5% - poor EV).
+- Driver lesson: cuModuleLoadDataEx WITH jit-log options broken on this Tegra libcuda (rc=1 empty log; earlier segfault with info-log opts). Always use plain cuModuleLoadData here.
+- Exp15 v21 PAIR-REDUCE (benched #47): warps 0-1 reduce 4 slots each (16 rows), 6 warps skip warp-uniform; sums distributed via shbuf upper half (r61+8192); lane0 loads+stores. 30x fewer shmem reduce-loads (LD_SH was 37% of static PTX). Bit-exact by construction (identical FMA/leaf order). Self-test 8/8 first try. Regs: f<40 decl (16 accs f1/f16/f22/f25+f26-f37), r76=tid.y r77=scratch, p7 dispatch (dead pred). Labels $red0/$red1/$redDis/$redSkip.
+- Exp16 v22 LANE-SPLIT EXCHANGE (benched #48): lane (q*8+sv) reads only its sv-partial (5 shmem reads vs 160/lane); 32 uniform (sc,dotsum) writes to per-warp area r65+8192 (256B x 8 = 2KB, upper shbuf); bar; lane0 replays 32 FMAs in exact v12 order (bit-exact, 4 accs, same regs/decls, no new branches, same 2-bar count). Self-test 8/8. BUG LESSON: gen line56 (r61/r65 setup) is INSIDE $LIT (recomputed per iter) - first v22 draft did add r61,+8192 there = runaway base, MISMATCH idx=0; fixed with per-iter fresh r79 base.
