@@ -343,3 +343,12 @@ discards without a changed assumption.
 - Exp19 v25 4-LANE PARALLEL REPLAY (benched #51): lane q (0..3) owns row q's FMA chain (was lane0 running all 4 chains = 96 instrs/iter). Reads its 8 (sc,dot) pairs at stride 32 from base 8q (exchange layout already matched: pair(q,sv) at 32sv+8q), sv ascending => bit-exact. v2 shared loads/stores; single predicated store for all 4 rows (replaces 4 store blocks + 3 branches). Replay 96->16 warp instrs/iter (~23% of per-iter issue slots). R440 LESSON: setp.lt.and.u32 is REJECTED by ptxas (line 460 arg mismatch) — use two setp + predicated mov to synthesize AND-inside-val; also cuModuleLoadDataEx jit-log is broken (see earlier).
 - Exp20 v26 BFE/XOR/MAD int path (benched #52): per r-step 48->22 instrs. (a) int8 x bytes: shl+shr.s32 sign-extend (2) -> bfe.s32(width 8) (1); (b) int4 code nibbles: shr+and255+and15+sub8 / shr4+and15+sub8 (7) -> xor.b32 0x88<<8r (1) + 2x bfe.s32(width 4) (2) — XOR flips nibble sign bits so sign-extend yields exactly (n-8); (c) mul/mul/add + acc add (4) -> 2x mad.lo.s32 (2). Integer math is EXACT (no rounding) => order/format-free, bit-exact by algebra. Exhaustive 16.7M-combo equivalence proof in Python before bench. ~96 fewer instrs/iter.
 - LESSON (v27 Exp21): when hoisting a load block across the pointer WALKS, the immediate offsets must absorb the walk amount (A-next loads need +(256,584,64), not 0). Bug signature: deterministic MISMATCH idx=0 with self-test gpu!=cpu; fix = pass delta=(256,584,64). Loads moved earlier for pipelining must be re-anchored to the pre-walk base.
+
+## Exp25 v31 (host-path slim-down: async copies + persistent context) — 2026-??
+Hypothesis: per-call fixed cost ~140us (H2D 28 host-blocking + launch 46 + sync/D2H 63)
+x ~190 calls/token = ~14ms/token. Keep the CUDA context current for the process
+lifetime (no per-call cuCtxSetCurrent(g_ctx)/cuCtxSetCurrent(0)) and use
+cuMemcpyHtoDAsync/cuMemcpyDtoHAsync on the legacy default stream with a single
+cuCtxSynchronize at the end, so the host never blocks on the H2D and the D2H is
+enqueued before the sync. Fallback to the sync path if the async symbols are absent.
+NOTE: cannot beat the ~20-50us device-side dispatch latency; only host stall removed.
