@@ -197,3 +197,24 @@ discards without a changed assumption.
 
 ## CPU-side (deprioritized per user: objective is GPU decode)
 - Quad-row blocked A57 GEMV (k2_core_a57.S, ~30% op reduction/block): syntax-clean version saved at /tmp/k2_core_a57_quad_bak.S. Validated law: 4-product smull tree (v1.8b*v2.8b, v1.16b*v2.16b, v0.8b*v3.8b, v0.16b*v3.16b) == tail code. Bit-exact gate never run. Resume only if CPU leg matters again.
+- V7 WARP-PER-ROW Q4 GEMV PROVEN (run #27, 2026-10-13): 1.19 -> 1.90 tok/s (+60%),
+  EN 216/216 + ZH 114/114 bit-exact vs engine goldens. Design: 32 lanes cover
+  8 blocks/iter (lane t: block s=t>>2, bytes q+4k q=t&3), xq streamed coalesced,
+  pure pointer walks (+144/+292/+32/+292), lane-0-equivalent chain run
+  redundantly on ALL lanes (unpredicated), fma(t,dot,acc) ascending = engine fmadd.
+  Sources: pulsar_arm/k2horizon/gpu_v7/ (generator + ptx + engine snapshot + selfcheck).
+- CUDA-8.0 (Nano) JIT LESSONS (cost a full debug loop, all proven by device dumps):
+  (a) per-iteration integer address recomputation inside loops gets MISCOMPILED
+  (stale values across the pipelined schedule) - use v6-style pure pointer walks;
+  (b) heavily-predicated (@%p5) shared-mem load chains in loops get MISCOMPILED -
+  use unpredicated all-lane redundant chains (single predicated store is fine);
+  (c) min.u32 was NOT the cause (selp equivalent behaves identically);
+  (d) kcmp-style gcc -O2 CPU references may be UNfused (mul+add) while the engine
+  uses fmadd - 1-ulp diffs vs such refs are HARNESS ARTIFACTS; gate on engine goldens.
+  Debug recipe that works: numpy sim of the exact mapping (catches logic bugs
+  instantly) + device dump of per-lane partials with a C self-check mirror
+  (catches JIT bugs by localizing to chain-vs-lanes in one run).
+- NEXT (GPU): per-token = ~196 GEMV calls x ~2.7ms = 527ms. Candidates:
+  (i) 2-row blocking in the warp kernel (amortize xq/code decode over 2 rows);
+  (ii) fewer/smarter launches (batch small GEMVs: q/k/v/o per layer?);
+  (iii) profile kernel-vs-overhead split first (nsys unavailable? use cuEvents).
