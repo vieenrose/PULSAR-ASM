@@ -557,3 +557,26 @@ Kernel is at a LOCAL OPTIMUM (#32). Every zero-cost reorganization of the same
 -0.46%, cache hints -0.35%, occupancy +0.47%, instructions 0%. Only ADDING
 traffic moves it (-38%, #29). Future headroom is algorithmic (fewer bytes per
 token) or hardware-bound - not scheduling.
+
+## gpu_free_mb was a FAILED QUERY, not a measurement (run #34, 2026-10-13)
+
+The dashboard printed gpu_free_mb=0.0 on every Q1_0 (and PQ2) run. The binary's
+own line also printed total_mb=0.0 - impossible for a working query - so
+cudaMemGetInfo was FAILING: the stats printers run from atexit, after CUDA's own
+atexit handler has destroyed the context, and the return code was never checked.
+Both fields kept their `size_t x = 0` initialisers, which the dashboard then
+reported as "0 MB free" on a 4GB board.
+
+Fix: sample once at arena allocation (context provably alive), print NA when
+unmeasured. Real values: free=412.5MB, total=3965.2MB == /proc/meminfo MemTotal,
+i.e. CUDA's total on Tegra is the WHOLE unified pool, not a carveout.
+
+NEW FACT for arena decisions: after the 1280MB arena cudaMalloc, 412.5MB of the
+3965MB pool is free. This is the quantified form of #23's mechanism - the arena
+and the page cache draw on one pool, so arena size trades against peak RSS, it
+does not add to it. Do NOT size the arena down to chase RSS on this board.
+
+Debug technique worth keeping: when a metric reads a physically impossible value
+(total memory = 0), the API call failed and the value is the initialiser. Check
+return codes before trusting printed diagnostics - and prefer a value that cannot
+be a measurement (NA) over a default that looks real (0.0).
