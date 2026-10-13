@@ -81,7 +81,7 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
   }
 #endif
   snprintf(buf, n,
-           "PQ2GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%.1f "
+           "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%.1f "
            "total_mb=%.1f tensors=%d",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
            freeb / 1048576.0, totb / 1048576.0, PQ1N);
@@ -170,7 +170,6 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
         if (cudaMemcpy(pb, codes, ncb, cudaMemcpyHostToDevice) == cudaSuccess &&
             cudaMemcpy(ps, scales, nsb, cudaMemcpyHostToDevice) == cudaSuccess) {
           PQ1ACUR += a + b;
-          if (PQ1ACUR > P2PEAK) P2PEAK = PQ1ACUR;
           if (PQ1ACUR > P2PEAK) P2PEAK = PQ1ACUR;
           PQ1C[ci].d_codes = pb;
           PQ1C[ci].d_scales = (unsigned short *)ps;
