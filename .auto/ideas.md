@@ -681,3 +681,36 @@ PITFALLS HIT AND CLOSED THIS SESSION (do not re-hit):
   the object/binary exist, then read the gate (#37's lesson, re-learned in #38).
 - A/B drivers must pass log PATHS to their parsers, not tags, and must link objects
   built with identical -D flags (the 2-bit path needs -DPQ2_HIST consistently).
+
+## #35's win confirmed at n=5 (run #39, 2026-10-13)
+
+GITREF=a3b3abe^ vs HEAD, one interleaved job, 5 runs/side:
+new 2.6120 vs old 2.3393 tps = **+11.66%** (382.85 vs 427.48 ms), every pair
+separated by >=31ms, Welch t~14, 1sigma ~0.8% absolute. #35's +10.01% (n=3) was
+within ~2 sigma; RSS identical to 0.1MB (341.4 both sides) - third confirmation
+the packed accumulator is resource-neutral.
+
+SLOPE MODEL CLOSES PROSPECTIVELY ON BOTH KERNELS:
+  1-bit: predicted -10.9% time (21.4% chain cut x ~51% chain share) -> measured
+         -10.44%. 2-bit (#38): predicted ~12% -> measured +12.38%.
+The model is accurate to ~5% relative, so op-level ideas can be sized on paper.
+
+SIZING RULE for any future candidate: removing ONE op from the 11-op 1-bit chain
+is worth ~4.6% of decode time. A candidate that cannot provably remove >=2 ops is
+below the measurement floor - do not spend board time on it.
+
+TWO IDEAS BOUNDED ANALYTICALLY (do not spend a session re-deriving these):
+1. Bit-slicing the int8 activations (T-MAC/BitBLAS style: sum_j 2^j * popc(plane_j
+   AND code_bits)). Int8 needs EIGHT planes, so per nibble it costs 8 LOP3 + 8 POPC
+   = 16 ops before the weighted accumulation - versus 11 for the current form.
+   Bit-slicing pays when the ACTIVATIONS are binary (1 plane); here the weights are
+   the binary side (already 1 bit = the current AND-based selection) and the
+   activations are the wide side, so the roles cannot be swapped profitably.
+2. Offloading fold ops from the ALU pipe to the XU/VA pipe (VADD4/VAADDLE4, native
+   on Maxwell). XU is 1/4 rate: moving 1 op per nibble costs ~59M warp-ops =
+   ~236M XU cycles to save ~16M ALU cycles, and the XU pipe already carries ~32ms
+   (7.4M warp-ops at 0.25/cycle) of the 394ms budget. Net loss.
+
+Standing on the primary metric: ~2.53-2.61 tps, all scheduling/cache/occupancy/
+instruction-count levers closed with data (#15/#24/#27/#29/#30/#31/#32/#35/#36/#38),
+both GEMV kernels at their op floor for this algorithm family.
