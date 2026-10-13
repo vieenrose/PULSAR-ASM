@@ -32,11 +32,19 @@
 
 #define PQ2_BLOCK_ROWS 16  /* 256 threads = 16 rows x 16 lanes */
 #define PQ2_MAXK 12288
-#define PQ2_MAXG (PQ2_MAXK / 128)   /* 96 groups max */
-#define PQ2_K128_MAX (PQ2_MAXG)     /* per-block group count bound */
 #define Q8K_NB 292                  /* Q8_K block: float d + 256 i8 */
 #define Q8K_TILE_STRIDE 272         /* shared tile stride: 256 acts (16B
                                      * aligned) + d + pad, 17 u32 words */
+/* v4 (E3): process K in chunks of 8 Q8_K blocks (16 groups) so the
+ * activation tile is 2.2KB instead of 13KB. Shared per block drops from
+ * ~20KB to ~3.4KB, lifting occupancy from 3 blocks/SM (shared-limited) to
+ * the 4-block register cap (32 warps vs 24). Each chunk gives every lane
+ * exactly one group, so the ordered fp reduce is a short 16-add pass per
+ * chunk instead of one long tail at the end. */
+#define PQ2_CHUNK_BLOCKS 8
+#define PQ2_CHUNK_GROUPS (PQ2_CHUNK_BLOCKS * 2)
+#define PQ2_CHUNK_BYTES (PQ2_CHUNK_BLOCKS * Q8K_TILE_STRIDE)
+#define PQ2_MAXCHUNK ((PQ2_MAXK / 256) / PQ2_CHUNK_BLOCKS)
 
 __device__ __forceinline__ int pq2_iadd3(int a, int b, int c) {
   return a + b + c; /* fuses to IADD3 */
@@ -55,18 +63,10 @@ __device__ __forceinline__ void pq2_split4(uint8_t cb, uint32_t *b0,
   *b1 = t1;
 }
 
-/* 4 one-bit flags -> 4 keep bytes (0xFF keep / 0x00 drop), no IMUL-free. */
+/* 4 one-bit flags -> 4 keep bytes (0xFF keep / 0x00 drop). */
 __device__ __forceinline__ uint32_t pq2_keep4(uint32_t bits4) {
   uint32_t spread = (bits4 * 0x00204081u) & 0x01010101u;
   return spread * 255u;
-}
-
-__device__ __forceinline__ int pq2_hsum4(uint32_t apack) {
-  int s0 = (int)(apack << 24) >> 24;
-  int s1 = (int)(apack << 16) >> 24;
-  int s2 = (int)(apack << 8) >> 24;
-  int s3 = (int)((int32_t)apack) >> 24;
-  return pq2_iadd3(s0, s1, s2) + s3;
 }
 
 /* masked 4-lane UNSIGNED byte sum (8 ops): bytes of apack where the keep
@@ -79,75 +79,72 @@ __device__ __forceinline__ int pq2_usum4(uint32_t apack, uint32_t keep,
   return acc + (int)s;
 }
 
-__global__ __launch_bounds__(256, 3)
+__global__ __launch_bounds__(256, 4)
 void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
                    const __half* __restrict__ w_scales,
                    const int16_t* __restrict__ w_corr,
                    const uint8_t* __restrict__ xq, float* __restrict__ y,
                    int K, int N) {
-  __shared__ __align__(16) uint8_t sh_x[PQ2_MAXK / 256 * Q8K_TILE_STRIDE];
-  __shared__ float sh_prod[PQ2_BLOCK_ROWS][PQ2_MAXG];
-  __shared__ int sh_au[PQ2_MAXG];  /* unsigned sum of all 128 acts per group */
+  __shared__ __align__(16) uint8_t sh_x[PQ2_CHUNK_BYTES];
+  __shared__ int sh_au[PQ2_CHUNK_GROUPS];
+  __shared__ float sh_prod[PQ2_BLOCK_ROWS][PQ2_CHUNK_GROUPS];
 
   int row = blockIdx.x * PQ2_BLOCK_ROWS + (threadIdx.x >> 4);
   int sub = threadIdx.x & 15;
   if (blockIdx.x * PQ2_BLOCK_ROWS >= N) return; /* block-uniform */
   bool active = row < N;
+  int rrow = active ? row : 0;
 
   int K128 = K >> 7;
-  int GperThr = K128 >> 4;   /* 2 (K=4096) or 6 (K=12288) */
-  int my_g0 = sub * GperThr;
+  int nchunk = K128 / PQ2_CHUNK_GROUPS;
+  if (nchunk > PQ2_MAXCHUNK || nchunk <= 0) return;
 
-  /* 1. Q8_K tile with a 272B stride so every 128-act group starts on a
-   * 16-byte boundary (LDS.128 in the inner loop). Source blocks are 292B
-   * (73 u32: d + 64 act words + 8 bsum words we skip), so the copy reads
-   * 65 words per block and biases the acts to unsigned (x' = x^0x80) in
-   * the same pass — no alignment hazard, and 11% less global traffic. */
-  {
-    const uint32_t *x32 = reinterpret_cast<const uint32_t *>(xq);
+  const uint32_t *cd32 =
+      reinterpret_cast<const uint32_t *>(w_codes + (size_t)rrow * (K >> 2));
+  float acc = 0.0f; /* lane 0 only; groups accumulated in order */
+
+  for (int ch = 0; ch < nchunk; ch++) {
+    /* 1. stage the chunk: d verbatim, acts biased to unsigned (x^0x80), at
+     * a 272B stride so every 128-act group is 16B-aligned (LDS.128). */
+    const uint32_t *x32 = reinterpret_cast<const uint32_t *>(xq) +
+                          (size_t)ch * PQ2_CHUNK_BLOCKS * 73;
     uint32_t *t32 = reinterpret_cast<uint32_t *>(sh_x);
-    int nb = K / 256;
-    int nw = nb * 65;
-    for (int i = (int)threadIdx.x; i < nw; i += (int)blockDim.x) {
-      int b = i / 65, w = i - b * 65;
-      uint32_t v = __ldg(x32 + b * 73 + w);
-      if (w == 0) t32[b * 68 + 64] = v; /* fp32 d, verbatim */
-      else t32[b * 68 + (w - 1)] = v ^ 0x80808080u;
+    {
+      const int nw = PQ2_CHUNK_BLOCKS * 65;
+      for (int i = (int)threadIdx.x; i < nw; i += (int)blockDim.x) {
+        int b = i / 65, w = i - b * 65;
+        uint32_t v = __ldg(x32 + b * 73 + w);
+        if (w == 0) t32[b * 68 + 64] = v;
+        else t32[b * 68 + (w - 1)] = v ^ 0x80808080u;
+      }
     }
-  }
-  __syncthreads();
+    __syncthreads();
 
-  /* 1b. Au (unsigned sum of all 128 acts per group) is row-independent, so
-   * one thread per group computes it once for the whole block. */
-  if ((int)threadIdx.x < K128) {
-    int g = (int)threadIdx.x;
-    const uint32_t *p = reinterpret_cast<const uint32_t *>(sh_x) +
-                        (g >> 1) * 68 + (g & 1) * 32;
-    uint32_t acc = 0;
+    /* 2. Au per group (row-independent): one thread per group. */
+    if ((int)threadIdx.x < PQ2_CHUNK_GROUPS) {
+      int gg = (int)threadIdx.x;
+      const uint32_t *p = t32 + (gg >> 1) * 68 + (gg & 1) * 32;
+      uint32_t a2 = 0;
 #pragma unroll
-    for (int q = 0; q < 32; q++) {
-      uint32_t m = p[q];
-      uint32_t t = (m & 0x00FF00FFu) + ((m >> 8) & 0x00FF00FFu);
-      acc += (t & 0xFFFFu) + (t >> 16);
+      for (int q = 0; q < 32; q++) {
+        uint32_t m = p[q];
+        uint32_t t = (m & 0x00FF00FFu) + ((m >> 8) & 0x00FF00FFu);
+        a2 += (t & 0xFFFFu) + (t >> 16);
+      }
+      sh_au[gg] = (int)a2;
     }
-    sh_au[g] = (int)acc;
-  }
-  __syncthreads();
+    __syncthreads();
 
-  /* 2. Per-group integer dot, fp32 product, in per-lane registers. */
-  const uint8_t *cd = w_codes + (size_t)(active ? row : 0) * (K >> 2);
-  for (int s = 0; s < GperThr; s++) {
-    int g = my_g0 + s;
-    const uint32_t *gb = reinterpret_cast<const uint32_t *>(sh_x) +
-                         (g >> 1) * 68;
+    /* 3. one group per lane (128 weights per group, 32 code bytes) */
+    int g = sub;
+    const uint8_t *c =
+        w_codes + (size_t)rrow * (K >> 2) +
+        (size_t)(ch * PQ2_CHUNK_GROUPS + g) * 32;
+    const uint32_t *gb = t32 + (g >> 1) * 68;
     float db;
     __builtin_memcpy(&db, gb + 64, 4);
-    const uint32_t *qs = gb + (g & 1) * 32; /* 32 u32 = 128 act bytes */
-    const uint8_t *c = cd + g * 32;
-    /* vector loads: 32 code bytes as 2x LDG.E.128 (16B-aligned: row stride
-     * K/4 and group stride 32 are both multiples of 16), and each 16-weight
-     * act slice as one LDS.128. Cuts inner-loop loads from 40 to 10 per
-     * group. Two accumulator pairs (even/odd word) give the chains ILP. */
+    const uint32_t *qs = gb + (g & 1) * 32;
+
     const uint4 *cv = reinterpret_cast<const uint4 *>(c);
     uint4 cw0 = __ldg(cv);
     uint4 cw1 = __ldg(cv + 1);
@@ -178,29 +175,28 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
         }
       }
     }
-    int pu = pu0 + pu1, mu = mu0 + mu1;
-    /* exact: isum = Pu + 2*Mu - Au + corr (bias corrections are exact
-     * integers, codes-only, precomputed at repack time) */
-    int isum = (mu << 1) + pu - sh_au[g] + (int)__ldg(w_corr + (size_t)(active ? row : 0) * K128 + g);
-    float ws = active ? __half2float(
-        __ldg(w_scales + (size_t)(active ? row : 0) * K128 + g)) : 0.0f;
-    /* (ws*db)*isum with no contraction, matching the C reference exactly */
+    int isum = ((mu0 + mu1) << 1) + (pu0 + pu1) - sh_au[g] +
+               (int)__ldg(w_corr + (size_t)rrow * K128 +
+                          (ch * PQ2_CHUNK_GROUPS + g));
+    float ws = active ? __half2float(__ldg(w_scales + (size_t)rrow * K128 +
+                                          (ch * PQ2_CHUNK_GROUPS + g)))
+                      : 0.0f;
     sh_prod[threadIdx.x >> 4][g] =
         __fmul_rn(__fmul_rn(ws, db), (float)isum);
+    __syncwarp();
+
+    /* 4. ordered reduce for this chunk: lane 0 of each row adds the 16
+     * products in group order (chunks are processed in order too). */
+    if (sub == 0) {
+      const float *p = sh_prod[threadIdx.x >> 4];
+#pragma unroll
+      for (int k = 0; k < PQ2_CHUNK_GROUPS; k++) acc = __fadd_rn(acc, p[k]);
+    }
+    __syncthreads(); /* the tile is reused by the next chunk */
   }
 
-  /* 3. Ordered reduce: lane 0 sums groups 0..K128-1 in order in fp32.
-   * That is the fork's accumulation order, so the row result is
-   * bit-identical to the serial reference (no tree, no shuffles). */
-  __syncwarp();
-  if (sub == 0 && active) {
-    float acc = 0.0f;
-    const float *p = sh_prod[threadIdx.x >> 4];
-    for (int g = 0; g < K128; g++) acc = __fadd_rn(acc, p[g]);
-    y[row] = acc;
-  }
+  if (sub == 0 && active) y[row] = acc;
 }
-
 extern "C" int pq2_gemv_sm53_launch(const uint8_t *w_codes,
                                     const unsigned short *w_scales_h,
                                     const short *w_corr,

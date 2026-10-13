@@ -78,6 +78,10 @@ PY
 
 echo "METRIC decode_ms_per_tok=$DEC"
 echo "METRIC prefill_ms_per_tok=$PRE"
+# Same measurements in tokens/s (1000/ms per token). Reported next to the ms
+# values so neither is derived from a different run.
+echo "METRIC decode_tps=$(python3 -c "print(f'{1000.0/float(\"$DEC\"):.4f}')")"
+echo "METRIC prefill_tps=$(python3 -c "print(f'{1000.0/float(\"$PRE\"):.4f}')")"
 echo "METRIC peak_rss_mb=$(( ${HWM:-0} / 1024 ))"
 echo "METRIC build_s=$BUILD_S"
 echo "METRIC startup_s=$(python3 -c "print(f'{$STARTUP/1000:.1f}')")"
