@@ -611,3 +611,38 @@ The 2-bit kernel (pq2_swar_sm53.cu) has the same 9-op usum4 chain (E4 counted
 DO NOT re-walk from the pre-#35 mindset: #29 (tables) and #30 (LDS vectorisation)
 are measured out - they failed for reasons this run CONFIRMS (wrong currency),
 not reasons this run changes.
+
+## Slope re-calibrated after #35 (run #36) + gate integrity bug (run #37)
+
+SLOPE (diagnostic probe, kk<4 = half the inner loop, checks_failed by design):
+386.45 -> 287.73 ms/tok = -25.5% decode time, every A/B pair separated
+(sd 0.6-3.1ms). => 0.51% time per 1% op cut (was 0.57% pre-#35, #28).
+The ALU currency is NOT saturated by #35. The per-nibble ALU chain is ~51% of
+decode time, so the remaining 11 ops/4 weights are worth ~4.6% of decode time
+per op removed. A primitive that removes 3 ops is worth ~14%.
+
+WHY 11 OPS IS NEAR THE FLOOR (analysis, not measured - do not spend a session
+re-deriving it): extract 2 (SHR+AND per nibble), mask spread 3 (IMAD
+b4*0x00204081, AND 0x01010101, IMAD *255), AND 1, fold 4 (AND, SHR, AND, ADD),
+accumulate 1 (IMAD). Examined and rejected: PRMT byte-select (cannot broadcast
+bits), 64-bit 8-bit spread (costs more than it saves), LOP3-fused masks (equal,
+already 1 op per AND), single-IMAD fold of unpre-scaled bytes (INEXACT: 4 biased
+bytes sum to <=1020, so the top byte overflows mod 256 - the 16-bit lane room is
+what makes #35's accumulator exact).
+
+GATE INTEGRITY (the session's most important harness finding): checks.sh never
+built anything. It ran ./pq1_parity and ./fwd8_q1 as the last build left them, so
+any kernel-TU change measured through ab_kernel.sh (which builds its own
+q1_old/q1_new objects) got a VACUOUS green gate. Proof: a kernel that ignores
+half its weights passed all three gates, then failed 0/256 after a rebuild.
+Fixed in #37: .auto/build_q1.sh (canonical copy of measure.sh's build recipe) is
+run as checks.sh step 0; verified by re-applying the probe -> gate fails.
+
+NOTE for future runs: gate 2's prompt-A check diffs .auto/last_run_log.txt,
+which only measure.sh writes. A standalone checks.sh after a probe run therefore
+fails prompt A legitimately. Run the harness, then checks.sh (what the tool does).
+
+MOTIVATION FOR #35 THAT IS NOW MEASURED: #35's 14->11 op cut predicted ~12-13%
+from the 0.57 slope and delivered 9.1% (0.44 slope) - the slope is real but
+shallower for partial cuts than for the full-chain probe, consistent with the
+loop containing non-reduced work (loads, addressing, loop arithmetic).
