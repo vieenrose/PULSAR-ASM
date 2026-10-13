@@ -218,3 +218,13 @@ discards without a changed assumption.
   (i) 2-row blocking in the warp kernel (amortize xq/code decode over 2 rows);
   (ii) fewer/smarter launches (batch small GEMVs: q/k/v/o per layer?);
   (iii) profile kernel-vs-overhead split first (nsys unavailable? use cuEvents).
+- V8 VECTORIZED LOADS PROVEN (run #28): 1.90 -> 2.73 tok/s (+44%). Same (s,m)
+  mapping as v7 but contiguous bytes j=4m+r per lane: code 2x u16 (18s+4m is
+  2-aligned; u32 faults - 18s odd), x8/x16 u32 (32s+4m+4 always 4-aligned).
+  Warp covers 8 contiguous 16B code chunks + 256B xq (was: strided 1B loads,
+  ~4-6x L2-sector waste). 14 -> 6 loads/lane/iter. Bit-exact by construction
+  (same products, int-exact dots, same fma order); EN 216 + ZH 114 green.
+- NEXT (GPU): 366ms/tok / ~196 calls = ~1.9ms/call. Still ~2x sector waste on
+  code (8x32B for 128B). Candidates: (i) 2-row blocking (share xq/code decode,
+  halves xq traffic); (ii) sc/db broadcast via shfl/smem (minor); (iii) batch
+  small GEMVs into fewer launches if launch overhead shows in profile.
