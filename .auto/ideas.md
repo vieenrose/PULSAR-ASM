@@ -352,3 +352,8 @@ cuMemcpyHtoDAsync/cuMemcpyDtoHAsync on the legacy default stream with a single
 cuCtxSynchronize at the end, so the host never blocks on the H2D and the D2H is
 enqueued before the sync. Fallback to the sync path if the async symbols are absent.
 NOTE: cannot beat the ~20-50us device-side dispatch latency; only host stall removed.
+
+## Exp26 v32 (pinned staging buffers) — host-path step 2
+v31 removed host blocking but the copies still stage through pageable memory.
+Persistent cuMemHostAlloc buffers (64KB in / 512KB out) + one host memcpy each way.
+Targets the ~63us D2H + ~28us H2D pageable latency x 188 calls/token.
