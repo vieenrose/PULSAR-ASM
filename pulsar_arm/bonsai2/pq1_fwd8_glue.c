@@ -61,12 +61,29 @@ static int PQ1ARENA_DEAD = 0;
  * gpu_arena_mb = cudaMalloc size of that arena (one mapping; Tegra's fixed
  *                GPU-VA table cannot take a malloc per tensor)
  * gpu_peak_mb  = high-water mark of arena use, i.e. the real requirement
- * gpu_free_mb / gpu_total_mb = cudaMemGetInfo at exit */
+ * gpu_free_mb / gpu_total_mb = cudaMemGetInfo, sampled at arena allocation.
+ *                NOT at exit: CUDA's own atexit handler has torn the context
+ *                down by then, the query fails, and both outputs keep their 0
+ *                initialisers - which is why the dashboard printed 0.0 on every
+ *                run. A real query cannot report total=0, so a 0 in these fields
+ *                meant an unmeasured value read as a measurement; unmeasured now
+ *                prints NA. */
 #ifdef PQ1_USE_CUDA
 static size_t P2PEAK = 0;
+/* Device memory is sampled once, at arena allocation, while the CUDA context is
+ * alive (the atexit query fails - see the note above). PQ1MEMQ records that the
+ * sample is valid. */
+static size_t PQ1FREE = 0, PQ1TOTAL = 0;
+static int PQ1MEMQ = 0;
 const char *pq1_gpu_stats_mb(char *buf, int n) {
-  size_t freeb = 0, totb = 0;
-  cudaMemGetInfo(&freeb, &totb);
+  char fb[16], tb[16];
+  const char *fs = "NA", *ts = "NA"; /* NA = not measured, never a fake 0 */
+  if (PQ1MEMQ) {
+    snprintf(fb, sizeof fb, "%.1f", PQ1FREE / 1048576.0);
+    snprintf(tb, sizeof tb, "%.1f", PQ1TOTAL / 1048576.0);
+    fs = fb;
+    ts = tb;
+  }
 #ifdef PQ1_HIST
   {
     unsigned long code[4];
@@ -81,10 +98,10 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
   }
 #endif
   snprintf(buf, n,
-           "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%.1f "
-           "total_mb=%.1f tensors=%d",
+           "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%s "
+           "total_mb=%s tensors=%d",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
-           freeb / 1048576.0, totb / 1048576.0, PQ1N);
+           fs, ts, PQ1N);
   return buf;
 }
 #endif
@@ -110,6 +127,14 @@ static int pq1_arena_init(size_t need) {
             cudaGetErrorString(rc));
     PQ1ARENA_DEAD = 1;
     return -1;
+  }
+  { /* sample device memory here: the context is alive now, not at atexit */
+    size_t f = 0, t = 0;
+    if (cudaMemGetInfo(&f, &t) == cudaSuccess) {
+      PQ1FREE = f;
+      PQ1TOTAL = t;
+      PQ1MEMQ = 1;
+    }
   }
   PQ1ARENA = (uint8_t *)ar;
   PQ1ALIM = mb << 20;

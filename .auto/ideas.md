@@ -528,3 +528,32 @@ Note on #32's 2.3737 tps harness sample - the best single sample of the session.
 It is NOT a win: the interleaved A/B of the same two binaries put it at +0.65%
 at 0.35 sigma. This is the clearest illustration of why single-sample "wins" are
 not admissible on this board.
+
+## Cumulative gain audited (run #33, 2026-10-13)
+
+GITREF=902dabc ab_kernel.sh 3 - HEAD kernel vs the run-#13 baseline kernel, one
+interleaved job: +10.71% tps (2.4069 vs 2.1740), every pair separated by ~45ms
+against ~1ms spread (t ~ 25).
+
+The recorded headline (+9.7%, from #19's cross-session arithmetic) is CONFIRMED
+and slightly UNDERSTATED. Consistent with #26: the isolated 64-vs-32-step was
+overstated (+7.6% recorded, +4.2% real), but the cumulative chain was not - the
+individual overstatements did not compound, because the baseline itself measured
+slower in the same job than its own historical sample (2.1740 warm vs 2.1349 cold).
+
+CAUTION FOR THE DASHBOARD: 2.4069 tps is a WARM-SEQUENCE number. The tool's
+dashboard compares it against the COLD baseline 2.1349 and prints +12.7%; that
+figure mixes conditions (cold-vs-warm is ~6% on this board) and should NOT be
+quoted. The defensible statement is:
+
+  decode is ~10.7% faster than the Q1_0 baseline kernel, measured drift-free.
+
+Audit series status: #19 (isolated step) -> +4.2% real; cumulative chain -> +10.71%
+real. Remaining unaudited kept claims: #7 (2-bit path, +4.5%) and #9 (2-bit path,
++4.0%) - different kernel TU, lower value, replay with GITREF if ever needed.
+
+Kernel is at a LOCAL OPTIMUM (#32). Every zero-cost reorganization of the same
+1.06GB/token traffic stream is null: prefetch -0.61%, locality +0.65%, LDS ops
+-0.46%, cache hints -0.35%, occupancy +0.47%, instructions 0%. Only ADDING
+traffic moves it (-38%, #29). Future headroom is algorithmic (fewer bytes per
+token) or hardware-bound - not scheduling.
