@@ -93,8 +93,10 @@ __device__ __forceinline__ int pq1_sdot4(uint32_t apack, uint32_t keep,
   return pq1_iadd3(s2, s3, acc);
 }
 
-/* masked 4-lane UNSIGNED byte sum (8 ops): bytes of apack where the keep
- * byte is 0xFF. Two-stage SWAR fold, no sign extension, no IMUL. */
+/* Masked 4-lane UNSIGNED byte sum (8 ops): bytes of apack where the keep
+ * byte is 0xFF. Two-stage SWAR fold, no sign extension, no IMUL. Superseded
+ * in the inner loop by the packed IMAD accumulator (see pq1_gemv_sm53), which
+ * computes the same integer in 1 IMAD + 4 folding ops. */
 __device__ __forceinline__ int pq1_usum4(uint32_t apack, uint32_t keep,
                                          int acc) {
   uint32_t mk = apack & keep;
@@ -196,7 +198,17 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
     uint32_t cws[4] = {(uint32_t)cw.x, (uint32_t)cw.y, (uint32_t)cw.z,
                        (uint32_t)cw.w};
     const uint32_t *av = qs; /* one act word (4 bytes) per 4-weight nibble */
-    int pu0 = 0, pu1 = 0, pc = 0;
+    /* Packed accumulator: pu0/pu1 hold (sum << 16). Each nibble contributes
+     * (x0+x1+x2+x3) to the TOP 16 bits through a single IMAD by 0x00010001, so
+     * the whole 4-byte masked sum costs one multiply-accumulate instead of the
+     * 9-op SWAR fold (pq1_usum4). Per group an accumulator takes 16 nibbles at
+     * <= 1020 each, so the packed value stays <= 16320 in the top 16 bits
+     * (1.07e9 < 2^31) and never overflows. Integer addition is associative and
+     * exact, so this computes the SAME integer Pu as the per-nibble SWAR sum -
+     * bit-identical by construction, no rounding, no reassociation question.
+     * The float conversion below is untouched. */
+    uint32_t pu0 = 0, pu1 = 0;
+    int pc = 0;
 #pragma unroll
     for (int w = 0; w < 4; w++) {
       uint32_t bits = cws[w];
@@ -207,13 +219,19 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
         /* 4 one-bit weights -> 4 keep bytes (0xFF keep / 0x00 drop) */
         uint32_t keep = ((b4 * 0x00204081u) & 0x01010101u) * 255u;
         uint32_t ap = av[w * 8 + kk]; /* the matching 4 act bytes */
-        if (kk & 1) pu1 = pq1_usum4(ap, keep, pu1);
-        else        pu0 = pq1_usum4(ap, keep, pu0);
+        uint32_t mk = ap & keep;
+        /* bytes 0,2 and 1,3 into the low halves of two 16-bit lanes; the IMAD
+         * then folds both lanes into the accumulator's top 16 bits */
+        uint32_t fold = (mk & 0x00FF00FFu) + ((mk >> 8) & 0x00FF00FFu);
+        if (kk & 1) pu1 += fold * 0x00010001u;
+        else        pu0 += fold * 0x00010001u;
       }
     }
     /* x' = x+128 unsigned, so with Pu = sum of x' where the bit is 1 and
-     * Au/pc from staging: sum(w*x) = 2*Pu - Au + 16384 - 256*pc, exact. */
-    int isum = ((pu0 + pu1) << 1) - sh_au[g] + 16384 - (pc << 8);
+     * Au/pc from staging: sum(w*x) = 2*Pu - Au + 16384 - 256*pc, exact.
+     * pu0/pu1 are packed (<< 16); shifting them down recovers Pu exactly. */
+    int isum = (int)(((pu0 >> 16) + (pu1 >> 16)) << 1) - sh_au[g] + 16384 -
+               (pc << 8);
     float ws = active ? __half2float(__ldg(w_scales + (size_t)rrow * K128 +
                                           (ch * PQ1_CHUNK_GROUPS + g)))
                       : 0.0f;
