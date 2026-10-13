@@ -7,6 +7,8 @@ own acc; lane0 stores. No shmem, no barriers. Grid: 32 rows/block.
 """
 import sys
 
+import sys as _s
+MASK = _s.argv[1] if len(_s.argv) > 1 else "31"
 P = []
 A = P.append
 A("// K2 Q4 GEMV v14 (Exp8: shuffle reduction, no shmem, no barriers): warp covers 4 rows, 8 blocks/iter")
@@ -85,8 +87,8 @@ for r in range(4):
     A("mul.lo.s32 %r15,%r57,%r43; mul.lo.s32 %r16,%r58,%r44; add.s32 %r59,%r15,%r16;")
     # row3
     A(f"shr.u32 %r29,%r27,{sh}; and.b32 %r29,%r29,255;")
-    A("and.b32 %r30,%r29,15; sub.s32 %r30,%r29,8;")
-    A("shr.u32 %r31,%r29,4; and.b32 %r31,%r29,15; sub.s32 %r31,%r31,8;")
+    A("and.b32 %r30,%r29,15; sub.s32 %r30,%r30,8;")
+    A("shr.u32 %r31,%r29,4; and.b32 %r31,%r31,15; sub.s32 %r31,%r31,8;")
     A("mul.lo.s32 %r37,%r30,%r43; mul.lo.s32 %r38,%r31,%r44; add.s32 %r32,%r37,%r38;")
     if r == 0:
         A("mov.b32 %r46,%r48; mov.b32 %r49,%r55; mov.b32 %r35,%r59; mov.b32 %r36,%r32;")
@@ -109,8 +111,8 @@ for (dotr, scr, acc) in (("%r46", "%r56", "%f1"), ("%r49", "%r57", "%f16"),
                          ("%r35", "%r29", "%f22"), ("%r36", "%r30", "%f25")):
     for s in range(8):
         A(f"mov.u32 %r60,{4*s};")
-        A(f"shfl.idx.b32 %r58,{dotr},%r60,31;")
-        A(f"shfl.idx.b32 %r61,{scr},%r60,31;")
+        A(f"shfl.idx.b32 %r58,{dotr},%r60,"+MASK+";")
+        A(f"shfl.idx.b32 %r61,{scr},%r60,"+MASK+";")
         A("mov.b32 %f10,%r61;")
         A("cvt.rn.f32.s32 %f8,%r58;")
         A("mul.f32 %f14,%f10,%f3;")
@@ -135,6 +137,25 @@ A("$done:")
 A("ret;")
 A("}")
 
+# self-check: all 4 row emission blocks must be structurally identical
+# modulo register renaming (lesson of Exp8: two fresh-text typos in row 3).
+import re as _re
+_blocks = _re.findall(r'# row\d\n((?:    A\(.*\n){4})', "\n".join(
+    [l for l in open(__file__).read().splitlines() if True]))
+_rows = [
+    [r'%r40',r'%r41',r'%r42',r'%r20',r'%r45',r'%r47',r'%r48'],
+    [r'%r50',r'%r51',r'%r52',r'%r22',r'%r53',r'%r54',r'%r55'],
+    [r'%r56',r'%r57',r'%r58',r'%r26',r'%r15',r'%r16',r'%r59'],
+    [r'%r29',r'%r30',r'%r31',r'%r27',r'%r37',r'%r38',r'%r32'],
+]
+_norm = []
+for _b, _rr in zip(_blocks, _rows):
+    _t = _b
+    for _i, _r in enumerate(_rr):
+        _t = _t.replace(_r, f'R{_i}')
+    _norm.append(_t)
+assert len(_blocks) == 4 and len(set(_norm)) == 1, "row-block divergence!"
+print("row-block self-check: 4/4 identical")
 ptx = "\n".join(P) + "\n"
 open('/tmp/k2v14.ptx', 'w').write(ptx)
 print("wrote /tmp/k2v14.ptx", len(P), "lines")

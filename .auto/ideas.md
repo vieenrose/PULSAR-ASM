@@ -276,3 +276,19 @@ discards without a changed assumption.
   captured pre-crash on the Nano: /tmp/gate10_out.txt "CUDA self-test OK (8/8 bit-exact)",
   /tmp/zh_check.txt 114 steps == .auto/k2nano_golden_zh.txt. NOT benchmarked => v9 (3.26 tok/s,
   fea4c10) remains HEAD of the GPU line.
+
+## Exp8 postmortem (run #37): shuffle reduction ABANDONED on Nano driver
+- `shfl.idx.b32` / `shfl.up.b32` JIT-compile (regprobe + engine device-stage OK) but
+  deliver ~0 at runtime on L4T R32 (R440-era ptxas, sm_53), regardless of form:
+  mask 31 / -1 / reg, .idx / .up-with-delta, .version 4.0 / 6.4 — all bit-identical
+  wrong (~0 rows). Graft proof (v14 loads + v12 chain = self-test 8/8) isolates shfl
+  as the sole defect. DO NOT retry shfl on this toolchain without new information.
+- Fresh-text row blocks need differential proof: gen_v14.py now self-checks that all
+  4 row emission blocks are structurally identical modulo register renaming
+  (caught 2 typos in row 3: lo-sub `%r30,%r29` and hi-and `%r31,%r29`).
+- NEXT: chain redundancy remains the fat (~50% of per-iter cost) but must be cut
+  WITHOUT cross-lane exchange: candidates (a) per-lane dual-s without exchange is
+  impossible (order) — instead (b) 16-block iters need 2KB shmem/warp (alias risk),
+  (c) small-grid latency sense: 512-row calls at 1GB/s vs 5120-row at 2.1GB/s —
+  investigate ILP (2 iters interleaved per thread?) or (d) fuse host per-call sync
+  (196 drains/token) via double-buffered async pipeline.
