@@ -232,3 +232,97 @@ the staging remapped to 8 threads per group): it amortises the per-chunk cost
 without growing the block, but it needs the inner loop duplicated (I-cache risk
 on this GPU) and it competes for the 48-register budget. Attempt it only with a
 full session and a fallback plan (keep the current commit as the reference).
+
+## Measurement method for this Nano harness (2026-10-13, run #22)
+
+- A SINGLE harness run is a cold run and reads ~6% slower than the same binary
+  run back-to-back in a warm sequence (413 vs 437 ms/tok on the same code).
+  Board level also drifts across hours: the 2.3410 tps sample and a later 2.28
+  sample of *identical* code differ by 2.2%, while a same-job interleaved A/B
+  of the two binaries gives -0.10%. Conclusion: never compare a run against a
+  number recorded in an earlier session; the only valid comparison for a change
+  inside the noise band is an interleaved A/B in one job (2 runs per binary,
+  alternating). Harness built for this: .auto/ab_stats.sh (builds the git HEAD
+  glue next to the working-tree glue, links q1_old/q1_new from shared objects,
+  runs 4 alternating runs, prints the ratio).
+- The Q1_0 GPU-RAM baseline is now on the dashboard (was blank for every
+  earlier run - the 1-bit TU printed the label 'PQ2GPU', the harness greps
+  'PQ1GPU'): used = peak = 1014.8 MB, arena = 1280 MB. Right-sizing the arena
+  default to ~1152MB (peak + 13%) is the next cheap secondary win; gates protect
+  correctness (too small => CPU fallback => the goldens fail).
+- gpu_free_mb reads 0.0 at exit. Verify what cudaMemGetInfo means on Tegra once
+  the arena is allocated before trusting that number for anything.
+
+## Arena right-sizing: MEASURED OUT (run #23, 2026-10-13)
+
+Idea: the dashboard now shows gpu_used = gpu_peak = 1014.8MB of a 1280MB arena,
+so drop the default to 1152MB (peak + 13.5%) for -128MB of reserved GPU RAM.
+
+Result: primary neutral (+0.19% tps, inside noise) and startup -0.15s, but a
+6-run interleaved A/B (.auto/ab_rss.sh) gives host peak RSS 342.0MB vs 262.3MB
+= **+79.7MB**, reproducible 3/3 (new: 343/342/341, old: 278/229/280).
+
+Why it backfires: on Tegra's unified memory a cudaMalloc comes out of the same
+physical RAM as the page cache. Releasing 128MB of device reservation lets the
+mmap'd GGUF pages become resident, so the GPU-RAM "saving" is paid out of
+peak_rss_mb - the metric the objective names. Device reservation and host RSS
+are ANTI-CORRELATED on this board, not additive.
+
+Consequences to keep:
+- Do not size the arena down to chase RSS. On a board with real discrete VRAM
+  this becomes a genuine win; there, re-measure with ab_rss.sh.
+- The RSS lever on this board is residency of the mmap'd GGUF (run #2's
+  madvise(MADV_DONTNEED) after upload), not the arena.
+- A bigger arena makes RSS *deterministic* (spread 2MB vs 51MB): it squeezes the
+  page cache. Single-run RSS on this board swings by 50MB, so RSS changes must
+  be A/B'd in one job, exactly like timing changes.
+
+## Cache policy: MEASURED OUT (run #24, 2026-10-13)
+
+Idea: the 1.06GB/token weight stream is read once, so __ldg (cache-all) evicts
+the reused act/scale data from Tegra X1's 128KB L2. Switch the code + scale
+loads to __ldcs (evict-first). Bit-identical by construction (parity green).
+
+Result: interleaved A/B, 3 runs/side (.auto/ab_kernel.sh, new tool - swaps the
+kernel .cu built from git HEAD vs the working tree against shared host objects):
+decode 2.3285 vs 2.3367 tps = -0.35%, inside the new side's own spread. RSS
+-18.7MB mean is a single 228MB outlier (median ~-4MB). No gain; reverted.
+
+The L2-thrash theory does not apply here: the weight words are consumed by one
+lane exactly once, so there is no reuse to protect, and __ldg was already
+non-coherent. This closes the last resource axis on this kernel - see the
+running list in "Measured-out micro-levers" above: issue slots 0, LDS/banks 0,
+overlap -5.6%, block shape 0 (saturated at 64 rows), unroll -2.8%, cache policy
+-0.35%. What is left is a different inner-loop ALGORITHM, not a tuning knob.
+
+## Scheduling / tail-wave: MEASURED OUT (run #25, 2026-10-13)
+
+Idea: this is a single-SM part with 5 resident blocks/SM, so any GEMV whose row
+count is not a multiple of 5*64 = 320 ends in a partially-filled last wave.
+Computed waste: 1.54% of work for N=4096 and N=12288, 20% for N=1024, ~2.3% of
+GEMV time weighted by rows*K. Fix: grid = ceil(tiles/5)*5, each block takes a
+contiguous ceil(N/G) row range and loops over 64-row tiles.
+
+Result: bit-exact (parity green) and resource-neutral (ptxas: 40 registers,
+0 spills, same 6336B smem) - and -7.65% tps in a 3-run interleaved A/B
+(new 445/453/458 ms vs old 412/412/428 ms; every pair separated).
+
+WHY IT FAILS - the arithmetic that kills it: all the large matrices have row
+counts that are multiples of 64 (4096, 12288, 151669), so ceil(N / (5*ceil(N/320)))
+= 64 = PQ1_BLOCK_ROWS, i.e. every block gets exactly ONE tile (ntiles = 1) and
+the "even" mapping degenerates to the mapping it replaces. The scheme cannot
+create fractional work: the work quantum per block is 256 threads / 4 lanes per
+row = 64 rows, so a partial last wave is structural. All that remains is the
+loop's cost (dynamic trip count, per-tile row/active/rrow re-derivation, the
+64-bit row*K128 scale-address multiply).
+
+Consequence: recovering that 1.54% requires a kernel whose work quantum per block
+DIVIDES N (lanes splitting a row's 16 groups, so rows/block is not quantised by
+256/lanes_per_row). That is the same structural rewrite as the open "different
+inner-loop algorithm" item - one session-sized task, not a tuning knob. Small-N
+matrices (k/v, N=1024, 20% tail) are 0.11% of per-token weight traffic, so they
+do not justify a special case.
+
+Note for future candidates: the tail-wave arithmetic (N vs 5*rows_per_block) is
+worth checking on the calculator BEFORE writing the kernel - the whole experiment
+was predictable from ceil() identities plus the model's row counts.
