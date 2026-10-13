@@ -166,3 +166,36 @@ Remaining headroom (honest): ~5.7e9 weights/s now vs ~20e9 implied by the
 ALU bound (6.75 lane-ops/weight over 128 lanes at 921MHz) -> ~3x is
 theoretically reachable with deeper latency hiding (occupancy is capped at
 3 blocks/SM by the 13KB act tile; register cap allows 4).
+
+## Autoresearch session (branch bonsai-jetson-nano, .auto/log.jsonl)
+
+Objective per operator: prefill + decode speed, accuracy frozen, peak RSS and
+GPU RAM down. Primary metric: decode_tps. Gates never overridden: pq2_parity
+BIT-EXACT at K=4096/K=12288 + greedy goldens on prompt A (measured) and
+prompt B (held-out).
+
+| run | change | decode | prefill | peak RSS | GPU used/reserved |
+|---|---|---|---|---|---|
+| #1 | baseline | 0.9436 | 0.9447 | 760 MB | 2029.6 / 2300 MB |
+| #2 | E1 drop GGUF pages after upload | 0.9401 | 0.9450 | **327 MB** | same |
+| #3 | E2 IMAD dot (discarded) | 0.635 | 0.641 | - | - |
+| #4 | E3 chunk K -> 2.2KB tiles | 0.9675 | 0.9793 | 276 MB | same |
+| #5 | E4 keep-mask LUT (discarded) | 0.9745 | 0.9674 | - | - |
+| #6 | E6 inline bias correction (-132MB) | 0.9518 | 0.9624 | 345 MB | **1916.9 / 2048 MB** |
+| #7 | E7 5 blocks/SM (48 regs) | 0.9950 | 0.9944 | 299 MB | same |
+| #8 | E8 6 blocks/SM (40 regs, discarded) | 0.9884 | 1.0062 | - | - |
+
+Final: ~0.99-1.01 tps decode (from 0.944), ~0.99 tps prefill (from 0.945),
+peak RSS 760 -> ~290 MB, GPU RAM 2029.6 -> 1916.9 MB used / 2300 -> 2048 MB
+reserved. All changes bit-exact; all gates green on every kept run.
+
+Findings worth keeping:
+- LATENCY/OCCUPANCY-bound, not issue-bound: cutting SASS ~30% (E4: 539->314
+  ANDs, XMAD family gone) changed nothing, while +8 warps (E7) bought 4.5%.
+- Maxwell IMAD is not full-rate: per-weight IMAD cost 1.49x (E2).
+- 40 warps (5 blocks x 256 threads, 48 regs) is the sweet spot; 48 warps and
+  a shared keep-mask LUT both do not help.
+- The 132MB correction array is a real speed/RAM dial: inline recomputation
+  costs ~1.7% decode and saves 113MB of GPU RAM.
+- Roofline: 2.18GB/token on a 25.6GB/s bus caps this model at 11.6 tps at
+  100% EMC; 13-15 tps is above the theoretical bus.
