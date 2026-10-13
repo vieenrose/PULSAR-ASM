@@ -15,12 +15,20 @@
 set -uo pipefail
 NANO=${NANO:-pesi@100.70.245.36}
 REPO=/home/louis/PULSAR-ASM
-R=/home/pesi/exp
 MODEL=/home/pesi/b8q1.gguf
 A_IDS="151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 624 151645 198 151644 77091 198"
 B_IDS="151644 872 198 7985 264 6386 38242 911 279 17951 624 151645 198 151644 77091 198"
 
 fail() { echo "CHECKS FAILED: $*"; exit 1; }
+
+# --- 0. build from the working tree (never gate a stale binary) --------------
+# Run #36 caught this: checks.sh used to run whatever fwd8_q1 / pq1_parity the
+# last build left on the Nano, so a kernel-TU-only change measured through
+# ab_kernel.sh (which builds its own objects) got a VACUOUS green gate. Proof:
+# a deliberately broken kernel (inner loop kk<4) passed all three gates on the
+# stale binaries and failed parity 0/256 (maxrel 1.78e+04) once rebuilt.
+R=/home/pesi/exp
+bash "$REPO/.auto/build_q1.sh" || fail "build failed - refusing to gate unbuilt sources"
 
 # --- 1. kernel bit-exactness -------------------------------------------------
 P=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 2>&1 | tail -n 2; ./pq1_parity 512 12288 2>&1 | tail -n 2" 2>/dev/null)
