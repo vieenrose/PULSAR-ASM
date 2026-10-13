@@ -36,7 +36,7 @@ BUILD=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && export PATH=/usr/local/cuda-1
   CUDAINC=/usr/local/cuda-10.2/targets/aarch64-linux/include && set -o pipefail && \
   rm -f fwd8_engine pq2_parity fwd8_engine.o pq2_glue.o pq2_swar_sm53.o && \
   t0=\$(date +%s) && \
-  nvcc -gencode arch=compute_53,code=sm_53 -O3 -maxrregcount=64 --use_fast_math -Xptxas -O3,-dlcm=ca -std=c++11 -c pq2_swar_sm53.cu -o pq2_swar_sm53.o 2>&1 | head -n5 && \
+  nvcc -gencode arch=compute_53,code=sm_53 -O3 -maxrregcount=48 --use_fast_math -Xptxas -O3,-dlcm=ca -std=c++11 -c pq2_swar_sm53.cu -o pq2_swar_sm53.o 2>&1 | head -n5 && \
   gcc -O2 -fopenmp -mcpu=cortex-a57 -ffp-contract=off -DSTANDALONE -DPQ2_REAL_CUDA -c pq2_host.c -o pq2_host.o 2>&1 | head -n3 && \
   gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ2_USE_CUDA -DBQ1_TIME -include $R/pq2_fwd8_shim.h -c fwd8.c -o fwd8_engine.o 2>&1 | grep -e ' error' | head -n3; \
   gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ2_USE_CUDA -I\$CUDAINC -c pq2_fwd8_glue.c -o pq2_glue.o 2>&1 | grep -e ' error' | head -n3 || true; \

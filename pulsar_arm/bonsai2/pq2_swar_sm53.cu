@@ -104,7 +104,7 @@ __device__ __forceinline__ int pq2_ssum4(uint32_t apack) {
   return pq2_iadd3(s0, s1, s2) + s3;
 }
 
-__global__ __launch_bounds__(256, 4)
+__global__ __launch_bounds__(256, 5)
 void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
                    const __half* __restrict__ w_scales,
                    const uint8_t* __restrict__ xq, float* __restrict__ y,
