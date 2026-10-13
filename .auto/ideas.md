@@ -646,3 +646,38 @@ MOTIVATION FOR #35 THAT IS NOW MEASURED: #35's 14->11 op cut predicted ~12-13%
 from the 0.57 slope and delivered 9.1% (0.44 slope) - the slope is real but
 shallower for partial cuts than for the full-chain probe, consistent with the
 loop containing non-reduced work (loads, addressing, loop arithmetic).
+
+## 2-bit kernel: packed accumulator lands +12.38% (run #38, 2026-10-13)
+
+#35's trick ports verbatim: pq2_swar_sm53 runs the 9-op usum4 fold FOUR times per
+4 weights (two 1-bit planes x even/odd accumulators) -> AND + 4-op fold + 1 IMAD
+each, ~29 -> ~21 ALU ops. Bit-exact at 256/256 @K=4096, 512/512 @K=12288 and
+4096/4096 @K=4096 (maxrel 0.00e+00) on fresh binaries. 40 regs, 0 spills.
+
+MEASURED AT KERNEL LEVEL (+12.38% speed, 1.6362 vs 1.8387 ms/launch, 3 runs/side,
+spread <0.2%): the 2-bit GGUF (b8.gguf) is GONE from the Nano - it was deleted
+when the objective retargeted to Q1_0 - so fwd8_engine cannot run end-to-end and
+its decode_tps is permanently unmeasurable on this board. pq2_parity.c now carries
+a PQ2_TIME=<iters> mode for exactly this situation (times N launches of the real
+kernel on the real data; launch overhead included in both sides => conservative).
+
+MODEL VALIDATION (the important part): the slope model (0.44-0.51% decode time per
+1% inner-loop op cut, calibrated in #28/#36) PREDICTED ~12% for this ~28% chain cut
+before any measurement; measured +12.38%. That is the first prospective prediction
+of a speedup in this session, and it landed within 0.4 points. The slope model is
+predictive, so future op-level changes can be sized on paper before burning board
+time - and a change worth <2% on paper is not worth measuring at all.
+
+BOTH GEMV KERNELS ARE NOW AT THE OP FLOOR for this algorithm family: 1-bit ~11
+ops/4 weights (#35), 2-bit ~21 (#38). Remaining primary-metric headroom = ~4.6% of
+decode time per inner-loop op removed, and the floor analysis (in the #36/#38 ASI
+notes) says multiplication cannot SELECT bytes (cross terms between byte lanes) and
+the 16-bit-lane fold is what makes the packed accumulator exact. A cheaper primitive
+is a research question, not a tuning knob.
+
+PITFALLS HIT AND CLOSED THIS SESSION (do not re-hit):
+- C comments containing "*/" inside text like "pu*/mu*" silently close the comment.
+- NEVER trust a parity line next to a failed build: rm -f the binary first, verify
+  the object/binary exist, then read the gate (#37's lesson, re-learned in #38).
+- A/B drivers must pass log PATHS to their parsers, not tags, and must link objects
+  built with identical -D flags (the 2-bit path needs -DPQ2_HIST consistently).
