@@ -30,7 +30,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#define PQ1_BLOCK_ROWS 32  /* 256 threads = 32 rows x 8 lanes: the act tile
+#define PQ1_BLOCK_ROWS 64  /* 256 threads = 32 rows x 8 lanes: the act tile
                             * is still staged by all 256 threads (16 groups,
                             * 16 threads each) and the barrier is still an
                             * 8-warp barrier, but the tile now feeds 32 rows
@@ -38,7 +38,7 @@
                             * per unit of work. The 512-thread version of this
                             * idea failed because a 16-warp barrier converges
                             * worse; this keeps the barrier size fixed. */
-#define PQ1_LANES 8        /* lanes per row; each lane owns two groups */
+#define PQ1_LANES 4        /* lanes per row; each lane owns four groups */
 #define PQ1_MAXK 12288
 #define Q8K_NB 292                  /* Q8_K block: float d + 256 i8 */
 #define Q8K_TILE_STRIDE 272         /* shared tile stride: 256 acts (16B
@@ -121,8 +121,8 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
   __shared__ int sh_au[PQ1_CHUNK_GROUPS];
   __shared__ float sh_prod[PQ1_BLOCK_ROWS][PQ1_CHUNK_GROUPS];
 
-  int row = blockIdx.x * PQ1_BLOCK_ROWS + (threadIdx.x >> 3);
-  int sub = threadIdx.x & 7;
+  int row = blockIdx.x * PQ1_BLOCK_ROWS + (threadIdx.x >> 2);
+  int sub = threadIdx.x & 3;
   if (blockIdx.x * PQ1_BLOCK_ROWS >= N) return; /* block-uniform */
   bool active = row < N;
   int rrow = active ? row : 0;
@@ -177,8 +177,8 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
      * groups); unroll 1 keeps the inner loop the same size as the single
      * group-per-lane version, so this tests the amortisation alone. */
 #pragma unroll 1
-    for (int half = 0; half < 2; half++) {
-    int g = sub + (half << 3);
+    for (int half = 0; half < 4; half++) {
+    int g = sub + (half << 2);
     /* one 128-weight group: codes are 128 bits = 4 u32 (one 16B LDG.128,
      * rows are 16B-aligned because the row stride is K/8 bytes); acts are
      * 128 bytes = 8 LDS.128. Per 4 weights: one bit-spread + one masked
@@ -217,7 +217,7 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
     float ws = active ? __half2float(__ldg(w_scales + (size_t)rrow * K128 +
                                           (ch * PQ1_CHUNK_GROUPS + g)))
                       : 0.0f;
-    sh_prod[threadIdx.x >> 3][g] =
+    sh_prod[threadIdx.x >> 2][g] =
         __fmul_rn(__fmul_rn(ws, db), (float)isum);
     __syncwarp();
 
@@ -226,7 +226,7 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
     /* 4. ordered reduce for this chunk: lane 0 of each row adds the 16
      * products in group order (chunks are processed in order too). */
     if (sub == 0) {
-      const float *p = sh_prod[threadIdx.x >> 3];
+      const float *p = sh_prod[threadIdx.x >> 2];
 #pragma unroll
       for (int k = 0; k < PQ1_CHUNK_GROUPS; k++) acc = __fadd_rn(acc, p[k]);
     }
