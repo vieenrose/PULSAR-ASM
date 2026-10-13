@@ -164,6 +164,9 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
       if (pq1_arena_init(a + b) == 0) {
         uint8_t *pb = PQ1ARENA + PQ1ACUR;
         uint8_t *ps = pb + a;
+        if (getenv("PQ1_TRACE"))
+          fprintf(stderr, "PQ1T bits pb=%p codes=%p n=%zu | scales ps=%p n=%zu\n",
+                  (void *)pb, (void *)codes, ncb, (void *)ps, nsb);
         if (cudaMemcpy(pb, codes, ncb, cudaMemcpyHostToDevice) == cudaSuccess &&
             cudaMemcpy(ps, scales, nsb, cudaMemcpyHostToDevice) == cudaSuccess) {
           PQ1ACUR += a + b;
@@ -183,7 +186,7 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
            * memory -- a fallback re-repack would re-read them from the
            * file. This is the resident mass on a 4GB board. */
           {
-            size_t tbytes = (size_t)rows * ng * 34;
+            size_t tbytes = (size_t)rows * ng * 18;
             uintptr_t p0 = (uintptr_t)w & ~(uintptr_t)4095;
             uintptr_t p1 = ((uintptr_t)w + tbytes + 4095) & ~(uintptr_t)4095;
             if (p1 > p0) madvise((void *)p0, (size_t)(p1 - p0), MADV_DONTNEED);
@@ -208,6 +211,9 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
         d_y = NULL;
         if (cudaMalloc(&d_y, yb) == cudaSuccess) P2YMAX = yb;
       }
+      if (getenv("PQ1_TRACE"))
+        fprintf(stderr, "PQ1T act d_xq=%p xq=%p n=%zu d_y=%p yb=%zu K=%d N=%d\n",
+                (void *)d_xq, (void *)xq, xqb, (void *)d_y, yb, cols, rows);
       if (d_xq && d_y &&
           cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
           pq1_gemv_sm53_launch(dc, dsc, d_xq, d_y, cols, rows, NULL) == 0 &&
