@@ -11,4 +11,22 @@
 void pq2_pq2_compat_gemv(int rows, int cols, const unsigned char *w,
                          const float *x, float *y, const unsigned char *xq);
 #define pq2_gemv pq2_pq2_compat_gemv
+
+#ifdef PQ2_USE_CUDA
+/* GPU-RAM report printed once at process exit (PQ2_STATS=1). Declared here
+ * with no CUDA headers: this shim is -include'd into fwd8.c, which is built
+ * by plain gcc, so pulling cuda_runtime.h in would break that TU. The
+ * definition (and cudaMemGetInfo) lives in pq2_fwd8_glue.c. */
+#include <stdio.h>
+#include <stdlib.h>
+const char *pq2_gpu_stats_mb(char *buf, int n);
+static void pq2_gpu_stats_dump(void) {
+  if (!getenv("PQ2_STATS")) return;
+  char b[256];
+  fprintf(stderr, "%s\n", pq2_gpu_stats_mb(b, sizeof b));
+}
+__attribute__((constructor)) static void pq2_gpu_stats_init(void) {
+  atexit(pq2_gpu_stats_dump);
+}
+#endif
 #endif

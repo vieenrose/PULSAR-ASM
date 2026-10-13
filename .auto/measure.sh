@@ -34,6 +34,7 @@ scp -q -o ConnectTimeout=25 \
 
 BUILD=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && export PATH=/usr/local/cuda-10.2/bin:\$PATH \
   CUDAINC=/usr/local/cuda-10.2/targets/aarch64-linux/include && set -o pipefail && \
+  rm -f fwd8_engine pq2_parity fwd8_engine.o pq2_glue.o pq2_swar_sm53.o && \
   t0=\$(date +%s) && \
   nvcc -gencode arch=compute_53,code=sm_53 -O3 -maxrregcount=64 --use_fast_math -Xptxas -O3,-dlcm=ca -std=c++11 -c pq2_swar_sm53.cu -o pq2_swar_sm53.o 2>&1 | head -n5 && \
   gcc -O2 -fopenmp -mcpu=cortex-a57 -ffp-contract=off -DSTANDALONE -DPQ2_REAL_CUDA -c pq2_host.c -o pq2_host.o 2>&1 | head -n3 && \
@@ -49,10 +50,11 @@ BUILD_S=$(echo "$BUILD" | tail -n1)
 # GPU clock witness (contention on this board changes results; never tuned).
 CLK=$(ssh -o ConnectTimeout=25 "$NANO" "cat /sys/devices/gpu.0/devfreq/57000000.gpu/cur_freq 2>/dev/null || echo 0" 2>/dev/null)
 
-ssh -o ConnectTimeout=25 "$NANO" "cd $R && OMP_NUM_THREADS=4 BQ1_TRACE=0 timeout 1200 /usr/bin/time -v ./fwd8_engine $MODEL $IDS --gen $GEN > run.log 2> time.log; echo RC=\$?" > "$REPO/.auto/last_nano_run.txt" 2>&1
+ssh -o ConnectTimeout=25 "$NANO" "cd $R && OMP_NUM_THREADS=4 BQ1_TRACE=0 PQ2_STATS=1 timeout 1200 /usr/bin/time -v ./fwd8_engine $MODEL $IDS --gen $GEN > run.log 2> time.log; echo RC=\$?" > "$REPO/.auto/last_nano_run.txt" 2>&1
 RC=$(grep -o 'RC=[0-9-]*' "$REPO/.auto/last_nano_run.txt" | head -n1 | cut -d= -f2)
 HWM=$(ssh -o ConnectTimeout=25 "$NANO" "awk '/Maximum resident set size/{print \$NF}' $R/time.log" 2>/dev/null)
 ssh -o ConnectTimeout=25 "$NANO" "cat $R/run.log" > "$REPO/.auto/last_run_log.txt" 2>&1
+ssh -o ConnectTimeout=25 "$NANO" "cat $R/time.log" > "$REPO/.auto/last_nano_time.txt" 2>&1
 
 [ "$RC" = "0" ] || { echo "RUN FAILED rc=$RC"; tail -n 5 "$REPO/.auto/last_run_log.txt"; exit 1; }
 
@@ -83,6 +85,12 @@ echo "METRIC prefill_ms_per_tok=$PRE"
 echo "METRIC decode_tps=$(python3 -c "print(f'{1000.0/float(\"$DEC\"):.4f}')")"
 echo "METRIC prefill_tps=$(python3 -c "print(f'{1000.0/float(\"$PRE\"):.4f}')")"
 echo "METRIC peak_rss_mb=$(( ${HWM:-0} / 1024 ))"
+GPU=$(grep -o 'PQ2GPU.*' "$REPO/.auto/last_nano_time.txt" 2>/dev/null | tail -n1)
+gv() { echo "$GPU" | sed -n "s/.*$1=\([0-9.]*\).*/\1/p"; }
+echo "METRIC gpu_used_mb=$(gv used_mb)"
+echo "METRIC gpu_arena_mb=$(gv arena_mb)"
+echo "METRIC gpu_peak_mb=$(gv peak_mb)"
+echo "METRIC gpu_free_mb=$(gv free_mb)"
 echo "METRIC build_s=$BUILD_S"
 echo "METRIC startup_s=$(python3 -c "print(f'{$STARTUP/1000:.1f}')")"
 echo "METRIC steps=$NSTEP gpu_clk_hz=$CLK"

@@ -69,6 +69,22 @@ __device__ __forceinline__ uint32_t pq2_keep4(uint32_t bits4) {
   return spread * 255u;
 }
 
+/* masked 4-lane SIGNED byte sum: bytes of apack where the keep byte is
+ * 0xFF, sign-extended and added to acc. The signed form is what removes the
+ * per-(row,group) correction array: with isum = 2*mu + pu - au computed
+ * directly, no bias bookkeeping is needed, which is 132MB less on the GPU
+ * for the 8B (6.5% of the arena) plus that array's read traffic. */
+__device__ __forceinline__ int pq2_sdot4(uint32_t apack, uint32_t keep,
+                                         int acc) {
+  uint32_t mk = apack & keep;
+  int s0 = (int)(mk << 24) >> 24;
+  int s1 = (int)(mk << 16) >> 24;
+  int s2 = (int)(mk << 8) >> 24;
+  int s3 = (int)((int32_t)mk) >> 24;
+  acc = pq2_iadd3(s0, s1, acc);
+  return pq2_iadd3(s2, s3, acc);
+}
+
 /* masked 4-lane UNSIGNED byte sum (8 ops): bytes of apack where the keep
  * byte is 0xFF. Two-stage SWAR fold, no sign extension, no IMUL. */
 __device__ __forceinline__ int pq2_usum4(uint32_t apack, uint32_t keep,
@@ -79,10 +95,18 @@ __device__ __forceinline__ int pq2_usum4(uint32_t apack, uint32_t keep,
   return acc + (int)s;
 }
 
+/* full 4-byte SIGNED sum (row-independent Au needs this form). */
+__device__ __forceinline__ int pq2_ssum4(uint32_t apack) {
+  int s0 = (int)(apack << 24) >> 24;
+  int s1 = (int)(apack << 16) >> 24;
+  int s2 = (int)(apack << 8) >> 24;
+  int s3 = (int)((int32_t)apack) >> 24;
+  return pq2_iadd3(s0, s1, s2) + s3;
+}
+
 __global__ __launch_bounds__(256, 4)
 void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
                    const __half* __restrict__ w_scales,
-                   const int16_t* __restrict__ w_corr,
                    const uint8_t* __restrict__ xq, float* __restrict__ y,
                    int K, int N) {
   __shared__ __align__(16) uint8_t sh_x[PQ2_CHUNK_BYTES];
@@ -99,8 +123,6 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
   int nchunk = K128 / PQ2_CHUNK_GROUPS;
   if (nchunk > PQ2_MAXCHUNK || nchunk <= 0) return;
 
-  const uint32_t *cd32 =
-      reinterpret_cast<const uint32_t *>(w_codes + (size_t)rrow * (K >> 2));
   float acc = 0.0f; /* lane 0 only; groups accumulated in order */
 
   for (int ch = 0; ch < nchunk; ch++) {
@@ -114,8 +136,8 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
       for (int i = (int)threadIdx.x; i < nw; i += (int)blockDim.x) {
         int b = i / 65, w = i - b * 65;
         uint32_t v = __ldg(x32 + b * 73 + w);
-        if (w == 0) t32[b * 68 + 64] = v;
-        else t32[b * 68 + (w - 1)] = v ^ 0x80808080u;
+        if (w == 0) t32[b * 68 + 64] = v;      /* fp32 d, verbatim */
+        else t32[b * 68 + (w - 1)] = v ^ 0x80808080u; /* x' = x + 128 */
       }
     }
     __syncthreads();
@@ -155,6 +177,13 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
     cws[6] = (uint32_t)cw1.z; cws[7] = (uint32_t)cw1.w;
     const uint4 *av = reinterpret_cast<const uint4 *>(qs);
     int pu0 = 0, mu0 = 0, pu1 = 0, mu1 = 0;
+    /* Bias-correction counts, derived from the code bytes in the same pass:
+     * with x' = x+128, isum = Pu + 2*Mu - Au + 16384 - 128*pc0 - 256*pc1.
+     * Computing this here instead of reading a per-(row,group) int16 array
+     * saves 132MB of GPU RAM (the array was as large as the scales) and its
+     * read traffic; the 2 POPC per code byte cost ~+6 ALU ops per 4 weights,
+     * which the SASS experiment showed we have slack for. */
+    int pc0 = 0, pc1 = 0;
 #pragma unroll
     for (int w = 0; w < 8; w++) {
       uint32_t cw = cws[w];
@@ -166,6 +195,8 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
         uint8_t cb = (uint8_t)(cw >> (j * 8));
         uint32_t f0, f1;
         pq2_split4(cb, &f0, &f1);
+        pc0 += __popc((uint32_t)cb & 0x55u);
+        pc1 += __popc(((uint32_t)cb >> 1) & 0x55u);
         if (w & 1) {
           pu1 = pq2_usum4(ap[j], pq2_keep4(f0), pu1);
           mu1 = pq2_usum4(ap[j], pq2_keep4(f1), mu1);
@@ -175,9 +206,8 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
         }
       }
     }
-    int isum = ((mu0 + mu1) << 1) + (pu0 + pu1) - sh_au[g] +
-               (int)__ldg(w_corr + (size_t)rrow * K128 +
-                          (ch * PQ2_CHUNK_GROUPS + g));
+    int isum = ((mu0 + mu1) << 1) + (pu0 + pu1) - sh_au[g] + 16384 -
+               (pc0 << 7) - (pc1 << 8);
     float ws = active ? __half2float(__ldg(w_scales + (size_t)rrow * K128 +
                                           (ch * PQ2_CHUNK_GROUPS + g)))
                       : 0.0f;
@@ -199,7 +229,6 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
 }
 extern "C" int pq2_gemv_sm53_launch(const uint8_t *w_codes,
                                     const unsigned short *w_scales_h,
-                                    const short *w_corr,
                                     const uint8_t *xq, float *y, int K, int N,
                                     void *stream) {
   if ((K & 127) != 0) return -2;
@@ -208,7 +237,6 @@ extern "C" int pq2_gemv_sm53_launch(const uint8_t *w_codes,
   dim3 grid((N + PQ2_BLOCK_ROWS - 1) / PQ2_BLOCK_ROWS, 1, 1);
   cudaStream_t s = (cudaStream_t)stream;
   pq2_gemv_sm53<<<grid, block, 0, s>>>(
-      w_codes, reinterpret_cast<const __half *>(w_scales_h),
-      w_corr, xq, y, K, N);
+      w_codes, reinterpret_cast<const __half *>(w_scales_h), xq, y, K, N);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }

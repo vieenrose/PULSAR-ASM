@@ -14,9 +14,6 @@ extern "C" {
 void pq2_split_repack(const uint8_t *pq2, int rows, int K,
                       uint8_t *w_codes, uint16_t *w_scales_h);
 
-/* Repack-time per-(row,group) bias correction for the unsigned kernel. */
-void pq2_corr_build(const uint8_t *w_codes, int rows, int K, int16_t *w_corr);
-
 /* Fork-faithful host reference: per 128-group
  *   acc += (ws * db) * (float)isum,  isum = sum (code-1)*qs[i]
  * with db/qs from a Q8_K block (292B per 256 acts). Bit-exact target for
@@ -27,7 +24,6 @@ void pq2_gemv_cpu(int rows, int K, const uint8_t *w_codes,
 /* CUDA launcher (pq2_swar_sm53.cu). <0 on error, -99 if not built. */
 int pq2_gemv_sm53_launch(const unsigned char *w_codes,
                          const unsigned short *w_scales_h,
-                         const short *w_corr,
                          const unsigned char *xq, float *y, int K, int N,
                          void *stream);
 

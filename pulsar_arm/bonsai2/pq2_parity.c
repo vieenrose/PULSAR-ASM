@@ -30,11 +30,10 @@ int main(int argc, char **argv) {
   size_t nbytes = (size_t)rows * ng * 34;
   uint8_t *pq2 = malloc(nbytes);
   uint8_t *cd = malloc((size_t)rows * ng * 32);
-  int16_t *corr = malloc((size_t)rows * ng * 2);
   uint16_t *sc = malloc((size_t)rows * ng * 2);
   uint8_t *xq = malloc((size_t)(K / 256) * 292);
   float *yA = malloc((size_t)rows * 4), *yB = malloc((size_t)rows * 4);
-  if (!pq2 || !cd || !sc || !corr || !xq || !yA || !yB) { printf("oom\n"); return 2; }
+  if (!pq2 || !cd || !sc || !xq || !yA || !yB) { printf("oom\n"); return 2; }
 
   srand(4242);
   for (size_t i = 0; i < nbytes; i++) pq2[i] = (uint8_t)(rand() & 0xFF);
@@ -45,7 +44,6 @@ int main(int argc, char **argv) {
   mk_q8k(xq, K, 77);
 
   pq2_split_repack(pq2, rows, K, cd, sc);
-  pq2_corr_build(cd, rows, K, corr);
   if (getenv("PQ2_DUMP")) {
     FILE *f = fopen(getenv("PQ2_DUMP"), "wb");
     int hdr[2] = {rows, K};
@@ -69,20 +67,16 @@ int main(int argc, char **argv) {
 #if defined(PQ2_REAL_CUDA)
   uint8_t *d_cd = NULL, *d_xq = NULL;
   uint16_t *d_sc = NULL;
-  int16_t *d_corr = NULL;
   float *d_y = NULL;
   size_t scb = (size_t)rows * ng * 2, xqb = (size_t)(K / 256) * 292;
-  size_t corb = (size_t)rows * ng * 2;
   cudaMalloc((void **)&d_cd, (size_t)rows * ng * 32);
   cudaMalloc((void **)&d_sc, scb);
-  cudaMalloc((void **)&d_corr, corb);
   cudaMalloc((void **)&d_xq, xqb);
   cudaMalloc((void **)&d_y, (size_t)rows * 4);
   cudaMemcpy(d_cd, cd, (size_t)rows * ng * 32, cudaMemcpyHostToDevice);
   cudaMemcpy(d_sc, sc, scb, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_corr, corr, corb, cudaMemcpyHostToDevice);
   cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice);
-  int rc = pq2_gemv_sm53_launch(d_cd, d_sc, d_corr, d_xq, d_y, K, rows, NULL);
+  int rc = pq2_gemv_sm53_launch(d_cd, d_sc, d_xq, d_y, K, rows, NULL);
   if (rc != 0) { printf("launch failed rc=%d\n", rc); return 1; }
   cudaError_t e1 = cudaDeviceSynchronize();
   if (e1 != cudaSuccess) printf("sync: %s\n", cudaGetErrorString(e1));
