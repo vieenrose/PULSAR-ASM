@@ -361,3 +361,22 @@ Targets the ~63us D2H + ~28us H2D pageable latency x 188 calls/token.
 ## Exp35 v43 (run #66): drop both per-iteration bar.sync — warp-synchronous STS→LDS
 - v29's two per-iter bar.sync (named barrier tid.y+1, count 32) are redundant: all 32 lanes of a warp are warp-synchronous; every STS→LDS pair is intra-warp (area base r65 = shbuf + tid.y*1024; the v4 LDS reads the 4 dot partials written by lanes 4*sv..4*sv+3 of the SAME warp; the replay reads the warp's own 256B area). SASS shows each BAR.SYNC also emits MEMBAR.CTA → removing 2 pairs saves ~4 instrs/iter (1.3%).
 - Self-test 8/8 on first build. If EN/ZH gates pass, the warp-synchrony argument is validated.
+
+## Exp39 v46 (run #68): threaded init (dlopen'd pthreads) — DISCARDED, and WHY (important)
+- Implemented exactly as designed: `libpthread.so.0` resolved at runtime (link line is
+  `-ldl` only), 2 threads for the 467MB 18B->16B repack (row-slice segments) and for the
+  H2D (16 x 64MB chunks, each worker does `cuCtxSetCurrent`). Self-test 8/8, 216-step gate
+  would pass; bench = 6.25 / 6.45 tok/s vs v38 baseline 6.29 / 6.54 => pure noise, no gain.
+- ROOT CAUSE of the null result: the isolated microbenchmarks that motivated it are NOT
+  representative. 467MB memcpy: 1 thread 435 ms vs 2 threads 52 ms (8x!) — but that buffer
+  was pre-touched. In the engine, `tmp = malloc(467MB)` is FRESH: the repack pays ~115k
+  first-touch page faults, serialized on the kernel mmap_lock, so extra threads buy nothing
+  (they contend on the same lock). Same for H2D: the engine's H2D is not the 530ms measured
+  from a pre-faulted source buffer.
+- LESSON (do not repeat): to cut init you must remove PAGE FAULTS, not add threads to a
+  fault-bound loop. If init is ever revisited: `mmap(MAP_ANONYMOUS|MAP_POPULATE)` (or
+  hugepages) for the repack buffer, and repack+H2D pipelined per-chunk so the first token
+  starts earlier; measure with K2INITDBG (INIT ... lines) before believing any win.
+- NOTE the init-cost accounting pitfall: init is 1.74 s of a 34 s window = 5.1%, so a FULL
+  elimination of init is worth +5%. Threading the repack (435 -> ~50 ms of CPU time) does
+  not translate because the metric is dominated by 216 tokens x 155 ms of GPU-bound decode.
