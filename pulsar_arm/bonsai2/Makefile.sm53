@@ -1,0 +1,43 @@
+# Makefile.sm53 — BQ1 binary path for Jetson Nano Gen1 (Tegra X1, aarch64 + sm_53)
+# Usage on the Nano (pesi@ipho-nano, JetPack 4 / CUDA 10.2):
+#   make -f Makefile.sm53 host_test        # CPU parity, no CUDA needed
+#   make -f Makefile.sm53 fwd8_sm53         # full CUDA binary
+#   make -f Makefile.sm53 check-sass        # verify IADD3/LDG, no IMUL/HMMA
+#
+# Host x86 smoke (this machine): make -f pulsar_arm/bonsai2/Makefile.sm53 host_test
+
+PREFIX ?= /usr/local/cuda-10.2
+NVCC ?= $(PREFIX)/bin/nvcc
+CXX_HOST ?= g++
+CC_HOST ?= gcc
+
+# Strict sm_53 SASS only — no PTX fallback (JIT would spill to 4GB unified RAM).
+NVCC_ARCH = -gencode arch=compute_53,code=sm_53
+NVCC_FLAGS = $(NVCC_ARCH) -O3 -maxrregcount=64 --use_fast_math \
+  -Xptxas -O3,-dlcm=ca -std=c++11 -Xcompiler -mcpu=cortex-a57,-fopenmp
+
+D = pulsar_arm/bonsai2
+
+host_test: $(D)/bq1_cpu.c $(D)/bq1_wrap.h $(D)/bq1_host_test.c
+	$(CC_HOST) -O2 -Wall -I$(D) $(D)/bq1_cpu.c $(D)/bq1_host_test.c -o /tmp/bq1_host_test -lm
+	/tmp/bq1_host_test
+
+bq1_swar_sm53.o: $(D)/bq1_swar_sm53.cu
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+fwd8_sm53: $(D)/fwd8.c $(D)/pq2_gemv.c bq1_swar_sm53.o $(D)/bq1_cpu.c
+	$(CC_HOST) -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -I$(D) -c $(D)/fwd8.c -o /tmp/fwd8.o
+	$(CC_HOST) -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -I$(D) -c $(D)/pq2_gemv.c -o /tmp/fwd8_pq2.o
+	$(CC_HOST) -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -I$(D) -c $(D)/bq1_cpu.c -o /tmp/bq1_cpu.o
+	$(CXX_HOST) /tmp/fwd8.o /tmp/fwd8_pq2.o /tmp/bq1_cpu.o bq1_swar_sm53.o -o $@ \
+	  -L$(PREFIX)/lib64 -lcudart -lm -fopenmp
+
+check-sass: fwd8_sm53
+	cuobjdump -sass fwd8_sm53 | grep -c "IADD3"
+	@echo "-- IMUL/HMMA in gemv must be 0:"
+	-cuobjdump -sass fwd8_sm53 | grep -c "IMUL\|HMMA"
+	@echo "-- LDG.E.128 must be >0:"
+	cuobjdump -sass fwd8_sm53 | grep -c "LDG.E.128"
+
+clean:
+	rm -f bq1_swar_sm53.o fwd8_sm53 /tmp/bq1_host_test /tmp/fwd8.o /tmp/fwd8_pq2.o /tmp/bq1_cpu.o
