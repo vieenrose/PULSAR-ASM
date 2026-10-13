@@ -326,3 +326,205 @@ do not justify a special case.
 Note for future candidates: the tail-wave arithmetic (N vs 5*rows_per_block) is
 worth checking on the calculator BEFORE writing the kernel - the whole experiment
 was predictable from ceil() identities plus the model's row counts.
+
+## Magnitude corrections from drift-free A/B (run #26, 2026-10-13)
+
+The 64-rows-vs-32-rows win (run #19) was recorded as +7.6% from a cross-session
+pair. Same-job interleaved A/B (3 runs/side, all pairs separated) says **+4.20%**
+(2.3353 vs 2.2411 tps). The win is real; the number was not.
+
+Rule adopted: a kept change's percentage is only trustworthy if measured with
+the two binaries in ONE job. `GITREF=<commit> bash .auto/ab_kernel.sh 3` replays
+any kernel-TU comparison that way.
+
+Audited so far: #19 -> +4.2% (was +7.6%).
+Presumed overstated (measured cross-session, not yet replayed): #7 (+4.5%),
+#9 (+4.0%), #17 (+2.0%). Orderings are unaffected - #7's 5-block optimum was
+independently reproduced by #8, and #17 was confirmed by #18.
+
+Side observation from #26: the 64-row kernel is also more DETERMINISTIC than the
+32-row one (sd 1.23ms vs 5.46ms over 3 runs), consistent with its better wave
+fill. Run-to-run sd is itself a usable signal for launch-shape changes.
+
+## Occupancy beyond 40 warps: MEASURED OUT (run #27, 2026-10-13)
+
+ptxas says the kernel naturally uses 40 registers, and 6 blocks/SM needs <=42
+(65536/(256*6)), so launch_bounds(256,6) buys 48 warps (62.5% -> 75% occupancy)
+for FREE: confirmed 40 regs, 0 spills, identical 6336B smem.
+
+Interleaved A/B: n=3 gave +1.28%, n=6 gave +0.47% (sd 5.22ms, ~0.7 sigma). Not
+significant; the n=3 signal was one 417ms outlier. Reverted to 5 blocks.
+
+Also CORRECTS run #8: its -0.7% rejection of 40 regs/6 blocks was drift, not a
+regression. The supported claim is "occupancy beyond 40 warps does nothing", not
+"40 is the sweet spot (48 is worse)".
+
+Consequence: the kernel is latency-SATURATED, not latency-starved. Every added
+latency-hiding mechanism now measures ~0 or negative - unroll x2 (-2.8%), double
+buffering (-5.6%), cache hints (-0.35%), extra warps (+0.47% n.s.). Remaining
+headroom must come from doing LESS work (the inner-loop rewrite), not from
+scheduling the same work better.
+
+BLOCKER for finding that work: GPU performance counters are denied on this Nano
+(nvprof -> ERR_NVGPUCTRPERM, no stall-reason metrics in the Tegra metric set).
+Asking the operator to enable profiling (root, or the Tegra perf access toggle)
+is the highest-leverage request available: it is the only way to see where the
+~40% issue-efficiency gap actually goes, and every structural idea so far has
+had to be argued from first principles.
+
+## Instruction sensitivity: the "not issue-bound" claim is OVER-STATED (run #28, 2026-10-13)
+
+Measured with a deliberately numerically-wrong probe (inner loop w<4 -> w<2,
+logged as checks_failed so it auto-reverts): halving the inner loop's
+instructions cuts decode time 28.3% (296.8 vs 414.0 ms, interleaved A/B).
+
+Slope ~= 0.6% time per 1% inner-loop instruction cut.
+
+CORRECTION to "Instruction-count cuts: 0% ... issue slots are not the
+constraint" (written after E4): that was true of the mask/keep ALU chain
+specifically, which overlaps with stalls and is free to remove. It does NOT
+generalise. The dependency-carrying part of the inner loop (the w-loop that
+consumes code words) pays ~0.6% time per 1% of instructions.
+
+CONSEQUENCE: the table-based inner loop is now a MEASURED bet, not a guess.
+  - Enabling fact: the inner accumulation is INTEGER (pu0/pu1 int accumulators,
+    isum = 2*Pu - Au + 16384 - 256*pc), so partial sums reassociate EXACTLY.
+    A lookup table of integer partial sums over the int8 Q8_K activations is
+    bit-identical to the bit-serial loop. A FLOAT table would not be - it would
+    break the parity gate.
+  - Shape: index by 2 bits -> 4 entries per 2-weight position, ~2 LDS + 2 IADD
+    per 8 weights vs ~14 ops today (1.75 -> ~0.5 ops/weight).
+  - Table build: once per token, in global/L2, shared by every block (it depends
+    only on xq and the K range). K/2 positions x 4 ints = 2K floats: 32KB at
+    K=4096, 96KB at K=12288 -> chunk K=12288 to stay inside the 128KB L2.
+  - Upper bound from the probe: ~28-40% (the probe cut instructions AND byte
+    traffic together; the rewrite cuts instructions only, so expect less).
+  - Floor: 0, if time tracks weight bytes rather than instructions.
+This is the highest-value remaining work, and it is a full-session task: build
+pass + new inner loop + parity proof BEFORE any timing claim.
+
+## Table-based inner loop: IMPLEMENTED, BIT-EXACT, AND 38% SLOWER (run #29, 2026-10-13)
+
+The session's biggest structural bet, executed in full (kernel inner loop + host
+build + glue upload + parity call site). Numerically PERFECT on the first try:
+parity 256/256 @K=4096, 512/512 @K=12288, both goldens exact.
+
+Performance: decode 1.4407 vs ~2.34 tps = ~-38%. REVERTED.
+
+WHY: the table trades cheap ALU for expensive memory. Per lane per group it
+issues 32 two-byte loads (vs 4 uint4 code loads + 32 tile-word reads), scattered
+across ~16 distinct 32B sectors per warp step. The ops #28 showed as removable
+were ALU ops largely OVERLAPPED WITH STALLS (that is exactly why E4's 30% cut
+bought 0%), so removing them is nearly free; the ops added land on the LSU/latency
+path, which is the actual bottleneck. #28's slope is real for ALU instructions
+and DOES NOT convert into wins when the replacement is paid in memory ops.
+
+CLOSED IN BOTH DIRECTIONS: 2-bit tables = 2 ops/weight (worse than the 1.75
+baseline, and |value| fits int16); nibble tables = 4 ops per 4 weights (good ALU)
+but 2 bytes of table traffic per weight and 32 loads/lane/group. Any table wide
+enough to beat the bit-spread needs >=2 bytes of table traffic per weight, which
+costs more than the ALU work it removes. Staging in shared makes it worse: the
+chunk slice is 16KB (K=4096) -> 14.6KB/block -> 3 blocks/SM (32 warps), priced by
+#7/#8 at ~-4.5% per block lost, and it still pays 2 bytes/weight of LDS.
+
+REFRAMING FOR ANY FUTURE ATTEMPT: "fewer ALU instructions" is a NON-GOAL on this
+part (proven twice: E4 = 0%, #29 = -38%). Remaining headroom must reduce MEMORY
+OPERATIONS PER WEIGHT per unit of work, or shorten the dependency chain without
+adding loads. Concretely that means keeping one wide load per lane serving many
+weights (the current uint4 = 32 weights per load is already 8 bytes/weight of
+ALU-facing work) - i.e. the burden of proof is on any design that increases the
+load count per weight.
+
+ASSET RECOVERABLE FROM THIS RUN (see ASI code_note for the exact index formula):
+a bit-exact nibble-table build (Q8_K 73-word blocks, 0x80 bias) - if a future
+architecture has a cheaper path (e.g. a hardware LUT/PRMT-based byte table on a
+part with real LUT throughput), the numerics are already proven.
+
+## Vectorized act loads (LDS.32 -> LDS.128): MEASURED OUT (run #30, 2026-10-13)
+
+Backlog idea #2 - the last unimplemented item from the session's original
+"known optimization directions" list. Implemented fully, bit-exact on the first
+try (parity 256/256 @K=4096, 512/512 @K=12288, both goldens), chain assignment
+preserved by construction.
+
+Result: -0.46% tps in a 3-run interleaved A/B, all of it from one 424ms outlier
+(medians 417.05 vs 417.47 ms = a wash). Reverted.
+
+WHY: at 40 warps/SM the SM is idle-issuing, so shared-memory issue slots are not
+scarce. Two independent experiments now bound this axis:
+  #15  removed all bank-conflict STALLS (op count unchanged) -> 0%
+  #30  removed 75% of LDS OP COUNT (conflicts irrelevant)   -> 0%
+The old "LDS has slack" note is now proven from both directions.
+
+## Cumulative bottleneck model (runs 13-30)
+
+Everything the kernel does on-chip is measured as SLACK:
+  ALU / instruction count ......... E4 -30% instructions -> 0% ; #29 -57% -> -38%
+                                    (the removed ALU ops were already overlapped
+                                     with stalls; adding memory ops is not free)
+  Shared memory (conflicts) ....... #15 -> 0%
+  Shared memory (op count) ........ #30 -75% LDS ops -> 0%
+  Occupancy / warps ............... #27 +20% warps -> +0.47% (n.s.)
+  ILP via unroll .................. #21 -2.8% ; #14 double-buffer -5.6%
+  Block shape / amortisation ...... saturated at 64 rows (#20: +0.1%)
+What is NOT slack: GLOBAL loads. #29's 32 extra 2-byte global loads per lane per
+group cost 38% of total time. Cross-check: 1.06GB/token needs ~41ms of DRAM
+transfer time, yet decode is ~427ms => ~10x the transfer time, i.e. the kernel
+is exposed to global-load LATENCY, not bandwidth.
+
+The only untested fix consistent with this model is putting more code loads in
+flight WITHOUT paying #21's price (2x code + live ranges): hoist the second
+group's uint4 load above the compute of the first (the half loop has 2 iterations,
+g = sub and sub+8), so both LDGs issue ~2000 cycles before use. Costs ~4 registers
+(ptxas reports 40 today; 51 is the 5-block ceiling), no code duplication.
+Prior evidence is discouraging: the two latency-hiding attempts so far (#14, #21)
+both regressed, because both bought latency by adding live ranges at the 40-reg
+boundary. A 1-deep hoist is the cheapest remaining test of the model.
+
+## Latency hiding: CLOSED (run #31, 2026-10-13)
+
+1-deep hoisted prefetch of the code stream (issue group h+1's uint4 before
+computing group h; last step's load skipped - warp-uniform predicate).
+Register-free: 40 regs, 0 spills, no code duplication. Bit-exact.
+Interleaved A/B 3 runs/side: -0.61% tps, inside noise. Reverted.
+
+This is the THIRD latency-hiding mechanism to fail, and the first at zero
+resource cost (#21 unroll -2.8% and #14 double-buffer -5.6% both paid registers
+and live ranges, which plausibly explains their losses). A null with no cost
+means the assumed ~700-cycle global-load latency is ALREADY hidden by the
+hardware at 40 warps. So the ~10x gap between DRAM transfer time (~41ms for
+1.06GB) and decode (~427ms) is NOT exposed load latency. The #30 model needs
+this correction.
+
+UNTESTED CONSEQUENCE (next candidate): DRAM REQUEST LOCALITY. At 4 lanes/row a
+warp issues 8 rows x 64 contiguous bytes per load step, with a 512B (K=4096) row
+stride. Giving each lane its TWO ADJACENT groups (g = 2sub, 2sub+1, 2sub+8,
+2sub+9) concentrates each row's 128 bytes into 2 consecutive half-steps instead
+of 4 spread across the chunk - a pure lane-to-group permutation: identical load
+count, identical compute, identical code; bit-exact by construction because the
+ordered reduce reads sh_prod by GROUP INDEX.
+
+## DRAM-side reorganization of the same stream: CLOSED (runs #31-#32, 2026-10-13)
+
+Two zero-cost mechanisms, both bit-exact, both null in interleaved A/B:
+  #31  1-deep hoisted prefetch (issue next group's uint4 early)   -0.61%  (n.s.)
+  #32  adjacent-pair lane mapping (row's 128B in 2 steps)        +0.65%  (0.35 sigma)
+
+#31 removes the latency-hiding family (unroll -2.8%, double-buffer -5.6%,
+prefetch -0.61%): with the register/code cost eliminated, latency hiding is
+provably NOT the lever - the ~700-cycle global-load latency is already hidden at
+40 warps. #32 removes DRAM page-locality: the mean gap was 2.7ms against ~8ms sd.
+
+NET RESULT: every mechanism that reorganizes the SAME 1.06GB/token stream -
+prefetch, request locality, LDS vectorization (#30), cache policy (#24),
+occupancy (#27), instruction count (#29 in the cheap direction) - measures |effect|
+< 1%. The only perturbation that ever moved decode time was #29 ADDING traffic
+(-38%). Conclusion for the session: this kernel is at a LOCAL OPTIMUM with
+respect to scheduling, memory ordering, cache policy, occupancy and instruction
+count. Remaining headroom is algorithmic (reduce bytes touched per token) or
+hardware-bound; it is not schedulable.
+
+Note on #32's 2.3737 tps harness sample - the best single sample of the session.
+It is NOT a win: the interleaved A/B of the same two binaries put it at +0.65%
+at 0.35 sigma. This is the clearest illustration of why single-sample "wins" are
+not admissible on this board.
