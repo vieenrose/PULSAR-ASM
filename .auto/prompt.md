@@ -1,103 +1,64 @@
-# Autoresearch: Spark Bonsai-27B prefill + decode speed at exact accuracy
+# Autoresearch: Jetson Nano 8B exact-PQ2 — prefill + decode speed, peak RSS
 
 ## Objective
-Make the 27B engine (`pulsar_arm/bonsai2`: `fwd.c` + `tq_gemv_neon.c` +
-`fwht.S`) faster per token on the Spark (20× Cortex-X925, CPU-only) —
-both prefill (prompt processing) and decode (generation). Every kept run
-must produce **bit-identical greedy streams** on fixed prompts
-(`checks.sh` enforces this; it cannot be overridden).
+Speed up the Nano GPU engine on branch `bonsai-jetson-nano`
+(`pulsar_arm/bonsai2/pq2_swar_sm53.cu` + `pq2_fwd8_glue.c` + the PQ2 path):
+**prefill and decode**, at frozen accuracy, while **reducing peak RSS**.
+Every kept run must keep three gates green (`.auto/checks.sh` enforces them
+and they cannot be overridden):
+  1. `pq2_parity` BIT-EXACT at K=4096 (256/256) and K=12288 (512/512) vs the
+     fork-faithful host reference (mirrors `pq2_gemv.c` /
+     `ggml_vec_dot_pq2_0_q8_K` accumulation order).
+  2. greedy stream on prompt A (measured) == frozen golden (44 tokens).
+  3. greedy stream on held-out prompt B == frozen golden (26 tokens).
 
-Current state: ~0.71 s/token threaded (20 cores), ~7.6 s/token single-core.
-GEMV kernel does 0.29 ns/weight single-core (BIT-EXACT). The engine is
-compute-bound (unlike the Pi gen1 loop, which converged at the 3.93 GB/s
-bus wall — that session is closed, see git log + `.auto/log.jsonl`
-runs ≤224).
+Context: 8B PQ2_0 streams 2.18 GB/token, so the board's 25.6 GB/s bus caps
+this at 11.6 tok/s at 100% EMC (~7 realistic); the kernel is compute-bound
+today, not bus-bound. 13-15 tok/s is above the theoretical bus for this
+model size and is not a target.
 
 ## Metrics
-- **Primary**: `decode_ms` (ms per generated token, lower is better).
-- **A/B adjudication**: every run also times the HEAD baseline in the same
-  invocation (`decode_base_ms`, order-reversed to cancel drift). Judge by
-  `decode_ratio` (=current/base) when load1 > 8 (shared box); by absolute
-  `decode_ms` when load1 <= 8. Either way the golden-stream gates must pass.
+- **Primary**: `decode_ms_per_tok` (ms per generated token, lower better) —
+  steady-state per-step forward time from in-binary timers.
+- **Secondary**: `prefill_ms_per_tok` (steady-state prompt steps),
+  `peak_rss_mb` (maximum resident set size), `startup_s` (one-time
+  split-repack + 2.3GB arena upload), `build_s`.
+- Contention witness: GPU clock + `gpu_clk_hz` echoed in the METRIC line
+  block. Bus/clock drift is real on this board: judge by ratios from
+  same-invocation A/B whenever a change is within ~3%.
 
-- **Primary**: `decode_ms` (ms per generated token, lower is better) —
-  steady-state incremental decode on prompt A + 20 gen tokens.
-- **Secondary**: `prefill_ms` (ms per prompt token, same kernel, reported
-  separately), `load1` (Spark 1-min load during the run — contention
-  witness, never optimized).
+## How to run
+`bash .auto/measure.sh` — syncs sources to the Nano, builds, runs the fixed
+prompt, prints METRIC lines, saves logs to `.auto/last_*.txt`.
+`bash .auto/checks.sh` — the three accuracy gates (runs automatically after
+each passing benchmark).
 
-## How to Run
-`./.auto/measure.sh` — syncs tree sources to the Spark, builds, times
-prefill (21 prompt forwards) and decode (20 gen forwards), prints
-`METRIC` lines, saves step logs to `.auto/last_*.txt`.
-`./.auto/checks.sh` — accuracy gate, runs automatically after passing runs.
+## Fixed prompts (never tune to them)
+- **A (measured)**: chatml, "List the four seasons and one thing that changes
+  in each." — 20 ids + 24 greedy steps.
+- **B (held-out, checks only)**: chatml, "Write a haiku about the ocean." —
+  16 ids + 10 greedy steps.
 
-## Prompts (fixed, never tune to them)
-- **A (measured)**: seasons en templated, 21 ids:
-  `248045 846 198 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 248046 198 248045 74455 198 248068` + 20 greedy gen.
-- **B (held-out, checks only)**: haiku templated, 17 ids:
-  `248045 846 198 7734 264 6185 36974 883 279 9117 13 248046 198 248045 74455 198 248068` + 10 greedy gen.
-- Golden streams in `.auto/golden_A.txt`, `.auto/golden_B.txt` (tops only,
-  from the proven engine). Final acceptance additionally requires a FRESH
-  third prompt validated against server temp-0 (manual, not in the loop).
+## Files in scope
+- `pulsar_arm/bonsai2/pq2_swar_sm53.cu` — the sm_53 SWAR GEMV (hot loop)
+- `pulsar_arm/bonsai2/pq2_fwd8_glue.c` — repack/cache/arena/launch glue
+- `pulsar_arm/bonsai2/pq2_host.c`, `pq2_wrap.h` — repack + host reference
+- `pulsar_arm/bonsai2/pq2_parity.c` — the parity gate itself
+- `.auto/measure.sh`, `.auto/checks.sh` — harness (may gain instrumentation)
 
-## Files in Scope
-- `pulsar_arm/bonsai2/fwd.c` — forward, norms, attention, GDN wiring, sampler
-- `pulsar_arm/bonsai2/tq_gemv_neon.c` — NEON integer GEMV (the hot loop)
-- `pulsar_arm/bonsai2/fwht.S` — FWHT asm
-- `pulsar_arm/bonsai2/tq_xgemv.c`, `tq_gemv_int.c` — scalar references (change only with cause)
-- `.auto/measure.sh`, `.auto/checks.sh` — may gain instrumentation as needed
+## Known optimization directions (from the perf analysis)
+- Occupancy is capped at 3 blocks/SM by the 13KB act tile (register cap
+  allows 4). Chunking K would shrink the tile.
+- Mask work (split4 + keep4, 11 ops per 4 weights) is *row-independent*: it
+  can be computed once for 2+ rows per lane, amortizing it.
+- Latency hiding: software-pipeline the next group's code loads.
+- Peak RSS: the transient host split buffers (up to ~165MB for the head)
+  and the mmap'd GGUF pages are the resident mass; `madvise(MADV_DONTNEED)`
+  after each tensor is uploaded drops the latter.
 
-## Harness fairness (learned 2026-10-07, run #258)
-- Identical-code A/B ratios ran 0.955-0.995 (always <1): the second runner
-  benefits (clocks/cache/page warmth). Fixed with warm-up runs for both
-  binaries + ABAB alternated decode averaging. Identical code must now read
-  ~1.000; judge keeps by ratio clearly below that band.
-- Order of battle: warm-up, prefill A/B, decode B,A,B,A averaged.
-
-## Hygiene (learned 2026-10-07)
-- `log_experiment` keep commits `git add -A` (sweeps in harness edits!);
-  discard-reverts do NOT cover `.auto/`. After any harness experiment,
-  manually restore `.auto/` to the intended state and commit hygiene
-  separately - never let build-flag trials leak into HEAD silently.
-
-## Off Limits
-- `pulsar_arm/asm/*`, `pulsar_arm/tools/*` (Pi engine + gemma tooling).
-- `pulsar_arm/bonsai2/fwd8.c`, `pq2_gemv.c` (8B line — separate session if ever).
-- Fork server, GGUF weights, tokenizer files, Spark `~/bonsai2/asm/*` dev tree
-  (loop builds in `~/bonsai2/exp/` from synced tree sources only).
-- `.auto/golden_*.txt` (frozen oracles), `.auto/log.jsonl` (append-only).
-
-## Constraints (hard — violations are cheating, discard + document)
-1. **Accuracy**: `checks.sh` must pass — exact greedy streams on A and B;
-   kernel GEMVs must be bit-exact OR fp32-close (maxrel<1e-6), so fp
-   reassociation is allowed but formulation drift is not.
-   No precision reduction anywhere without a bit-exact (or argmax-preserving
-   + distribution-checked) proof first.
-2. **No benchmark gaming**: fixed prompts, fixed gen counts, fixed threads
-   (6 both sides as of run #268; descent 20>16>12>8>6 all won; 20>16>12>8 so far, contention dominates;
-   taskset 0-19) optimum follows traffic: 20>16 at 27GB, 16>12 at 27GB, 16>12 at 14GB;
-   taskset 0-19), fixed flags
-   (-O2 -fopenmp -march=armv8.2-a+dotprod+fp16; no -ffast-math ever, fp order
-   preserved; -O3/mcpu-native tried runs #232 (hurts/discarded)).
-   No prompt-dependent branches, no answer caching, no skipped layers/norms,
-   no EOS-handling changes that alter measured work, no accuracy-for-speed
-   trades hidden in the sampler (sampler is out of scope unless bit-identical
-   streams preserved).
-3. **No overfit**: the primary metric lives on prompt A; B is an unseen
-   correctness tripwire; victory lap uses a third prompt + server diff.
-   Ideas that only help A-specific shapes (e.g. tuned to 21/20 lengths) are
-   discarded even if faster.
-4. **Same-job discipline**: one benchmark at a time on the Spark; record
-   `load1`; don't run while other heavy jobs hold cores (check `uptime`
-   first; idle llama-servers are fine).
-5. **Keep the tree green**: builds must be warning-clean-ish (no new
-   warnings), binaries stay bit-deterministic threaded-vs-single (row-split
-   reductions only — verify on any threading change).
-
-## What's Been Tried
-- (this session) scalar-int 139 ms → NEON SDOT 26.0 ms per 89M-weight
-  projection (5.3×), BIT-EXACT; OpenMP rows → 0.71 s/token on 20 cores
-  (10.7× over single-core, tops bit-identical).
-- (prior Pi session, closed): bus wall 3.93 GB/s, OMP +4.2% discarded,
-  prefetch +19% discarded, converged — see ideas.md wall notes.
+## Record: superseded objective
+The previous session on this repo targeted the Spark 27B CPU engine
+(`fwd.c` + `tq_gemv_neon.c` + `fwht.S`), primary `decode_ms`, ~0.71 s/token
+threaded. Its harness is kept at `.auto/measure_spark_27b.sh` and its
+directives/goldens (`golden_A.txt`/`golden_B.txt` were re-frozen for the
+Nano prompts above) are in the git history. Do not mix the two.
