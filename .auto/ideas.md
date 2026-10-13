@@ -357,3 +357,7 @@ NOTE: cannot beat the ~20-50us device-side dispatch latency; only host stall rem
 v31 removed host blocking but the copies still stage through pageable memory.
 Persistent cuMemHostAlloc buffers (64KB in / 512KB out) + one host memcpy each way.
 Targets the ~63us D2H + ~28us H2D pageable latency x 188 calls/token.
+
+## Exp35 v43 (run #66): drop both per-iteration bar.sync — warp-synchronous STS→LDS
+- v29's two per-iter bar.sync (named barrier tid.y+1, count 32) are redundant: all 32 lanes of a warp are warp-synchronous; every STS→LDS pair is intra-warp (area base r65 = shbuf + tid.y*1024; the v4 LDS reads the 4 dot partials written by lanes 4*sv..4*sv+3 of the SAME warp; the replay reads the warp's own 256B area). SASS shows each BAR.SYNC also emits MEMBAR.CTA → removing 2 pairs saves ~4 instrs/iter (1.3%).
+- Self-test 8/8 on first build. If EN/ZH gates pass, the warp-synchrony argument is validated.
