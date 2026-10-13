@@ -43,6 +43,10 @@ static int P2N = 0;
 
 const char *pq2_compat_name(void) { return "exact-pq2"; }
 
+#ifdef PQ2_HIST
+void pq2_hist_report(unsigned long *code);
+#endif
+
 
 #ifdef PQ2_USE_CUDA
 static uint8_t *P2ARENA = NULL;
@@ -63,6 +67,19 @@ static size_t P2PEAK = 0;
 const char *pq2_gpu_stats_mb(char *buf, int n) {
   size_t freeb = 0, totb = 0;
   cudaMemGetInfo(&freeb, &totb);
+#ifdef PQ2_HIST
+  {
+    unsigned long code[4];
+    pq2_hist_report(code);
+    unsigned long tot = code[0] + code[1] + code[2] + code[3];
+    fprintf(stderr,
+            "PQ2HIST w=-1:%.2f%% 0:%.2f%% +1:%.2f%% +2:%.2f%% (n=%.3fG) "
+            "ternary_lossless=%.2f%%\n",
+            100.0 * code[0] / tot, 100.0 * code[1] / tot,
+            100.0 * code[2] / tot, 100.0 * code[3] / tot, tot / 1e9,
+            100.0 * (code[0] + code[1] + code[2]) / tot);
+  }
+#endif
   snprintf(buf, n,
            "PQ2GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%.1f "
            "total_mb=%.1f tensors=%d",

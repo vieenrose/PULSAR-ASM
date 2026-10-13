@@ -19,6 +19,24 @@ float pq2_h2f(uint16_t h) {
   float r; memcpy(&r, &o, 4); return r;
 }
 
+#ifdef PQ2_HIST
+/* Code histogram over the 2-bit codes, to decide whether a ternary
+ * (1.58-bit) repack of this checkpoint would be lossless: counts code
+ * value c = 0..3 (weight value c-1, i.e. -1,0,+1,+2). */
+unsigned long pq2_hist[256];
+void pq2_hist_report(unsigned long *code) {
+  for (int c = 0; c < 4; c++) code[c] = 0;
+  for (int v = 0; v < 256; v++) {
+    unsigned long h = pq2_hist[v];
+    if (!h) continue;
+    code[(v) & 3] += h;
+    code[(v >> 2) & 3] += h;
+    code[(v >> 4) & 3] += h;
+    code[(v >> 6) & 3] += h;
+  }
+}
+#endif
+
 void pq2_split_repack(const uint8_t *pq2, int rows, int K,
                       uint8_t *w_codes, uint16_t *w_scales_h) {
   int ng = K / 128;
@@ -27,7 +45,11 @@ void pq2_split_repack(const uint8_t *pq2, int rows, int K,
     uint8_t *cd = w_codes + (size_t)r * ng * 32;
     uint16_t *sc = w_scales_h + (size_t)r * ng;
     for (int g = 0; g < ng; g++) {
+#ifdef PQ2_HIST
+      for (int b = 0; b < 32; b++) pq2_hist[row[g * 34 + 2 + b]]++;
+#else
       memcpy(cd + g * 32, row + g * 34 + 2, 32);
+#endif
       memcpy(sc + g, row + g * 34, 2);
     }
   }

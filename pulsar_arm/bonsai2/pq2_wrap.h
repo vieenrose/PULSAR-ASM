@@ -29,6 +29,10 @@ int pq2_gemv_sm53_launch(const unsigned char *w_codes,
 
 float pq2_h2f(uint16_t h);
 
+#ifdef PQ2_HIST
+void pq2_hist_report(unsigned long *code);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
