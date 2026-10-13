@@ -228,3 +228,14 @@ discards without a changed assumption.
   code (8x32B for 128B). Candidates: (i) 2-row blocking (share xq/code decode,
   halves xq traffic); (ii) sc/db broadcast via shfl/smem (minor); (iii) batch
   small GEMVs into fewer launches if launch overhead shows in profile.
+- V9 2-ROW BLOCKING PROVEN (run #29): 2.73 -> 3.26 tok/s (+19%). Warp covers
+  rows (2w,2w+1): xq/x16/db loaded once, dotted vs 2 code/sc rows (9 loads for
+  2 rows = 4.5/row). Grid 16 rows/block (both engine launch sites updated);
+  odd-row tail guarded (selp-clamp + uniform branch skip; engine selftest covers
+  full range incl. tail). Debug note: shmem stride MUST be 1024B/warp (4 arrays);
+  512B stride silently aliases warp w row-0 <- warp w-1 row-1. EN 216 + ZH green.
+- NEXT (GPU): 307ms/tok / ~196 calls = ~1.6ms/call. Candidates: (i) 4-row
+  blocking (register pressure? 2 rows already share xq; diminishing); (ii) code
+  2x sector waste (8x32B per 128B: 16B chunks in 18B rows) - needs layout change,
+  high risk; (iii) batch small GEMVs / persistent kernels if launch overhead
+  shows; (iv) profile per-shape timings to aim the next cut.
