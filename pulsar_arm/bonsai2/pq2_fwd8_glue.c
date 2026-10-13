@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include "pq2_wrap.h"
 
 #ifdef PQ2_USE_CUDA
@@ -149,6 +150,17 @@ void pq2_pq2_compat_gemv(int rows, int cols, const unsigned char *w,
           codes = NULL;
           scales = NULL;
           corr = NULL;
+          /* The GGUF pages are single-use for the device path: drop them
+           * once the tensor lives in the arena. They are clean file-backed
+           * pages (MAP_PRIVATE read-only), so madvise(DONTNEED) only frees
+           * memory -- a fallback re-repack would re-read them from the
+           * file. This is the resident mass on a 4GB board. */
+          {
+            size_t tbytes = (size_t)rows * ng * 34;
+            uintptr_t p0 = (uintptr_t)w & ~(uintptr_t)4095;
+            uintptr_t p1 = ((uintptr_t)w + tbytes + 4095) & ~(uintptr_t)4095;
+            if (p1 > p0) madvise((void *)p0, (size_t)(p1 - p0), MADV_DONTNEED);
+          }
         } else {
           fprintf(stderr, "pq2: arena memcpy failed -> CPU\n");
           cudaGetLastError();
