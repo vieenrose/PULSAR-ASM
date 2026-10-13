@@ -184,7 +184,18 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
     cws[4] = (uint32_t)cw1.x; cws[5] = (uint32_t)cw1.y;
     cws[6] = (uint32_t)cw1.z; cws[7] = (uint32_t)cw1.w;
     const uint4 *av = reinterpret_cast<const uint4 *>(qs);
-    int pu0 = 0, mu0 = 0, pu1 = 0, mu1 = 0;
+    /* PACKED ACCUMULATORS (run #35's trick, applied to both 1-bit planes).
+     * The four accumulators (pu0/mu0 for even words, pu1/mu1 for odd) hold
+     * (sum << 16): each 4-weight nibble folds its four masked bytes into the
+     * low halves of two 16-bit lanes, then ONE IMAD by 0x00010001 folds those
+     * lanes into the accumulator's top 16 bits. That replaces pq2_usum4's
+     * 9-op two-stage SWAR fold per plane (18 ops per 4 weights for both
+     * planes -> 12), cutting ~8 of the ~29 ALU ops the loop spends per 4
+     * weights. Integer addition is associative and exact, so each plane sums
+     * the SAME integer as before: bit-identical by construction.
+     * Overflow bound: 16 nibbles/group x 1020 max = 16320 in the top 16 bits
+     * = 1.07e9 < 2^31, so the >>16 unpack is exact. */
+    uint32_t pu0 = 0, mu0 = 0, pu1 = 0, mu1 = 0;
     /* Bias-correction counts, derived from the code bytes in the same pass:
      * with x' = x+128, isum = Pu + 2*Mu - Au + 16384 - 128*pc0 - 256*pc1.
      * Computing this here instead of reading a per-(row,group) int16 array
@@ -205,17 +216,27 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
         pq2_split4(cb, &f0, &f1);
         pc0 += __popc((uint32_t)cb & 0x55u);
         pc1 += __popc(((uint32_t)cb >> 1) & 0x55u);
+        /* keep masks (0xFF/0x00 per byte) select the bytes; AND is the only
+         * op that can select a byte - a multiply cannot (it creates cross
+         * terms between byte lanes) */
+        uint32_t fl0 = pq2_keep4(f0) & ap[j];
+        uint32_t fl1 = pq2_keep4(f1) & ap[j];
+        fl0 = (fl0 & 0x00FF00FFu) + ((fl0 >> 8) & 0x00FF00FFu);
+        fl1 = (fl1 & 0x00FF00FFu) + ((fl1 >> 8) & 0x00FF00FFu);
         if (w & 1) {
-          pu1 = pq2_usum4(ap[j], pq2_keep4(f0), pu1);
-          mu1 = pq2_usum4(ap[j], pq2_keep4(f1), mu1);
+          pu1 += fl0 * 0x00010001u;
+          mu1 += fl1 * 0x00010001u;
         } else {
-          pu0 = pq2_usum4(ap[j], pq2_keep4(f0), pu0);
-          mu0 = pq2_usum4(ap[j], pq2_keep4(f1), mu0);
+          pu0 += fl0 * 0x00010001u;
+          mu0 += fl1 * 0x00010001u;
         }
       }
     }
-    int isum = ((mu0 + mu1) << 1) + (pu0 + pu1) - sh_au[g] + 16384 -
-               (pc0 << 7) - (pc1 << 8);
+    /* Unpack the four accumulators (exact: values <= 16320) and combine in the
+     * same integer order as the previous 9-op form. */
+    int isum = (int)((((mu0 >> 16) + (mu1 >> 16)) << 1) + (pu0 >> 16) +
+                     (pu1 >> 16)) -
+               sh_au[g] + 16384 - (pc0 << 7) - (pc1 << 8);
     float ws = active ? __half2float(__ldg(w_scales + (size_t)rrow * K128 +
                                           (ch * PQ2_CHUNK_GROUPS + g)))
                       : 0.0f;

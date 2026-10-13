@@ -100,5 +100,29 @@ int main(int argc, char **argv) {
   printf("kernel vs fork-ref: %d/%d bit-exact, maxrel %.2e %s\n", exact, rows, md,
          exact == rows ? "BIT-EXACT" : (md < 1e-5 ? "CLOSE" : "MISMATCH"));
   printf("sample: ref %.6f dev %.6f\n", yA[0], yB[0]);
+
+  /* Kernel-level timing, for the path that has no end-to-end workload left on
+   * this board: the 2-bit (PQ2_0) GGUF was removed from the Nano when the
+   * objective retargeted to Q1_0, so fwd8_engine cannot run and the packed-
+   * accumulator change (run #35's trick applied to pq2) can only be timed at
+   * the kernel level. PQ2_TIME=<iters> launches the same kernel the engine
+   * launches, on the same data, N times with one sync at the end. The launch
+   * overhead is included and is identical for both binaries, so the ratio
+   * UNDERSTATES the kernel-level effect - a conservative measurement. */
+  if (getenv("PQ2_TIME")) {
+    int nit = atoi(getenv("PQ2_TIME"));
+    for (int i = 0; i < 20; i++) /* warm clocks and caches */
+      pq2_gemv_sm53_launch(d_cd, d_sc, d_xq, d_y, K, rows, NULL);
+    cudaDeviceSynchronize();
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < nit; i++)
+      pq2_gemv_sm53_launch(d_cd, d_sc, d_xq, d_y, K, rows, NULL);
+    cudaDeviceSynchronize();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    printf("PQ2TIME iters=%d rows=%d K=%d ms_per_launch=%.4f\n", nit, rows, K,
+           ((double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+            (double)(t1.tv_nsec - t0.tv_nsec) * 1e-6) / (double)nit);
+  }
   return (exact == rows && repack_ok) ? 0 : 1;
 }
