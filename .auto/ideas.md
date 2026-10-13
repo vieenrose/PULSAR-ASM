@@ -239,3 +239,21 @@ discards without a changed assumption.
   2x sector waste (8x32B per 128B: 16B chunks in 18B rows) - needs layout change,
   high risk; (iii) batch small GEMVs / persistent kernels if launch overhead
   shows; (iv) profile per-shape timings to aim the next cut.
+- OPS: NANO "WENT DEAD" WAS A LOCAL SSH BUG, NOT THE BOARD (2026-10-13). `ssh picard@picard-desktop`
+  failed host-key verification (stale hashed known_hosts entry for the short name), which reads
+  identically to a dead box through the tailnet. Diagnosis ladder that worked: `tailscale status`
+  (showed "active; relay hkg, rx 0") -> `tailscale ping` (timeouts, looked fatal) -> ssh to the
+  bare IP with `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null` => CONNECTED
+  immediately, 23 days uptime. Lesson: when a tailnet peer looks dead, ALWAYS ssh with host-key
+  checking disabled ONCE to separate "unreachable" from "key changed/stale". Board was up, no reboot.
+  Fixed by reseeding known_hosts with `ssh-keyscan -t ed25519,ecdsa,rsa <name>` (short-name entry
+  must be added for `picard-desktop` AND `picard-desktop.tailf63b31.ts.net`; a scan keyed on the
+  IP does not satisfy the hostname lookup).
+- V10 / EXP4 STATE (2026-10-13, pre-benchmark): /tmp/k2_cuda_v10.c == Nano /tmp/k2_exp.c
+  (md5 1fd18113fe9070383089fb3600bdad42), PTX /tmp/k2v10.ptx in sync both sides
+  (md5 061347d1a7604b7283b9870ef6bbc5b8). Gate evidence on Nano: /tmp/gate10_out.txt shows
+  "CUDA self-test OK (8/8 bit-exact)" and /tmp/zh_check.txt has 114 steps == k2nano_golden_zh.txt.
+  Change vs v9: Q4 code repacked from 18B-stride rows to contiguous 16B blocks (host-side one-time
+  gather per tensor, cached in rp_cache[64] keyed by device base/rows/nb), killing the 2x 32B-sector
+  waste on code reads; addressing is shl #4 / shl #2 instead of mul 18. Bit-exact by construction
+  (same products, same order).
