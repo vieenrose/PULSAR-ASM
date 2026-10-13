@@ -126,34 +126,42 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
   float acc = 0.0f; /* lane 0 only; groups accumulated in order */
 
   for (int ch = 0; ch < nchunk; ch++) {
-    /* 1. stage the chunk: d verbatim, acts biased to unsigned (x^0x80), at
-     * a 272B stride so every 128-act group is 16B-aligned (LDS.128). */
+    /* 1. Fused staging + Au: 16 threads per group (256 threads cover all
+     * 16 groups), each copying its own 2 act words into the 272B-strided
+     * tile and folding them locally, then a 4-step half-warp shuffle
+     * reduces to the group's Au. This removes a barrier per chunk and
+     * replaces a 32-iteration serial fold on 16 threads (240 threads idle
+     * at the barrier) with ~22 cycles on all of them. */
     const uint32_t *x32 = reinterpret_cast<const uint32_t *>(xq) +
                           (size_t)ch * PQ2_CHUNK_BLOCKS * 73;
     uint32_t *t32 = reinterpret_cast<uint32_t *>(sh_x);
     {
-      const int nw = PQ2_CHUNK_BLOCKS * 65;
-      for (int i = (int)threadIdx.x; i < nw; i += (int)blockDim.x) {
-        int b = i / 65, w = i - b * 65;
-        uint32_t v = __ldg(x32 + b * 73 + w);
-        if (w == 0) t32[b * 68 + 64] = v;      /* fp32 d, verbatim */
-        else t32[b * 68 + (w - 1)] = v ^ 0x80808080u; /* x' = x + 128 */
+      /* 256 threads / 16 groups = 16 threads per group: gid picks the
+       * group, slot picks which 2 of its 32 act words this thread owns. */
+      int gid = (int)threadIdx.x >> 4;   /* 0..15 group in this chunk */
+      int slot = (int)threadIdx.x & 15;  /* 0..15 within the group */
+      int bb = gid >> 1;                 /* its Q8_K block */
+      int wb = (gid & 1) * 32 + slot * 2;
+      const uint32_t *src = x32 + bb * 73 + 1 + wb;
+      uint32_t v0 = __ldg(src);
+      uint32_t v1 = __ldg(src + 1);
+      uint32_t m0 = v0 ^ 0x80808080u, m1 = v1 ^ 0x80808080u;
+      t32[bb * 68 + wb] = m0;
+      t32[bb * 68 + wb + 1] = m1;
+      if ((int)threadIdx.x < PQ2_CHUNK_BLOCKS) {
+        uint32_t dv = __ldg(x32 + (int)threadIdx.x * 73);
+        t32[(int)threadIdx.x * 68 + 64] = dv; /* fp32 d, verbatim */
       }
-    }
-    __syncthreads();
-
-    /* 2. Au per group (row-independent): one thread per group. */
-    if ((int)threadIdx.x < PQ2_CHUNK_GROUPS) {
-      int gg = (int)threadIdx.x;
-      const uint32_t *p = t32 + (gg >> 1) * 68 + (gg & 1) * 32;
-      uint32_t a2 = 0;
+      uint32_t t0 = (m0 & 0x00FF00FFu) + ((m0 >> 8) & 0x00FF00FFu);
+      uint32_t t1 = (m1 & 0x00FF00FFu) + ((m1 >> 8) & 0x00FF00FFu);
+      int a2 = (int)((t0 & 0xFFFFu) + (t0 >> 16) + (t1 & 0xFFFFu) +
+                     (t1 >> 16));
+      /* the 16 threads of a group are lanes gid*16..gid*16+15, i.e. one
+       * half-warp each, so a stride-8..1 shuffle reduces within the group */
 #pragma unroll
-      for (int q = 0; q < 32; q++) {
-        uint32_t m = p[q];
-        uint32_t t = (m & 0x00FF00FFu) + ((m >> 8) & 0x00FF00FFu);
-        a2 += (t & 0xFFFFu) + (t >> 16);
-      }
-      sh_au[gg] = (int)a2;
+      for (int o = 8; o > 0; o >>= 1)
+        a2 += __shfl_down_sync(0xFFFFFFFFu, a2, o);
+      if (slot == 0) sh_au[gid] = a2;
     }
     __syncthreads();
 
