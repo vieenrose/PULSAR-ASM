@@ -165,3 +165,70 @@ and the lessons. Objective and gates are unchanged.
 - Prompt-parallel prefill is NOT applicable (causal incremental engine; batch
   prefill would change numerics - forbidden by accuracy gate).
 - 8B line (fwd8/pq2) excluded from this loop; open a second session if ever.
+
+## Q1_0 (true 1-bit) kernel — deferred ideas (Nano, 2.13 tps baseline)
+
+Measured category map for this kernel so far:
+- critical-path/occupancy changes worked on the 2-bit path (chunking +2.5%,
+  fused staging+Au +4.0%, 5 blocks/SM +4.5%); instruction-count cuts gave 0.
+- double-buffering the chunk tile on the 1-bit kernel REGRESSED -5.6%: the
+  staging shuffle+reduction now overlaps compute, and its live ranges sit
+  across the whole compute phase (register pressure / scheduling), while the
+  single-buffer barrier was evidently not the bottleneck here.
+
+Next candidates, in expected-value order:
+1. Two groups per lane (GperThr=2 for K=4096): halves the per-lane epilogue
+   (reductions, product stores, the popcount tail) per group and gives two
+   independent dependency chains. Costs registers; watch the 48-reg/5-block
+   budget.
+2. Vectorize the act loads: the inner loop currently issues 32 LDS.32 per
+   128-weight group; one LDS.128 per 4 nibbles cuts that to 8 and removes
+   ~24 instructions per group.
+3. Bank-conflict check on the act tile reads (lane sub reads its own group's
+   128 bytes; 16 lanes stride 32 words apart -> likely 2-way conflicts).
+4. Arena right-sizing: 1280MB default vs the measured need (~1.19GB + KV);
+   consider growing the arena in chunks so the reserved GPU RAM tracks the
+   model instead of a fixed cap.
+5. The PQ1GPU exit stats line does not reach stderr in the 1-bit build (the
+   2-bit build printed PQ2GPU), so gpu_used/peak are not on the dashboard for
+   this workload. Register the atexit dump inside the glue TU instead of the
+   shim's constructor.
+
+## Measured-out micro-levers on the Q1_0 kernel (do not re-walk)
+
+- Instruction-count cuts: 0% (the 2-bit E4 result; the 1-bit kernel is at
+  ~29% of the ALU issue peak, so issue slots are not the constraint).
+- Shared-memory bank conflicts: the act tile had a REAL 2-way conflict on
+  every load (lanes 2m/2m+1 read words 32 apart = same bank since 32 % 32
+  banks = 0). Padding the tile to 69 words per Q8_K block with the halves at
+  words 0/33 removed it - and bought nothing (2.1349 -> 2.1071 tps, inside
+  noise, discarded). Conclusion: LDS throughput has slack; shared memory is
+  NOT the limiter, so further LDS/vectorisation work is low value.
+- Overlap machinery (double-buffered staging): -5.6% (live ranges across the
+  compute phase cost more than the overlap saves).
+- So the remaining lever is the DEPENDENCY STRUCTURE / per-chunk fixed cost:
+  two groups per lane (halves the per-chunk barriers and staging passes per
+  unit of work, adds a second independent chain) is the untested candidate
+  and needs a full work session - it touches the staging thread mapping
+  (256 threads / 32 groups = 8 threads per group), sh_prod sizing and the
+  ordered reduce, and it risks the 48-reg / 5-block occupancy budget.
+
+## Closed direction: bigger blocks / more overlap (Q1_0 kernel)
+
+Three structural attempts on the 32-row/512-thread amortisation idea and its
+cousins, all measured on the same harness:
+- 512-thread / 32 rows per block (same tile reused by 2x the rows, staging
+  and barrier cost per unit of work halved, inner loop untouched): **-9.1%**
+  (2.1349 -> 1.9404 tps). A 16-warp barrier converges worse than an 8-warp
+  one, and this part is a single-SM (128-core) GPU, so coarser blocks just
+  add arrival spread.
+- double-buffered staging: -5.6% (live ranges across compute).
+- bank-conflict-free padded tile: ~0% (LDS has slack).
+
+Conclusion: the 256-thread / 16-row / 5-blocks-per-SM shape with one group per
+lane is a local optimum for this kernel. What remains untested is the DEPENDENCY
+STRUCTURE inside a lane (two groups per lane, i.e. 32 groups per chunk, with
+the staging remapped to 8 threads per group): it amortises the per-chunk cost
+without growing the block, but it needs the inner loop duplicated (I-cache risk
+on this GPU) and it competes for the 48-register budget. Attempt it only with a
+full session and a fallback plan (keep the current commit as the reference).
