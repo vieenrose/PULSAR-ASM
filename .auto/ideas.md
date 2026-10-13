@@ -257,3 +257,22 @@ discards without a changed assumption.
   gather per tensor, cached in rp_cache[64] keyed by device base/rows/nb), killing the 2x 32B-sector
   waste on code reads; addressing is shl #4 / shl #2 instead of mul 18. Bit-exact by construction
   (same products, same order).
+- V10 EXP4 DEVICE-MEMORY WALL (2026-10-13, Nano went dark mid-bench): the v10 repack stages
+  a SECOND copy of every Q4 tensor (16B blocks, 635 MB) alongside the existing 714 MB blob
+  mirror => 1349 MB device footprint on a 4 GB Nano whose TDA/carveout is ~1.9 GB. Evidence:
+  `mlock blob failed (errno 12)` at startup (already at the RLIMIT_MEMLOCK edge), the box's
+  tailscale rx counter climbing to 1.59 MB then freezing, `ssh` rc=127/137, and 5/5 tailscale
+  ping timeouts. My own two `ssh` calls exited **137 = SIGKILL = local OOM killer** (3791255
+  bench + tee chain was also live). Net: the Nano is now unreachable at the network layer
+  (tailscale `Online: True, Conn: None` = stale key-expiry only, no key exchange).
+  FIX REQUIRED BEFORE ANY v10 RUN: (1) do NOT double-stage — repack IN PLACE into a single
+  canonical Q4 layout (one copy) and delete the 18B-stride mirror from the loop path, i.e.
+  stage only the repacked 635 MB and drop dev_base for the Q4 region; (2) free RAM first
+  (jtop x4 was running, 749 MB used + 172 buff/cache); (3) never launch a bench while the
+  box has < 800 MB MemAvailable. Recovery: power-cycle the Nano, verify
+  `free -m`, `tailscale ping`, then re-run .auto/k2nano_gpu_bench.sh with SRC=/tmp/k2_cuda_v10.c.
+  v10 SOURCES ARE SAFE: committed b18104e (gpu_v10/{gen_v10.py,k2_gexp_engine_v10.c,k2v10.ptx}),
+  md5 src 1fd18113fe9070383089fb3600bdad42, PTX 061347d1a7604b7283b9870ef6bbc5b8. Gate evidence
+  captured pre-crash on the Nano: /tmp/gate10_out.txt "CUDA self-test OK (8/8 bit-exact)",
+  /tmp/zh_check.txt 114 steps == .auto/k2nano_golden_zh.txt. NOT benchmarked => v9 (3.26 tok/s,
+  fea4c10) remains HEAD of the GPU line.
