@@ -1,52 +1,55 @@
 #!/bin/bash
-# Accuracy gate: greedy streams must equal frozen goldens EXACTLY.
-# - Prompt A: reuse measure.sh's saved decode log (41 steps).
-# - Prompt B (held-out): run the just-built loop binary on the Spark.
-# - If kernel files changed vs HEAD, re-run the NEON bit-exact validation.
-set -euo pipefail
-SPARK=luigi@spark
-LOCAL=/home/user/PULSAR-ASM
-B_IDS="248045 846 198 7734 264 6185 36974 883 279 9117 13 248046 198 248045 74455 198 248068"
-MODEL=../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf
+# Accuracy gate for the Nano exact-PQ2 engine (branch bonsai-jetson-nano).
+# Runs automatically after every passing benchmark. Two independent checks:
+#
+#  1. Kernel bit-exactness: pq2_parity must report BIT-EXACT at K=4096 and
+#     K=12288 vs the fork-faithful host reference (which mirrors
+#     pq2_gemv.c / ggml_vec_dot_pq2_0_q8_K's accumulation order).
+#  2. End-to-end greedy streams: prompt A (measured) and prompt B
+#     (held-out, different content) must reproduce the frozen goldens
+#     token-for-token. Any numerics change that alters the argmax path
+#     fails here, so speed cannot be bought with accuracy.
+#
+# Nothing here is tuned to the benchmark prompts' content; the goldens were
+# frozen from the pre-optimization HEAD and are the engine's own output.
+set -uo pipefail
+NANO=${NANO:-pesi@100.70.245.36}
+REPO=/home/louis/PULSAR-ASM
+R=/home/pesi/exp
+MODEL=/home/pesi/b8.gguf
+A_IDS="151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 624 151645 198 151644 77091 198"
+B_IDS="151644 872 198 7985 264 6386 38242 911 279 17951 624 151645 198 151644 77091 198"
 
-tops() { grep '^step' "$1" | sed 's/.*top=//;s/ .*//'; }
+fail() { echo "CHECKS FAILED: $*"; exit 1; }
 
-# A: 41 steps from the measured run
-A_N=$(tops "$LOCAL/.auto/last_decode.txt" | wc -l)
-[ "$A_N" -eq 41 ] || { echo "CHECKS: A has $A_N tops, want 41"; exit 1; }
-if ! diff <(tops "$LOCAL/.auto/last_decode.txt") "$LOCAL/.auto/golden_A.txt" > /dev/null; then
-    echo "CHECKS FAILED: prompt-A stream differs from golden"
-    diff <(tops "$LOCAL/.auto/last_decode.txt") "$LOCAL/.auto/golden_A.txt" | head -5
-    exit 1
+# --- 1. kernel bit-exactness -------------------------------------------------
+P=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq2_parity 256 4096 2>&1 | tail -n 2; ./pq2_parity 512 12288 2>&1 | tail -n 2" 2>/dev/null)
+echo "$P" | grep -q "256/256 bit-exact" || fail "K=4096 parity: $(echo "$P" | head -n1)"
+echo "$P" | grep -q "512/512 bit-exact" || fail "K=12288 parity: $(echo "$P" | tail -n1)"
+echo "checks: pq2 kernel BIT-EXACT at K=4096 (256/256) and K=12288 (512/512)"
+
+# --- 2. greedy stream goldens ------------------------------------------------
+ssh -o ConnectTimeout=25 "$NANO" \
+  "cd $R && OMP_NUM_THREADS=4 timeout 900 ./fwd8_engine $MODEL $B_IDS --gen 10 2>/dev/null | grep '^step'" \
+  > "$REPO/.auto/last_B.txt"
+A_TOPS=$(grep '^step' "$REPO/.auto/last_run_log.txt" | sed 's/.*top=//;s/ .*//' | grep -E '^[0-9]+$')
+B_TOPS=$(sed 's/.*top=//;s/ .*//' "$REPO/.auto/last_B.txt" | grep -E '^[0-9]+$')
+
+GA=$(wc -l < "$REPO/.auto/golden_A.txt")
+GB=$(wc -l < "$REPO/.auto/golden_B.txt")
+[ "$(echo "$A_TOPS" | grep -c .)" -eq "$GA" ] || fail "prompt A steps $(echo "$A_TOPS" | grep -c .) != $GA (run aborted?)"
+if ! diff <(echo "$A_TOPS") "$REPO/.auto/golden_A.txt" > /dev/null; then
+  echo "$A_TOPS" > "$REPO/.auto/last_A_tops.txt"
+  diff "$REPO/.auto/last_A_tops.txt" "$REPO/.auto/golden_A.txt" | head -n 5
+  fail "prompt A greedy stream differs from golden"
 fi
-echo "checks: prompt A exact (41/41)"
+echo "checks: prompt A greedy stream exact ($GA/$GA)"
 
-# B: held-out prompt, fresh run of the same binary
-ssh -o BatchMode=yes -o ConnectTimeout=20 "$SPARK" \
-    "cd ~/bonsai2/exp && OMP_NUM_THREADS=20 taskset -c 0-19 ./fwd_exp $MODEL $B_IDS --gen 10 2>/dev/null | grep '^step'" \
-    > "$LOCAL/.auto/last_B.txt"
-B_N=$(grep -c '^step' "$LOCAL/.auto/last_B.txt")
-[ "$B_N" -eq 27 ] || { echo "CHECKS: B has $B_N steps, want 27"; exit 1; }
-if ! diff <(tops "$LOCAL/.auto/last_B.txt") "$LOCAL/.auto/golden_B.txt" > /dev/null; then
-    echo "CHECKS FAILED: held-out prompt-B stream differs from golden"
-    diff <(tops "$LOCAL/.auto/last_B.txt") "$LOCAL/.auto/golden_B.txt" | head -5
-    exit 1
+[ "$(echo "$B_TOPS" | grep -c .)" -eq "$GB" ] || fail "held-out prompt B steps $(echo "$B_TOPS" | grep -c .) != $GB"
+if ! diff <(echo "$B_TOPS") "$REPO/.auto/golden_B.txt" > /dev/null; then
+  echo "$B_TOPS" > "$REPO/.auto/last_B_tops.txt"
+  diff "$REPO/.auto/last_B_tops.txt" "$REPO/.auto/golden_B.txt" | head -n 5
+  fail "held-out prompt B greedy stream differs from golden"
 fi
-echo "checks: held-out prompt B exact (27/27)"
-
-# Kernel regression: if GEMV/FWHT sources changed, bit-exactness must hold
-if git -C "$LOCAL" status --porcelain pulsar_arm/bonsai2/tq_gemv_neon.c pulsar_arm/bonsai2/fwht.S pulsar_arm/bonsai2/tq_xgemv.c | grep -q .; then
-    echo "checks: kernel files touched - running bit-exact validation"
-    OUT=$(ssh -o BatchMode=yes -o ConnectTimeout=20 "$SPARK" \
-        'cd ~/bonsai2/exp && LB=~/bonsai2/llama.cpp/build/bin && gcc -O3 -march=armv8.2-a+dotprod+fp16 -mtune=native -DTQ_XGEMV_LIB -o tqv tq_gemv_neon.c tq_xgemv.c fwht.S -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm && taskset -c 3 ./tqv ../models/Ternary-Bonsai-2-27B-PTQ1_0.gguf 11120992 594124800 64 2>&1 | head -2')
-    echo "$OUT"
-    if echo "$OUT" | grep -q BIT-EXACT; then echo "checks: kernel bit-exact"; else
-        MR=$(echo "$OUT" | grep -o "maxrel [0-9.e+-]*" | head -1 | cut -d" " -f2)
-        python3 -c "import sys; sys.exit(0 if float('$MR') < 1e-6 else 1)" \
-            || { echo "CHECKS FAILED: kernel diverged (maxrel $MR)"; exit 1; }
-        echo "checks: kernel fp32-close (maxrel $MR, reassociation allowed)"
-    fi
-else
-    echo "checks: kernels untouched - bit-exact check skipped"
-fi
-echo "ALL CHECKS PASSED"
+echo "checks: held-out prompt B greedy stream exact ($GB/$GB)"
+exit 0

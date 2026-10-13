@@ -87,6 +87,23 @@ static void q8_K_quant(const float *x, uint8_t *yv, int64_t k) {
 void pq2_gemv(int rows, int cols, const uint8_t *w, const float *x, float *y,
               const uint8_t *xq);
 
+#ifdef BQ1_TIME
+/* Harness instrumentation only (no math): per-step wall time so the
+ * autoresearch loop can separate prefill from decode. Guarded so other
+ * builds (Spark/phone) are byte-identical to before. */
+#include <time.h>
+static double bq1_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+#define BQ1_T0() double _t0 = bq1_now()
+#define BQ1_T1(step)     printf("BQ1TIME step=%d ms=%.3f\n", step, (bq1_now() - _t0) * 1e3), fflush(stdout)
+#else
+#define BQ1_T0() ((void)0)
+#define BQ1_T1(step) ((void)0)
+#endif
+
 static int TRACE = 0;
 #define MAG(nm, v, n) do { double _s = 0; int _n = (n); \
     for (int _i = 0; _i < _n; _i++) _s += (double)(v)[_i] * (v)[_i]; \
@@ -321,6 +338,7 @@ int main(int argc, char **argv) {
     int n0 = nids;
     NPOS = 0;
     for (int step = 0; step < n0 + gen; step++) {
+        BQ1_T0();
         int id = step < n0 ? ids[step]
                : (STEMP > 0 ? sample_topkpp(HEAD, VOCAB, STEMP, STOPP, STopK, SMINP)
                             : argmax(HEAD, VOCAB));
@@ -381,6 +399,7 @@ int main(int argc, char **argv) {
         gemvP(tw("output.weight"), VOCAB, HID, XN, HEAD);
         int top = argmax(HEAD, VOCAB);
         printf("step %d id_in=%d top=%d logit=%.4f\n", step, id, top, HEAD[top]);
+        BQ1_T1(step);
         if (getenv("TOP40") && step == 22) {
             /* print top-40 (id:prob) under the configured sampler for comparison
                with server n_probs at the same position */
