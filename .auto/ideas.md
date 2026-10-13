@@ -580,3 +580,34 @@ Debug technique worth keeping: when a metric reads a physically impossible value
 (total memory = 0), the API call failed and the value is the initialiser. Check
 return codes before trusting printed diagnostics - and prefer a value that cannot
 be a measurement (NA) over a default that looks real (0.0).
+
+## ALU ops ARE a profitable currency when paid in ALU (run #35, 2026-10-13)
+
+Packed-accumulator inner loop: the 4-byte masked sum is (ap & keep) summed into
+the TOP 16 bits of the accumulator by ONE IMAD with 0x00010001, replacing the
+9-op two-stage SWAR fold. 14 -> 11 ALU ops per 4 weights. Bit-exact by integer
+associativity (parity green, both goldens, top=911). Resources IDENTICAL (40
+regs, 0 spills, same smem). Interleaved A/B: **+10.01% decode** (2.5881 vs
+2.3526 tps), every pair separated, t ~ 13. Largest single-step win of the
+session; cold harness 2.5499 tps, prefill +11.7%.
+
+SUPERSEDES #32's "local optimum" conclusion. The correct model is a currency
+model, not an optimality claim:
+  - #30 cut LDS ops  -> 0%  (LDS is not the binding currency)
+  - #29 cut ALU ops, paid in LOADS -> -38% (paid in the scarcer currency)
+  - #21/#14 bought ILP, paid in REGISTERS/LIVE RANGES -> -2.8% / -5.6%
+  - #35 cuts ALU ops, paid in ALU (IMAD is full-rate, zero resource cost) -> +10%
+Every earlier failure paid for the change in a resource the kernel was short of.
+#28's slope (0.6% time per 1% inner-loop instruction cut) is confirmed in the
+profitable direction: measured ~0.44% per 1% op cut (14 -> 11 ops = 9.1% time).
+
+MINE IT FURTHER (untested): the keep-mask chain is still 3 ops (IMAD
+b4*0x00204081, AND 0x01010101, IMAD *255). The *255 byte-expansion looks hard to
+remove - the 0x01-per-lane form loses the activation byte values - so the floor
+for this formulation is ~11 ops/4 weights, i.e. this loop is close to mined out.
+The 2-bit kernel (pq2_swar_sm53.cu) has the same 9-op usum4 chain (E4 counted
+539 ANDs) and has NEVER had this treatment: apply the packed accumulator there.
+
+DO NOT re-walk from the pre-#35 mindset: #29 (tables) and #30 (LDS vectorisation)
+are measured out - they failed for reasons this run CONFIRMS (wrong currency),
+not reasons this run changes.
