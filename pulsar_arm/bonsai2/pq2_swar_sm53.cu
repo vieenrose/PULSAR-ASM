@@ -7,6 +7,12 @@
  *
  * Math (exact, fork order): code c = b0 + 2*b1, value v = c-1
  *   v = 2*b1 + (b0 - 1)   =>  isum = 2*mpos_b1 + S_pos(b0) - S_all
+ * Unsigned kernel form (v2): activations are stored biased x' = x XOR 0x80
+ * so every masked partial sum needs only and/shift/add (no sign extension):
+ *   isum = Pu(b0) + 2*Mu(b1) - Au + corr[row][g]
+ * with Au (row-independent) precomputed per block into shared, and corr
+ * (codes-only) precomputed at repack time into int16. Both are exact, so
+ * the integer result is unchanged.
  *   acc += (ws * db) * (float)isum        (per 128-group, group order)
  * Integer partials are exact (|isum| <= 32512), so the SWAR decomposition
  * equals the fork's direct dot bit-for-bit; the fp accumulation is made
@@ -27,7 +33,10 @@
 #define PQ2_BLOCK_ROWS 16  /* 256 threads = 16 rows x 16 lanes */
 #define PQ2_MAXK 12288
 #define PQ2_MAXG (PQ2_MAXK / 128)   /* 96 groups max */
-#define Q8K_NB 292
+#define PQ2_K128_MAX (PQ2_MAXG)     /* per-block group count bound */
+#define Q8K_NB 292                  /* Q8_K block: float d + 256 i8 */
+#define Q8K_TILE_STRIDE 272         /* shared tile stride: 256 acts (16B
+                                     * aligned) + d + pad, 17 u32 words */
 
 __device__ __forceinline__ int pq2_iadd3(int a, int b, int c) {
   return a + b + c; /* fuses to IADD3 */
@@ -60,25 +69,25 @@ __device__ __forceinline__ int pq2_hsum4(uint32_t apack) {
   return pq2_iadd3(s0, s1, s2) + s3;
 }
 
-/* masked 4-lane byte sum: bytes of apack where keep byte == 0xFF. */
-__device__ __forceinline__ int pq2_dot4(uint32_t apack, uint32_t keep,
-                                        int acc) {
+/* masked 4-lane UNSIGNED byte sum (8 ops): bytes of apack where the keep
+ * byte is 0xFF. Two-stage SWAR fold, no sign extension, no IMUL. */
+__device__ __forceinline__ int pq2_usum4(uint32_t apack, uint32_t keep,
+                                         int acc) {
   uint32_t mk = apack & keep;
-  int s0 = (int)(mk << 24) >> 24;
-  int s1 = (int)(mk << 16) >> 24;
-  int s2 = (int)(mk << 8) >> 24;
-  int s3 = (int)((int32_t)mk) >> 24;
-  acc = pq2_iadd3(s0, s1, acc);
-  return pq2_iadd3(s2, s3, acc);
+  uint32_t t = (mk & 0x00FF00FFu) + ((mk >> 8) & 0x00FF00FFu);
+  uint32_t s = (t & 0xFFFFu) + (t >> 16);
+  return acc + (int)s;
 }
 
 __global__ __launch_bounds__(256, 3)
 void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
                    const __half* __restrict__ w_scales,
+                   const int16_t* __restrict__ w_corr,
                    const uint8_t* __restrict__ xq, float* __restrict__ y,
                    int K, int N) {
-  __shared__ uint8_t sh_x[PQ2_MAXK / 256 * Q8K_NB]; /* <=14016B */
+  __shared__ __align__(16) uint8_t sh_x[PQ2_MAXK / 256 * Q8K_TILE_STRIDE];
   __shared__ float sh_prod[PQ2_BLOCK_ROWS][PQ2_MAXG];
+  __shared__ int sh_au[PQ2_MAXG];  /* unsigned sum of all 128 acts per group */
 
   int row = blockIdx.x * PQ2_BLOCK_ROWS + (threadIdx.x >> 4);
   int sub = threadIdx.x & 15;
@@ -89,11 +98,39 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
   int GperThr = K128 >> 4;   /* 2 (K=4096) or 6 (K=12288) */
   int my_g0 = sub * GperThr;
 
-  /* 1. Q8_K tile: cooperative LDG.E.128 once per block. */
-  int nvec = (K / 256 * Q8K_NB) >> 4;
-  for (int i = (int)threadIdx.x; i < nvec; i += (int)blockDim.x) {
-    int4 v = __ldg(reinterpret_cast<const int4*>(xq + i * 16));
-    *reinterpret_cast<int4*>(sh_x + i * 16) = v;
+  /* 1. Q8_K tile with a 272B stride so every 128-act group starts on a
+   * 16-byte boundary (LDS.128 in the inner loop). Source blocks are 292B
+   * (73 u32: d + 64 act words + 8 bsum words we skip), so the copy reads
+   * 65 words per block and biases the acts to unsigned (x' = x^0x80) in
+   * the same pass — no alignment hazard, and 11% less global traffic. */
+  {
+    const uint32_t *x32 = reinterpret_cast<const uint32_t *>(xq);
+    uint32_t *t32 = reinterpret_cast<uint32_t *>(sh_x);
+    int nb = K / 256;
+    int nw = nb * 65;
+    for (int i = (int)threadIdx.x; i < nw; i += (int)blockDim.x) {
+      int b = i / 65, w = i - b * 65;
+      uint32_t v = __ldg(x32 + b * 73 + w);
+      if (w == 0) t32[b * 68 + 64] = v; /* fp32 d, verbatim */
+      else t32[b * 68 + (w - 1)] = v ^ 0x80808080u;
+    }
+  }
+  __syncthreads();
+
+  /* 1b. Au (unsigned sum of all 128 acts per group) is row-independent, so
+   * one thread per group computes it once for the whole block. */
+  if ((int)threadIdx.x < K128) {
+    int g = (int)threadIdx.x;
+    const uint32_t *p = reinterpret_cast<const uint32_t *>(sh_x) +
+                        (g >> 1) * 68 + (g & 1) * 32;
+    uint32_t acc = 0;
+#pragma unroll
+    for (int q = 0; q < 32; q++) {
+      uint32_t m = p[q];
+      uint32_t t = (m & 0x00FF00FFu) + ((m >> 8) & 0x00FF00FFu);
+      acc += (t & 0xFFFFu) + (t >> 16);
+    }
+    sh_au[g] = (int)acc;
   }
   __syncthreads();
 
@@ -101,33 +138,50 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
   const uint8_t *cd = w_codes + (size_t)(active ? row : 0) * (K >> 2);
   for (int s = 0; s < GperThr; s++) {
     int g = my_g0 + s;
-    const uint8_t *qb = sh_x + (size_t)(g >> 1) * Q8K_NB;
+    const uint32_t *gb = reinterpret_cast<const uint32_t *>(sh_x) +
+                         (g >> 1) * 68;
     float db;
-    __builtin_memcpy(&db, qb, 4);
-    const int8_t *qs = (const int8_t *)(qb + 4 + (g & 1) * 128);
+    __builtin_memcpy(&db, gb + 64, 4);
+    const uint32_t *qs = gb + (g & 1) * 32; /* 32 u32 = 128 act bytes */
     const uint8_t *c = cd + g * 32;
-    int pos0 = 0, mpos = 0, all = 0;
+    /* vector loads: 32 code bytes as 2x LDG.E.128 (16B-aligned: row stride
+     * K/4 and group stride 32 are both multiples of 16), and each 16-weight
+     * act slice as one LDS.128. Cuts inner-loop loads from 40 to 10 per
+     * group. Two accumulator pairs (even/odd word) give the chains ILP. */
+    const uint4 *cv = reinterpret_cast<const uint4 *>(c);
+    uint4 cw0 = __ldg(cv);
+    uint4 cw1 = __ldg(cv + 1);
+    uint32_t cws[8];
+    cws[0] = (uint32_t)cw0.x; cws[1] = (uint32_t)cw0.y;
+    cws[2] = (uint32_t)cw0.z; cws[3] = (uint32_t)cw0.w;
+    cws[4] = (uint32_t)cw1.x; cws[5] = (uint32_t)cw1.y;
+    cws[6] = (uint32_t)cw1.z; cws[7] = (uint32_t)cw1.w;
+    const uint4 *av = reinterpret_cast<const uint4 *>(qs);
+    int pu0 = 0, mu0 = 0, pu1 = 0, mu1 = 0;
 #pragma unroll
-    for (int b = 0; b < 32; b += 4) {
-      uint32_t cw;
-      __builtin_memcpy(&cw, c + b, 4);
-      uint32_t a0, a1, a2, a3;
-      __builtin_memcpy(&a0, qs + b * 4, 4);
-      __builtin_memcpy(&a1, qs + b * 4 + 4, 4);
-      __builtin_memcpy(&a2, qs + b * 4 + 8, 4);
-      __builtin_memcpy(&a3, qs + b * 4 + 12, 4);
-      uint32_t ap[4] = {a0, a1, a2, a3};
+    for (int w = 0; w < 8; w++) {
+      uint32_t cw = cws[w];
+      uint4 av4 = av[w]; /* LDS.128: 16 act bytes */
+      uint32_t ap[4] = {(uint32_t)av4.x, (uint32_t)av4.y, (uint32_t)av4.z,
+                        (uint32_t)av4.w};
 #pragma unroll
       for (int j = 0; j < 4; j++) {
         uint8_t cb = (uint8_t)(cw >> (j * 8));
         uint32_t f0, f1;
         pq2_split4(cb, &f0, &f1);
-        pos0 = pq2_dot4(ap[j], pq2_keep4(f0), pos0);
-        mpos = pq2_dot4(ap[j], pq2_keep4(f1), mpos);
-        all = pq2_iadd3(pq2_hsum4(ap[j]), 0, all);
+        if (w & 1) {
+          pu1 = pq2_usum4(ap[j], pq2_keep4(f0), pu1);
+          mu1 = pq2_usum4(ap[j], pq2_keep4(f1), mu1);
+        } else {
+          pu0 = pq2_usum4(ap[j], pq2_keep4(f0), pu0);
+          mu0 = pq2_usum4(ap[j], pq2_keep4(f1), mu0);
+        }
       }
     }
-    int isum = (mpos << 1) + pos0 - all;
+    int pu = pu0 + pu1, mu = mu0 + mu1;
+    /* exact: isum = Pu + 2*Mu - Au + corr (bias corrections are exact
+     * integers, codes-only, precomputed at repack time) */
+    int isum = (mu << 1) + pu - sh_au[g] + (int)__ldg(w_corr + (size_t)(active ? row : 0) * K128 + g);
     float ws = active ? __half2float(
         __ldg(w_scales + (size_t)(active ? row : 0) * K128 + g)) : 0.0f;
     /* (ws*db)*isum with no contraction, matching the C reference exactly */
@@ -149,6 +203,7 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
 
 extern "C" int pq2_gemv_sm53_launch(const uint8_t *w_codes,
                                     const unsigned short *w_scales_h,
+                                    const short *w_corr,
                                     const uint8_t *xq, float *y, int K, int N,
                                     void *stream) {
   if ((K & 127) != 0) return -2;
@@ -157,6 +212,7 @@ extern "C" int pq2_gemv_sm53_launch(const uint8_t *w_codes,
   dim3 grid((N + PQ2_BLOCK_ROWS - 1) / PQ2_BLOCK_ROWS, 1, 1);
   cudaStream_t s = (cudaStream_t)stream;
   pq2_gemv_sm53<<<grid, block, 0, s>>>(
-      w_codes, reinterpret_cast<const __half *>(w_scales_h), xq, y, K, N);
+      w_codes, reinterpret_cast<const __half *>(w_scales_h),
+      w_corr, xq, y, K, N);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }

@@ -133,3 +133,36 @@ LUT for the plane masks) to reach ~4.5 instr/weight.
 **Roofline note:** exact 8B PQ2_0 streams 2.18GB/token; at the Nano's
 25.6 GB/s peak that is 11.6 tok/s at 100% EMC (~7 at a realistic 65-70%).
 13-15 tok/s is above the *theoretical* bus for this model size.
+
+## Perf pass on the exact-PQ2 kernel (branch bonsai-jetson-nano)
+
+Diagnosis first (nvprof, e2e gen=3): 1771 launches, 10.0s total -> the GEMV
+kernel is ~100% of wall time (5.64ms avg/launch). So the work is all in the
+kernel, not the glue/memcpy.
+
+Two rewrites, both BIT-EXACT-preserving (parity re-run after each):
+- v2 "unsigned": activations stored biased (x' = x^0x80) so every masked
+  partial sum is and/shift/add with no sign extension; the bias corrections
+  are codes-only so they are precomputed at repack time (int16 per
+  row/group), and Au (sum of acts per group) is row-independent and
+  computed once per block. Removed the per-row hsum. -> NO net gain
+  (1.58 vs 1.56 s/tok): we were not issue-bound the way the op count
+  suggested.
+- v3 "vector loads + ILP": shared tile restrided to 272B so every 128-act
+  group is 16B-aligned (LDS.128 for acts), codes fetched as 2x LDG.E.128
+  per group, bsum words skipped (11% less global traffic on the act side),
+  and two accumulator pairs for ILP. Inner-loop loads drop 40 -> 10 per
+  group. -> **1.08 s/tok marginal, ~0.93 tok/s decode** (was 1.56 s/tok /
+  0.64 tok/s).
+
+Timings (same job, 4 threads, MAXN + jetson_clocks):
+  v1  gen10 54s  gen60 132s  -> 1.56 s/tok (~0.64 tok/s)
+  v2  gen10 71s  gen60 150s  -> 1.58 s/tok (no gain)
+  v3  gen10 55s  gen60 109s  -> 1.08 s/tok (~0.93 tok/s)  <- current
+One-time cost ~44s (split repack + 2.3GB arena upload + prompt prefill).
+Quality unchanged: coherent Qwen3 reasoning trace, logits 16-25.
+
+Remaining headroom (honest): ~5.7e9 weights/s now vs ~20e9 implied by the
+ALU bound (6.75 lane-ops/weight over 128 lanes at 921MHz) -> ~3x is
+theoretically reachable with deeper latency hiding (occupancy is capped at
+3 blocks/SM by the 13KB act tile; register cap allows 4).

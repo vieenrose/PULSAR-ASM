@@ -30,9 +30,11 @@ typedef struct {
   const uint8_t *w;
   uint8_t *codes;   /* host splits (may be NULL after upload) */
   uint16_t *scales;
+  int16_t *corr;    /* unsigned-bias corrections (codes-only) */
 #ifdef PQ2_USE_CUDA
   uint8_t *d_codes;
   unsigned short *d_scales;
+  short *d_corr;
 #endif
   int rows, cols;
 } pq2_ent;
@@ -90,21 +92,26 @@ void pq2_pq2_compat_gemv(int rows, int cols, const unsigned char *w,
 
   uint8_t *codes = NULL;
   uint16_t *scales = NULL;
+  int16_t *corr = NULL;
   if (ci < 0) {
     codes = (uint8_t *)malloc((size_t)rows * ng * 32);
     scales = (uint16_t *)malloc((size_t)rows * ng * 2);
-    if (!codes || !scales) { fprintf(stderr, "pq2: OOM repack\n"); exit(1); }
+    corr = (int16_t *)malloc((size_t)rows * ng * 2);
+    if (!codes || !scales || !corr) { fprintf(stderr, "pq2: OOM repack\n"); exit(1); }
     pq2_split_repack(w, rows, cols, codes, scales);
+    pq2_corr_build(codes, rows, cols, corr);
     if (P2N < PQ2_MAXT) {
       ci = P2N++;
       P2C[ci].w = w;
       P2C[ci].codes = codes;
       P2C[ci].scales = scales;
+      P2C[ci].corr = corr;
       P2C[ci].rows = rows;
       P2C[ci].cols = cols;
 #ifdef PQ2_USE_CUDA
       P2C[ci].d_codes = NULL;
       P2C[ci].d_scales = NULL;
+      P2C[ci].d_corr = NULL;
 #endif
     } else {
       fprintf(stderr, "pq2: cache full, %dx%d kept local\n", rows, cols);
@@ -112,27 +119,36 @@ void pq2_pq2_compat_gemv(int rows, int cols, const unsigned char *w,
   } else {
     codes = P2C[ci].codes;
     scales = P2C[ci].scales;
+    corr = P2C[ci].corr;
   }
 
 #ifdef PQ2_USE_CUDA
   if (ci >= 0) {
     if (!P2C[ci].d_codes && codes) {
       size_t ncb = (size_t)rows * ng * 32, nsb = (size_t)rows * ng * 2;
+      size_t corb = (size_t)rows * ng * 2;
       size_t a = (ncb + 63) / 64 * 64, b = (nsb + 63) / 64 * 64;
-      if (pq2_arena_init(a + b) == 0) {
+      size_t c2 = (corb + 63) / 64 * 64;
+      if (pq2_arena_init(a + b + c2) == 0) {
         uint8_t *pb = P2ARENA + P2ACUR;
         uint8_t *ps = pb + a;
+        uint8_t *pc = ps + b;
         if (cudaMemcpy(pb, codes, ncb, cudaMemcpyHostToDevice) == cudaSuccess &&
-            cudaMemcpy(ps, scales, nsb, cudaMemcpyHostToDevice) == cudaSuccess) {
-          P2ACUR += a + b;
+            cudaMemcpy(ps, scales, nsb, cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(pc, corr, corb, cudaMemcpyHostToDevice) == cudaSuccess) {
+          P2ACUR += a + b + c2;
           P2C[ci].d_codes = pb;
           P2C[ci].d_scales = (unsigned short *)ps;
+          P2C[ci].d_corr = (short *)pc;
           free(codes);
           free(scales);
+          free(corr);
           P2C[ci].codes = NULL;
           P2C[ci].scales = NULL;
+          P2C[ci].corr = NULL;
           codes = NULL;
           scales = NULL;
+          corr = NULL;
         } else {
           fprintf(stderr, "pq2: arena memcpy failed -> CPU\n");
           cudaGetLastError();
@@ -141,7 +157,8 @@ void pq2_pq2_compat_gemv(int rows, int cols, const unsigned char *w,
     }
     uint8_t *dc = P2C[ci].d_codes;
     unsigned short *dsc = P2C[ci].d_scales;
-    if (dc && dsc) {
+    short *dco = P2C[ci].d_corr;
+    if (dc && dsc && dco) {
       size_t xqb = (size_t)(cols / 256) * 292, yb = (size_t)rows * 4;
       if (!d_xq || xqb > P2XQMAX) {
         if (d_xq) cudaFree(d_xq);
@@ -155,7 +172,7 @@ void pq2_pq2_compat_gemv(int rows, int cols, const unsigned char *w,
       }
       if (d_xq && d_y &&
           cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
-          pq2_gemv_sm53_launch(dc, dsc, d_xq, d_y, cols, rows, NULL) == 0 &&
+          pq2_gemv_sm53_launch(dc, dsc, dco, d_xq, d_y, cols, rows, NULL) == 0 &&
           cudaDeviceSynchronize() == cudaSuccess &&
           cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess)
         return;

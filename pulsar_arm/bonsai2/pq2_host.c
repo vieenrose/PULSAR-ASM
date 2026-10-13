@@ -33,6 +33,30 @@ void pq2_split_repack(const uint8_t *pq2, int rows, int K,
   }
 }
 
+/* Per-(row,group) bias correction for the unsigned-activation kernel:
+ * with x' = x XOR 0x80 (unsigned), Pu = sum_{b0} x', Mu = sum_{b1} x',
+ * Au = sum_all x' (row-independent):
+ *   isum = Pu + 2*Mu - Au + corr,
+ *   corr = 16384 - 128*popcount(b0) - 256*popcount(b1),
+ * which fits in int16 (range [16384-16384-32768, 16384] = [-32768, 16384]).
+ * Counts depend only on the weight codes, so this is repack-time work. */
+void pq2_corr_build(const uint8_t *w_codes, int rows, int K, int16_t *w_corr) {
+  int ng = K / 128;
+  for (int r = 0; r < rows; r++) {
+    const uint8_t *cd = w_codes + (size_t)r * ng * 32;
+    int16_t *co = w_corr + (size_t)r * ng;
+    for (int g = 0; g < ng; g++) {
+      const uint8_t *c = cd + g * 32;
+      int pc0 = 0, pc1 = 0;
+      for (int b = 0; b < 32; b++) {
+        pc0 += __builtin_popcount((unsigned)(c[b] & 0x55u));
+        pc1 += __builtin_popcount((unsigned)((c[b] >> 1) & 0x55u));
+      }
+      co[g] = (int16_t)(16384 - 128 * pc0 - 256 * pc1);
+    }
+  }
+}
+
 void pq2_gemv_cpu(int rows, int K, const uint8_t *w_codes,
                   const uint16_t *w_scales_h, const uint8_t *xq, float *y) {
   int ng = K / 128;
