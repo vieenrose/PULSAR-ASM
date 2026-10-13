@@ -194,3 +194,6 @@ To unlock more: (a) fp32-close attention (real vectorization), (b) cooled or
 bigger hardware (sustained 1.71GHz thermal cap binds), (c) new workload/config.
 Engine + phone binary both at exp#6, gate green. Loop converged; do not revive
 discards without a changed assumption.
+
+## CPU-side (deprioritized per user: objective is GPU decode)
+- Quad-row blocked A57 GEMV (k2_core_a57.S, ~30% op reduction/block): syntax-clean version saved at /tmp/k2_core_a57_quad_bak.S. Validated law: 4-product smull tree (v1.8b*v2.8b, v1.16b*v2.16b, v0.8b*v3.8b, v0.16b*v3.16b) == tail code. Bit-exact gate never run. Resume only if CPU leg matters again.
