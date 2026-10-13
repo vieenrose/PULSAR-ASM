@@ -254,6 +254,19 @@ static int NPOS;
 static void embed(int id) {
     uint8_t *W = tw("token_embd.weight");
     int ng = HID / 128;
+#ifdef PQ1_BUILD
+    /* Real Q1_0 (1-bit) checkpoint: 18-byte blocks = fp16 scale + 128
+     * packed bits, bit=1 -> +1. Selected by the shim for the 1-bit build;
+     * the 2-bit path below is unchanged. */
+    const uint8_t *row = W + (size_t)id * ng * 18;
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *b = row + g * 18;
+        float sc = h2f((uint16_t)(b[0] | (b[1] << 8)));
+        const uint8_t *q = b + 2;
+        for (int j = 0; j < 128; j++)
+            X[g * 128 + j] = ((q[j >> 3] >> (j & 7)) & 1) ? sc : -sc;
+    }
+#else
     const uint8_t *row = W + (size_t)id * ng * 34;
     for (int g = 0; g < ng; g++) {
         const uint8_t *b = row + g * 34;
@@ -262,6 +275,7 @@ static void embed(int id) {
         for (int j = 0; j < 128; j++)
             X[g * 128 + j] = (float)(((q[j / 4] >> ((j % 4) * 2)) & 3) - 1) * sc;
     }
+#endif
 }
 
 static int argmax(const float *v, int n) {
