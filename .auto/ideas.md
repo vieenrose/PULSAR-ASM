@@ -980,3 +980,20 @@ OUT: carry-save across code words 0..2 per plane (popc(x0)+popc(x1)+popc(x2) =
 popc(x0^x1^x2)+2popc(maj)), POPC 64 -> 48 at equal instruction count. Needs plane-major
 order: spills at 48 regs (1.64 ms), 64 regs/4 blocks no spill still 1.44 ms > 1.373. The
 kernel is issue-bound; POPC removal only pays when instructions go with it.
+
+## #78 Attention block as one CUDA graph per layer — KEPT
+q+k+v GEMV, head norms, rope, KV store (device cache in arena), attention, Q8_K and attn_output fused per layer. PQ1_ATT_CHECK: 1548 layer-steps bit-exact. ab_pair PQ1_ATT=0: -7.9% when off. Cold 7.46 -> 7.89 decode tps, RSS 343. Arena 1158.9/1280 MB. Next: rms/residual/FFN quant on device (whole layer in one graph); T-MAC epilogue lane split; head GEMV at ~48% of ceiling.
+
+## #79 T-MAC prep one warp per group (ballot) — KEPT
+nvprof showed pq1_tm_prep at 36 us x 4/layer (one thread per group). Ballot version: planes/au identical, A/B PQ1_TMPW=0 -3.2%. Cold 7.89 -> 8.16 decode tps, RSS 339.
+Measured out (iter 5): T-MAC epilogue lane split + sh_prod pad, kernel flat/-1%. Kernel is POPC-throughput bound (sm_5x POPC 32/clk/SM).
+Remaining small kernels per layer (nvprof): attn_pre 100 us, silu_q8k 62 us, attn_core 55 us.
+
+## #80 attn_pre per-thread RMS chains — KEPT
+One-lane DP instructions cost a full warp of DP issue on sm_53; packing 40 head chains into lanes: A/B PQ1_APRE=0 -1.75%. Cold 8.29 decode tps, RSS 342.
+
+## Measured out (loop iter 8): T-MAC plane skipping
+Activation word bit widths (prompt A): K=4096 inputs avg 7.2 signed bits (55% need 8), down input avg 6.7. Kernel V=2 skipping sign-extension planes with warp-uniform branches: 1.371 -> 1.695 ms at 24576x4096 (+23%), overhead >> the 10-16% POPC it could save. Patch in autoresearch/loop-261014-2216/iter8_tm_planeskip.patch.
+
+## Measured out (loop iter 9): silu in the gate+up T-MAC epilogue
+Thread row0=gate i, row1=up N+i, epilogue silu(g)*u then q8k<0>: bit-exact (FFNCHK 1548/0) but ab_pair PQ1_TMSILU=0 +2.04% (old path faster): the DP expf tail serializes on lane sub 0 at block end instead of overlapping. Patch iter9_tm_silu_epilogue.patch.
