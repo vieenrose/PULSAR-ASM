@@ -21,8 +21,8 @@ Three gates, enforced by `.auto/checks.sh`, never overridable:
 
 | metric | baseline (#13) | now | notes |
 |---|---|---|---|
-| decode_tps | 2.1349 | **4.0218** (+88%) | cold harness #70; board clocks locked (jetson_clocks + c7 off, see §5.2) |
-| prefill_tps | 2.2256 | **4.1948** | same code path; no prompt batching |
+| decode_tps | 2.1349 | **4.6106** (+116%) | cold harness #71; board clocks locked (jetson_clocks + c7 off, see §5.2) |
+| prefill_tps | 2.2256 | **4.7612** | same code path; no prompt batching |
 | peak_rss_mb | 206 | 342 | grew with merges+graphs; arena unchanged |
 | startup_s | 2.8 | 2.5 | step 0 = repack + upload + first forward |
 | gpu_used / arena | - | 1014.8 / 1280 MB | the arena is NOT to be shrunk (see #23) |
@@ -35,11 +35,11 @@ HEAD-before-#69 under the same clocks: gemv 217.6, attn 26.7, quant 12.7, silu 1
 
 | shape | calls/token | ms/call | ms/token | kernel |
 |---|---|---|---|---|
-| gate+up merged 24576x4096 | 36 | 2.97 | 106.8 | **T-MAC** |
+| gate+up merged 24576x4096 | 36 | 2.97 -> ~1.9 (#71) | ~70 | **T-MAC, 2 rows/thread** |
 | down 4096x12288 | 36 | 1.60 | 57.5 | SWAR r128 |
 | q/k/v merged 6144x4096 | 36 | ~0.45 | ~16 | SWAR r128 (inside a graph) |
 | o 4096x4096 | 36 | 0.67 | 24.2 | SWAR r128 |
-| head 151669x4096 | 1 | 15.4 | 15.4 | **T-MAC** |
+| head 151669x4096 | 1 | 15.4 -> ~9 (#71) | ~9 | **T-MAC, 2 rows/thread** |
 
 ## 3. What the engine looks like now (the kept chain)
 
@@ -111,8 +111,17 @@ primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy 
    HEAD-before-#69 code: 280 -> ~273 ms/tok (~2%). Re-apply after a reboot before
    comparing against #69's numbers; the #69 A/B (3 pairs, HEAD vs NEON, same clocks):
    275.1/269.5/275.4 vs 246.4/246.6/247.1 ms/tok = +10.5%, no overlap.
-3. **POPC-rate probe** (15 lines, doc §6.1 of the research notes): settles whether POPC
-   is 1/4 or 1/8 rate on this die; decides how far the bit-sliced family can be pushed.
+3. **POPC-rate probe: DONE (#71, `pulsar_arm/bonsai2/tools/popc_probe.cu`).** POPC runs
+   at ~32/clk/SM (quarter rate; popc+iadd chains 31.4 steps/clk, lop+popc+iadd the same).
+   But the T-MAC kernel is NOT POPC-bound: knockouts at 24576x4096 (PQ1_TIME hot loop,
+   2.27 ms) gave no-weight-LDG -2.5%, POPC->LOP -1.5%, no-plane-LDS **-35%**. It was
+   LDS-bound (8 LDS.128 per 128 weights per row). **#71 made it 2 rows/thread** (one
+   plane load feeds two rows' code words): tm 2.27 -> 1.43 ms at gate+up, head 13.5 ->
+   8.2 ms, engine A/B +14.5/+17.9/+18.1%. Next on this kernel: 4 rows/thread (registers:
+   40 used + 16 B spill at 2 rows under -maxrregcount=48; the cap may need raising for
+   the tm kernel only via __launch_bounds__), and re-testing T-MAC on the shapes where
+   the one-row kernel lost (down 4096x12288, q/k/v 6144, o 4096) via PQ1_TM=1 A/B.
+   Apply the same knockout method to the SWAR r128 kernel (down+o+qkv = ~97 ms/token).
 4. **Token-tiled prefill** (M=16/64 GEMM): our prefill = decode speed per token, so the
    20-token prompt costs ~20 decode steps. Batching would make prompts nearly free and
    shorten every harness run, but it does **not** move `decode_tps`. Large task; needs

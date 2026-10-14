@@ -560,6 +560,18 @@ extern "C" int pq1_gemv_r256_launch(const uint8_t* w_codes,
  * mirror the Q8_K block layout (73 words/block: word 0 = fp32 d, words 1..64 =
  * 64 plane words) so the kernel's staging code and every address is unchanged. */
 #define TM_GROUP_WORDS 32 /* 4 32-weight blocks x 8 planes per 128-weight group */
+/* Run #71: TWO rows per thread (128 rows per block). Knockout timing at
+ * 24576x4096 (PQ1_TIME hot loop, 2.27 ms): removing the weight LDG -2.5%,
+ * replacing POPC by LOP -1.5%, removing the plane LDS.128s -35%. The plane
+ * words were re-read from shared for every row (8 LDS.128 per 128 weights,
+ * each a 4-phase 512-byte warp transaction), so the kernel is LDS-bound, not
+ * XU- or DRAM-bound. Each thread now applies one plane load to the code words
+ * of two rows (row and row+64): plane LDS per weight halves, POPC count is
+ * unchanged. Every row's dot product keeps its own pu/pc/isum, its own fp
+ * epilogue and its own in-order 16-group sum, so the result is bit-identical
+ * to the one-row kernel (pq1_parity at every engine shape). */
+#define TM_ROWS 128
+#define TM_HALF 64
 
 __global__ __launch_bounds__(256, 5)
 void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
@@ -568,27 +580,33 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
                  float* __restrict__ y, int K, int N) {
   __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
   __shared__ int sh_au[PQ1_CHUNK_GROUPS];
-  __shared__ float sh_prod[PQ1_BLOCK_ROWS][PQ1_CHUNK_GROUPS];
+  __shared__ float sh_prod[TM_ROWS][PQ1_CHUNK_GROUPS];
 
-  int row = blockIdx.x * PQ1_BLOCK_ROWS + (threadIdx.x >> 2);
+  int lrow = threadIdx.x >> 2;                   /* 0..63 */
+  int row0 = blockIdx.x * TM_ROWS + lrow;
+  int row1 = row0 + TM_HALF;
   int sub = threadIdx.x & 3;
-  if (blockIdx.x * PQ1_BLOCK_ROWS >= N) return; /* block-uniform */
-  bool active = row < N;
-  int rrow = active ? row : 0;
+  if (blockIdx.x * TM_ROWS >= N) return; /* block-uniform */
+  bool act0 = row0 < N, act1 = row1 < N;
+  int rrow0 = act0 ? row0 : 0;
+  int rrow1 = act1 ? row1 : 0;
 
   int K128 = K >> 7;
   int nchunk = K128 / PQ1_CHUNK_GROUPS;
   if (nchunk > PQ1_MAXCHUNK || nchunk <= 0) return;
 
-  float acc = 0.0f; /* lane 0 only; groups accumulated in order */
+  float acc0 = 0.0f, acc1 = 0.0f; /* lane 0 only; groups accumulated in order */
   uint32_t* t32 = reinterpret_cast<uint32_t*>(sh_x);
+  const uint8_t* wrow0 = w_codes + (size_t)rrow0 * (size_t)(K >> 3);
+  const uint8_t* wrow1 = w_codes + (size_t)rrow1 * (size_t)(K >> 3);
+  const __half* srow0 = w_scales + (size_t)rrow0 * (size_t)K128;
+  const __half* srow1 = w_scales + (size_t)rrow1 * (size_t)K128;
 
   for (int ch = 0; ch < nchunk; ch++) {
-    /* Stage this chunk's plane words (and the fp32 scales) into shared. Same
-     * 73-word-per-block source layout, same 68-word-per-block tile layout and
-     * the same 2-words-per-thread split as the SWAR kernel; only the XOR 0x80
-     * is gone (the host applied the bias while building the planes) and Au now
-     * comes from the host instead of a shuffle reduction. */
+    /* Stage this chunk's plane words (and the fp32 scales) into shared: same
+     * 73-word-per-block source layout and 68-word-per-block tile layout as
+     * the SWAR kernel; the host applied the 0x80 bias while building the
+     * planes and supplies Au. */
     const uint32_t* x32 = reinterpret_cast<const uint32_t*>(xpl) +
                           (size_t)ch * PQ1_CHUNK_BLOCKS * 73;
     {
@@ -610,50 +628,58 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
 #pragma unroll 1
     for (int half = 0; half < 4; half++) {
       int g = sub + (half << 2);
+      size_t goff = (size_t)(ch * PQ1_CHUNK_GROUPS + g);
       /* 128 weights = 4 code words (one uint4) = 32 plane words (8 uint4) */
-      const uint4* cv = reinterpret_cast<const uint4*>(
-          w_codes + (size_t)rrow * (K >> 3) +
-          (size_t)(ch * PQ1_CHUNK_GROUPS + g) * 16);
       const uint4* pv =
           reinterpret_cast<uint4*>(t32) + (g >> 1) * 17 + (g & 1) * 8;
-      uint4 cw = __ldg(cv);
-      int pc = __popc(cw.x) + __popc(cw.y) + __popc(cw.z) + __popc(cw.w);
-      int pu = 0;
+      uint4 cw0 = __ldg(reinterpret_cast<const uint4*>(wrow0 + goff * 16));
+      uint4 cw1 = __ldg(reinterpret_cast<const uint4*>(wrow1 + goff * 16));
+      int pc0 = __popc(cw0.x) + __popc(cw0.y) + __popc(cw0.z) + __popc(cw0.w);
+      int pc1 = __popc(cw1.x) + __popc(cw1.y) + __popc(cw1.z) + __popc(cw1.w);
+      int pu0 = 0, pu1 = 0;
 #pragma unroll
       for (int ci = 0; ci < 4; ci++) {
-        uint32_t m = (ci == 0)   ? cw.x
-                     : (ci == 1) ? cw.y
-                     : (ci == 2) ? cw.z
-                                 : cw.w;
+        uint32_t m0 = (ci == 0) ? cw0.x : (ci == 1) ? cw0.y : (ci == 2) ? cw0.z : cw0.w;
+        uint32_t m1 = (ci == 0) ? cw1.x : (ci == 1) ? cw1.y : (ci == 2) ? cw1.z : cw1.w;
         uint4 lo4 = pv[ci * 2];
         uint4 hi4 = pv[ci * 2 + 1];
-        int lo = __popc(lo4.x & m) + 2 * __popc(lo4.y & m) +
-                 4 * __popc(lo4.z & m) + 8 * __popc(lo4.w & m);
-        int hi = 16 * __popc(hi4.x & m) + 32 * __popc(hi4.y & m) +
-                 64 * __popc(hi4.z & m) + 128 * __popc(hi4.w & m);
-        pu += lo + hi;
+        int lo0 = __popc(lo4.x & m0) + 2 * __popc(lo4.y & m0) +
+                  4 * __popc(lo4.z & m0) + 8 * __popc(lo4.w & m0);
+        int hi0 = 16 * __popc(hi4.x & m0) + 32 * __popc(hi4.y & m0) +
+                  64 * __popc(hi4.z & m0) + 128 * __popc(hi4.w & m0);
+        pu0 += lo0 + hi0;
+        int lo1 = __popc(lo4.x & m1) + 2 * __popc(lo4.y & m1) +
+                  4 * __popc(lo4.z & m1) + 8 * __popc(lo4.w & m1);
+        int hi1 = 16 * __popc(hi4.x & m1) + 32 * __popc(hi4.y & m1) +
+                  64 * __popc(hi4.z & m1) + 128 * __popc(hi4.w & m1);
+        pu1 += lo1 + hi1;
       }
       float db;
       __builtin_memcpy(&db, t32 + (g >> 1) * 68 + 64, 4);
+      int au = sh_au[g];
       /* identical to the SWAR kernel's epilogue: same integer isum, same fp */
-      int isum = (pu << 1) - sh_au[g] + 16384 - (pc << 8);
-      float ws = active ? __half2float(__ldg(w_scales + (size_t)rrow * K128 +
-                                            (size_t)(ch * PQ1_CHUNK_GROUPS + g)))
-                        : 0.0f;
-      sh_prod[threadIdx.x >> 2][g] =
-          __fmul_rn(__fmul_rn(ws, db), (float)isum);
+      int isum0 = (pu0 << 1) - au + 16384 - (pc0 << 8);
+      int isum1 = (pu1 << 1) - au + 16384 - (pc1 << 8);
+      float ws0 = act0 ? __half2float(__ldg(srow0 + goff)) : 0.0f;
+      float ws1 = act1 ? __half2float(__ldg(srow1 + goff)) : 0.0f;
+      sh_prod[lrow][g] = __fmul_rn(__fmul_rn(ws0, db), (float)isum0);
+      sh_prod[lrow + TM_HALF][g] = __fmul_rn(__fmul_rn(ws1, db), (float)isum1);
       __syncwarp();
     }
 
     if (sub == 0) {
-      const float* p = sh_prod[threadIdx.x >> 2];
+      const float* p0 = sh_prod[lrow];
+      const float* p1 = sh_prod[lrow + TM_HALF];
 #pragma unroll
-      for (int k = 0; k < PQ1_CHUNK_GROUPS; k++) acc = __fadd_rn(acc, p[k]);
+      for (int k = 0; k < PQ1_CHUNK_GROUPS; k++) acc0 = __fadd_rn(acc0, p0[k]);
+#pragma unroll
+      for (int k = 0; k < PQ1_CHUNK_GROUPS; k++) acc1 = __fadd_rn(acc1, p1[k]);
     }
     __syncthreads(); /* the tile is reused by the next chunk */
   }
 
-  if (sub == 0 && active) y[row] = acc;
+  if (sub == 0 && act0) y[row0] = acc0;
+  if (sub == 0 && act1) y[row1] = acc1;
 }
 
 extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
@@ -663,7 +689,7 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
   if ((K & 127) != 0) return -2;
   if (K <= 0 || K > PQ1_MAXK || N <= 0) return -2;
   dim3 block(256, 1, 1);
-  dim3 grid((N + PQ1_BLOCK_ROWS - 1) / PQ1_BLOCK_ROWS, 1, 1);
+  dim3 grid((N + TM_ROWS - 1) / TM_ROWS, 1, 1);
   cudaStream_t s = (cudaStream_t)stream;
   pq1_gemv_tm<<<grid, block, 0, s>>>(
       w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
