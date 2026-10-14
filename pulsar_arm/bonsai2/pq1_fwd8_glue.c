@@ -492,12 +492,22 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
     if (dc && dsc) {
       size_t xqb = (size_t)(cols / 256) * 292, yb = (size_t)rows * 4;
       if (PQ1_TM < 0) {
-        /* Run #41: T-MAC is 1.36-1.53x faster per kernel launch in isolation
-         * but -1.8% END TO END, because the engine's 253 short launches per
-         * token keep the devfreq governor at ~460MHz (measured: median 461MHz,
-         * max 845MHz) where the kernel is not ALU-bound. Opt-in only, so the
-         * kernel stays available for kernel-level study. */
-        PQ1_TM = getenv("PQ1_TM") ? 1 : 0;
+        /* Run #46/#50: T-MAC (bit-sliced inner loop) is 1.36-1.53x faster per
+         * kernel launch in isolation and bit-exact, but measures -3% to -3.7%
+         * END TO END when it replaces the SWAR kernel on EVERY shape. #42's
+         * per-shape table that appeared to show the long shapes winning was
+         * VOID (#45: that build omitted -DPQ1_REAL_CUDA, so T-MAC never ran).
+         * Modes: unset/0 = off (default), 1 = all shapes, 2 = only the long
+         * shapes (rows >= 100000, i.e. the head GEMV) - the shape-conditional
+         * arm, which has never had valid data. Kernel stays available for study. */
+        const char *e = getenv("PQ1_TM");
+        /* DEFAULT = 2 (head-only). Run #60: gating the bit-sliced kernel to the
+         * rows >= 100000 shapes measured +0.92% decode (order-balanced A/B, two
+         * pairs, +0.46%/+1.38%, every T-MAC run above its paired SWAR run) -
+         * the first VALID shape-conditional T-MAC measurement (#42's per-shape
+         * table was void per #45). PQ1_TM=0 restores pure SWAR everywhere,
+         * PQ1_TM=1 forces T-MAC on every shape (measured -3% at #50). */
+        PQ1_TM = e ? atoi(e) : 2;
       }
       if (PQ1_R128 < 0) {
         /* Run #45: 128 rows/block (2 lanes/row) is the DEFAULT. Interleaved
@@ -536,7 +546,10 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
       }
       double kt0 = KTON ? pq1_now() : 0.0;
       double t_b = 0, t_c = 0, t_e = 0;
-      size_t aub = PQ1_TM ? (size_t)(cols >> 7) * 4 : 0;
+      /* PQ1_TM=2 gates the bit-sliced kernel by shape: only matrices with
+       * rows >= 100000 (the 151669-row head) take the T-MAC path. */
+      int tm_here = (PQ1_TM == 1) || (PQ1_TM == 2 && rows >= 100000);
+      size_t aub = tm_here ? (size_t)(cols >> 7) * 4 : 0;
       if (!d_xq) {
         if (cudaMalloc(&d_xq, PQ1_GRAPH_XQ) == cudaSuccess) P2XQMAX = PQ1_GRAPH_XQ;
       }
@@ -546,7 +559,7 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
       uint32_t *pl = NULL;
       int *auh = NULL;
       int tm_ok = 0;
-      if (PQ1_TM) {
+      if (tm_here) {
         if (!PL_H || xqb > PL_HMAX) {
           free(PL_H);
           PL_H = (uint32_t *)malloc(xqb ? xqb : 1);
