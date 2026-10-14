@@ -854,3 +854,61 @@ off by default. Do not retry on this board; on discrete-VRAM targets it is a ~7%
 * Launch+sync floor: ~150 graph launches/token x 133us (measured in tools/graph_probe.cu)
   = 20ms/token = 6% - irreducible while each GEMV's output is consumed by the CPU
   before the next one's input exists.
+
+---
+
+# SESSION HANDOFF — Q1_0 true-1-bit 8B on Jetson Nano (branch `bonsai-jetson-nano`)
+
+Final state 2026-10-14: **decode 3.53 tps vs the 2.13 tps baseline (+65%)**, prefill 3.66 tps,
+RSS 341 MB, startup 3.0 s, all three gates green. 68 runs logged; ~20 kept changes.
+Full detail: `.auto/HANDOFF_NANO_Q1_0.md`.
+
+## Review: bonsai8b-jetson-nano-research-notes.md (2026-10-14)
+
+**Confirmed by measurement (docs agree with the board):**
+- One 128-core Maxwell SM = 4 partition x 32 lanes; 65536 regs/SM. The doc hedges
+  ("if regsPerMultiprocessor = 32768, halve the block counts") - RESOLVED empirically:
+  5 blocks x 256 thr x 40 regs = 51200 registers resident, and 6 blocks at 42 regs
+  (64512) also fits (#7/#27), so the file is the full 65536.
+- LOP3 / POPC / BFE / PRMT / SHFL all present; 128-bit LDG; sm_53 + CUDA 10.2 frozen.
+- The doc's "XNOR+POPC core" (LOP3 0xC3, POPC, IMAD) is exactly our T-MAC kernel, which
+  is now the default for the long shapes (#60 head +0.9%, #62 gate/up +5.5%).
+- The doc's occupancy table (42 regs = 6 blocks = 48 warps = 75%) matches #27's
+  measurement that extra occupancy beyond 40 warps buys nothing (~+0.5%, n.s.).
+- Register/launch_bounds discipline, uint4 coalescing, shuffle reductions, and fused
+  QKV/gate+up launches are all things this session arrived at independently (merged
+  tensors #55/#56 + CUDA graphs #57/#58 replaced the "fused kernel" form: same effect,
+  zero kernel-side cost).
+
+**Where the doc does NOT apply to this engine (important for the next session):**
+- Its whole GEMV design assumes **binary activations** (sign(x) -> bit-packed bitmap,
+  1 LOP3 + 1 POPC per 32 weights). Our engine mirrors ggml `Q1_0` semantics:
+  1-bit weights x **int8 Q8_K activations**, so the inner loop needs the SWAR
+  mask-and-fold (11 ALU + 2 LDS per 4 weights) or T-MAC's 8 bit-planes.
+- A binary-activation engine would be a NEW OBJECTIVE, not a tuning step: it would
+  cut the inner loop ~4x (the doc's roofline says the kernel then becomes DRAM-bound
+  at 1.06 GB/token = ~44 ms/token floor, i.e. ~15-20 tps). It cannot be validated
+  against the current frozen goldens (they encode the Q8_K pipeline's token stream)
+  - it needs gates derived from the true model (MLX/paper) semantics first.
+- KV quantization/paging/64K-context sections: N/A while prompts are tens of tokens.
+
+**Instruments worth building (cheap, not yet built):**
+- §6.1 POPC throughput probe (15 lines): settles 1/4 vs 1/8 XU rate, which decides the
+  T-MAC-vs-SWAR crossover and how far the bit-sliced path can be pushed.
+- §6.2 read-only DRAM probe: already covered by `tools/stream_ceiling.cu`
+  (21.4 GB/s boosted from 1 SM, 8.7 GB/s in a 1-s window).
+
+**Operator-level levers (§4.4) never tested here because they need root - HIGHEST VALUE ASK:**
+- `sudo nvpmodel -m 0 && sudo jetson_clocks` (10 W MAXN + lock CPU/GPU/EMC clocks).
+  The GPU is already at 921.6 MHz during runs (#43), but the CPU governor was never
+  checked, and #68 found **~28% of decode is CPU-side** (79 ms of 283 ms/token:
+  attention softmax, silu expf, Q8_K quantize, rmsnorms, argmax). If the A57s are
+  parked by schedutil, that share is inflated - lock the clocks, then RE-BASELINE.
+- `isolcpus=2,3` + pinning the engine to cores 2-3, zram, `nvm-map=3264M` headless.
+
+**Prefill batching (doc §5.4) - recorded, not scheduled:** our engine prefills one token
+at a time (prefill_tps 3.66 ~= decode 3.53), so a 20-token prompt costs like 20 decode
+steps. A token-tiled prefill kernel (M=16/64) would make prompt processing ~free and
+speed up every harness run, but it does not move `decode_tps` (the primary metric), and
+it is a large kernel+KV-API task. Bit-exactness is plausible (per-token dot order
+unchanged) but must be proven with the same parity+golden gates.
