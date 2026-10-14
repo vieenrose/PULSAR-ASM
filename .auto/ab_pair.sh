@@ -22,7 +22,12 @@ REPO=/home/louis/PULSAR-ASM
 IDS="151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 624 151645 198 151644 77091 198"
 
 run_arm() { # $1 = arm (base|env), $2 = label
-  if [ "$1" = env ]; then export PQ1_EXTRA="$ENVNAME=1"; else unset PQ1_EXTRA; fi
+  if [ "$1" = env ]; then
+    # ENVNAME may be a bare var name (-> =1) or a full assignment, e.g. PQ1_R128=0
+    case "$ENVNAME" in *"="*) export PQ1_EXTRA="$ENVNAME";; *) export PQ1_EXTRA="$ENVNAME=1";; esac
+  else
+    unset PQ1_EXTRA
+  fi
   local out t
   out=$(cd "$REPO" && bash .auto/measure.sh 2>&1)
   t=$(echo "$out" | grep -o 'decode_tps=[0-9.]*' | cut -d= -f2)

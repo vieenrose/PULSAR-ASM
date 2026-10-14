@@ -289,7 +289,13 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
          * was a single cross-session harness sample of the same shape, i.e. a
          * null inside a +-2-6% drift band, not a measured zero. Set PQ1_SWAR=1
          * to A/B the 64-row kernel against it. */
-        PQ1_R128 = getenv("PQ1_SWAR") ? 0 : 1;
+        PQ1_R128 = getenv("PQ1_R128") ? atoi(getenv("PQ1_R128"))
+                                       : (getenv("PQ1_SWAR") ? 0 : 1);
+        /* PQ1_R128 unset -> default rule (rows>=8192 use r256, the rest r128);
+         * PQ1_R128=0 -> the 64-row kernel for the shapes the rule sends to r128
+         * (the small-N arm of run #48's dispatch experiment, which the old
+         * PQ1_SWAR-only initialisation made unreachable - #49 proved the env
+         * var was silently ignored); PQ1_R128=1 -> r128 for every shape. */
       }
       if (PQ1_R256 < 0) {
         /* Run #46: 256 rows/block (1 lane/row) is used for LARGE matrices only.
