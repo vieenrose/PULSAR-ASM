@@ -1,4 +1,4 @@
-.globl g_LBASE, g_O_HEAD, g_vocab, tbl_koff, tbl_krows, tbl_kcols, g_task_sc, k2q4_gemv_range, b_KCAbuf, b_VCAbuf, b_SC, b_HEADB
+.globl g_LBASE, g_O_HEAD, g_vocab, tbl_koff, tbl_krows, tbl_kcols, g_task_sc, k2q4_gemv_range, b_KCAbuf, b_VCAbuf, b_SC, b_HEADB, g_nthreads
 /* PULSAR-ASM | pulsar_arm/k2horizon/k2_core.S
  *
  * Pure AArch64 assembly runtime for IFM K2-Horizon-0.9B (Q4 blobs).
