@@ -21,8 +21,8 @@ Three gates, enforced by `.auto/checks.sh`, never overridable:
 
 | metric | baseline (#13) | now | notes |
 |---|---|---|---|
-| decode_tps | 2.1349 | **6.4104** (+200%) | cold harness #73; board clocks locked (jetson_clocks + c7 off, see §5.2) |
-| prefill_tps | 2.2256 | **6.7021** | same code path; no prompt batching |
+| decode_tps | 2.1349 | **6.7476** (+216%) | cold harness #74; board clocks locked (jetson_clocks + c7 off, see §5.2) |
+| prefill_tps | 2.2256 | **6.8938** | same code path; no prompt batching |
 | peak_rss_mb | 206 | 340 | grew with merges+graphs; arena unchanged |
 | startup_s | 2.8 | 2.4 | step 0 = repack + upload + first forward |
 | gpu_used / arena | - | 1014.8 / 1280 MB | the arena is NOT to be shrunk (see #23) |
@@ -32,6 +32,9 @@ before #69; after #69 (pass-level profiler `PQ1_CPUTIME=1`, ms/tok over decode s
 total 251.2 = gemv 214.2 (GPU + glue) + attn 13.6 + silu 12.3 + quant 4.7 + rms 2.1 +
 headnorm 1.4 + sample 1.1 + resid 0.8 + rope 0.5 + argmax 0.4 + kvcopy 0.1.
 HEAD-before-#69 under the same clocks: gemv 217.6, attn 26.7, quant 12.7, silu 11.2, rope 5.9.
+After #74 (same profiler, 24 decode steps): total 151.5 = gemv 127.8 (GPU + API) + attn 8.3 +
+silu 7.4 + quant 3.8 + rms 2.0 + headnorm 1.4 + sample 1.1 + kvcopy 0.8 + resid 0.7 +
+rope 0.5 + argmax 0.4. CPU side is now ~24 ms/token (16%).
 
 | shape | calls/token | ms/call | ms/token | kernel |
 |---|---|---|---|---|
@@ -93,12 +96,24 @@ primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy 
 
 ## 5. Open levers, ranked
 
-1. **CPU passes: now ~37 ms/token (15%), was ~79.** Done in #69 (all bit-exact, logits
+1. **CPU passes: now ~24 ms/token (16%), was ~79.** #74 (all bit-exact, logits identical
+   on all 44 steps): K cache transposed into 16-position tiles `KTC[l][kh][t/16][i][t%16]`
+   so q.k is one vfmaq chain per lane (lane = position, i order unchanged; the first
+   attempt with a plain `[i][t]` layout at 2 KB stride THRASHED the 2-way L1 and was
+   slower, 17.7 ms); V cache kv-head major `VCA[l][kh][t][128]` so p.v streams a 22 KB
+   slab that stays in L1 across the 4 passes and the 4 heads of a kv group; p.v with 8
+   NAMED accumulators (gcc 7 -O2 keeps a `float32x4_t a[16]` in memory: 8.8 ms); silu
+   with two independent 4-lane chains per iteration; Q8_K quant with a 16-lane amax-index
+   probe, uzp1 narrowing and an in-register pairwise bsums tree (12.5 vs 15.8 us/call at
+   K=4096, bytes identical). attn 13.6 -> 8.3, silu 9.1 -> 7.4, quant 4.5 -> 3.8.
+   OpenMP retried on the head loop and silu (4 threads, static): attn 11.6/9.7 ms and
+   silu 9.4/10.5 ms (passive/active) vs 8.3/7.4 serial - still a loss, see below.
+   Previously done in #69 (all bit-exact, logits
    identical on every step, goldens exact): rope tables once per position (5.9 -> 0.5),
    expf once per score + 8-way interleaved fmaf q.k chains + 4-lane vfmaq p.v (26.7 ->
    13.6), NEON Q8_K quant with the nearest_int magic-add done per lane (12.7 -> 4.7).
    What is left and how to take it:
-   - **silu 12.3 -> 9.0 ms (#70):** glibc 2.27 `expf` re-implemented in 2-lane float64
+   - **silu 12.3 -> 9.0 ms (#70), 7.4 (#74):** glibc 2.27 `expf` re-implemented in 2-lane float64
      NEON (`pq1_expf_neon.h`, proven by exhaustive test over all 4.28e9 non-NaN floats
      with `pq1_expf_test.c`, 0 mismatches). It MUST live in a `-ffp-contract=off` unit
      (pq1_host.c): under default contraction 2 inputs came out 1 ulp off. The remaining
@@ -106,9 +121,10 @@ primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy 
      (vgetq_lane + scalar ldr + vcreate); `vld1q_lane_u64` straight from the table and
      `vdivq_f32` latency are the next targets (worth maybe 3-4 ms = ~1.5%). Moving silu
      to the GPU breaks bit-exactness (different expf).
-   - **attn 13.6 ms** at NPOS<=44: dominated by the p.v pass (128-wide, memory-bound
-     on VCA) and the 8-chain q.k; a further 2x would need K/V in a head-major layout
-     (one contiguous 128-float row per (t, kh) already, so little left).
+   - **attn 8.3 ms (#74)** at NPOS<=44: q.k ~3.7 (1.77M fmla/token, near 1 fmla/clk),
+     softmax ~1.2 (expf + fdiv per score), p.v ~3.8. What is left is instruction floor
+     plus the 32x per-head overhead; the next real step is the head loop on the idle
+     cores with a custom spin pool (see OpenMP note).
    - **OpenMP is a measured LOSS here, do not retry naively:** with passive waits the
      ~390 us worker wake-up after each GPU wait made quant 12.7 -> 55 ms; with
      `OMP_WAIT_POLICY=active` / `GOMP_SPINCOUNT` the CPU passes drop (quant 7, attn 9,
@@ -123,6 +139,20 @@ primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy 
    HEAD-before-#69 code: 280 -> ~273 ms/tok (~2%). Re-apply after a reboot before
    comparing against #69's numbers; the #69 A/B (3 pairs, HEAD vs NEON, same clocks):
    275.1/269.5/275.4 vs 246.4/246.6/247.1 ms/tok = +10.5%, no overlap.
+   - **T-MAC kernel knockouts (#74, hot loop 24576x4096, base 1.434 ms):** no weight
+     LDG 1.323 (-8%), no plane LDS 1.198 (-16%), both 1.067 (-26%). 1.07 ms IS the POPC
+     floor (28.3M POPC/call at 32/clk/SM, 921.6 MHz = 0.96 ms) and the issue floor (~30
+     instrs per 32-weight row step), so the kernel sits at ~70% of its instruction
+     floor. Latency-hiding variants, all bit-exact, all measured OUT: software-pipelined
+     weight prefetch 1.435, full unroll 1.645 (68 B spill), `__launch_bounds__(256,4)`
+     at 64 regs 1.481, pipe+lb4 1.429, unroll+lb4 1.574 vs 1.4255 base. LUT, HFMA2 and
+     byte-SWAR formulations were analysed and are no better than POPC on sm_53.
+   - **Next big lever = hybrid CPU/GPU row split:** 3 A57 cores idle during the ~128 ms
+     of GPU time per token. Keeping ~15-20% of the rows of each tensor in host RAM and
+     running them on the CPU (Q8_K dot, same per-row order as the kernel: exact) while
+     the GPU does the rest would cut the GPU phase proportionally. Costs: ~200 MB more
+     RSS, a CPU 1-bit kernel at ~3-4 GB/s per core, and the merge of outputs; needs the
+     same parity gate per row.
 3. **POPC-rate probe: DONE (#71, `pulsar_arm/bonsai2/tools/popc_probe.cu`).** POPC runs
    at ~32/clk/SM (quarter rate; popc+iadd chains 31.4 steps/clk, lop+popc+iadd the same).
    But the T-MAC kernel is NOT POPC-bound: knockouts at 24576x4096 (PQ1_TIME hot loop,

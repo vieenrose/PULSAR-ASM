@@ -141,6 +141,24 @@ int pq1_tm_prep_launch(const unsigned char *a, unsigned int *b, int *c, int d,
  * and 2 of 4.28e9 inputs came out 1 ulp off (exhaustive test). */
 void pq1_silu_mul(float *lu, const float *lg, int n) {
     int i = 0;
+    /* two independent 4-lane chains per iteration (#74): the expf core is a
+     * dependent chain of ~20 double ops plus a divide, so one chain at a time
+     * left the A57's second FP pipe idle. Per-lane arithmetic unchanged. */
+    const int n8 = n & ~7;
+    /* Serial on purpose: OpenMP over 4 cores read 9.4 (passive) / 10.5 ms/tok
+     * (active) against 7.5 serial; 36 fork/joins per token cost more than the
+     * work they split (#74). */
+    for (int j = 0; j < n8; j += 8) {
+        const float32x4_t g0 = vld1q_f32(lg + j), u0 = vld1q_f32(lu + j);
+        const float32x4_t g1 = vld1q_f32(lg + j + 4), u1 = vld1q_f32(lu + j + 4);
+        const float32x4_t e0 = pq1_expf4(vnegq_f32(g0));
+        const float32x4_t e1 = pq1_expf4(vnegq_f32(g1));
+        const float32x4_t sg0 = vdivq_f32(vdupq_n_f32(1.0f), vaddq_f32(vdupq_n_f32(1.0f), e0));
+        const float32x4_t sg1 = vdivq_f32(vdupq_n_f32(1.0f), vaddq_f32(vdupq_n_f32(1.0f), e1));
+        vst1q_f32(lu + j, vmulq_f32(vmulq_f32(g0, sg0), u0));
+        vst1q_f32(lu + j + 4, vmulq_f32(vmulq_f32(g1, sg1), u1));
+    }
+    i = n8;
     for (; i + 4 <= n; i += 4) {
         const float32x4_t g = vld1q_f32(lg + i), u = vld1q_f32(lu + i);
         const float32x4_t e = pq1_expf4(vnegq_f32(g));

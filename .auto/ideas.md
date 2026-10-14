@@ -912,3 +912,14 @@ steps. A token-tiled prefill kernel (M=16/64) would make prompt processing ~free
 speed up every harness run, but it does not move `decode_tps` (the primary metric), and
 it is a large kernel+KV-API task. Bit-exactness is plausible (per-token dot order
 unchanged) but must be proven with the same parity+golden gates.
+
+## #74 CPU attention/silu/quant second pass (keep): decode 6.4104 -> 6.7476 cold
+K cache tiled-transposed (16 positions per 8 KB tile), V cache kv-head major, p.v with
+8 named accumulators, silu 2 chains, Q8_K quant 16-lane amax probe + uzp1 + bsums tree.
+Bit-exact (logits identical 44/44, goldens A/B exact, parity 256/256 512/512). On-board
+alternating A/B vs HEAD binary, 2 rounds x 3 pairs, ms/tok (new/head): 156.65/160.94,
+150.85/160.97, 150.73/166.77, 151.09/161.22, 150.60/160.96, 151.88/160.95 = -6.0%.
+Measured OUT in the same run: `[i][t]` K^T at 2 KB stride (L1 2-way thrash, attn 17.7 ms),
+`float32x4_t a[16]` accumulators (kept in memory by gcc 7, p.v 8.8 ms), OpenMP on heads
+and silu (passive/active: attn 11.6/9.7, silu 9.4/10.5 vs 8.3/7.4 serial), T-MAC
+latency-hiding variants (pipe/unroll/launch_bounds: 1.429-1.645 vs 1.4255 ms).

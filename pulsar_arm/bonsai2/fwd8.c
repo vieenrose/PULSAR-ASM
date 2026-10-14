@@ -69,8 +69,21 @@ static void q8_K_quant(const float *x, uint8_t *yv, int64_t k) {
             memset(yb + 4, 0, 256);
             continue;
         }
+        /* first index with |x| == amax, 16 lanes per probe (#74): same
+           element the serial strict-> scan selects */
         float max = 0;
-        for (int j = 0; j < 256; ++j) if (fabsf(x[j]) == amax) { max = x[j]; break; }
+        {
+            const float32x4_t am4 = vdupq_n_f32(amax);
+            int j = 0;
+            for (; j < 256; j += 16) {
+                uint32x4_t e = vorrq_u32(vorrq_u32(vceqq_f32(vabsq_f32(vld1q_f32(x + j)), am4),
+                                                   vceqq_f32(vabsq_f32(vld1q_f32(x + j + 4)), am4)),
+                                         vorrq_u32(vceqq_f32(vabsq_f32(vld1q_f32(x + j + 8)), am4),
+                                                   vceqq_f32(vabsq_f32(vld1q_f32(x + j + 12)), am4)));
+                if (vmaxvq_u32(e)) break;
+            }
+            for (int jj = j; jj < j + 16; ++jj) if (fabsf(x[jj]) == amax) { max = x[jj]; break; }
+        }
         const float iscale = -127.f / max;
         /* nearest_int(iscale*x) per lane: one IEEE multiply, the +2^23*1.5
            magic add (FPCR round-to-nearest-even, as the scalar FPU), the
@@ -79,13 +92,26 @@ static void q8_K_quant(const float *x, uint8_t *yv, int64_t k) {
         const int32x4_t m23 = vdupq_n_s32(0x007fffff), b22 = vdupq_n_s32(0x00400000);
         const int32x4_t c127 = vdupq_n_s32(127);
 #define Q8K_LANE4(off) vminq_s32(vsubq_s32(vandq_s32(vreinterpretq_s32_f32( \
-            vaddq_f32(vmulq_f32(vld1q_f32(x + j + (off)), is4), magic)), m23), b22), c127)
-        for (int j = 0; j < 256; j += 16) {
-            int16x8_t h01 = vcombine_s16(vmovn_s32(Q8K_LANE4(0)), vmovn_s32(Q8K_LANE4(4)));
-            int16x8_t h23 = vcombine_s16(vmovn_s32(Q8K_LANE4(8)), vmovn_s32(Q8K_LANE4(12)));
-            int8x16_t q = vcombine_s8(vmovn_s16(h01), vmovn_s16(h23));
-            vst1q_s8(qs + j, q);
-            bsums[j >> 4] = vaddlvq_s8(q);   /* exact: |sum| <= 16*127 */
+            vaddq_f32(vmulq_f32(vld1q_f32(x + (off)), is4), magic)), m23), b22), c127)
+        /* bsums: 8 int16 group sums per half block, reduced in registers by
+           a pairwise-add tree and stored as one vector (#74); integer sums
+           of 16 int8 are exact in any order, |sum| <= 16*127 */
+        for (int j = 0; j < 256; j += 128) {
+            int16x8_t sm[8];
+            for (int g = 0; g < 8; g++) {
+                const int jg = j + 16 * g;
+                /* narrowing by uzp1 (low halves of the lane pairs) = xtn+ins
+                   in one op; the values fit in int8 so the halves are exact */
+                int16x8_t h01 = vuzp1q_s16(vreinterpretq_s16_s32(Q8K_LANE4(jg)),
+                                           vreinterpretq_s16_s32(Q8K_LANE4(jg + 4)));
+                int16x8_t h23 = vuzp1q_s16(vreinterpretq_s16_s32(Q8K_LANE4(jg + 8)),
+                                           vreinterpretq_s16_s32(Q8K_LANE4(jg + 12)));
+                vst1q_s8(qs + jg, vuzp1q_s8(vreinterpretq_s8_s16(h01), vreinterpretq_s8_s16(h23)));
+                sm[g] = vaddq_s16(h01, h23);
+            }
+            int16x8_t p01 = vpaddq_s16(sm[0], sm[1]), p23 = vpaddq_s16(sm[2], sm[3]);
+            int16x8_t p45 = vpaddq_s16(sm[4], sm[5]), p67 = vpaddq_s16(sm[6], sm[7]);
+            vst1q_s16(bsums + (j >> 4), vpaddq_s16(vpaddq_s16(p01, p23), vpaddq_s16(p45, p67)));
         }
 #undef Q8K_LANE4
         float d = 1.0f / iscale;
@@ -321,8 +347,17 @@ static float X[HID], XN[HID], AO[HID], FO[HID];
 static float QF[32 * 128], KF[8 * 128], VF[8 * 128];
 static float ATTO[32 * 128], LG[INTER], LU[INTER];
 static float HEAD[VOCAB];
-static float KCA[36][512][8 * 128];
-static float VCA[36][512][8 * 128];
+/* K cache TRANSPOSED (run #74): [layer][kv head][dim][position], so that the
+ * q.k scores of 4/8/16 consecutive positions are one NEON fma chain per lane
+ * (lane = position) with the per-position arithmetic unchanged: lane t of
+ * vfmaq_f32(acc, dup(q[i]), K^T[i][t..]) is exactly fmaf(q[i], K[t][i], acc)
+ * in the same i order as the serial reference. Same 75 MB as the row layout. */
+#define KTB 16                       /* positions per contiguous K^T tile */
+static float KTC[36][NKV][CTX / KTB][HDIM][KTB];   /* [layer][kh][tile][i][t%16] */
+/* V cache kv-head major (#74): a head's p.v walks a contiguous 512 B/position
+ * slab (22 KB at 44 positions) that stays in L1 across its 4 passes and the 4
+ * query heads sharing the kv head; the row layout strode 4 KB (L1 set alias). */
+static float VCA[36][NKV][CTX][HDIM];
 static int NPOS;
 
 static void embed(int id) {
@@ -458,8 +493,9 @@ int main(int argc, char **argv) {
             rope_yarn_apply(QF, NHEAD, NPOS);
             rope_yarn_apply(KF, NKV, NPOS);
             ct_mark(CT_ROPE);
-            memcpy(KCA[il][NPOS], KF, NKV * HDIM * 4);
-            memcpy(VCA[il][NPOS], VF, NKV * HDIM * 4);
+            for (int kh = 0; kh < NKV; kh++)
+                for (int i = 0; i < HDIM; i++) KTC[il][kh][NPOS / KTB][i][NPOS % KTB] = KF[kh * 128 + i];
+            for (int kh = 0; kh < NKV; kh++) memcpy(VCA[il][kh][NPOS], VF + kh * HDIM, HDIM * 4);
             ct_mark(CT_KVCPY);
             /* Same arithmetic as the serial reference (kept in
              * fwd8_cpu_parity.c), reorganised for the A57:
@@ -470,49 +506,63 @@ int main(int argc, char **argv) {
              *  - softmax: expf(sc-mx) once per score, reused in the sum.
              *  - p.v: lane i accumulates o[i] = fma(p, v[i], o[i]) over t in
              *    the reference order; four lanes per NEON fma. */
+            /* Serial on purpose: an OpenMP parallel-for over the 32 heads read
+             * 11.6 ms/tok (passive) / 9.7 (active) vs 8.7 serial, and the active
+             * spin cost the GPU side 5% on top (#74). */
             for (int h = 0; h < NHEAD; h++) {
                 const int kh = h / 4;
                 const float *q = QF + h * 128;
-                float mx = -1e30f, sc[CTX];
-                int t = 0;
-                for (; t + 8 <= NPOS + 1; t += 8) {
-                    const float *K0 = (float *)KCA[il][t + 0] + kh * 128;
-                    const float *K1 = (float *)KCA[il][t + 1] + kh * 128;
-                    const float *K2 = (float *)KCA[il][t + 2] + kh * 128;
-                    const float *K3 = (float *)KCA[il][t + 3] + kh * 128;
-                    const float *K4 = (float *)KCA[il][t + 4] + kh * 128;
-                    const float *K5 = (float *)KCA[il][t + 5] + kh * 128;
-                    const float *K6 = (float *)KCA[il][t + 6] + kh * 128;
-                    const float *K7 = (float *)KCA[il][t + 7] + kh * 128;
-                    float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
-                    for (int i = 0; i < 128; i++) {
-                        const float qi = q[i];
-                        s0 = fmaf(qi, K0[i], s0); s1 = fmaf(qi, K1[i], s1);
-                        s2 = fmaf(qi, K2[i], s2); s3 = fmaf(qi, K3[i], s3);
-                        s4 = fmaf(qi, K4[i], s4); s5 = fmaf(qi, K5[i], s5);
-                        s6 = fmaf(qi, K6[i], s6); s7 = fmaf(qi, K7[i], s7);
+                float mx = -1e30f, sc[CTX], pr[CTX];
+                const float32x4_t scl = vdupq_n_f32(0.0883883476f);
+                int t;
+                /* q.k over 16-position tiles (8 KB contiguous each): lane =
+                 * position, fma chain over i in the reference order (#74).
+                 * The last tile is computed in full; lanes past NPOS are
+                 * never read (static storage, always finite). */
+                for (t = 0; t <= NPOS; t += KTB) {
+                    float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+                    float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+                    const float *kp = &KTC[il][kh][t / KTB][0][0];
+                    for (int i = 0; i < 128; i++, kp += KTB) {
+                        const float32x4_t qi = vdupq_n_f32(q[i]);
+                        a0 = vfmaq_f32(a0, qi, vld1q_f32(kp));
+                        a1 = vfmaq_f32(a1, qi, vld1q_f32(kp + 4));
+                        a2 = vfmaq_f32(a2, qi, vld1q_f32(kp + 8));
+                        a3 = vfmaq_f32(a3, qi, vld1q_f32(kp + 12));
                     }
-                    sc[t + 0] = s0 * 0.0883883476f; sc[t + 1] = s1 * 0.0883883476f;
-                    sc[t + 2] = s2 * 0.0883883476f; sc[t + 3] = s3 * 0.0883883476f;
-                    sc[t + 4] = s4 * 0.0883883476f; sc[t + 5] = s5 * 0.0883883476f;
-                    sc[t + 6] = s6 * 0.0883883476f; sc[t + 7] = s7 * 0.0883883476f;
-                }
-                for (; t <= NPOS; t++) {
-                    const float *Kt = (float *)KCA[il][t] + kh * 128;
-                    float s = 0;
-                    for (int i = 0; i < 128; i++) s = fmaf(q[i], Kt[i], s);
-                    sc[t] = s * 0.0883883476f;
+                    vst1q_f32(sc + t, vmulq_f32(a0, scl));
+                    vst1q_f32(sc + t + 4, vmulq_f32(a1, scl));
+                    vst1q_f32(sc + t + 8, vmulq_f32(a2, scl));
+                    vst1q_f32(sc + t + 12, vmulq_f32(a3, scl));
                 }
                 for (t = 0; t <= NPOS; t++) if (sc[t] > mx) mx = sc[t];
                 double es = 0;
                 for (t = 0; t <= NPOS; t++) { sc[t] = expf(sc[t] - mx); es += sc[t]; }
+                for (t = 0; t <= NPOS; t++) pr[t] = sc[t] / (float)es;
+                /* p.v: o[i] = fma(p_t, v_t[i], o[i]) over t in order; 16 lane
+                 * groups kept in registers per pass, two passes over i (#74) */
                 float *o = ATTO + h * 128;
-                for (int i = 0; i < 128; i += 4) vst1q_f32(o + i, vdupq_n_f32(0));
-                for (t = 0; t <= NPOS; t++) {
-                    const float32x4_t p4 = vdupq_n_f32(sc[t] / (float)es);
-                    const float *Vt = (float *)VCA[il][t] + kh * 128;
-                    for (int i = 0; i < 128; i += 4)
-                        vst1q_f32(o + i, vfmaq_f32(vld1q_f32(o + i), vld1q_f32(Vt + i), p4));
+                for (int ib = 0; ib < 128; ib += 32) {
+                    /* 8 named accumulators: gcc 7 -O2 keeps a float32x4_t[]
+                     * in memory (no unroll), which cost 8.8 ms/tok (#74) */
+                    float32x4_t c0 = vdupq_n_f32(0), c1 = c0, c2 = c0, c3 = c0;
+                    float32x4_t c4 = c0, c5 = c0, c6 = c0, c7 = c0;
+                    const float *Vt = &VCA[il][kh][0][ib];
+                    for (t = 0; t <= NPOS; t++, Vt += HDIM) {
+                        const float32x4_t p4 = vdupq_n_f32(pr[t]);
+                        c0 = vfmaq_f32(c0, vld1q_f32(Vt), p4);
+                        c1 = vfmaq_f32(c1, vld1q_f32(Vt + 4), p4);
+                        c2 = vfmaq_f32(c2, vld1q_f32(Vt + 8), p4);
+                        c3 = vfmaq_f32(c3, vld1q_f32(Vt + 12), p4);
+                        c4 = vfmaq_f32(c4, vld1q_f32(Vt + 16), p4);
+                        c5 = vfmaq_f32(c5, vld1q_f32(Vt + 20), p4);
+                        c6 = vfmaq_f32(c6, vld1q_f32(Vt + 24), p4);
+                        c7 = vfmaq_f32(c7, vld1q_f32(Vt + 28), p4);
+                    }
+                    vst1q_f32(o + ib, c0);      vst1q_f32(o + ib + 4, c1);
+                    vst1q_f32(o + ib + 8, c2);  vst1q_f32(o + ib + 12, c3);
+                    vst1q_f32(o + ib + 16, c4); vst1q_f32(o + ib + 20, c5);
+                    vst1q_f32(o + ib + 24, c6); vst1q_f32(o + ib + 28, c7);
                 }
             }
             ct_mark(CT_ATTN);
