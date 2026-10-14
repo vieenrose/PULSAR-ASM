@@ -21,13 +21,17 @@ Three gates, enforced by `.auto/checks.sh`, never overridable:
 
 | metric | baseline (#13) | now | notes |
 |---|---|---|---|
-| decode_tps | 2.1349 | **3.5289** (+65%) | cold harness, 3 samples 3.5248-3.5339 |
-| prefill_tps | 2.2256 | **3.6585** | same code path; no prompt batching |
-| peak_rss_mb | 206 | 341 | grew with merges+graphs; arena unchanged |
-| startup_s | 2.8 | 3.0 | step 0 = repack + upload + first forward |
+| decode_tps | 2.1349 | **3.9900** (+87%) | cold harness #69; board clocks locked (jetson_clocks + c7 off, see §5.2) |
+| prefill_tps | 2.2256 | **4.1333** | same code path; no prompt batching |
+| peak_rss_mb | 206 | 342 | grew with merges+graphs; arena unchanged |
+| startup_s | 2.8 | 2.5 | step 0 = repack + upload + first forward |
 | gpu_used / arena | - | 1014.8 / 1280 MB | the arena is NOT to be shrunk (see #23) |
 
-Per-token budget (PQ1_KTIME=1 + arithmetic): **283 ms = 204 ms device + ~79 ms CPU (28%)**.
+Per-token budget (PQ1_KTIME=1 + arithmetic): **283 ms = 204 ms device + ~79 ms CPU (28%)**
+before #69; after #69 (pass-level profiler `PQ1_CPUTIME=1`, ms/tok over decode steps):
+total 251.2 = gemv 214.2 (GPU + glue) + attn 13.6 + silu 12.3 + quant 4.7 + rms 2.1 +
+headnorm 1.4 + sample 1.1 + resid 0.8 + rope 0.5 + argmax 0.4 + kvcopy 0.1.
+HEAD-before-#69 under the same clocks: gemv 217.6, attn 26.7, quant 12.7, silu 11.2, rope 5.9.
 
 | shape | calls/token | ms/call | ms/token | kernel |
 |---|---|---|---|---|
@@ -77,17 +81,32 @@ primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy 
 
 ## 5. Open levers, ranked
 
-1. **CPU passes = ~79 ms/token (28%).** Not yet profiled at pass level. Plan: add
-   `clock_gettime` timers per pass in `fwd8.c` (attention, rmsnorm, Q8_K quantize, silu,
-   rope, argmax, scatter), print at exit. Then attack only bit-exact-safe parts:
-   e.g. attention currently calls `expf` **twice per score** (once for the softmax
-   denominator, once in the weighted sum) — caching it is bit-exact and halves the expf
-   count. `q8_K_quant`'s abs-max scan and the rms sum are the other candidates, but any
-   NEON rewrite must preserve IEEE order/tie-breaks exactly or the goldens break.
-2. **Lock the board clocks (operator, needs root):** `sudo nvpmodel -m 0 &&
-   sudo jetson_clocks`, optionally `isolcpus=2,3`. The GPU is already at 921.6 MHz
-   during runs (#43), but the **CPU governor was never checked** and the CPU is now 28%
-   of decode. Lock, then **re-baseline** — this could be worth several %.
+1. **CPU passes: now ~37 ms/token (15%), was ~79.** Done in #69 (all bit-exact, logits
+   identical on every step, goldens exact): rope tables once per position (5.9 -> 0.5),
+   expf once per score + 8-way interleaved fmaf q.k chains + 4-lane vfmaq p.v (26.7 ->
+   13.6), NEON Q8_K quant with the nearest_int magic-add done per lane (12.7 -> 4.7).
+   What is left and how to take it:
+   - **silu 12.3 ms** = 36 x 12288 scalar `expf` + divide. The only bit-exact route is
+     re-implementing glibc 2.27's `expf` (Szabolcs Nagy table+poly, computed in double)
+     in 2-lane float64 NEON, then `vdivq_f32` (IEEE). Est. gain 5-8 ms. Moving silu to
+     the GPU breaks bit-exactness (different expf).
+   - **attn 13.6 ms** at NPOS<=44: dominated by the p.v pass (128-wide, memory-bound
+     on VCA) and the 8-chain q.k; a further 2x would need K/V in a head-major layout
+     (one contiguous 128-float row per (t, kh) already, so little left).
+   - **OpenMP is a measured LOSS here, do not retry naively:** with passive waits the
+     ~390 us worker wake-up after each GPU wait made quant 12.7 -> 55 ms; with
+     `OMP_WAIT_POLICY=active` / `GOMP_SPINCOUNT` the CPU passes drop (quant 7, attn 9,
+     silu 4) but the gemv bucket rises 217 -> ~270 ms (spinning workers slow the CUDA
+     sync path; GPU clock stayed 921.6 MHz, cause not isolated). Net: 3.28-3.31 tps vs
+     3.57 single-threaded. A custom pool that spins only inside CPU phases and parks
+     (futex) before each GPU wait is the untested variant.
+2. **Board clocks (operator, needs root, NON-PERSISTENT across reboot):** governor was
+   already `performance` @1.479 GHz. In #69 the board was put under `sudo jetson_clocks`
+   (EMC 1.6 GHz, GPU 921.6 MHz) and cpuidle c7 disabled on all 4 CPUs
+   (`echo 1 | sudo tee /sys/devices/system/cpu/cpu*/cpuidle/state1/disable`). Effect on
+   HEAD-before-#69 code: 280 -> ~273 ms/tok (~2%). Re-apply after a reboot before
+   comparing against #69's numbers; the #69 A/B (3 pairs, HEAD vs NEON, same clocks):
+   275.1/269.5/275.4 vs 246.4/246.6/247.1 ms/tok = +10.5%, no overlap.
 3. **POPC-rate probe** (15 lines, doc §6.1 of the research notes): settles whether POPC
    is 1/4 or 1/8 rate on this die; decides how far the bit-sliced family can be pushed.
 4. **Token-tiled prefill** (M=16/64 GEMM): our prefill = decode speed per token, so the

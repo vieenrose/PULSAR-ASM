@@ -18,6 +18,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <arm_neon.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -51,37 +52,44 @@ static inline int nearest_int(float fval) {
 }
 static void q8_K_quant(const float *x, uint8_t *yv, int64_t k) {
     const int nb = (int)(k / 256);
-    for (int i = 0; i < nb; i++) {
-        float max = 0, amax = 0;
-        for (int j = 0; j < 256; ++j) {
-            float ax = fabsf(x[j]);
-            if (ax > amax) { amax = ax; max = x[j]; }
-        }
+    for (int i = 0; i < nb; i++, x += 256) {
         uint8_t *yb = yv + (size_t)i * 292;
         int8_t *qs = (int8_t *)(yb + 4);
         int16_t *bsums = (int16_t *)(yb + 4 + 256);
+        /* amax = max |x| (order-free); max = x at the FIRST index reaching
+           it, which is what the serial strict-> scan selects. */
+        float32x4_t am = vdupq_n_f32(0);
+        for (int j = 0; j < 256; j += 4) am = vmaxq_f32(am, vabsq_f32(vld1q_f32(x + j)));
+        const float amax = vmaxvq_f32(am);
         if (!amax) {
             /* the fork zeroes only d and qs here, leaving bsums stale; the
                kernel never reads bsums, but matching it exactly is what makes
                the byte-for-byte verification against the library meaningful */
             memset(yb, 0, 4);
             memset(yb + 4, 0, 256);
-            x += 256;
             continue;
         }
+        float max = 0;
+        for (int j = 0; j < 256; ++j) if (fabsf(x[j]) == amax) { max = x[j]; break; }
         const float iscale = -127.f / max;
-        for (int j = 0; j < 256; ++j) {
-            int v = nearest_int(iscale * x[j]);
-            qs[j] = (int8_t)(v < 127 ? v : 127);   /* MIN(127, v) */
+        /* nearest_int(iscale*x) per lane: one IEEE multiply, the +2^23*1.5
+           magic add (FPCR round-to-nearest-even, as the scalar FPU), the
+           mantissa bit tricks on the integer image, then MIN(127, v). */
+        const float32x4_t is4 = vdupq_n_f32(iscale), magic = vdupq_n_f32(12582912.f);
+        const int32x4_t m23 = vdupq_n_s32(0x007fffff), b22 = vdupq_n_s32(0x00400000);
+        const int32x4_t c127 = vdupq_n_s32(127);
+#define Q8K_LANE4(off) vminq_s32(vsubq_s32(vandq_s32(vreinterpretq_s32_f32( \
+            vaddq_f32(vmulq_f32(vld1q_f32(x + j + (off)), is4), magic)), m23), b22), c127)
+        for (int j = 0; j < 256; j += 16) {
+            int16x8_t h01 = vcombine_s16(vmovn_s32(Q8K_LANE4(0)), vmovn_s32(Q8K_LANE4(4)));
+            int16x8_t h23 = vcombine_s16(vmovn_s32(Q8K_LANE4(8)), vmovn_s32(Q8K_LANE4(12)));
+            int8x16_t q = vcombine_s8(vmovn_s16(h01), vmovn_s16(h23));
+            vst1q_s8(qs + j, q);
+            bsums[j >> 4] = vaddlvq_s8(q);   /* exact: |sum| <= 16*127 */
         }
-        for (int j = 0; j < 16; ++j) {
-            int sum = 0;
-            for (int ii = 0; ii < 16; ++ii) sum += qs[j * 16 + ii];
-            bsums[j] = (int16_t)sum;
-        }
+#undef Q8K_LANE4
         float d = 1.0f / iscale;
         memcpy(yb, &d, 4);
-        x += 256;
     }
 }
 void pq2_gemv(int rows, int cols, const uint8_t *w, const float *x, float *y,
@@ -99,9 +107,43 @@ static double bq1_now(void) {
 }
 #define BQ1_T0() double _t0 = bq1_now()
 #define BQ1_T1(step)     printf("BQ1TIME step=%d ms=%.3f\n", step, (bq1_now() - _t0) * 1e3), fflush(stdout)
+/* Pass-level CPU profile (PQ1_CPUTIME=1): time between consecutive marks is
+ * charged to the category of the mark, so every pass of the step loop is
+ * accounted for once. ~600 clock_gettime calls per token; no math touched. */
+enum { CT_SAMPLE, CT_EMBED, CT_RMS, CT_QUANT, CT_GEMV, CT_HNORM, CT_ROPE,
+       CT_KVCPY, CT_ATTN, CT_RESID, CT_SILU, CT_ARGMAX, CT_N };
+static const char *CT_NAME[CT_N] = {"sample", "embed", "rms", "quant", "gemv",
+    "headnorm", "rope", "kvcopy", "attn", "resid", "silu", "argmax"};
+static double CT_ACC[CT_N], CT_LAST;
+static int CT_ON = -1, CT_STEPS;
+static inline void ct_mark(int cat) {
+    if (CT_ON <= 0) return;
+    double n = bq1_now();
+    CT_ACC[cat] += n - CT_LAST;
+    CT_LAST = n;
+}
+static void ct_begin(int step, int n0) {
+    if (CT_ON < 0) CT_ON = getenv("PQ1_CPUTIME") ? 1 : 0;
+    if (CT_ON <= 0) return;
+    if (step == n0) { memset(CT_ACC, 0, sizeof CT_ACC); CT_STEPS = 0; }
+    if (step >= n0) CT_STEPS++;
+    CT_LAST = bq1_now();
+}
+static void ct_dump(void) {
+    if (CT_ON <= 0 || !CT_STEPS) return;
+    double tot = 0;
+    for (int i = 0; i < CT_N; i++) tot += CT_ACC[i];
+    fprintf(stderr, "PQ1CPU decode steps=%d total=%.1f ms/tok\n", CT_STEPS, tot * 1e3 / CT_STEPS);
+    for (int i = 0; i < CT_N; i++)
+        fprintf(stderr, "PQ1CPU %-9s %8.2f ms/tok %5.1f%%\n", CT_NAME[i],
+                CT_ACC[i] * 1e3 / CT_STEPS, 100.0 * CT_ACC[i] / tot);
+}
 #else
 #define BQ1_T0() ((void)0)
 #define BQ1_T1(step) ((void)0)
+#define ct_mark(c) ((void)0)
+#define ct_begin(s, n) ((void)0)
+#define ct_dump() ((void)0)
 #endif
 
 static int TRACE = 0;
@@ -194,7 +236,9 @@ static void dec_row(const uint8_t *W, int row, int cols, float *o) {
 static uint8_t *XQ;   /* (12288/256)*292 max */
 static void gemvP(const uint8_t *W, int rows, int K, const float *x, float *y) {
     q8_K_quant(x, XQ, K);
+    ct_mark(CT_QUANT);
     pq2_gemv(rows, K, W, x, y, XQ);
+    ct_mark(CT_GEMV);
 }
 
 /* One launch for the projections that consume the same activation vector
@@ -208,8 +252,10 @@ static void gemvP(const uint8_t *W, int rows, int K, const float *x, float *y) {
 static void gemvP_multi(const uint8_t *const *W, const int *rows, int n, int K,
                         const float *x, float *const *Y) {
     q8_K_quant(x, XQ, K);
-    if (pq2_gemv_batch && pq2_gemv_batch(W, rows, n, K, Y, XQ) == 0) return;
+    ct_mark(CT_QUANT);
+    if (pq2_gemv_batch && pq2_gemv_batch(W, rows, n, K, Y, XQ) == 0) { ct_mark(CT_GEMV); return; }
     for (int i = 0; i < n; i++) pq2_gemv(rows[i], K, W[i], x, Y[i], XQ);
+    ct_mark(CT_GEMV);
 }
 
 static void rms(const float *x, const float *w, int n, float *y) {
@@ -238,19 +284,32 @@ static void yarn_init(void) {
     CORR[1] = en < 127 ? en : 127;
     CORR_INIT = 1;
 }
-static void rope_yarn_apply(float *x, int heads, int pos) {
+/* The 64 (cos, sin) pairs depend only on pos, not on the head or the layer,
+ * so they are computed once per position (same expressions, same order) and
+ * reused by the 40 heads x 36 layers of that token: 92k cosf/sinf per token
+ * become 128. The per-element rotation is untouched. */
+static float RC_C[64], RC_S[64];
+static int RC_POS = -1;
+static void rope_table(int pos) {
     if (!CORR_INIT) yarn_init();
     const float fs = 1.0f / YARN_FACTOR, msc = 1.0f + 0.1f * logf(YARN_FACTOR);
     const float tscale = powf(FREQ_BASE, -2.0f / 128.0f);
+    float theta = (float)pos;
+    for (int j = 0; j < 64; j++, theta *= tscale) {
+        float y = (j - CORR[0]) / fmaxf(0.001f, CORR[1] - CORR[0]);
+        float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+        float ti = fs * theta, te = theta;
+        float th = ti * (1 - ramp) + te * ramp;
+        RC_C[j] = cosf(th) * msc; RC_S[j] = sinf(th) * msc;
+    }
+    RC_POS = pos;
+}
+static void rope_yarn_apply(float *x, int heads, int pos) {
+    if (RC_POS != pos) rope_table(pos);
     for (int h = 0; h < heads; h++) {
         float *xh = x + h * 128;
-        float theta = (float)pos;
-        for (int j = 0; j < 64; j++, theta *= tscale) {
-            float y = (j - CORR[0]) / fmaxf(0.001f, CORR[1] - CORR[0]);
-            float ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, y));
-            float ti = fs * theta, te = theta;
-            float th = ti * (1 - ramp) + te * ramp;
-            float c = cosf(th) * msc, s = sinf(th) * msc;
+        for (int j = 0; j < 64; j++) {
+            float c = RC_C[j], s = RC_S[j];
             float a = xh[j], b = xh[j + 64];
             xh[j] = a * c - b * s;
             xh[j + 64] = a * s + b * c;
@@ -368,15 +427,19 @@ int main(int argc, char **argv) {
     NPOS = 0;
     for (int step = 0; step < n0 + gen; step++) {
         BQ1_T0();
+        ct_begin(step, n0);
         int id = step < n0 ? ids[step]
                : (STEMP > 0 ? sample_topkpp(HEAD, VOCAB, STEMP, STOPP, STopK, SMINP)
                             : argmax(HEAD, VOCAB));
         if (step >= n0) ids[nids++] = id;
+        ct_mark(CT_SAMPLE);
         embed(id);
+        ct_mark(CT_EMBED);
         if (TRACE) { MAG("emb", X, HID); V8("emb", X); }
         for (int il = 0; il < NLAYER; il++) {
             float *anw = (float *)TW(il, "attn_norm.weight");
             rms(X, anw, HID, XN);
+            ct_mark(CT_RMS);
             /* attention */
             { /* one launch for q+k+v: same K=4096 activation (XN) */
                 const uint8_t *Wq[3] = {TW(il, "attn_q.weight"),
@@ -390,37 +453,77 @@ int main(int argc, char **argv) {
             float *knw = (float *)TW(il, "attn_k_norm.weight");
             for (int h = 0; h < NHEAD; h++) rms(QF + h * 128, qnw, 128, QF + h * 128);
             for (int h = 0; h < NKV; h++) rms(KF + h * 128, knw, 128, KF + h * 128);
+            ct_mark(CT_HNORM);
             if (TRACE) { V8("qnorm", QF); V8("knorm", KF); V8("vcur", VF); }
             rope_yarn_apply(QF, NHEAD, NPOS);
             rope_yarn_apply(KF, NKV, NPOS);
+            ct_mark(CT_ROPE);
             memcpy(KCA[il][NPOS], KF, NKV * HDIM * 4);
             memcpy(VCA[il][NPOS], VF, NKV * HDIM * 4);
+            ct_mark(CT_KVCPY);
+            /* Same arithmetic as the serial reference (kept in
+             * fwd8_cpu_parity.c), reorganised for the A57:
+             *  - q.k: gcc fuses the reference's `s += q*k` into fmadd, so each
+             *    score is one fused chain over i; eight positions' chains are
+             *    interleaved (independent accumulators) to hide the 4-cycle
+             *    fmadd latency. Per-chain order is unchanged.
+             *  - softmax: expf(sc-mx) once per score, reused in the sum.
+             *  - p.v: lane i accumulates o[i] = fma(p, v[i], o[i]) over t in
+             *    the reference order; four lanes per NEON fma. */
             for (int h = 0; h < NHEAD; h++) {
-                int kh = h / 4;
+                const int kh = h / 4;
+                const float *q = QF + h * 128;
                 float mx = -1e30f, sc[CTX];
-                for (int t = 0; t <= NPOS; t++) {
-                    float s = 0;
-                    float *Kt = (float *)KCA[il][t] + kh * 128;
-                    for (int i = 0; i < 128; i++) s += QF[h * 128 + i] * Kt[i];
-                    sc[t] = s * 0.0883883476f;
-                    if (sc[t] > mx) mx = sc[t];
+                int t = 0;
+                for (; t + 8 <= NPOS + 1; t += 8) {
+                    const float *K0 = (float *)KCA[il][t + 0] + kh * 128;
+                    const float *K1 = (float *)KCA[il][t + 1] + kh * 128;
+                    const float *K2 = (float *)KCA[il][t + 2] + kh * 128;
+                    const float *K3 = (float *)KCA[il][t + 3] + kh * 128;
+                    const float *K4 = (float *)KCA[il][t + 4] + kh * 128;
+                    const float *K5 = (float *)KCA[il][t + 5] + kh * 128;
+                    const float *K6 = (float *)KCA[il][t + 6] + kh * 128;
+                    const float *K7 = (float *)KCA[il][t + 7] + kh * 128;
+                    float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
+                    for (int i = 0; i < 128; i++) {
+                        const float qi = q[i];
+                        s0 = fmaf(qi, K0[i], s0); s1 = fmaf(qi, K1[i], s1);
+                        s2 = fmaf(qi, K2[i], s2); s3 = fmaf(qi, K3[i], s3);
+                        s4 = fmaf(qi, K4[i], s4); s5 = fmaf(qi, K5[i], s5);
+                        s6 = fmaf(qi, K6[i], s6); s7 = fmaf(qi, K7[i], s7);
+                    }
+                    sc[t + 0] = s0 * 0.0883883476f; sc[t + 1] = s1 * 0.0883883476f;
+                    sc[t + 2] = s2 * 0.0883883476f; sc[t + 3] = s3 * 0.0883883476f;
+                    sc[t + 4] = s4 * 0.0883883476f; sc[t + 5] = s5 * 0.0883883476f;
+                    sc[t + 6] = s6 * 0.0883883476f; sc[t + 7] = s7 * 0.0883883476f;
                 }
+                for (; t <= NPOS; t++) {
+                    const float *Kt = (float *)KCA[il][t] + kh * 128;
+                    float s = 0;
+                    for (int i = 0; i < 128; i++) s = fmaf(q[i], Kt[i], s);
+                    sc[t] = s * 0.0883883476f;
+                }
+                for (t = 0; t <= NPOS; t++) if (sc[t] > mx) mx = sc[t];
                 double es = 0;
-                for (int t = 0; t <= NPOS; t++) es += expf(sc[t] - mx);
+                for (t = 0; t <= NPOS; t++) { sc[t] = expf(sc[t] - mx); es += sc[t]; }
                 float *o = ATTO + h * 128;
-                for (int i = 0; i < 128; i++) o[i] = 0;
-                for (int t = 0; t <= NPOS; t++) {
-                    float p = expf(sc[t] - mx) / (float)es;
-                    float *Vt = (float *)VCA[il][t] + kh * 128;
-                    for (int i = 0; i < 128; i++) o[i] += p * Vt[i];
+                for (int i = 0; i < 128; i += 4) vst1q_f32(o + i, vdupq_n_f32(0));
+                for (t = 0; t <= NPOS; t++) {
+                    const float32x4_t p4 = vdupq_n_f32(sc[t] / (float)es);
+                    const float *Vt = (float *)VCA[il][t] + kh * 128;
+                    for (int i = 0; i < 128; i += 4)
+                        vst1q_f32(o + i, vfmaq_f32(vld1q_f32(o + i), vld1q_f32(Vt + i), p4));
                 }
             }
+            ct_mark(CT_ATTN);
             gemvP(TW(il, "attn_output.weight"), HID, HID, ATTO, AO);
             if (TRACE) { V8("attnout", AO); V8R("attnout", AO, 1000); }
             for (int i = 0; i < HID; i++) X[i] += AO[i];
+            ct_mark(CT_RESID);
             /* FFN (8B names its second norm ffn_norm, not post_attention_norm) */
             float *pnw = (float *)TW(il, "ffn_norm.weight");
             rms(X, pnw, HID, XN);
+            ct_mark(CT_RMS);
             { /* one launch for gate+up: same K=4096 activation (XN) */
                 const uint8_t *Wg[2] = {TW(il, "ffn_gate.weight"),
                                         TW(il, "ffn_up.weight")};
@@ -429,14 +532,18 @@ int main(int argc, char **argv) {
                 gemvP_multi(Wg, Rg, 2, HID, XN, Yg);
             }
             for (int i = 0; i < INTER; i++) LU[i] = silu(LG[i]) * LU[i];
+            ct_mark(CT_SILU);
             gemvP(TW(il, "ffn_down.weight"), HID, INTER, LU, FO);
             if (TRACE) { V8("ffnout", FO); V8R("gate", LG, 1000); V8R("up", LU, 1000); V8R("ffnout", FO, 1000); }
             for (int i = 0; i < HID; i++) X[i] += FO[i];
+            ct_mark(CT_RESID);
         }
         float *onw = (float *)tw("output_norm.weight");
         rms(X, onw, HID, XN);
+        ct_mark(CT_RMS);
         gemvP(tw("output.weight"), VOCAB, HID, XN, HEAD);
         int top = argmax(HEAD, VOCAB);
+        ct_mark(CT_ARGMAX);
         printf("step %d id_in=%d top=%d logit=%.4f\n", step, id, top, HEAD[top]);
         BQ1_T1(step);
         if (getenv("TOP40") && step == 22) {
@@ -465,5 +572,6 @@ int main(int argc, char **argv) {
         if (step >= n0 && id == 151645) break; /* EOS */
         NPOS++;
     }
+    ct_dump();
     return 0;
 }
