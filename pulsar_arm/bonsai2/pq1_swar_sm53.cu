@@ -1232,6 +1232,50 @@ __global__ __launch_bounds__(128) void pq1_attn_pre(const float* __restrict__ qk
   for (int k = 0; k < 4; k++) dst[l + 32 * k] = o[k];
 }
 
+/* Loop iter 7 (PQ1_APRE=1, default; 0 is the A/B arm): the same per-head math
+ * in one 256-thread block. The q/k head RMS chain (128 serial double fma) used
+ * to run on lane 0 of one warp per head: on sm_53 a one-lane DP instruction
+ * still costs a whole warp's DP issue (8 clk), so 40 heads x 128 x 2 DP ops
+ * serialized (~100 us). Here thread t runs head t's chain, so one DP warp
+ * instruction serves 32 heads; each chain is unchanged (same j order, same
+ * fma, same scale formula), and the rope/scale stage is the same per element. */
+#define PQ1_APRE_MAXH 64
+__global__ __launch_bounds__(256) void pq1_attn_pre1(const float* __restrict__ qkv,
+                                                    const float* __restrict__ nw,
+                                                    const uint8_t* __restrict__ par,
+                                                    float* __restrict__ qo, float* __restrict__ kc,
+                                                    float* __restrict__ vc, int nh, int nkv, int ctx) {
+  extern __shared__ float sx[]; /* [nqk][129] */
+  __shared__ float ssc[PQ1_APRE_MAXH];
+  const int nqk = nh + nkv, t = threadIdx.x;
+  const int npos = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS);
+  for (int i = t; i < nqk * 128; i += 256) sx[(i >> 7) * 129 + (i & 127)] = qkv[i];
+  for (int i = t; i < nkv * 128; i += 256) {
+    const int h = i >> 7, d = i & 127;
+    vc[((size_t)h * ctx + npos) * 128 + d] = qkv[(size_t)(nqk + h) * 128 + d];
+  }
+  __syncthreads();
+  if (t < nqk) {
+    const float* r = sx + t * 129;
+    double sd = 0.0;
+    for (int j = 0; j < 128; j++) { const double d = pq1_f2d(r[j]); sd = __fma_rn(d, d, sd); }
+    ssc[t] = pq1_fdiv(1.0f, pq1_fsqrt(pq1_fadd(pq1_d2f(__ddiv_rn(sd, 128.0)), 1e-6f)));
+  }
+  __syncthreads();
+  const float* rc = reinterpret_cast<const float*>(par + PQ1_APAR_ROPE); /* cos[64] | sin[64] */
+  for (int i = t; i < nqk * 64; i += 256) {   /* pair (j, j+64) of head hh */
+    const int hh = i >> 6, j = i & 63;
+    const float sc = ssc[hh];
+    const float* wn = nw + (hh < nh ? 0 : 128);
+    const float a = pq1_fmul(pq1_fmul(sc, sx[hh * 129 + j]), wn[j]);
+    const float b = pq1_fmul(pq1_fmul(sc, sx[hh * 129 + j + 64]), wn[j + 64]);
+    const float c = rc[j], sn = rc[64 + j];
+    float* dst = hh < nh ? qo + (size_t)hh * 128 : kc + ((size_t)(hh - nh) * ctx + npos) * 128;
+    dst[j] = pq1_ffma(a, c, pq1_fneg(pq1_fmul(b, sn)));
+    dst[j + 64] = pq1_ffma(a, sn, pq1_fmul(b, c));
+  }
+}
+
 /* one block per query head, 128 threads: thread = position for q.k / softmax,
  * thread = output dim for p.v */
 __global__ __launch_bounds__(128) void pq1_attn_core(const float* __restrict__ qo,
@@ -1297,7 +1341,13 @@ extern "C" int pq1_attn_launch(const float* qkv_d, const float* nw_d, const uint
   if (nh <= 0 || nkv <= 0 || (nh % nkv) || ((nh + 2 * nkv) & 3) || ctx <= 0 || ctx > PQ1_ACTX)
     return -2;
   cudaStream_t s = (cudaStream_t)stream;
-  pq1_attn_pre<<<(nh + 2 * nkv) / 4, 128, 0, s>>>(qkv_d, nw_d, par_d, qo_d, kc_d, vc_d, nh, nkv, ctx);
+  static int apre = -1;
+  if (apre < 0) { const char* e = getenv("PQ1_APRE"); apre = e ? atoi(e) : 1; }
+  if (apre && nh + nkv <= PQ1_APRE_MAXH)
+    pq1_attn_pre1<<<1, 256, (nh + nkv) * 129 * sizeof(float), s>>>(qkv_d, nw_d, par_d, qo_d, kc_d,
+                                                                   vc_d, nh, nkv, ctx);
+  else
+    pq1_attn_pre<<<(nh + 2 * nkv) / 4, 128, 0, s>>>(qkv_d, nw_d, par_d, qo_d, kc_d, vc_d, nh, nkv, ctx);
   if (cudaGetLastError() != cudaSuccess) return -1;
   pq1_attn_core<<<nh, 128, 0, s>>>(qo_d, kc_d, vc_d, par_d, atto_d, nh, nkv, ctx);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
