@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/mman.h>
 #include "pq1_wrap.h"
 
@@ -54,6 +55,44 @@ static size_t PQ1ACUR = 0, PQ1ALIM = 0;
 static uint8_t *d_xq = NULL;
 static float *d_y = NULL;
 static size_t P2XQMAX = 0, P2YMAX = 0;
+/* T-MAC path (run #41): the bit-plane mirror of xq is the SAME size (73 words
+ * per 256-activation block, word 0 = the fp32 scale) so d_xq is reused as the
+ * device plane buffer; only the host scratch is new. PQ1_NO_TM=1 falls back to
+ * the SWAR kernel, which lets one binary be A/B'd against itself. */
+static uint8_t *d_au = NULL;
+static size_t P2AUMAX = 0;
+static uint32_t *PL_H = NULL;
+static int *AU_H = NULL;
+static size_t PL_HMAX = 0, AU_HMAX = 0;
+static int PQ1_TM = -1;
+static long PQ1_TM_CALLS = 0, PQ1_SWAR_CALLS = 0; /* diagnostic: which kernel ran */
+
+/* PQ1_KTIME=1: per-shape device-path timing (upload + launch + sync + readback),
+ * printed by pq1_stats at exit. Needed because a kernel-level speedup measured
+ * on a standalone launch does not automatically appear in the engine. */
+typedef struct { int rows, cols; double ms; long n; } pq1_kt;
+static pq1_kt KT[64];
+static int NKT = 0, KTON = -1;
+static double pq1_now(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec * 1e3 + t.tv_nsec * 1e-6;
+}
+static void pq1_kt_add(int rows, int cols, double ms) {
+  for (int i = 0; i < NKT; i++)
+    if (KT[i].rows == rows && KT[i].cols == cols) {
+      KT[i].ms += ms;
+      KT[i].n++;
+      return;
+    }
+  if (NKT < 64) {
+    KT[NKT].rows = rows;
+    KT[NKT].cols = cols;
+    KT[NKT].ms = ms;
+    KT[NKT].n = 1;
+    NKT++;
+  }
+}
 static int PQ1ARENA_DEAD = 0;
 
 /* GPU-RAM accounting for the harness (PQ1_STATS=1 prints one line at exit).
@@ -97,11 +136,17 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
             100.0 * (code[0] + code[1] + code[2]) / tot);
   }
 #endif
+  if (KTON) {
+    for (int i = 0; i < NKT; i++)
+      fprintf(stderr,
+              "PQ1KT rows=%-7d cols=%-6d n=%-4ld total=%8.2f ms  per=%7.4f ms\n",
+              KT[i].rows, KT[i].cols, KT[i].n, KT[i].ms, KT[i].ms / KT[i].n);
+  }
   snprintf(buf, n,
            "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%s "
-           "total_mb=%s tensors=%d",
+           "total_mb=%s tensors=%d tm=%ld swar=%ld",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
-           fs, ts, PQ1N);
+           fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_SWAR_CALLS);
   return buf;
 }
 #endif
@@ -225,6 +270,21 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
     unsigned short *dsc = PQ1C[ci].d_scales;
     if (dc && dsc) {
       size_t xqb = (size_t)(cols / 256) * 292, yb = (size_t)rows * 4;
+      if (PQ1_TM < 0) {
+        /* Run #41: T-MAC is 1.36-1.53x faster per kernel launch in isolation
+         * but -1.8% END TO END, because the engine's 253 short launches per
+         * token keep the devfreq governor at ~460MHz (measured: median 461MHz,
+         * max 845MHz) where the kernel is not ALU-bound. Opt-in only, so the
+         * kernel stays available for kernel-level study. */
+        PQ1_TM = getenv("PQ1_TM") ? 1 : 0;
+      }
+      if (KTON < 0) {
+        const char *ke = getenv("PQ1_KTIME");
+        KTON = ke ? atoi(ke) : 0;
+      }
+      double kt0 = KTON ? pq1_now() : 0.0;
+      double t_b = 0, t_c = 0, t_e = 0;
+      size_t aub = PQ1_TM ? (size_t)(cols >> 7) * 4 : 0;
       if (!d_xq || xqb > P2XQMAX) {
         if (d_xq) cudaFree(d_xq);
         d_xq = NULL;
@@ -235,15 +295,71 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
         d_y = NULL;
         if (cudaMalloc(&d_y, yb) == cudaSuccess) P2YMAX = yb;
       }
+      uint32_t *pl = NULL;
+      int *auh = NULL;
+      int tm_ok = 0;
+      if (PQ1_TM) {
+        if (!PL_H || xqb > PL_HMAX) {
+          free(PL_H);
+          PL_H = (uint32_t *)malloc(xqb ? xqb : 1);
+          PL_HMAX = PL_H ? xqb : 0;
+        }
+        if (!AU_H || aub > AU_HMAX) {
+          free(AU_H);
+          AU_H = (int *)malloc(aub ? aub : 1);
+          AU_HMAX = AU_H ? aub : 0;
+        }
+        if (!d_au || aub > P2AUMAX) {
+          if (d_au) cudaFree(d_au);
+          d_au = NULL;
+          if (cudaMalloc(&d_au, aub) == cudaSuccess) P2AUMAX = aub;
+        }
+        tm_ok = PL_H && AU_H && d_au;
+        if (tm_ok) {
+          t_b = KTON > 1 ? pq1_now() : 0.0;
+          pq1_build_planes(xq, cols, PL_H);
+          pq1_build_au(xq, cols, AU_H);
+          t_c = KTON > 1 ? pq1_now() : 0.0;
+          pl = (uint32_t *)d_xq;
+          auh = (int *)d_au;
+        }
+      }
       if (getenv("PQ1_TRACE"))
         fprintf(stderr, "PQ1T act d_xq=%p xq=%p n=%zu d_y=%p yb=%zu K=%d N=%d\n",
                 (void *)d_xq, (void *)xq, xqb, (void *)d_y, yb, cols, rows);
+      if (tm_ok) {
+        if (pl && d_y && auh &&
+            cudaMemcpy(pl, PL_H, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(auh, AU_H, aub, cudaMemcpyHostToDevice) == cudaSuccess &&
+            pq1_gemv_tm_launch(dc, dsc, pl, auh, d_y, cols, rows, NULL) == 0 &&
+            cudaDeviceSynchronize() == cudaSuccess &&
+            cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess) {
+          PQ1_TM_CALLS++;
+          if (KTON) {
+            t_e = pq1_now();
+            pq1_kt_add(rows, cols, t_e - kt0);
+            if (KTON > 1)
+              fprintf(stderr,
+                      "PQ1PH rows=%d cols=%d build=%.1f upload+launch+sync+readback"
+                      "=%.1f total=%.1f us\n", rows, cols, t_c - t_b, t_e - t_c,
+                      t_e - kt0);
+          }
+          return;
+        }
+        fprintf(stderr, "pq2: tm device path failed: %s -> SWAR\n",
+                cudaGetErrorString(cudaGetLastError()));
+        cudaGetLastError();
+        PQ1_TM = 0;
+      }
       if (d_xq && d_y &&
           cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
           pq1_gemv_sm53_launch(dc, dsc, d_xq, d_y, cols, rows, NULL) == 0 &&
           cudaDeviceSynchronize() == cudaSuccess &&
-          cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess)
+          cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess) {
+        PQ1_SWAR_CALLS++;
+        if (KTON) pq1_kt_add(rows, cols, pq1_now() - kt0);
         return;
+      }
       fprintf(stderr, "pq2: device path failed: %s -> CPU fallback\n",
               cudaGetErrorString(cudaGetLastError()));
     }

@@ -24,6 +24,17 @@ int pq1_gemv_sm53_launch(const unsigned char *w_bits,
                          const unsigned char *xq, float *y, int K, int N,
                          void *stream);
 
+/* T-MAC bit-sliced variant (run #41). pq1_build_planes mirrors the Q8_K block
+ * layout (73 words per 256-activation block; word 0 = the fp32 scale d, words
+ * 1..64 = the 64 bit-plane words) so the kernel's addresses are unchanged.
+ * planes needs (K/256)*73 words, au needs K/128 ints. */
+void pq1_build_planes(const uint8_t *xq, int K, uint32_t *planes);
+void pq1_build_au(const uint8_t *xq, int K, int *au);
+
+int pq1_gemv_tm_launch(const unsigned char *w_bits,
+                       const unsigned short *w_scales_h, const unsigned int *xpl,
+                       const int *xau, float *y, int K, int N, void *stream);
+
 float pq1_h2f(uint16_t h);
 #ifdef __cplusplus
 }

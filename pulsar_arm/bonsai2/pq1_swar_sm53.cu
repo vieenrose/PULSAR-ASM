@@ -258,6 +258,135 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
 
   if (sub == 0 && active) y[row] = acc;
 }
+/* ---- Run #41 experiment: T-MAC bit-sliced inner loop -----------------------
+ * Why: SWAR's masked sum costs ~2.5 lane-ops/weight organised as a ~7-deep
+ * dependent chain per 4 weights. The measured slope on this kernel is 0.51% of
+ * decode time per 1% of that chain, and the chain is ~51% of decode time - so
+ * SWAR's whole family is capped at ~2x. Bit-slicing amortises the work over 32
+ * weights per instruction instead of 4:
+ *   Pu(code word W) = sum_p 2^p * popc(plane_p & W)
+ * is an EXACT integer identity for "sum the unsigned biased bytes x' = x+128 of
+ * the selected activations": plane word p bit a carries bit p of activation a,
+ * so activation a contributes sum_p 2^p * bit_p(x'_a) = x'_a, once. Integer and
+ * order-independent, hence bit-identical to the SWAR sum (no reassociation, no
+ * rounding) - the same integer isum feeds the same fp epilogue.
+ * Cost: 8 AND + 8 POPC + 8 accumulate per 32 weights = 0.75 ALU + 0.25 XU ops
+ * per weight, against 2.5 ALU per weight. The activation side is read as 8
+ * plane words per 32 weights = 1 byte/weight: IDENTICAL load count to today.
+ * The planes are built once per token on the host (pq1_build_planes); they
+ * mirror the Q8_K block layout (73 words/block: word 0 = fp32 d, words 1..64 =
+ * 64 plane words) so the kernel's staging code and every address is unchanged. */
+#define TM_GROUP_WORDS 32 /* 4 32-weight blocks x 8 planes per 128-weight group */
+
+__global__ __launch_bounds__(256, 5)
+void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+                 const __half* __restrict__ w_scales,
+                 const uint32_t* __restrict__ xpl, const int* __restrict__ xau,
+                 float* __restrict__ y, int K, int N) {
+  __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
+  __shared__ int sh_au[PQ1_CHUNK_GROUPS];
+  __shared__ float sh_prod[PQ1_BLOCK_ROWS][PQ1_CHUNK_GROUPS];
+
+  int row = blockIdx.x * PQ1_BLOCK_ROWS + (threadIdx.x >> 2);
+  int sub = threadIdx.x & 3;
+  if (blockIdx.x * PQ1_BLOCK_ROWS >= N) return; /* block-uniform */
+  bool active = row < N;
+  int rrow = active ? row : 0;
+
+  int K128 = K >> 7;
+  int nchunk = K128 / PQ1_CHUNK_GROUPS;
+  if (nchunk > PQ1_MAXCHUNK || nchunk <= 0) return;
+
+  float acc = 0.0f; /* lane 0 only; groups accumulated in order */
+  uint32_t* t32 = reinterpret_cast<uint32_t*>(sh_x);
+
+  for (int ch = 0; ch < nchunk; ch++) {
+    /* Stage this chunk's plane words (and the fp32 scales) into shared. Same
+     * 73-word-per-block source layout, same 68-word-per-block tile layout and
+     * the same 2-words-per-thread split as the SWAR kernel; only the XOR 0x80
+     * is gone (the host applied the bias while building the planes) and Au now
+     * comes from the host instead of a shuffle reduction. */
+    const uint32_t* x32 = reinterpret_cast<const uint32_t*>(xpl) +
+                          (size_t)ch * PQ1_CHUNK_BLOCKS * 73;
+    {
+      int gid = (int)threadIdx.x >> 4;  /* 0..15 group in this chunk */
+      int slot = (int)threadIdx.x & 15; /* 0..15 within the group */
+      int bb = gid >> 1;                /* its Q8_K block */
+      int wb = (gid & 1) * 32 + slot * 2;
+      const uint32_t* src = x32 + bb * 73 + 1 + wb;
+      t32[bb * 68 + wb] = __ldg(src);
+      t32[bb * 68 + wb + 1] = __ldg(src + 1);
+      if ((int)threadIdx.x < PQ1_CHUNK_BLOCKS) {
+        uint32_t dv = __ldg(x32 + (int)threadIdx.x * 73);
+        t32[(int)threadIdx.x * 68 + 64] = dv; /* fp32 d, verbatim */
+      }
+      if (slot == 0) sh_au[gid] = xau[ch * PQ1_CHUNK_GROUPS + gid];
+    }
+    __syncthreads();
+
+#pragma unroll 1
+    for (int half = 0; half < 4; half++) {
+      int g = sub + (half << 2);
+      /* 128 weights = 4 code words (one uint4) = 32 plane words (8 uint4) */
+      const uint4* cv = reinterpret_cast<const uint4*>(
+          w_codes + (size_t)rrow * (K >> 3) +
+          (size_t)(ch * PQ1_CHUNK_GROUPS + g) * 16);
+      const uint4* pv =
+          reinterpret_cast<uint4*>(t32) + (g >> 1) * 17 + (g & 1) * 8;
+      uint4 cw = __ldg(cv);
+      int pc = __popc(cw.x) + __popc(cw.y) + __popc(cw.z) + __popc(cw.w);
+      int pu = 0;
+#pragma unroll
+      for (int ci = 0; ci < 4; ci++) {
+        uint32_t m = (ci == 0)   ? cw.x
+                     : (ci == 1) ? cw.y
+                     : (ci == 2) ? cw.z
+                                 : cw.w;
+        uint4 lo4 = pv[ci * 2];
+        uint4 hi4 = pv[ci * 2 + 1];
+        int lo = __popc(lo4.x & m) + 2 * __popc(lo4.y & m) +
+                 4 * __popc(lo4.z & m) + 8 * __popc(lo4.w & m);
+        int hi = 16 * __popc(hi4.x & m) + 32 * __popc(hi4.y & m) +
+                 64 * __popc(hi4.z & m) + 128 * __popc(hi4.w & m);
+        pu += lo + hi;
+      }
+      float db;
+      __builtin_memcpy(&db, t32 + (g >> 1) * 68 + 64, 4);
+      /* identical to the SWAR kernel's epilogue: same integer isum, same fp */
+      int isum = (pu << 1) - sh_au[g] + 16384 - (pc << 8);
+      float ws = active ? __half2float(__ldg(w_scales + (size_t)rrow * K128 +
+                                            (size_t)(ch * PQ1_CHUNK_GROUPS + g)))
+                        : 0.0f;
+      sh_prod[threadIdx.x >> 2][g] =
+          __fmul_rn(__fmul_rn(ws, db), (float)isum);
+      __syncwarp();
+    }
+
+    if (sub == 0) {
+      const float* p = sh_prod[threadIdx.x >> 2];
+#pragma unroll
+      for (int k = 0; k < PQ1_CHUNK_GROUPS; k++) acc = __fadd_rn(acc, p[k]);
+    }
+    __syncthreads(); /* the tile is reused by the next chunk */
+  }
+
+  if (sub == 0 && active) y[row] = acc;
+}
+
+extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
+                                  const unsigned short* w_scales_h,
+                                  const uint32_t* xpl, const int* xau, float* y,
+                                  int K, int N, void* stream) {
+  if ((K & 127) != 0) return -2;
+  if (K <= 0 || K > PQ1_MAXK || N <= 0) return -2;
+  dim3 block(256, 1, 1);
+  dim3 grid((N + PQ1_BLOCK_ROWS - 1) / PQ1_BLOCK_ROWS, 1, 1);
+  cudaStream_t s = (cudaStream_t)stream;
+  pq1_gemv_tm<<<grid, block, 0, s>>>(
+      w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
 extern "C" int pq1_gemv_sm53_launch(const uint8_t *w_codes,
                                     const unsigned short *w_scales_h,
                                     const uint8_t *xq, float *y, int K, int N,

@@ -714,3 +714,46 @@ TWO IDEAS BOUNDED ANALYTICALLY (do not spend a session re-deriving these):
 Standing on the primary metric: ~2.53-2.61 tps, all scheduling/cache/occupancy/
 instruction-count levers closed with data (#15/#24/#27/#29/#30/#31/#32/#35/#36/#38),
 both GEMV kernels at their op floor for this algorithm family.
+
+## The engine is DVFS-bound, not ALU-bound (2026-10-14, run #42)
+
+Built the T-MAC bit-sliced 1-bit GEMV (run #41's plan) and it is **bit-exact at
+every shape** (256/256 @K=4096, 512/512 @K=12288, 1024/1024, 151669/4096,
+maxrel 0.00e+00) and **1.36-1.53x faster per launch in isolation** (PQ1_TIME in
+pq1_parity, all launch-gap regimes 0/200µs/1ms/3ms). In the engine it is
+**-1.8%**. That contradiction is the finding.
+
+Measured mechanism: the GPU devfreq governor. Sampling
+`/sys/devices/gpu.0/devfreq/57000000.gpu/cur_freq` during engine decode gives
+**min 76.8 / median 460.8 / max 844.8 MHz**; a standalone kernel loop runs at
+max. The engine issues ~253 GEMV launches per token, each ~0.35-2.5ms, separated
+by CPU work (quantize, rope, softmax) — bursts too short for the governor to
+boost. So in-engine the kernel is **launch/latency-bound at ~55% clock**, where
+removing ALU ops buys nothing; standalone it is ALU-bound at 100% clock, where
+T-MAC's 3.3x op cut shows up in full.
+
+Per-shape in-engine time per call (SWAR -> T-MAC): 4096x4096 0.809->1.010ms,
+1024x4096 0.348->0.604, 12288x4096 1.979->2.085, 4096x12288 1.945->2.399,
+151669x4096 21.92->20.18 (the only win; 16% of decode). Net = -1.8%.
+`pq1_fwd8_glue.c` now carries PQ1_KTIME=1 (per-shape device-path timing) and
+PQ1_KTIME=2 (per-call phase timing: host plane build is 0.2µs — free), plus a
+tm=/swar= call counter in the PQ1GPU stats line. The T-MAC kernel is kept behind
+**PQ1_TM=1** (default off) so the kernel stays available for study.
+
+THIS SUPERSEDES the "kernel is at a local optimum / is latency-bound" reading of
+runs #15-#32: those experiments all measured in-engine, i.e. at ~460MHz. Any
+kernel-level lever must be priced at the ENGINE clock, not at the standalone one.
+
+ACTIONABLE (the first engine-level lever the session has found):
+1. **Fewer, bigger launches.** Batch the projections that share an input vector
+   into ONE launch: q+k+v (same K=4096 input), gate+up (same input). 7 GEMVs per
+   layer -> 4, i.e. 253 -> ~150 launches/token, each ~2x longer. Longer bursts
+   should hold the governor up AND cut per-call CPU overhead. Numerics unchanged
+   (each output row's math is identical); needs a batched kernel taking a small
+   array of {codes, scales, rows} plus a row->tensor map, and the arena may need
+   to place grouped tensors adjacently.
+2. **Overlap CPU work with the GPU** (double-buffer d_xq/d_y, async stream, sync
+   once per layer instead of per GEMV). Keeps the GPU fed; the dependency chain
+   (layer N+1 needs layer N's output) still allows one-deep pipelining.
+3. Neither is a numerics change, so the three gates apply unchanged - and both
+   are worth more than any remaining inner-loop op cut.
