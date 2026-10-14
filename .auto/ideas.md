@@ -431,3 +431,24 @@ Targets the ~63us D2H + ~28us H2D pageable latency x 188 calls/token.
   the fast repack) on any allocation failure, which alone is worth ~700 ms.
 - Probe scripts (in /tmp, ephemeral — content in this file): h2dp5/h2dp6 (pinned DMA
   throughput vs queue depth and engine memory state), repackprobe/2 (16B copy forms).
+
+## Exp45 CUDA-GRAPH replay: MEASURED DEAD on R440 (run #70/#71 probes) — closes the banked idea
+- pgb probe (real CUDA 10.2 signatures; R440 has NO cuGraphAddMemcpyNode1D — that is CUDA 11+,
+  the 10.2 symbol is cuGraphAddMemcpyNode with CUDA_MEMCPY3D by pointer):
+  a 3-node graph (H2D -> gemv -> D2H) instantiated once, replayed per call, is
+  **BIT-IDENTICAL** to the direct path (0/256 mismatches) so the mechanism WORKS,
+  but per-call cost is HIGHER than the engine's current path:
+    A engine-style (H2DA+launch+D2HA+event-poll) 323.75 us
+    B graph + per-call cuGraphExecKernelNodeSetParams 250.44 us  (set 4.16, launch 68.14, poll 178.03)
+    C graph, fixed params                                 206.07 us
+    D graph pipelined (no per-call event)                 961.54 us  (queue saturation, far worse)
+  The killer number: **cuGraphLaunch = 68 us vs cuLaunchKernel = 42.5 us** (pg v2, 1-node
+  graphs amortized to 11.14 us/node over a 30-node chain, i.e. graph *dispatch* is cheap but
+  graph *submission* costs ~60 us fixed). On R440 a graph launch can therefore never beat a
+  single kernel launch; it only pays off when ONE launch stands in for many nodes.
+- DO-NOT-RETRY: per-call graph replay to cut the engine's ~100 us/call host path. The
+  submission cost is in the driver's per-launch path, which graphs share (and exceed).
+- Consequence for the remaining search: the ~9.2 ms/token of launch cost (40 us x ~230 calls,
+  6.2% of 149 ms) can only be removed by REDUCING THE NUMBER OF LAUNCHES, i.e. a persistent
+  worker kernel (one launch per token, device-side doorbell + completion flags in pinned mem).
+  Estimated ceiling +6-8%; big change, bit-exactness preserved because the math per row is unchanged.
