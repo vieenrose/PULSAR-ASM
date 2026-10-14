@@ -24,6 +24,11 @@ int pq1_gemv_sm53_launch(const unsigned char *w_bits,
                          const unsigned char *xq, float *y, int K, int N,
                          void *stream);
 
+/* In-process GPU keep-alive (run #43): starts a side-stream spin thread when
+ * PQ1_KEEPWARM=1, so the devfreq governor sees a busy GPU during the engine's
+ * short GEMV bursts. Returns 1 if started, 0 if not requested, <0 on error. */
+int pq1_keepwarm_start(void);
+
 /* T-MAC bit-sliced variant (run #41). pq1_build_planes mirrors the Q8_K block
  * layout (73 words per 256-activation block; word 0 = the fp32 scale d, words
  * 1..64 = the 64 bit-plane words) so the kernel's addresses are unchanged.

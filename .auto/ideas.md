@@ -757,3 +757,39 @@ ACTIONABLE (the first engine-level lever the session has found):
    (layer N+1 needs layer N's output) still allows one-deep pipelining.
 3. Neither is a numerics change, so the three gates apply unchanged - and both
    are worth more than any remaining inner-loop op cut.
+
+## Keep-warm / DVFS: REFUTED as the engine's bottleneck (2026-10-14, run #43)
+
+Follow-up to #42's clock reading (461MHz median). Two measurements, both against
+the engine binary that contains the T-MAC kernel:
+
+1. **Cross-process keep-warm** (a second process launching 1ms dependent-IMAD
+   spins): decode 714 ms/tok vs 370 control = **-93%**. CUDA contexts time-slice;
+   the engine's ~253 launches/token each queue behind a 1ms spin.
+2. **In-process keep-warm** (same context, side stream, 1 warp, dependent IMAD
+   chain, 1ms spins + 200us gaps, PQ1_KEEPWARM=1): **376.5 -> 581.2 ms/tok =
+   -35.2%** (3 runs/side, interleaved, sd 0.4-4.6ms). Same cause: GM20B has one
+   SM, so the engine's short kernels serialise behind each spin launch.
+   Code reverted; it is not a lever.
+
+**And the DVFS premise itself is wrong**: sampling
+`/sys/devices/57000000.gpu/cur_freq` through a full engine run gives median = max
+= **921.6 MHz** (n=213-313 samples, 0.05s interval) in *both* arms. #42's
+461MHz median was the sampler outliving the run and reading the parked clock of
+an idle GPU (460.8MHz is a devfreq parking step; the engine exits in ~13s, so the
+tail of a 20s sampling window is post-exit idle).
+
+CONSEQUENCE for the record: #42's "engine is DVFS-bound" conclusion is VOID. The
+correct picture of engine decode at run #43 is:
+  - GPU at 921.6MHz (max) for the whole run.
+  - Engine streams 1.06 GB/token in ~373ms = 2.84 GB/s = 13.3% of the measured
+    21.4 GB/s single-SM ceiling.
+  - Cutting the inner loop 3.3x in ALU ops (T-MAC) changes end-to-end decode by
+    -1.8% => the engine's GEMV is NOT ALU-throughput-bound.
+  - It is not DRAM-bandwidth-bound either (13% of ceiling).
+  => It is bound by per-lane SERIAL LATENCY chains: ~828K weight-steps per lane
+  with a dependent chain per step, on one SM with 40 warps. Levers that shorten
+  the *per-lane chain* pay (#35 +10%, #40 +3.08%); levers that only reduce op
+  *count* (T-MAC, E4, #29) do not. Any future inner loop must be designed for
+  chain length: minimise the number of dependent ops from LDG to the accumulator,
+  and maximise independent chains in flight (ILP x occupancy).
