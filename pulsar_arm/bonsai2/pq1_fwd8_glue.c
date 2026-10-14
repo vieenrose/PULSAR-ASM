@@ -68,7 +68,8 @@ static int PQ1_TM = -1;
 static int PQ1_R128 = -1;   /* run #45: 128 rows/block, 2 lanes/row (default) */
 static int PQ1_R256 = -1;   /* run #46: 256 rows/block; -1 = auto (rows>=8192) */
 static long PQ1_TM_CALLS = 0, PQ1_R128_CALLS = 0, PQ1_R256_CALLS = 0, PQ1_SWAR_CALLS = 0; /* diagnostic: which kernel ran */
-static long PQ1_BATCH_CALLS = 0, PQ1_BATCH_ROWS = 0; /* diagnostic: batched launches */
+static int PQ1_BATCH = -1;  /* run #55: merged-tensor launches; -1 = auto, 0 = off, 2 = every group */
+static long PQ1_BATCH_CALLS = 0, PQ1_BATCH_ROWS = 0; /* diagnostic: merged launches */
 
 /* PQ1_KTIME=1: per-shape device-path timing (upload + launch + sync + readback),
  * printed by pq1_stats at exit. Needed because a kernel-level speedup measured
@@ -564,25 +565,44 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
   }
 }
 
-/* ---- Run #54: batched launches (q+k+v, gate+up) ---------------------------
+/* ---- Run #55: merged (concatenated) tensors, one scalar launch -------------
  * Run #53 (PQ1_KTIME=3) measured the engine's per-call API cost at ~40us H2D +
- * ~45us launch + ~100us D2H, i.e. 46.6ms per token = 12.8% of the 365ms decode
- * step. The engine issues one launch per projection (253/token) and each pays
- * that fixed cost. The projections that share an input vector can share a launch:
- * q, k, v all read the same Q8_K XN, and gate and up both read the post-attention
- * norm. This entry takes up to PQ1_BATCH_MAX tensors, uploads the activation
- * ONCE, launches ONCE, syncs ONCE, then reads back each output (the D2H cannot
- * be merged: the CPU consumes QF/KF/VF as separate vectors).
+ * ~45us launch + ~100us D2H, 46.6ms per token = 12.8% of the decode step, paid
+ * once per projection (253 launches/token). Run #54 batched the projections that
+ * share an activation vector into one launch of a MULTI-TENSOR kernel and found
+ * the win is real for the large group (gate+up: +1.37% end to end) but NEGATIVE
+ * for small shapes, because that kernel needs 15 parameters (3 code + 3 scale +
+ * 3 y pointers + 3 row counts + K + N) and its start-up cost is not amortised on
+ * a 6144-row launch (+49% kernel time).
  *
- * Returns 0 when the batch ran, non-zero when the caller must run the scalar path
- * (no CUDA, cache miss that cannot be uploaded, launch failure...). The math per
- * output row is the same kernel body as the single-tensor path, so the results are
- * bit-identical; pq1_parity verifies the batch kernels against the host reference.
- * PQ1_BATCH=0 disables it (the A/B arm). */
+ * This version removes the multi-pointer kernel entirely: the tensors of a group
+ * are CONCATENATED AT REPACK TIME into one contiguous device tensor of
+ * rows_total rows, and the EXISTING scalar kernel runs the whole matrix. The
+ * kernel is byte-for-byte the one the parity gate certifies, so kernel time is
+ * the scalar kernel's; the API saving is 1 H2D + 1 launch + 1 D2H per group.
+ * The single output buffer is read back in one D2H into a host staging buffer and
+ * scattered to QF/KF/VF (or LG/LU) with plain CPU memcpy - a few KB, microseconds,
+ * and bit-identical because the copy moves the kernel's floats verbatim.
+ *
+ * Returns 0 when the merged launch ran, non-zero when the caller must run the
+ * scalar path per tensor (no CUDA, OOM, launch failure). PQ1_BATCH=0 disables it
+ * (the A/B arm), PQ1_BATCH=1 batches only groups whose tensors all have >= 8192
+ * rows (measured: that is where merging wins), PQ1_BATCH=2 batches every group.
+ */
 #define PQ1_BATCH_MAX 3
-static int PQ1_BATCH = -1;
-static uint8_t *d_yb = NULL;
-static size_t P2YBMAX = 0;
+static uint8_t *MDY = NULL;        /* device output buffer for merged launches */
+static size_t P2MDYMAX = 0;
+
+typedef struct {
+  const unsigned char *w[PQ1_BATCH_MAX];
+  int rows[PQ1_BATCH_MAX];
+  int n, cols;
+  uint8_t *d_codes;
+  unsigned short *d_scales;
+} pq1_merged;
+#define PQ1_MERGED_MAX 64
+static pq1_merged PQ1M[PQ1_MERGED_MAX];
+static int PQ1NM = 0;
 
 int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, int n,
                                int cols, float *const *ys, const unsigned char *xq) {
@@ -593,28 +613,83 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
   }
   if (!PQ1_BATCH || n < 1 || n > PQ1_BATCH_MAX) return -1;
   if ((cols & 127) != 0 || cols <= 0) return -1;
-
-  int ng = cols / 128;
-  const uint8_t *dc[PQ1_BATCH_MAX];
-  unsigned short *dsc[PQ1_BATCH_MAX];
-  int nrow[PQ1_BATCH_MAX];
   int total = 0;
   for (int i = 0; i < n; i++) {
-    dc[i] = NULL;
-    dsc[i] = NULL;
-    nrow[i] = rows[i];
-    int ci = -1;
-    for (int j = 0; j < PQ1N; j++)
-      if (PQ1C[j].w == w[i] && PQ1C[j].rows == rows[i] && PQ1C[j].cols == cols) {
-        ci = j;
-        break;
-      }
-    if (ci < 0) return -1; /* not repacked+cached yet: let the caller use the scalar path */
-    dc[i] = PQ1C[ci].d_codes;
-    dsc[i] = PQ1C[ci].d_scales;
-    if (!dc[i] || !dsc[i]) return -1;
+    if (rows[i] <= 0) return -1;
     total += rows[i];
   }
+  int use256 = 1;
+  for (int i = 0; i < n; i++)
+    if (rows[i] < 8192) use256 = 0;
+  /* Run #54 measured the small-shape merge as a loss (see the header comment):
+   * the batch KERNEL cost +49% there. The merged path runs the unmodified scalar
+   * kernel, so the sign is an open question - PQ1_BATCH=2 tests it, and the A/B
+   * in this run's log settles it. The default stays on the group that is proven
+   * to win until the merged path has its own measurement. */
+  if (!use256 && PQ1_BATCH < 2) return -1;
+
+  /* find or build the merged tensor */
+  int mi = -1;
+  for (int i = 0; i < PQ1NM; i++) {
+    if (PQ1M[i].n == n && PQ1M[i].cols == cols) {
+      int same = 1;
+      for (int k = 0; k < n; k++)
+        if (PQ1M[i].w[k] != w[k] || PQ1M[i].rows[k] != rows[k]) { same = 0; break; }
+      if (same) { mi = i; break; }
+    }
+  }
+  size_t rowcb = (size_t)(cols / 32) * 4, rowsc = (size_t)(cols / 128) * 2;
+  size_t ncb = (size_t)total * rowcb, nsb = (size_t)total * rowsc;
+  size_t a = (ncb + 63) / 64 * 64, b = (nsb + 63) / 64 * 64;
+  if (mi < 0) {
+    if (PQ1NM >= PQ1_MERGED_MAX) return -1;
+    if (pq1_arena_init(a + b) != 0) return -1;
+    uint8_t *pb = PQ1ARENA + PQ1ACUR;
+    uint8_t *ps = pb + a;
+    uint8_t *tmpc = NULL;
+    uint16_t *tmps = NULL;
+    int ok = 1;
+    size_t oc = 0, os = 0;
+    for (int i = 0; i < n; i++) {
+      size_t cb = (size_t)rows[i] * rowcb, sb = (size_t)rows[i] * rowsc; /* both bytes */
+      void *tc = realloc(tmpc, cb);
+      void *ts = realloc(tmps, sb ? sb : 2);
+      if (!tc || !ts) { ok = 0; break; }
+      tmpc = (uint8_t *)tc;
+      tmps = (uint16_t *)ts;
+      pq1_split_repack(w[i], rows[i], cols, (uint32_t *)tmpc, tmps);
+      if (cudaMemcpy(pb + oc, tmpc, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
+          cudaMemcpy(ps + os, tmps, sb, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaGetLastError();
+        ok = 0;
+        break;
+      }
+      oc += cb;
+      os += sb;
+      /* the GGUF pages of a tensor consumed by a merged tensor are single-use */
+      size_t tbytes = (size_t)rows[i] * (cols / 128) * 18;
+      uintptr_t p0 = (uintptr_t)w[i] & ~(uintptr_t)4095;
+      uintptr_t p1 = ((uintptr_t)w[i] + tbytes + 4095) & ~(uintptr_t)4095;
+      if (p1 > p0) madvise((void *)p0, (size_t)(p1 - p0), MADV_DONTNEED);
+    }
+    free(tmpc);
+    free(tmps);
+    if (!ok) return -1;
+    PQ1ACUR += a + b;
+    if (PQ1ACUR > P2PEAK) P2PEAK = PQ1ACUR;
+    mi = PQ1NM++;
+    for (int i = 0; i < n; i++) { PQ1M[mi].w[i] = w[i]; PQ1M[mi].rows[i] = rows[i]; }
+    PQ1M[mi].n = n;
+    PQ1M[mi].cols = cols;
+    PQ1M[mi].d_codes = pb;
+    PQ1M[mi].d_scales = (unsigned short *)ps;
+    if (getenv("PQ1_TRACE"))
+      fprintf(stderr, "PQ1M merged n=%d cols=%d rows=%d codes=%p+%zu scales=%p+%zu\n",
+              n, cols, total, (void *)pb, ncb, (void *)ps, nsb);
+  }
+  const uint8_t *dc = PQ1M[mi].d_codes;
+  const unsigned short *dsc = PQ1M[mi].d_scales;
+  if (!dc || !dsc) return -1;
 
   size_t xqb = (size_t)(cols / 256) * 292, yb = (size_t)total * 4;
   if (!d_xq || xqb > P2XQMAX) {
@@ -622,34 +697,20 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
     d_xq = NULL;
     if (cudaMalloc(&d_xq, xqb) == cudaSuccess) P2XQMAX = xqb;
   }
-  if (!d_yb || yb > P2YBMAX) {
-    if (d_yb) cudaFree(d_yb);
-    d_yb = NULL;
-    if (cudaMalloc(&d_yb, yb) == cudaSuccess) P2YBMAX = yb;
+  if (!MDY || yb > P2MDYMAX) {
+    if (MDY) cudaFree(MDY);
+    MDY = NULL;
+    if (cudaMalloc(&MDY, yb) == cudaSuccess) P2MDYMAX = yb;
   }
-  if (!d_xq || !d_yb) { cudaGetLastError(); return -1; }
-
-  float *dy[PQ1_BATCH_MAX];
-  int off = 0;
-  for (int i = 0; i < n; i++) {
-    dy[i] = (float *)d_yb + off;
-    off += rows[i];
+  static uint8_t *stage = NULL;
+  static size_t STAGEMAX = 0;
+  if (!stage || yb > STAGEMAX) {
+    free(stage);
+    stage = (uint8_t *)malloc(yb);
+    STAGEMAX = stage ? yb : 0;
+    if (!stage) return -1;
   }
-  int use256 = 1;
-  for (int i = 0; i < n; i++)
-    if (rows[i] < 8192) use256 = 0;
-  /* Run #54 measured the two shapes in one job (PQ1_KTIME=3, per launch):
-   *   gate+up (24576 rows, 256 rows/block): batch sync 3.152ms vs 2 x 1.731ms
-   *     separate = 3.462ms -> the batch kernel is 9% FASTER, and it saves one
-   *     H2D + one launch + one D2H of API time (0.168ms) => +0.48ms per layer.
-   *   q+k+v (6144 rows, 128 rows/block): batch sync 1.645ms vs 1.101ms for the
-   *     three separate launches (+49%), which costs more than the 0.237ms of API
-   *     time it saves => -0.31ms per layer. The extra parameters (15 vs 6) put
-   *     the small-shape kernel on the critical path even at identical register
-   *     counts (40, 0 spills, same shared memory).
-   * So the default batches only groups whose tensors all have >= 8192 rows. Set
-   * PQ1_BATCH=2 to batch every group (the arm this run measured and rejected). */
-  if (!use256 && PQ1_BATCH < 2) return -1;
+  if (!d_xq || !MDY) { cudaGetLastError(); return -1; }
 
   double kt0 = KTON ? pq1_now() : 0.0;
   double ta = 0, tb = 0, tc = 0, td = 0, te = 0;
@@ -659,41 +720,36 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
     return -1;
   }
   if (KTON >= 3) tb = pq1_now();
-  if (pq1_gemv_batch_launch(use256, dc, dsc, dy, nrow, n, cols, total, d_xq,
-                            NULL) != 0) {
-    cudaGetLastError();
-    return -1;
-  }
+  int rc = use256 ? pq1_gemv_r256_launch(dc, dsc, d_xq, (float *)MDY, cols, total, NULL)
+                  : pq1_gemv_r128_launch(dc, dsc, d_xq, (float *)MDY, cols, total, NULL);
+  if (rc != 0) { cudaGetLastError(); return -1; }
   if (KTON >= 3) tc = pq1_now();
-  if (cudaDeviceSynchronize() != cudaSuccess) {
+  if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); return -1; }
+  if (KTON >= 3) td = pq1_now();
+  if (cudaMemcpy(stage, MDY, yb, cudaMemcpyDeviceToHost) != cudaSuccess) {
     cudaGetLastError();
     return -1;
   }
-  if (KTON >= 3) td = pq1_now();
-  off = 0;
+  if (KTON >= 3) te = pq1_now();
+  size_t off = 0;
   for (int i = 0; i < n; i++) {
-    if (cudaMemcpy(ys[i], d_yb + (size_t)off * 4, (size_t)rows[i] * 4,
-                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-      cudaGetLastError();
-      return -1;
-    }
+    memcpy(ys[i], stage + (off * 4), (size_t)rows[i] * 4);
     off += rows[i];
   }
   if (KTON >= 3) {
-    te = pq1_now();
-    for (int i = 0; i < n; i++) pq1_kt_phase(rows[i], cols, 0.0, 0.0, 0.0, 0.0);
-    for (int i = 0; i < n; i++)
-      pq1_kt_add(rows[i], cols, (te - kt0) / n); /* one launch, charged evenly */
     fprintf(stderr,
             "PQ1BT n=%d cols=%-6d h2d=%6.1f launch=%6.1f sync=%7.1f d2h=%6.1f ms\n",
             n, cols, tb - ta, tc - tb, td - tc, te - td);
+    for (int i = 0; i < n; i++) {
+      pq1_kt_add(rows[i], cols, (te - kt0) / n);
+      pq1_kt_phase(rows[i], cols, (tb - ta) / n, (tc - tb) / n, (td - tc) / n,
+                   (te - td) / n);
+    }
   }
   PQ1_BATCH_CALLS++;
   PQ1_BATCH_ROWS += total;
   if (use256) PQ1_R256_CALLS += n;
   else PQ1_R128_CALLS += n;
-  if (KTON) pq1_kt_add(-n, cols, te - kt0);
-  (void)ng;
   return 0;
 #else
   (void)w; (void)rows; (void)n; (void)cols; (void)ys; (void)xq;
