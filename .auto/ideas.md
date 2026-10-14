@@ -452,3 +452,29 @@ Targets the ~63us D2H + ~28us H2D pageable latency x 188 calls/token.
   6.2% of 149 ms) can only be removed by REDUCING THE NUMBER OF LAUNCHES, i.e. a persistent
   worker kernel (one launch per token, device-side doorbell + completion flags in pinned mem).
   Estimated ceiling +6-8%; big change, bit-exactness preserved because the math per row is unchanged.
+
+## Exp51 (run #73 probes) persistent-kernel megakernel: feasibility PROVEN, engine build pending
+- p63/p65 bisect: the rc=719 "persistent kernel crash" was MY addressing bug (loop kernels added
+  the base pointer twice: `rd3 = pw + tid*stride` computed outside the loop, then `pw + item + rd3`
+  inside -> OOB address). Corrected loop kernels (p67 q1/q2/q3) run CLEAN on R440 (sync rc=0,
+  liveness verified nonzero). No driver prohibition on loops/atomics/stores in kernels.
+- Measured (probe_bw68, random-filled buffer, 360MB, engine-dominant geometry):
+  flat grid 14656x256 @96B/thr: 13.25 GB/s (27.2ms)  [p96 == n96: .nc texture path = NO effect]
+  loop grid 64x256 (under-parallel): q1 11.05 GB/s, q2 atomics 79 GB-s-IMPLAUSIBLE (see below),
+  q3_small 16.7ms/120MB = 7.2 GB/s effective.
+  LIVENESS TRAP: q2_loop_atom reported y[0] = 2x expected and 79 GB/s > DRAM peak (25.6 GB/s) ->
+  the probe's y expectation formula and/or the compiler's dead-code-elimination inflate loop-kernel
+  numbers; NEVER trust GB/s from loop kernels without a byte-verified checksum. p96 flat is the
+  honest baseline: 13.25 GB/s at this access pattern.
+- probe_graph69 (1-node graph vs raw, engine cadence 229 calls x 20 tokens): GRAPH is 30.5 us/call
+  SLOWER (2969 vs 2938 us/call) -> confirms Exp45: per-call graph replay is DEAD on R440. DO NOT
+  RETRY graphs at any node count.
+- DESIGN for v53 megakernel (if pursued): host enqueues 229 work descriptors (w, sc_off, xq, y,
+  r0, r1, nb32) per token into a pinned ring; ONE launch per token; kernel grid-strides over all
+  rows of all descriptors (full-grid occupancy ~128 SMs x 2 blocks x 256 thr); completion via
+  device->pinned progress word + host poll. Bit-exactness: per-row math unchanged.
+  Ceiling ~ +6-8% (9.2ms launch cost + inter-kernel gaps out of 143ms). Loop-form BW loss at
+  64 blocks (11 vs 13.25 GB/s) means the megakernel MUST use a flat grid-stride over (item, row),
+  not a per-block serial loop over items.
+- Launch-cost reference (probe_queue54, engine shapes): launch-only 96.5 us, H2DA+launch+D2HA
+  65.5 us, +event-poll 111.6 us per call at engine sizes.
