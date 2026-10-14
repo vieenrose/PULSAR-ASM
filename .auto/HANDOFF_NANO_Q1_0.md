@@ -1,6 +1,7 @@
 # HANDOFF — Bonsai-8B Q1_0 (true 1-bit) on Jetson Nano, branch `bonsai-jetson-nano`
 
-Written 2026-10-14 at the end of an autoresearch session (68 logged runs).
+Written 2026-10-14 at the end of an autoresearch session (68 logged runs); updated the same
+day after autoresearch loop `autoresearch/loop-261014-2216` (runs #76-#80, see §2.1).
 **Read this first; `.auto/ideas.md` has the append-only history, `.auto/log.jsonl` the raw runs.**
 
 ---
@@ -21,13 +22,46 @@ Three gates, enforced by `.auto/checks.sh`, never overridable:
 
 | metric | baseline (#13) | now | notes |
 |---|---|---|---|
-| decode_tps | 2.1349 | **6.7476** (+216%) | cold harness #74; board clocks locked (jetson_clocks + c7 off, see §5.2) |
-| prefill_tps | 2.2256 | **6.8938** | same code path; no prompt batching |
-| peak_rss_mb | 206 | 340 | grew with merges+graphs; arena unchanged |
+| decode_tps | 2.1349 | **8.2899** (+288%) | cold harness #80 (was 6.7476 at #74); board clocks locked (jetson_clocks + c7 off, see §5.2) |
+| prefill_tps | 2.2256 | **8.2672** | same code path; no prompt batching (6.8938 at #74) |
+| peak_rss_mb | 206 | 342 | grew with merges+graphs; arena unchanged (339-344 across #76-#80) |
 | startup_s | 2.8 | 2.4 | step 0 = repack + upload + first forward |
-| gpu_used / arena | - | 1014.8 / 1280 MB | the arena is NOT to be shrunk (see #23) |
+| gpu_used / arena | - | 1158.9 / 1280 MB | +144 MB = device K/V cache (#78); the arena is NOT to be shrunk (see #23) |
 
-Per-token budget (PQ1_KTIME=1 + arithmetic): **283 ms = 204 ms device + ~79 ms CPU (28%)**
+### 2.1 Loop 261014-2216 (runs #76-#80): 6.76 -> 8.29 decode tps, all bit-exact
+
+Every keep: three gates green on a fresh build, logits identical to the reference on all
+44 steps of prompt A, order-balanced `ab_pair` in both orders. The decode path is now
+almost entirely on the GPU: per layer, one attention graph and one FFN graph.
+
+| run | commit | change | A/B | cold decode tps | A/B arm |
+|---|---|---|---|---|---|
+| #76 | a17461c | FFN tail as one graph per layer: T-MAC gate+up, device silu*u + Q8_K (`pq1_silu_q8k`, glibc-faithful `pq1_expf_dev`), T-MAC down | +10.4% | 6.76 -> 7.32 | `PQ1_FFN=0` |
+| #77 | bb2aea8 | T-MAC: pc folded into plane 7, POPC 72 -> 64 per 2-row group | +2.2% | 7.32 -> 7.46 | `PQ1_TMV=0` |
+| #78 | 0a017e4 | Attention block as one graph per layer: q+k+v T-MAC, head RMS + rope + K/V store (`pq1_attn_pre`), q.k/softmax/p.v (`pq1_attn_core`), Q8_K, o T-MAC; K/V cache lives in the arena (`[layer][k|v][kvhead][ctx][128]`), host path mirrors rows via `pq1_attn_kv_put` | +8.6% | 7.46 -> 7.89 | `PQ1_ATT=0` |
+| #79 | 082ad34 | `pq1_tm_prep` one warp per 128-activation group, planes via `__ballot_sync` (was one thread per group, 36 us x 4 per layer) | +3.3% | 7.89 -> 8.16 | `PQ1_TMPW=0` |
+| #80 | 92f35d5 | `pq1_attn_pre1`: one block, thread t runs head t's serial double RMS chain (was lane 0 of one warp per head, 100 us/layer) | +1.8% | 8.16 -> 8.29 | `PQ1_APRE=0` |
+
+Bit-exact verification switches: `PQ1_ATT_CHECK=1` reruns the host attention after each
+fused layer and compares K/V rows, attention output and AO bitwise (`ATTCHK ... 0 bad`
+over 1548 layer-steps); `PQ1_FFN_CHECK=1` does the same for the FFN (`FFNCHK`).
+`PQ1GPU ... ffn=G/C att=G/C` proves the graphs ran (36 graphs, 1548 calls).
+
+**Per-token budget after #78** (`PQ1_CPUTIME=1`, 24 decode steps): total 126.7 ms = gemv
+121.3 (GPU graphs + API) + rms 1.9 + quant 1.3 + sample 1.1 + resid 0.65 + argmax 0.4.
+`PQ1_KTIME=1`: attention graph 0.90 ms/layer, FFN graph 2.20 ms/layer, head 8.43 ms.
+nvprof (after #80): T-MAC GEMV ~85% of decode; small kernels per layer: silu_q8k 62 us
+(DP-bound glibc expf, ~12 DP ops/element at full lane occupancy), attn_core 55 us.
+
+**sm_53 lesson (#79/#80):** a DP instruction with one active lane still costs a full warp
+of DP issue (8 clk on the 4-lane/clk DP unit). Serial double chains must be packed one
+chain per lane, never one chain per warp.
+
+**Why the loop stopped at 9/25 iterations:** the T-MAC kernel is near its POPC floor
+(POPC 32/clk/SM: ~8G weights x 8 planes / 32 = ~68 ms/token of ~120), and three kernel
+experiments in a row lost (see §4). Remaining items are each < the ~1% A/B resolution.
+
+**History before the loop:** Per-token budget (PQ1_KTIME=1 + arithmetic): **283 ms = 204 ms device + ~79 ms CPU (28%)**
 before #69; after #69 (pass-level profiler `PQ1_CPUTIME=1`, ms/tok over decode steps):
 total 251.2 = gemv 214.2 (GPU + glue) + attn 13.6 + silu 12.3 + quant 4.7 + rms 2.1 +
 headnorm 1.4 + sample 1.1 + resid 0.8 + rope 0.5 + argmax 0.4 + kvcopy 0.1.
@@ -94,7 +128,31 @@ primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy 
 (#53): **-390%** (cudaHostAlloc memory is CPU-uncached on Tegra). GPU keep-warm (#43):
 -35% (1 SM, kernels serialise). T-MAC on all shapes with the HOST plane build (#50 -3%, #72 -5.5% even with the 2-row kernel): the host build + 5 API calls per call were the cost, see §3. Hybrid CPU/GPU row split (#75): <=+1.3% unresolved at its best point (8% rows, 2 workers), the two sides starve each other on DRAM; see §5.1.
 
+Loop 261014-2216 (patches in `autoresearch/loop-261014-2216/`):
+* Carry-save adder across T-MAC code words (iter 1): POPC 64 -> 48 but spills at 48 regs
+  (1.64 ms) and is still slower at 64 regs (1.44 vs 1.37 ms): issue-bound, not POPC-only.
+* T-MAC epilogue split across lanes sub 0/1 + `sh_prod` padded to 17 (iter 5): flat/-1%.
+* T-MAC skipping sign-extension planes per 32-activation word (iter 8): activations need
+  7.2 signed bits on average at K=4096 (55% need all 8), 6.7 on the down input, so at most
+  10-16% of POPCs are skippable; warp-uniform branches made the kernel **+23% slower**.
+* silu(g)*u in the gate+up T-MAC epilogue (iter 9, bit-exact): -2.0% (`PQ1_TMSILU=0`
+  faster); the DP expf tail serializes on lane sub 0 at block end.
+* Device RMS for the 4096-wide norms (analysis only): a serial double chain on one lane is
+  latency-bound (~70-90 us per norm) vs ~26 us on the CPU; not attempted.
+
 ## 5. Open levers, ranked
+
+**Updated after loop 261014-2216.** Item 1 below (CPU passes) is largely superseded:
+attention, silu and the FFN quant moved to the GPU (#76/#78), and CPU time is now ~5 ms/token.
+Current ranking:
+1. **The T-MAC kernel itself** (~85% of decode, near the POPC floor). Gains need a different
+   inner product formulation with fewer POPCs *and* no extra ALU; see §4 for what failed.
+2. **Head GEMV** 8.4 ms/token (151669 rows, ~9.7 GB/s vs 21.4 ceiling): same kernel.
+3. **Small items, each < 1%:** argmax runs twice per greedy token (`sample` pass and after
+   the head, ~0.4 ms); `attn_core` sums the softmax on thread 0 in double (pack the heads
+   one per lane, as #80 did); graph launch + sync gaps (~2 graphs/layer).
+
+Original ranking (before the loop):
 
 1. **CPU passes: now ~24 ms/token (16%), was ~79.** #74 (all bit-exact, logits identical
    on all 44 steps): K cache transposed into 16-position tiles `KTC[l][kh][t/16][i][t%16]`
