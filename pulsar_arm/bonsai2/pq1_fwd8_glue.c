@@ -72,7 +72,7 @@ static long PQ1_TM_CALLS = 0, PQ1_R128_CALLS = 0, PQ1_R256_CALLS = 0, PQ1_SWAR_C
 /* PQ1_KTIME=1: per-shape device-path timing (upload + launch + sync + readback),
  * printed by pq1_stats at exit. Needed because a kernel-level speedup measured
  * on a standalone launch does not automatically appear in the engine. */
-typedef struct { int rows, cols; double ms; long n; } pq1_kt;
+typedef struct { int rows, cols; double ms; long n; double h2d, launch, sync, d2h; } pq1_kt;
 static pq1_kt KT[64];
 static int NKT = 0, KTON = -1;
 static double pq1_now(void) {
@@ -96,6 +96,118 @@ static void pq1_kt_add(int rows, int cols, double ms) {
   }
 }
 static int PQ1ARENA_DEAD = 0;
+
+/* Zero-copy output buffers (PQ1_ZC=1 to enable; OFF by default, measured -390%).
+ *
+ * Run #53's phase timing (PQ1_KTIME=3) measured the engine's per-call API cost
+ * at 190us for a 4096x4096 GEMV: h2d 40us + launch 49us + d2h 101us, i.e.
+ * 46.6ms per token of the 365ms decode step (12.8%), of which the D2H readback
+ * of the output vector is 26ms/token (7%). Those copies are pure overhead on
+ * this board: Tegra shares one physical address space between the CPU and the
+ * GPU, so the kernel can write the engine's output vectors (QF/KF/VF/AO/LG/LU/
+ * FO/HEAD) in place. Each distinct buffer is DMA-mapped once at its first use
+ * (cudaHostRegister + cudaHostGetDevicePointer); the kernel then writes the
+ * device pointer of that buffer instead of the arena staging buffer, and the
+ * cudaMemcpy D2H disappears. The values written are identical, so the greedy
+ * stream and the parity gate are unaffected. Any registration failure disables
+ * the path for the rest of the run and the copy path is used. */
+#define PQ1_ZC_MAX 24
+static struct { const void *h; void *d; size_t n; } ZC[PQ1_ZC_MAX];
+static int NZC = 0, ZCON = -1, ZCFAIL = 0;
+
+static void *pq1_out_dev(const void *h, size_t n) {
+  if (ZCON < 0) {
+    const char *z = getenv("PQ1_ZC");
+    /* DEFAULT OFF. Run #53 measured the zero-copy output path (kernel writes the
+     * engine's output buffers in place, removing the 24ms/token of D2H memcpy):
+     * the copies do disappear (d2h = 0.00ms with 8 buffers mapped), but decode
+     * goes 365 -> 1862 ms/token, i.e. -390%. cudaHostAlloc memory on Tegra is
+     * CPU-uncached, so the engine's own CPU passes over those vectors (attention
+     * over QF/KF/VF, silu over LG/LU, residual adds over AO/FO, argmax over
+     * HEAD) cost several times what the DMA copies cost. The API overhead it
+     * removes is real (46.6ms/token = 12.8% of decode by the same phase timing);
+     * the way to reclaim it is batching the calls, not mapping the buffers. */
+    ZCON = (z && atoi(z) != 0) ? 1 : 0;
+  }
+  if (!ZCON || ZCFAIL >= 4 || !h) return NULL;
+  for (int i = 0; i < NZC; i++)
+    if (ZC[i].h == h && ZC[i].n == n) return ZC[i].d;
+  if (NZC >= PQ1_ZC_MAX) return NULL;
+  void *d = NULL;
+  /* Fast path: the buffer came from pq1_hostmap (cudaHostAlloc Mapped), which
+   * cudaHostGetDevicePointer translates directly. Probing it first is required
+   * on Tegra, where cudaHostRegister is not supported at all (run #53 measured
+   * "operation not supported" for malloc'd memory). */
+  if (cudaHostGetDevicePointer(&d, (void *)h, 0) == cudaSuccess && d) {
+    ZC[NZC].h = h;
+    ZC[NZC].n = n;
+    ZC[NZC].d = d;
+    NZC++;
+    return ZC[NZC - 1].d;
+  }
+  cudaGetLastError(); /* clear the probe's error so it cannot poison later checks */
+  /* Fallback for a plain malloc'd buffer: register the whole set of pages that
+   * contains it (cudaHostRegister is page-granular; malloc gives 16-byte
+   * alignment), then offset the device pointer by the in-page offset. */
+  uintptr_t base = (uintptr_t)h & ~(uintptr_t)4095u;
+  size_t off = (uintptr_t)h - base;
+  size_t len = ((off + n + 4095u) & ~(size_t)4095u);
+  d = NULL;
+  cudaError_t e = cudaHostRegister((void *)base, len, cudaHostRegisterDefault);
+  if (e != cudaSuccess) {
+    cudaGetLastError();
+    if (getenv("PQ1_TRACE"))
+      fprintf(stderr, "PQ1ZC register %p n=%zu -> %s\n", h, n, cudaGetErrorString(e));
+    ZCFAIL++;
+    return NULL;
+  }
+  if (cudaHostGetDevicePointer(&d, (void *)base, 0) != cudaSuccess || !d) {
+    cudaHostUnregister((void *)base);
+    ZCFAIL++;
+    return NULL;
+  }
+  ZC[NZC].h = h;
+  ZC[NZC].n = n;
+  ZC[NZC].d = (void *)((uintptr_t)d + off);
+  NZC++;
+  return ZC[NZC - 1].d;
+}
+
+/* Host allocation the GPU can address directly. On Tegra the CPU and GPU share
+ * one physical address space, so a cudaHostAlloc(Mapped) buffer is ordinary
+ * RAM that both sides can touch: fwd8.c allocates its GEMV output vectors with
+ * this, the kernel writes them in place, and the per-call D2H memcpy goes away
+ * (run #53 measured that copy at 26ms per token = 7% of the decode step).
+ * Returns NULL when mapping is unavailable; the caller then uses malloc and the
+ * glue keeps the (bit-identical) copy path. */
+void *pq1_hostmap(size_t bytes) {
+  if (ZCON < 0) {
+    const char *z = getenv("PQ1_ZC");
+    ZCON = (z && atoi(z) != 0) ? 1 : 0; /* off by default, see pq1_out_dev (#53) */
+  }
+  if (!ZCON) return NULL;
+  void *p = NULL;
+  if (cudaHostAlloc(&p, bytes, cudaHostAllocMapped) != cudaSuccess) {
+    if (getenv("PQ1_TRACE")) fprintf(stderr, "PQ1ZC hostalloc %zu -> failed\n", bytes);
+    ZCFAIL++;
+    return NULL;
+  }
+  return p;
+}
+
+/* PQ1_KTIME=3 additionally splits the per-call cost into its API phases
+ * (H2D / launch / device-sync / D2H), because the engine spends ~44ms/token
+ * outside the GEMV kernels and the batch-launch idea is only worth building if
+ * a meaningful part of that is per-call API overhead rather than CPU math. */
+static void pq1_kt_phase(int rows, int cols, double h2d, double launch,
+                         double sync, double d2h) {
+  for (int i = 0; i < NKT; i++)
+    if (KT[i].rows == rows && KT[i].cols == cols) {
+      KT[i].h2d += h2d; KT[i].launch += launch;
+      KT[i].sync += sync; KT[i].d2h += d2h;
+      return;
+    }
+}
 
 /* GPU-RAM accounting for the harness (PQ1_STATS=1 prints one line at exit).
  * gpu_used_mb  = bytes of the device arena actually holding weights
@@ -143,12 +255,24 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
       fprintf(stderr,
               "PQ1KT rows=%-7d cols=%-6d n=%-4ld total=%8.2f ms  per=%7.4f ms\n",
               KT[i].rows, KT[i].cols, KT[i].n, KT[i].ms, KT[i].ms / KT[i].n);
+    if (KTON >= 3)
+      for (int i = 0; i < NKT; i++)
+        fprintf(stderr,
+                "PQ1PH rows=%-7d cols=%-6d n=%-4ld h2d=%7.2f launch=%7.2f "
+                "sync=%8.2f d2h=%7.2f ms  (us/call %.1f / %.1f / %.1f / %.1f)\n",
+                KT[i].rows, KT[i].cols, KT[i].n, KT[i].h2d, KT[i].launch,
+                KT[i].sync, KT[i].d2h,
+                KT[i].n ? 1e3 * KT[i].h2d / KT[i].n : 0.0,
+                KT[i].n ? 1e3 * KT[i].launch / KT[i].n : 0.0,
+                KT[i].n ? 1e3 * KT[i].sync / KT[i].n : 0.0,
+                KT[i].n ? 1e3 * KT[i].d2h / KT[i].n : 0.0);
   }
   snprintf(buf, n,
            "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%s "
-           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld",
+           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld zc=%d zcfail=%d",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
-           fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_R128_CALLS, PQ1_R256_CALLS, PQ1_SWAR_CALLS);
+           fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_R128_CALLS, PQ1_R256_CALLS,
+           PQ1_SWAR_CALLS, NZC, ZCFAIL);
   return buf;
 }
 #endif
@@ -385,18 +509,37 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
         PQ1_TM = 0;
       }
       int use256 = (PQ1_R256 < 0) ? (rows >= 8192) : (PQ1_R256 != 0);
-      if (d_xq && d_y &&
-          cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
-          (use256 ? pq1_gemv_r256_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)
-           : PQ1_R128 ? pq1_gemv_r128_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)
-                      : pq1_gemv_sm53_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)) == 0 &&
-          cudaDeviceSynchronize() == cudaSuccess &&
-          cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess) {
-        if (use256) PQ1_R256_CALLS++;
-        else if (PQ1_R128) PQ1_R128_CALLS++;
-        else PQ1_SWAR_CALLS++;
-        if (KTON) pq1_kt_add(rows, cols, pq1_now() - kt0);
-        return;
+      if (d_xq && (d_y || pq1_out_dev(y, yb))) {
+        int ok = 1;
+        double ta = 0, tb = 0, tc = 0, td = 0, te = 0;
+        void *ydev = pq1_out_dev(y, yb);
+        if (!ydev && !d_y) ok = 0;
+        if (KTON >= 3) ta = pq1_now();
+        if (cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) != cudaSuccess) ok = 0;
+        if (KTON >= 3) tb = pq1_now();
+        if (ok) {
+          void *yo = ydev ? ydev : d_y;
+          int rc = use256 ? pq1_gemv_r256_launch(dc, dsc, d_xq, yo, cols, rows, NULL)
+                   : PQ1_R128 ? pq1_gemv_r128_launch(dc, dsc, d_xq, yo, cols, rows, NULL)
+                              : pq1_gemv_sm53_launch(dc, dsc, d_xq, yo, cols, rows, NULL);
+          if (rc != 0) ok = 0;
+        }
+        if (KTON >= 3) tc = pq1_now();
+        if (ok && cudaDeviceSynchronize() != cudaSuccess) ok = 0;
+        if (KTON >= 3) td = pq1_now();
+        if (ok && !ydev && cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) != cudaSuccess) ok = 0;
+        if (KTON >= 3) {
+          te = pq1_now();
+          pq1_kt_phase(rows, cols, tb - ta, tc - tb, td - tc,
+                       ydev ? 0.0 : te - td);
+        }
+        if (ok) {
+          if (use256) PQ1_R256_CALLS++;
+          else if (PQ1_R128) PQ1_R128_CALLS++;
+          else PQ1_SWAR_CALLS++;
+          if (KTON) pq1_kt_add(rows, cols, pq1_now() - kt0);
+          return;
+        }
       }
       fprintf(stderr, "pq2: device path failed: %s -> CPU fallback\n",
               cudaGetErrorString(cudaGetLastError()));
