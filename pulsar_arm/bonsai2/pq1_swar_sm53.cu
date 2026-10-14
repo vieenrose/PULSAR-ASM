@@ -121,6 +121,7 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
                    int K, int N) {
   __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
   __shared__ int sh_au[PQ1_CHUNK_GROUPS];
+  __shared__ uint32_t sh_keep[16]; /* run #67: 16-entry nibble -> 0xFF byte mask */
   __shared__ float sh_prod[PQ1_BLOCK_ROWS][PQ1_CHUNK_GROUPS];
 
   int row = blockIdx.x * PQ1_BLOCK_ROWS + (threadIdx.x >> 2);
@@ -173,6 +174,17 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
         a2 += __shfl_down_sync(0xFFFFFFFFu, a2, o);
       if (slot == 0) sh_au[gid] = a2;
     }
+    /* Run #67: the keep mask depends only on the 4-bit nibble value, so it is a
+     * 16-entry table lookup instead of a chain of constant multiplies. ptxas
+     * emits each 32-bit constant multiply as 3 XMAD-family ops, so the source
+     * `((b4*0x00204081)&0x01010101)*255` costs ~6 SASS ops per nibble; this is
+     * 1 LDS.32 on a 64-byte table (word j -> 0xFF in byte j iff bit j set),
+     * which #15/#30 showed is not a scarce resource on this part. Built before
+     * the staging barrier so every thread sees it afterwards. */
+    if (threadIdx.x < 16) {
+      uint32_t kb = (uint32_t)threadIdx.x;
+      sh_keep[kb] = ((kb * 0x00204081u) & 0x01010101u) * 255u;
+    }
     __syncthreads();
 
     /* 3. two groups per lane (the 8 lanes of a row cover the chunk's 16
@@ -217,7 +229,7 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
       for (int kk = 0; kk < 8; kk++) {
         uint32_t b4 = (bits >> (kk * 4)) & 0xFu;
         /* 4 one-bit weights -> 4 keep bytes (0xFF keep / 0x00 drop) */
-        uint32_t keep = ((b4 * 0x00204081u) & 0x01010101u) * 255u;
+        uint32_t keep = sh_keep[b4];
         uint32_t ap = av[w * 8 + kk]; /* the matching 4 act bytes */
         /* 3-input LOP3 form: folding the selection AND into both byte-mask ANDs
          * lets ptxas emit two LOP32I ops instead of three LOPs plus an LOP for
@@ -279,6 +291,7 @@ void pq1_gemv_r128(const uint8_t* __restrict__ w_codes,
                    int K, int N) {
   __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
   __shared__ int sh_au[PQ1_CHUNK_GROUPS];
+  __shared__ uint32_t sh_keep[16]; /* run #67: 16-entry nibble -> 0xFF byte mask */
   __shared__ float sh_prod[PQ1_BLOCK_ROWS2][PQ1_CHUNK_GROUPS];
 
   int row = blockIdx.x * PQ1_BLOCK_ROWS2 + (threadIdx.x >> 1);
@@ -321,6 +334,17 @@ void pq1_gemv_r128(const uint8_t* __restrict__ w_codes,
         a2 += __shfl_down_sync(0xFFFFFFFFu, a2, o);
       if (slot == 0) sh_au[gid] = a2;
     }
+    /* Run #67: the keep mask depends only on the 4-bit nibble value, so it is a
+     * 16-entry table lookup instead of a chain of constant multiplies. ptxas
+     * emits each 32-bit constant multiply as 3 XMAD-family ops, so the source
+     * `((b4*0x00204081)&0x01010101)*255` costs ~6 SASS ops per nibble; this is
+     * 1 LDS.32 on a 64-byte table (word j -> 0xFF in byte j iff bit j set),
+     * which #15/#30 showed is not a scarce resource on this part. Built before
+     * the staging barrier so every thread sees it afterwards. */
+    if (threadIdx.x < 16) {
+      uint32_t kb = (uint32_t)threadIdx.x;
+      sh_keep[kb] = ((kb * 0x00204081u) & 0x01010101u) * 255u;
+    }
     __syncthreads();
 
 #pragma unroll 1
@@ -346,7 +370,7 @@ void pq1_gemv_r128(const uint8_t* __restrict__ w_codes,
 #pragma unroll
         for (int kk = 0; kk < 8; kk++) {
           uint32_t b4 = (bits >> (kk * 4)) & 0xFu;
-          uint32_t keep = ((b4 * 0x00204081u) & 0x01010101u) * 255u;
+          uint32_t keep = sh_keep[b4];
           uint32_t ap = av[w * 8 + kk];
           uint32_t fold = (ap & keep & 0x00FF00FFu) +
                           ((ap & keep & 0xFF00FF00u) >> 8);
@@ -407,6 +431,7 @@ void pq1_gemv_r256(const uint8_t* __restrict__ w_codes,
                    int K, int N) {
   __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
   __shared__ int sh_au[PQ1_CHUNK_GROUPS];
+  __shared__ uint32_t sh_keep[16]; /* run #67: 16-entry nibble -> 0xFF byte mask */
 
   int row = blockIdx.x * PQ1_BLOCK_ROWS3 + threadIdx.x;
   if (blockIdx.x * PQ1_BLOCK_ROWS3 >= N) return; /* block-uniform */
@@ -447,6 +472,17 @@ void pq1_gemv_r256(const uint8_t* __restrict__ w_codes,
         a2 += __shfl_down_sync(0xFFFFFFFFu, a2, o);
       if (slot == 0) sh_au[gid] = a2;
     }
+    /* Run #67: the keep mask depends only on the 4-bit nibble value, so it is a
+     * 16-entry table lookup instead of a chain of constant multiplies. ptxas
+     * emits each 32-bit constant multiply as 3 XMAD-family ops, so the source
+     * `((b4*0x00204081)&0x01010101)*255` costs ~6 SASS ops per nibble; this is
+     * 1 LDS.32 on a 64-byte table (word j -> 0xFF in byte j iff bit j set),
+     * which #15/#30 showed is not a scarce resource on this part. Built before
+     * the staging barrier so every thread sees it afterwards. */
+    if (threadIdx.x < 16) {
+      uint32_t kb = (uint32_t)threadIdx.x;
+      sh_keep[kb] = ((kb * 0x00204081u) & 0x01010101u) * 255u;
+    }
     __syncthreads();
 
 #pragma unroll 1
@@ -470,7 +506,7 @@ void pq1_gemv_r256(const uint8_t* __restrict__ w_codes,
 #pragma unroll
         for (int kk = 0; kk < 8; kk++) {
           uint32_t b4 = (bits >> (kk * 4)) & 0xFu;
-          uint32_t keep = ((b4 * 0x00204081u) & 0x01010101u) * 255u;
+          uint32_t keep = sh_keep[b4];
           uint32_t ap = av[w * 8 + kk];
           uint32_t fold = (ap & keep & 0x00FF00FFu) +
                           ((ap & keep & 0xFF00FF00u) >> 8);
@@ -685,6 +721,7 @@ void pq1_gemv_batch(const uint8_t* __restrict__ c0, const uint8_t* __restrict__ 
   const int RPB = 256 / LANES;
   __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
   __shared__ int sh_au[PQ1_CHUNK_GROUPS];
+  __shared__ uint32_t sh_keep[16]; /* run #67: 16-entry nibble -> 0xFF byte mask */
   __shared__ float sh_prod[RPB][PQ1_CHUNK_GROUPS];
 
   int row = blockIdx.x * RPB + (LANES == 1 ? threadIdx.x : threadIdx.x >> 1);
@@ -736,6 +773,17 @@ void pq1_gemv_batch(const uint8_t* __restrict__ c0, const uint8_t* __restrict__ 
         a2 += __shfl_down_sync(0xFFFFFFFFu, a2, o);
       if (slot == 0) sh_au[gid] = a2;
     }
+    /* Run #67: the keep mask depends only on the 4-bit nibble value, so it is a
+     * 16-entry table lookup instead of a chain of constant multiplies. ptxas
+     * emits each 32-bit constant multiply as 3 XMAD-family ops, so the source
+     * `((b4*0x00204081)&0x01010101)*255` costs ~6 SASS ops per nibble; this is
+     * 1 LDS.32 on a 64-byte table (word j -> 0xFF in byte j iff bit j set),
+     * which #15/#30 showed is not a scarce resource on this part. Built before
+     * the staging barrier so every thread sees it afterwards. */
+    if (threadIdx.x < 16) {
+      uint32_t kb = (uint32_t)threadIdx.x;
+      sh_keep[kb] = ((kb * 0x00204081u) & 0x01010101u) * 255u;
+    }
     __syncthreads();
 
 #pragma unroll 1
@@ -760,7 +808,7 @@ void pq1_gemv_batch(const uint8_t* __restrict__ c0, const uint8_t* __restrict__ 
 #pragma unroll
         for (int kk = 0; kk < 8; kk++) {
           uint32_t b4 = (bits >> (kk * 4)) & 0xFu;
-          uint32_t keep = ((b4 * 0x00204081u) & 0x01010101u) * 255u;
+          uint32_t keep = sh_keep[b4];
           uint32_t ap = av[w * 8 + kk];
           uint32_t fold = (ap & keep & 0x00FF00FFu) +
                           ((ap & keep & 0xFF00FF00u) >> 8);
