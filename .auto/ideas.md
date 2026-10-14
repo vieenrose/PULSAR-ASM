@@ -793,3 +793,30 @@ correct picture of engine decode at run #43 is:
   *count* (T-MAC, E4, #29) do not. Any future inner loop must be designed for
   chain length: minimise the number of dependent ops from LDG to the accumulator,
   and maximise independent chains in flight (ILP x occupancy).
+
+## Contention and measurement-window artifacts (2026-10-14, run #44)
+
+Stream-benchmark ceiling measured twice in two window regimes, which is itself the
+finding: the SAME grid=40 config reports 8.67 GB/s in a ~1s window (cold clocks)
+and 21.4 GB/s at the tail of a multi-minute sweep (boosted clocks). Any "we are
+at X% of the ceiling" claim must state the clock state of its baseline.
+
+Contention test: stream benchmark run concurrently with a full engine decode
+(OMP_NUM_THREADS=4 engine in the background) = 8.40 GB/s vs 8.67 GB/s with an
+idle CPU. The CPU's per-token work steals no measurable GPU bandwidth, so the
+engine's 2.84 GB/s is not DRAM contention with the CPU.
+
+Engine-side per-token GEMV budget (PQ1_KTIME=1, --gen 4, per token, SWAR):
+gate+up (12288x4096) 142.5ms = 38% | down (4096x12288) 70.0ms = 19% |
+q+o (4096x4096) 58.2ms = 16% | head (151669x4096) 21.9ms = 6% | k+v 25.1ms = 7%.
+The big matrices run at 3.2-3.8 GB/s in-engine and the same shapes measured
+standalone agree (2.5-5.7 GB/s), so the engine is not paying a per-launch penalty
+on them - the cost is inside the kernel's inner loop at 40 warps.
+
+Blocked on: GPU performance counters (nvprof -> ERR_NVGPUCTRPERM, #27). Every
+resource that can be measured from the outside (ALU ops, LDS ops, LDS latency,
+DRAM bytes, DRAM contention, occupancy, instruction count, clock) has now been
+bounded by A/B experiment, and every one of them is slack. The 17x gap between
+the inner loop's ALU-issue estimate (~22ms/token) and measured decode (~373ms)
+cannot be attributed without stall-reason counters. Requesting profiling access
+(root, or the Tegra perf-access toggle) is the highest-value ask available.
