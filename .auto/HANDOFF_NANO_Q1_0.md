@@ -21,8 +21,8 @@ Three gates, enforced by `.auto/checks.sh`, never overridable:
 
 | metric | baseline (#13) | now | notes |
 |---|---|---|---|
-| decode_tps | 2.1349 | **5.9961** (+181%) | cold harness #72; board clocks locked (jetson_clocks + c7 off, see §5.2) |
-| prefill_tps | 2.2256 | **6.3608** | same code path; no prompt batching |
+| decode_tps | 2.1349 | **6.4104** (+200%) | cold harness #73; board clocks locked (jetson_clocks + c7 off, see §5.2) |
+| prefill_tps | 2.2256 | **6.7021** | same code path; no prompt batching |
 | peak_rss_mb | 206 | 340 | grew with merges+graphs; arena unchanged |
 | startup_s | 2.8 | 2.4 | step 0 = repack + upload + first forward |
 | gpu_used / arena | - | 1014.8 / 1280 MB | the arena is NOT to be shrunk (see #23) |
@@ -35,11 +35,11 @@ HEAD-before-#69 under the same clocks: gemv 217.6, attn 26.7, quant 12.7, silu 1
 
 | shape | calls/token | ms/call | ms/token | kernel |
 |---|---|---|---|---|
-| gate+up merged 24576x4096 | 36 | 1.56 (#72) | 56 | **T-MAC** 2 rows/thread, graph |
-| down 4096x12288 | 36 | 0.91 (#72) | 33 | **T-MAC** (was r128 1.60) |
-| q/k/v merged 6144x4096 | 36 | 0.57 (#72) | 20 | **T-MAC** (was r128 ~0.45-0.86) |
-| o 4096x4096 | 36 | 0.43 (#72) | 15.5 | **T-MAC** (was r128 0.67) |
-| head 151669x4096 | 1 | 8.7 (#72) | 8.7 | **T-MAC** 2 rows/thread, graph |
+| gate+up merged 24576x4096 | 36 | 1.49 (#73) | 54 | **T-MAC** 2 rows/thread, graph |
+| down 4096x12288 | 36 | 0.84 (#73) | 30 | **T-MAC** (was r128 1.60) |
+| q/k/v merged 6144x4096 | 36 | 0.48 (#73) | 17 | **T-MAC** (was r128 ~0.45-0.86) |
+| o 4096x4096 | 36 | 0.35 (#73) | 12.7 | **T-MAC** (was r128 0.67) |
+| head 151669x4096 | 1 | 8.7 (#73) | 8.7 | **T-MAC** 2 rows/thread, graph |
 
 ## 3. What the engine looks like now (the kept chain)
 
@@ -63,6 +63,13 @@ HEAD-before-#69 under the same clocks: gemv 217.6, attn 26.7, quant 12.7, silu 1
   parity gate checks the device-built planes byte-for-byte against the host build and
   runs the tm gate on them. The SWAR r128/r256 kernels no longer run in decode
   (`PQ1GPU ... tm=6380 r128=0 r256=0`).
+* **Spin scheduling** (#73): `cudaSetDeviceFlags(cudaDeviceScheduleSpin)` before the
+  context is created (first CUDA call = arena allocation). The default heuristic blocks
+  on this 4-core board and every one of the ~145 syncs per token paid a wake-up; the
+  per-call gap between the engine (PQ1_KTIME=1) and the hot loop fell from ~0.11-0.16 ms
+  to ~0.03-0.09 ms. ab_pair 2 reps: 6.0074/6.4092, 6.4160/5.9276 = **+7.46%**, bias 0.993.
+  `PQ1_SPIN=0` is the A/B arm. (A first attempt whose patch had not applied measured
+  +0.19% on identical binaries: that is the harness's noise floor with locked clocks.)
 * **SWAR kernels** (pq1_swar_sm53.cu): 64-row (`swar`), 128-row (`r128`, 2 lanes/row),
   256-row (`r256`, 1 lane/row). 1-bit weights x **int8 Q8_K** activations, packed
   16-bit-lane accumulator (#35), LOP3-fused byte fold (#40), and a **16-entry shared

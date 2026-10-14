@@ -390,6 +390,22 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
 
 static int pq1_arena_init(size_t need) {
   if (PQ1ARENA_DEAD) return -1;
+  /* Run #73: the host SPINS in cudaDeviceSynchronize (cudaDeviceScheduleSpin)
+   * instead of the default heuristic, which on this 4-core Tegra blocks and
+   * takes a wake-up on every one of the ~145 syncs per token. ab_pair, 2 reps
+   * (one pair per order): 6.0074/6.4092 and 6.4160/5.9276 tps = +7.46%, bias
+   * 0.993. The CPU is otherwise idle while the GPU runs, so the spin costs
+   * nothing; PQ1_SPIN=0 is the A/B arm. Must precede the first CUDA call that
+   * creates the context, which is the arena allocation below. */
+  {
+    static int once = 0;
+    const char *se = getenv("PQ1_SPIN");
+    if (!once++ && (!se || atoi(se) > 0)) {
+      cudaError_t fe = cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+      if (fe != cudaSuccess) fprintf(stderr, "pq2: cudaSetDeviceFlags(spin): %s\n", cudaGetErrorString(fe));
+      else fprintf(stderr, "pq2: device schedule = spin\n");
+    }
+  }
   if (PQ1ARENA) {
     if (PQ1ACUR + need <= PQ1ALIM) return 0;
     fprintf(stderr, "pq2: arena full (%.0fMB used) -> CPU fallback\n",
