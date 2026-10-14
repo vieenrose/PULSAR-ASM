@@ -31,10 +31,18 @@ R=/home/pesi/exp
 bash "$REPO/.auto/build_q1.sh" || fail "build failed - refusing to gate unbuilt sources"
 
 # --- 1. kernel bit-exactness -------------------------------------------------
-P=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 2>&1 | tail -n 2; ./pq1_parity 512 12288 2>&1 | tail -n 2" 2>/dev/null)
-echo "$P" | grep -q "256/256 bit-exact" || fail "K=4096 parity: $(echo "$P" | head -n1)"
-echo "$P" | grep -q "512/512 bit-exact" || fail "K=12288 parity: $(echo "$P" | tail -n1)"
-echo "checks: pq1 kernel BIT-EXACT at K=4096 (256/256) and K=12288 (512/512)"
+# mode "all" checks EVERY device kernel in the TU against the host reference
+# (64-row SWAR, 128-row r128 = the engine default, T-MAC). Run #45 made r128 the
+# default, so the gate must cover it: a gate that only checks the kernel the
+# engine no longer runs is vacuous. Non-zero exit = any kernel not bit-exact.
+if ! ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 all >/dev/null 2>&1 && ./pq1_parity 512 12288 all >/dev/null 2>&1"; then
+  P=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 all 2>&1 | tail -n 3; ./pq1_parity 512 12288 all 2>&1 | tail -n 3" 2>/dev/null)
+  fail "pq1 parity (all kernels): $(echo "$P" | grep -E 'MISMATCH|failed' | head -n 2)"
+fi
+P=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 all 2>&1; ./pq1_parity 512 12288 all 2>&1" 2>/dev/null)
+[ "$(echo "$P" | grep -c '256/256 bit-exact')" -ge 3 ] || fail "K=4096: not all kernels bit-exact"
+[ "$(echo "$P" | grep -c '512/512 bit-exact')" -ge 3 ] || fail "K=12288: not all kernels bit-exact"
+echo "checks: pq1 kernels (swar, r128, tm) BIT-EXACT at K=4096 (256/256) and K=12288 (512/512)"
 
 # --- 2. greedy stream goldens ------------------------------------------------
 ssh -o ConnectTimeout=25 "$NANO" \

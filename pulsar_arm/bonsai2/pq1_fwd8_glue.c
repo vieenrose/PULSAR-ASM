@@ -65,7 +65,8 @@ static uint32_t *PL_H = NULL;
 static int *AU_H = NULL;
 static size_t PL_HMAX = 0, AU_HMAX = 0;
 static int PQ1_TM = -1;
-static long PQ1_TM_CALLS = 0, PQ1_SWAR_CALLS = 0; /* diagnostic: which kernel ran */
+static int PQ1_R128 = -1;   /* run #45: 128 rows/block, 2 lanes/row */
+static long PQ1_TM_CALLS = 0, PQ1_R128_CALLS = 0, PQ1_SWAR_CALLS = 0; /* diagnostic: which kernel ran */
 
 /* PQ1_KTIME=1: per-shape device-path timing (upload + launch + sync + readback),
  * printed by pq1_stats at exit. Needed because a kernel-level speedup measured
@@ -144,9 +145,9 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
   }
   snprintf(buf, n,
            "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%s "
-           "total_mb=%s tensors=%d tm=%ld swar=%ld",
+           "total_mb=%s tensors=%d tm=%ld r128=%ld swar=%ld",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
-           fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_SWAR_CALLS);
+           fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_R128_CALLS, PQ1_SWAR_CALLS);
   return buf;
 }
 #endif
@@ -279,6 +280,17 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
          * kernel stays available for kernel-level study. */
         PQ1_TM = getenv("PQ1_TM") ? 1 : 0;
       }
+      if (PQ1_R128 < 0) {
+        /* Run #45: 128 rows/block (2 lanes/row) is the DEFAULT. Interleaved
+         * A/B through the canonical harness, 3 runs/side: 2.6952 vs 2.6225
+         * decode_tps = +2.8%, every pair separated (t~8). Bit-exact vs the host
+         * reference at every shape the gate uses (256x4096, 512x12288).
+         * This supersedes run #20's "amortisation saturates at 64 rows": that
+         * was a single cross-session harness sample of the same shape, i.e. a
+         * null inside a +-2-6% drift band, not a measured zero. Set PQ1_SWAR=1
+         * to A/B the 64-row kernel against it. */
+        PQ1_R128 = getenv("PQ1_SWAR") ? 0 : 1;
+      }
       if (KTON < 0) {
         const char *ke = getenv("PQ1_KTIME");
         KTON = ke ? atoi(ke) : 0;
@@ -354,10 +366,11 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
       }
       if (d_xq && d_y &&
           cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
-          pq1_gemv_sm53_launch(dc, dsc, d_xq, d_y, cols, rows, NULL) == 0 &&
+          (PQ1_R128 ? pq1_gemv_r128_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)
+                    : pq1_gemv_sm53_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)) == 0 &&
           cudaDeviceSynchronize() == cudaSuccess &&
           cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess) {
-        PQ1_SWAR_CALLS++;
+        if (PQ1_R128) PQ1_R128_CALLS++; else PQ1_SWAR_CALLS++;
         if (KTON) pq1_kt_add(rows, cols, pq1_now() - kt0);
         return;
       }

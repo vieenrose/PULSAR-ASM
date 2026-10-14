@@ -40,6 +40,11 @@ int pq1_gemv_tm_launch(const unsigned char *w_bits,
                        const unsigned short *w_scales_h, const unsigned int *xpl,
                        const int *xau, float *y, int K, int N, void *stream);
 
+/* 128-rows-per-block variant (run #45): same math, 2 lanes/row. */
+int pq1_gemv_r128_launch(const unsigned char *w_bits,
+                         const unsigned short *w_scales_h, const unsigned char *xq,
+                         float *y, int K, int N, void *stream);
+
 float pq1_h2f(uint16_t h);
 #ifdef __cplusplus
 }

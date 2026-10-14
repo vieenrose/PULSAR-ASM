@@ -41,8 +41,8 @@ BUILD=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && export PATH=/usr/local/cuda-1
   gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ1_USE_CUDA -DBQ1_TIME  -include $R/pq1_fwd8_shim.h -c fwd8.c -o fwd8_q1.o 2>&1 | grep -e ' error' | head -n3; \
   gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ1_USE_CUDA  -I\$CUDAINC -c pq1_fwd8_glue.c -o pq1_glue.o 2>&1 | grep -e ' error' | head -n3 || true; \
   gcc -O2 -fopenmp -mcpu=cortex-a57 -ffp-contract=off -DSTANDALONE -DPQ1_REAL_CUDA -I\$CUDAINC -c pq1_parity.c -o pq1_parity.o 2>&1 | grep -e ' error' | head -n3 || true; \
-  g++ fwd8_q1.o pq1_host.o pq1_glue.o pq1_swar_sm53.o -o fwd8_q1 -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm -fopenmp 2>&1 | head -n3 && \
-  g++ pq1_host.o pq1_parity.o pq1_swar_sm53.o -o pq1_parity -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm 2>&1 | head -n3 && \
+  g++ fwd8_q1.o pq1_host.o pq1_glue.o pq1_swar_sm53.o -o fwd8_q1 -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm -lpthread -fopenmp 2>&1 | head -n3 && \
+  g++ pq1_host.o pq1_parity.o pq1_swar_sm53.o -o pq1_parity -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm -lpthread 2>&1 | head -n3 && \
   echo BUILT && echo \$((\$(date +%s)-t0))" 2>&1)
 echo "$BUILD" | grep -q BUILT || { echo "BUILD FAILED"; echo "$BUILD" | head -n 20; exit 1; }
 BUILD_S=$(echo "$BUILD" | tail -n1)
@@ -50,7 +50,7 @@ BUILD_S=$(echo "$BUILD" | tail -n1)
 # GPU clock witness (contention on this board changes results; never tuned).
 CLK=$(ssh -o ConnectTimeout=25 "$NANO" "cat /sys/devices/gpu.0/devfreq/57000000.gpu/cur_freq 2>/dev/null || echo 0" 2>/dev/null)
 
-ssh -o ConnectTimeout=25 "$NANO" "cd $R && OMP_NUM_THREADS=4 BQ1_TRACE=0 PQ1_STATS=1 timeout 1200 /usr/bin/time -v ./fwd8_q1 $MODEL $IDS --gen $GEN > run.log 2> time.log; echo RC=\$?" > "$REPO/.auto/last_nano_run.txt" 2>&1
+ssh -o ConnectTimeout=25 "$NANO" "cd $R && ${PQ1_EXTRA:-} OMP_NUM_THREADS=4 BQ1_TRACE=0 PQ1_STATS=1 timeout 1200 /usr/bin/time -v ./fwd8_q1 $MODEL $IDS --gen $GEN > run.log 2> time.log; echo RC=\$?" > "$REPO/.auto/last_nano_run.txt" 2>&1
 RC=$(grep -o 'RC=[0-9-]*' "$REPO/.auto/last_nano_run.txt" | head -n1 | cut -d= -f2)
 HWM=$(ssh -o ConnectTimeout=25 "$NANO" "awk '/Maximum resident set size/{print \$NF}' $R/time.log" 2>/dev/null)
 ssh -o ConnectTimeout=25 "$NANO" "cat $R/run.log" > "$REPO/.auto/last_run_log.txt" 2>&1

@@ -258,6 +258,136 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
 
   if (sub == 0 && active) y[row] = acc;
 }
+/* ---- Run #45 experiment: 128 rows per block (2 lanes/row) -----------------
+ * Continues the session's only validated scaling trend: #20 halved the number of
+ * blocks by going 32 -> 64 rows/block (measured +4.2% real in #26), because every
+ * block re-stages the same activation chunk (2.2KB) from global and pays the
+ * barrier; more rows per block amortises that over more work. #20's 512-thread
+ * version (32 rows... 256 threads / 8 lanes) REGRESSED -9.1% - a 16-warp barrier
+ * converges worse - so this keeps the block at 8 warps and takes the rows by
+ * HALVING the lanes per row: 2 lanes/row x 128 rows = 256 threads, each lane
+ * owning 8 of the chunk's 16 groups. The barrier size is unchanged; the staging
+ * traffic per row halves (N/64 -> N/128 blocks per matrix). Numerically identical
+ * by construction: the per-group products and the group-order reduce are the same
+ * integers and the same fp32 sequence. */
+#define PQ1_BLOCK_ROWS2 128
+
+__global__ __launch_bounds__(256, 5)
+void pq1_gemv_r128(const uint8_t* __restrict__ w_codes,
+                   const __half* __restrict__ w_scales,
+                   const uint8_t* __restrict__ xq, float* __restrict__ y,
+                   int K, int N) {
+  __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
+  __shared__ int sh_au[PQ1_CHUNK_GROUPS];
+  __shared__ float sh_prod[PQ1_BLOCK_ROWS2][PQ1_CHUNK_GROUPS];
+
+  int row = blockIdx.x * PQ1_BLOCK_ROWS2 + (threadIdx.x >> 1);
+  int sub = threadIdx.x & 1;
+  if (blockIdx.x * PQ1_BLOCK_ROWS2 >= N) return; /* block-uniform */
+  bool active = row < N;
+  int rrow = active ? row : 0;
+
+  int K128 = K >> 7;
+  int nchunk = K128 / PQ1_CHUNK_GROUPS;
+  if (nchunk > PQ1_MAXCHUNK || nchunk <= 0) return;
+
+  float acc = 0.0f;
+
+  for (int ch = 0; ch < nchunk; ch++) {
+    const uint32_t* x32 = reinterpret_cast<const uint32_t*>(xq) +
+                          (size_t)ch * PQ1_CHUNK_BLOCKS * 73;
+    uint32_t* t32 = reinterpret_cast<uint32_t*>(sh_x);
+    {
+      int gid = (int)threadIdx.x >> 4;
+      int slot = (int)threadIdx.x & 15;
+      int bb = gid >> 1;
+      int wb = (gid & 1) * 32 + slot * 2;
+      const uint32_t* src = x32 + bb * 73 + 1 + wb;
+      uint32_t v0 = __ldg(src);
+      uint32_t v1 = __ldg(src + 1);
+      uint32_t m0 = v0 ^ 0x80808080u, m1 = v1 ^ 0x80808080u;
+      t32[bb * 68 + wb] = m0;
+      t32[bb * 68 + wb + 1] = m1;
+      if ((int)threadIdx.x < PQ1_CHUNK_BLOCKS) {
+        uint32_t dv = __ldg(x32 + (int)threadIdx.x * 73);
+        t32[(int)threadIdx.x * 68 + 64] = dv;
+      }
+      uint32_t t0 = (m0 & 0x00FF00FFu) + ((m0 >> 8) & 0x00FF00FFu);
+      uint32_t t1 = (m1 & 0x00FF00FFu) + ((m1 >> 8) & 0x00FF00FFu);
+      int a2 = (int)((t0 & 0xFFFFu) + (t0 >> 16) + (t1 & 0xFFFFu) +
+                     (t1 >> 16));
+#pragma unroll
+      for (int o = 8; o > 0; o >>= 1)
+        a2 += __shfl_down_sync(0xFFFFFFFFu, a2, o);
+      if (slot == 0) sh_au[gid] = a2;
+    }
+    __syncthreads();
+
+#pragma unroll 1
+    for (int half = 0; half < 8; half++) {
+      int g = sub + (half << 1);
+      const uint8_t* c =
+          w_codes + (size_t)rrow * (K >> 3) +
+          (size_t)(ch * PQ1_CHUNK_GROUPS + g) * 16;
+      const uint32_t* gb = t32 + (g >> 1) * 68;
+      float db;
+      __builtin_memcpy(&db, gb + 64, 4);
+      const uint32_t* av = gb + (g & 1) * 32;
+      const uint4* cv = reinterpret_cast<const uint4*>(c);
+      uint4 cw = __ldg(cv);
+      uint32_t cws[4] = {(uint32_t)cw.x, (uint32_t)cw.y, (uint32_t)cw.z,
+                         (uint32_t)cw.w};
+      uint32_t pu0 = 0, pu1 = 0;
+      int pc = 0;
+#pragma unroll
+      for (int w = 0; w < 4; w++) {
+        uint32_t bits = cws[w];
+        pc += __popc(bits);
+#pragma unroll
+        for (int kk = 0; kk < 8; kk++) {
+          uint32_t b4 = (bits >> (kk * 4)) & 0xFu;
+          uint32_t keep = ((b4 * 0x00204081u) & 0x01010101u) * 255u;
+          uint32_t ap = av[w * 8 + kk];
+          uint32_t fold = (ap & keep & 0x00FF00FFu) +
+                          ((ap & keep & 0xFF00FF00u) >> 8);
+          if (kk & 1) pu1 += fold * 0x00010001u;
+          else        pu0 += fold * 0x00010001u;
+        }
+      }
+      int isum = (int)(((pu0 >> 16) + (pu1 >> 16)) << 1) - sh_au[g] + 16384 -
+                 (pc << 8);
+      float ws = active ? __half2float(__ldg(w_scales + (size_t)rrow * K128 +
+                                            (size_t)(ch * PQ1_CHUNK_GROUPS + g)))
+                        : 0.0f;
+      sh_prod[threadIdx.x >> 1][g] = __fmul_rn(__fmul_rn(ws, db), (float)isum);
+      __syncwarp();
+    }
+
+    if (sub == 0) {
+      const float* p = sh_prod[threadIdx.x >> 1];
+#pragma unroll
+      for (int k = 0; k < PQ1_CHUNK_GROUPS; k++) acc = __fadd_rn(acc, p[k]);
+    }
+    __syncthreads();
+  }
+
+  if (sub == 0 && active) y[row] = acc;
+}
+
+extern "C" int pq1_gemv_r128_launch(const uint8_t* w_codes,
+                                    const unsigned short* w_scales_h,
+                                    const uint8_t* xq, float* y, int K, int N,
+                                    void* stream) {
+  if ((K & 127) != 0) return -2;
+  if (K <= 0 || K > PQ1_MAXK || N <= 0) return -2;
+  dim3 block(256, 1, 1);
+  dim3 grid((N + PQ1_BLOCK_ROWS2 - 1) / PQ1_BLOCK_ROWS2, 1, 1);
+  cudaStream_t s = (cudaStream_t)stream;
+  pq1_gemv_r128<<<grid, block, 0, s>>>(
+      w_codes, reinterpret_cast<const __half*>(w_scales_h), xq, y, K, N);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
 /* ---- Run #41 experiment: T-MAC bit-sliced inner loop -----------------------
  * Why: SWAR's masked sum costs ~2.5 lane-ops/weight organised as a ~7-deep
  * dependent chain per 4 weights. The measured slope on this kernel is 0.51% of

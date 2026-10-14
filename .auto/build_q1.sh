@@ -33,8 +33,8 @@ BUILD=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && export PATH=/usr/local/cuda-1
   gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ1_USE_CUDA -DBQ1_TIME  -include $R/pq1_fwd8_shim.h -c fwd8.c -o fwd8_q1.o 2>&1 | grep -e ' error' | head -n3; \
   gcc -O2 -fopenmp -mcpu=cortex-a57 -DSTANDALONE -DPQ1_USE_CUDA  -I\$CUDAINC -c pq1_fwd8_glue.c -o pq1_glue.o 2>&1 | grep -e ' error' | head -n3 || true; \
   gcc -O2 -fopenmp -mcpu=cortex-a57 -ffp-contract=off -DSTANDALONE -DPQ1_REAL_CUDA -I\$CUDAINC -c pq1_parity.c -o pq1_parity.o 2>&1 | grep -e ' error' | head -n3 || true; \
-  g++ fwd8_q1.o pq1_host.o pq1_glue.o pq1_swar_sm53.o -o fwd8_q1 -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm -fopenmp 2>&1 | head -n3 && \
-  g++ pq1_host.o pq1_parity.o pq1_swar_sm53.o -o pq1_parity -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm 2>&1 | head -n3 && \
+  g++ fwd8_q1.o pq1_host.o pq1_glue.o pq1_swar_sm53.o -o fwd8_q1 -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm -lpthread -fopenmp 2>&1 | head -n3 && \
+  g++ pq1_host.o pq1_parity.o pq1_swar_sm53.o -o pq1_parity -L/usr/local/cuda-10.2/targets/aarch64-linux/lib -lcudart -lm -lpthread 2>&1 | head -n3 && \
   echo BUILT" 2>&1)
 
 echo "$BUILD" | grep -q BUILT || { echo "BUILD FAILED"; echo "$BUILD" | head -n 20; exit 1; }
