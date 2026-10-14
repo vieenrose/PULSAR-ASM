@@ -51,6 +51,26 @@ int pq1_gemv_r256_launch(const unsigned char *w_bits,
                          float *y, int K, int N, void *stream);
 
 float pq1_h2f(uint16_t h);
+
+/* Hybrid CPU/GPU row split (run #75): the tail rows of a tensor are computed
+ * on the A57s while the GPU streams the head rows. pq1_hyb_rows is the NEON
+ * port of pq1_gemv_cpu for rows [0, rows) of a (codes, scales) slice: the
+ * 128-group isum is an exact integer (2 * sum of the selected int8 minus the
+ * group sum) and the fp32 chain acc += (ws * db) * (float)isum runs in the
+ * reference's group order in this -ffp-contract=off unit, so y is bit-exact.
+ * scales_f are the fp16 scales already converted by pq1_h2f. pq1_hyb_run
+ * splits the rows over the calling thread plus PQ1_HYB_THREADS-1 spinning
+ * workers (created on first use). */
+void pq1_hyb_rows(const uint32_t *codes, const float *scales_f, int rows, int K,
+                  const uint8_t *xq, const int *gsum, float *y);
+void pq1_hyb_gsum(const uint8_t *xq, int K, int *gsum);
+void pq1_hyb_run(const uint32_t *codes, const float *scales_f, int rows, int K,
+                 const uint8_t *xq, float *y);
+void pq1_hyb_threads(int n);
+/* split form: start the workers before the GPU launch, wait after its sync */
+void pq1_hyb_start(const uint32_t *codes, const float *scales_f, int rows, int K,
+                   const uint8_t *xq, float *y);
+void pq1_hyb_wait(void);
 #ifdef __cplusplus
 }
 #endif

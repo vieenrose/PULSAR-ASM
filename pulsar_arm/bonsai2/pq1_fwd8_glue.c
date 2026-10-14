@@ -138,7 +138,51 @@ typedef struct {
   pq1_graph g;   /* run #57: captured {H2D, kernel, D2H} for this tensor */
 #endif
   int rows, cols;
+  /* run #75 hybrid split: the last hrows rows live on the host too (codes in
+   * the split layout, scales converted to float) and are computed on the A57s
+   * while the GPU streams rows [0, rows-hrows). */
+  uint32_t *hc; float *hs; int hrows;
 } pq1_ent;
+
+/* run #75: PQ1_HYB = percent of each tensor's rows computed on the CPU by the
+ * NEON workers in pq1_host.c while the GPU streams the rest. MEASURED OUT, default
+ * 0: cudaGraphLaunch blocks the caller on this platform (hence start/wait around
+ * the launch), and with real overlap the two sides starve each other on DRAM
+ * (8%/3 workers: GPU 126 ms on 92% of the rows vs 121 ms on all, CPU at 4.3 Gw/s
+ * vs 9.9 standalone). Best point 8% on 2 workers: ab_pair +1.27/+1.37/-4.4%, not
+ * resolved, +47 MB RSS. Bit-exact at every setting; kept for the record. */
+static int PQ1_HYB = -1;
+static long PQ1_HYB_CALLS = 0, PQ1_HYB_ROWS = 0;
+static double PQ1_HYB_US = 0, PQ1_HSYNC_US = 0;
+static double pq1_now_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e6 + ts.tv_nsec * 1e-3; }
+static int pq1_hyb_rows_of(int rows, int cap) {
+  if (PQ1_HYB < 0) {
+    const char *e = getenv("PQ1_HYB");
+    PQ1_HYB = e ? atoi(e) : 0;
+    if (PQ1_HYB < 0) PQ1_HYB = 0;
+    if (PQ1_HYB > 90) PQ1_HYB = 90;
+    const char *t = getenv("PQ1_HYB_THREADS");
+    if (t) pq1_hyb_threads(atoi(t));
+  }
+  if (!PQ1_HYB || rows < 1024) return 0;
+  int h = (int)((long)rows * PQ1_HYB / 100) & ~127;
+  if (h > cap) h = cap & ~127;
+  if (h >= rows) h = (rows - 128) & ~127;
+  return h < 0 ? 0 : h;
+}
+/* take the tail of a split (codes, scales) block: hrows rows starting at row0 */
+static int pq1_hyb_take(const uint32_t *codes, const uint16_t *scales, int row0, int hrows,
+                        int cols, uint32_t **hc, float **hs) {
+  size_t cw = (size_t)cols / 32, nb = (size_t)cols / 128;
+  *hc = NULL; *hs = NULL;
+  if (!hrows) return 0;
+  *hc = (uint32_t *)malloc((size_t)hrows * cw * 4);
+  *hs = (float *)malloc((size_t)hrows * nb * 4);
+  if (!*hc || !*hs) { free(*hc); free(*hs); *hc = NULL; *hs = NULL; return 0; }
+  memcpy(*hc, codes + (size_t)row0 * cw, (size_t)hrows * cw * 4);
+  for (size_t i = 0; i < (size_t)hrows * nb; i++) (*hs)[i] = pq1_h2f(scales[(size_t)row0 * nb + i]);
+  return hrows;
+}
 
 static pq1_ent PQ1C[PQ1_MAXT];
 static int PQ1N = 0;
@@ -379,11 +423,11 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
   }
   snprintf(buf, n,
            "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%s "
-           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld zc=%d zcfail=%d batch=%ld brows=%ld graphs=%ld/%ld",
+           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld zc=%d zcfail=%d batch=%ld brows=%ld graphs=%ld/%ld hyb=%ld hrows=%ld gpu_ms=%.1f hwait_ms=%.1f",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
            fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_R128_CALLS, PQ1_R256_CALLS,
            PQ1_SWAR_CALLS, NZC, ZCFAIL, PQ1_BATCH_CALLS, PQ1_BATCH_ROWS,
-           PQ1_GRAPH_OK, PQ1_GRAPH_CALLS);
+           PQ1_GRAPH_OK, PQ1_GRAPH_CALLS, PQ1_HYB_CALLS, PQ1_HYB_ROWS, PQ1_HYB_US * 1e-3, PQ1_HSYNC_US * 1e-3);
   return buf;
 }
 #endif
@@ -467,6 +511,11 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
       PQ1C[ci].scales = scales;
       PQ1C[ci].rows = rows;
       PQ1C[ci].cols = cols;
+      {
+        int h = pq1_hyb_rows_of(rows, rows);
+        PQ1C[ci].hrows = pq1_hyb_take((const uint32_t *)codes, scales, rows - h, h, cols,
+                                      &PQ1C[ci].hc, &PQ1C[ci].hs);
+      }
 #ifdef PQ1_USE_CUDA
       PQ1C[ci].d_codes = NULL;
       PQ1C[ci].d_scales = NULL;
@@ -618,8 +667,17 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
          * graphs are off, the same four steps run as plain API calls. */
         if (PQ1_GRAPH < 0) pq1_graph_init();
         int ok = 1;
+        /* run #75: the GPU takes rows [0, rows-hrows), the A57s the tail,
+         * overlapped with the graph (the host rows run between the launch
+         * and the sync). The tail write lands in y directly. */
+        const int hr = PQ1C[ci].hrows, ng_rows = rows - hr;
+        const size_t ygb = (size_t)ng_rows * 4;
+        /* workers first: the graph launch below blocks this thread until the
+         * GPU is done (see pq1_hyb_start in pq1_host.c) */
+        double th0 = pq1_now_us();
+        if (hr) pq1_hyb_start(PQ1C[ci].hc, PQ1C[ci].hs, hr, cols, xq, y + ng_rows);
         int gr = pq1_graph_run(&PQ1C[ci].g, 2, dc, dsc, xq, d_xq, d_y, (void *)y,
-                               cols, rows, xqb, yb);
+                               cols, ng_rows, xqb, ygb);
         t_b = KTON > 1 ? pq1_now() : 0.0;
         if (gr == 0) {
           if (cudaDeviceSynchronize() != cudaSuccess) ok = 0;
@@ -627,10 +685,14 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
         } else {
           ok = cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
                pq1_tm_prep_launch(d_xq, d_pl, d_au, cols, NULL) == 0 &&
-               pq1_gemv_tm_launch(dc, dsc, d_pl, d_au, d_y, cols, rows, NULL) == 0 &&
+               pq1_gemv_tm_launch(dc, dsc, d_pl, d_au, d_y, cols, ng_rows, NULL) == 0 &&
                cudaDeviceSynchronize() == cudaSuccess &&
-               cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess;
+               cudaMemcpy(y, d_y, ygb, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
+        double th1 = pq1_now_us();
+        if (hr) pq1_hyb_wait();
+        PQ1_HYB_US += th1 - th0; PQ1_HSYNC_US += pq1_now_us() - th1;
+        if (ok && hr) { PQ1_HYB_CALLS++; PQ1_HYB_ROWS += hr; }
         if (ok) {
           PQ1_TM_CALLS++;
           if (KTON) {
@@ -750,6 +812,7 @@ typedef struct {
 #ifdef PQ1_USE_CUDA
   pq1_graph g;
 #endif
+  uint32_t *hc; float *hs; int hrows;   /* run #75: tail rows on the host */
 } pq1_merged;
 /* Capacity of the merged-tensor cache. The engine needs 72 entries (36 layers x
  * 2 groups: q/k/v and gate/up), but the default has been 64, so the last 4
@@ -853,6 +916,11 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
       tmpc = (uint8_t *)tc;
       tmps = (uint16_t *)ts;
       pq1_split_repack(w[i], rows[i], cols, (uint32_t *)tmpc, tmps);
+      if (i == n - 1) {   /* run #75: the merged tail is the tail of the last tensor */
+        int h = pq1_hyb_rows_of(total, rows[i]);
+        PQ1M[PQ1NM].hrows = pq1_hyb_take((const uint32_t *)tmpc, tmps, rows[i] - h, h, cols,
+                                         &PQ1M[PQ1NM].hc, &PQ1M[PQ1NM].hs);
+      }
       if (cudaMemcpy(pb + oc, tmpc, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
           cudaMemcpy(ps + os, tmps, sb, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaGetLastError();
@@ -869,7 +937,7 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
     }
     free(tmpc);
     free(tmps);
-    if (!ok) return -1;
+    if (!ok) { free(PQ1M[PQ1NM].hc); free(PQ1M[PQ1NM].hs); PQ1M[PQ1NM].hc = NULL; PQ1M[PQ1NM].hs = NULL; PQ1M[PQ1NM].hrows = 0; return -1; }
     PQ1ACUR += a + b;
     if (PQ1ACUR > P2PEAK) P2PEAK = PQ1ACUR;
     mi = PQ1NM++;
@@ -924,8 +992,12 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
       /* run #72: one graph {H2D raw xq, device prep, tm kernel, D2H} exactly as
        * the SWAR merged path below; plain API calls until it is captured. */
       if (PQ1_GRAPH < 0) pq1_graph_init();
+      const int hr = PQ1M[mi].hrows, ng_rows = total - hr;   /* run #75 */
+      const size_t ygb = (size_t)ng_rows * 4;
+      double th0 = pq1_now_us();
+      if (hr) pq1_hyb_start(PQ1M[mi].hc, PQ1M[mi].hs, hr, cols, xq, (float *)stage + ng_rows);
       int gr = pq1_graph_run(&PQ1M[mi].g, 2, dc, dsc, xq, d_xq, (void *)MDY,
-                             (void *)stage, cols, total, xqb, yb);
+                             (void *)stage, cols, ng_rows, xqb, ygb);
       int ok;
       if (gr == 0) {
         ok = cudaDeviceSynchronize() == cudaSuccess;
@@ -933,11 +1005,15 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
       } else {
         ok = cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
              pq1_tm_prep_launch(d_xq, d_pl, d_au, cols, NULL) == 0 &&
-             pq1_gemv_tm_launch(dc, dsc, d_pl, d_au, MDY, cols, total, NULL) == 0 &&
+             pq1_gemv_tm_launch(dc, dsc, d_pl, d_au, MDY, cols, ng_rows, NULL) == 0 &&
              cudaDeviceSynchronize() == cudaSuccess &&
-             cudaMemcpy(stage, MDY, yb, cudaMemcpyDeviceToHost) == cudaSuccess;
+             cudaMemcpy(stage, MDY, ygb, cudaMemcpyDeviceToHost) == cudaSuccess;
       }
+      { double th1 = pq1_now_us();
+        if (hr) pq1_hyb_wait();
+        PQ1_HYB_US += th1 - th0; PQ1_HSYNC_US += pq1_now_us() - th1; }
       if (ok) {
+        if (hr) { PQ1_HYB_CALLS++; PQ1_HYB_ROWS += hr; }
         PQ1_TM_CALLS++;
         tm_done = 1;
         if (KTON) pq1_kt_add(total, cols, pq1_now() - kt0);

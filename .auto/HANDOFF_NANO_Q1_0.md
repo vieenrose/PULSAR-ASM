@@ -92,7 +92,7 @@ blocks (#16: -9.1%; #20 flat at 128 rows). Tail-wave scheduling (#25): -7.65% �
 arithmetically impossible to help, since every N is a multiple of 64. Arena shrink (#23):
 primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy outputs
 (#53): **-390%** (cudaHostAlloc memory is CPU-uncached on Tegra). GPU keep-warm (#43):
--35% (1 SM, kernels serialise). T-MAC on all shapes with the HOST plane build (#50 -3%, #72 -5.5% even with the 2-row kernel): the host build + 5 API calls per call were the cost, see §3.
+-35% (1 SM, kernels serialise). T-MAC on all shapes with the HOST plane build (#50 -3%, #72 -5.5% even with the 2-row kernel): the host build + 5 API calls per call were the cost, see §3. Hybrid CPU/GPU row split (#75): <=+1.3% unresolved at its best point (8% rows, 2 workers), the two sides starve each other on DRAM; see §5.1.
 
 ## 5. Open levers, ranked
 
@@ -147,12 +147,13 @@ primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy 
      weight prefetch 1.435, full unroll 1.645 (68 B spill), `__launch_bounds__(256,4)`
      at 64 regs 1.481, pipe+lb4 1.429, unroll+lb4 1.574 vs 1.4255 base. LUT, HFMA2 and
      byte-SWAR formulations were analysed and are no better than POPC on sm_53.
-   - **Next big lever = hybrid CPU/GPU row split:** 3 A57 cores idle during the ~128 ms
-     of GPU time per token. Keeping ~15-20% of the rows of each tensor in host RAM and
-     running them on the CPU (Q8_K dot, same per-row order as the kernel: exact) while
-     the GPU does the rest would cut the GPU phase proportionally. Costs: ~200 MB more
-     RSS, a CPU 1-bit kernel at ~3-4 GB/s per core, and the merge of outputs; needs the
-     same parity gate per row.
+   - **Hybrid CPU/GPU row split: MEASURED OUT (#75).** Code kept (`PQ1_HYB=<percent>`,
+     `PQ1_HYB_THREADS`, `pq1_hyb_*` in pq1_host.c, bit-exact at every setting), default
+     off. `cudaGraphLaunch` blocks the caller until the GPU is done on this platform, so
+     the slice must run on workers started before the launch; even so the GPU and CPU
+     starve each other on DRAM (8%/3 thr: GPU phase 126 ms on 92% rows vs 121 ms on 100%,
+     CPU slice at 4.3 Gw/s vs 9.9 standalone). Best setting 8% on 2 workers: ab_pair
+     3 reps +1.27/+1.37/-4.4%, not resolved, +47 MB RSS. Details in ideas.md #75.
 3. **POPC-rate probe: DONE (#71, `pulsar_arm/bonsai2/tools/popc_probe.cu`).** POPC runs
    at ~32/clk/SM (quarter rate; popc+iadd chains 31.4 steps/clk, lop+popc+iadd the same).
    But the T-MAC kernel is NOT POPC-bound: knockouts at 24576x4096 (PQ1_TIME hot loop,

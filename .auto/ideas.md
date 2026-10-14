@@ -923,3 +923,30 @@ Measured OUT in the same run: `[i][t]` K^T at 2 KB stride (L1 2-way thrash, attn
 `float32x4_t a[16]` accumulators (kept in memory by gcc 7, p.v 8.8 ms), OpenMP on heads
 and silu (passive/active: attn 11.6/9.7, silu 9.4/10.5 vs 8.3/7.4 serial), T-MAC
 latency-hiding variants (pipe/unroll/launch_bounds: 1.429-1.645 vs 1.4255 ms).
+
+## #75 Hybrid CPU/GPU row split (measured OUT; code kept, default off `PQ1_HYB=0`)
+A tail of each tensor's rows (multiple of 128, env `PQ1_HYB` = percent) stays in host RAM
+and is computed by a NEON Q8_K x 1-bit kernel (`pq1_hyb_rows`, tbl+tst mask, vpadalq, the
+reference per-row chain) on `PQ1_HYB_THREADS` spinning workers while the GPU streams the
+head rows. Bit-exact at every setting (logits identical 44/44, goldens A/B exact, parity
+256/256 512/512; hybtest 0 mismatches vs pq1_gemv_cpu at 4 shapes; 9.4-9.9 Gw/s on 3-4
+threads standalone). Two findings killed it:
+1. `cudaGraphLaunch` BLOCKS on this platform (CUDA 10.2 Tegra, spin scheduling): the
+   cudaDeviceSynchronize after it costs 7.8 us/call with 120 ms of GPU work per token.
+   The caller's thread cannot compute while the GPU runs; the first version (slice on the
+   caller + workers after the launch) serialised fully: HYB=4 5.54, 8 4.82, 12 3.55 tps
+   vs 6.73 off (+8 ms/tok per 1% share, i.e. the CPU kernel at its standalone speed, zero
+   overlap). Fixed by `pq1_hyb_start` (workers) before the launch, `pq1_hyb_wait` after.
+2. With overlap the two sides starve each other on the shared DRAM/cluster path: at 8% on
+   3 workers the GPU phase on 92% of the rows took 126 ms/tok (121 ms for 100% off) and
+   the CPU slice ~145 ms (4.3 Gw/s, less than half standalone); 3 workers + the spinning
+   caller also starve the CUDA driver (HYB=4/3 thr: gpu 129 ms, hwait 21 ms/tok, 5.28 tps).
+   Two workers: HYB=2 6.13, 4 6.64, 6 6.70, 8 **6.79** (gemv 119.9 vs 122.3 ms/tok,
+   gpu_ms 5230 vs 5384 per 44 tokens = -2.9% for -8% rows), 10 6.36, 12 5.82 (CPU slice
+   overruns: hwait 505/1192 ms). 3 register-only spinning cores do NOT slow the GPU
+   (6.726 vs 6.73): it is memory contention, not power/clock capping (MAXN, GPU 921.6 MHz).
+ab_pair "PQ1_HYB=8 PQ1_HYB_THREADS=2" 3 reps: 6.7089/6.7942 (+1.27%), 6.8223/6.7298
+(+1.37%), 6.7108/6.4187 (-4.4%) -> not resolved, <=+1.3% at best, +47 MB RSS, and two
+cores burned. Not worth a default. If revisited: the CPU share only pays if its DRAM
+traffic stops stalling the GPU (e.g. prefetch the tail rows into L2 between tokens, or a
+bit-transposed code layout so the CPU kernel is compute-light and issues fewer requests).

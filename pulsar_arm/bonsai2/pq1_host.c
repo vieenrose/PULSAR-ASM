@@ -6,6 +6,10 @@
 #include <omp.h>
 #endif
 #include <math.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <sched.h>
 
 float pq1_h2f(uint16_t h) {
   uint32_t s = (uint32_t)(h & 0x8000u) << 16;
@@ -166,4 +170,148 @@ void pq1_silu_mul(float *lu, const float *lg, int n) {
         vst1q_f32(lu + i, vmulq_f32(vmulq_f32(g, sg), u));
     }
     for (; i < n; i++) lu[i] = (lg[i] * (1.0f / (1.0f + expf(-lg[i])))) * lu[i];
+}
+
+/* ---- run #75: hybrid CPU rows ------------------------------------------ */
+void pq1_hyb_gsum(const uint8_t *xq, int K, int *gsum) {
+  int nb = K >> 7;
+  for (int b = 0; b < nb; b++) {
+    const int8_t *qs = (const int8_t *)(xq + (size_t)(b >> 1) * 292 + 4 + (b & 1) * 128);
+    int32x4_t a = vdupq_n_s32(0);
+    for (int i = 0; i < 128; i += 16) a = vpadalq_s16(a, vpaddlq_s8(vld1q_s8(qs + i)));
+    gsum[b] = vaddvq_s32(a);
+  }
+}
+
+void pq1_hyb_rows(const uint32_t *codes, const float *scales_f, int rows, int K,
+                  const uint8_t *xq, const int *gsum, float *y) {
+  const int nb = K >> 7;
+  /* lane l of (bytes {2s x8, 2s+1 x8} TST bitm) = bit (l&7) of byte 2s+(l>>3)
+   * = weight 16s+l of the group (LSB-first words, little-endian bytes). */
+  static const uint8_t BITM[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+  static const uint8_t IDX[8][16] = {
+    {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1}, {2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3},
+    {4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5}, {6,6,6,6,6,6,6,6,7,7,7,7,7,7,7,7},
+    {8,8,8,8,8,8,8,8,9,9,9,9,9,9,9,9}, {10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11},
+    {12,12,12,12,12,12,12,12,13,13,13,13,13,13,13,13}, {14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15}};
+  const uint8x16_t bitm = vld1q_u8(BITM);
+  const uint8x16_t i0 = vld1q_u8(IDX[0]), i1 = vld1q_u8(IDX[1]), i2 = vld1q_u8(IDX[2]), i3 = vld1q_u8(IDX[3]);
+  const uint8x16_t i4 = vld1q_u8(IDX[4]), i5 = vld1q_u8(IDX[5]), i6 = vld1q_u8(IDX[6]), i7 = vld1q_u8(IDX[7]);
+  const size_t rb = (size_t)K / 8;   /* bytes per row of codes */
+  int r = 0;
+  /* four rows at a time: one activation load feeds four independent
+   * accumulate chains (the A57 cannot overlap one row's 8-step padal chain
+   * with its own scalar epilogue; four rows give it the ILP) */
+  for (; r + 4 <= rows; r += 4) {
+    const uint8_t *w0 = (const uint8_t *)codes + (size_t)r * rb;
+    const uint8_t *w1 = w0 + rb, *w2 = w1 + rb, *w3 = w2 + rb;
+    const float *ws0 = scales_f + (size_t)r * nb, *ws1 = ws0 + nb, *ws2 = ws1 + nb, *ws3 = ws2 + nb;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int b = 0; b < nb; b++) {
+      const uint8_t *qb = xq + (size_t)(b >> 1) * 292;
+      float db; memcpy(&db, qb, 4);
+      const int8_t *qs = (const int8_t *)(qb + 4 + (b & 1) * 128);
+      const uint8x16_t c0 = vld1q_u8(w0 + b * 16), c1 = vld1q_u8(w1 + b * 16);
+      const uint8x16_t c2 = vld1q_u8(w2 + b * 16), c3 = vld1q_u8(w3 + b * 16);
+      int16x8_t s0 = vdupq_n_s16(0), s1 = vdupq_n_s16(0), s2 = vdupq_n_s16(0), s3 = vdupq_n_s16(0);
+#define HYB4(ix, off) { const int8x16_t x = vld1q_s8(qs + (off)); \
+      s0 = vpadalq_s8(s0, vandq_s8(x, vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(c0, ix), bitm)))); \
+      s1 = vpadalq_s8(s1, vandq_s8(x, vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(c1, ix), bitm)))); \
+      s2 = vpadalq_s8(s2, vandq_s8(x, vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(c2, ix), bitm)))); \
+      s3 = vpadalq_s8(s3, vandq_s8(x, vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(c3, ix), bitm)))); }
+      HYB4(i0, 0); HYB4(i1, 16); HYB4(i2, 32); HYB4(i3, 48);
+      HYB4(i4, 64); HYB4(i5, 80); HYB4(i6, 96); HYB4(i7, 112);
+#undef HYB4
+      const int g = gsum[b];
+      a0 += (ws0[b] * db) * (float)(2 * vaddlvq_s16(s0) - g);
+      a1 += (ws1[b] * db) * (float)(2 * vaddlvq_s16(s1) - g);
+      a2 += (ws2[b] * db) * (float)(2 * vaddlvq_s16(s2) - g);
+      a3 += (ws3[b] * db) * (float)(2 * vaddlvq_s16(s3) - g);
+    }
+    y[r] = a0; y[r + 1] = a1; y[r + 2] = a2; y[r + 3] = a3;
+  }
+  for (; r < rows; r++) {
+    const uint8_t *w0 = (const uint8_t *)codes + (size_t)r * rb;
+    const float *ws0 = scales_f + (size_t)r * nb;
+    float a0 = 0.0f;
+    for (int b = 0; b < nb; b++) {
+      const uint8_t *qb = xq + (size_t)(b >> 1) * 292;
+      float db; memcpy(&db, qb, 4);
+      const int8_t *qs = (const int8_t *)(qb + 4 + (b & 1) * 128);
+      const uint8x16_t c0 = vld1q_u8(w0 + b * 16);
+      int16x8_t s0 = vdupq_n_s16(0);
+#define HYB1(ix, off) s0 = vpadalq_s8(s0, vandq_s8(vld1q_s8(qs + (off)), \
+          vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(c0, ix), bitm))))
+      HYB1(i0, 0); HYB1(i1, 16); HYB1(i2, 32); HYB1(i3, 48);
+      HYB1(i4, 64); HYB1(i5, 80); HYB1(i6, 96); HYB1(i7, 112);
+#undef HYB1
+      a0 += (ws0[b] * db) * (float)(2 * vaddlvq_s16(s0) - gsum[b]);
+    }
+    y[r] = a0;
+  }
+}
+
+/* spinning pool: workers wait on a generation counter, run their row slice of
+ * the current job and count themselves done. They spin (yield) between jobs,
+ * i.e. during the GPU phases too; PQ1_HYB_THREADS=1 keeps everything on the
+ * calling thread. */
+typedef struct {
+  const uint32_t *codes; const float *scales_f; const uint8_t *xq; const int *gsum;
+  float *y; int rows, K;
+} pq1_hyb_job;
+static pq1_hyb_job HJ;
+static atomic_int HGEN = 0, HDONE = 0;
+static int HNT = 0;
+static int HMAXT = 3;   /* 3 workers; the 4th core launches and spins in CUDA */
+static void pq1_hyb_slice(int t, int nt) {
+  int r0 = (int)((long)HJ.rows * t / nt), r1 = (int)((long)HJ.rows * (t + 1) / nt);
+  if (r1 > r0)
+    pq1_hyb_rows(HJ.codes + (size_t)r0 * (HJ.K / 32), HJ.scales_f + (size_t)r0 * (HJ.K / 128),
+                 r1 - r0, HJ.K, HJ.xq, HJ.gsum, HJ.y + r0);
+}
+static void *pq1_hyb_worker(void *arg) {
+  int t = (int)(intptr_t)arg, seen = 0;
+  for (;;) {
+    while (atomic_load_explicit(&HGEN, memory_order_acquire) == seen) __asm__ volatile("yield");
+    seen = atomic_load_explicit(&HGEN, memory_order_acquire);
+    pq1_hyb_slice(t, HNT);
+    atomic_fetch_add_explicit(&HDONE, 1, memory_order_release);
+  }
+  return NULL;
+}
+void pq1_hyb_threads(int n) { HMAXT = n < 1 ? 1 : n; }
+/* Run #75: the slice runs on HNT worker threads only; the caller's thread is
+ * the one that launches the CUDA graph, and on this platform (CUDA 10.2,
+ * Tegra, spin scheduling) cudaGraphLaunch does not return until the GPU is
+ * done (hsync 7.8 us per call with 120 ms of GPU work), so the caller cannot
+ * compute anything while the GPU runs. Start the workers, launch, then wait. */
+void pq1_hyb_start(const uint32_t *codes, const float *scales_f, int rows, int K,
+                   const uint8_t *xq, float *y) {
+  static int gsum[4096];
+  if (K / 128 > 4096) { rows = 0; }   /* K > 512K: not a shape this engine has */
+  pq1_hyb_gsum(xq, K, gsum);
+  if (!HNT) {
+    const char *e = getenv("PQ1_HYB_THREADS");
+    HNT = e ? atoi(e) : HMAXT;
+    if (HNT < 1) HNT = 1;
+    for (int t = 0; t < HNT; t++) {
+      pthread_t th;
+      if (pthread_create(&th, NULL, pq1_hyb_worker, (void *)(intptr_t)t) != 0) { HNT = t; break; }
+      pthread_detach(th);
+    }
+    if (!HNT) HNT = -1;   /* no workers: the caller computes in pq1_hyb_wait */
+  }
+  HJ.codes = codes; HJ.scales_f = scales_f; HJ.xq = xq; HJ.gsum = gsum;
+  HJ.y = y; HJ.rows = rows; HJ.K = K;
+  atomic_store_explicit(&HDONE, 0, memory_order_relaxed);
+  atomic_fetch_add_explicit(&HGEN, 1, memory_order_release);
+}
+void pq1_hyb_wait(void) {
+  if (HNT < 0) { pq1_hyb_slice(0, 1); return; }
+  while (atomic_load_explicit(&HDONE, memory_order_acquire) < HNT) __asm__ volatile("yield");
+}
+void pq1_hyb_run(const uint32_t *codes, const float *scales_f, int rows, int K,
+                 const uint8_t *xq, float *y) {
+  pq1_hyb_start(codes, scales_f, rows, K, xq, y);
+  pq1_hyb_wait();
 }
