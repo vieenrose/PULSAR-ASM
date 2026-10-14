@@ -128,6 +128,11 @@ int pq1_gemv_tm_launch(const unsigned char *a, const unsigned short *b,
   (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
   return -99;
 }
+int pq1_tm_prep_launch(const unsigned char *a, unsigned int *b, int *c, int d,
+                       void *e) {
+  (void)a; (void)b; (void)c; (void)d; (void)e;
+  return -99;
+}
 #endif
 
 /* silu(g)*u in place: LU[i] = (g * (1/(1+expf(-g)))) * LU[i], four lanes at

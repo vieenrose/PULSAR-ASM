@@ -88,6 +88,7 @@ int main(int argc, char **argv) {
   float *yC = (float *)malloc((size_t)rows * 4);
   uint32_t *d_pl; int *d_au; float *d_y2;
   if (!planes || !au_h || !yC) { printf("oom\n"); return 2; }
+  memset(planes, 0, plw * 4);   /* words 65..72 of each block are padding, never read */
   pq1_build_planes(xq, K, planes);
   pq1_build_au(xq, K, au_h);
   cudaMalloc((void **)&d_pl, plw * 4);
@@ -95,6 +96,40 @@ int main(int argc, char **argv) {
   cudaMalloc((void **)&d_y2, (size_t)rows * 4);
   cudaMemcpy(d_pl, planes, plw * 4, cudaMemcpyHostToDevice);
   cudaMemcpy(d_au, au_h, (size_t)ngr * 4, cudaMemcpyHostToDevice);
+  /* run #72: the engine builds the planes and group sums ON THE DEVICE from the
+   * raw bytes in d_xq (pq1_tm_prep). They must be byte-identical to the host
+   * build, and the tm gate below runs on the DEVICE-built ones. */
+  {
+    uint32_t *d_pl2; int *d_au2;
+    uint32_t *pl2 = (uint32_t *)malloc(plw * 4);
+    int *au2 = (int *)malloc((size_t)ngr * 4);
+    if (!pl2 || !au2) { printf("oom\n"); return 2; }
+    cudaMalloc((void **)&d_pl2, plw * 4);
+    cudaMalloc((void **)&d_au2, (size_t)ngr * 4);
+    cudaMemset(d_pl2, 0xA5, plw * 4);
+    cudaMemset(d_au2, 0xA5, (size_t)ngr * 4);
+    int rcp = pq1_tm_prep_launch(d_xq, d_pl2, d_au2, K, NULL);
+    if (rcp != 0 || cudaDeviceSynchronize() != cudaSuccess) {
+      printf("tm prep launch failed rc=%d: %s\n", rcp, cudaGetErrorString(cudaGetLastError()));
+      return 1;
+    }
+    cudaMemcpy(pl2, d_pl2, plw * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(au2, d_au2, (size_t)ngr * 4, cudaMemcpyDeviceToHost);
+    int okp = !memcmp(pl2, planes, plw * 4), oka = !memcmp(au2, au_h, (size_t)ngr * 4);
+    if (!okp) {
+      for (size_t i = 0; i < plw; i++)
+        if (pl2[i] != planes[i]) {
+          printf("  first plane mismatch word %zu (block %zu word %zu): dev %08x host %08x\n",
+                 i, i / 73, i % 73, pl2[i], planes[i]);
+          break;
+        }
+    }
+    printf("tm device prep vs host build: planes %s, au %s\n",
+           okp ? "identical" : "MISMATCH", oka ? "identical" : "MISMATCH");
+    if (!okp || !oka) return 1;
+    d_pl = d_pl2; d_au = d_au2;   /* the tm gate and timings use the device-built planes */
+    free(pl2); free(au2);
+  }
   int rc2 = pq1_gemv_tm_launch(d_wb, d_sc, d_pl, d_au, d_y2, K, rows, NULL);
   if (rc2 != 0) { printf("tm launch failed rc=%d\n", rc2); return 1; }
   cudaError_t e2 = cudaDeviceSynchronize();

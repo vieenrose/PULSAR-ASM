@@ -21,10 +21,10 @@ Three gates, enforced by `.auto/checks.sh`, never overridable:
 
 | metric | baseline (#13) | now | notes |
 |---|---|---|---|
-| decode_tps | 2.1349 | **4.6106** (+116%) | cold harness #71; board clocks locked (jetson_clocks + c7 off, see §5.2) |
-| prefill_tps | 2.2256 | **4.7612** | same code path; no prompt batching |
-| peak_rss_mb | 206 | 342 | grew with merges+graphs; arena unchanged |
-| startup_s | 2.8 | 2.5 | step 0 = repack + upload + first forward |
+| decode_tps | 2.1349 | **5.9961** (+181%) | cold harness #72; board clocks locked (jetson_clocks + c7 off, see §5.2) |
+| prefill_tps | 2.2256 | **6.3608** | same code path; no prompt batching |
+| peak_rss_mb | 206 | 340 | grew with merges+graphs; arena unchanged |
+| startup_s | 2.8 | 2.4 | step 0 = repack + upload + first forward |
 | gpu_used / arena | - | 1014.8 / 1280 MB | the arena is NOT to be shrunk (see #23) |
 
 Per-token budget (PQ1_KTIME=1 + arithmetic): **283 ms = 204 ms device + ~79 ms CPU (28%)**
@@ -35,11 +35,11 @@ HEAD-before-#69 under the same clocks: gemv 217.6, attn 26.7, quant 12.7, silu 1
 
 | shape | calls/token | ms/call | ms/token | kernel |
 |---|---|---|---|---|
-| gate+up merged 24576x4096 | 36 | 2.97 -> ~1.9 (#71) | ~70 | **T-MAC, 2 rows/thread** |
-| down 4096x12288 | 36 | 1.60 | 57.5 | SWAR r128 |
-| q/k/v merged 6144x4096 | 36 | ~0.45 | ~16 | SWAR r128 (inside a graph) |
-| o 4096x4096 | 36 | 0.67 | 24.2 | SWAR r128 |
-| head 151669x4096 | 1 | 15.4 -> ~9 (#71) | ~9 | **T-MAC, 2 rows/thread** |
+| gate+up merged 24576x4096 | 36 | 1.56 (#72) | 56 | **T-MAC** 2 rows/thread, graph |
+| down 4096x12288 | 36 | 0.91 (#72) | 33 | **T-MAC** (was r128 1.60) |
+| q/k/v merged 6144x4096 | 36 | 0.57 (#72) | 20 | **T-MAC** (was r128 ~0.45-0.86) |
+| o 4096x4096 | 36 | 0.43 (#72) | 15.5 | **T-MAC** (was r128 0.67) |
+| head 151669x4096 | 1 | 8.7 (#72) | 8.7 | **T-MAC** 2 rows/thread, graph |
 
 ## 3. What the engine looks like now (the kept chain)
 
@@ -52,12 +52,17 @@ HEAD-before-#69 under the same clocks: gemv 217.6, attn 26.7, quant 12.7, silu 1
   2nd call with a stable pointer key) and replayed with one `cudaGraphLaunch` + sync.
   **The staging buffers are allocated once at fixed size (256 KB activation, 1 MB output)
   and must never be reallocated** — a graph that bakes in a freed pointer fails silently.
-* **Shape-gated T-MAC** (#60/#62): the bit-sliced popcount kernel runs only for
-  `rows >= 20000` (gate+up) and `rows >= 100000` (head); `PQ1_TM` modes 0..6 control it.
-  Default **PQ1_TM=4**. T-MAC is bit-exact and *wins* on these two shapes; it **loses**
-  on 6144 rows (q/k/v, -0.73%), 4096 rows x K=12288 (down, -3.05%) and everything smaller.
-  The discriminator is wave fill / block count, NOT loop length (down has the longest K
-  and loses). Do not re-litigate without a new mechanism.
+* **T-MAC on every shape** (#72; default **PQ1_TM=1**, `PQ1_TM=4` is the old gate and
+  `0` pure SWAR, for A/B). Two things made the one-row kernel lose on the narrow shapes
+  (#60/#62: -0.73% on q/k/v, -3.05% on down): it was LDS-bound (fixed by #71, 2 rows per
+  thread, now the fastest kernel at every decode shape), and the tm path built the bit
+  planes on the HOST (0.21 ms at K=4096, 0.64 ms at K=12288 per call) and ran five API
+  calls while the SWAR path ran one graph. #72 moved the plane/group-sum build into a
+  tiny device kernel (`pq1_tm_prep`, K/128 threads) and captures {H2D raw xq, prep, tm,
+  D2H} as one graph per tensor, so the tm path now costs what the SWAR path cost. The
+  parity gate checks the device-built planes byte-for-byte against the host build and
+  runs the tm gate on them. The SWAR r128/r256 kernels no longer run in decode
+  (`PQ1GPU ... tm=6380 r128=0 r256=0`).
 * **SWAR kernels** (pq1_swar_sm53.cu): 64-row (`swar`), 128-row (`r128`, 2 lanes/row),
   256-row (`r256`, 1 lane/row). 1-bit weights x **int8 Q8_K** activations, packed
   16-bit-lane accumulator (#35), LOP3-fused byte fold (#40), and a **16-entry shared
@@ -77,7 +82,7 @@ blocks (#16: -9.1%; #20 flat at 128 rows). Tail-wave scheduling (#25): -7.65% �
 arithmetically impossible to help, since every N is a multiple of 64. Arena shrink (#23):
 primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy outputs
 (#53): **-390%** (cudaHostAlloc memory is CPU-uncached on Tegra). GPU keep-warm (#43):
--35% (1 SM, kernels serialise). T-MAC on all shapes (#50): -3%.
+-35% (1 SM, kernels serialise). T-MAC on all shapes with the HOST plane build (#50 -3%, #72 -5.5% even with the 2-row kernel): the host build + 5 API calls per call were the cost, see §3.
 
 ## 5. Open levers, ranked
 
@@ -117,11 +122,14 @@ primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy 
    2.27 ms) gave no-weight-LDG -2.5%, POPC->LOP -1.5%, no-plane-LDS **-35%**. It was
    LDS-bound (8 LDS.128 per 128 weights per row). **#71 made it 2 rows/thread** (one
    plane load feeds two rows' code words): tm 2.27 -> 1.43 ms at gate+up, head 13.5 ->
-   8.2 ms, engine A/B +14.5/+17.9/+18.1%. Next on this kernel: 4 rows/thread (registers:
-   40 used + 16 B spill at 2 rows under -maxrregcount=48; the cap may need raising for
-   the tm kernel only via __launch_bounds__), and re-testing T-MAC on the shapes where
-   the one-row kernel lost (down 4096x12288, q/k/v 6144, o 4096) via PQ1_TM=1 A/B.
-   Apply the same knockout method to the SWAR r128 kernel (down+o+qkv = ~97 ms/token).
+   8.2 ms, engine A/B +14.5/+17.9/+18.1%. **#72 then put T-MAC on every shape** with a
+   device-side plane build inside the graph (see §3): A/B vs #71 173.10/222.22,
+   171.20/222.26, 170.66/219.75 ms/tok (-22%, +29% tps), cold harness 5.9961 tps.
+   Next on this kernel: 4 rows/thread (registers: 40 used + 16 B spill at 2 rows under
+   -maxrregcount=48; the cap may need raising for the tm kernel only via
+   __launch_bounds__). The GPU is now ~133 ms of the 167 ms token (tm per-call sums above);
+   the CPU passes (~35-40 ms: attention 13.6, silu 9, norms, Q8_K quant) are the other
+   lever. The r128/r256/swar kernels are now dead code in decode; keep them for the gate.
 4. **Token-tiled prefill** (M=16/64 GEMM): our prefill = decode speed per token, so the
    20-token prompt costs ~20 decode steps. Batching would make prompts nearly free and
    shorten every harness run, but it does **not** move `decode_tps`. Large task; needs
@@ -150,7 +158,7 @@ bash .auto/checks.sh       # the three gates (builds from the working tree first
   **links need `-fopenmp`** (pq1_host.o uses OpenMP now).
 * Engine env vars reach the remote only through **`PQ1_EXTRA="VAR=1 VAR2=0"`** —
   a bare `VAR=1 bash .auto/measure.sh` does NOT propagate.
-* Useful knobs: `PQ1_TM` (0=SWAR everywhere, 1=all shapes, 2=head only, 4=default,
+* Useful knobs: `PQ1_TM` (1=all shapes = default since #72, 0=SWAR everywhere, 2=head only, 4=old gate,
   5=+long-K, 6=+all merged), `PQ1_GRAPH=0` (no graphs), `PQ1_MERGED_CAP`, `PQ1_SWAR=1`
   (force the 64-row kernel), `PQ1_R128`, `PQ1_KTIME=1|2|3` (per-shape / per-phase / API
   timing), `PQ1_TRACE=1` (per-call trace + the PQ1GPU counter line).

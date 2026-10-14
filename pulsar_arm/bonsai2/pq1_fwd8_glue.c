@@ -53,6 +53,7 @@ typedef struct {
 static int PQ1_GRAPH = -1;  /* run #57: CUDA graphs for the GEMV API sequence; -1 = auto (on), 0 = off (the A/B arm) */
 static long PQ1_GRAPH_OK = 0, PQ1_GRAPH_CALLS = 0; /* graphs instantiated / launched */
 static cudaStream_t PQ1_CS = NULL; /* capture stream, created on first use */
+static uint32_t *d_pl; static int *d_au; /* T-MAC device prep buffers (defined below) */
 
 #ifdef PQ1_USE_CUDA
 static void pq1_graph_init(void) {
@@ -62,7 +63,7 @@ static void pq1_graph_init(void) {
   }
 }
 
-static int pq1_graph_run(pq1_graph *G, int use256, const void *dc, const void *dsc,
+static int pq1_graph_run(pq1_graph *G, int use256 /* 0 r128, 1 r256, 2 tm */, const void *dc, const void *dsc,
                          const void *xq, void *xq_d, void *y_dev, void *y_host,
                          int K, int N, size_t xqb, size_t yb) {
   if (PQ1_GRAPH == 0) return -1;
@@ -87,6 +88,14 @@ static int pq1_graph_run(pq1_graph *G, int use256, const void *dc, const void *d
     if (cudaStreamBeginCapture(PQ1_CS, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
       cap = 1;
       cudaMemcpyAsync(xq_d, (void *)xq, xqb, cudaMemcpyHostToDevice, PQ1_CS);
+      if (use256 == 2) {
+        /* run #72: raw bytes up, planes + group sums built on the device, then
+         * the bit-sliced kernel - all inside the one graph */
+        rc = pq1_tm_prep_launch((const uint8_t *)xq_d, d_pl, d_au, K, PQ1_CS);
+        if (rc == 0)
+          rc = pq1_gemv_tm_launch((const uint8_t *)dc, (const unsigned short *)dsc,
+                                  d_pl, d_au, (float *)y_dev, K, N, PQ1_CS);
+      } else
       rc = use256
         ? pq1_gemv_r256_launch((const uint8_t *)dc, (const unsigned short *)dsc,
                                (const uint8_t *)xq_d, (float *)y_dev, K, N, PQ1_CS)
@@ -147,15 +156,22 @@ static size_t PQ1ACUR = 0, PQ1ALIM = 0;
 static uint8_t *d_xq = NULL;
 static float *d_y = NULL;
 static size_t P2XQMAX = 0, P2YMAX = 0;
-/* T-MAC path (run #41): the bit-plane mirror of xq is the SAME size (73 words
- * per 256-activation block, word 0 = the fp32 scale) so d_xq is reused as the
- * device plane buffer; only the host scratch is new. PQ1_NO_TM=1 falls back to
- * the SWAR kernel, which lets one binary be A/B'd against itself. */
-static uint8_t *d_au = NULL;
-static size_t P2AUMAX = 0;
-static uint32_t *PL_H = NULL;
-static int *AU_H = NULL;
-static size_t PL_HMAX = 0, AU_HMAX = 0;
+/* T-MAC path (run #41, device-side prep since #72): d_xq receives the raw
+ * Q8_K bytes exactly as for the SWAR kernels, pq1_tm_prep builds the bit-plane
+ * mirror (same byte size, 73 words per 256-activation block) into d_pl and the
+ * K/128 group sums into d_au on the GPU, and the whole {H2D, prep, tm, D2H}
+ * sequence is one captured graph. Both buffers are allocated ONCE at a fixed
+ * size (graphs bake their pointers in) and never reallocated. */
+static uint32_t *d_pl = NULL;
+static int *d_au = NULL;
+static size_t P2PLMAX = 0, P2AUMAX = 0;
+#define PQ1_GRAPH_AU (PQ1_GRAPH_XQ / 64)   /* 4 KB: K/128 ints up to K=131072 */
+static int pq1_tm_bufs(int K, size_t xqb, size_t yb, size_t ymax) {
+  if (!d_pl && cudaMalloc((void **)&d_pl, PQ1_GRAPH_XQ) == cudaSuccess) P2PLMAX = PQ1_GRAPH_XQ;
+  if (!d_au && cudaMalloc((void **)&d_au, PQ1_GRAPH_AU) == cudaSuccess) P2AUMAX = PQ1_GRAPH_AU;
+  size_t aub = (size_t)(K >> 7) * 4;
+  return d_pl && d_au && xqb <= P2PLMAX && aub <= P2AUMAX && yb <= ymax;
+}
 static int PQ1_TM = -1;
 static int PQ1_R128 = -1;   /* run #45: 128 rows/block, 2 lanes/row (default) */
 static int PQ1_R256 = -1;   /* run #46: 256 rows/block; -1 = auto (rows>=8192) */
@@ -509,7 +525,14 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
          * table was void per #45: T-MAC never ran in that build).
          * PQ1_TM=0 = pure SWAR, 1 = every shape (measured -3% at #50), 5 = also
          * long K (different algorithm, kept for study). */
-        PQ1_TM = e ? atoi(e) : 4;
+        /* Run #72: DEFAULT = 1 (every shape). With the planes built on the
+         * device inside the captured graph (pq1_tm_prep) the per-call cost
+         * that made T-MAC lose on the narrow shapes is gone, and the 2-rows/
+         * thread kernel (#71) is the fastest kernel at EVERY decode shape
+         * (hot loop vs r128: 6144x4096 0.43 vs 0.69 ms, 4096x4096 0.32 vs
+         * 0.48, 4096x12288 0.81 vs 1.35, 24576x4096 1.40 vs 2.55). Cold
+         * harness 4.61 -> 5.92 tps; PQ1_TM=4 is the old gate (A/B arm). */
+        PQ1_TM = e ? atoi(e) : 1;
       }
       if (PQ1_R128 < 0) {
         /* Run #45: 128 rows/block (2 lanes/row) is the DEFAULT. Interleaved
@@ -562,61 +585,44 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
         int wide      = (PQ1_TM == 4 || PQ1_TM == 5) && rows >= 20000;
         tm_here = long_rows || long_k || wide;
       }
-      size_t aub = tm_here ? (size_t)(cols >> 7) * 4 : 0;
       if (!d_xq) {
         if (cudaMalloc(&d_xq, PQ1_GRAPH_XQ) == cudaSuccess) P2XQMAX = PQ1_GRAPH_XQ;
       }
       if (!d_y) {
         if (cudaMalloc(&d_y, PQ1_GRAPH_YB) == cudaSuccess) P2YMAX = PQ1_GRAPH_YB;
       }
-      uint32_t *pl = NULL;
-      int *auh = NULL;
-      int tm_ok = 0;
-      if (tm_here) {
-        if (!PL_H || xqb > PL_HMAX) {
-          free(PL_H);
-          PL_H = (uint32_t *)malloc(xqb ? xqb : 1);
-          PL_HMAX = PL_H ? xqb : 0;
-        }
-        if (!AU_H || aub > AU_HMAX) {
-          free(AU_H);
-          AU_H = (int *)malloc(aub ? aub : 1);
-          AU_HMAX = AU_H ? aub : 0;
-        }
-        if (!d_au || aub > P2AUMAX) {
-          if (d_au) cudaFree(d_au);
-          d_au = NULL;
-          if (cudaMalloc(&d_au, aub) == cudaSuccess) P2AUMAX = aub;
-        }
-        tm_ok = PL_H && AU_H && d_au;
-        if (tm_ok) {
-          t_b = KTON > 1 ? pq1_now() : 0.0;
-          pq1_build_planes(xq, cols, PL_H);
-          pq1_build_au(xq, cols, AU_H);
-          t_c = KTON > 1 ? pq1_now() : 0.0;
-          pl = (uint32_t *)d_xq;
-          auh = (int *)d_au;
-        }
-      }
+      int tm_ok = tm_here && d_xq && d_y && xqb <= P2XQMAX &&
+                  pq1_tm_bufs(cols, xqb, yb, P2YMAX);
       if (getenv("PQ1_TRACE"))
-        fprintf(stderr, "PQ1T act d_xq=%p xq=%p n=%zu d_y=%p yb=%zu K=%d N=%d\n",
-                (void *)d_xq, (void *)xq, xqb, (void *)d_y, yb, cols, rows);
+        fprintf(stderr, "PQ1T act d_xq=%p xq=%p n=%zu d_y=%p yb=%zu K=%d N=%d tm=%d\n",
+                (void *)d_xq, (void *)xq, xqb, (void *)d_y, yb, cols, rows, tm_ok);
       if (tm_ok) {
-        if (pl && d_y && auh &&
-            cudaMemcpy(pl, PL_H, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
-            cudaMemcpy(auh, AU_H, aub, cudaMemcpyHostToDevice) == cudaSuccess &&
-            pq1_gemv_tm_launch(dc, dsc, pl, auh, d_y, cols, rows, NULL) == 0 &&
-            cudaDeviceSynchronize() == cudaSuccess &&
-            cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess) {
+        /* run #72: {H2D raw xq, device prep, tm kernel, D2H} as ONE graph launch,
+         * same as the SWAR path. Until the graph is captured (2nd call) or if
+         * graphs are off, the same four steps run as plain API calls. */
+        if (PQ1_GRAPH < 0) pq1_graph_init();
+        int ok = 1;
+        int gr = pq1_graph_run(&PQ1C[ci].g, 2, dc, dsc, xq, d_xq, d_y, (void *)y,
+                               cols, rows, xqb, yb);
+        t_b = KTON > 1 ? pq1_now() : 0.0;
+        if (gr == 0) {
+          if (cudaDeviceSynchronize() != cudaSuccess) ok = 0;
+          else PQ1_GRAPH_CALLS++;
+        } else {
+          ok = cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
+               pq1_tm_prep_launch(d_xq, d_pl, d_au, cols, NULL) == 0 &&
+               pq1_gemv_tm_launch(dc, dsc, d_pl, d_au, d_y, cols, rows, NULL) == 0 &&
+               cudaDeviceSynchronize() == cudaSuccess &&
+               cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        if (ok) {
           PQ1_TM_CALLS++;
           if (KTON) {
             t_e = pq1_now();
             pq1_kt_add(rows, cols, t_e - kt0);
             if (KTON > 1)
-              fprintf(stderr,
-                      "PQ1PH rows=%d cols=%d build=%.1f upload+launch+sync+readback"
-                      "=%.1f total=%.1f us\n", rows, cols, t_c - t_b, t_e - t_c,
-                      t_e - kt0);
+              fprintf(stderr, "PQ1PH rows=%d cols=%d graph=%d api=%.1f total=%.1f us\n",
+                      rows, cols, gr == 0, (t_e - t_b) * 1e3, (t_e - kt0) * 1e3);
           }
           return;
         }
@@ -887,7 +893,8 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
 
   double kt0 = KTON ? pq1_now() : 0.0;
   double ta = 0, tb = 0, tc = 0, td = 0, te = 0;
-  if (PQ1_TM < 0) { const char *e = getenv("PQ1_TM"); PQ1_TM = e ? atoi(e) : 4; }
+  int tm_done = 0;
+  if (PQ1_TM < 0) { const char *e = getenv("PQ1_TM"); PQ1_TM = e ? atoi(e) : 1; }
   /* Shape-gated bit-sliced kernel for the WIDE merged blocks (gate+up, 24576
    * rows = 38% of decode). Same mode table as the scalar path: 1 = all shapes,
    * 4/5 = wide (rows >= 20000), 3/5 = long K. The scalar path cannot see these
@@ -897,45 +904,38 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
     int tm_here = (PQ1_TM == 1) ||
                   ((PQ1_TM == 4 || PQ1_TM == 5) && total >= 20000) ||
                   ((PQ1_TM == 3 || PQ1_TM == 5) && cols >= 12288);
-    if (tm_here) {
-      size_t aub = (size_t)(cols >> 7) * 4;
-      if (!PL_H || xqb > PL_HMAX) {
-        free(PL_H);
-        PL_H = (uint32_t *)malloc(xqb ? xqb : 1);
-        PL_HMAX = PL_H ? xqb : 0;
+    if (tm_here && pq1_tm_bufs(cols, xqb, yb, P2MDYMAX)) {
+      /* run #72: one graph {H2D raw xq, device prep, tm kernel, D2H} exactly as
+       * the SWAR merged path below; plain API calls until it is captured. */
+      if (PQ1_GRAPH < 0) pq1_graph_init();
+      int gr = pq1_graph_run(&PQ1M[mi].g, 2, dc, dsc, xq, d_xq, (void *)MDY,
+                             (void *)stage, cols, total, xqb, yb);
+      int ok;
+      if (gr == 0) {
+        ok = cudaDeviceSynchronize() == cudaSuccess;
+        if (ok) PQ1_GRAPH_CALLS++;
+      } else {
+        ok = cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
+             pq1_tm_prep_launch(d_xq, d_pl, d_au, cols, NULL) == 0 &&
+             pq1_gemv_tm_launch(dc, dsc, d_pl, d_au, MDY, cols, total, NULL) == 0 &&
+             cudaDeviceSynchronize() == cudaSuccess &&
+             cudaMemcpy(stage, MDY, yb, cudaMemcpyDeviceToHost) == cudaSuccess;
       }
-      if (!AU_H || aub > AU_HMAX) {
-        free(AU_H);
-        AU_H = (int *)malloc(aub ? aub : 1);
-        AU_HMAX = AU_H ? aub : 0;
+      if (ok) {
+        PQ1_TM_CALLS++;
+        tm_done = 1;
+        if (KTON) pq1_kt_add(total, cols, pq1_now() - kt0);
+        /* The caller receives this group's outputs by scattering from the
+         * staging buffer below (the scalar kernels write directly into the
+         * engine's own vectors; merged ones are concatenated, so the launch
+         * writes MDY and the results are copied out here). Returning early
+         * skipped the scatter and silently starved the engine of gate/up
+         * outputs - which the GOLDEN STREAMS caught (run #61) while the
+         * parity gate stayed green, because the bug was in this glue, not in
+         * any kernel. Fall through to the scatter instead. */
+        goto pq1_merged_scatter;
       }
-      if (!d_au || aub > P2AUMAX) {
-        if (d_au) cudaFree(d_au);
-        d_au = NULL;
-        if (cudaMalloc(&d_au, aub) == cudaSuccess) P2AUMAX = aub;
-      }
-      if (PL_H && AU_H && d_au) {
-        pq1_build_planes(xq, cols, PL_H);
-        pq1_build_au(xq, cols, AU_H);
-        if (cudaMemcpy(d_xq, PL_H, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
-            cudaMemcpy(d_au, AU_H, aub, cudaMemcpyHostToDevice) == cudaSuccess &&
-            pq1_gemv_tm_launch(dc, dsc, d_xq, d_au, MDY, cols, total, NULL) == 0 &&
-            cudaDeviceSynchronize() == cudaSuccess &&
-            cudaMemcpy(stage, MDY, yb, cudaMemcpyDeviceToHost) == cudaSuccess) {
-          PQ1_TM_CALLS++;
-          if (KTON) pq1_kt_add(total, cols, pq1_now() - kt0);
-          /* The caller receives this group's outputs by scattering from the
-           * staging buffer below (the scalar kernels write directly into the
-           * engine's own vectors; merged ones are concatenated, so the launch
-           * writes MDY and the results are copied out here). Returning early
-           * skipped the scatter and silently starved the engine of gate/up
-           * outputs - which the GOLDEN STREAMS caught (run #61) while the
-           * parity gate stayed green, because the bug was in this glue, not in
-           * any kernel. Fall through to the scatter instead. */
-          goto pq1_merged_scatter;
-        }
-        cudaGetLastError();
-      }
+      cudaGetLastError();
     }
   }
   if (PQ1_GRAPH < 0) pq1_graph_init();
@@ -985,7 +985,8 @@ pq1_merged_scatter:
   }
   PQ1_BATCH_CALLS++;
   PQ1_BATCH_ROWS += total;
-  if (use256) PQ1_R256_CALLS += n;
+  if (tm_done) ;                       /* counted as tm above (#72: the goto used to land here and double-count) */
+  else if (use256) PQ1_R256_CALLS += n;
   else PQ1_R128_CALLS += n;
   return 0;
 #else

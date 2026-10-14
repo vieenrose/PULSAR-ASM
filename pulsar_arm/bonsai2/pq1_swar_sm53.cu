@@ -697,6 +697,65 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
 }
 
 
+/* Device-side T-MAC activation prep (run #72). The engine used to build the
+ * bit planes and the per-group sums on the host (pq1_build_planes/_au: 0.21 ms
+ * at K=4096, 0.64 ms at K=12288 per call) and then needed five API calls
+ * (2 H2D, launch, sync, D2H) that the SWAR path had folded into one CUDA
+ * graph. That overhead is why T-MAC lost on every shape but gate+up and the
+ * head even after #71 made the kernel itself the fastest at every shape.
+ * This kernel is the same integer transform, one thread per 128-activation
+ * group (K/128 threads: 32..96), so the raw Q8_K bytes can be uploaded as for
+ * the SWAR kernels and {H2D, prep, tm, D2H} captured in one graph. The planes
+ * and sums are integers built from the same bytes, so the result is identical
+ * to the host build (pq1_parity checks the two byte-for-byte). */
+__global__ void pq1_tm_prep(const uint8_t* __restrict__ xq, uint32_t* __restrict__ pl,
+                            int* __restrict__ au, int ngroups) {
+  int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= ngroups) return;
+  int b = g >> 1, half = g & 1;
+  const uint8_t* src = xq + (size_t)b * 292 + 4 + half * 128;
+  uint32_t* dst = pl + (size_t)b * 73 + 1 + half * 32;
+  if (half == 0)
+    pl[(size_t)b * 73] = *reinterpret_cast<const uint32_t*>(xq + (size_t)b * 292);
+  else {
+    /* words 65..72 mirror Q8_K's bsums area: unread by the kernel, zeroed so the
+     * device build is byte-identical to a zero-initialised host build */
+#pragma unroll
+    for (int w = 65; w < 73; w++) pl[(size_t)b * 73 + w] = 0u;
+  }
+  int s = 0;
+#pragma unroll
+  for (int w = 0; w < 4; w++) {
+    uint32_t p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, p7 = 0;
+#pragma unroll
+    for (int a = 0; a < 32; a++) {
+      unsigned v = (unsigned)src[w * 32 + a] ^ 0x80u;
+      s += (int)v;
+      p0 |= ((v >> 0) & 1u) << a;
+      p1 |= ((v >> 1) & 1u) << a;
+      p2 |= ((v >> 2) & 1u) << a;
+      p3 |= ((v >> 3) & 1u) << a;
+      p4 |= ((v >> 4) & 1u) << a;
+      p5 |= ((v >> 5) & 1u) << a;
+      p6 |= ((v >> 6) & 1u) << a;
+      p7 |= ((v >> 7) & 1u) << a;
+    }
+    dst[w * 8 + 0] = p0; dst[w * 8 + 1] = p1; dst[w * 8 + 2] = p2; dst[w * 8 + 3] = p3;
+    dst[w * 8 + 4] = p4; dst[w * 8 + 5] = p5; dst[w * 8 + 6] = p6; dst[w * 8 + 7] = p7;
+  }
+  au[g] = s;
+}
+
+extern "C" int pq1_tm_prep_launch(const uint8_t* xq_d, uint32_t* pl_d, int* au_d,
+                                  int K, void* stream) {
+  if ((K & 255) != 0 || K <= 0 || K > PQ1_MAXK) return -2;
+  int ng = K >> 7;
+  dim3 block(128, 1, 1);
+  dim3 grid((ng + 127) / 128, 1, 1);
+  pq1_tm_prep<<<grid, block, 0, (cudaStream_t)stream>>>(xq_d, pl_d, au_d, ng);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
 extern "C" int pq1_gemv_sm53_launch(const uint8_t *w_codes,
                                     const unsigned short *w_scales_h,
                                     const uint8_t *xq, float *y, int K, int N,

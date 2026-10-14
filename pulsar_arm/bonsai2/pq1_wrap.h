@@ -34,6 +34,11 @@ void pq1_build_au(const uint8_t *xq, int K, int *au);
 int pq1_gemv_tm_launch(const unsigned char *w_bits,
                        const unsigned short *w_scales_h, const unsigned int *xpl,
                        const int *xau, float *y, int K, int N, void *stream);
+/* Device-side pq1_build_planes + pq1_build_au (run #72): xq_d holds the raw
+ * Q8_K bytes (as uploaded for the SWAR kernels), pl_d/au_d receive the planes
+ * (same byte size as xq) and the K/128 group sums. Graph-capturable. */
+int pq1_tm_prep_launch(const unsigned char *xq_d, unsigned int *pl_d, int *au_d,
+                       int K, void *stream);
 
 /* 128-rows-per-block variant (run #45): same math, 2 lanes/row. */
 int pq1_gemv_r128_launch(const unsigned char *w_bits,
