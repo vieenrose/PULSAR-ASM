@@ -1,6 +1,7 @@
 # PULSAR-ASM
 
-**Ternary-model inference: Bonsai checkpoints on CPU, Gemma-3 on a Pi.**
+**Ternary-model inference: Bonsai checkpoints on CPU and on a Jetson Nano
+GPU, Gemma-3 on a Pi.**
 The demo line is Bonsai — `Ternary-Bonsai-8B` (2.18 GB) and
 `Ternary-Bonsai-2-27B` (7.21 GB) running on a DGX Spark, CPU-only, through
 the C + NEON port in `pulsar_arm/bonsai2/` (greedy streams identical to the
@@ -10,6 +11,12 @@ AArch64 binary, direct `svc` syscalls, no libc, no CRT, no third-party code,
 with the tokenizer, sampler, chat REPL and whole forward pass in
 `pulsar_arm/asm/core.S`.
 
+Active work (branch `bonsai-jetson-nano`): **Bonsai-8B Q1_0** (true 1-bit,
+~1.06 GB streamed per token) decoding on a **Jetson Nano Gen1** (Tegra X1,
+one Maxwell SM, 4 GB unified memory) at **8.29 tok/s**, every GEMV
+bit-exact against the fork-faithful host reference. See
+[Bonsai-8B Q1_0 on a Jetson Nano](#bonsai-8b-q1_0-on-a-jetson-nano) below.
+
 Two checkpoints run unmodified on the Spark port, whose dimensions come from
 the GGUF header so one binary covers each family:
 
@@ -17,6 +24,7 @@ the GGUF header so one binary covers each family:
 |---|---|---|---|---|---|
 | `Ternary-Bonsai-2-27B-PTQ1_0` | 5120 | 17408 | 64 | 5.95 GB | **~0.10 s/token** (9.7 tok/s decode, 8 threads) |
 | `Ternary-Bonsai-8B-PQ2_0` | 4096 | 12288 | 36 | 2.18 GB | **~35 ms/token** (28 tok/s, 6 threads; ~0.21 s/token on a phone) |
+| `Bonsai-8B-Q1_0` (Jetson Nano GPU) | 4096 | 12288 | 36 | 1.06 GB | **~121 ms/token** (8.29 tok/s, sm_53 CUDA, see below) |
 
 Three gemma checkpoints run unmodified on the Pi engine, which reads its
 dimensions from the safetensors header, so one binary covers all of them:
@@ -31,8 +39,8 @@ dimensions from the safetensors header, so one binary covers all of them:
 
 | | |
 |---|---|
-| Target | Raspberry Pi 4, Cortex-A72 / NEON only (no SVE, no dotprod), 3 cores — for gemma; DGX Spark, 20 Cortex-X925 cores, CPU-only — for Bonsai |
-| Engine | one static binary: `as` + `ld`, direct syscalls, zero dependencies (gemma); C + NEON + OpenMP in `pulsar_arm/bonsai2/` (Bonsai) |
+| Target | Raspberry Pi 4, Cortex-A72 / NEON only (no SVE, no dotprod), 3 cores — for gemma; DGX Spark, 20 Cortex-X925 cores, CPU-only — for Bonsai; Jetson Nano Gen1 (4× A57 + Maxwell sm_53, 4 GB) — for Bonsai-8B Q1_0 |
+| Engine | one static binary: `as` + `ld`, direct syscalls, zero dependencies (gemma); C + NEON + OpenMP in `pulsar_arm/bonsai2/` (Bonsai); C + CUDA 10.2 sm_53 in `pulsar_arm/bonsai2/pq1_*` (Nano) |
 | Bandwidth | ~3.6–3.9 GB/s of a measured 3.93 GB/s streaming ceiling (92–98 %) |
 | Parity | greedy output identical to transformers, token for token (1B bf16, 270m fp32); greedy Bonsai streams identical to the reference server, token for token (27B 17/17, 8B 5/5), plus a full top-20 distribution match |
 | Determinism | fixed seed ⇒ byte-identical transcripts across runs |
@@ -86,6 +94,73 @@ The sampler follows the fork chain order (top-k → top-p → min-p on raw
 logits, temperature scale last); the server default min-p is 0.05. The 8B
 engine builds the same way from `pq2_gemv.c` + `fwd8.c` (no sign tables —
 that checkpoint carries no Hadamard transform).
+
+## Bonsai-8B Q1_0 on a Jetson Nano
+
+The current branch (`bonsai-jetson-nano`) runs `Bonsai-8B-Q1_0.gguf` — true
+1-bit weights, 128-weight blocks with one f16 scale — on a Jetson Nano Gen1:
+4× Cortex-A57, one Maxwell SM (sm_53), 4 GB shared between CPU and GPU, a
+measured 21.4 GB/s streaming ceiling. The weights are repacked once into a
+1280 MB device arena; each decode step is then almost entirely on the GPU,
+one CUDA graph for the attention block and one for the FFN per layer.
+
+| | |
+|---|---|
+| Decode | **8.29 tok/s** (~121 ms/token), up from 2.13 at the first working build and 6.76 at the start of the last autoresearch loop |
+| Prefill | 8.27 tok/s (token by token through the decode path; no batched prefill yet) |
+| Peak RSS | 342 MB (GGUF pages are dropped once each tensor is uploaded) |
+| Bandwidth | ~8.8 GB/s of 21.4 (41 %): the T-MAC GEMV is POPC/issue-bound on one SM, not bus-bound |
+| Conditions | cold harness run, prompt A (20 ids + 24 greedy tokens), `jetson_clocks` (EMC 1.6 GHz, GPU 921.6 MHz), cpuidle c7 off, context cap 512 |
+
+Where the time goes (`PQ1_KTIME=1`, per token): attention graph 0.90 ms ×
+36 layers, FFN graph 2.20 ms × 36, head GEMV 8.4 ms; the T-MAC kernel is
+~85 % of decode. The kept chain, each step accepted only on an
+order-balanced same-job A/B with all gates green:
+
+- **GEMV kernels** (`pq1_swar_sm53.cu`): 1-bit weights × int8 Q8_K
+  activations. Three SWAR kernels (64/128/256 rows per block, packed 16-bit
+  lane accumulators, LOP3 byte folds, a shared keep-mask table) and a
+  **T-MAC bit-sliced kernel** (activation bit planes × weight sign words via
+  POPC, 2 rows per thread), which now serves every decode shape; the
+  activation planes are built on the device, one warp per 128-group.
+- **Merged tensors** (q+k+v, gate+up) and **CUDA graphs** with fixed staging
+  buffers; spin scheduling for the ~145 syncs per token.
+- **Device attention**: head RMS, YaRN rope, K/V store, q·k / softmax / p·v
+  and the o projection in one graph, the K/V cache in the arena.
+- **Device FFN**: T-MAC gate+up, silu·u with a glibc-faithful `expf`, Q8_K
+  quant and T-MAC down in one graph.
+
+Accuracy gates (`.auto/checks.sh`, rebuilt from the working tree, never
+overridden): (1) `pq1_parity` — all four kernels bit-exact vs the host
+reference at K = 4096 (256/256 rows) and K = 12288 (512/512); (2) the
+44-token greedy stream on prompt A equals `.auto/golden_q1_A.txt`; (3) the
+26-token stream on held-out prompt B equals `.auto/golden_q1_B.txt`.
+`PQ1_ATT_CHECK=1` / `PQ1_FFN_CHECK=1` rerun the host attention / FFN after
+every fused layer and compare bitwise (0 mismatches over 1548 layer-steps).
+
+```sh
+bash .auto/measure.sh                 # sync sources -> build on the Nano -> prompt A -> METRIC lines
+bash .auto/checks.sh                  # the three accuracy gates
+bash .auto/ab_pair.sh "PQ1_TM=0" 2    # order-balanced A/B of an engine switch
+PQ1_EXTRA="PQ1_KTIME=1" bash .auto/measure.sh   # engine env vars reach the board only this way
+```
+
+Build on the board (CUDA 10.2, gcc 7.5; the exact recipe is
+`.auto/build_q1.sh`): `nvcc -gencode arch=compute_53,code=sm_53 -O3
+-maxrregcount=48 --use_fast_math` for `pq1_swar_sm53.cu`, `gcc -O2 -fopenmp
+-mcpu=cortex-a57` for the C side (`pq1_host.c` and `pq1_parity.c` with
+`-ffp-contract=off`), and `fwd8.c` compiled unmodified with
+`-include pq1_fwd8_shim.h`. Run: `./fwd8_q1 Bonsai-8B-Q1_0.gguf <ids...>
+--gen N`. The full record — kept chain, every measured-out idea with its
+data, ranked open levers — is `.auto/HANDOFF_NANO_Q1_0.md`; `.auto/ideas.md`
+is the append-only history and `pulsar_arm/bonsai2/NANO_BRINGUP.md` the
+bring-up ledger.
+
+**In progress:** a 4096-token context with an f16 KV cache whose decode
+arithmetic follows the fork's flash-attention path
+(`.auto/FORK_F16_FA_SPEC.md`), measured on a 3197-token Traditional
+Chinese prompt (`.auto/prompt_zh_tw.txt`) so decode speed is reported at
+depth. The engine's context cap is still 512 on this branch.
 
 ## Modes and flags
 
@@ -212,8 +287,13 @@ reproduce these frames, never invent them.
 
 - **Bonsai greedy parity.** 27B: 17-token stream exact vs the reference
   server at temp-0; 8B: 5/5 exact. Full top-20 distribution match at a
-  sampled position (19/20 same ids, same order) — the engines' logits are
-  the fork's logits, so sampling draws from the same distribution.
+  sampled position (19/20 same ids, same order) — the CPU engines' logits
+  are the fork's logits, so sampling draws from the same distribution.
+- **Bonsai-8B Q1_0 on the Nano.** All four GEMV kernels bit-exact vs the
+  fork-faithful host reference; greedy streams on two prompts equal frozen
+  goldens (the 25 generated tokens of prompt A also equal the fork's
+  temp-0 stream). Logits are close to the fork's, not identical: see
+  Disclosures.
 - **Bonsai kernels.** PTQ1_0 decoder, FWHT-1024, full 89M-weight projection
   and both NEON GEMVs bit-exact vs the fork (26.0 ms / 0.29 ns/w PTQ1_0,
   7.3 ms / 0.15 ns/w PQ2_0, single pinned core); GDN and both ropes at
@@ -267,16 +347,30 @@ pulsar_arm/kernels, runtime  C reference path — parity oracle only, NOT shippe
 pulsar_arm/bonsai2/          Bonsai ternary port (C + NEON, CPU-only): fwd/fwd8
                              engines, NEON GEMVs, FWHT asm, GGUF/tokenizer
                              tools, fork-graph oracle, own README + ledger
+pulsar_arm/bonsai2/pq1_*     Jetson Nano Q1_0 path: sm_53 GEMV/attention/FFN
+                             kernels, repack + arena + graph glue, host
+                             reference, parity gate (bq1_*/pq2_* = earlier
+                             Nano paths, kept for reference)
+.auto/                       Nano harness (measure/checks/A-B scripts),
+                             goldens, handoff and idea history
+autoresearch/                per-loop results tables and discarded patches
 pulsar_arm/tests/            parity tests (Pi-side, need torch + HF cache)
 doc/                         demo GIFs and write-ups
 ```
 
 ## Disclosures
 
-- The four Bonsai clips above run the reference runtime, not the in-tree
-  port; they are presented as the checkpoints' ceiling behaviour at their
-  own sampling, with transcripts verified programmatically against the run
-  logs (never hand-typed). Engine-native re-renders are in progress.
+- The Nano Q1_0 engine quantizes activations to **Q8_K** (256-wide blocks,
+  one fp32 scale, accumulation `(ws*db)*isum` per 128-group), inherited
+  from the PQ2 path. The fork's Q1_0 dot product uses **Q8_0** (32-wide
+  blocks, f16 scale). So the engine has never been logit-identical to the
+  fork on Q1_0, only greedy-stream-identical on the gate prompts: on prompt
+  A, step 19, the top logit is 19.8211 (engine) vs 19.8919 (fork, f16 KV,
+  flash attention on). The goldens are the engine's own exact path; agreement
+  with the fork is reported separately.
+- The fork's own greedy stream is not unique either: on the long zh-TW
+  prompt, flash attention on vs off first differs at token 36, and 20
+  threads vs 1 thread at token 32.
 - The 27B is a reasoning model: its raw stream opens inside `<think>`;
   clips show the answer content as the server renders it (reasoning kept
   out of frame, same convention).

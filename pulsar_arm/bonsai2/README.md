@@ -97,3 +97,22 @@ layer. 8B: 36 dense layers, 4096/12288, 32+8 heads, vocab 151669, YaRN
   caches); generality was traded for auditability, same as `core.S`.
 - Bonsai 1.7B/4B were evaluated and set aside over output quality; the 8B and
   27B above are the demo line.
+
+## Jetson Nano GPU path (branch `bonsai-jetson-nano`)
+
+The same 8B forward (`fwd8.c`, compiled unmodified with
+`-include pq1_fwd8_shim.h`) also runs `Bonsai-8B-Q1_0` on a Jetson Nano
+Gen1 (sm_53, CUDA 10.2): 8.29 tok/s decode, 342 MB peak RSS, every GEMV
+bit-exact vs the host reference.
+
+| file | what |
+|---|---|
+| `pq1_swar_sm53.cu` | GEMV kernels (SWAR 64/128/256-row, T-MAC bit-sliced), device attention and FFN kernels |
+| `pq1_fwd8_glue.c` | repack, 1280 MB device arena, merged q+k+v / gate+up, CUDA graphs, dispatch, timers |
+| `pq1_host.c`, `pq1_wrap.h` | OpenMP repack and the host reference the kernels must match bit for bit |
+| `pq1_parity.c` | parity gate: `./pq1_parity <rows> <K> all` |
+| `pq1_expf_neon.h` | glibc-2.27 `expf` in float64 NEON, exhaustively tested |
+| `bq1_*`, `pq2_*`, `Makefile.sm53` | earlier Nano paths (sign-projected binary, exact 2-bit), kept for reference |
+
+Build, harness and gates: see the root README section and
+`.auto/HANDOFF_NANO_Q1_0.md`; `NANO_BRINGUP.md` is the bring-up ledger.
