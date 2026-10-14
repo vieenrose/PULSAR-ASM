@@ -11,7 +11,14 @@
 #define PQ1_BUILD 1 /* fwd8.c: decode the Q1_0 embedding layout */
 void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
                          const float *x, float *y, const unsigned char *xq);
+/* Batched variant (run #54): n tensors that share one Q8_K activation, launched
+ * once. Returns 0 if the batch ran, non-zero if the caller must run the scalar
+ * path per tensor (unrepacked tensors, no CUDA, launch failure). */
+__attribute__((weak)) int pq1_pq1_compat_gemv_batch(const unsigned char *const *w,
+                                const int *rows, int n, int cols,
+                                float *const *ys, const unsigned char *xq);
 #define pq2_gemv pq1_pq1_compat_gemv
+#define pq2_gemv_batch pq1_pq1_compat_gemv_batch
 
 #ifdef PQ1_USE_CUDA
 /* GPU-RAM report printed once at process exit (PQ1_STATS=1). Declared here

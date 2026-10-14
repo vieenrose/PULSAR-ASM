@@ -68,6 +68,7 @@ static int PQ1_TM = -1;
 static int PQ1_R128 = -1;   /* run #45: 128 rows/block, 2 lanes/row (default) */
 static int PQ1_R256 = -1;   /* run #46: 256 rows/block; -1 = auto (rows>=8192) */
 static long PQ1_TM_CALLS = 0, PQ1_R128_CALLS = 0, PQ1_R256_CALLS = 0, PQ1_SWAR_CALLS = 0; /* diagnostic: which kernel ran */
+static long PQ1_BATCH_CALLS = 0, PQ1_BATCH_ROWS = 0; /* diagnostic: batched launches */
 
 /* PQ1_KTIME=1: per-shape device-path timing (upload + launch + sync + readback),
  * printed by pq1_stats at exit. Needed because a kernel-level speedup measured
@@ -269,10 +270,10 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
   }
   snprintf(buf, n,
            "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%s "
-           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld zc=%d zcfail=%d",
+           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld zc=%d zcfail=%d batch=%ld brows=%ld",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
            fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_R128_CALLS, PQ1_R256_CALLS,
-           PQ1_SWAR_CALLS, NZC, ZCFAIL);
+           PQ1_SWAR_CALLS, NZC, ZCFAIL, PQ1_BATCH_CALLS, PQ1_BATCH_ROWS);
   return buf;
 }
 #endif
@@ -561,4 +562,141 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
     /* cache full and no entry: use the local splits */
     pq1_gemv_cpu(rows, cols, codes, scales, xq, y);
   }
+}
+
+/* ---- Run #54: batched launches (q+k+v, gate+up) ---------------------------
+ * Run #53 (PQ1_KTIME=3) measured the engine's per-call API cost at ~40us H2D +
+ * ~45us launch + ~100us D2H, i.e. 46.6ms per token = 12.8% of the 365ms decode
+ * step. The engine issues one launch per projection (253/token) and each pays
+ * that fixed cost. The projections that share an input vector can share a launch:
+ * q, k, v all read the same Q8_K XN, and gate and up both read the post-attention
+ * norm. This entry takes up to PQ1_BATCH_MAX tensors, uploads the activation
+ * ONCE, launches ONCE, syncs ONCE, then reads back each output (the D2H cannot
+ * be merged: the CPU consumes QF/KF/VF as separate vectors).
+ *
+ * Returns 0 when the batch ran, non-zero when the caller must run the scalar path
+ * (no CUDA, cache miss that cannot be uploaded, launch failure...). The math per
+ * output row is the same kernel body as the single-tensor path, so the results are
+ * bit-identical; pq1_parity verifies the batch kernels against the host reference.
+ * PQ1_BATCH=0 disables it (the A/B arm). */
+#define PQ1_BATCH_MAX 3
+static int PQ1_BATCH = -1;
+static uint8_t *d_yb = NULL;
+static size_t P2YBMAX = 0;
+
+int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, int n,
+                               int cols, float *const *ys, const unsigned char *xq) {
+#ifdef PQ1_USE_CUDA
+  if (PQ1_BATCH < 0) {
+    const char *e = getenv("PQ1_BATCH");
+    PQ1_BATCH = e ? atoi(e) : 1;
+  }
+  if (!PQ1_BATCH || n < 1 || n > PQ1_BATCH_MAX) return -1;
+  if ((cols & 127) != 0 || cols <= 0) return -1;
+
+  int ng = cols / 128;
+  const uint8_t *dc[PQ1_BATCH_MAX];
+  unsigned short *dsc[PQ1_BATCH_MAX];
+  int nrow[PQ1_BATCH_MAX];
+  int total = 0;
+  for (int i = 0; i < n; i++) {
+    dc[i] = NULL;
+    dsc[i] = NULL;
+    nrow[i] = rows[i];
+    int ci = -1;
+    for (int j = 0; j < PQ1N; j++)
+      if (PQ1C[j].w == w[i] && PQ1C[j].rows == rows[i] && PQ1C[j].cols == cols) {
+        ci = j;
+        break;
+      }
+    if (ci < 0) return -1; /* not repacked+cached yet: let the caller use the scalar path */
+    dc[i] = PQ1C[ci].d_codes;
+    dsc[i] = PQ1C[ci].d_scales;
+    if (!dc[i] || !dsc[i]) return -1;
+    total += rows[i];
+  }
+
+  size_t xqb = (size_t)(cols / 256) * 292, yb = (size_t)total * 4;
+  if (!d_xq || xqb > P2XQMAX) {
+    if (d_xq) cudaFree(d_xq);
+    d_xq = NULL;
+    if (cudaMalloc(&d_xq, xqb) == cudaSuccess) P2XQMAX = xqb;
+  }
+  if (!d_yb || yb > P2YBMAX) {
+    if (d_yb) cudaFree(d_yb);
+    d_yb = NULL;
+    if (cudaMalloc(&d_yb, yb) == cudaSuccess) P2YBMAX = yb;
+  }
+  if (!d_xq || !d_yb) { cudaGetLastError(); return -1; }
+
+  float *dy[PQ1_BATCH_MAX];
+  int off = 0;
+  for (int i = 0; i < n; i++) {
+    dy[i] = (float *)d_yb + off;
+    off += rows[i];
+  }
+  int use256 = 1;
+  for (int i = 0; i < n; i++)
+    if (rows[i] < 8192) use256 = 0;
+  /* Run #54 measured the two shapes in one job (PQ1_KTIME=3, per launch):
+   *   gate+up (24576 rows, 256 rows/block): batch sync 3.152ms vs 2 x 1.731ms
+   *     separate = 3.462ms -> the batch kernel is 9% FASTER, and it saves one
+   *     H2D + one launch + one D2H of API time (0.168ms) => +0.48ms per layer.
+   *   q+k+v (6144 rows, 128 rows/block): batch sync 1.645ms vs 1.101ms for the
+   *     three separate launches (+49%), which costs more than the 0.237ms of API
+   *     time it saves => -0.31ms per layer. The extra parameters (15 vs 6) put
+   *     the small-shape kernel on the critical path even at identical register
+   *     counts (40, 0 spills, same shared memory).
+   * So the default batches only groups whose tensors all have >= 8192 rows. Set
+   * PQ1_BATCH=2 to batch every group (the arm this run measured and rejected). */
+  if (!use256 && PQ1_BATCH < 2) return -1;
+
+  double kt0 = KTON ? pq1_now() : 0.0;
+  double ta = 0, tb = 0, tc = 0, td = 0, te = 0;
+  if (KTON >= 3) ta = pq1_now();
+  if (cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaGetLastError();
+    return -1;
+  }
+  if (KTON >= 3) tb = pq1_now();
+  if (pq1_gemv_batch_launch(use256, dc, dsc, dy, nrow, n, cols, total, d_xq,
+                            NULL) != 0) {
+    cudaGetLastError();
+    return -1;
+  }
+  if (KTON >= 3) tc = pq1_now();
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    cudaGetLastError();
+    return -1;
+  }
+  if (KTON >= 3) td = pq1_now();
+  off = 0;
+  for (int i = 0; i < n; i++) {
+    if (cudaMemcpy(ys[i], d_yb + (size_t)off * 4, (size_t)rows[i] * 4,
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+      cudaGetLastError();
+      return -1;
+    }
+    off += rows[i];
+  }
+  if (KTON >= 3) {
+    te = pq1_now();
+    for (int i = 0; i < n; i++) pq1_kt_phase(rows[i], cols, 0.0, 0.0, 0.0, 0.0);
+    for (int i = 0; i < n; i++)
+      pq1_kt_add(rows[i], cols, (te - kt0) / n); /* one launch, charged evenly */
+    fprintf(stderr,
+            "PQ1BT n=%d cols=%-6d h2d=%6.1f launch=%6.1f sync=%7.1f d2h=%6.1f ms\n",
+            n, cols, tb - ta, tc - tb, td - tc, te - td);
+  }
+  PQ1_BATCH_CALLS++;
+  PQ1_BATCH_ROWS += total;
+  if (use256) PQ1_R256_CALLS += n;
+  else PQ1_R128_CALLS += n;
+  if (KTON) pq1_kt_add(-n, cols, te - kt0);
+  (void)ng;
+  return 0;
+#else
+  (void)w; (void)rows; (void)n; (void)cols; (void)ys; (void)xq;
+  return -1;
+#endif
 }

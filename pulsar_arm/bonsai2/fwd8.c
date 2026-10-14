@@ -197,6 +197,21 @@ static void gemvP(const uint8_t *W, int rows, int K, const float *x, float *y) {
     pq2_gemv(rows, K, W, x, y, XQ);
 }
 
+/* One launch for the projections that consume the same activation vector
+   (q/k/v share XN, gate/up share the post-attention norm). Run #53's phase
+   timing measured the per-call API cost at ~40us H2D + ~45us launch + ~100us
+   D2H, so 253 launches/token pay 46.6ms = 12.8% of the decode step in fixed
+   overhead. The batch entry is a weak reference: builds that do not link it
+   (the 2-bit path) take the scalar loop, and a non-zero return (tensor not
+   repacked yet, no CUDA, launch failure) falls back to the same loop, so the
+   results are the scalar path's bit for bit. */
+static void gemvP_multi(const uint8_t *const *W, const int *rows, int n, int K,
+                        const float *x, float *const *Y) {
+    q8_K_quant(x, XQ, K);
+    if (pq2_gemv_batch && pq2_gemv_batch(W, rows, n, K, Y, XQ) == 0) return;
+    for (int i = 0; i < n; i++) pq2_gemv(rows[i], K, W[i], x, Y[i], XQ);
+}
+
 static void rms(const float *x, const float *w, int n, float *y) {
     double s = 0;
     for (int i = 0; i < n; i++) s += (double)x[i] * x[i];
@@ -363,9 +378,14 @@ int main(int argc, char **argv) {
             float *anw = (float *)TW(il, "attn_norm.weight");
             rms(X, anw, HID, XN);
             /* attention */
-            gemvP(TW(il, "attn_q.weight"), NHEAD * HDIM, HID, XN, QF);
-            gemvP(TW(il, "attn_k.weight"), NKV * HDIM, HID, XN, KF);
-            gemvP(TW(il, "attn_v.weight"), NKV * HDIM, HID, XN, VF);
+            { /* one launch for q+k+v: same K=4096 activation (XN) */
+                const uint8_t *Wq[3] = {TW(il, "attn_q.weight"),
+                                        TW(il, "attn_k.weight"),
+                                        TW(il, "attn_v.weight")};
+                const int Rq[3] = {NHEAD * HDIM, NKV * HDIM, NKV * HDIM};
+                float *Yq[3] = {QF, KF, VF};
+                gemvP_multi(Wq, Rq, 3, HID, XN, Yq);
+            }
             float *qnw = (float *)TW(il, "attn_q_norm.weight");
             float *knw = (float *)TW(il, "attn_k_norm.weight");
             for (int h = 0; h < NHEAD; h++) rms(QF + h * 128, qnw, 128, QF + h * 128);
@@ -401,8 +421,13 @@ int main(int argc, char **argv) {
             /* FFN (8B names its second norm ffn_norm, not post_attention_norm) */
             float *pnw = (float *)TW(il, "ffn_norm.weight");
             rms(X, pnw, HID, XN);
-            gemvP(TW(il, "ffn_gate.weight"), INTER, HID, XN, LG);
-            gemvP(TW(il, "ffn_up.weight"), INTER, HID, XN, LU);
+            { /* one launch for gate+up: same K=4096 activation (XN) */
+                const uint8_t *Wg[2] = {TW(il, "ffn_gate.weight"),
+                                        TW(il, "ffn_up.weight")};
+                const int Rg[2] = {INTER, INTER};
+                float *Yg[2] = {LG, LU};
+                gemvP_multi(Wg, Rg, 2, HID, XN, Yg);
+            }
             for (int i = 0; i < INTER; i++) LU[i] = silu(LG[i]) * LU[i];
             gemvP(TW(il, "ffn_down.weight"), HID, INTER, LU, FO);
             if (TRACE) { V8("ffnout", FO); V8R("gate", LG, 1000); V8R("up", LU, 1000); V8R("ffnout", FO, 1000); }

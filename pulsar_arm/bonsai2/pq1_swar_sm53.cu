@@ -648,3 +648,188 @@ extern "C" int pq1_gemv_sm53_launch(const uint8_t *w_codes,
       w_codes, reinterpret_cast<const __half *>(w_scales_h), xq, y, K, N);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
+
+/* ---- Run #54: batched (multi-tensor) launches -----------------------------
+ * Run #53's phase timing (PQ1_KTIME=3) measured the engine's per-call API cost:
+ * ~40us H2D + ~45us launch + ~100us D2H, i.e. 46.6ms per token = 12.8% of the
+ * 365ms decode step. The engine calls one GEMV per projection - 253 launches per
+ * token - and several of them consume the SAME activation vector: q, k, v all
+ * read XN, and gate and up both read the post-attention norm. Folding each such
+ * group into ONE launch pays the H2D and the launch once for the whole group
+ * (the D2H must stay per output buffer: the CPU reads QF/KF/VF separately).
+ *
+ * Numerics: each output row's dot product is computed by exactly the same code,
+ * in the same order, with the same accumulator as the single-tensor kernels - the
+ * only addition is a three-way select of the base pointers from the global row
+ * index. Bit-exactness is verified by pq1_parity against the host reference at
+ * every shape the batch path is used for.
+ *
+ * LANES = 1 -> 256 rows/block (the r256 epilogue: the lane owns its row's 16
+ * groups and writes y itself); LANES = 2 -> 128 rows/block (the r128 epilogue:
+ * two lanes per row, combined through sh_prod, lane 0 summing the 16 groups in
+ * ascending group order). The row counts of every tensor in this model (3072,
+ * 4096, 1024, 12288, 151669) are multiples of 256 except the 151669-row head,
+ * which is never batched, so a block never straddles two tensors. */
+#define PQ1_BN 3
+
+template <int LANES>
+__global__ __launch_bounds__(256, 5)
+void pq1_gemv_batch(const uint8_t* __restrict__ c0, const uint8_t* __restrict__ c1,
+                    const uint8_t* __restrict__ c2,
+                    const __half* __restrict__ s0, const __half* __restrict__ s1,
+                    const __half* __restrict__ s2,
+                    float* __restrict__ y0, float* __restrict__ y1,
+                    float* __restrict__ y2,
+                    int n0, int n1, int n2,
+                    const uint8_t* __restrict__ xq, int K, int N) {
+  const int RPB = 256 / LANES;
+  __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
+  __shared__ int sh_au[PQ1_CHUNK_GROUPS];
+  __shared__ float sh_prod[RPB][PQ1_CHUNK_GROUPS];
+
+  int row = blockIdx.x * RPB + (LANES == 1 ? threadIdx.x : threadIdx.x >> 1);
+  int sub = (LANES == 2) ? (threadIdx.x & 1) : 0;
+  if (blockIdx.x * RPB >= N) return; /* block-uniform */
+  bool active = row < N;
+
+  /* one-time row -> tensor resolution (row is a multiple of RPB <= every row count) */
+  const uint8_t* codes = c0;
+  const __half* sc = s0;
+  float* y = y0;
+  int rrow = row;
+  if (row >= n0) {
+    if (row < n0 + n1) { codes = c1; sc = s1; y = y1; rrow = row - n0; }
+    else               { codes = c2; sc = s2; y = y2; rrow = row - n0 - n1; }
+  }
+
+  int K128 = K >> 7;
+  int nchunk = K128 / PQ1_CHUNK_GROUPS;
+  if (nchunk > PQ1_MAXCHUNK || nchunk <= 0) return;
+
+  float acc = 0.0f;
+
+  for (int ch = 0; ch < nchunk; ch++) {
+    const uint32_t* x32 = reinterpret_cast<const uint32_t*>(xq) +
+                          (size_t)ch * PQ1_CHUNK_BLOCKS * 73;
+    uint32_t* t32 = reinterpret_cast<uint32_t*>(sh_x);
+    {
+      int gid = (int)threadIdx.x >> 4;
+      int slot = (int)threadIdx.x & 15;
+      int bb = gid >> 1;
+      int wb = (gid & 1) * 32 + slot * 2;
+      const uint32_t* src = x32 + bb * 73 + 1 + wb;
+      uint32_t v0 = __ldg(src);
+      uint32_t v1 = __ldg(src + 1);
+      uint32_t m0 = v0 ^ 0x80808080u, m1 = v1 ^ 0x80808080u;
+      t32[bb * 68 + wb] = m0;
+      t32[bb * 68 + wb + 1] = m1;
+      if ((int)threadIdx.x < PQ1_CHUNK_BLOCKS) {
+        uint32_t dv = __ldg(x32 + (int)threadIdx.x * 73);
+        t32[(int)threadIdx.x * 68 + 64] = dv;
+      }
+      uint32_t t0 = (m0 & 0x00FF00FFu) + ((m0 >> 8) & 0x00FF00FFu);
+      uint32_t t1 = (m1 & 0x00FF00FFu) + ((m1 >> 8) & 0x00FF00FFu);
+      int a2 = (int)((t0 & 0xFFFFu) + (t0 >> 16) + (t1 & 0xFFFFu) +
+                     (t1 >> 16));
+#pragma unroll
+      for (int o = 8; o > 0; o >>= 1)
+        a2 += __shfl_down_sync(0xFFFFFFFFu, a2, o);
+      if (slot == 0) sh_au[gid] = a2;
+    }
+    __syncthreads();
+
+#pragma unroll 1
+    for (int g = 0; g < PQ1_CHUNK_GROUPS; g++) {
+      const uint8_t* c =
+          codes + (size_t)rrow * (K >> 3) +
+          (size_t)(ch * PQ1_CHUNK_GROUPS + g) * 16;
+      const uint32_t* gb = t32 + (g >> 1) * 68;
+      float db;
+      __builtin_memcpy(&db, gb + 64, 4);
+      const uint32_t* av = gb + (g & 1) * 32;
+      const uint4* cv = reinterpret_cast<const uint4*>(c);
+      uint4 cw = __ldg(cv);
+      uint32_t cws[4] = {(uint32_t)cw.x, (uint32_t)cw.y, (uint32_t)cw.z,
+                         (uint32_t)cw.w};
+      uint32_t pu0 = 0, pu1 = 0;
+      int pc = 0;
+#pragma unroll
+      for (int w = 0; w < 4; w++) {
+        uint32_t bits = cws[w];
+        pc += __popc(bits);
+#pragma unroll
+        for (int kk = 0; kk < 8; kk++) {
+          uint32_t b4 = (bits >> (kk * 4)) & 0xFu;
+          uint32_t keep = ((b4 * 0x00204081u) & 0x01010101u) * 255u;
+          uint32_t ap = av[w * 8 + kk];
+          uint32_t fold = (ap & keep & 0x00FF00FFu) +
+                          ((ap & keep & 0xFF00FF00u) >> 8);
+          if (kk & 1) pu1 += fold * 0x00010001u;
+          else        pu0 += fold * 0x00010001u;
+        }
+      }
+      int isum = (int)(((pu0 >> 16) + (pu1 >> 16)) << 1) - sh_au[g] + 16384 -
+                 (pc << 8);
+      float ws = active ? __half2float(__ldg(sc + (size_t)rrow * K128 +
+                                            (size_t)(ch * PQ1_CHUNK_GROUPS + g)))
+                        : 0.0f;
+      if (LANES == 1) {
+        acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(ws, db), (float)isum));
+      } else {
+        sh_prod[threadIdx.x >> 1][g] = __fmul_rn(__fmul_rn(ws, db), (float)isum);
+        __syncwarp();
+      }
+    }
+
+    /* Epilogues are kept fully compile-time separate per instantiation: taking
+     * the address of `acc` (e.g. `const float* p = &acc`) forces the accumulator
+     * into LOCAL MEMORY, which made the shared epilogue of the first batch draft
+     * 4x slower per launch than the specialised kernels (run #54: sync 4.6ms per
+     * q+k+v batch vs 1.1ms for the three separate launches, at identical 40-register
+     * occupancy). LANES is a template parameter, so exactly one branch survives. */
+    if (LANES == 2 && sub == 0) {
+#pragma unroll
+      for (int k = 0; k < PQ1_CHUNK_GROUPS; k++)
+        acc = __fadd_rn(acc, sh_prod[threadIdx.x >> 1][k]);
+    }
+    __syncthreads();
+  }
+
+  if (active && (LANES == 1 || sub == 0)) y[rrow] = acc;
+}
+
+extern "C" int pq1_gemv_batch_launch(int use256, const uint8_t* const* codes,
+                                     const unsigned short* const* scales,
+                                     float* const* ys, const int* rows, int n,
+                                     int K, int N, const uint8_t* xq,
+                                     void* stream) {
+  if ((K & 127) != 0) return -2;
+  if (K <= 0 || K > PQ1_MAXK || N <= 0 || n < 1 || n > PQ1_BN) return -2;
+  const uint8_t* c[PQ1_BN] = {codes[0], n > 1 ? codes[1] : codes[0],
+                              n > 2 ? codes[2] : codes[0]};
+  const __half* s[PQ1_BN];
+  float* y[PQ1_BN];
+  int rn[PQ1_BN];
+  for (int i = 0; i < PQ1_BN; i++) {
+    s[i] = reinterpret_cast<const __half*>(scales[i]);
+    y[i] = ys[i];
+    rn[i] = (i < n) ? rows[i] : 0;
+  }
+  dim3 block(256, 1, 1);
+  cudaStream_t st = (cudaStream_t)stream;
+  int rc;
+  if (use256) {
+    dim3 grid((N + PQ1_BLOCK_ROWS3 - 1) / PQ1_BLOCK_ROWS3, 1, 1);
+    pq1_gemv_batch<1><<<grid, block, 0, st>>>(c[0], c[1], c[2], s[0], s[1], s[2],
+                                             y[0], y[1], y[2], rn[0], rn[1], rn[2],
+                                             xq, K, N);
+    rc = (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+  } else {
+    dim3 grid((N + PQ1_BLOCK_ROWS2 - 1) / PQ1_BLOCK_ROWS2, 1, 1);
+    pq1_gemv_batch<2><<<grid, block, 0, st>>>(c[0], c[1], c[2], s[0], s[1], s[2],
+                                             y[0], y[1], y[2], rn[0], rn[1], rn[2],
+                                             xq, K, N);
+    rc = (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+  }
+  return rc;
+}
