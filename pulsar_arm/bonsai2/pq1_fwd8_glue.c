@@ -501,13 +501,15 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
          * shapes (rows >= 100000, i.e. the head GEMV) - the shape-conditional
          * arm, which has never had valid data. Kernel stays available for study. */
         const char *e = getenv("PQ1_TM");
-        /* DEFAULT = 2 (head-only). Run #60: gating the bit-sliced kernel to the
-         * rows >= 100000 shapes measured +0.92% decode (order-balanced A/B, two
-         * pairs, +0.46%/+1.38%, every T-MAC run above its paired SWAR run) -
-         * the first VALID shape-conditional T-MAC measurement (#42's per-shape
-         * table was void per #45). PQ1_TM=0 restores pure SWAR everywhere,
-         * PQ1_TM=1 forces T-MAC on every shape (measured -3% at #50). */
-        PQ1_TM = e ? atoi(e) : 2;
+        /* DEFAULT = 4 (head + wide). Run #60 gated T-MAC to the head (+0.92%,
+         * rows >= 100000); run #61 extended it to the WIDE merged blocks
+         * (gate+up, 24576 rows = 38% of decode) for +6.9% more, while the
+         * long-K arm (down, mode 3) measured -3.05% and stays OFF. Those are
+         * the first VALID shape-conditional T-MAC measurements (#42's per-shape
+         * table was void per #45: T-MAC never ran in that build).
+         * PQ1_TM=0 = pure SWAR, 1 = every shape (measured -3% at #50), 5 = also
+         * long K (different algorithm, kept for study). */
+        PQ1_TM = e ? atoi(e) : 4;
       }
       if (PQ1_R128 < 0) {
         /* Run #45: 128 rows/block (2 lanes/row) is the DEFAULT. Interleaved
@@ -546,9 +548,20 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
       }
       double kt0 = KTON ? pq1_now() : 0.0;
       double t_b = 0, t_c = 0, t_e = 0;
-      /* PQ1_TM=2 gates the bit-sliced kernel by shape: only matrices with
-       * rows >= 100000 (the 151669-row head) take the T-MAC path. */
-      int tm_here = (PQ1_TM == 1) || (PQ1_TM == 2 && rows >= 100000);
+      /* Shape gate for the bit-sliced kernel. T-MAC's advantage grows with the
+       * length of the per-lane loop (it amortises the plane work over the K
+       * dimension), and #46/#50 showed it LOSES when applied to every shape.
+       * Modes: 0 = off everywhere, 1 = all shapes, 2 = the long-ROW shapes
+       * (head, 151669 rows), 3 = long K (down, K=12288), 4 = wide (gate+up,
+       * 24576 rows), 5 = 3 or 4 combined. */
+      int tm_here = 0;
+      if (PQ1_TM == 1) tm_here = 1;
+      else if (PQ1_TM >= 2) {
+        int long_rows = rows >= 100000;                      /* always: proven +13% */
+        int long_k    = (PQ1_TM == 3 || PQ1_TM == 5) && cols >= 12288;
+        int wide      = (PQ1_TM == 4 || PQ1_TM == 5) && rows >= 20000;
+        tm_here = long_rows || long_k || wide;
+      }
       size_t aub = tm_here ? (size_t)(cols >> 7) * 4 : 0;
       if (!d_xq) {
         if (cudaMalloc(&d_xq, PQ1_GRAPH_XQ) == cudaSuccess) P2XQMAX = PQ1_GRAPH_XQ;
@@ -856,6 +869,57 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
 
   double kt0 = KTON ? pq1_now() : 0.0;
   double ta = 0, tb = 0, tc = 0, td = 0, te = 0;
+  if (PQ1_TM < 0) { const char *e = getenv("PQ1_TM"); PQ1_TM = e ? atoi(e) : 4; }
+  /* Shape-gated bit-sliced kernel for the WIDE merged blocks (gate+up, 24576
+   * rows = 38% of decode). Same mode table as the scalar path: 1 = all shapes,
+   * 4/5 = wide (rows >= 20000), 3/5 = long K. The scalar path cannot see these
+   * matrices - they are concatenated and launched here - so the gate lives here
+   * too. Bit-exactness is the same TM kernel the parity gate certifies. */
+  {
+    int tm_here = (PQ1_TM == 1) ||
+                  ((PQ1_TM == 4 || PQ1_TM == 5) && total >= 20000) ||
+                  ((PQ1_TM == 3 || PQ1_TM == 5) && cols >= 12288);
+    if (tm_here) {
+      size_t aub = (size_t)(cols >> 7) * 4;
+      if (!PL_H || xqb > PL_HMAX) {
+        free(PL_H);
+        PL_H = (uint32_t *)malloc(xqb ? xqb : 1);
+        PL_HMAX = PL_H ? xqb : 0;
+      }
+      if (!AU_H || aub > AU_HMAX) {
+        free(AU_H);
+        AU_H = (int *)malloc(aub ? aub : 1);
+        AU_HMAX = AU_H ? aub : 0;
+      }
+      if (!d_au || aub > P2AUMAX) {
+        if (d_au) cudaFree(d_au);
+        d_au = NULL;
+        if (cudaMalloc(&d_au, aub) == cudaSuccess) P2AUMAX = aub;
+      }
+      if (PL_H && AU_H && d_au) {
+        pq1_build_planes(xq, cols, PL_H);
+        pq1_build_au(xq, cols, AU_H);
+        if (cudaMemcpy(d_xq, PL_H, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpy(d_au, AU_H, aub, cudaMemcpyHostToDevice) == cudaSuccess &&
+            pq1_gemv_tm_launch(dc, dsc, d_xq, d_au, MDY, cols, total, NULL) == 0 &&
+            cudaDeviceSynchronize() == cudaSuccess &&
+            cudaMemcpy(stage, MDY, yb, cudaMemcpyDeviceToHost) == cudaSuccess) {
+          PQ1_TM_CALLS++;
+          if (KTON) pq1_kt_add(total, cols, pq1_now() - kt0);
+          /* The caller receives this group's outputs by scattering from the
+           * staging buffer below (the scalar kernels write directly into the
+           * engine's own vectors; merged ones are concatenated, so the launch
+           * writes MDY and the results are copied out here). Returning early
+           * skipped the scatter and silently starved the engine of gate/up
+           * outputs - which the GOLDEN STREAMS caught (run #61) while the
+           * parity gate stayed green, because the bug was in this glue, not in
+           * any kernel. Fall through to the scatter instead. */
+          goto pq1_merged_scatter;
+        }
+        cudaGetLastError();
+      }
+    }
+  }
   if (PQ1_GRAPH < 0) pq1_graph_init();
   int gr = pq1_graph_run(&PQ1M[mi].g, use256, dc, dsc, xq, d_xq, (void *)MDY,
                          (void *)stage, cols, total, xqb, yb);
@@ -883,10 +947,13 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
     }
     if (KTON >= 3) te = pq1_now();
   }
+pq1_merged_scatter:
+  {
   size_t off = 0;
   for (int i = 0; i < n; i++) {
     memcpy(ys[i], stage + (off * 4), (size_t)rows[i] * 4);
     off += rows[i];
+  }
   }
   if (KTON >= 3) {
     fprintf(stderr,
