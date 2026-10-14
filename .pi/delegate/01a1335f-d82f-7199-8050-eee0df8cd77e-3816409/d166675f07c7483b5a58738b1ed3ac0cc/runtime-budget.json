@@ -1,0 +1,67 @@
+{
+  "schema_version": "pi-background-tasks.delegate-runtime-budget.v1",
+  "task_id": "d166675f07c7483b5a58738b1ed3ac0cc",
+  "launch_nonce": "d38e0129c31c6c5895df72bd0509d50b",
+  "policy": {
+    "live_provider_context_owner": "pi_and_provider",
+    "retained_growth_estimator": "provable_1_byte_per_token",
+    "finalization_input_reserve_tokens": 32768,
+    "finalization_trigger_tokens": 8192
+  },
+  "retained_growth_budget_tokens": 88200,
+  "retained_growth_tokens": 85925,
+  "retained_tool_result_bytes": 69124,
+  "spilled_tool_result_bytes": 0,
+  "context_pressure_spill_bytes": 0,
+  "finalization_requested": true,
+  "finalization_reason": "assistant intermediate message left 2275 protected retained-growth tokens",
+  "first_request_observed_input_tokens": 33127,
+  "calibration_violation": null,
+  "latest_context_estimate": {
+    "request_ordinal": 4,
+    "retained_utf8_bytes": 198639,
+    "estimated_input_tokens": 198759,
+    "allowed_input_tokens": 233472,
+    "signed_headroom_tokens": 34713,
+    "dominant_byte_class": "dense_ascii",
+    "finalization_requested": true
+  },
+  "context_measurements": [
+    {
+      "request_ordinal": 1,
+      "retained_utf8_bytes": 112344,
+      "estimated_input_tokens": 112504,
+      "allowed_input_tokens": 233472,
+      "signed_headroom_tokens": 120968,
+      "dominant_byte_class": "dense_ascii",
+      "finalization_requested": false
+    },
+    {
+      "request_ordinal": 2,
+      "retained_utf8_bytes": 166604,
+      "estimated_input_tokens": 166758,
+      "allowed_input_tokens": 233472,
+      "signed_headroom_tokens": 66714,
+      "dominant_byte_class": "dense_ascii",
+      "finalization_requested": false
+    },
+    {
+      "request_ordinal": 3,
+      "retained_utf8_bytes": 183993,
+      "estimated_input_tokens": 184144,
+      "allowed_input_tokens": 233472,
+      "signed_headroom_tokens": 49328,
+      "dominant_byte_class": "dense_ascii",
+      "finalization_requested": false
+    },
+    {
+      "request_ordinal": 4,
+      "retained_utf8_bytes": 198639,
+      "estimated_input_tokens": 198759,
+      "allowed_input_tokens": 233472,
+      "signed_headroom_tokens": 34713,
+      "dominant_byte_class": "dense_ascii",
+      "finalization_requested": true
+    }
+  ]
+}

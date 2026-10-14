@@ -412,3 +412,22 @@ Targets the ~63us D2H + ~28us H2D pageable latency x 188 calls/token.
 - v48 code survived? NO (was in /tmp only). Rebuild from gpu_v43 engine + re-add ring:
   Q4_NSLOT=2 x Q4_SLOT=32MB pinned ring, cuMemcpyHtoDAsync(g_stream), pre-touch slots with
   memset, free via cuMemHostAlloc'd pointer -> cuMemFreeHost ONLY (free() = SIGSEGV double-free).
+
+## Exp42 (run #69) — v49 pinned-ring streaming init, pre-bench evidence
+- repackprobe/repackprobe2 on the Nano (910MB dest, byte-verified identical output):
+  V0 glibc `memcpy(d, s+2, 16)` = **1007 ms**, V5 packed-struct 16B assignment = **287 ms**
+  (V4 __builtin_memcpy 295, V7 u64 pair 288, V8 unrolled x4 296 — all identical bytes,
+  all within noise of each other; took V5). => ~700 ms of the engine's measured
+  981 ms "repack + H2D" init phase is glibc memcpy call overhead on 16-byte copies.
+  v49 applies V5 to BOTH the serial repack and the ring producer (shared Q4_REPACK_INTO).
+- h2dp6 (engine-state probe, 467MB device alloc first): depth-1 H2D 1.05 GB/s,
+  depth-2 **2.86 GB/s**, single cuMemcpyHtoD 5.99 GB/s (82 ms for 467MB).
+  **Corrects a misreading of h2dp5**: its `rc=1` at slot 4 was an OUT-OF-RANGE
+  destination (15 x 32MB = 480MB written into a 467MB cuMemAlloc), NOT a queue-depth
+  limit. Depth-2 is legal on R440. v49 NSLOT=3, sync every 2 enqueues.
+- Predicted v49 init: pin+pretouch 3x32MB ~80 ms + fast repack ~150 ms + H2D overlapped
+  ~163 ms => ~250 ms vs 981 ms measured for the serial path, i.e. ~700-900 ms of the
+  34 s metric window (2-2.6%) IF the ring works; falls back to the serial path (with
+  the fast repack) on any allocation failure, which alone is worth ~700 ms.
+- Probe scripts (in /tmp, ephemeral — content in this file): h2dp5/h2dp6 (pinned DMA
+  throughput vs queue depth and engine memory state), repackprobe/2 (16B copy forms).

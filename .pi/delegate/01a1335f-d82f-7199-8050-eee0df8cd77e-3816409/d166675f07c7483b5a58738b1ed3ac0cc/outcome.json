@@ -1,0 +1,1 @@
+{"error_code":"child_exited_without_commit","launch_nonce":"d38e0129c31c6c5895df72bd0509d50b","observed_task_status":"failed","outcome":{"errorCode":"child_exited_without_commit","status":"failed"},"schema_version":"pi-background-tasks.delegate-outcome.v1","task_id":"d166675f07c7483b5a58738b1ed3ac0cc"}

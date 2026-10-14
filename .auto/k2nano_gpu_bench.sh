@@ -6,6 +6,10 @@
 set -u
 SRC=${SRC:-/tmp/k2_cuda.c}
 PEER=picard@picard-desktop
+# Fail fast (2s) if a reboot wiped the /tmp assets - the 2026-10-14 wipe cost a whole
+# 9-minute bench cycle plus a board cooling cycle. Restore, then re-run.
+bash /home/user/PULSAR-ASM/.auto/k2nano_preflight.sh || {
+  echo "ABORT: preflight failed - restore the assets above, then re-run."; exit 1; }
 EN="64018 2985 200 21127 542 1426 265 30066 4318 394 316 1662 37398 15 64019 64018 612 10102 200 64029 200"
 GOLDEN=/home/user/PULSAR-ASM/.auto/k2nano_golden.txt
 TMP=$(mktemp -d); trap 'rm -rf $TMP' EXIT
