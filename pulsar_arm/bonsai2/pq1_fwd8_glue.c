@@ -609,7 +609,7 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
 #ifdef PQ1_USE_CUDA
   if (PQ1_BATCH < 0) {
     const char *e = getenv("PQ1_BATCH");
-    PQ1_BATCH = e ? atoi(e) : 1;
+    PQ1_BATCH = e ? atoi(e) : 2;
   }
   if (!PQ1_BATCH || n < 1 || n > PQ1_BATCH_MAX) return -1;
   if ((cols & 127) != 0 || cols <= 0) return -1;
@@ -621,11 +621,14 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
   int use256 = 1;
   for (int i = 0; i < n; i++)
     if (rows[i] < 8192) use256 = 0;
-  /* Run #54 measured the small-shape merge as a loss (see the header comment):
-   * the batch KERNEL cost +49% there. The merged path runs the unmodified scalar
-   * kernel, so the sign is an open question - PQ1_BATCH=2 tests it, and the A/B
-   * in this run's log settles it. The default stays on the group that is proven
-   * to win until the merged path has its own measurement. */
+  /* Run #54 measured batching the small group as a LOSS (+49% kernel time) - but
+   * that was its multi-pointer batch KERNEL. The merged path runs the unmodified
+   * scalar kernel, so that cost is gone, and run #55 measured q+k+v merging at
+   * +3.3% in a position-balanced A/B. Default (PQ1_BATCH unset -> 2) therefore
+   * merges every group; PQ1_BATCH=1 restricts merging to groups whose tensors all
+   * have >= 8192 rows (the #55 default), PQ1_BATCH=0 disables it (the A/B arm).
+   * The dispatch below is the scalar kernels' own rule applied to the merged row
+   * count: total >= 8192 -> r256 (1 lane/row), else r128 (2 lanes/row). */
   if (!use256 && PQ1_BATCH < 2) return -1;
 
   /* find or build the merged tensor */
