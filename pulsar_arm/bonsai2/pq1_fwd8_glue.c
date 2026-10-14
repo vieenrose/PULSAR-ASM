@@ -28,6 +28,97 @@
  * the arena fills. Override with PQ1_ARENA_MB. */
 #define PQ1_MAXT 300
 
+/* Fixed sizes for the staging buffers a captured graph bakes in (run #57). A
+ * graph records the pointers it sees, so these are allocated once at their final
+ * size and NEVER reallocated; a request that exceeds them declines the graph path
+ * (and the merged path) and falls back to the explicit API sequence. The engine's
+ * largest activation is K=12288 (14KB) and its largest output is the 151669-row
+ * head (607KB), so 256KB / 1MB leave 10x headroom. */
+#define PQ1_GRAPH_XQ (256 * 1024)
+#define PQ1_GRAPH_YB (1024 * 1024)
+
+#ifdef PQ1_USE_CUDA
+typedef struct {
+  int seen;              /* calls with this key (graph captured at 2) */
+  int ok;                /* graph is instantiated and usable */
+  int use256;            /* kernel/shape selector, part of the key */
+  const void *dc, *dsc;  /* device codes/scales, must be stable */
+  const void *xq, *y;    /* host activation, device/dest output, must be stable */
+  const void *ydev;      /* device buffer the kernel writes (stable!) */
+  int K, N;
+  size_t xqb, yb;
+  cudaGraphExec_t ex;
+} pq1_graph;
+
+static int PQ1_GRAPH = -1;  /* run #57: CUDA graphs for the GEMV API sequence; -1 = auto (on), 0 = off (the A/B arm) */
+static long PQ1_GRAPH_OK = 0, PQ1_GRAPH_CALLS = 0; /* graphs instantiated / launched */
+static cudaStream_t PQ1_CS = NULL; /* capture stream, created on first use */
+
+#ifdef PQ1_USE_CUDA
+static void pq1_graph_init(void) {
+  if (PQ1_GRAPH < 0) {
+    const char *e = getenv("PQ1_GRAPH");
+    PQ1_GRAPH = e ? atoi(e) : 1;
+  }
+}
+
+static int pq1_graph_run(pq1_graph *G, int use256, const void *dc, const void *dsc,
+                         const void *xq, void *xq_d, void *y_dev, void *y_host,
+                         int K, int N, size_t xqb, size_t yb) {
+  if (PQ1_GRAPH == 0) return -1;
+  int same = G->seen && G->use256 == use256 && G->dc == dc && G->dsc == dsc &&
+             G->xq == xq && G->y == y_host && G->ydev == y_dev && G->K == K &&
+             G->N == N && G->xqb == xqb && G->yb == yb;
+  if (!same) {
+    G->seen = 1; G->ok = 0;
+    G->use256 = use256; G->dc = dc; G->dsc = dsc; G->xq = xq; G->y = y_host;
+    G->ydev = y_dev; G->K = K; G->N = N; G->xqb = xqb; G->yb = yb;
+    return -1;
+  }
+  if (!G->ok) {
+    if (G->seen < 2) { G->seen = 2; return -1; }   /* capture on the 2nd call */
+    if (!PQ1_CS && cudaStreamCreateWithFlags(&PQ1_CS, cudaStreamNonBlocking) != cudaSuccess) {
+      cudaGetLastError();
+      PQ1_GRAPH = 0;
+      return -1;
+    }
+    cudaGraph_t g = NULL;
+    int cap = 0, rc = 0;
+    if (cudaStreamBeginCapture(PQ1_CS, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+      cap = 1;
+      cudaMemcpyAsync(xq_d, (void *)xq, xqb, cudaMemcpyHostToDevice, PQ1_CS);
+      rc = use256
+        ? pq1_gemv_r256_launch((const uint8_t *)dc, (const unsigned short *)dsc,
+                               (const uint8_t *)xq_d, (float *)y_dev, K, N, PQ1_CS)
+        : pq1_gemv_r128_launch((const uint8_t *)dc, (const unsigned short *)dsc,
+                               (const uint8_t *)xq_d, (float *)y_dev, K, N, PQ1_CS);
+      cudaMemcpyAsync(y_host, y_dev, yb, cudaMemcpyDeviceToHost, PQ1_CS);
+      if (cudaStreamEndCapture(PQ1_CS, &g) != cudaSuccess) { cap = 0; g = NULL; }
+      if (rc != 0) cap = 0;
+    }
+    if (cap && g) {
+      if (cudaGraphInstantiate(&G->ex, g, NULL, NULL, 0) == cudaSuccess && G->ex) {
+        G->ok = 1;
+        PQ1_GRAPH_OK++;
+      } else {
+        cudaGetLastError();
+        PQ1_GRAPH = 0;   /* this platform will not instantiate graphs */
+      }
+    } else if (g) {
+      cudaGraphDestroy(g);
+    }
+    cudaGetLastError();
+    if (!G->ok) { G->seen = 1; return -1; }
+  }
+  if (cudaGraphLaunch(G->ex, 0) != cudaSuccess) {
+    cudaGetLastError();
+    G->ok = 0;
+    return -1;
+  }
+  return 0;
+}
+#endif
+
 typedef struct {
   const uint8_t *w;
   uint8_t *codes;   /* host splits (may be NULL after upload) */
@@ -35,6 +126,7 @@ typedef struct {
 #ifdef PQ1_USE_CUDA
   uint8_t *d_codes;
   unsigned short *d_scales;
+  pq1_graph g;   /* run #57: captured {H2D, kernel, D2H} for this tensor */
 #endif
   int rows, cols;
 } pq1_ent;
@@ -70,8 +162,6 @@ static int PQ1_R256 = -1;   /* run #46: 256 rows/block; -1 = auto (rows>=8192) *
 static long PQ1_TM_CALLS = 0, PQ1_R128_CALLS = 0, PQ1_R256_CALLS = 0, PQ1_SWAR_CALLS = 0; /* diagnostic: which kernel ran */
 static int PQ1_BATCH = -1;  /* run #55: merged-tensor launches; -1 = auto, 0 = off, 2 = every group */
 static long PQ1_BATCH_CALLS = 0, PQ1_BATCH_ROWS = 0; /* diagnostic: merged launches */
-static int PQ1_GRAPH = -1;  /* run #57: CUDA graphs for the GEMV API sequence; -1 = auto (on), 0 = off (the A/B arm) */
-static long PQ1_GRAPH_OK = 0, PQ1_GRAPH_CALLS = 0; /* graphs instantiated / launched */
 
 /* PQ1_KTIME=1: per-shape device-path timing (upload + launch + sync + readback),
  * printed by pq1_stats at exit. Needed because a kernel-level speedup measured
@@ -447,15 +537,11 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
       double kt0 = KTON ? pq1_now() : 0.0;
       double t_b = 0, t_c = 0, t_e = 0;
       size_t aub = PQ1_TM ? (size_t)(cols >> 7) * 4 : 0;
-      if (!d_xq || xqb > P2XQMAX) {
-        if (d_xq) cudaFree(d_xq);
-        d_xq = NULL;
-        if (cudaMalloc(&d_xq, xqb) == cudaSuccess) P2XQMAX = xqb;
+      if (!d_xq) {
+        if (cudaMalloc(&d_xq, PQ1_GRAPH_XQ) == cudaSuccess) P2XQMAX = PQ1_GRAPH_XQ;
       }
-      if (!d_y || yb > P2YMAX) {
-        if (d_y) cudaFree(d_y);
-        d_y = NULL;
-        if (cudaMalloc(&d_y, yb) == cudaSuccess) P2YMAX = yb;
+      if (!d_y) {
+        if (cudaMalloc(&d_y, PQ1_GRAPH_YB) == cudaSuccess) P2YMAX = PQ1_GRAPH_YB;
       }
       uint32_t *pl = NULL;
       int *auh = NULL;
@@ -519,7 +605,16 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
         double ta = 0, tb = 0, tc = 0, td = 0, te = 0;
         void *ydev = pq1_out_dev(y, yb);
         if (!ydev && !d_y) ok = 0;
+        if (xqb > P2XQMAX || yb > P2YMAX) ok = 0; /* too big for the fixed buffers */
+        int gr = pq1_graph_run(&PQ1C[ci].g, use256, dc, dsc, xq, d_xq, d_y, (void *)y,
+                               cols, rows, xqb, yb);
         if (KTON >= 3) ta = pq1_now();
+        if (gr == 0) {
+          /* the graph contains the H2D, the kernel and the D2H: one API call */
+          if (cudaDeviceSynchronize() != cudaSuccess) ok = 0;
+          if (KTON >= 3) { tb = tc = td = pq1_now(); te = pq1_now(); }
+          if (ok) PQ1_GRAPH_CALLS++;
+        } else if (ok) {
         if (cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) != cudaSuccess) ok = 0;
         if (KTON >= 3) tb = pq1_now();
         if (ok) {
@@ -537,6 +632,7 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
           te = pq1_now();
           pq1_kt_phase(rows, cols, tb - ta, tc - tb, td - tc,
                        ydev ? 0.0 : te - td);
+        }
         }
         if (ok) {
           if (use256) PQ1_R256_CALLS++;
@@ -596,18 +692,6 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
 static uint8_t *MDY = NULL;        /* device output buffer for merged launches */
 static size_t P2MDYMAX = 0;
 
-#ifdef PQ1_USE_CUDA
-typedef struct {
-  int seen;              /* calls with this key (graph captured at 2) */
-  int ok;                /* graph is instantiated and usable */
-  int use256;            /* kernel/shape selector, part of the key */
-  const void *dc, *dsc;  /* device codes/scales, must be stable */
-  const void *xq, *y;    /* host activation, device/dest output, must be stable */
-  const void *ydev;      /* device buffer the kernel writes (stable!) */
-  int K, N;
-  size_t xqb, yb;
-  cudaGraphExec_t ex;
-} pq1_graph;
 
 typedef struct {
   const unsigned char *w[PQ1_BATCH_MAX];
@@ -644,72 +728,7 @@ static int PQ1NM = 0;
  * the SAME D2H, so the values are identical; the greedy goldens are the proof. */
 #endif
 
-static cudaStream_t PQ1_CS = NULL; /* capture stream, created on first use */
 
-#ifdef PQ1_USE_CUDA
-static void pq1_graph_init(void) {
-  if (PQ1_GRAPH < 0) {
-    const char *e = getenv("PQ1_GRAPH");
-    PQ1_GRAPH = e ? atoi(e) : 1;
-  }
-}
-
-static int pq1_graph_run(pq1_graph *G, int use256, const void *dc, const void *dsc,
-                         const void *xq, void *xq_d, void *y_dev, void *y_host,
-                         int K, int N, size_t xqb, size_t yb) {
-  if (PQ1_GRAPH == 0) return -1;
-  int same = G->seen && G->use256 == use256 && G->dc == dc && G->dsc == dsc &&
-             G->xq == xq && G->y == y_host && G->ydev == y_dev && G->K == K &&
-             G->N == N && G->xqb == xqb && G->yb == yb;
-  if (!same) {
-    G->seen = 1; G->ok = 0;
-    G->use256 = use256; G->dc = dc; G->dsc = dsc; G->xq = xq; G->y = y_host;
-    G->ydev = y_dev; G->K = K; G->N = N; G->xqb = xqb; G->yb = yb;
-    return -1;
-  }
-  if (!G->ok) {
-    if (G->seen < 2) { G->seen = 2; return -1; }   /* capture on the 2nd call */
-    if (!PQ1_CS && cudaStreamCreateWithFlags(&PQ1_CS, cudaStreamNonBlocking) != cudaSuccess) {
-      cudaGetLastError();
-      PQ1_GRAPH = 0;
-      return -1;
-    }
-    cudaGraph_t g = NULL;
-    int cap = 0, rc = 0;
-    if (cudaStreamBeginCapture(PQ1_CS, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
-      cap = 1;
-      cudaMemcpyAsync(xq_d, (void *)xq, xqb, cudaMemcpyHostToDevice, PQ1_CS);
-      rc = use256
-        ? pq1_gemv_r256_launch((const uint8_t *)dc, (const unsigned short *)dsc,
-                               (const uint8_t *)xq_d, (float *)y_dev, K, N, PQ1_CS)
-        : pq1_gemv_r128_launch((const uint8_t *)dc, (const unsigned short *)dsc,
-                               (const uint8_t *)xq_d, (float *)y_dev, K, N, PQ1_CS);
-      cudaMemcpyAsync(y_host, y_dev, yb, cudaMemcpyDeviceToHost, PQ1_CS);
-      if (cudaStreamEndCapture(PQ1_CS, &g) != cudaSuccess) { cap = 0; g = NULL; }
-      if (rc != 0) cap = 0;
-    }
-    if (cap && g) {
-      if (cudaGraphInstantiate(&G->ex, g, NULL, NULL, 0) == cudaSuccess && G->ex) {
-        G->ok = 1;
-        PQ1_GRAPH_OK++;
-      } else {
-        cudaGetLastError();
-        PQ1_GRAPH = 0;   /* this platform will not instantiate graphs */
-      }
-    } else if (g) {
-      cudaGraphDestroy(g);
-    }
-    cudaGetLastError();
-    if (!G->ok) { G->seen = 1; return -1; }
-  }
-  if (cudaGraphLaunch(G->ex, 0) != cudaSuccess) {
-    cudaGetLastError();
-    G->ok = 0;
-    return -1;
-  }
-  return 0;
-}
-#endif
 
 int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, int n,
                                int cols, float *const *ys, const unsigned char *xq) {
@@ -808,8 +827,6 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
    * is gate+up (24576 rows = 98KB); 1MB each is 10x headroom for any larger model
    * and costs 2MB of the arena. If a request exceeds it, the merged path declines
    * (returns -1) and the caller uses the scalar path - never a dangling graph. */
-#define PQ1_GRAPH_XQ (256 * 1024)
-#define PQ1_GRAPH_YB (1024 * 1024)
   if (!d_xq) {
     if (cudaMalloc(&d_xq, PQ1_GRAPH_XQ) == cudaSuccess) P2XQMAX = PQ1_GRAPH_XQ;
   }
