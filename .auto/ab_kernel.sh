@@ -16,6 +16,8 @@ CU=${CU:-pq1_swar_sm53.cu}
 GITREF=${GITREF:-HEAD}
 
 git -C "$REPO" show "$GITREF:pulsar_arm/bonsai2/$CU" > /tmp/kv_old.cu || exit 1
+# Older TUs may not define entry points the current glue calls; delegate them.
+cat "$REPO/.auto/ab_delegates.inc" >> /tmp/kv_old.cu
 scp -q "$SRC/$CU" /tmp/kv_old.cu "$NANO:$R/" || { echo SCP_FAILED; exit 1; }
 
 ssh -o ConnectTimeout=25 "$NANO" "cd $R && export PATH=/usr/local/cuda-10.2/bin:\$PATH

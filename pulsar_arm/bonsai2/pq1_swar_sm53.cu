@@ -634,68 +634,6 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
-/* ---- Run #43: in-process GPU keep-alive (devfreq) --------------------------
- * Measured (run #42): during engine decode the GPU sits at 461MHz median of a
- * 921MHz ceiling, because the engine issues ~253 GEMV launches per token of
- * 0.35-2.5ms each, separated by CPU work - bursts too short for the devfreq
- * governor, and the EMC (memory) clock is coupled to it (emc3d_ratio=750).
- * Raising the clock floor needs root, so the engine must keep the GPU non-idle
- * itself. A dependent-IMAD chain in ONE warp on a side stream issues ~1
- * instruction per ~4 cycles (latency-bound, never issue-bound), so it is nearly
- * free, while the SM never sees an idle gap long enough to downclock.
- * It must run in THIS process's context: a second process time-slices the GPU
- * and halves throughput (measured 714 vs 370 ms/token). 40 registers means a
- * 1-warp block co-resides with the GEMV's 5 blocks/SM (6 blocks fit: 40 regs
- * <= 65536/(256*6), smem 6336B*6 = 38KB < 64KB).
- * Enabled by PQ1_KEEPWARM=1; spin length/gap via PQ1_KW_SPIN_MS / PQ1_KW_GAP. */
-#include <pthread.h>
-#include <unistd.h>
-#include <cstdlib>
-#include <cstdio>
-__global__ void pq1_kw_spin(long long cycles) {
-  long long t0 = clock64();
-  unsigned long long x = threadIdx.x + 1u;
-  while (clock64() - t0 < cycles) {
-#pragma unroll 32
-    for (int i = 0; i < 32; i++) x = x * 6364136223846793005ULL + 1ULL;
-  }
-  if (x == 0x123456789abcdefULL) printf("x"); /* never true: keeps the chain live */
-}
-typedef struct {
-  long cyc;
-  long gap_us;
-} pq1_kw_args;
-static void *pq1_kw_main(void *p) {
-  pq1_kw_args *a = (pq1_kw_args *)p;
-  cudaSetDevice(0);
-  cudaStream_t s;
-  if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
-    free(a);
-    return NULL;
-  }
-  for (;;) {
-    pq1_kw_spin<<<1, 32, 0, s>>>((long long)a->cyc);
-    if (cudaStreamSynchronize(s) != cudaSuccess) break;
-    if (a->gap_us > 0) usleep((useconds_t)a->gap_us);
-  }
-  free(a);
-  return NULL;
-}
-extern "C" int pq1_keepwarm_start(void) {
-  const char *e = getenv("PQ1_KEEPWARM");
-  if (!e) return 0;
-  pq1_kw_args *a = (pq1_kw_args *)malloc(sizeof *a);
-  if (!a) return -1;
-  const char *sp = getenv("PQ1_KW_SPIN_MS");
-  const char *gp = getenv("PQ1_KW_GAP");
-  double ms = sp ? atof(sp) : 1.0;
-  a->cyc = (long)(ms * 1e6); /* ~1ms at ~1GHz (clock64 counts SM cycles) */
-  a->gap_us = gp ? atol(gp) : 200;
-  pthread_t th;
-  if (pthread_create(&th, NULL, pq1_kw_main, a) != 0) { free(a); return -1; }
-  pthread_detach(th);
-  return 1;
-}
 
 extern "C" int pq1_gemv_sm53_launch(const uint8_t *w_codes,
                                     const unsigned short *w_scales_h,

@@ -186,7 +186,6 @@ static int pq1_arena_init(size_t need) {
   PQ1ARENA = (uint8_t *)ar;
   PQ1ALIM = mb << 20;
   PQ1ACUR = 0;
-  pq1_keepwarm_start(); /* no-op unless PQ1_KEEPWARM=1 */
   fprintf(stderr, "pq2: arena %zuMB ok\n", mb);
   return 0;
 }
