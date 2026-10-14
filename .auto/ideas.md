@@ -820,3 +820,37 @@ bounded by A/B experiment, and every one of them is slack. The 17x gap between
 the inner loop's ALU-issue estimate (~22ms/token) and measured decode (~373ms)
 cannot be attributed without stall-reason counters. Requesting profiling access
 (root, or the Tegra perf-access toggle) is the highest-value ask available.
+
+## API-overhead family: DONE (2026-10-14, runs #53-#58)
+The engine's per-GEMV API pattern (H2D + launch + D2H + sync) measured 46.6ms/token
+= 12.8% of decode (PQ1_KTIME=3). Harvested with two structural changes, both
+bit-exact (both greedy goldens byte-identical, parity green):
+  * MERGED tensors: projections sharing an activation (q+k+v, gate+up) concatenated
+    at repack time, one launch of the UNMODIFIED scalar kernel, one D2H into a host
+    staging buffer + CPU scatter. +2.10% (gate/up, t=6.8) and +4.00% (q/k/v, t=22).
+    Reverses #54's rejection of q/k/v batching: that loss was the multi-pointer
+    batch KERNEL's cost (15 params, +49% on short launches), not the idea.
+  * CUDA GRAPHS: capture {H2D, kernel, D2H} per tensor (stream capture, lazily on
+    the 2nd call with a stable pointer key), replay with cudaGraphLaunch + sync.
+    +3.4% total (tools/graph_probe.cu predicted 3.3% from 81us/call). Requires the
+    staging buffers to be allocated ONCE at fixed size (256KB/1MB) - a graph that
+    bakes in a pointer that is later reallocated reads freed memory silently.
+Net: 2.7540 -> 3.0473 tps (+10.7%) in one session day; engine is kernel-bound again
+(328ms/token, ~318ms of it inside the GEMV kernels).
+
+## CLOSED: zero-copy outputs on Tegra (run #53)
+cudaHostRegister is "operation not supported" on Tegra; cudaHostAlloc(Mapped) works
+but is CPU-uncached, so the engine's CPU passes over GEMV outputs cost ~5x the DMA
+copy they replace: 365 -> 1862 ms/token (-390%). The path stays behind PQ1_ZC=1,
+off by default. Do not retry on this board; on discrete-VRAM targets it is a ~7% win.
+
+## Remaining (kernel-level, unchanged conclusions)
+* Inner-loop dependency chain: 4.6% of decode time per op removed from the 11-op
+  1-bit chain (#36's slope); #36's analysis says 11 ops/4 weights is the floor for
+  the SWAR formulation (PRMT cannot test bits; 64-bit spread costs more; LOP3 is
+  already 1 op/AND; the 16-bit-lane fold is what makes the packed accumulator exact).
+* Head GEMV device-side argmax: kills the 607KB D2H (0.41ms) + the CPU scan (~0.3ms)
+  = ~0.2% of decode. Below the measurement floor; record only.
+* Launch+sync floor: ~150 graph launches/token x 133us (measured in tools/graph_probe.cu)
+  = 20ms/token = 6% - irreducible while each GEMV's output is consumed by the CPU
+  before the next one's input exists.

@@ -1,6 +1,9 @@
 /* pq1_host.c — Q1_0 split repack + fork-shaped host reference (no CUDA). */
 #include "pq1_wrap.h"
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <math.h>
 
 float pq1_h2f(uint16_t h) {
@@ -18,6 +21,13 @@ float pq1_h2f(uint16_t h) {
 void pq1_split_repack(const uint8_t *q1, int rows, int K, uint32_t *w_bits,
                       uint16_t *w_scales_h) {
   int nb = K / 128;                 /* 18B blocks per row */
+#ifdef _OPENMP
+  /* Pure data movement: each row writes a disjoint slice, so the loop is a
+   * partition of the output and the result is bit-identical to the serial loop,
+   * at any thread count. The repack is the dominant part of the engine's startup
+   * (it walks all 7.57G weights), so parallelising it is a pure startup win. */
+#pragma omp parallel for schedule(static)
+#endif
   for (int r = 0; r < rows; r++) {
     const uint8_t *row = q1 + (size_t)r * nb * 18;
     uint32_t *wb = w_bits + (size_t)r * (K / 32);
