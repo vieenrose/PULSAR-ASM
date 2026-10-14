@@ -28,7 +28,7 @@ GEN=${GEN:-24}
 mkdir -p "$REPO/.auto"
 
 scp -q -o ConnectTimeout=25 \
-  "$SRC/fwd8.c" "$SRC/pq1_swar_sm53.cu" "$SRC/pq1_wrap.h" "$SRC/pq1_host.c" \
+  "$SRC/fwd8.c" "$SRC/pq1_expf_neon.h" "$SRC/pq1_swar_sm53.cu" "$SRC/pq1_wrap.h" "$SRC/pq1_host.c" \
   "$SRC/pq1_fwd8_glue.c" "$SRC/pq1_fwd8_shim.h" "$SRC/pq1_parity.c" \
   "$NANO:$R/" || { echo "SCP FAILED"; exit 1; }
 

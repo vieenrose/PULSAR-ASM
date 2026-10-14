@@ -531,7 +531,14 @@ int main(int argc, char **argv) {
                 float *Yg[2] = {LG, LU};
                 gemvP_multi(Wg, Rg, 2, HID, XN, Yg);
             }
+#ifdef PQ1_BUILD
+            /* silu(g)*u four lanes at a time (pq1_host.c, built with
+             * -ffp-contract=off): expf via the glibc-2.27-exact NEON port in
+             * pq1_expf_neon.h, then 1/(1+e), *g, *u in the reference order. */
+            pq1_silu_mul(LU, LG, INTER);
+#else
             for (int i = 0; i < INTER; i++) LU[i] = silu(LG[i]) * LU[i];
+#endif
             ct_mark(CT_SILU);
             gemvP(TW(il, "ffn_down.weight"), HID, INTER, LU, FO);
             if (TRACE) { V8("ffnout", FO); V8R("gate", LG, 1000); V8R("up", LU, 1000); V8R("ffnout", FO, 1000); }

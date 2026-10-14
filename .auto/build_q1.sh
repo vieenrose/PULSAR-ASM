@@ -21,7 +21,7 @@ SRC=$REPO/pulsar_arm/bonsai2
 R=/home/pesi/exp
 
 scp -q -o ConnectTimeout=25 \
-  "$SRC/fwd8.c" "$SRC/pq1_swar_sm53.cu" "$SRC/pq1_wrap.h" "$SRC/pq1_host.c" \
+  "$SRC/fwd8.c" "$SRC/pq1_expf_neon.h" "$SRC/pq1_swar_sm53.cu" "$SRC/pq1_wrap.h" "$SRC/pq1_host.c" \
   "$SRC/pq1_fwd8_glue.c" "$SRC/pq1_fwd8_shim.h" "$SRC/pq1_parity.c" \
   "$NANO:$R/" || { echo "BUILD FAILED: scp"; exit 1; }
 

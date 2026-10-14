@@ -18,6 +18,8 @@ __attribute__((weak)) int pq1_pq1_compat_gemv_batch(const unsigned char *const *
                                 const int *rows, int n, int cols,
                                 float *const *ys, const unsigned char *xq);
 #define pq2_gemv pq1_pq1_compat_gemv
+/* silu(g)*u, NEON, bit-exact with glibc 2.27 expf (pq1_host.c) */
+void pq1_silu_mul(float *lu, const float *lg, int n);
 #define pq2_gemv_batch pq1_pq1_compat_gemv_batch
 
 #ifdef PQ1_USE_CUDA

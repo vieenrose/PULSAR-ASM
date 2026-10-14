@@ -1,5 +1,6 @@
 /* pq1_host.c — Q1_0 split repack + fork-shaped host reference (no CUDA). */
 #include "pq1_wrap.h"
+#include "pq1_expf_neon.h"
 #include <string.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -128,3 +129,18 @@ int pq1_gemv_tm_launch(const unsigned char *a, const unsigned short *b,
   return -99;
 }
 #endif
+
+/* silu(g)*u in place: LU[i] = (g * (1/(1+expf(-g)))) * LU[i], four lanes at
+ * a time. Lives here because this file is built with -ffp-contract=off: in
+ * fwd8.c's default-contract build gcc fused one of the header's double ops
+ * and 2 of 4.28e9 inputs came out 1 ulp off (exhaustive test). */
+void pq1_silu_mul(float *lu, const float *lg, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t g = vld1q_f32(lg + i), u = vld1q_f32(lu + i);
+        const float32x4_t e = pq1_expf4(vnegq_f32(g));
+        const float32x4_t sg = vdivq_f32(vdupq_n_f32(1.0f), vaddq_f32(vdupq_n_f32(1.0f), e));
+        vst1q_f32(lu + i, vmulq_f32(vmulq_f32(g, sg), u));
+    }
+    for (; i < n; i++) lu[i] = (lg[i] * (1.0f / (1.0f + expf(-lg[i])))) * lu[i];
+}

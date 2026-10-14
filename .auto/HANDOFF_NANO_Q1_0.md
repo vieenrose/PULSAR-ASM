@@ -21,8 +21,8 @@ Three gates, enforced by `.auto/checks.sh`, never overridable:
 
 | metric | baseline (#13) | now | notes |
 |---|---|---|---|
-| decode_tps | 2.1349 | **3.9900** (+87%) | cold harness #69; board clocks locked (jetson_clocks + c7 off, see §5.2) |
-| prefill_tps | 2.2256 | **4.1333** | same code path; no prompt batching |
+| decode_tps | 2.1349 | **4.0218** (+88%) | cold harness #70; board clocks locked (jetson_clocks + c7 off, see §5.2) |
+| prefill_tps | 2.2256 | **4.1948** | same code path; no prompt batching |
 | peak_rss_mb | 206 | 342 | grew with merges+graphs; arena unchanged |
 | startup_s | 2.8 | 2.5 | step 0 = repack + upload + first forward |
 | gpu_used / arena | - | 1014.8 / 1280 MB | the arena is NOT to be shrunk (see #23) |
@@ -86,10 +86,14 @@ primary-neutral but **raises** RSS by 79.7 MB (Tegra unified memory). Zero-copy 
    expf once per score + 8-way interleaved fmaf q.k chains + 4-lane vfmaq p.v (26.7 ->
    13.6), NEON Q8_K quant with the nearest_int magic-add done per lane (12.7 -> 4.7).
    What is left and how to take it:
-   - **silu 12.3 ms** = 36 x 12288 scalar `expf` + divide. The only bit-exact route is
-     re-implementing glibc 2.27's `expf` (Szabolcs Nagy table+poly, computed in double)
-     in 2-lane float64 NEON, then `vdivq_f32` (IEEE). Est. gain 5-8 ms. Moving silu to
-     the GPU breaks bit-exactness (different expf).
+   - **silu 12.3 -> 9.0 ms (#70):** glibc 2.27 `expf` re-implemented in 2-lane float64
+     NEON (`pq1_expf_neon.h`, proven by exhaustive test over all 4.28e9 non-NaN floats
+     with `pq1_expf_test.c`, 0 mismatches). It MUST live in a `-ffp-contract=off` unit
+     (pq1_host.c): under default contraction 2 inputs came out 1 ulp off. The remaining
+     9 ms is ~30 cycles/element: the table gather crosses NEON<->GP twice per lane
+     (vgetq_lane + scalar ldr + vcreate); `vld1q_lane_u64` straight from the table and
+     `vdivq_f32` latency are the next targets (worth maybe 3-4 ms = ~1.5%). Moving silu
+     to the GPU breaks bit-exactness (different expf).
    - **attn 13.6 ms** at NPOS<=44: dominated by the p.v pass (128-wide, memory-bound
      on VCA) and the 8-chain q.k; a further 2x would need K/V in a head-major layout
      (one contiguous 128-float row per (t, kh) already, so little left).
