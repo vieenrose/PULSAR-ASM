@@ -40,9 +40,9 @@ if ! ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 all >/dev/
   fail "pq1 parity (all kernels): $(echo "$P" | grep -E 'MISMATCH|failed' | head -n 2)"
 fi
 P=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 all 2>&1; ./pq1_parity 512 12288 all 2>&1" 2>/dev/null)
-[ "$(echo "$P" | grep -c '256/256 bit-exact')" -ge 3 ] || fail "K=4096: not all kernels bit-exact"
-[ "$(echo "$P" | grep -c '512/512 bit-exact')" -ge 3 ] || fail "K=12288: not all kernels bit-exact"
-echo "checks: pq1 kernels (swar, r128, tm) BIT-EXACT at K=4096 (256/256) and K=12288 (512/512)"
+[ "$(echo "$P" | grep -c '256/256 bit-exact')" -ge 4 ] || fail "K=4096: not all kernels bit-exact"
+[ "$(echo "$P" | grep -c '512/512 bit-exact')" -ge 4 ] || fail "K=12288: not all kernels bit-exact"
+echo "checks: pq1 kernels (swar, r128, r256, tm) BIT-EXACT at K=4096 (256/256) and K=12288 (512/512)"
 
 # --- 2. greedy stream goldens ------------------------------------------------
 ssh -o ConnectTimeout=25 "$NANO" \

@@ -65,8 +65,9 @@ static uint32_t *PL_H = NULL;
 static int *AU_H = NULL;
 static size_t PL_HMAX = 0, AU_HMAX = 0;
 static int PQ1_TM = -1;
-static int PQ1_R128 = -1;   /* run #45: 128 rows/block, 2 lanes/row */
-static long PQ1_TM_CALLS = 0, PQ1_R128_CALLS = 0, PQ1_SWAR_CALLS = 0; /* diagnostic: which kernel ran */
+static int PQ1_R128 = -1;   /* run #45: 128 rows/block, 2 lanes/row (default) */
+static int PQ1_R256 = -1;   /* run #46: 256 rows/block; -1 = auto (rows>=8192) */
+static long PQ1_TM_CALLS = 0, PQ1_R128_CALLS = 0, PQ1_R256_CALLS = 0, PQ1_SWAR_CALLS = 0; /* diagnostic: which kernel ran */
 
 /* PQ1_KTIME=1: per-shape device-path timing (upload + launch + sync + readback),
  * printed by pq1_stats at exit. Needed because a kernel-level speedup measured
@@ -145,9 +146,9 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
   }
   snprintf(buf, n,
            "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%s "
-           "total_mb=%s tensors=%d tm=%ld r128=%ld swar=%ld",
+           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
-           fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_R128_CALLS, PQ1_SWAR_CALLS);
+           fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_R128_CALLS, PQ1_R256_CALLS, PQ1_SWAR_CALLS);
   return buf;
 }
 #endif
@@ -291,6 +292,20 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
          * to A/B the 64-row kernel against it. */
         PQ1_R128 = getenv("PQ1_SWAR") ? 0 : 1;
       }
+      if (PQ1_R256 < 0) {
+        /* Run #46: 256 rows/block (1 lane/row) is used for LARGE matrices only.
+         * Kernel-level (PQ1_TIME, 200 iters, same process as r128):
+         *   151669x4096  18.55 vs 19.53 ms  = +5.3% vs r128
+         *    12288x4096   1.639 vs 1.744 ms = +6.4% vs r128
+         *    4096x12288   2.473 vs 1.756 ms = -41%  (16 blocks underfill one SM)
+         * so the dispatch is by row count: >= 8192 rows -> r256, else r128.
+         * PQ1_R256=0 forces it off (the A/B arm), PQ1_R256=1 forces it on for
+         * every shape (the kernel-level measurement). All three kernels are
+         * bit-exact against the host reference, so the rule cannot change the
+         * numerics - only the speed. */
+        const char *e256 = getenv("PQ1_R256");
+        PQ1_R256 = e256 ? atoi(e256) : -1;
+      }
       if (KTON < 0) {
         const char *ke = getenv("PQ1_KTIME");
         KTON = ke ? atoi(ke) : 0;
@@ -364,13 +379,17 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
         cudaGetLastError();
         PQ1_TM = 0;
       }
+      int use256 = (PQ1_R256 < 0) ? (rows >= 8192) : (PQ1_R256 != 0);
       if (d_xq && d_y &&
           cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
-          (PQ1_R128 ? pq1_gemv_r128_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)
-                    : pq1_gemv_sm53_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)) == 0 &&
+          (use256 ? pq1_gemv_r256_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)
+           : PQ1_R128 ? pq1_gemv_r128_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)
+                      : pq1_gemv_sm53_launch(dc, dsc, d_xq, d_y, cols, rows, NULL)) == 0 &&
           cudaDeviceSynchronize() == cudaSuccess &&
           cudaMemcpy(y, d_y, yb, cudaMemcpyDeviceToHost) == cudaSuccess) {
-        if (PQ1_R128) PQ1_R128_CALLS++; else PQ1_SWAR_CALLS++;
+        if (use256) PQ1_R256_CALLS++;
+        else if (PQ1_R128) PQ1_R128_CALLS++;
+        else PQ1_SWAR_CALLS++;
         if (KTON) pq1_kt_add(rows, cols, pq1_now() - kt0);
         return;
       }
