@@ -219,10 +219,15 @@ void pq1_gemv_sm53(const uint8_t* __restrict__ w_codes,
         /* 4 one-bit weights -> 4 keep bytes (0xFF keep / 0x00 drop) */
         uint32_t keep = ((b4 * 0x00204081u) & 0x01010101u) * 255u;
         uint32_t ap = av[w * 8 + kk]; /* the matching 4 act bytes */
-        uint32_t mk = ap & keep;
-        /* bytes 0,2 and 1,3 into the low halves of two 16-bit lanes; the IMAD
-         * then folds both lanes into the accumulator's top 16 bits */
-        uint32_t fold = (mk & 0x00FF00FFu) + ((mk >> 8) & 0x00FF00FFu);
+        /* 3-input LOP3 form: folding the selection AND into both byte-mask ANDs
+         * lets ptxas emit two LOP32I ops instead of three LOPs plus an LOP for
+         * the mk temporary - 1 SASS op per nibble, ~32 in the unrolled body.
+         * (ap & keep & M1) takes the low pair of bytes; (ap & keep & 0xFF00FF00)
+         * >> 8 takes the high pair into the same 16-bit lanes, which is exactly
+         * the previous (mk >> 8) & 0x00FF00FF. Same boolean function, integer
+         * sums untouched: bit-identical by construction. */
+        uint32_t fold = (ap & keep & 0x00FF00FFu) +
+                        ((ap & keep & 0xFF00FF00u) >> 8);
         if (kk & 1) pu1 += fold * 0x00010001u;
         else        pu0 += fold * 0x00010001u;
       }
