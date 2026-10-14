@@ -503,3 +503,28 @@ Targets the ~63us D2H + ~28us H2D pageable latency x 188 calls/token.
   Next step if resumed: fix the done protocol to a monotonic counter, re-run probe75 with the corrected
   host reference (base = it*131072 + bi*2048, 8 fmaf at +0..+7), require y-bad==0 in all modes, and
   compare one vs all at engine shapes (rows=512 nb=48 -> 64 blocks is the dominant call).
+
+## Exp51 CLOSED (run #75): probe78 decisive — megakernel doorbell is DEAD on R440/Tegra210
+probe78 (modes n1/n2/n3, /tmp/probe78.c + /tmp/p78.ptx, ONE block, 2 items of 524288B,
+host rings ctrl[0]=1 then 2 after observing item0; every spin clock64-bounded):
+- n2/n3 CONFIRM the GOOD half: device writes to DEVICE memory are host-visible MID-KERNEL
+  (y[0] correct via concurrent-stream D2H poll at 0.33-0.42ms while the kernel was still
+  spinning). So "kernel writes y to device, host reads it early" works.
+- n2/n3 KILL the doorbell: item1's y (which requires the host's ctrl[0]=2 write issued at
+  ~0.4ms) was NEVER observed by the host's 200000-poll loop (35s, ~177us/poll), and the
+  kernel's 150M-cycle spin (~163ms at 921MHz, ~2s at min idle clock) expired; the final
+  post-join D2H showed y[1] CORRECT. => host->device visibility of pinned writes to a
+  RUNNING kernel is unbounded (seconds-class, cache-eviction-bound on Tegra), NOT sub-ms.
+- probe74's earlier "observed a 200ms-delayed write" was consistent: visibility completes on
+  cache eviction, which takes ~200ms in the best case, seconds under pressure.
+VERDICT: a persistent megakernel fed by a pinned doorbell cannot deliver work items at token
+latency (~150ms/token). All three engine-blocking observations (probe70 719-storm = geometry
+misalignment; probe74 s1 hang = 3.5s event-poll budget vs 10.7s spin; probe77 loop stall =
+same visibility limit) are now explained. DO NOT rebuild a doorbell engine. Exp51 CLOSED.
+Salvaged for the engine: per-launch overhead IS real (probe75 all-mode 264us/item vs engine
+cadence 434-672us/item) and mid-kernel host reads of device memory work (n2) — so REDUCING
+the launch count per token remains the lever, via batching, not persistence.
+Next hypothesis (v55): batch consecutive engine calls that share identical xq CONTENT (the
+len-8/len-5 runs found by K2DEDUP: 197+394 runs/token) into ONE launch covering 8x/5x the
+rows with per-item y offsets; ~7.6% fewer launches. Secondary: the engine's own d_xq
+double-buffering so the CPU runs ahead on non-deduped calls (WAR removal).
