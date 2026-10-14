@@ -478,3 +478,28 @@ Targets the ~63us D2H + ~28us H2D pageable latency x 188 calls/token.
   not a per-block serial loop over items.
 - Launch-cost reference (probe_queue54, engine shapes): launch-only 96.5 us, H2DA+launch+D2HA
   65.5 us, +event-poll 111.6 us per call at engine sizes.
+
+## Exp51 (run #74) mini-megakernel probes p75/p76: protocol partially validated, NOT ready for engine
+- probe74 (pinned visibility): kernel reads cuMemHostAlloc(DEVICEMAP) word at launch = coherent (saw
+  pre-launch write 7); s1 SPINS (clock64-bounded) and observes a host write issued 200ms AFTER launch
+  => device-side doorbell spin on pinned memory WORKS on R440/Tegra. This was the key feasibility gate.
+- probe75 v1 geometry bug (mine): strides 6144/24 made v4 loads 16B-UNALIGNED -> kernel memory-faults:
+  event never completes, y=0, and later launches return rc=719 sticky (context poisoned). Symptom looks
+  like a driver limitation - it is NOT. Rule: every ld.global.v4 address must be 16B aligned (use
+  shifts: ctaid<<13, tid<<5 for a 8192B/block, 32B/thread layout on 512KB items).
+- probe76 bisect (one/nb/ns/nn) confirmed the hang follows the UNALIGNED geometry, not membar.sys / not the
+  pinned store: all four variants behaved identically.
+- probe75 v2 (524288B items, engine cadence 229 items = 117MB/token): one=389.9 us/item, all=260-277 us/item
+  (single launch, host polls pinned done). all-mode is ~33% faster per item than one-mode. CAUTION: host
+  reference had geometry bugs (6144 vs 8192 stride, k<6 vs k<8) so y-bad>14000 in every mode; the timing
+  comparison is between two unverified kernels. The `mega` (rings-per-item) mode deadlocked at item 4:
+  the done marker was a CONSTANT store (0xDEADBEEF) not a counter, so the host's `done<64` gate is broken;
+  with grid >> resident capacity, per-item completion requires all 64 blocks to retire - design the engine
+  protocol as ONE progress counter (item-major, monotonic), never per-item flags.
+- ENGINE DESIGN CONSTRAINT discovered: with 14656 blocks/token the launch frontier is FIFO; a per-item
+  gate that requires 64 blocks to retire before the host advances will stall. Use a monotonic
+  items-completed counter incremented by the LAST block of each item (atomic), host polls counter>=k.
+- Megakernel remains UNPROVEN end-to-end (no bit-exact y vs engine path). Do not build v54 on this evidence.
+  Next step if resumed: fix the done protocol to a monotonic counter, re-run probe75 with the corrected
+  host reference (base = it*131072 + bi*2048, 8 fmaf at +0..+7), require y-bad==0 in all modes, and
+  compare one vs all at engine shapes (rows=512 nb=48 -> 64 blocks is the dominant call).
