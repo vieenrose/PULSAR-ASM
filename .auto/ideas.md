@@ -967,3 +967,16 @@ inline PTX without .ftz (the .cu is --use_fast_math = ftz; the A57 keeps denorma
 - cold: decode 7.3212 tps (136.59 ms/tok), prefill 7.5251, peak RSS 345 MB (baseline 6.7582
   / 344). ab_pair "PQ1_FFN=0" 1 pair: 7.3164/6.4948 base-first, 6.7476/7.3039 new-first ->
   off/on = 0.9056 (-9.44%), i.e. fused +10.4%. PQ1GPU ffn=36/1548 proves the path ran.
+
+## #77 T-MAC: pc folded into plane 7 (KEPT, +2.2%); carry-save across code words (OUT)
+2pu - 256pc = 2*(S7 - 128*popc(~P7&m)) since popc(P7&m) = pc - popc(~P7&m): the 4 POPC +
+3 adds of pc per row-group go (POPC 72 -> 64 per 2-row iteration; ~P7 is free in LOP).
+Same integer isum -> same fp. Kernel (PQ1_TIME 200, 2 alternations): 24576x4096 1.430/1.423
+-> 1.373/1.373 ms; 4096x12288 0.809/0.805 -> 0.788/0.794; 6144x4096 0.417/0.416 ->
+0.411/0.414; 4096x4096 0.299/0.297 -> 0.284/0.295. All bit-exact (pq1_parity all shapes).
+Engine: cold 7.4572 tps decode / 7.6816 prefill, RSS 340; ab_pair "PQ1_TMV=0" 1 pair:
+7.4594/7.3217 base-first, 7.2956/7.4800 old-first -> old/new 0.9784 (new +2.2%).
+OUT: carry-save across code words 0..2 per plane (popc(x0)+popc(x1)+popc(x2) =
+popc(x0^x1^x2)+2popc(maj)), POPC 64 -> 48 at equal instruction count. Needs plane-major
+order: spills at 48 regs (1.64 ms), 64 regs/4 blocks no spill still 1.44 ms > 1.373. The
+kernel is issue-bound; POPC removal only pays when instructions go with it.

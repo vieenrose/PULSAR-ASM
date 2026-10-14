@@ -29,6 +29,7 @@
  */
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #define PQ1_BLOCK_ROWS 64  /* 256 threads = 32 rows x 8 lanes: the act tile
                             * is still staged by all 256 threads (16 groups,
@@ -573,6 +574,19 @@ extern "C" int pq1_gemv_r256_launch(const uint8_t* w_codes,
 #define TM_ROWS 128
 #define TM_HALF 64
 
+/* Loop iter 3: pc folded into plane 7 (V=1, default; PQ1_TMV=0 is the A/B arm).
+ * pu = S7 + 128*popc(P7&m) with popc(P7&m) = pc - popc(~P7&m), so
+ * 2pu - 256pc = 2*(S7 - 128*popc(~P7&m)): the 4 POPC + 3 adds of pc per row
+ * and group disappear (POPC 72 -> 64 per 2-row group iteration, same isum, so
+ * the fp epilogue and the result are unchanged). Kernel, PQ1_TIME 200 iters,
+ * two alternations: 24576x4096 1.430/1.423 -> 1.373/1.373 ms, 4096x12288
+ * 0.809/0.805 -> 0.788/0.794, 6144x4096 0.417/0.416 -> 0.411/0.414, 4096x4096
+ * 0.299/0.297 -> 0.284/0.295. Measured out alongside: a carry-save adder across
+ * code words 0..2 per plane (popc(x0)+popc(x1)+popc(x2) = popc(x0^x1^x2) +
+ * 2*popc(maj)), POPC 64 -> 48 at equal instruction count: plane-major order
+ * spills at 48 regs (1.64 ms) and is still slower at 64 regs/no spill (1.44
+ * ms): the kernel is issue-bound, POPC only paid where instructions went too. */
+template <int V>
 __global__ __launch_bounds__(256, 5)
 void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
                  const __half* __restrict__ w_scales,
@@ -634,8 +648,8 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
           reinterpret_cast<uint4*>(t32) + (g >> 1) * 17 + (g & 1) * 8;
       uint4 cw0 = __ldg(reinterpret_cast<const uint4*>(wrow0 + goff * 16));
       uint4 cw1 = __ldg(reinterpret_cast<const uint4*>(wrow1 + goff * 16));
-      int pc0 = __popc(cw0.x) + __popc(cw0.y) + __popc(cw0.z) + __popc(cw0.w);
-      int pc1 = __popc(cw1.x) + __popc(cw1.y) + __popc(cw1.z) + __popc(cw1.w);
+      int pc0 = V ? 0 : __popc(cw0.x) + __popc(cw0.y) + __popc(cw0.z) + __popc(cw0.w);
+      int pc1 = V ? 0 : __popc(cw1.x) + __popc(cw1.y) + __popc(cw1.z) + __popc(cw1.w);
       int pu0 = 0, pu1 = 0;
 #pragma unroll
       for (int ci = 0; ci < 4; ci++) {
@@ -646,20 +660,22 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
         int lo0 = __popc(lo4.x & m0) + 2 * __popc(lo4.y & m0) +
                   4 * __popc(lo4.z & m0) + 8 * __popc(lo4.w & m0);
         int hi0 = 16 * __popc(hi4.x & m0) + 32 * __popc(hi4.y & m0) +
-                  64 * __popc(hi4.z & m0) + 128 * __popc(hi4.w & m0);
+                  64 * __popc(hi4.z & m0) +
+                  (V ? -128 * __popc(~hi4.w & m0) : 128 * __popc(hi4.w & m0));
         pu0 += lo0 + hi0;
         int lo1 = __popc(lo4.x & m1) + 2 * __popc(lo4.y & m1) +
                   4 * __popc(lo4.z & m1) + 8 * __popc(lo4.w & m1);
         int hi1 = 16 * __popc(hi4.x & m1) + 32 * __popc(hi4.y & m1) +
-                  64 * __popc(hi4.z & m1) + 128 * __popc(hi4.w & m1);
+                  64 * __popc(hi4.z & m1) +
+                  (V ? -128 * __popc(~hi4.w & m1) : 128 * __popc(hi4.w & m1));
         pu1 += lo1 + hi1;
       }
-      float db;
-      __builtin_memcpy(&db, t32 + (g >> 1) * 68 + 64, 4);
       int au = sh_au[g];
       /* identical to the SWAR kernel's epilogue: same integer isum, same fp */
       int isum0 = (pu0 << 1) - au + 16384 - (pc0 << 8);
       int isum1 = (pu1 << 1) - au + 16384 - (pc1 << 8);
+      float db;
+      __builtin_memcpy(&db, t32 + (g >> 1) * 68 + 64, 4);
       float ws0 = act0 ? __half2float(__ldg(srow0 + goff)) : 0.0f;
       float ws1 = act1 ? __half2float(__ldg(srow1 + goff)) : 0.0f;
       sh_prod[lrow][g] = __fmul_rn(__fmul_rn(ws0, db), (float)isum0);
@@ -691,8 +707,14 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
   dim3 block(256, 1, 1);
   dim3 grid((N + TM_ROWS - 1) / TM_ROWS, 1, 1);
   cudaStream_t s = (cudaStream_t)stream;
-  pq1_gemv_tm<<<grid, block, 0, s>>>(
-      w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
+  static int tmv = -1;
+  if (tmv < 0) { const char* e = getenv("PQ1_TMV"); tmv = e ? atoi(e) : 1; }
+  if (tmv == 1)
+    pq1_gemv_tm<1><<<grid, block, 0, s>>>(
+        w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
+  else
+    pq1_gemv_tm<0><<<grid, block, 0, s>>>(
+        w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
