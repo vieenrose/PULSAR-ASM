@@ -1,0 +1,131 @@
+diff --git a/pulsar_arm/bonsai2/pq1_fwd8_glue.c b/pulsar_arm/bonsai2/pq1_fwd8_glue.c
+index 9cf407c..81155d9 100644
+--- a/pulsar_arm/bonsai2/pq1_fwd8_glue.c
++++ b/pulsar_arm/bonsai2/pq1_fwd8_glue.c
+@@ -1105,6 +1105,12 @@ typedef struct { const void *wd, *xq; float *fo; int ok; cudaGraphExec_t ex; } p
+ static pq1_ffng PQ1F[PQ1_MERGED_MAX];
+ static int PQ1_FFN = -1;
+ #endif
++/* loop iter 9: silu(g)*u in the gate+up T-MAC epilogue (PQ1_TMSILU=0: A/B arm) */
++static int pq1_tmsilu_on(void) {
++  static int on = -1;
++  if (on < 0) { const char *e = getenv("PQ1_TMSILU"); on = e ? atoi(e) : 1; }
++  return on;
++}
+ int pq1_ffn_fused(const unsigned char *wg, const unsigned char *wu, const unsigned char *wd,
+                   int inter, int hid, const unsigned char *xq, float *fo) {
+ #ifdef PQ1_USE_CUDA
+@@ -1142,9 +1148,13 @@ int pq1_ffn_fused(const unsigned char *wg, const unsigned char *wu, const unsign
+     }
+     if (cudaMemcpyAsync(d_xq, xq, xqb1, cudaMemcpyHostToDevice, PQ1_CS) == cudaSuccess &&
+         pq1_tm_prep_launch(d_xq, d_pl, d_au, hid, PQ1_CS) == 0 &&
+-        pq1_gemv_tm_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, gu, hid, 2 * inter,
+-                           PQ1_CS) == 0 &&
+-        pq1_silu_q8k_launch(gu, inter, d_xq, NULL, PQ1_CS) == 0 &&
++        (pq1_tmsilu_on()
++             ? pq1_gemv_tm_silu_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, gu,
++                                       hid, inter, PQ1_CS) == 0 &&
++                   pq1_q8k_launch(gu, inter, d_xq, PQ1_CS) == 0
++             : pq1_gemv_tm_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, gu, hid,
++                                  2 * inter, PQ1_CS) == 0 &&
++                   pq1_silu_q8k_launch(gu, inter, d_xq, NULL, PQ1_CS) == 0) &&
+         pq1_tm_prep_launch(d_xq, d_pl, d_au, inter, PQ1_CS) == 0 &&
+         pq1_gemv_tm_launch(PQ1C[ci].d_codes, PQ1C[ci].d_scales, d_pl, d_au, yd, inter, hid,
+                            PQ1_CS) == 0 &&
+diff --git a/pulsar_arm/bonsai2/pq1_swar_sm53.cu b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+index aef1bc5..62d51f1 100644
+--- a/pulsar_arm/bonsai2/pq1_swar_sm53.cu
++++ b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+@@ -586,7 +586,17 @@ extern "C" int pq1_gemv_r256_launch(const uint8_t* w_codes,
+  * 2*popc(maj)), POPC 64 -> 48 at equal instruction count: plane-major order
+  * spills at 48 regs (1.64 ms) and is still slower at 64 regs/no spill (1.44
+  * ms): the kernel is issue-bound, POPC only paid where instructions went too. */
+-template <int V>
++/* defined with the device FFN tail below */
++__device__ __forceinline__ float pq1_fadd(float a, float b);
++__device__ __forceinline__ float pq1_fmul(float a, float b);
++__device__ __forceinline__ float pq1_fdiv(float a, float b);
++__device__ __forceinline__ float pq1_expf_dev(float x);
++/* Loop iter 9: S=1 is the gate+up -> silu(g)*u form. The merged tensor holds
++ * [gate rows 0..N-1 | up rows 0..N-1]; S=1 gives a thread gate row i as row0
++ * and up row N+i as row1 (64 outputs per block), so the two dot products are
++ * computed exactly as before and the epilogue applies pq1_silu_q8k<1>'s
++ * formula, writing v[i]. The DP-heavy expf now overlaps other warps' POPCs. */
++template <int V, int S>
+ __global__ __launch_bounds__(256, 5)
+ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+                  const __half* __restrict__ w_scales,
+@@ -597,11 +607,11 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+   __shared__ float sh_prod[TM_ROWS][PQ1_CHUNK_GROUPS];
+ 
+   int lrow = threadIdx.x >> 2;                   /* 0..63 */
+-  int row0 = blockIdx.x * TM_ROWS + lrow;
+-  int row1 = row0 + TM_HALF;
++  int row0 = S ? blockIdx.x * TM_HALF + lrow : blockIdx.x * TM_ROWS + lrow;
++  int row1 = S ? row0 + N : row0 + TM_HALF;
+   int sub = threadIdx.x & 3;
+-  if (blockIdx.x * TM_ROWS >= N) return; /* block-uniform */
+-  bool act0 = row0 < N, act1 = row1 < N;
++  if (blockIdx.x * (S ? TM_HALF : TM_ROWS) >= N) return; /* block-uniform */
++  bool act0 = row0 < N, act1 = S ? act0 : row1 < N;
+   int rrow0 = act0 ? row0 : 0;
+   int rrow1 = act1 ? row1 : 0;
+ 
+@@ -694,6 +704,14 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+     __syncthreads(); /* the tile is reused by the next chunk */
+   }
+ 
++  if (S) {
++    if (sub == 0 && act0) {
++      const float e = pq1_expf_dev(__uint_as_float(__float_as_uint(acc0) ^ 0x80000000u));
++      const float sg = pq1_fdiv(1.0f, pq1_fadd(1.0f, e));
++      y[row0] = pq1_fmul(pq1_fmul(acc0, sg), acc1);
++    }
++    return;
++  }
+   if (sub == 0 && act0) y[row0] = acc0;
+   if (sub == 0 && act1) y[row1] = acc1;
+ }
+@@ -710,14 +728,26 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
+   static int tmv = -1;
+   if (tmv < 0) { const char* e = getenv("PQ1_TMV"); tmv = e ? atoi(e) : 1; }
+   if (tmv == 1)
+-    pq1_gemv_tm<1><<<grid, block, 0, s>>>(
++    pq1_gemv_tm<1, 0><<<grid, block, 0, s>>>(
+         w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
+   else
+-    pq1_gemv_tm<0><<<grid, block, 0, s>>>(
++    pq1_gemv_tm<0, 0><<<grid, block, 0, s>>>(
+         w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
+   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+ }
+ 
++/* gate+up -> v = silu(g)*u (N = inter outputs, merged tensor of 2N rows) */
++extern "C" int pq1_gemv_tm_silu_launch(const uint8_t* w_codes, const unsigned short* w_scales_h,
++                                       const uint32_t* xpl, const int* xau, float* v, int K,
++                                       int N, void* stream) {
++  if ((K & 127) != 0) return -2;
++  if (K <= 0 || K > PQ1_MAXK || N <= 0) return -2;
++  dim3 grid((N + TM_HALF - 1) / TM_HALF, 1, 1);
++  pq1_gemv_tm<1, 1><<<grid, 256, 0, (cudaStream_t)stream>>>(
++      w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, v, K, N);
++  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
++}
++
+ 
+ /* Device-side T-MAC activation prep (run #72). The engine used to build the
+  * bit planes and the per-group sums on the host (pq1_build_planes/_au: 0.21 ms
+diff --git a/pulsar_arm/bonsai2/pq1_wrap.h b/pulsar_arm/bonsai2/pq1_wrap.h
+index 712603d..060f828 100644
+--- a/pulsar_arm/bonsai2/pq1_wrap.h
++++ b/pulsar_arm/bonsai2/pq1_wrap.h
+@@ -45,6 +45,9 @@ int pq1_tm_prep_launch(const unsigned char *xq_d, unsigned int *pl_d, int *au_d,
+ int pq1_silu_q8k_launch(const float *gu_d, int n, unsigned char *xq_d, float *vout_d,
+                         void *stream);
+ /* loop iter 4: plain q8_K_quant of a device vector (same quant as above) */
++int pq1_gemv_tm_silu_launch(const unsigned char *w_codes, const unsigned short *w_scales_h,
++                            const unsigned int *xpl, const int *xau, float *v, int K, int N,
++                            void *stream);
+ int pq1_q8k_launch(const float *x_d, int n, unsigned char *xq_d, void *stream);
+ /* loop iter 4: attention block (head rms + rope + K/V row store, then q.k, softmax,
+  * p.v) for one layer. par_d holds, per token: cos[64] | sin[64] at PQ1_APAR_ROPE,

@@ -1,0 +1,89 @@
+diff --git a/.auto/ideas.md b/.auto/ideas.md
+index c0c3afb..041dc71 100644
+--- a/.auto/ideas.md
++++ b/.auto/ideas.md
+@@ -980,3 +980,6 @@ OUT: carry-save across code words 0..2 per plane (popc(x0)+popc(x1)+popc(x2) =
+ popc(x0^x1^x2)+2popc(maj)), POPC 64 -> 48 at equal instruction count. Needs plane-major
+ order: spills at 48 regs (1.64 ms), 64 regs/4 blocks no spill still 1.44 ms > 1.373. The
+ kernel is issue-bound; POPC removal only pays when instructions go with it.
++
++## #78 Attention block as one CUDA graph per layer — KEPT
++q+k+v GEMV, head norms, rope, KV store (device cache in arena), attention, Q8_K and attn_output fused per layer. PQ1_ATT_CHECK: 1548 layer-steps bit-exact. ab_pair PQ1_ATT=0: -7.9% when off. Cold 7.46 -> 7.89 decode tps, RSS 343. Arena 1158.9/1280 MB. Next: rms/residual/FFN quant on device (whole layer in one graph); T-MAC epilogue lane split; head GEMV at ~48% of ceiling.
+diff --git a/pulsar_arm/bonsai2/pq1_swar_sm53.cu b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+index f00c94b..82d403e 100644
+--- a/pulsar_arm/bonsai2/pq1_swar_sm53.cu
++++ b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+@@ -586,7 +586,11 @@ extern "C" int pq1_gemv_r256_launch(const uint8_t* w_codes,
+  * 2*popc(maj)), POPC 64 -> 48 at equal instruction count: plane-major order
+  * spills at 48 regs (1.64 ms) and is still slower at 64 regs/no spill (1.44
+  * ms): the kernel is issue-bound, POPC only paid where instructions went too. */
+-template <int V>
++/* Loop iter 5 (E=1, default; PQ1_TME=0 is the A/B arm): sh_prod rows padded
++ * to 17 floats (the 8 rows of a warp hit 8 banks instead of 2) and the two
++ * rows' in-order 16-group sums run on lanes sub 0 and 1 in parallel instead of
++ * back to back on lane 0. Each row keeps the same serial fadd order. */
++template <int V, int E>
+ __global__ __launch_bounds__(256, 5)
+ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+                  const __half* __restrict__ w_scales,
+@@ -594,7 +598,7 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+                  float* __restrict__ y, int K, int N) {
+   __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
+   __shared__ int sh_au[PQ1_CHUNK_GROUPS];
+-  __shared__ float sh_prod[TM_ROWS][PQ1_CHUNK_GROUPS];
++  __shared__ float sh_prod[TM_ROWS][PQ1_CHUNK_GROUPS + E];
+ 
+   int lrow = threadIdx.x >> 2;                   /* 0..63 */
+   int row0 = blockIdx.x * TM_ROWS + lrow;
+@@ -683,7 +687,13 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+       __syncwarp();
+     }
+ 
+-    if (sub == 0) {
++    if (E) {
++      if (sub < 2) { /* sub 0 owns row0's acc, sub 1 row1's (kept in acc0) */
++        const float* p0 = sh_prod[lrow + sub * TM_HALF];
++#pragma unroll
++        for (int k = 0; k < PQ1_CHUNK_GROUPS; k++) acc0 = __fadd_rn(acc0, p0[k]);
++      }
++    } else if (sub == 0) {
+       const float* p0 = sh_prod[lrow];
+       const float* p1 = sh_prod[lrow + TM_HALF];
+ #pragma unroll
+@@ -694,8 +704,13 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+     __syncthreads(); /* the tile is reused by the next chunk */
+   }
+ 
+-  if (sub == 0 && act0) y[row0] = acc0;
+-  if (sub == 0 && act1) y[row1] = acc1;
++  if (E) {
++    if (sub == 0 && act0) y[row0] = acc0;
++    if (sub == 1 && act1) y[row1] = acc0;
++  } else {
++    if (sub == 0 && act0) y[row0] = acc0;
++    if (sub == 0 && act1) y[row1] = acc1;
++  }
+ }
+ 
+ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
+@@ -709,12 +724,15 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
+   cudaStream_t s = (cudaStream_t)stream;
+   static int tmv = -1;
+   if (tmv < 0) { const char* e = getenv("PQ1_TMV"); tmv = e ? atoi(e) : 1; }
+-  if (tmv == 1)
+-    pq1_gemv_tm<1><<<grid, block, 0, s>>>(
+-        w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
++  static int tme = -1;
++  if (tme < 0) { const char* e = getenv("PQ1_TME"); tme = e ? atoi(e) : 1; }
++  const __half* ws = reinterpret_cast<const __half*>(w_scales_h);
++  if (tmv == 1 && tme)
++    pq1_gemv_tm<1, 1><<<grid, block, 0, s>>>(w_codes, ws, xpl, xau, y, K, N);
++  else if (tmv == 1)
++    pq1_gemv_tm<1, 0><<<grid, block, 0, s>>>(w_codes, ws, xpl, xau, y, K, N);
+   else
+-    pq1_gemv_tm<0><<<grid, block, 0, s>>>(
+-        w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
++    pq1_gemv_tm<0, 0><<<grid, block, 0, s>>>(w_codes, ws, xpl, xau, y, K, N);
+   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+ }
+ 

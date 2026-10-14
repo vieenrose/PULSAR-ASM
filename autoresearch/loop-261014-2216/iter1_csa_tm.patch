@@ -1,0 +1,134 @@
+diff --git a/pulsar_arm/bonsai2/pq1_swar_sm53.cu b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+index 35da79a..0eee4bf 100644
+--- a/pulsar_arm/bonsai2/pq1_swar_sm53.cu
++++ b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+@@ -29,6 +29,7 @@
+  */
+ #include <cuda_fp16.h>
+ #include <stdint.h>
++#include <stdlib.h>
+ 
+ #define PQ1_BLOCK_ROWS 64  /* 256 threads = 32 rows x 8 lanes: the act tile
+                             * is still staged by all 256 threads (16 groups,
+@@ -573,6 +574,31 @@ extern "C" int pq1_gemv_r256_launch(const uint8_t* w_codes,
+ #define TM_ROWS 128
+ #define TM_HALF 64
+ 
++/* Run #76: carry-save (Harley-Seal) reduction of the masked plane words.
++ * The #74 knockouts put the kernel at its POPC floor: 32 AND + 32 POPC (+4
++ * POPC for pc) per 128 weights per row, POPC at 32 lanes/clk/SM (quarter
++ * rate), so ~36 XU clocks against ~67 ALU ops (~17 issue clocks). Words of
++ * equal weight 2^p are compressed with full adders (s = a^b^c, c = maj(a,b,c),
++ * one LOP3 each) column by column, low to high, so each column leaves ONE word
++ * to popcount: 10 POPC + 48 LOP3 per group per row. The pc term is folded
++ * into column 7 by an exact identity: with q = P7 | ~m (plane 7 of the biased
++ * bytes, OR the complement of the code word),
++ *   popc(q) = 32 - popc(m) + popc(P7 & m)
++ * so T = sum_ci [sum_{p<7} 2^p popc(P_p & m_ci) + 128 popc(P7_ci | ~m_ci)]
++ *      = pu + 16384 - 128 pc   and   isum = 2 pu - au + 16384 - 256 pc
++ *                                         = 2 T - au - 16384.
++ * Integers only, every identity exact: the same isum reaches the same fp
++ * epilogue, so the output is bit-identical (pq1_parity). The shared tile is
++ * staged plane-major ([p][ci] instead of [ci][p]) so one LDS.128 gives a
++ * column; the global plane layout and the prep kernel are unchanged.
++ * PQ1_TMC=0 selects the #71 arithmetic for same-binary A/B. */
++__device__ __forceinline__ void pq1_fa(uint32_t a, uint32_t b, uint32_t c,
++                                       uint32_t& s, uint32_t& cy) {
++  s = a ^ b ^ c;
++  cy = (a & b) | (c & (a ^ b));
++}
++
++template <int CSA>
+ __global__ __launch_bounds__(256, 5)
+ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+                  const __half* __restrict__ w_scales,
+@@ -615,8 +641,15 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+       int bb = gid >> 1;                /* its Q8_K block */
+       int wb = (gid & 1) * 32 + slot * 2;
+       const uint32_t* src = x32 + bb * 73 + 1 + wb;
+-      t32[bb * 68 + wb] = __ldg(src);
+-      t32[bb * 68 + wb + 1] = __ldg(src + 1);
++      if (CSA) {
++        /* plane-major tile: word j = ci*8 + p of the group lands at p*4 + ci */
++        int gb = bb * 68 + (gid & 1) * 32, j = slot * 2;
++        t32[gb + ((j & 7) << 2) + (j >> 3)] = __ldg(src);
++        t32[gb + (((j + 1) & 7) << 2) + ((j + 1) >> 3)] = __ldg(src + 1);
++      } else {
++        t32[bb * 68 + wb] = __ldg(src);
++        t32[bb * 68 + wb + 1] = __ldg(src + 1);
++      }
+       if ((int)threadIdx.x < PQ1_CHUNK_BLOCKS) {
+         uint32_t dv = __ldg(x32 + (int)threadIdx.x * 73);
+         t32[(int)threadIdx.x * 68 + 64] = dv; /* fp32 d, verbatim */
+@@ -634,6 +667,36 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+           reinterpret_cast<uint4*>(t32) + (g >> 1) * 17 + (g & 1) * 8;
+       uint4 cw0 = __ldg(reinterpret_cast<const uint4*>(wrow0 + goff * 16));
+       uint4 cw1 = __ldg(reinterpret_cast<const uint4*>(wrow1 + goff * 16));
++      int isum0, isum1;
++      if (CSA) {
++        uint32_t k00 = 0, k01 = 0, k02 = 0, k10 = 0, k11 = 0, k12 = 0;
++        int T0 = 0, T1 = 0;
++#pragma unroll
++        for (int p = 0; p < 8; p++) {
++          uint4 c = pv[p]; /* plane p of the 4 code words' activations */
++          uint32_t a0, a1, a2, a3, b0, b1, b2, b3;
++          if (p < 7) {
++            a0 = c.x & cw0.x; a1 = c.y & cw0.y; a2 = c.z & cw0.z; a3 = c.w & cw0.w;
++            b0 = c.x & cw1.x; b1 = c.y & cw1.y; b2 = c.z & cw1.z; b3 = c.w & cw1.w;
++          } else {
++            a0 = c.x | ~cw0.x; a1 = c.y | ~cw0.y; a2 = c.z | ~cw0.z; a3 = c.w | ~cw0.w;
++            b0 = c.x | ~cw1.x; b1 = c.y | ~cw1.y; b2 = c.z | ~cw1.z; b3 = c.w | ~cw1.w;
++          }
++          uint32_t t, u, sw, ca, cb, cc;
++          pq1_fa(a0, a1, a2, t, ca); pq1_fa(a3, k00, k01, u, cb); pq1_fa(t, u, k02, sw, cc);
++          T0 += __popc(sw) << p; k00 = ca; k01 = cb; k02 = cc;
++          pq1_fa(b0, b1, b2, t, ca); pq1_fa(b3, k10, k11, u, cb); pq1_fa(t, u, k12, sw, cc);
++          T1 += __popc(sw) << p; k10 = ca; k11 = cb; k12 = cc;
++        }
++        uint32_t s8, c9;
++        pq1_fa(k00, k01, k02, s8, c9);
++        T0 += (__popc(s8) << 8) + (__popc(c9) << 9);
++        pq1_fa(k10, k11, k12, s8, c9);
++        T1 += (__popc(s8) << 8) + (__popc(c9) << 9);
++        int au = sh_au[g];
++        isum0 = (T0 << 1) - au - 16384;
++        isum1 = (T1 << 1) - au - 16384;
++      } else {
+       int pc0 = __popc(cw0.x) + __popc(cw0.y) + __popc(cw0.z) + __popc(cw0.w);
+       int pc1 = __popc(cw1.x) + __popc(cw1.y) + __popc(cw1.z) + __popc(cw1.w);
+       int pu0 = 0, pu1 = 0;
+@@ -654,12 +717,13 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+                   64 * __popc(hi4.z & m1) + 128 * __popc(hi4.w & m1);
+         pu1 += lo1 + hi1;
+       }
+-      float db;
+-      __builtin_memcpy(&db, t32 + (g >> 1) * 68 + 64, 4);
+       int au = sh_au[g];
+       /* identical to the SWAR kernel's epilogue: same integer isum, same fp */
+-      int isum0 = (pu0 << 1) - au + 16384 - (pc0 << 8);
+-      int isum1 = (pu1 << 1) - au + 16384 - (pc1 << 8);
++      isum0 = (pu0 << 1) - au + 16384 - (pc0 << 8);
++      isum1 = (pu1 << 1) - au + 16384 - (pc1 << 8);
++      }
++      float db;
++      __builtin_memcpy(&db, t32 + (g >> 1) * 68 + 64, 4);
+       float ws0 = act0 ? __half2float(__ldg(srow0 + goff)) : 0.0f;
+       float ws1 = act1 ? __half2float(__ldg(srow1 + goff)) : 0.0f;
+       sh_prod[lrow][g] = __fmul_rn(__fmul_rn(ws0, db), (float)isum0);
+@@ -691,8 +755,14 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
+   dim3 block(256, 1, 1);
+   dim3 grid((N + TM_ROWS - 1) / TM_ROWS, 1, 1);
+   cudaStream_t s = (cudaStream_t)stream;
+-  pq1_gemv_tm<<<grid, block, 0, s>>>(
+-      w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
++  static int tmc = -1;
++  if (tmc < 0) { const char* e = getenv("PQ1_TMC"); tmc = e ? atoi(e) : 1; }
++  if (tmc)
++    pq1_gemv_tm<1><<<grid, block, 0, s>>>(
++        w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
++  else
++    pq1_gemv_tm<0><<<grid, block, 0, s>>>(
++        w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
+   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+ }
+ 

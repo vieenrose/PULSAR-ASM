@@ -1,0 +1,88 @@
+diff --git a/pulsar_arm/bonsai2/pq1_swar_sm53.cu b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+index aef1bc5..8155a94 100644
+--- a/pulsar_arm/bonsai2/pq1_swar_sm53.cu
++++ b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+@@ -595,6 +595,7 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+   __shared__ __align__(16) uint8_t sh_x[PQ1_CHUNK_BYTES];
+   __shared__ int sh_au[PQ1_CHUNK_GROUPS];
+   __shared__ float sh_prod[TM_ROWS][PQ1_CHUNK_GROUPS];
++  __shared__ int sh_k[PQ1_CHUNK_GROUPS * 4];
+ 
+   int lrow = threadIdx.x >> 2;                   /* 0..63 */
+   int row0 = blockIdx.x * TM_ROWS + lrow;
+@@ -638,6 +639,23 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+       if (slot == 0) sh_au[gid] = xau[ch * PQ1_CHUNK_GROUPS + gid];
+     }
+     __syncthreads();
++    if (V == 2) {
++      /* Loop iter 8: per 32-activation word, k = number of low planes that
++       * carry information. Planes b in [k, 6] equal ~U7 (the sign plane of the
++       * int8 value x = u - 128), so x fits k+1 signed bits and
++       * sum(m*x) = sum_{b<k} 2^b popc(U_b & m) - 2^k popc(~U7 & m), the same
++       * integer V=1 computes with k = 7. Planes are row-independent: k is
++       * warp-uniform and the skipped planes are real branches. */
++      if ((int)threadIdx.x < PQ1_CHUNK_GROUPS * 4) {
++        int gg = (int)threadIdx.x >> 2, ci = (int)threadIdx.x & 3;
++        const uint32_t* P = t32 + (gg >> 1) * 68 + (gg & 1) * 32 + ci * 8;
++        uint32_t s7 = ~P[7];
++        int kk = 7;
++        while (kk > 0 && P[kk - 1] == s7) kk--;
++        sh_k[threadIdx.x] = kk;
++      }
++      __syncthreads();
++    }
+ 
+ #pragma unroll 1
+     for (int half = 0; half < 4; half++) {
+@@ -651,6 +669,37 @@ void pq1_gemv_tm(const uint8_t* __restrict__ w_codes,
+       int pc0 = V ? 0 : __popc(cw0.x) + __popc(cw0.y) + __popc(cw0.z) + __popc(cw0.w);
+       int pc1 = V ? 0 : __popc(cw1.x) + __popc(cw1.y) + __popc(cw1.z) + __popc(cw1.w);
+       int pu0 = 0, pu1 = 0;
++      if (V == 2) {
++#pragma unroll
++        for (int ci = 0; ci < 4; ci++) {
++          uint32_t m0 = (ci == 0) ? cw0.x : (ci == 1) ? cw0.y : (ci == 2) ? cw0.z : cw0.w;
++          uint32_t m1 = (ci == 0) ? cw1.x : (ci == 1) ? cw1.y : (ci == 2) ? cw1.z : cw1.w;
++          const int kk = sh_k[g * 4 + ci];
++          uint4 lo4 = pv[ci * 2];
++          uint4 hi4 = pv[ci * 2 + 1];
++          const uint32_t s7 = ~hi4.w;
++          int a0 = -(__popc(s7 & m0) << kk), a1 = -(__popc(s7 & m1) << kk);
++          if (kk >= 4) {
++            a0 += __popc(lo4.x & m0) + 2 * __popc(lo4.y & m0) + 4 * __popc(lo4.z & m0) +
++                  8 * __popc(lo4.w & m0);
++            a1 += __popc(lo4.x & m1) + 2 * __popc(lo4.y & m1) + 4 * __popc(lo4.z & m1) +
++                  8 * __popc(lo4.w & m1);
++            if (kk >= 5) {
++              a0 += 16 * __popc(hi4.x & m0); a1 += 16 * __popc(hi4.x & m1);
++              if (kk >= 6) {
++                a0 += 32 * __popc(hi4.y & m0); a1 += 32 * __popc(hi4.y & m1);
++                if (kk == 7) { a0 += 64 * __popc(hi4.z & m0); a1 += 64 * __popc(hi4.z & m1); }
++              }
++            }
++          } else {
++            if (kk >= 1) { a0 += __popc(lo4.x & m0); a1 += __popc(lo4.x & m1); }
++            if (kk >= 2) { a0 += 2 * __popc(lo4.y & m0); a1 += 2 * __popc(lo4.y & m1); }
++            if (kk >= 3) { a0 += 4 * __popc(lo4.z & m0); a1 += 4 * __popc(lo4.z & m1); }
++          }
++          pu0 += a0;
++          pu1 += a1;
++        }
++      } else
+ #pragma unroll
+       for (int ci = 0; ci < 4; ci++) {
+         uint32_t m0 = (ci == 0) ? cw0.x : (ci == 1) ? cw0.y : (ci == 2) ? cw0.z : cw0.w;
+@@ -708,8 +757,11 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
+   dim3 grid((N + TM_ROWS - 1) / TM_ROWS, 1, 1);
+   cudaStream_t s = (cudaStream_t)stream;
+   static int tmv = -1;
+-  if (tmv < 0) { const char* e = getenv("PQ1_TMV"); tmv = e ? atoi(e) : 1; }
+-  if (tmv == 1)
++  if (tmv < 0) { const char* e = getenv("PQ1_TMV"); tmv = e ? atoi(e) : 2; }
++  if (tmv == 2)
++    pq1_gemv_tm<2><<<grid, block, 0, s>>>(
++        w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
++  else if (tmv == 1)
+     pq1_gemv_tm<1><<<grid, block, 0, s>>>(
+         w_codes, reinterpret_cast<const __half*>(w_scales_h), xpl, xau, y, K, N);
+   else

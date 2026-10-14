@@ -1,0 +1,22 @@
+{
+  "version": "2.1.0",
+  "source": "loop",
+  "timestamp": "2026-10-14T23:20:31+08:00",
+  "status": "COMPLETE",
+  "stopped_early": "9 of 25 iterations: plateau, last three kernel experiments lost and the remaining levers are each below the ~1% A/B resolution",
+  "results_tsv": "autoresearch/loop-261014-2216/results.tsv",
+  "findings": [
+    "decode_tps 6.7582 -> 8.2899 cold (+22.7%), prefill 6.9415 -> 8.2672, peak RSS 344 -> 342 MB; all three gates green and logits identical on every keep",
+    "kept: fused FFN tail graph (+10.4% A/B), pc folded into T-MAC plane 7 (+2.2%), attention block as one graph per layer (+8.6%), tm_prep one warp per group via ballot (+3.3%), attn_pre per-thread head RMS chains (+1.8%)",
+    "sm_53: a one-lane DP instruction costs a full warp of DP issue; pack serial double chains across lanes",
+    "T-MAC kernel is now ~85% of decode and near its POPC floor (32/clk/SM, ~68 ms/tok); epilogue lane split, sign-plane skipping (+23% slower) and silu-in-epilogue (-2%) measured out",
+    "remaining small items: argmax computed twice per greedy token (~0.4 ms), attn_core serial es on thread 0 (~0.3%), silu_q8k DP-bound glibc expf (62 us/layer)"
+  ],
+  "config": {
+    "goal": "optimize decode throughput of Bonsai-8B Q1_0 on Jetson Nano Gen1 preserving accuracy and peak RSS",
+    "scope": "pulsar_arm/bonsai2/pq1_* and fwd8.c",
+    "metric": "decode_tps",
+    "direction": "higher_is_better",
+    "verify": "bash .auto/measure.sh (METRIC decode_tps) + bash .auto/ab_pair.sh; guard bash .auto/checks.sh and peak_rss_mb <= 346"
+  }
+}

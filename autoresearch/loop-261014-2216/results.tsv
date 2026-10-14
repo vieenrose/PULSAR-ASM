@@ -1,0 +1,12 @@
+# metric_direction: higher_is_better
+iteration	timestamp	commit	metric	delta	guard	guard-metric	status	description
+0	2026-10-14T22:17:39+08:00	e799c64	6.7582	0.0	pass	rss=344	baseline	initial state (cold measure.sh, gates green)
+1	2026-10-14T22:23:11+08:00	-	-	-	pass(parity 4 shapes bit-exact)	kernel 24576x4096 tm 1.6229 vs 1.4277 ms; 4096x12288 0.9336 vs 0.7986; 6144x4096 0.4605 vs 0.4174; 4096x4096 0.3484 vs 0.3001	discard	carry-save (Harley-Seal LOP3) T-MAC reduction, 10 POPC/group-row instead of 36, pc folded into column 7 via P7|~m: bit-exact but +12-17% slower; kernel is issue-bound on the single SM (136 instr/128w/row ~0.91 ms issue floor vs 0.96 POPC), LOP3 tree adds ops + 14 spills. patch: iter1_csa_tm.patch
+2	2026-10-14T22:35:03+08:00	a17461c	7.3212	+0.5630	pass(3/3 gates, logits diff 0, FFNCHK 0/1548)	rss=345; ab_pair PQ1_FFN=0 off/on=0.9056 (+10.4% fused)	keep	fused FFN tail as one CUDA graph per layer: device silu*u + Q8_K quant (bit-exact over all 2^32 g), removes CPU silu/quant + 36 syncs/tok
+3	2026-10-14T22:44:44+08:00	bb2aea8	7.4572	+0.1360	pass(3/3 gates, logits diff 0, parity 4 shapes)	rss=340; ab_pair PQ1_TMV=0 old/new=0.9784 (+2.2%)	keep	T-MAC pc folded into plane 7 (~P7&m weight -128): POPC 72->64 per 2-row group, gate+up kernel 1.430->1.373 ms; carry-save variant measured out (issue-bound)
+4	2026-10-14T22:58:35+08:00	0a017e4	7.8859	+0.4287	pass	rss=343	keep	attention block as one CUDA graph per layer (+8.6% A/B)
+5	2026-10-14T23:01:57+08:00	-	7.8859	0	pass	-	discard	T-MAC epilogue lane split + sh_prod pad: kernel flat/-1% (24576x4096 1.372->1.375 ms, 4096x12288 0.786->0.799, head 7.98->8.00)
+6	2026-10-14T23:06:08+08:00	082ad34	8.1606	+0.2747	pass	rss=339	keep	T-MAC prep one warp per group via ballot (+3.3% A/B)
+7	2026-10-14T23:09:59+08:00	92f35d5	8.2899	+0.1293	pass	rss=342	keep	attn_pre one block, per-thread head RMS chains (+1.8% A/B)
+8	2026-10-14T23:16:14+08:00	-	8.2899	0	pass	-	discard	T-MAC skip sign-extension planes per word (V=2): kernel +23% slower (24576x4096 1.371->1.695 ms); real activations need 7.2 bits avg (K=4096), 6.7 (down), max saving 10-16% POPC
+9	2026-10-14T23:20:17+08:00	-	8.2899	0	pass	-	discard	silu(g)*u in gate+up T-MAC epilogue (bit-exact, FFNCHK 0 bad): ab_pair PQ1_TMSILU=0 +2.04% (new path slower)
