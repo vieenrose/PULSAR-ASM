@@ -53,6 +53,22 @@ FC_SYS = ("<bos><start_of_turn>developer\n"
 FC_SYS_LABEL = ("# system prompt, verbatim from tool_official.txt"
                 " (functions / tools are defined here):")
 
+# Bonsai-8B Q1_0 (true 1-bit) on a Jetson Nano Gen1, CUDA sm_53 engine
+# (pulsar_arm/bonsai2 fwd8_q1, committed HEAD build). These two clips are
+# TIMED: each token appears at its measured step time from the run log, and
+# loading (step 0: repack + upload + first forward) and prefill last their
+# measured durations, so the reveal runs at the engine's real speed. Sampling
+# is the checkpoint's own GGUF config (temp 0.5, top-p 0.85, top-k 20).
+# bonsai8b-q1-nano-en: per-token text pieces and per-token step times (ms), verbatim from
+# the run log (BQ1TIME lines); 90 tokens, EOS excluded.
+PIECES_EN = ["Here", " are", " the", " four", " seasons", " and", " one", " thing", " that", " changes", " in", " each", ":\n\n", "1", ".", " **", "Spring", "**", " \u2013", " Plants", " begin", " to", " bloom", " and", " grow", ",", " and", " temperatures", " rise", ".\n", "2", ".", " **", "Summer", "**", " \u2013", " The", " weather", " is", " warm", " and", " sunny", ",", " and", " the", " days", " are", " long", ".\n", "3", ".", " **", "Aut", "umn", " (", "Fall", ")**", " \u2013", " Leaves", " change", " color", " and", " fall", " from", " trees", ",", " and", " the", " weather", " becomes", " cooler", ".\n", "4", ".", " **", "Winter", "**", " \u2013", " It", " is", " cold", " and", " snowy", ",", " and", " the", " days", " are", " short", "."]
+MS_EN = [119.1, 128.6, 127.1, 127.0, 126.9, 127.1, 127.2, 127.2, 127.2, 127.5, 127.5, 127.6, 127.5, 127.7, 127.6, 127.8, 128.3, 127.9, 127.9, 128.2, 128.3, 127.8, 128.7, 128.6, 127.9, 128.3, 128.3, 128.5, 128.2, 128.5, 128.5, 128.7, 128.5, 128.7, 128.6, 128.9, 128.7, 129.0, 128.7, 129.2, 129.2, 129.3, 129.6, 129.5, 129.3, 129.7, 129.5, 129.8, 129.7, 129.7, 129.9, 129.7, 130.0, 129.8, 130.2, 129.9, 130.4, 130.2, 130.5, 130.3, 131.6, 130.4, 130.7, 130.7, 130.8, 130.9, 131.0, 130.9, 130.8, 131.0, 131.1, 131.2, 131.2, 131.9, 132.2, 131.9, 132.6, 132.4, 132.6, 133.1, 132.5, 132.4, 133.0, 132.6, 132.8, 133.0, 133.1, 133.2, 133.1, 133.5]
+
+# bonsai8b-q1-nano-zh-tw: per-token text pieces and per-token step times (ms), verbatim from
+# the run log (BQ1TIME lines); 211 tokens, EOS excluded.
+PIECES_ZH = ["\u7576\u7136", "\u53ef\u4ee5", "\uff01", "\u4ee5\u4e0b", "\u662f\u4e00", "\u500b", "\u95dc\u65bc", "\u56db\u5b63", "\u53ca\u5176", "\u6703", "\u6539\u8b8a", "\u7684\u4e00", "\u500b", "\u7c21", "\u6f54", "\u5217\u8868", "\uff1a\n\n", "---\n\n", "###", " **", "\u6625", "**", "  \n", "-", " **", "\u82b1", "\u958b", "**", "\uff08", "\u5982", "", "\u6adb", "\u82b1", "\u3001", "", "\u6afa", "\u82b1", "\uff09", "  \n", "-", " **", "\u690d\u7269", "\u6210\u9577", "**", "  \n", "-", " **", "\u96e8", "\u5b63", "\u958b\u59cb", "**", "  \n", "-", " **", "\u6c23", "\u6eab", "\u5347", "\u6eab", "**", "  \n\n", "---\n\n", "###", " **", "\u590f", "**", "  \n", "-", " **", "\u967d", "\u5149", "\u5f37", "\u70c8", "**", "  \n", "-", " **", "\u71b1", "\u6d6a", "**", "  \n", "-", " **", "\u8fb2", "\u696d", "\u6210", "\u8c50", "**", "  \n", "-", " **", "\u591c", "\u7a7a\u4e2d", "\u7e41", "\u661f", "**", "  \n\n", "---\n\n", "###", " **", "\u79cb", "**", "  \n", "-", " **", "\u8449", "\u5b50", "\u8b8a", "\u8272", "**", "\uff08", "\u91d1", "\u3001", "\u6a59", "\u3001", "\u7d05", "\uff09", "  \n", "-", " **", "\u6c23", "\u6eab", "\u4e0b\u964d", "**", "  \n", "-", " **", "\u8fb2", "\u696d", "\u6536", "\u6210", "**", "  \n", "-", " **", "\u591c", "\u7a7a\u4e2d", "\u6d41\u661f", "**", "  \n\n", "---\n\n", "###", " **", "\u51ac\u5929", "**", "  \n", "-", " **", "\u6c23", "\u6eab", "\u4f4e", "\u65bc", " freezing", "**", "  \n", "-", " **", "\u96ea", "fall", "**", "  \n", "-", " **", "\u690d\u7269", "\u4f11", "\u7720", "**", "  \n", "-", " **", "\u591c", "\u7a7a\u4e2d", "\u5bd2\u51b7", "**", "  \n\n", "---\n\n", "\u5982\u679c\u4f60", "\u60f3\u8981", "\u66f4", "\u5177", "\u9ad4", "\u7684", "\u5167\u5bb9", "\uff08", "\u4f8b\u5982", "\u6bcf", "\u5b63", "\u6703", "\u6539\u8b8a", "\u7684", "\u81ea\u7136", "\u73fe", "\u8c61", "\u3001", "\u4eba\u985e", "\u884c\u70ba", "\u3001", "\u6c23", "\u8c61", "\u7b49", "\uff09\uff0c", "\u6211", "\u4e5f\u53ef\u4ee5", "\u63d0\u4f9b", "\u66f4", "\u8a73\u7d30", "\u7684", "\u8aaa\u660e", "\u3002", "\u9700\u8981", "\u55ce", "\uff1f"]
+MS_ZH = [118.9, 127.3, 126.9, 127.1, 127.2, 126.8, 127.4, 127.0, 126.9, 127.4, 127.3, 127.7, 128.3, 127.6, 127.6, 127.6, 128.0, 128.1, 127.9, 128.3, 127.8, 127.7, 128.0, 128.0, 128.2, 128.7, 128.1, 128.7, 128.2, 128.3, 128.5, 128.6, 128.7, 128.6, 128.7, 128.8, 128.6, 128.6, 128.9, 129.1, 129.1, 129.4, 129.5, 129.2, 129.1, 129.2, 129.3, 129.7, 130.1, 129.8, 129.8, 130.1, 129.6, 129.8, 129.9, 130.0, 129.9, 130.0, 130.3, 130.1, 130.1, 130.3, 130.3, 130.6, 130.5, 130.5, 130.8, 130.6, 130.8, 131.0, 131.0, 131.4, 131.3, 131.9, 131.6, 131.6, 131.9, 132.1, 132.2, 132.6, 132.8, 132.4, 132.6, 132.6, 132.4, 132.9, 133.2, 133.1, 133.7, 133.2, 133.4, 133.5, 133.3, 133.5, 133.9, 133.8, 133.6, 133.5, 134.0, 133.9, 133.9, 134.2, 134.3, 135.0, 134.4, 135.1, 135.3, 135.3, 135.5, 135.5, 135.7, 135.5, 135.5, 135.5, 135.6, 135.9, 135.9, 135.8, 136.4, 135.8, 135.7, 135.9, 136.3, 136.4, 136.3, 136.3, 136.0, 136.2, 136.2, 136.2, 136.5, 136.6, 137.0, 136.5, 136.5, 136.9, 136.6, 137.1, 137.2, 137.6, 137.1, 137.2, 136.9, 137.5, 137.1, 137.5, 137.4, 137.7, 137.5, 137.2, 137.3, 137.7, 137.9, 138.0, 137.8, 138.4, 137.8, 137.9, 137.9, 138.3, 138.1, 137.9, 138.1, 138.1, 137.9, 138.2, 138.4, 138.6, 138.5, 138.8, 138.7, 138.8, 138.8, 139.9, 139.3, 139.9, 139.4, 139.2, 139.1, 139.4, 139.4, 139.7, 140.3, 139.6, 139.6, 139.6, 140.4, 140.2, 140.1, 140.3, 140.1, 140.1, 140.2, 140.5, 140.1, 140.9, 140.8, 141.4, 140.7, 140.9, 140.8, 141.5, 142.0, 142.2, 142.1, 142.2, 142.1, 141.8, 142.3, 142.4, 143.0]
+
 SPECS = {
     "1b-en": dict(
         out="gemma3-1b-chat-en.gif",
@@ -226,6 +242,31 @@ SPECS = {
         response=("\n\n<think>\n\u7528\u6237\u8981\u6c42\u5217\u51fa\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u4f1a\u6539\u53d8\u7684\u4e00\u4ef6\u4e8b\u3002\u8fd9\u662f\u4e00\u4e2a\u7b80\u5355\u7684\u77e5\u8bc6\u6027\u95ee\u9898\u3002\n\n\u56db\u5b63\uff1a\u6625\u3001\u590f\u3001\u79cb\u3001\u51ac\n\n\u6bcf\u4e00\u5b63\u4f1a\u6539\u53d8\u7684\u4e00\u4ef6\u4e8b\uff0c\u6211\u53ef\u4ee5\u4ece\u81ea\u7136\u73b0\u8c61\u3001\u6c14\u5019\u3001\u690d\u7269\u3001\u52a8\u7269\u884c\u4e3a\u7b49\u65b9\u9762\u6765\u8003\u8651\uff1a\n\n- \u6625\u5929\uff1a\u6c14\u6e29\u56de\u5347\uff0c\u690d\u7269\u53d1\u82bd/\u5f00\u82b1\n- \u590f\u5929\uff1a\u65e5\u7167\u65f6\u95f4\u53d8\u957f\uff0c\u6c14\u6e29\u5347\u9ad8\n- \u79cb\u5929\uff1a\u6811\u53f6\u53d8\u9ec4/\u843d\u53f6\n- \u51ac\u5929\uff1a\u6c14\u6e29\u4e0b\u964d\uff0c\u53ef\u80fd\u964d\u96ea\n\n\u6211\u9009\u62e9\u6bcf\u5b63\u4e00\u4e2a\u6700\u5178\u578b\u3001\u6700\u76f4\u89c2\u7684\u53d8\u5316\uff1a\n- \u6625\uff1a\u690d\u7269\u53d1\u82bd\u3001\u5f00\u82b1\n- \u590f\uff1a\u65e5\u7167\u65f6\u95f4\u53d8\u957f\uff08\u6216\u6c14\u6e29\u5347\u9ad8\uff09\n- \u79cb\uff1a\u6811\u53f6\u53d8\u8272\u3001\u843d\u53f6\n- \u51ac\uff1a\u6c14\u6e29\u4e0b\u964d\u3001\u964d\u96ea\n\n\u6211\u9009\u62e9\u6bd4\u8f83\u6709\u753b\u9762\u611f\u4e14\u660e\u786e\u7684\uff1a\n- \u6625\uff1a\u690d\u7269\u4ece\u82bd\u53d8\u5230\u5f00\u82b1\n- \u590f\uff1a\u767d\u5929\u53d8\u957f\uff08\u65e5\u7167\u65f6\u95f4\u589e\u52a0\uff09\n- \u79cb\uff1a\u6811\u53f6\u7531\u7eff\u53d8\u9ec4\u518d\u843d\u53f6\n- \u51ac\uff1a\u5929\u7a7a\u4ece\u6674\u6717\u53d8\u4e3a\u591a\u96ea\uff08\u6216\u6c14\u6e29\u663e\u8457\u4e0b\u964d\uff09\n\n\u8ba9\u6211\u7b80\u6d01\u6e05\u6670\u5730\u56de\u7b54\u3002\n</think>\n\n## \u56db\u5b63\u53ca\u5176\u53d8\u5316\n\n| \u5b63 | \u4ee3\u8868\u53d8\u5316 |\n|---|---|\n| **\u6625** | \u690d\u7269\u53d1\u82bd\u3001\u5f00\u82b1\uff0c\u5927\u5730\u7531\u67af\u8f6c\u7eff |\n| **\u590f** | \u65e5\u7167\u65f6\u95f4\u53d8\u957f\uff0c\u767d\u5929\u9010\u6e10\u5ef6\u957f |\n| **\u79cb** | \u6811\u53f6\u7531\u7eff\u8f6c\u9ec4\u3001\u7ea2\uff0c\u7ee7\u800c\u98d8\u843d |\n| **\u51ac** | \u6c14\u6e29\u9aa4\u964d\uff0c\u5929\u7a7a\u5f00\u59cb\u964d\u96ea |\n\n> \u7b80\u5355\u8bf4\uff1a\u6625\u662f**\u751f**\uff0c\u590f\u662f**\u957f**\uff0c\u79cb\u662f**\u843d**\uff0c\u51ac\u662f**\u85cf**\u2014\u2014\u81ea\u7136\u4ee5\u8fd9\u56db\u4ef6\u4e8b\u6807\u8bb0\u65f6\u95f4\u7684\u6d41\u8f6c\u3002"),
         status="7.5 tok/s \u00b7 temp 0.5 \u00b7 8 threads",
         wrap="char"),
+
+    "bonsai8b-q1-nano-en": dict(
+        out="bonsai8b-q1-nano-chat-en.gif",
+        title="pulsar \u00b7 Bonsai-8B Q1_0 (1-bit) \u00b7 jetson nano cuda",
+        cmd="$ OMP_NUM_THREADS=4 ./fwd8_q1 b8q1.gguf 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.5 0.85 20 7",
+        you="> List the four seasons and one thing that changes in each.",
+        tpl="prompt ids: 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 271",
+        response="".join(PIECES_EN),
+        pieces=PIECES_EN,
+        ms=MS_EN,
+        load_ms=2308.1, prefill_ms=2649.9,
+        status="7.7 tok/s \u00b7 temp 0.5 \u00b7 Jetson Nano GPU (sm_53)",
+        wrap="word"),
+    "bonsai8b-q1-nano-zh-tw": dict(
+        out="bonsai8b-q1-nano-chat-zh-tw.gif",
+        title="pulsar \u00b7 Bonsai-8B Q1_0 (1-bit) \u00b7 jetson nano cuda",
+        cmd="$ OMP_NUM_THREADS=4 ./fwd8_q1 b8q1.gguf 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.5 0.85 20 123",
+        you="> \u8acb\u5217\u51fa\u56db\u5b63\uff0c\u4ee5\u53ca\u6bcf\u4e00\u5b63\u6703\u6539\u8b8a\u7684\u4e00\u4ef6\u4e8b\u3002",
+        tpl="prompt ids: 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 271",
+        response="".join(PIECES_ZH),
+        pieces=PIECES_ZH,
+        ms=MS_ZH,
+        load_ms=2361.8, prefill_ms=2657.8,
+        status="7.4 token/s \u00b7 temp 0.5 \u00b7 Jetson Nano GPU (sm_53)",
+        wrap="char"),
 }
 
 
@@ -362,6 +403,10 @@ def render(name, spec, out_dir=DOC):
         img.save(os.path.join(tmp, f"f{len(os.listdir(tmp)):04d}.png"))
 
     fps = 14
+    if spec.get("ms"):
+        _timed(spec, frame, compose, head, stages, full, tx, text_w, mid_px, fps)
+        _encode(name, spec, tmp, fps, out_dir)
+        return
     for _ in range(fps):
         frame(head + [("", 0.0, FG)], "loading engine", False)
     for st in stages[1:]:
@@ -383,6 +428,43 @@ def render(name, spec, out_dir=DOC):
     for _ in range(3 * fps):
         frame(compose(body), spec["status"], False)
 
+    _encode(name, spec, tmp, fps, out_dir)
+
+
+def _timed(spec, frame, compose, head, stages, full, tx, text_w, mid_px, fps):
+    """Real-time reveal: token k is on screen from the cumulative measured
+    time of tokens 0..k; loading and prefill hold for their measured times."""
+    for _ in range(max(1, round(spec["load_ms"] / 1000 * fps))):
+        frame(head + [("", 0.0, FG)], "loading engine: repack + upload + first forward", False)
+    n_pre = max(len(stages) - 1, 1)
+    per = max(1, round(spec["prefill_ms"] / 1000 * fps / n_pre))
+    for st in stages[1:]:
+        for _ in range(per):
+            frame(st + [("", 0.0, FG)], "prefill (24 prompt tokens)", False)
+    cum, acc = [], 0.0
+    for ms in spec["ms"]:
+        acc += ms
+        cum.append(acc)
+    n = len(cum)
+    f = 0
+    while True:
+        now = f * 1000.0 / fps
+        k = sum(1 for c in cum if c <= now)
+        part = "".join(spec["pieces"][:k])
+        blines = wrap(part, tx, text_w - mid_px, spec["wrap"])
+        body = [("model> " + blines[0], 0.0, FG)] + \
+               [(t, mid_px, FG) for t in blines[1:]]
+        frame(compose(body), f"{k}/{n} tokens \u00b7 " + spec["status"], f % 2 == 1)
+        if k == n:
+            break
+        f += 1
+    body = [("model> " + full[0], 0.0, FG)] + [(t, mid_px, FG)
+                                               for t in full[1:]]
+    for _ in range(3 * fps):
+        frame(compose(body), f"{n}/{n} tokens \u00b7 " + spec["status"], False)
+
+
+def _encode(name, spec, tmp, fps, out_dir):
     out = os.path.join(out_dir, spec["out"])
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
                     "-i", os.path.join(tmp, "f%04d.png"),
