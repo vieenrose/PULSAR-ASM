@@ -768,13 +768,59 @@ __global__ void pq1_tm_prep(const uint8_t* __restrict__ xq, uint32_t* __restrict
   au[g] = s;
 }
 
+/* Loop iter 6: the same transform with one warp per group (PQ1_TMPW=1,
+ * default; 0 is the A/B arm). Lane a holds activation byte a of each 32-byte
+ * word, plane word b = __ballot_sync(bit b): lane a's bit lands at bit a, as
+ * in the serial loop above. au is an integer sum, so the shuffle tree gives
+ * the identical value. 32..96 serial threads -> 32..96 warps. */
+__global__ __launch_bounds__(128) void pq1_tm_prep_w(const uint8_t* __restrict__ xq,
+                                                    uint32_t* __restrict__ pl,
+                                                    int* __restrict__ au, int ngroups) {
+  int g = blockIdx.x * 4 + (threadIdx.x >> 5);
+  int lane = threadIdx.x & 31;
+  if (g >= ngroups) return; /* warp-uniform */
+  int b = g >> 1, half = g & 1;
+  const uint8_t* src = xq + (size_t)b * 292 + 4 + half * 128;
+  uint32_t* dst = pl + (size_t)b * 73 + 1 + half * 32;
+  if (half == 0) {
+    if (lane == 0) pl[(size_t)b * 73] = *reinterpret_cast<const uint32_t*>(xq + (size_t)b * 292);
+  } else if (lane < 8) {
+    pl[(size_t)b * 73 + 65 + lane] = 0u;
+  }
+  int s = 0;
+#pragma unroll
+  for (int w = 0; w < 4; w++) {
+    unsigned v = (unsigned)src[w * 32 + lane] ^ 0x80u;
+    s += (int)v;
+    uint32_t pb[8];
+#pragma unroll
+    for (int q = 0; q < 8; q++) pb[q] = __ballot_sync(0xffffffffu, (v >> q) & 1u);
+    if (lane < 8) {
+      uint32_t o = pb[0];
+#pragma unroll
+      for (int q = 1; q < 8; q++) if (lane == q) o = pb[q];
+      dst[w * 8 + lane] = o;
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+  if (lane == 0) au[g] = s;
+}
+
 extern "C" int pq1_tm_prep_launch(const uint8_t* xq_d, uint32_t* pl_d, int* au_d,
                                   int K, void* stream) {
   if ((K & 255) != 0 || K <= 0 || K > PQ1_MAXK) return -2;
   int ng = K >> 7;
+  static int pw = -1;
+  if (pw < 0) { const char* e = getenv("PQ1_TMPW"); pw = e ? atoi(e) : 1; }
   dim3 block(128, 1, 1);
-  dim3 grid((ng + 127) / 128, 1, 1);
-  pq1_tm_prep<<<grid, block, 0, (cudaStream_t)stream>>>(xq_d, pl_d, au_d, ng);
+  if (pw) {
+    dim3 gridw((ng + 3) / 4, 1, 1);
+    pq1_tm_prep_w<<<gridw, block, 0, (cudaStream_t)stream>>>(xq_d, pl_d, au_d, ng);
+  } else {
+    dim3 grid((ng + 127) / 128, 1, 1);
+    pq1_tm_prep<<<grid, block, 0, (cudaStream_t)stream>>>(xq_d, pl_d, au_d, ng);
+  }
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
