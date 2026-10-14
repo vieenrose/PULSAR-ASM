@@ -380,3 +380,35 @@ Targets the ~63us D2H + ~28us H2D pageable latency x 188 calls/token.
 - NOTE the init-cost accounting pitfall: init is 1.74 s of a 34 s window = 5.1%, so a FULL
   elimination of init is worth +5%. Threading the repack (435 -> ~50 ms of CPU time) does
   not translate because the metric is dominated by 216 tokens x 155 ms of GPU-bound decode.
+
+## HARNESS DISASTER + RECOVERY (2026-10-14, run #69 attempt)
+- The Nano (picard-desktop) REBOOTED (uptime 3:26h, boot 2000-01-01 09:00 fake-clock). /tmp is tmpfs:
+  ALL of /tmp on the Nano was wiped — k2h_09_q4.blob, k2_base, k2_gexp, k2_exp.S.
+- LOCAL /tmp was ALSO wiped (local machine rebooted: /tmp is tmpfs, 31G tmpfs now ~empty):
+  /tmp/k2_cuda.c, /tmp/k2_cuda.S, /tmp/k2_cuda_v*.c ALL GONE. The /tmp-only files were:
+  k2_cuda.S (THE engine core asm — k2_core_a57.S + .globl line + 3 call-site swaps:
+  bl k2q4_gemv_range -> bl cuda_gemv at ~1608/1653/1691, + bl cuda_init at ~3148),
+  /tmp/k2_cuda.c (staged HEAD engine = gpu_v43 copy), and the v33-v48 working C files.
+- RECOVERED into .auto/rescue/ + git commit 8cab961: k2_cuda.S (md5 4f1eb84b, from
+  luigi@spark:~/k2/k2_cuda.S, Oct 12 22:05 — matches the deployed-md5 record), k2_core_a57.S
+  (identical to repo copy), k2_cuda.c (Phase-1 engine, reference only).
+- REBUILD RECIPE (memorize): engine C = pulsar_arm/k2horizon/gpu_vNN/k2_gexp_engine_vNN.c ->
+  /tmp/k2_cuda.c; asm = cp .auto/rescue/k2_cuda.S /tmp/k2_cuda.S (THE .S NEVER CHANGED after
+  Oct 12 22:05 — all v33..v48 iterations were C-side (q4_build/gemv host path); kernel changes
+  went through gen_vNN.py -> PTX string inside the C, so k2_cuda.S is stable).
+  k2_base = as -march=armv8-a k2_core_a57.S + gcc -static -nostartfiles (rebuilt OK on Nano).
+- Blob: md5 1b026978510f9111bb0a6a6607f3c50d, 748976168 B, source luigi@spark:~/k2/k2h_09_q4.blob
+  (spark is the durable store; Nano /tmp is volatile!). Restore: direct hop
+  `scp luigi@spark:~/k2/k2h_09_q4.blob picard@picard-desktop:/tmp/` (worked at 30+ MB/s).
+- RULE: keep durable copies of /tmp assets in the repo (.auto/rescue) and re-verify at loop start:
+  `ssh picard 'ls /tmp/k2h_09_q4.blob'` + md5 of /tmp/k2_cuda.S before any bench.
+- Run #69 (v48 pinned-staging init) pre-bench findings BEFORE the wipe: cuMemHostAlloc(467MB)
+  SUCCEEDS on the Nano (rc=0, ~450ms) and pin+pretouch+repack ran, but the process was OOM-KILLED
+  (dmesg: Out of memory: Kill process k2_gexp48, total-vm 9.5GB) DURING the 467MB H2D: on 4GB
+  Tegra the 467MB pinned staging + 467MB device alloc + 714MB blob mmap exceed RAM. The v48 design
+  MUST use the 32MB ring (mode 1), not the single 467MB pinned buffer (mode 2): Q4_RING=2 is DEAD
+  by design on this board; Q4_RING=1 is the viable config. Ring numbers before kill: dev-alloc
+  467MB ~288-826ms, pin 467MB ~441-1979ms (!), pretouch ~204-239ms.
+- v48 code survived? NO (was in /tmp only). Rebuild from gpu_v43 engine + re-add ring:
+  Q4_NSLOT=2 x Q4_SLOT=32MB pinned ring, cuMemcpyHtoDAsync(g_stream), pre-touch slots with
+  memset, free via cuMemHostAlloc'd pointer -> cuMemFreeHost ONLY (free() = SIGSEGV double-free).
