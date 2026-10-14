@@ -346,6 +346,42 @@ static void rope_yarn_apply(float *x, int heads, int pos) {
 static float X[HID], XN[HID], AO[HID], FO[HID];
 static float QF[32 * 128], KF[8 * 128], VF[8 * 128];
 static float ATTO[32 * 128], LG[INTER], LU[INTER];
+#ifdef PQ1_BUILD
+/* PQ1_FFN_CHECK=1: after every fused FFN graph, rerun the host-driven path
+ * (gemvP_multi, pq1_silu_mul, gemvP) and compare, bit for bit, the device's
+ * Q8_K down activation (d + qs of every block) and the FFN output. */
+static long FFNCHK_N = 0, FFNCHK_XQ = 0, FFNCHK_FO = 0;
+static void ffn_check_report(void) {
+    fprintf(stderr, "FFNCHK layers=%ld xq_blocks_bad=%ld fo_bad=%ld\n", FFNCHK_N, FFNCHK_XQ, FFNCHK_FO);
+}
+static int ffn_check_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("PQ1_FFN_CHECK") && atoi(getenv("PQ1_FFN_CHECK")) && pq1_ffn_dbg_xq;
+        if (on) atexit(ffn_check_report);
+    }
+    return on;
+}
+static void gemvP_multi(const uint8_t *const *W, const int *rows, int n, int K,
+                        const float *x, float *const *Y);
+static void gemvP(const uint8_t *W, int rows, int K, const float *x, float *y);
+static void ffn_check(const uint8_t *const *Wg, const uint8_t *Wd) {
+    static float FOF[HID];
+    static uint8_t XQF[(INTER / 256) * 292];
+    memcpy(FOF, FO, sizeof FOF);
+    pq1_ffn_dbg_xq(XQF, sizeof XQF);
+    const int Rg[2] = {INTER, INTER};
+    float *Yg[2] = {LG, LU};
+    gemvP_multi(Wg, Rg, 2, HID, XN, Yg);
+    pq1_silu_mul(LU, LG, INTER);
+    gemvP(Wd, HID, INTER, LU, FO);
+    for (int b = 0; b < INTER / 256; b++)
+        if (memcmp(XQF + (size_t)b * 292, XQ + (size_t)b * 292, 260)) FFNCHK_XQ++;
+    for (int i = 0; i < HID; i++)
+        if (memcmp(&FOF[i], &FO[i], 4)) FFNCHK_FO++;
+    FFNCHK_N++;
+}
+#endif
 static float HEAD[VOCAB];
 /* K cache TRANSPOSED (run #74): [layer][kv head][dim][position], so that the
  * q.k scores of 4/8/16 consecutive positions are one NEON fma chain per lane
@@ -574,23 +610,40 @@ int main(int argc, char **argv) {
             float *pnw = (float *)TW(il, "ffn_norm.weight");
             rms(X, pnw, HID, XN);
             ct_mark(CT_RMS);
-            { /* one launch for gate+up: same K=4096 activation (XN) */
+            {
                 const uint8_t *Wg[2] = {TW(il, "ffn_gate.weight"),
                                         TW(il, "ffn_up.weight")};
-                const int Rg[2] = {INTER, INTER};
-                float *Yg[2] = {LG, LU};
-                gemvP_multi(Wg, Rg, 2, HID, XN, Yg);
-            }
+                const uint8_t *Wd = TW(il, "ffn_down.weight");
+                int fused = 0;
 #ifdef PQ1_BUILD
-            /* silu(g)*u four lanes at a time (pq1_host.c, built with
-             * -ffp-contract=off): expf via the glibc-2.27-exact NEON port in
-             * pq1_expf_neon.h, then 1/(1+e), *g, *u in the reference order. */
-            pq1_silu_mul(LU, LG, INTER);
-#else
-            for (int i = 0; i < INTER; i++) LU[i] = silu(LG[i]) * LU[i];
+                /* loop iter 2: the whole tail (gate+up, silu*u, Q8_K of the
+                 * product, down) as one device graph when the glue has it;
+                 * declines on the first token (tensors not merged yet) and
+                 * under TRACE (LG/LU stay on the device). */
+                if (!TRACE && pq1_ffn_fused) {
+                    q8_K_quant(XN, XQ, HID);
+                    ct_mark(CT_QUANT);
+                    fused = pq1_ffn_fused(Wg[0], Wg[1], Wd, INTER, HID, XQ, FO) == 0;
+                    if (fused) { ct_mark(CT_GEMV); if (ffn_check_on()) ffn_check(Wg, Wd); }
+                }
 #endif
-            ct_mark(CT_SILU);
-            gemvP(TW(il, "ffn_down.weight"), HID, INTER, LU, FO);
+                if (!fused) {
+                    /* one launch for gate+up: same K=4096 activation (XN) */
+                    const int Rg[2] = {INTER, INTER};
+                    float *Yg[2] = {LG, LU};
+                    gemvP_multi(Wg, Rg, 2, HID, XN, Yg);
+#ifdef PQ1_BUILD
+                    /* silu(g)*u four lanes at a time (pq1_host.c, built with
+                     * -ffp-contract=off): expf via the glibc-2.27-exact NEON port in
+                     * pq1_expf_neon.h, then 1/(1+e), *g, *u in the reference order. */
+                    pq1_silu_mul(LU, LG, INTER);
+#else
+                    for (int i = 0; i < INTER; i++) LU[i] = silu(LG[i]) * LU[i];
+#endif
+                    ct_mark(CT_SILU);
+                    gemvP(Wd, HID, INTER, LU, FO);
+                }
+            }
             if (TRACE) { V8("ffnout", FO); V8R("gate", LG, 1000); V8R("up", LU, 1000); V8R("ffnout", FO, 1000); }
             for (int i = 0; i < HID; i++) X[i] += FO[i];
             ct_mark(CT_RESID);

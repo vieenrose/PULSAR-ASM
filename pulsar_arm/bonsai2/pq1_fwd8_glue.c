@@ -53,6 +53,7 @@ typedef struct {
 static int PQ1_GRAPH = -1;  /* run #57: CUDA graphs for the GEMV API sequence; -1 = auto (on), 0 = off (the A/B arm) */
 static long PQ1_GRAPH_OK = 0, PQ1_GRAPH_CALLS = 0; /* graphs instantiated / launched */
 static cudaStream_t PQ1_CS = NULL; /* capture stream, created on first use */
+static long PQ1_FFN_GRAPHS = 0, PQ1_FFN_CALLS = 0; /* loop iter 2: fused FFN graphs built / launched */
 static uint32_t *d_pl; static int *d_au; /* T-MAC device prep buffers (defined below) */
 
 #ifdef PQ1_USE_CUDA
@@ -423,11 +424,12 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
   }
   snprintf(buf, n,
            "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%s "
-           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld zc=%d zcfail=%d batch=%ld brows=%ld graphs=%ld/%ld hyb=%ld hrows=%ld gpu_ms=%.1f hwait_ms=%.1f",
+           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld zc=%d zcfail=%d batch=%ld brows=%ld graphs=%ld/%ld hyb=%ld hrows=%ld gpu_ms=%.1f hwait_ms=%.1f ffn=%ld/%ld",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
            fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_R128_CALLS, PQ1_R256_CALLS,
            PQ1_SWAR_CALLS, NZC, ZCFAIL, PQ1_BATCH_CALLS, PQ1_BATCH_ROWS,
-           PQ1_GRAPH_OK, PQ1_GRAPH_CALLS, PQ1_HYB_CALLS, PQ1_HYB_ROWS, PQ1_HYB_US * 1e-3, PQ1_HSYNC_US * 1e-3);
+           PQ1_GRAPH_OK, PQ1_GRAPH_CALLS, PQ1_HYB_CALLS, PQ1_HYB_ROWS, PQ1_HYB_US * 1e-3, PQ1_HSYNC_US * 1e-3,
+           PQ1_FFN_GRAPHS, PQ1_FFN_CALLS);
   return buf;
 }
 #endif
@@ -1084,5 +1086,98 @@ pq1_merged_scatter:
 #else
   (void)w; (void)rows; (void)n; (void)cols; (void)ys; (void)xq;
   return -1;
+#endif
+}
+
+/* ---- loop iter 2: the whole FFN tail of a layer as ONE captured graph ------
+ * {H2D Q8_K(ffn_norm(x)), prep, T-MAC gate+up -> MDY, silu(g)*u + Q8_K quant on
+ * the device -> d_xq, prep, T-MAC down -> MDY+512KB, D2H -> fo}. Replaces, per
+ * layer: the gate+up D2H + sync, the CPU silu (7.4 ms/tok), the CPU quant of the
+ * down activation, the down H2D + sync. Values: the same two T-MAC launches the
+ * merged and scalar paths run, and pq1_silu_q8k is bit-exact with fwd8's
+ * pq1_silu_mul + q8_K_quant (see the kernel). It reuses the merged gate+up and
+ * the scalar down tensors already in the arena, so it allocates nothing: it
+ * declines (-1, caller runs the old path) until both exist, and whenever the
+ * T-MAC/graph/hybrid configuration is not the default. PQ1_FFN=0 is the A/B arm. */
+#ifdef PQ1_USE_CUDA
+typedef struct { const void *wd, *xq; float *fo; int ok; cudaGraphExec_t ex; } pq1_ffng;
+static pq1_ffng PQ1F[PQ1_MERGED_MAX];
+static int PQ1_FFN = -1;
+#endif
+int pq1_ffn_fused(const unsigned char *wg, const unsigned char *wu, const unsigned char *wd,
+                  int inter, int hid, const unsigned char *xq, float *fo) {
+#ifdef PQ1_USE_CUDA
+  if (PQ1_FFN < 0) { const char *e = getenv("PQ1_FFN"); PQ1_FFN = e ? atoi(e) : 1; }
+  if (!PQ1_FFN) return -1;
+  if (PQ1_GRAPH < 0) pq1_graph_init();
+  if (PQ1_GRAPH == 0 || PQ1_TM != 1) return -1;
+  if ((hid & 255) || (inter & 255) || hid <= 0 || inter <= 0) return -1;
+  int mi = -1, ci = -1;
+  for (int i = 0; i < PQ1NM; i++)
+    if (PQ1M[i].n == 2 && PQ1M[i].cols == hid && PQ1M[i].w[0] == wg && PQ1M[i].w[1] == wu &&
+        PQ1M[i].rows[0] == inter && PQ1M[i].rows[1] == inter) { mi = i; break; }
+  for (int i = 0; i < PQ1N; i++)
+    if (PQ1C[i].w == wd && PQ1C[i].rows == hid && PQ1C[i].cols == inter) { ci = i; break; }
+  if (mi < 0 || ci < 0) return -1;
+  if (PQ1M[mi].hrows || PQ1C[ci].hrows || !PQ1M[mi].d_codes || !PQ1C[ci].d_codes) return -1;
+  const size_t xqb1 = (size_t)(hid / 256) * 292, xqb2 = (size_t)(inter / 256) * 292;
+  const size_t half = PQ1_GRAPH_YB / 2;
+  if (!d_xq || !MDY || xqb2 > P2XQMAX || xqb1 > P2XQMAX || (size_t)inter * 8 > half ||
+      (size_t)hid * 4 > half || !pq1_tm_bufs(inter, xqb2, 0, 1) || !pq1_tm_bufs(hid, xqb1, 0, 1))
+    return -1;
+  pq1_ffng *F = &PQ1F[mi];
+  if (F->ok && (F->wd != wd || F->xq != xq || F->fo != fo)) { cudaGraphExecDestroy(F->ex); F->ok = 0; }
+  if (!F->ok) {
+    if (!PQ1_CS && cudaStreamCreateWithFlags(&PQ1_CS, cudaStreamNonBlocking) != cudaSuccess) {
+      cudaGetLastError();
+      return -1;
+    }
+    float *gu = (float *)MDY, *yd = (float *)(MDY + half);
+    cudaGraph_t g = NULL;
+    int rc = -1;
+    if (cudaStreamBeginCapture(PQ1_CS, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+      cudaGetLastError();
+      return -1;
+    }
+    if (cudaMemcpyAsync(d_xq, xq, xqb1, cudaMemcpyHostToDevice, PQ1_CS) == cudaSuccess &&
+        pq1_tm_prep_launch(d_xq, d_pl, d_au, hid, PQ1_CS) == 0 &&
+        pq1_gemv_tm_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, gu, hid, 2 * inter,
+                           PQ1_CS) == 0 &&
+        pq1_silu_q8k_launch(gu, inter, d_xq, NULL, PQ1_CS) == 0 &&
+        pq1_tm_prep_launch(d_xq, d_pl, d_au, inter, PQ1_CS) == 0 &&
+        pq1_gemv_tm_launch(PQ1C[ci].d_codes, PQ1C[ci].d_scales, d_pl, d_au, yd, inter, hid,
+                           PQ1_CS) == 0 &&
+        cudaMemcpyAsync(fo, yd, (size_t)hid * 4, cudaMemcpyDeviceToHost, PQ1_CS) == cudaSuccess)
+      rc = 0;
+    if (cudaStreamEndCapture(PQ1_CS, &g) != cudaSuccess) { rc = -1; g = NULL; }
+    if (rc == 0 && g && cudaGraphInstantiate(&F->ex, g, NULL, NULL, 0) == cudaSuccess && F->ex) {
+      F->ok = 1; F->wd = wd; F->xq = xq; F->fo = fo;
+      PQ1_FFN_GRAPHS++;
+    }
+    if (g) cudaGraphDestroy(g);
+    cudaGetLastError();
+    if (!F->ok) { PQ1_FFN = 0; return -1; }   /* never retry a failing capture */
+  }
+  double kt0 = KTON > 0 ? pq1_now() : 0.0;
+  if (cudaGraphLaunch(F->ex, 0) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+    cudaGetLastError();
+    F->ok = 0;
+    return -1;
+  }
+  if (KTON > 0) pq1_kt_add(-1, inter, pq1_now() - kt0);   /* rows -1: the fused FFN tail */
+  PQ1_FFN_CALLS++;
+  return 0;
+#else
+  (void)wg; (void)wu; (void)wd; (void)inter; (void)hid; (void)xq; (void)fo;
+  return -1;
+#endif
+}
+
+/* PQ1_FFN_CHECK support: the device copy of the last down-projection activation */
+void pq1_ffn_dbg_xq(unsigned char *dst, unsigned long n) {
+#ifdef PQ1_USE_CUDA
+  if (d_xq && n <= P2XQMAX) cudaMemcpy(dst, d_xq, n, cudaMemcpyDeviceToHost);
+#else
+  (void)dst; (void)n;
 #endif
 }

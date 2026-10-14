@@ -966,3 +966,103 @@ extern "C" int pq1_gemv_batch_launch(int use256, const uint8_t* const* codes,
   }
   return rc;
 }
+
+/* ---- loop iter 2: fused FFN tail, silu(g)*u + Q8_K quant on the device ----
+ * One block per 256-activation Q8_K block, one thread per element. The value
+ * is fwd8's CPU chain bit for bit: e = glibc-2.27 expf(-g) (the table+poly
+ * algorithm of pq1_expf_neon.h in double, plus glibc's |x|>=88 special cases
+ * that the NEON port hands to libm), sg = 1/(1+e), v = (g*sg)*u; then
+ * q8_K_quant: amax = max|v|, max = v at the FIRST index reaching it,
+ * iscale = -127/max, q = MIN(127, mantissa(fma(v, iscale, 1.5*2^23)) - 2^22)
+ * (gcc contracts fwd8.c's vmulq+vaddq to fmla), d = 1/iscale.
+ * Every f32 op is inline PTX WITHOUT .ftz: this file is built --use_fast_math
+ * (ftz=true), the A57 keeps denormals, and the _rn intrinsics would inherit
+ * the flush. Double ops are never flushed or contracted as __d*_rn. */
+__constant__ unsigned long long PQ1_EXP2F_TAB_D[32] = {
+    0x3ff0000000000000ULL, 0x3fefd9b0d3158574ULL, 0x3fefb5586cf9890fULL, 0x3fef9301d0125b51ULL,
+    0x3fef72b83c7d517bULL, 0x3fef54873168b9aaULL, 0x3fef387a6e756238ULL, 0x3fef1e9df51fdee1ULL,
+    0x3fef06fe0a31b715ULL, 0x3feef1a7373aa9cbULL, 0x3feedea64c123422ULL, 0x3feece086061892dULL,
+    0x3feebfdad5362a27ULL, 0x3feeb42b569d4f82ULL, 0x3feeab07dd485429ULL, 0x3feea47eb03a5585ULL,
+    0x3feea09e667f3bcdULL, 0x3fee9f75e8ec5f74ULL, 0x3feea11473eb0187ULL, 0x3feea589994cce13ULL,
+    0x3feeace5422aa0dbULL, 0x3feeb737b0cdc5e5ULL, 0x3feec49182a3f090ULL, 0x3feed503b23e255dULL,
+    0x3feee89f995ad3adULL, 0x3feeff76f2fb5e47ULL, 0x3fef199bdd85529cULL, 0x3fef3720dcef9069ULL,
+    0x3fef5818dcfba487ULL, 0x3fef7c97337b9b5fULL, 0x3fefa4afa2a490daULL, 0x3fefd0765b6e4540ULL,
+};
+__device__ __forceinline__ float pq1_fadd(float a, float b) { float r; asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float pq1_fmul(float a, float b) { float r; asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float pq1_fdiv(float a, float b) { float r; asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float pq1_ffma(float a, float b, float c) { float r; asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c)); return r; }
+__device__ __forceinline__ double pq1_f2d(float a) { double r; asm("cvt.f64.f32 %0, %1;" : "=d"(r) : "f"(a)); return r; }
+__device__ __forceinline__ float pq1_d2f(double a) { float r; asm("cvt.rn.f32.f64 %0, %1;" : "=f"(r) : "d"(a)); return r; }
+
+__device__ __forceinline__ float pq1_expf_dev(float x) {
+  const uint32_t ux = __float_as_uint(x), abstop = (ux >> 20) & 0x7ffu;
+  if (abstop >= 0x42bu) {                          /* |x| >= 88 or NaN: glibc's branches */
+    if (ux == 0xff800000u) return 0.0f;            /* -inf */
+    if (abstop >= 0x7f8u) return pq1_fadd(x, x);   /* +inf, NaN */
+    if ((int32_t)ux > 0 && ux > 0x42b17217u) return __uint_as_float(0x7f800000u); /* oflow */
+    if ((int32_t)ux < 0 && ux > 0xc2cff1b4u) return 0.0f;                         /* uflow */
+  }
+  const double z = __dmul_rn(__longlong_as_double(0x40471547652b82feLL), pq1_f2d(x));
+  const double SH = __longlong_as_double(0x4338000000000000LL);
+  double kd = __dadd_rn(z, SH);
+  const unsigned long long ki = (unsigned long long)__double_as_longlong(kd);
+  kd = __dsub_rn(kd, SH);
+  const double r = __dsub_rn(z, kd);
+  const double s = __longlong_as_double((long long)(PQ1_EXP2F_TAB_D[ki & 31] + (ki << 47)));
+  const double zz = __fma_rn(__longlong_as_double(0x3ebc6af84b912394LL), r,
+                             __longlong_as_double(0x3f2ebfce50fac4f3LL));
+  const double r2 = __dmul_rn(r, r);
+  double y = __fma_rn(__longlong_as_double(0x3f962e42ff0c52d6LL), r, 1.0);
+  y = __fma_rn(zz, r2, y);
+  return pq1_d2f(__dmul_rn(y, s));
+}
+
+__global__ __launch_bounds__(256) void pq1_silu_q8k(const float* __restrict__ gu, int n,
+                                                    uint8_t* __restrict__ xq,
+                                                    float* __restrict__ vout) {
+  __shared__ float sv[256];
+  __shared__ unsigned sm[8];
+  __shared__ int si[8];
+  const int t = threadIdx.x, i = blockIdx.x * 256 + t;
+  const float g = gu[i], u = gu[n + i];
+  const float e = pq1_expf_dev(__uint_as_float(__float_as_uint(g) ^ 0x80000000u));
+  const float sg = pq1_fdiv(1.0f, pq1_fadd(1.0f, e));
+  const float v = pq1_fmul(pq1_fmul(g, sg), u);
+  if (vout) vout[i] = v;
+  sv[t] = v;
+  const unsigned a = __float_as_uint(v) & 0x7fffffffu;   /* |v| bits: integer order == float order */
+  unsigned m = a;
+#pragma unroll
+  for (int o = 16; o; o >>= 1) m = max(m, __shfl_xor_sync(0xffffffffu, m, o));
+  if ((t & 31) == 0) sm[t >> 5] = m;
+  __syncthreads();
+  unsigned am = sm[0];
+#pragma unroll
+  for (int k = 1; k < 8; k++) am = max(am, sm[k]);
+  uint8_t* yb = xq + (size_t)blockIdx.x * 292;
+  if (am == 0u) {                                   /* fork: d = 0, qs = 0 */
+    if (t == 0) *reinterpret_cast<uint32_t*>(yb) = 0u;
+    yb[4 + t] = 0;
+    return;
+  }
+  int idx = (a == am) ? t : 256;
+#pragma unroll
+  for (int o = 16; o; o >>= 1) idx = min(idx, __shfl_xor_sync(0xffffffffu, idx, o));
+  if ((t & 31) == 0) si[t >> 5] = idx;
+  __syncthreads();
+  int first = si[0];
+#pragma unroll
+  for (int k = 1; k < 8; k++) first = min(first, si[k]);
+  const float iscale = pq1_fdiv(-127.0f, sv[first]);
+  int q = (int)(__float_as_uint(pq1_ffma(v, iscale, 12582912.0f)) & 0x007fffffu) - 0x00400000;
+  yb[4 + t] = (uint8_t)(int8_t)min(q, 127);
+  if (t == 0) *reinterpret_cast<float*>(yb) = pq1_fdiv(1.0f, iscale);
+}
+
+extern "C" int pq1_silu_q8k_launch(const float* gu_d, int n, uint8_t* xq_d, float* vout_d,
+                                   void* stream) {
+  if (n <= 0 || (n & 255) != 0) return -2;
+  pq1_silu_q8k<<<n / 256, 256, 0, (cudaStream_t)stream>>>(gu_d, n, xq_d, vout_d);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}

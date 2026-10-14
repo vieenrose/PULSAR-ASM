@@ -950,3 +950,20 @@ ab_pair "PQ1_HYB=8 PQ1_HYB_THREADS=2" 3 reps: 6.7089/6.7942 (+1.27%), 6.8223/6.7
 cores burned. Not worth a default. If revisited: the CPU share only pays if its DRAM
 traffic stops stalling the GPU (e.g. prefetch the tail rows into L2 between tokens, or a
 bit-transposed code layout so the CPU kernel is compute-light and issues fewer requests).
+
+## #76 fused FFN tail: one CUDA graph per layer, silu*u + Q8_K quant on the device (KEPT, +10.4%)
+Per layer {H2D Q8_K(ffn_norm x), prep, T-MAC gate+up -> MDY, `pq1_silu_q8k` -> d_xq, prep,
+T-MAC down -> MDY+512KB, D2H -> FO} is one graph (`pq1_ffn_fused`, glue). Removes per token:
+CPU silu (7.4 ms), the CPU quant of the down activation, 36 D2H of 98 KB, 36 H2D, 36 syncs.
+No new allocation: reuses the merged gate+up and scalar down tensors, d_xq/MDY/d_pl/d_au.
+Exactness: `pq1_silu_q8k` replays glibc-2.27 expf in double (+ glibc's |x|>=88 branches
+the NEON port hands to libm), 1/(1+e), (g*sg)*u, then q8_K_quant with the fmla that gcc
+emits in fwd8.c (`fmla` seen in the fwd8_q1.o disassembly) -> fma.rn.f32. Every f32 op is
+inline PTX without .ftz (the .cu is --use_fast_math = ftz; the A57 keeps denormals).
+- `pq1_ffn_test`: device v vs host pq1_silu_mul over ALL 2^32 g (u=1) + 2^26 random (g,u)
+  incl. denormal u: 0 mismatches (NaN pairs only where both NaN).
+- `PQ1_FFN_CHECK=1` in the engine: 1548 fused layers vs the host path, xq_blocks_bad=0,
+  fo_bad=0. Logits of prompt A identical (diff 0). Gates 3/3 green on a fresh build.
+- cold: decode 7.3212 tps (136.59 ms/tok), prefill 7.5251, peak RSS 345 MB (baseline 6.7582
+  / 344). ab_pair "PQ1_FFN=0" 1 pair: 7.3164/6.4948 base-first, 6.7476/7.3039 new-first ->
+  off/on = 0.9056 (-9.44%), i.e. fused +10.4%. PQ1GPU ffn=36/1548 proves the path ran.

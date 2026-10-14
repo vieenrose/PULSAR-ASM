@@ -21,6 +21,12 @@ __attribute__((weak)) int pq1_pq1_compat_gemv_batch(const unsigned char *const *
 /* silu(g)*u, NEON, bit-exact with glibc 2.27 expf (pq1_host.c) */
 void pq1_silu_mul(float *lu, const float *lg, int n);
 #define pq2_gemv_batch pq1_pq1_compat_gemv_batch
+/* loop iter 2: the FFN tail of one layer as one device graph (glue); 0 = ran,
+ * FO written. Non-zero = caller runs the host-driven path. */
+__attribute__((weak)) int pq1_ffn_fused(const unsigned char *wg, const unsigned char *wu,
+                                        const unsigned char *wd, int inter, int hid,
+                                        const unsigned char *xq, float *fo);
+__attribute__((weak)) void pq1_ffn_dbg_xq(unsigned char *dst, unsigned long n);
 
 #ifdef PQ1_USE_CUDA
 /* GPU-RAM report printed once at process exit (PQ1_STATS=1). Declared here

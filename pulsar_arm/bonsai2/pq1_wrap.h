@@ -39,6 +39,11 @@ int pq1_gemv_tm_launch(const unsigned char *w_bits,
  * (same byte size as xq) and the K/128 group sums. Graph-capturable. */
 int pq1_tm_prep_launch(const unsigned char *xq_d, unsigned int *pl_d, int *au_d,
                        int K, void *stream);
+/* Loop iter 2: v = silu(g)*u (gu_d = [g | u], n each) quantized to Q8_K in
+ * xq_d, bit-exact with fwd8's pq1_silu_mul + q8_K_quant (bsums left
+ * untouched: the T-MAC prep never reads them). vout_d may be NULL. */
+int pq1_silu_q8k_launch(const float *gu_d, int n, unsigned char *xq_d, float *vout_d,
+                        void *stream);
 
 /* 128-rows-per-block variant (run #45): same math, 2 lanes/row. */
 int pq1_gemv_r128_launch(const unsigned char *w_bits,
