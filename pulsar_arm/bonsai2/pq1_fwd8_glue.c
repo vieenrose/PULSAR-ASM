@@ -729,7 +729,16 @@ typedef struct {
   pq1_graph g;
 #endif
 } pq1_merged;
-#define PQ1_MERGED_MAX 64
+/* Capacity of the merged-tensor cache. The engine needs 72 entries (36 layers x
+ * 2 groups: q/k/v and gate/up), but the default has been 64, so the last 4
+ * layers silently never take the merged path - they run as separate scalar
+ * launches (visible in the counters: 64 merged calls per step, not 72). Each
+ * merged entry is a second copy of that group's weights in the arena, so a
+ * larger cache trades GPU RAM for fewer launches; PQ1_MERGED_CAP makes the size
+ * runtime-tunable so the trade can be A/B'd. Default = 64 (the historical
+ * behaviour); unset means 64. */
+#define PQ1_MERGED_MAX 256
+static int PQ1_MERGED_CAP = 0;
 static pq1_merged PQ1M[PQ1_MERGED_MAX];
 static int PQ1NM = 0;
 
@@ -797,7 +806,16 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
   size_t ncb = (size_t)total * rowcb, nsb = (size_t)total * rowsc;
   size_t a = (ncb + 63) / 64 * 64, b = (nsb + 63) / 64 * 64;
   if (mi < 0) {
-    if (PQ1NM >= PQ1_MERGED_MAX) return -1;
+    if (!PQ1_MERGED_CAP) {
+      const char *e = getenv("PQ1_MERGED_CAP");
+      /* Default 128: the engine needs 72 entries, so 64 silently left the last
+       * 4 layers unmerged (see the header comment above). Measured +0.82%
+       * decode (order-balanced A/B, pairs +0.87%/+0.78%). */
+      PQ1_MERGED_CAP = e ? atoi(e) : 128;
+      if (PQ1_MERGED_CAP < 1) PQ1_MERGED_CAP = 1;
+      if (PQ1_MERGED_CAP > PQ1_MERGED_MAX) PQ1_MERGED_CAP = PQ1_MERGED_MAX;
+    }
+    if (PQ1NM >= PQ1_MERGED_CAP) return -1;
     if (pq1_arena_init(a + b) != 0) return -1;
     uint8_t *pb = PQ1ARENA + PQ1ACUR;
     uint8_t *ps = pb + a;
