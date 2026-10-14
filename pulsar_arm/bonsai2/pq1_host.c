@@ -52,11 +52,69 @@ void pq1_gemv_cpu(int rows, int K, const uint32_t *w_bits,
   }
 }
 
+/* T-MAC bit-plane repack of the Q8_K activations (run #41 experiment).
+ *
+ * For every 32 activations (one 32-bit code word = 32 weights) build the 8
+ * bit-plane words: plane word p has bit a = bit p of the unsigned biased byte
+ * x' = (uint8)(x + 128) of activation (32c + a). Then for a code word W
+ *   Pu = sum_p 2^p * popc(plane[c][p] & W)
+ * is EXACTLY the sum of x' over the selected weights: each activation
+ * contributes its own byte value once (bit a of plane p carries bit p of that
+ * byte, weighted by 2^p). Integer, so order-independent and bit-exact.
+ *
+ * Size: 8 words per 32 activations = 1 byte per activation - byte-identical
+ * traffic to the int8 array it replaces, and the block stride (73 words =
+ * 292B) mirrors Q8_K so the kernel's staging code and addresses are unchanged
+ * (word 0 = the fp32 scale d, words 1..64 = 64 plane words). */
+void pq1_build_planes(const uint8_t *xq, int K, uint32_t *planes) {
+  int nb = K >> 8;
+  for (int b = 0; b < nb; b++) {
+    const uint8_t *src = xq + (size_t)b * 292;
+    uint32_t *dst = planes + (size_t)b * 73;
+    memcpy(dst, src, 4);            /* fp32 scale d, verbatim (word 0) */
+    memset(dst + 1, 0, 64 * 4);
+    const uint8_t *act = src + 4;   /* 256 int8 activations */
+    for (int i = 0; i < 256; i++) {
+      unsigned v = (unsigned)act[i] ^ 0x80u;   /* x' = x + 128, unsigned */
+      uint32_t *pw = dst + 1 + (i >> 5) * 8;
+      uint32_t m = 1u << (i & 31);
+      if (v & 1u) pw[0] |= m;
+      if (v & 2u) pw[1] |= m;
+      if (v & 4u) pw[2] |= m;
+      if (v & 8u) pw[3] |= m;
+      if (v & 16u) pw[4] |= m;
+      if (v & 32u) pw[5] |= m;
+      if (v & 64u) pw[6] |= m;
+      if (v & 128u) pw[7] |= m;
+    }
+  }
+}
+
+/* Au[g] = sum of the unsigned biased bytes x' over the group's 128 activations
+ * (= sum(int8) + 16384). Row-independent, so the host computes it once per
+ * token; the kernel's isum = 2*Pu - Au + 16384 - 256*pc is unchanged. */
+void pq1_build_au(const uint8_t *xq, int K, int *au) {
+  int nb = K >> 7;
+  for (int b = 0; b < nb; b++) {
+    const int8_t *qs = (const int8_t *)(xq + (size_t)(b >> 1) * 292 + 4 +
+                                         (b & 1) * 128);
+    int s = 0;
+    for (int i = 0; i < 128; i++) s += (int)qs[i] + 128;
+    au[b] = s;
+  }
+}
+
 #ifndef PQ1_REAL_CUDA
 int pq1_gemv_sm53_launch(const unsigned char *a, const unsigned short *b,
                          const unsigned char *c, float *d, int e, int f,
                          void *g) {
   (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g;
+  return -99;
+}
+int pq1_gemv_tm_launch(const unsigned char *a, const unsigned short *b,
+                       const unsigned int *c, const int *d, float *e, int f,
+                       int g, void *h) {
+  (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
   return -99;
 }
 #endif
