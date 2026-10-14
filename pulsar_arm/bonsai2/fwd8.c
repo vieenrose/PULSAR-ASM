@@ -480,6 +480,145 @@ static int sample_topkpp(const float *lg, int n, float temp, float topp, int top
 static float STEMP = 0, STOPP = 1, SMINP = 0;
 static int STopK = 0;
 
+/* The attention block of layer il on the host: q/k/v GEMV, head norms, rope,
+ * K/V cache store, attention, attn_output GEMV -> AO. put = also mirror the new
+ * K/V rows into the device cache (loop iter 4; 0 under PQ1_ATT_CHECK, where the
+ * device path has already written them). */
+static void attn_cpu(int il, int put) {
+    /* attention */
+    { /* one launch for q+k+v: same K=4096 activation (XN) */
+        const uint8_t *Wq[3] = {TW(il, "attn_q.weight"),
+                                TW(il, "attn_k.weight"),
+                                TW(il, "attn_v.weight")};
+        const int Rq[3] = {NHEAD * HDIM, NKV * HDIM, NKV * HDIM};
+        float *Yq[3] = {QF, KF, VF};
+        gemvP_multi(Wq, Rq, 3, HID, XN, Yq);
+    }
+    float *qnw = (float *)TW(il, "attn_q_norm.weight");
+    float *knw = (float *)TW(il, "attn_k_norm.weight");
+    for (int h = 0; h < NHEAD; h++) rms(QF + h * 128, qnw, 128, QF + h * 128);
+    for (int h = 0; h < NKV; h++) rms(KF + h * 128, knw, 128, KF + h * 128);
+    ct_mark(CT_HNORM);
+    if (TRACE) { V8("qnorm", QF); V8("knorm", KF); V8("vcur", VF); }
+    rope_yarn_apply(QF, NHEAD, NPOS);
+    rope_yarn_apply(KF, NKV, NPOS);
+    ct_mark(CT_ROPE);
+    for (int kh = 0; kh < NKV; kh++)
+        for (int i = 0; i < HDIM; i++) KTC[il][kh][NPOS / KTB][i][NPOS % KTB] = KF[kh * 128 + i];
+    for (int kh = 0; kh < NKV; kh++) memcpy(VCA[il][kh][NPOS], VF + kh * HDIM, HDIM * 4);
+#ifdef PQ1_BUILD
+    /* loop iter 4: keep the device K/V cache complete for the fused path */
+    if (put && pq1_attn_kv_put) pq1_attn_kv_put(il, NLAYER, NKV, CTX, NPOS, KF, VF);
+#else
+    (void)put;
+#endif
+    ct_mark(CT_KVCPY);
+    /* Same arithmetic as the serial reference (kept in
+     * fwd8_cpu_parity.c), reorganised for the A57:
+     *  - q.k: gcc fuses the reference's `s += q*k` into fmadd, so each
+     *    score is one fused chain over i; eight positions' chains are
+     *    interleaved (independent accumulators) to hide the 4-cycle
+     *    fmadd latency. Per-chain order is unchanged.
+     *  - softmax: expf(sc-mx) once per score, reused in the sum.
+     *  - p.v: lane i accumulates o[i] = fma(p, v[i], o[i]) over t in
+     *    the reference order; four lanes per NEON fma. */
+    /* Serial on purpose: an OpenMP parallel-for over the 32 heads read
+     * 11.6 ms/tok (passive) / 9.7 (active) vs 8.7 serial, and the active
+     * spin cost the GPU side 5% on top (#74). */
+    for (int h = 0; h < NHEAD; h++) {
+        const int kh = h / 4;
+        const float *q = QF + h * 128;
+        float mx = -1e30f, sc[CTX], pr[CTX];
+        const float32x4_t scl = vdupq_n_f32(0.0883883476f);
+        int t;
+        /* q.k over 16-position tiles (8 KB contiguous each): lane =
+         * position, fma chain over i in the reference order (#74).
+         * The last tile is computed in full; lanes past NPOS are
+         * never read (static storage, always finite). */
+        for (t = 0; t <= NPOS; t += KTB) {
+            float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
+            float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+            const float *kp = &KTC[il][kh][t / KTB][0][0];
+            for (int i = 0; i < 128; i++, kp += KTB) {
+                const float32x4_t qi = vdupq_n_f32(q[i]);
+                a0 = vfmaq_f32(a0, qi, vld1q_f32(kp));
+                a1 = vfmaq_f32(a1, qi, vld1q_f32(kp + 4));
+                a2 = vfmaq_f32(a2, qi, vld1q_f32(kp + 8));
+                a3 = vfmaq_f32(a3, qi, vld1q_f32(kp + 12));
+            }
+            vst1q_f32(sc + t, vmulq_f32(a0, scl));
+            vst1q_f32(sc + t + 4, vmulq_f32(a1, scl));
+            vst1q_f32(sc + t + 8, vmulq_f32(a2, scl));
+            vst1q_f32(sc + t + 12, vmulq_f32(a3, scl));
+        }
+        for (t = 0; t <= NPOS; t++) if (sc[t] > mx) mx = sc[t];
+        double es = 0;
+        for (t = 0; t <= NPOS; t++) { sc[t] = expf(sc[t] - mx); es += sc[t]; }
+        for (t = 0; t <= NPOS; t++) pr[t] = sc[t] / (float)es;
+        /* p.v: o[i] = fma(p_t, v_t[i], o[i]) over t in order; 16 lane
+         * groups kept in registers per pass, two passes over i (#74) */
+        float *o = ATTO + h * 128;
+        for (int ib = 0; ib < 128; ib += 32) {
+            /* 8 named accumulators: gcc 7 -O2 keeps a float32x4_t[]
+             * in memory (no unroll), which cost 8.8 ms/tok (#74) */
+            float32x4_t c0 = vdupq_n_f32(0), c1 = c0, c2 = c0, c3 = c0;
+            float32x4_t c4 = c0, c5 = c0, c6 = c0, c7 = c0;
+            const float *Vt = &VCA[il][kh][0][ib];
+            for (t = 0; t <= NPOS; t++, Vt += HDIM) {
+                const float32x4_t p4 = vdupq_n_f32(pr[t]);
+                c0 = vfmaq_f32(c0, vld1q_f32(Vt), p4);
+                c1 = vfmaq_f32(c1, vld1q_f32(Vt + 4), p4);
+                c2 = vfmaq_f32(c2, vld1q_f32(Vt + 8), p4);
+                c3 = vfmaq_f32(c3, vld1q_f32(Vt + 12), p4);
+                c4 = vfmaq_f32(c4, vld1q_f32(Vt + 16), p4);
+                c5 = vfmaq_f32(c5, vld1q_f32(Vt + 20), p4);
+                c6 = vfmaq_f32(c6, vld1q_f32(Vt + 24), p4);
+                c7 = vfmaq_f32(c7, vld1q_f32(Vt + 28), p4);
+            }
+            vst1q_f32(o + ib, c0);      vst1q_f32(o + ib + 4, c1);
+            vst1q_f32(o + ib + 8, c2);  vst1q_f32(o + ib + 12, c3);
+            vst1q_f32(o + ib + 16, c4); vst1q_f32(o + ib + 20, c5);
+            vst1q_f32(o + ib + 24, c6); vst1q_f32(o + ib + 28, c7);
+        }
+    }
+    ct_mark(CT_ATTN);
+    gemvP(TW(il, "attn_output.weight"), HID, HID, ATTO, AO);
+    if (TRACE) { V8("attnout", AO); V8R("attnout", AO, 1000); }
+}
+
+#ifdef PQ1_BUILD
+/* PQ1_ATT_CHECK=1: after every fused attention graph, rerun the host path and
+ * compare, bit for bit, the device's K and V rows, attention output and AO. */
+static long ATTCHK_N = 0, ATTCHK_K = 0, ATTCHK_V = 0, ATTCHK_O = 0, ATTCHK_AO = 0;
+static void att_check_report(void) {
+    fprintf(stderr, "ATTCHK layers=%ld k_bad=%ld v_bad=%ld atto_bad=%ld ao_bad=%ld\n",
+            ATTCHK_N, ATTCHK_K, ATTCHK_V, ATTCHK_O, ATTCHK_AO);
+}
+static int att_check_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("PQ1_ATT_CHECK") && atoi(getenv("PQ1_ATT_CHECK")) && pq1_attn_dbg;
+        if (on) atexit(att_check_report);
+    }
+    return on;
+}
+static void att_check(int il) {
+    static float AOF[HID], KD[NKV * HDIM], VD[NKV * HDIM], OD[NHEAD * HDIM];
+    memcpy(AOF, AO, sizeof AOF);
+    pq1_attn_dbg(il, NPOS, KD, VD, OD, NHEAD);
+    attn_cpu(il, 0);
+    for (int i = 0; i < NKV * HDIM; i++) {
+        if (memcmp(&KD[i], &KF[i], 4)) ATTCHK_K++;
+        if (memcmp(&VD[i], &VF[i], 4)) ATTCHK_V++;
+    }
+    for (int i = 0; i < NHEAD * HDIM; i++)
+        if (memcmp(&OD[i], &ATTO[i], 4)) ATTCHK_O++;
+    for (int i = 0; i < HID; i++)
+        if (memcmp(&AOF[i], &AO[i], 4)) ATTCHK_AO++;
+    ATTCHK_N++;
+}
+#endif
+
 int main(int argc, char **argv) {
     gguf_table(argv[1]);
     XQ = malloc(((size_t)INTER / 256) * 292);
@@ -511,99 +650,24 @@ int main(int argc, char **argv) {
             float *anw = (float *)TW(il, "attn_norm.weight");
             rms(X, anw, HID, XN);
             ct_mark(CT_RMS);
-            /* attention */
-            { /* one launch for q+k+v: same K=4096 activation (XN) */
-                const uint8_t *Wq[3] = {TW(il, "attn_q.weight"),
-                                        TW(il, "attn_k.weight"),
-                                        TW(il, "attn_v.weight")};
-                const int Rq[3] = {NHEAD * HDIM, NKV * HDIM, NKV * HDIM};
-                float *Yq[3] = {QF, KF, VF};
-                gemvP_multi(Wq, Rq, 3, HID, XN, Yq);
+            int afused = 0;
+#ifdef PQ1_BUILD
+            /* loop iter 4: q+k+v, head norms, rope, K/V store, attention, Q8_K
+             * and attn_output as one device graph; declines on the first token
+             * (merged q+k+v not built yet) and under TRACE */
+            if (!TRACE && pq1_attn_fused) {
+                if (RC_POS != NPOS) rope_table(NPOS);
+                q8_K_quant(XN, XQ, HID);
+                ct_mark(CT_QUANT);
+                afused = pq1_attn_fused(il, TW(il, "attn_q.weight"), TW(il, "attn_k.weight"),
+                                        TW(il, "attn_v.weight"), TW(il, "attn_output.weight"),
+                                        (float *)TW(il, "attn_q_norm.weight"),
+                                        (float *)TW(il, "attn_k_norm.weight"), NHEAD, NKV, HID,
+                                        CTX, NPOS, RC_C, RC_S, XQ, AO) == 0;
+                if (afused) { ct_mark(CT_GEMV); if (att_check_on()) att_check(il); }
             }
-            float *qnw = (float *)TW(il, "attn_q_norm.weight");
-            float *knw = (float *)TW(il, "attn_k_norm.weight");
-            for (int h = 0; h < NHEAD; h++) rms(QF + h * 128, qnw, 128, QF + h * 128);
-            for (int h = 0; h < NKV; h++) rms(KF + h * 128, knw, 128, KF + h * 128);
-            ct_mark(CT_HNORM);
-            if (TRACE) { V8("qnorm", QF); V8("knorm", KF); V8("vcur", VF); }
-            rope_yarn_apply(QF, NHEAD, NPOS);
-            rope_yarn_apply(KF, NKV, NPOS);
-            ct_mark(CT_ROPE);
-            for (int kh = 0; kh < NKV; kh++)
-                for (int i = 0; i < HDIM; i++) KTC[il][kh][NPOS / KTB][i][NPOS % KTB] = KF[kh * 128 + i];
-            for (int kh = 0; kh < NKV; kh++) memcpy(VCA[il][kh][NPOS], VF + kh * HDIM, HDIM * 4);
-            ct_mark(CT_KVCPY);
-            /* Same arithmetic as the serial reference (kept in
-             * fwd8_cpu_parity.c), reorganised for the A57:
-             *  - q.k: gcc fuses the reference's `s += q*k` into fmadd, so each
-             *    score is one fused chain over i; eight positions' chains are
-             *    interleaved (independent accumulators) to hide the 4-cycle
-             *    fmadd latency. Per-chain order is unchanged.
-             *  - softmax: expf(sc-mx) once per score, reused in the sum.
-             *  - p.v: lane i accumulates o[i] = fma(p, v[i], o[i]) over t in
-             *    the reference order; four lanes per NEON fma. */
-            /* Serial on purpose: an OpenMP parallel-for over the 32 heads read
-             * 11.6 ms/tok (passive) / 9.7 (active) vs 8.7 serial, and the active
-             * spin cost the GPU side 5% on top (#74). */
-            for (int h = 0; h < NHEAD; h++) {
-                const int kh = h / 4;
-                const float *q = QF + h * 128;
-                float mx = -1e30f, sc[CTX], pr[CTX];
-                const float32x4_t scl = vdupq_n_f32(0.0883883476f);
-                int t;
-                /* q.k over 16-position tiles (8 KB contiguous each): lane =
-                 * position, fma chain over i in the reference order (#74).
-                 * The last tile is computed in full; lanes past NPOS are
-                 * never read (static storage, always finite). */
-                for (t = 0; t <= NPOS; t += KTB) {
-                    float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0);
-                    float32x4_t a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
-                    const float *kp = &KTC[il][kh][t / KTB][0][0];
-                    for (int i = 0; i < 128; i++, kp += KTB) {
-                        const float32x4_t qi = vdupq_n_f32(q[i]);
-                        a0 = vfmaq_f32(a0, qi, vld1q_f32(kp));
-                        a1 = vfmaq_f32(a1, qi, vld1q_f32(kp + 4));
-                        a2 = vfmaq_f32(a2, qi, vld1q_f32(kp + 8));
-                        a3 = vfmaq_f32(a3, qi, vld1q_f32(kp + 12));
-                    }
-                    vst1q_f32(sc + t, vmulq_f32(a0, scl));
-                    vst1q_f32(sc + t + 4, vmulq_f32(a1, scl));
-                    vst1q_f32(sc + t + 8, vmulq_f32(a2, scl));
-                    vst1q_f32(sc + t + 12, vmulq_f32(a3, scl));
-                }
-                for (t = 0; t <= NPOS; t++) if (sc[t] > mx) mx = sc[t];
-                double es = 0;
-                for (t = 0; t <= NPOS; t++) { sc[t] = expf(sc[t] - mx); es += sc[t]; }
-                for (t = 0; t <= NPOS; t++) pr[t] = sc[t] / (float)es;
-                /* p.v: o[i] = fma(p_t, v_t[i], o[i]) over t in order; 16 lane
-                 * groups kept in registers per pass, two passes over i (#74) */
-                float *o = ATTO + h * 128;
-                for (int ib = 0; ib < 128; ib += 32) {
-                    /* 8 named accumulators: gcc 7 -O2 keeps a float32x4_t[]
-                     * in memory (no unroll), which cost 8.8 ms/tok (#74) */
-                    float32x4_t c0 = vdupq_n_f32(0), c1 = c0, c2 = c0, c3 = c0;
-                    float32x4_t c4 = c0, c5 = c0, c6 = c0, c7 = c0;
-                    const float *Vt = &VCA[il][kh][0][ib];
-                    for (t = 0; t <= NPOS; t++, Vt += HDIM) {
-                        const float32x4_t p4 = vdupq_n_f32(pr[t]);
-                        c0 = vfmaq_f32(c0, vld1q_f32(Vt), p4);
-                        c1 = vfmaq_f32(c1, vld1q_f32(Vt + 4), p4);
-                        c2 = vfmaq_f32(c2, vld1q_f32(Vt + 8), p4);
-                        c3 = vfmaq_f32(c3, vld1q_f32(Vt + 12), p4);
-                        c4 = vfmaq_f32(c4, vld1q_f32(Vt + 16), p4);
-                        c5 = vfmaq_f32(c5, vld1q_f32(Vt + 20), p4);
-                        c6 = vfmaq_f32(c6, vld1q_f32(Vt + 24), p4);
-                        c7 = vfmaq_f32(c7, vld1q_f32(Vt + 28), p4);
-                    }
-                    vst1q_f32(o + ib, c0);      vst1q_f32(o + ib + 4, c1);
-                    vst1q_f32(o + ib + 8, c2);  vst1q_f32(o + ib + 12, c3);
-                    vst1q_f32(o + ib + 16, c4); vst1q_f32(o + ib + 20, c5);
-                    vst1q_f32(o + ib + 24, c6); vst1q_f32(o + ib + 28, c7);
-                }
-            }
-            ct_mark(CT_ATTN);
-            gemvP(TW(il, "attn_output.weight"), HID, HID, ATTO, AO);
-            if (TRACE) { V8("attnout", AO); V8R("attnout", AO, 1000); }
+#endif
+            if (!afused) attn_cpu(il, 1);
             for (int i = 0; i < HID; i++) X[i] += AO[i];
             ct_mark(CT_RESID);
             /* FFN (8B names its second norm ffn_norm, not post_attention_norm) */

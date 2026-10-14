@@ -27,6 +27,16 @@ __attribute__((weak)) int pq1_ffn_fused(const unsigned char *wg, const unsigned 
                                         const unsigned char *wd, int inter, int hid,
                                         const unsigned char *xq, float *fo);
 __attribute__((weak)) void pq1_ffn_dbg_xq(unsigned char *dst, unsigned long n);
+/* loop iter 4: the attention block of one layer as one device graph (glue);
+ * 0 = ran, AO written. kv_put mirrors host-path K/V rows into the device cache. */
+__attribute__((weak)) int pq1_attn_fused(int il, const unsigned char *wq, const unsigned char *wk,
+                                         const unsigned char *wv, const unsigned char *wo,
+                                         const float *qnw, const float *knw, int nh, int nkv,
+                                         int hid, int ctx, int npos, const float *rcc,
+                                         const float *rcs, const unsigned char *xq, float *ao);
+__attribute__((weak)) int pq1_attn_kv_put(int il, int nl, int nkv, int ctx, int npos,
+                                          const float *k, const float *v);
+__attribute__((weak)) void pq1_attn_dbg(int il, int npos, float *k, float *v, float *atto, int nh);
 
 #ifdef PQ1_USE_CUDA
 /* GPU-RAM report printed once at process exit (PQ1_STATS=1). Declared here

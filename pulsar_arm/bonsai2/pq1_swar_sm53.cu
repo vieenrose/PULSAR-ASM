@@ -1040,6 +1040,9 @@ __device__ __forceinline__ float pq1_expf_dev(float x) {
   return pq1_d2f(__dmul_rn(y, s));
 }
 
+/* SILU=1: v = silu(gu[i]) * gu[n+i] (the FFN tail). SILU=0 (loop iter 4): v = gu[i],
+ * i.e. plain q8_K_quant of a device vector (the attention output). */
+template <int SILU>
 __global__ __launch_bounds__(256) void pq1_silu_q8k(const float* __restrict__ gu, int n,
                                                     uint8_t* __restrict__ xq,
                                                     float* __restrict__ vout) {
@@ -1047,10 +1050,15 @@ __global__ __launch_bounds__(256) void pq1_silu_q8k(const float* __restrict__ gu
   __shared__ unsigned sm[8];
   __shared__ int si[8];
   const int t = threadIdx.x, i = blockIdx.x * 256 + t;
-  const float g = gu[i], u = gu[n + i];
-  const float e = pq1_expf_dev(__uint_as_float(__float_as_uint(g) ^ 0x80000000u));
-  const float sg = pq1_fdiv(1.0f, pq1_fadd(1.0f, e));
-  const float v = pq1_fmul(pq1_fmul(g, sg), u);
+  float v;
+  if (SILU) {
+    const float g = gu[i], u = gu[n + i];
+    const float e = pq1_expf_dev(__uint_as_float(__float_as_uint(g) ^ 0x80000000u));
+    const float sg = pq1_fdiv(1.0f, pq1_fadd(1.0f, e));
+    v = pq1_fmul(pq1_fmul(g, sg), u);
+  } else {
+    v = gu[i];
+  }
   if (vout) vout[i] = v;
   sv[t] = v;
   const unsigned a = __float_as_uint(v) & 0x7fffffffu;   /* |v| bits: integer order == float order */
@@ -1085,6 +1093,166 @@ __global__ __launch_bounds__(256) void pq1_silu_q8k(const float* __restrict__ gu
 extern "C" int pq1_silu_q8k_launch(const float* gu_d, int n, uint8_t* xq_d, float* vout_d,
                                    void* stream) {
   if (n <= 0 || (n & 255) != 0) return -2;
-  pq1_silu_q8k<<<n / 256, 256, 0, (cudaStream_t)stream>>>(gu_d, n, xq_d, vout_d);
+  pq1_silu_q8k<1><<<n / 256, 256, 0, (cudaStream_t)stream>>>(gu_d, n, xq_d, vout_d);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+extern "C" int pq1_q8k_launch(const float* x_d, int n, uint8_t* xq_d, void* stream) {
+  if (n <= 0 || (n & 255) != 0) return -2;
+  pq1_silu_q8k<0><<<n / 256, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, NULL);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+/* ---- loop iter 4: the attention block on the device ------------------------
+ * fwd8's CPU attention, bit for bit (its object code was read to pin every
+ * contraction: gcc 7.5 -O2 -mcpu=cortex-a57, default -ffp-contract=fast):
+ *  head rms   s = fma(double(x), double(x), s) serially over the 128 dims (the
+ *             products are exact), sc = 1/sqrtf(float(s/128) + 1e-6f),
+ *             y = (sc*x)*w                         [rms(): fmadd d; fdiv d; fcvt;
+ *                                                   fadd; fsqrt; fdiv; fmul; fmul]
+ *  rope       x[j] = fma(a, c, -(b*s)), x[j+64] = fma(a, s, b*c)
+ *                                                  [rope_yarn_apply: fmul; fnmsub;
+ *                                                   fmul; fmadd]
+ *  q.k        a = fma(q[i], k[i], a) over i in order, score = a * 0.0883883476f
+ *  softmax    mx = fold of (s > mx ? s : mx) from -1e30f (NaN never taken: fcmp +
+ *             fcsel le), e = expf(s - mx), es = serial double sum of e, p = e/(float)es
+ *  p.v        o[i] = fma(v_t[i], p_t, o) over t in order
+ * The max is a block reduction of the same strict-> fold: the value is the true
+ * maximum; only the sign of a zero maximum can differ from the serial fold, and
+ * x - (+0) == x - (-0) for every x except x = -0, where expf gives 1 either way.
+ * As in pq1_silu_q8k every f32 op is inline PTX without .ftz. The cos/sin table,
+ * npos and the Q8_K activation arrive in one H2D (layout PQ1_APAR_*, pq1_wrap.h);
+ * K/V caches are [kv head][ctx][128] per layer in the arena. */
+#define PQ1_ACTX 512
+#ifndef PQ1_APAR_ROPE   /* per-token parameter block layout: the same values as pq1_wrap.h */
+#define PQ1_APAR_ROPE 0
+#define PQ1_APAR_NPOS 512
+#define PQ1_APAR_XQ 576
+#endif
+__device__ __forceinline__ float pq1_fsub(float a, float b) { float r; asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float pq1_fsqrt(float a) { float r; asm("sqrt.rn.f32 %0, %1;" : "=f"(r) : "f"(a)); return r; }
+__device__ __forceinline__ float pq1_fneg(float a) { return __uint_as_float(__float_as_uint(a) ^ 0x80000000u); }
+/* (s > m) ? s : m with an IEEE compare (no ftz): NaN s never taken */
+__device__ __forceinline__ float pq1_fgtsel(float m, float s) {
+  float r;
+  asm("{ .reg .pred p; setp.gt.f32 p, %2, %1; selp.f32 %0, %2, %1, p; }" : "=f"(r) : "f"(m), "f"(s));
+  return r;
+}
+
+/* one warp per head: warps [0, nh+nkv) are q then k heads (rms + rope; k goes to
+ * the cache row npos), warps [nh+nkv, nh+2nkv) copy the v heads to their row */
+__global__ __launch_bounds__(128) void pq1_attn_pre(const float* __restrict__ qkv,
+                                                    const float* __restrict__ nw,
+                                                    const uint8_t* __restrict__ par,
+                                                    float* __restrict__ qo, float* __restrict__ kc,
+                                                    float* __restrict__ vc, int nh, int nkv, int ctx) {
+  __shared__ float sx[4][128];
+  const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+  const int hh = blockIdx.x * 4 + w;
+  if (hh >= nh + 2 * nkv) return;   /* warp-uniform */
+  const int npos = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS);
+  const float* src = qkv + (size_t)hh * 128;
+  if (hh >= nh + nkv) {
+    float* dst = vc + ((size_t)(hh - nh - nkv) * ctx + npos) * 128;
+#pragma unroll
+    for (int k = 0; k < 4; k++) dst[l + 32 * k] = src[l + 32 * k];
+    return;
+  }
+  float x[4];
+#pragma unroll
+  for (int k = 0; k < 4; k++) { x[k] = src[l + 32 * k]; sx[w][l + 32 * k] = x[k]; }
+  __syncwarp();
+  float sc = 0.0f;
+  if (l == 0) {
+    double s = 0.0;
+    for (int j = 0; j < 128; j++) { const double d = pq1_f2d(sx[w][j]); s = __fma_rn(d, d, s); }
+    sc = pq1_fdiv(1.0f, pq1_fsqrt(pq1_fadd(pq1_d2f(__ddiv_rn(s, 128.0)), 1e-6f)));
+  }
+  sc = __shfl_sync(0xffffffffu, sc, 0);
+  const float* wn = nw + (hh < nh ? 0 : 128);
+  float y[4];
+#pragma unroll
+  for (int k = 0; k < 4; k++) y[k] = pq1_fmul(pq1_fmul(sc, x[k]), wn[l + 32 * k]);
+  const float* rc = reinterpret_cast<const float*>(par + PQ1_APAR_ROPE); /* cos[64] | sin[64] */
+  float o[4];
+#pragma unroll
+  for (int k = 0; k < 2; k++) {   /* pairs (j, j+64), j = l + 32k */
+    const float c = rc[l + 32 * k], sn = rc[64 + l + 32 * k], a = y[k], b = y[k + 2];
+    o[k] = pq1_ffma(a, c, pq1_fneg(pq1_fmul(b, sn)));
+    o[k + 2] = pq1_ffma(a, sn, pq1_fmul(b, c));
+  }
+  float* dst = hh < nh ? qo + (size_t)hh * 128 : kc + ((size_t)(hh - nh) * ctx + npos) * 128;
+#pragma unroll
+  for (int k = 0; k < 4; k++) dst[l + 32 * k] = o[k];
+}
+
+/* one block per query head, 128 threads: thread = position for q.k / softmax,
+ * thread = output dim for p.v */
+__global__ __launch_bounds__(128) void pq1_attn_core(const float* __restrict__ qo,
+                                                     const float* __restrict__ kc,
+                                                     const float* __restrict__ vc,
+                                                     const uint8_t* __restrict__ par,
+                                                     float* __restrict__ atto, int nh, int nkv,
+                                                     int ctx) {
+  __shared__ __align__(16) float sq[128];
+  __shared__ float sp[PQ1_ACTX];
+  __shared__ float smx[4];
+  __shared__ float ses;
+  const int h = blockIdx.x, t0 = threadIdx.x;
+  const int kh = h / (nh / nkv);
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  sq[t0] = qo[(size_t)h * 128 + t0];
+  __syncthreads();
+  const float* kb = kc + (size_t)kh * ctx * 128;
+  const float* vb = vc + (size_t)kh * ctx * 128;
+  float mx = -1e30f;
+  for (int t = t0; t < T; t += 128) {
+    const float4* kr = reinterpret_cast<const float4*>(kb + (size_t)t * 128);
+    const float4* q4 = reinterpret_cast<const float4*>(sq);
+    float a = 0.0f;
+#pragma unroll 8
+    for (int i4 = 0; i4 < 32; i4++) {
+      const float4 k4 = __ldg(kr + i4), qq = q4[i4];
+      a = pq1_ffma(qq.x, k4.x, a);
+      a = pq1_ffma(qq.y, k4.y, a);
+      a = pq1_ffma(qq.z, k4.z, a);
+      a = pq1_ffma(qq.w, k4.w, a);
+    }
+    const float s = pq1_fmul(a, 0.0883883476f);
+    sp[t] = s;
+    mx = pq1_fgtsel(mx, s);
+  }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) mx = pq1_fgtsel(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  if ((t0 & 31) == 0) smx[t0 >> 5] = mx;
+  __syncthreads();
+  mx = pq1_fgtsel(pq1_fgtsel(pq1_fgtsel(smx[0], smx[1]), smx[2]), smx[3]);
+  for (int t = t0; t < T; t += 128) sp[t] = pq1_expf_dev(pq1_fsub(sp[t], mx));
+  __syncthreads();
+  if (t0 == 0) {
+    double es = 0.0;
+    for (int t = 0; t < T; t++) es = __dadd_rn(es, pq1_f2d(sp[t]));
+    ses = pq1_d2f(es);
+  }
+  __syncthreads();
+  const float esf = ses;
+  for (int t = t0; t < T; t += 128) sp[t] = pq1_fdiv(sp[t], esf);
+  __syncthreads();
+  const float* vr = vb + t0;
+  float c = 0.0f;
+#pragma unroll 4
+  for (int t = 0; t < T; t++) c = pq1_ffma(__ldg(vr + (size_t)t * 128), sp[t], c);
+  atto[(size_t)h * 128 + t0] = c;
+}
+
+extern "C" int pq1_attn_launch(const float* qkv_d, const float* nw_d, const uint8_t* par_d,
+                               float* qo_d, float* kc_d, float* vc_d, float* atto_d, int nh,
+                               int nkv, int ctx, void* stream) {
+  if (nh <= 0 || nkv <= 0 || (nh % nkv) || ((nh + 2 * nkv) & 3) || ctx <= 0 || ctx > PQ1_ACTX)
+    return -2;
+  cudaStream_t s = (cudaStream_t)stream;
+  pq1_attn_pre<<<(nh + 2 * nkv) / 4, 128, 0, s>>>(qkv_d, nw_d, par_d, qo_d, kc_d, vc_d, nh, nkv, ctx);
+  if (cudaGetLastError() != cudaSuccess) return -1;
+  pq1_attn_core<<<nh, 128, 0, s>>>(qo_d, kc_d, vc_d, par_d, atto_d, nh, nkv, ctx);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }

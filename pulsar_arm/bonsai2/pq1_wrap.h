@@ -44,6 +44,18 @@ int pq1_tm_prep_launch(const unsigned char *xq_d, unsigned int *pl_d, int *au_d,
  * untouched: the T-MAC prep never reads them). vout_d may be NULL. */
 int pq1_silu_q8k_launch(const float *gu_d, int n, unsigned char *xq_d, float *vout_d,
                         void *stream);
+/* loop iter 4: plain q8_K_quant of a device vector (same quant as above) */
+int pq1_q8k_launch(const float *x_d, int n, unsigned char *xq_d, void *stream);
+/* loop iter 4: attention block (head rms + rope + K/V row store, then q.k, softmax,
+ * p.v) for one layer. par_d holds, per token: cos[64] | sin[64] at PQ1_APAR_ROPE,
+ * int npos at PQ1_APAR_NPOS, the Q8_K activation of attn_norm(x) at PQ1_APAR_XQ. */
+#define PQ1_APAR_ROPE 0
+#define PQ1_APAR_NPOS 512
+#define PQ1_APAR_XQ 576
+#define PQ1_APAR_BYTES (576 + 8192)
+int pq1_attn_launch(const float *qkv_d, const float *nw_d, const unsigned char *par_d,
+                    float *qo_d, float *kc_d, float *vc_d, float *atto_d, int nh, int nkv,
+                    int ctx, void *stream);
 
 /* 128-rows-per-block variant (run #45): same math, 2 lanes/row. */
 int pq1_gemv_r128_launch(const unsigned char *w_bits,
