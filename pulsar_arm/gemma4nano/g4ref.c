@@ -509,6 +509,12 @@ static int __attribute__((unused)) parse_sample(int argc, char **argv, int *i) {
  * Output: per token the argmax index and raw logit (TOPI/TOPV); if keep >= 0 the
  * full logits of token `keep` are left in logits[] (the sampler needs them). */
 #define BATCH_MAX 8
+/* G_PAR (set by the engine): the per-token loops of forward_batch() run on all CPU
+   cores. Each token's operations are unchanged; only independent tokens overlap.
+   Attention is split in two loops (all K/V stores, then all attention reads) so a
+   token never reads a K/V row before it is written. The reference keeps G_PAR = 0. */
+static int G_PAR;
+#define PFOR _Pragma("omp parallel for schedule(static) if(G_PAR)")
 static int TOPI[BATCH_MAX];
 static float TOPV[BATCH_MAX];
 static float XSB[BATCH_MAX][H], PINB[BATCH_MAX][NL * PLE], QBB[BATCH_MAX][NH * HD_F], KBB[BATCH_MAX][HD_F],
@@ -570,6 +576,7 @@ static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int
         int full = !SLIDING[il], hd = full ? HD_F : HD_S, inter = il >= FIRST_SHARED ? 2 * INTER : INTER;
         const layer_t *L = &LT[il];
         /* attention: q (and k, v) for all tokens */
+        PFOR
         for (int t = 0; t < B; t++) { G_RMS(XSB[t], L->n_attn, HBB[t], H); G_Q8K(HBB[t], XQB + (size_t)t * xsH, H); }
         if (il < FIRST_SHARED) {
             const tensor_t *ts[3] = {L->q, L->k, L->v};
@@ -591,7 +598,8 @@ static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int
             for (int t = 0; t < B; t++) memcpy(QBB[t], qtmp + (size_t)t * NH * hd, (size_t)NH * hd * 4);
         }
         int src = il < FIRST_SHARED ? il : (full ? store_f : store_s);
-        for (int t = 0; t < B; t++) {          /* per token, in order: norms, rope, KV store, attention */
+        PFOR
+        for (int t = 0; t < B; t++) {          /* per token: q/k norms, rope, K/V store */
             int pos = pos0 + t;
             const float *cs = rope_cs(full, 0, pos), *sn = rope_cs(full, 1, pos);
             float *qb_ = QBB[t];
@@ -603,33 +611,42 @@ static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int
                 G_RMSNS(VBB[t], hd);
                 memcpy(VC[il] + (size_t)pos * hd, VBB[t], hd * 4);
             }
+        }
+        PFOR
+        for (int t = 0; t < B; t++) {          /* per token: attention over positions <= its own */
+            int pos = pos0 + t;
             int lo = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
-            G_ATTNALL(qb_, KC[src], VC[src], lo, pos, hd, ABB[t]);
+            G_ATTNALL(QBB[t], KC[src], VC[src], lo, pos, hd, ABB[t]);
         }
         /* o projection */
         const int xsO = (NH * hd / 256) * Q8B;
+        PFOR
         for (int t = 0; t < B; t++) G_Q8K(ABB[t], XQB + (size_t)t * xsO, NH * hd);
         {
             static float otmp[BATCH_MAX * H];
             const tensor_t *ts[1] = {L->o};
             float *ys[1] = {otmp};
             G_Q4N_B(1, ts, XQB, xsO, B, ys);
+            PFOR
             for (int t = 0; t < B; t++) {
                 float tt[H]; G_RMS(otmp + (size_t)t * H, L->n_post_attn, tt, H);
                 for (int i = 0; i < H; i++) XSB[t][i] = XSB[t][i] + tt[i];
             }
         }
         /* MLP */
+        PFOR
         for (int t = 0; t < B; t++) { G_RMS(XSB[t], L->n_ffn, HBB[t], H); G_Q8K(HBB[t], XQB + (size_t)t * xsH, H); }
         {
             static float mtmp[BATCH_MAX * H];
             G_MLP_B(L, inter, XQB, xsH, B, mtmp);
+            PFOR
             for (int t = 0; t < B; t++) {
                 float tt[H]; G_RMS(mtmp + (size_t)t * H, L->n_post_ffw, tt, H);
                 for (int i = 0; i < H; i++) XSB[t][i] = XSB[t][i] + tt[i];
             }
         }
         /* per-layer input */
+        PFOR
         for (int t = 0; t < B; t++) G_Q8K(XSB[t], XQB + (size_t)t * xsH, H);
         {
             static float gtmp[BATCH_MAX * PLE];
@@ -637,6 +654,7 @@ static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int
             float *ys[1] = {gtmp};
             G_Q4N_B(1, ts, XQB, xsH, B, ys);
             const int xsP = (PLE / 256) * Q8B;
+            PFOR
             for (int t = 0; t < B; t++) {
                 memcpy(PLEGB[t], gtmp + (size_t)t * PLE, PLE * 4);
                 G_GEGLU(PLEGB[t], PINB[t] + il * PLE, PLE);
@@ -646,6 +664,7 @@ static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int
             const tensor_t *tp[1] = {L->proj};
             float *yp[1] = {ptmp};
             G_Q4N_B(1, tp, XQB, xsP, B, yp);
+            PFOR
             for (int t = 0; t < B; t++) {
                 float tt[H]; G_RMS(ptmp + (size_t)t * H, L->n_post, tt, H);
                 for (int i = 0; i < H; i++) XSB[t][i] = XSB[t][i] + tt[i];
@@ -653,7 +672,9 @@ static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int
             }
         }
     }
-    for (int t = 0; t < B; t++) { G_RMS(XSB[t], f32t(tens("output_norm.weight")), HBB[t], H); G_Q8K(HBB[t], XQB + (size_t)t * xsH, H); }
+    const float *onw = f32t(tens("output_norm.weight"));
+    PFOR
+    for (int t = 0; t < B; t++) { G_RMS(XSB[t], onw, HBB[t], H); G_Q8K(HBB[t], XQB + (size_t)t * xsH, H); }
     G_HEAD_B(emb, XQB, xsH, B, keep);
 }
 

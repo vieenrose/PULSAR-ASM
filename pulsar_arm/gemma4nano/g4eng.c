@@ -501,6 +501,7 @@ static void gpu_init(void) {
         build_tab(); G_GEGLU = geglu_asm; G_ATTN = attn_head_asm; G_ATTNALL = attn_all_asm; G_RMS = rms_asm; G_RMSNS = rmsns_asm; G_Q8K = q8k_asm;
         fprintf(stderr, "host kernels: assembly (g4_host.S)\n");
     }
+    G_PAR = !(getenv("G4PAR") && getenv("G4PAR")[0] == '0') && G_ATTNALL == attn_all_asm;   /* thread-safe host kernels only */
 }
 
 int main(int argc, char **argv) {
@@ -517,10 +518,14 @@ int main(int argc, char **argv) {
     { int c = 0; for (int i = 0; i < NL; i++) c += !SLIDING[i];
       if (c != 7) { fprintf(stderr, "sliding pattern: %d full layers, want 7\n", c); return 2; } }
     layer_table();
-    { size_t want = (size_t)MAXSEQ * (128 + 256) * 2 * 4;
-      ROPE = malloc(want); FILE *f = fopen(argv[2], "rb");
-      if (!f || fread(ROPE, 1, want, f) != want) { fprintf(stderr, "rope table %s: want %zu bytes\n", argv[2], want); return 2; }
-      fclose(f); }
+    { /* mapped read-only, not copied: only the pages of the positions actually used
+         become resident (the table holds 2048 positions, 6.3 MB) */
+      size_t want = (size_t)MAXSEQ * (128 + 256) * 2 * 4;
+      int fd = open(argv[2], O_RDONLY); struct stat st;
+      if (fd < 0 || fstat(fd, &st) || (size_t)st.st_size < want) { fprintf(stderr, "rope table %s: want %zu bytes\n", argv[2], want); return 2; }
+      void *m = mmap(NULL, want, PROT_READ, MAP_PRIVATE, fd, 0);
+      if (m == MAP_FAILED) { fprintf(stderr, "rope table %s: mmap failed\n", argv[2]); return 2; }
+      close(fd); ROPE = m; }
     prof = getenv("G4PROF") && getenv("G4PROF")[0] == '1';
     gpu_init();
     int n_prompt = n;

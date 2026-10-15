@@ -44,8 +44,8 @@ static inline void attn_head_asm(const float *q, const float *K, const float *V,
    scores per head = the same fmaf chains; softmax per head as attn_head_ref;
    p.V per head and dim = the same fmaf chain over t. */
 static void attn_all_asm(const float *q, const float *K, const float *V, int lo, int pos, int hd, float *o) {
-    static float qT[HD_F * NH], S8[MAXSEQ * NH], P8[MAXSEQ * NH];
-    static double xin[MAXSEQ], e[MAXSEQ];
+    static __thread float qT[HD_F * NH], S8[MAXSEQ * NH], P8[MAXSEQ * NH];   /* per thread: forward_batch */
+    static __thread double xin[MAXSEQ], e[MAXSEQ];                          /* may run tokens in parallel */
     int n = pos - lo + 1;
     for (int h = 0; h < NH; h++) for (int d = 0; d < hd; d++) qT[d * NH + h] = q[h * hd + d];
     g4_attn_scores8(qT, K + (size_t)lo * hd, n, hd, S8);
