@@ -262,6 +262,8 @@ static int fpl_parity(void) {
     for (int i = 0; i < 2 * n; i++) X[i] = frand() * sx * (i % 97 == 13 ? 60.0f : 1.0f);
     for (int i = 0; i < n; i++) { R[i] = frand() * sx; W[i] = 0.25f + 2.0f * fabsf(frand()); }
     if (v % 3 == 0) for (int i = 256; i < 512; i++) { X[i] = 0.0f; R[i] = 0.0f; X[n + i] = 0.0f; }
+    if (kind >= 2 && v % 5 == 2)   /* |v| ties of alternating sign: the first index decides */
+      for (int i = 5, m = 0; i < n; i += 37, m++) { X[i] = 80.0f * sx * (m & 1 ? -1.0f : 1.0f); X[n + i] = 3.0f * sx * (m & 2 ? -1.0f : 1.0f); }
     for (int arm = 0; arm < 2; arm++) {
       uint8_t *h = arm ? h2 : h1;
       cudaMemcpy(d_X, X, 2 * n * 4, cudaMemcpyHostToDevice);
@@ -316,7 +318,7 @@ static int fpl_parity(void) {
     printf("us/call: rms %.2f rms_pl %.2f | silu %.2f silu_pl %.2f | prep4096 %.2f prep12288 %.2f\n",
            t[0] * 5, t[1] * 5, t[2] * 5, t[3] * 5, t[4] * 5, t[5] * 5);
   }
-  printf("fpl: %d cases (rms+R, rms, silu, q8k; n 4096/12288; zero blocks), bad=%d\n", ncase, bad);
+  printf("fpl: %d cases (rms+R, rms, silu, q8k; n 4096/12288; zero blocks, amax ties), bad=%d\n", ncase, bad);
   printf("FPL PARITY: %s\n", bad ? "FAIL" : "PASS");
   return bad ? 1 : 0;
 }

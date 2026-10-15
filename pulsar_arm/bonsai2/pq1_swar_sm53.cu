@@ -1702,6 +1702,96 @@ __global__ __launch_bounds__(256) void pq1_silu_q8k(const float* __restrict__ gu
   }
 }
 
+/* Warp-per-block form of pq1_silu_q8k with planes (loop-261014-2216 row 21):
+ * one warp per 256-element Q8_K block, lane l owning elements l + 32 j
+ * (j = 0..7), shuffle-only reductions. The 256-thread form ran one Q8_K
+ * block per CTA: 48 CTAs = 6 waves on the one SM, each a chain of loads,
+ * two __syncthreads reductions, three divides and the plane build. Here
+ * the 48 warps of the FFN tail are resident at once. Same values: amax over
+ * |v| bits, first index by integer min, iscale/d/q as pq1_silu_q8k, planes by
+ * pq1_plane_tr over the same 32-byte words (word j = elements 32j..32j+31),
+ * group sums as integers. PQ1_QW=0 keeps the 256-thread kernel. */
+template <int SILU>
+__global__ __launch_bounds__(256) void pq1_q8k_w(const float* __restrict__ gu, int n,
+                                                 uint8_t* __restrict__ xq,
+                                                 uint32_t* __restrict__ pl,
+                                                 int* __restrict__ au) {
+  __shared__ float stab[SILU == 2 ? 64 : 1];
+  __shared__ __align__(16) uint8_t sqb[8][256];
+  const int t = threadIdx.x, l = t & 31, w = t >> 5;
+  if (SILU == 2) {
+    pq1_expf_tab(stab, t);
+    __syncthreads();
+  }
+  const int b = blockIdx.x * 8 + w;
+  if (b * 256 >= n) return;                         /* warp-uniform; no CTA barrier follows */
+  const float* src = gu + (size_t)b * 256 + l;
+  float v[8];
+  unsigned a[8], am = 0u;
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    const float x = src[32 * j];
+    if (SILU) {
+      const float u = src[n + 32 * j];
+      const float mg = __uint_as_float(__float_as_uint(x) ^ 0x80000000u);
+      const float e = SILU == 2 ? pq1_expf_ff(mg, stab) : pq1_expf_dev(mg);
+      const float sg = pq1_fdiv(1.0f, pq1_fadd(1.0f, e));
+      v[j] = pq1_fmul(pq1_fmul(x, sg), u);
+    } else {
+      v[j] = x;
+    }
+    a[j] = __float_as_uint(v[j]) & 0x7fffffffu;
+    am = max(am, a[j]);
+  }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) am = max(am, __shfl_xor_sync(0xffffffffu, am, o));
+  uint8_t* yb = xq + (size_t)b * 292;
+  uint32_t q[8];
+  unsigned dbits = 0u;
+  if (am == 0u) {                                   /* fork: d = 0, qs = 0 (warp-uniform) */
+#pragma unroll
+    for (int j = 0; j < 8; j++) q[j] = 0u;
+  } else {
+    int idx = 256;
+    float vf = 0.0f;
+#pragma unroll
+    for (int j = 7; j >= 0; j--)                    /* ends on the lowest j */
+      if (a[j] == am) { idx = l + 32 * j; vf = v[j]; }
+    int first = idx;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) first = min(first, __shfl_xor_sync(0xffffffffu, first, o));
+    const float vmax = __shfl_sync(0xffffffffu, vf, first & 31);
+    const float iscale = pq1_fdiv(-127.0f, vmax);
+#pragma unroll
+    for (int j = 0; j < 8; j++) q[j] = (uint8_t)(int8_t)pq1_q8n(v[j], iscale);
+    dbits = __float_as_uint(pq1_fdiv(1.0f, iscale));
+  }
+  if (l == 0) *reinterpret_cast<uint32_t*>(yb) = dbits;
+#pragma unroll
+  for (int j = 0; j < 8; j++) { yb[4 + l + 32 * j] = (uint8_t)q[j]; sqb[w][l + 32 * j] = (uint8_t)q[j]; }
+  __syncwarp();
+  uint32_t* dst = pl + (size_t)b * 73;
+#pragma unroll
+  for (int h = 0; h < 2; h++) {                     /* plane word wd = 8 * word + plane */
+    const int wd = l + 32 * h;
+    const uint4* s4 = reinterpret_cast<const uint4*>(&sqb[w][(wd >> 3) * 32]);
+    dst[1 + wd] = pq1_plane_tr(s4[0], s4[1], wd & 7);
+  }
+  if (l < 8) dst[65 + l] = 0u;
+  if (l == 0) dst[0] = dbits;
+  if (au) {
+    int s0 = 0, s1 = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j++) { s0 += (int)(q[j] ^ 0x80u); s1 += (int)(q[j + 4] ^ 0x80u); }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      s0 += __shfl_xor_sync(0xffffffffu, s0, o);
+      s1 += __shfl_xor_sync(0xffffffffu, s1, o);
+    }
+    if (l == 0) { au[2 * b] = s0; au[2 * b + 1] = s1; }
+  }
+}
+
 /* pq1_parity expf: pq1_expf_ff and the certified core against pq1_expf_dev for
  * inputs base .. base + 2^20 - 1. c[0] final mismatches, c[1] certified but
  * wrong, c[2] in-range fallbacks, c[3] fallbacks whose fast value was right. */
@@ -1757,6 +1847,18 @@ extern "C" int pq1_q8k_launch(const float* x_d, int n, uint8_t* xq_d, void* stre
 extern "C" int pq1_silu_q8k_pl_launch(int silu, const float* x_d, int n, uint8_t* xq_d,
                                       uint32_t* pl_d, int* au_d, void* stream) {
   if (n <= 0 || (n & 255) != 0 || n > PQ1_MAXK) return -2;
+  static int qw = -1;
+  if (qw < 0) { const char* e = getenv("PQ1_QW"); qw = e ? atoi(e) : 1; }
+  if (qw) {
+    const int nb = (n / 256 + 7) / 8;
+    if (silu && pq1_exf())
+      pq1_q8k_w<2><<<nb, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, pl_d, au_d);
+    else if (silu)
+      pq1_q8k_w<1><<<nb, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, pl_d, au_d);
+    else
+      pq1_q8k_w<0><<<nb, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, pl_d, au_d);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+  }
   if (silu && pq1_exf())
     pq1_silu_q8k<2><<<n / 256, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, NULL, pl_d, au_d);
   else if (silu)
