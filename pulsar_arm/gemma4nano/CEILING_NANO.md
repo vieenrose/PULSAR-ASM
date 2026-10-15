@@ -30,3 +30,6 @@ problem in Traditional Chinese. (The same train problem in English is answered w
 same discount problem in Chinese starts wrong. Both are reported, not hidden.)
 Both reruns are byte-identical (`probes/*_steps.txt`). Engine-reported rates: en 291 decode
 steps 6.17 tok/s, prefill 33 tokens 6.61 tok/s; zh 117 steps 6.56 tok/s, prefill 35 tokens 6.47 tok/s.
+Reshoot after the second optimization round (engine a487267, 3 runs each, both step files
+reproduced byte for byte): en decode 9.54/9.64/9.38 tok/s, prefill 14.7-15.6 tok/s; zh decode
+9.55/10.10/9.47 tok/s, prefill 14.2-14.4 tok/s.

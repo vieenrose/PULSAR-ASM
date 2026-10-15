@@ -218,3 +218,39 @@ Open, measured or estimated:
   could join the GPU like the MLP (~2-4 ms, estimate). Moving norms to the GPU needs a
   parallel-friendly sum order, i.e. a change of the reference arithmetic and new goldens.
 - Prefill is token by token.
+
+## Second optimization round (2026-10-16)
+
+Benchmark: a 225-token prompt + 128 greedy tokens, median of 3 runs, every kept step with
+all gates bit-identical. End to end 57.1 s -> 26.7 s (6.19 -> 13.21 tok/s), prefill 6.48 ->
+16.74 tok/s, decode 5.73 -> 9.62 tok/s; peak RSS 713.8 -> 707 MB; GPU 1,474 -> 1,385 MB.
+The kept steps are listed in the README (second-round table) and in the commit messages. The
+three "open" items above are done: down at 12288 columns runs on q4i (chunked staging), the
+per-layer-input chain is on the GPU, prefill goes 8 tokens per weight pass.
+
+Measured facts that steered the round:
+- The Q4 GEMV was ALU-bound on per-nibble extraction (SHR/BFE, half rate). Masking a word with
+  0x000F000F gives two nibbles per op; inline PTX `mad.wide.s16` on register halves becomes
+  XMAD with half selects (plain C did not). Large tensors now read at 19-22 GB/s.
+- A data-dependent `if (t < B)` around unrolled per-token chains kept the batched kernels from
+  interleaving them (~1.5x).
+- libgomp's default spin (~300k iterations) keeps idle workers busy while the main thread waits
+  on the GPU and slows everything on the shared DRAM/power budget; GOMP_SPINCOUNT=10000.
+- The A57's double divider (~30 cycles per element) was 7% of a decode step in the RMS norms;
+  Markstein's correction (y = RN(1/r), q = fma(fma(-x*y, r, x), y, x*y)) is the correctly rounded
+  quotient (theorem + markstein_check.c: 2.5e11 pairs, no difference).
+- Shared memory, not registers or bandwidth, limited the 12288-column down projection (24.6 KB
+  of staged activations, 2 blocks per SM): chunked staging, +12.7% decode.
+- cuLaunchKernel costs ~52 us of CPU per call on this driver; it is hidden behind GPU work
+  except in chains of tiny kernels (the per-layer-input GEMVs were launch-paced, ~0.1 ms each).
+- The GPU idles at 76.8 MHz and devfreq ramps over ~1 s: micro-benchmarks need a warm-up.
+
+Tried and dropped (bit-exact but no gain, or slower):
+- prompt batches of 16: the batched kernels are bound by per-token integer work;
+- register caps (`__launch_bounds__` minimum blocks) on the Q4 decode, decode-head and batched
+  head kernels; deeper load rings (6, 8): spills and lost overlap cost more than occupancy;
+- the decode Q4 chain split into two partial sums: not latency-bound;
+- parallel RMS norms in decode: waking the OpenMP workers costs more than the divides;
+- fusing tiny kernels to cut launches (stage3, Q8_K in the softmax kernel, GeGLU+Q8_K alone);
+  GPU argmax for greedy decode; Markstein divides in the GPU softmax: real effects under 1%,
+  not resolvable by the benchmark.
