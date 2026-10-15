@@ -515,11 +515,14 @@ static void tq_encode_codes(int B, const float *x, int *v) {
   }
 }
 static int tq_parity(int B) {
-  const int nh = 32, nkv = 8, ctx = 2048, CW = B == 3 ? 12 : 16;
-  const int Ts[] = {1, 2, 33, 255, 256, 257, 700, 2048};
+  /* PQ1_TQ_CTX: cache positions (default 2048; the engine's prompt-A run uses 64) */
+  const int nh = 32, nkv = 8, BK = B == 43 ? 4 : B, BV = B == 43 ? 3 : B,
+            CWK = BK == 3 ? 12 : 16, CWV = BV == 3 ? 12 : 16;   /* B = 43: 4-bit K, 3-bit V */
+  const int ctx = getenv("PQ1_TQ_CTX") ? atoi(getenv("PQ1_TQ_CTX")) : 2048;
+  const int Ts[] = {1, 2, 33, 44, 64, 128, 129, 255, 256, 257, 700, 2048};
   float *q = malloc((size_t)nh * 128 * 4), *od = malloc((size_t)nh * 128 * 4);
   uint16_t *K = malloc((size_t)nkv * ctx * 256), *V = malloc((size_t)nkv * ctx * 256);
-  uint32_t *kc = malloc((size_t)nkv * ctx * CW * 4), *vc = malloc((size_t)nkv * ctx * CW * 4);
+  uint32_t *kc = malloc((size_t)nkv * ctx * CWK * 4), *vc = malloc((size_t)nkv * ctx * CWV * 4);
   float *ks = malloc((size_t)nkv * ctx * 4), *vs = malloc((size_t)nkv * ctx * 4);
   double *Kd = malloc((size_t)nkv * ctx * 128 * 8), *Vd = malloc((size_t)nkv * ctx * 128 * 8);
   unsigned char par[PQ1_APAR_BYTES];
@@ -528,9 +531,9 @@ static int tq_parity(int B) {
   unsigned short *d_st;
   unsigned char *d_par;
   cudaMalloc((void **)&d_q, (size_t)nh * 512); cudaMalloc((void **)&d_o, (size_t)nh * 512);
-  cudaMalloc((void **)&d_kc, (size_t)nkv * ctx * CW * 4); cudaMalloc((void **)&d_vc, (size_t)nkv * ctx * CW * 4);
+  cudaMalloc((void **)&d_kc, (size_t)nkv * ctx * CWK * 4); cudaMalloc((void **)&d_vc, (size_t)nkv * ctx * CWV * 4);
   cudaMalloc((void **)&d_ks, (size_t)nkv * ctx * 4); cudaMalloc((void **)&d_vs, (size_t)nkv * ctx * 4);
-  cudaMalloc((void **)&d_sc, (size_t)nh * ctx * 4); cudaMalloc((void **)&d_part, (size_t)nh * ctx * 4);
+  cudaMalloc((void **)&d_sc, (size_t)nh * ctx * 4); cudaMalloc((void **)&d_part, (size_t)nh * 128 * 4 * ((ctx + 255) / 256));   /* per-256 chunk partials */
   cudaMalloc((void **)&d_inv, 4096); cudaMalloc((void **)&d_st, (size_t)2 * nkv * 256);
   cudaMalloc((void **)&d_par, sizeof par);
   srand(777);
@@ -557,8 +560,8 @@ static int tq_parity(int B) {
     if (pq1_tq_store_launch(B, d_st, t, d_kc, d_ks, d_vc, d_vs, nkv, ctx, 0)) { printf("store launch failed\n"); return 1; }
   }
   cudaDeviceSynchronize();
-  cudaMemcpy(kc, d_kc, (size_t)nkv * ctx * CW * 4, cudaMemcpyDeviceToHost);
-  cudaMemcpy(vc, d_vc, (size_t)nkv * ctx * CW * 4, cudaMemcpyDeviceToHost);
+  cudaMemcpy(kc, d_kc, (size_t)nkv * ctx * CWK * 4, cudaMemcpyDeviceToHost);
+  cudaMemcpy(vc, d_vc, (size_t)nkv * ctx * CWV * 4, cudaMemcpyDeviceToHost);
   cudaMemcpy(ks, d_ks, (size_t)nkv * ctx * 4, cudaMemcpyDeviceToHost);
   cudaMemcpy(vs, d_vs, (size_t)nkv * ctx * 4, cudaMemcpyDeviceToHost);
   /* (1) codes vs the host encoder; decoded rows and their error */
@@ -570,20 +573,21 @@ static int tq_parity(int B) {
       float x[128];
       int v[128];
       for (int j = 0; j < 128; j++) x[j] = pq1_h2f(src[j]);
-      tq_encode_codes(B, x, v);
-      const uint32_t *cw = (w ? vc : kc) + r * CW;
-      for (int j = 0; j < 128; j++) cbad += tq_code(B, cw, j) != v[j];
+      tq_encode_codes(w ? BV : BK, x, v);
+      const uint32_t *cw = (w ? vc : kc) + r * (w ? CWV : CWK);
+      for (int j = 0; j < 128; j++) cbad += tq_code(w ? BV : BK, cw, j) != v[j];
       double *xd = (w ? Vd : Kd) + r * 128;
-      tq_decode(B, cw, (w ? vs : ks)[r], xd);
+      tq_decode(w ? BV : BK, cw, (w ? vs : ks)[r], xd);
       if (!w)
         for (int j = 0; j < 128; j++) { ke2 += (xd[j] - x[j]) * (xd[j] - x[j]); kn2 += (double)x[j] * x[j]; }
     }
   printf("tq%d codes vs host encoder: %ld / %ld differ (threshold ties of the float rotation)\n", B, cbad,
          (long)2 * nkv * ctx * 128);
-  printf("tq%d K rows: relative MSE %.5f (theory %.4f)\n", B, ke2 / kn2, B == 3 ? 0.0340 : 0.0093);
+  printf("tq%d K rows: relative MSE %.5f (theory %.4f)\n", B, ke2 / kn2, BK == 3 ? 0.0340 : 0.0093);
   int allok = cbad * 10000 < (long)2 * nkv * ctx * 128;   /* < 1e-4 of the codes */
   for (unsigned ti = 0; ti < sizeof Ts / sizeof Ts[0]; ti++) {
     const int T = Ts[ti], npos = T - 1;
+    if (T > ctx) continue;
     memset(par, 0, sizeof par);
     memcpy(par + PQ1_APAR_NPOS, &npos, 4);
     cudaMemcpy(d_par, par, sizeof par, cudaMemcpyHostToDevice);
@@ -625,8 +629,66 @@ static int tq_parity(int B) {
            B, T, rc, emax, ok ? "OK" : "MISMATCH", sqrt(qe2 / qn2));
     if (!ok) allok = 0;
   }
+  if (ctx <= 256) {
+    /* the short-context path (store + 2 kernels) must equal store + the long chain bit for bit */
+    float *o1 = malloc((size_t)nh * 512), *o2 = malloc((size_t)nh * 512);
+    long sbad = 0;
+    for (unsigned ti = 0; ti < sizeof Ts / sizeof Ts[0]; ti++) {
+      const int T = Ts[ti], npos = T - 1;
+      if (T > ctx) continue;
+      memset(par, 0, sizeof par);
+      memcpy(par + PQ1_APAR_NPOS, &npos, 4);
+      cudaMemcpy(d_par, par, sizeof par, cudaMemcpyHostToDevice);
+      for (int h = 0; h < nkv; h++) {
+        memcpy(st + h * 128, K + ((size_t)h * ctx + npos) * 128, 256);
+        memcpy(st + (nkv + h) * 128, V + ((size_t)h * ctx + npos) * 128, 256);
+      }
+      cudaMemcpy(d_st, st, sizeof st, cudaMemcpyHostToDevice);
+      cudaMemset(d_o, 0xff, (size_t)nh * 512);
+      int rc = pq1_tq_fa_launch(B, d_q, d_par, d_kc, d_ks, d_vc, d_vs, d_sc, d_part, d_inv, d_o, nh, nkv, ctx, 0);
+      cudaDeviceSynchronize();
+      cudaMemcpy(o1, d_o, (size_t)nh * 512, cudaMemcpyDeviceToHost);
+      /* wipe row npos so the short path's own store is what gets read */
+      for (int h = 0; h < nkv; h++) {
+        cudaMemset(d_kc + ((size_t)h * ctx + npos) * CWK, 0, CWK * 4);
+        cudaMemset(d_vc + ((size_t)h * ctx + npos) * CWV, 0, CWV * 4);
+        cudaMemset(d_ks + (size_t)h * ctx + npos, 0, 4);
+        cudaMemset(d_vs + (size_t)h * ctx + npos, 0, 4);
+      }
+      cudaMemset(d_o, 0xff, (size_t)nh * 512);
+      rc |= pq1_tq_short_launch(B, d_q, d_st, d_par, d_kc, d_ks, d_vc, d_vs, d_sc, d_o, nh, nkv, ctx, 0);
+      cudaDeviceSynchronize();
+      cudaMemcpy(o2, d_o, (size_t)nh * 512, cudaMemcpyDeviceToHost);
+      long nb = 0;
+      for (int i = 0; i < nh * 128; i++) nb += memcmp(o1 + i, o2 + i, 4) != 0;
+      uint32_t kr[16], vr[16];
+      float ksr, vsr;
+      for (int h = 0; h < nkv; h++) {
+        const size_t r = (size_t)h * ctx + npos;
+        cudaMemcpy(kr, d_kc + r * CWK, CWK * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(vr, d_vc + r * CWV, CWV * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(&ksr, d_ks + r, 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(&vsr, d_vs + r, 4, cudaMemcpyDeviceToHost);
+        nb += memcmp(kr, kc + r * CWK, CWK * 4) != 0 || memcmp(vr, vc + r * CWV, CWV * 4) != 0 ||
+              memcmp(&ksr, ks + r, 4) != 0 || memcmp(&vsr, vs + r, 4) != 0;
+      }
+      printf("tq%d short T=%4d rc=%d: %ld words differ from the long path\n", B, T, rc, nb);
+      sbad += nb + (rc != 0);
+    }
+    if (sbad) allok = 0;
+    free(o1); free(o2);
+  }
   if (getenv("PQ1_TQ_TIME")) {
-    for (int T = 64; T <= ctx; T *= 4) {
+    /* the f16 path on the same rows, for the side-by-side cost; PQ1_TQ_TIME=T
+     * times that T only */
+    unsigned short *d_K, *d_V;
+    float *d_mv;
+    cudaMalloc((void **)&d_K, (size_t)nkv * ctx * 256); cudaMalloc((void **)&d_V, (size_t)nkv * ctx * 256);
+    cudaMalloc((void **)&d_mv, (size_t)2 * PQ1_FA_MAXH * ctx * 4);
+    cudaMemcpy(d_K, K, (size_t)nkv * ctx * 256, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, V, (size_t)nkv * ctx * 256, cudaMemcpyHostToDevice);
+    const int T1 = atoi(getenv("PQ1_TQ_TIME"));
+    for (int T = T1 > 1 ? T1 : 64; T <= ctx; T = T1 > 1 ? ctx + 1 : T * 4) {
       const int npos = T - 1;
       memcpy(par + PQ1_APAR_NPOS, &npos, 4);
       cudaMemcpy(d_par, par, sizeof par, cudaMemcpyHostToDevice);
@@ -638,7 +700,20 @@ static int tq_parity(int B) {
       cudaEventSynchronize(e1);
       float ms;
       cudaEventElapsedTime(&ms, e0, e1);
-      printf("   tq%d T=%4d: %.3f ms per layer (ctx %d grids)\n", B, T, ms / 20, ctx);
+      cudaEventRecord(e0, 0);
+      for (int r = 0; r < 20; r++) pq1_tq_store_launch(B, d_st, npos, d_kc, d_ks, d_vc, d_vs, nkv, ctx, 0);
+      cudaEventRecord(e1, 0);
+      cudaEventSynchronize(e1);
+      float mst;
+      cudaEventElapsedTime(&mst, e0, e1);
+      cudaEventRecord(e0, 0);
+      for (int r = 0; r < 20; r++) pq1_fa_launch(d_q, d_K, d_V, d_sc, d_mv, d_par, d_o, nh, nkv, ctx, 0);
+      cudaEventRecord(e1, 0);
+      cudaEventSynchronize(e1);
+      float msf;
+      cudaEventElapsedTime(&msf, e0, e1);
+      printf("   tq%d T=%4d: %.3f ms per layer + store %.3f | f16 fa %.3f (ctx %d grids)\n", B, T, ms / 20,
+             mst / 20, msf / 20, ctx);
     }
   }
   printf("TQ%d PARITY: %s\n", B, allok ? "PASS" : "FAIL");

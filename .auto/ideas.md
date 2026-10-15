@@ -1085,3 +1085,21 @@ same slope), speed and PQ1GPU used_mb unchanged. Mid-run /proc: RssAnon 604 MB (
 the board uses the same memory, the arena size only moves ~520 MB between the process's anon
 RSS and the nvmap/GPU-allocator accounting. Not a saving. Peak RSS on this board is therefore
 an accounting metric; compare memory claims with MemAvailable at the same arena size.
+Row 51 (kept): TQ short-context path. At ctx <= 256 (one V chunk; the graph is captured per
+ctx, prompt A runs at ctx 64) pq1_attn_tq_launch runs pq1_tq_qks + pq1_tq_tail instead of
+store + qk + sm + pv + out. nvprof in the engine, us per layer call at ctx 64: old chain qk 43.3
++ pv 21.5 + sm 15.4 + store 7.4 + out 6.3 = 93.8; new qks 19.8 + tail 28.2 = 48.0; f16 qk4 18.4
++ pv 18.3 + sm 9.7 = 46.3. What the time was: not arithmetic but serial latency. A one-position
+pq1_tq_sm costs 13 us, and the first tail (4 heads' softmax one after the other, 16 barriers)
+took 48 us at T=1; running the 4 heads' trees side by side (3 barriers) halved it. The fully
+unrolled 128-term qk body (~14 KB of code, fetched cold every layer since the weight stream
+evicts L2) cost ~2x vs a rolled word loop (T=44: 36.8 -> 19.4 us). qks forms the table entry
+fl(q_r c) inline and folds the K/V row store of npos in; tail keeps every reduction tree of
+sm/pv/out. Bit-identical: pq1_parity tq 3|4|43 compares the short path with store + long chain
+word for word at ctx 64 and 256 (0 differ), TQ4 goldens A 44/44 B 26/26 unchanged. The parity
+harness gained K4/V3 support (it had one code width) and a correctly sized partials buffer
+(nh*ctx floats was short at ctx < 256: the ctx-64 FAIL was the harness, the engine's region is
+2*64*ctx floats). Order-balanced A/B on one binary, prompt A, PQ1_KVTQ=4 vs +PQ1_TQSHORT=0:
+R = 1.0304 / 1.0261 / 1.0292 (bias 1.001 / 0.997 / 0.999); TQ4 vs f16 same rep 1.003 / 1.000 /
+1.003. Short-context TQ4 overhead is gone. Open: ctx > 256 runs still use the long chain while
+T is small (needs a host-side per-step graph choice).

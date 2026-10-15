@@ -3361,6 +3361,217 @@ __global__ void pq1_tq_out(const float* __restrict__ part, const float* __restri
   o.z = pq1_tq_dsign(x[2] * k, 4 * l + 2); o.w = pq1_tq_dsign(x[3] * k, 4 * l + 3);
   reinterpret_cast<float4*>(atto + (size_t)h * 128)[l] = o;
 }
+/* short-context TurboQuant attention (ctx <= PQ1_TQ_CH, one V chunk): two
+ * kernels instead of store + qk + sm + pv + out. pq1_tq_qks scores without
+ * the table (its entry fl(q_r c) is formed inline, so every sum is the same
+ * fmaf chain as pq1_tq_qk) and encodes the new K/V rows of position npos
+ * itself; pq1_tq_tail is pq1_tq_sm + pq1_tq_pv + pq1_tq_out for the 4 q heads
+ * of one kv head with the same reduction trees. Bit-identical to the long path. */
+#define PQ1_TQ_SB 128   /* positions per pq1_tq_qks block */
+template <int BK, int BV>
+__global__ __launch_bounds__(PQ1_TQ_SB) void pq1_tq_qks(const float* __restrict__ qo, const unsigned short* __restrict__ stage,
+                                                        const uint8_t* __restrict__ par, uint32_t* __restrict__ kcode,
+                                                        float* __restrict__ ksc, uint32_t* __restrict__ vcode,
+                                                        float* __restrict__ vsc, float* __restrict__ sc, int nkv, int ctx) {
+  enum { CW = pq1_tqc<BK>::CW, CWV = pq1_tqc<BV>::CW, NV = pq1_tqc<BK>::NV / 2 };
+  __shared__ __align__(16) float4 qr[128];
+  __shared__ float cm[NV];
+  __shared__ __align__(16) uint32_t kn[CW];
+  __shared__ float kns;
+  const int kh = blockIdx.x, tid = threadIdx.x, w = tid >> 5, l = tid & 31;
+  const int npos = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS), T = npos + 1;
+  const int t0 = blockIdx.y * PQ1_TQ_SB;
+  if (t0 >= T) return;   /* block-uniform */
+  const bool own = npos - t0 < PQ1_TQ_SB;   /* this block scores position npos */
+  if (own && w == 0) {
+    pq1_tq_row<BK>(stage + (size_t)kh * 128, kn, &kns, l);
+    __syncwarp();
+    const size_t r = (size_t)kh * ctx + npos;
+    if (l < CW) kcode[r * CW + l] = kn[l];
+    if (!l) ksc[r] = kns;
+  }
+  if (own && w == 1) {
+    const size_t r = (size_t)kh * ctx + npos;
+    pq1_tq_row<BV>(stage + (size_t)(nkv + kh) * 128, vcode + r * CWV, vsc + r, l);
+  }
+  {
+    const float4 q4 = reinterpret_cast<const float4*>(qo + (size_t)(kh * 4 + w) * 128)[l];
+    float x[4] = {pq1_tq_dsign(q4.x, 4 * l), pq1_tq_dsign(q4.y, 4 * l + 1),
+                  pq1_tq_dsign(q4.z, 4 * l + 2), pq1_tq_dsign(q4.w, 4 * l + 3)};
+    pq1_fwht128(x, l);
+    float* qf = reinterpret_cast<float*>(qr);
+#pragma unroll
+    for (int i = 0; i < 4; i++) qf[(4 * l + i) * 4 + w] = x[i] * 0.0078125f;
+  }
+  if (tid < NV) cm[tid] = pq1_tq_cent(BK, tid);
+  __syncthreads();
+  const int t = t0 + tid;
+  if (t >= T) return;
+  /* the outer word loop stays rolled: the unrolled 128-term body is ~14 KB of
+   * code fetched cold from DRAM every layer (the weight stream evicts L2) */
+  const uint32_t* kb = t == npos ? kn : kcode + ((size_t)kh * ctx + t) * CW;
+  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+  if (BK == 3) {
+#pragma unroll 1
+    for (int k = 0; k < 8; k++) {
+      const uint32_t mw = kb[k], sw = kb[8 + (k >> 1)] >> (16 * (k & 1));
+#pragma unroll
+      for (int i = 0; i < 16; i++) {
+        const float4 q = qr[16 * k + i];
+        const float c = cm[(mw >> (2 * i)) & 3];
+        const float g = __int_as_float(0x3f800000 | (((sw >> i) & 1) << 31));
+        a0 = fmaf(g, __fmul_rn(q.x, c), a0); a1 = fmaf(g, __fmul_rn(q.y, c), a1);
+        a2 = fmaf(g, __fmul_rn(q.z, c), a2); a3 = fmaf(g, __fmul_rn(q.w, c), a3);
+      }
+    }
+  } else {
+#pragma unroll 1
+    for (int k = 0; k < 16; k++) {
+      const uint32_t wv = kb[k];
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        const float4 q = qr[8 * k + i];
+        const uint32_t v = wv >> (4 * i);
+        const float c = cm[v & 7];
+        const float g = __int_as_float(0x3f800000 | ((v & 8) << 28));
+        a0 = fmaf(g, __fmul_rn(q.x, c), a0); a1 = fmaf(g, __fmul_rn(q.y, c), a1);
+        a2 = fmaf(g, __fmul_rn(q.z, c), a2); a3 = fmaf(g, __fmul_rn(q.w, c), a3);
+      }
+    }
+  }
+  const float s = t == npos ? kns : __ldg(ksc + (size_t)kh * ctx + t);
+  float* so = sc + (size_t)kh * 4 * ctx + t;
+  so[0] = a0 * s; so[ctx] = a1 * s; so[2 * (size_t)ctx] = a2 * s; so[3 * (size_t)ctx] = a3 * s;
+}
+template <int B>
+__global__ __launch_bounds__(256) void pq1_tq_tail(const float* __restrict__ sc, const uint32_t* __restrict__ vcode,
+                                                   const float* __restrict__ vsc, const uint8_t* __restrict__ par,
+                                                   float* __restrict__ atto, int ctx) {
+  /* the 4 heads' reductions run side by side (3 barriers, not 4 per head);
+   * each head keeps pq1_tq_sm's tree: one position per thread (T <= 256),
+   * xor-shuffle within the warp, the 8 warp values in order */
+  enum { CW = pq1_tqc<B>::CW, NV = pq1_tqc<B>::NV };
+  __shared__ __align__(16) float4 wt[PQ1_TQ_CH];
+  __shared__ __align__(16) uint32_t cs[PQ1_TQ_CH * CW];
+  __shared__ float cent[NV];
+  __shared__ __align__(16) float red[4][4][128];
+  __shared__ float rm[4][8], rs[4][8], inv[4];
+  const int kh = blockIdx.x, tid = threadIdx.x, w = tid >> 5, l = tid & 31;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  const bool on = tid < T;
+  float x[4], m[4], vs = 0.0f;
+#pragma unroll
+  for (int h = 0; h < 4; h++) x[h] = on ? sc[(size_t)(kh * 4 + h) * ctx + tid] : -INFINITY;
+  if (on) vs = __ldg(vsc + (size_t)kh * ctx + tid);
+  if (tid < NV) cent[tid] = pq1_tq_cent(B, tid);
+  const uint32_t* vb = vcode + (size_t)kh * ctx * CW;
+  for (int i = tid; i < T * CW / 4; i += 256)
+    reinterpret_cast<uint4*>(cs)[i] = reinterpret_cast<const uint4*>(vb)[i];
+#pragma unroll
+  for (int h = 0; h < 4; h++) m[h] = x[h];
+#pragma unroll
+  for (int o = 16; o; o >>= 1)
+#pragma unroll
+    for (int h = 0; h < 4; h++) m[h] = fmaxf(m[h], __shfl_xor_sync(0xffffffffu, m[h], o));
+  if (!l)
+#pragma unroll
+    for (int h = 0; h < 4; h++) rm[h][w] = m[h];
+  __syncthreads();
+  float p[4], sum[4];
+#pragma unroll
+  for (int h = 0; h < 4; h++) {
+    float mm = rm[h][0];
+#pragma unroll
+    for (int k = 1; k < 8; k++) mm = fmaxf(mm, rm[h][k]);
+    p[h] = on ? expf(x[h] - mm) : 0.0f;
+    sum[h] = 0.0f;
+    if (on) sum[h] += p[h];
+  }
+#pragma unroll
+  for (int o = 16; o; o >>= 1)
+#pragma unroll
+    for (int h = 0; h < 4; h++) sum[h] += __shfl_xor_sync(0xffffffffu, sum[h], o);
+  if (!l)
+#pragma unroll
+    for (int h = 0; h < 4; h++) rs[h][w] = sum[h];
+  if (on) wt[tid] = make_float4(p[0] * vs, p[1] * vs, p[2] * vs, p[3] * vs);
+  __syncthreads();
+  if (tid < 4) {
+    float z = 0.0f;
+    for (int k = 0; k < 8; k++) z += rs[tid][k];
+    inv[tid] = 1.0f / z;
+  }
+  /* pq1_tq_pv on chunk 0: warp w < 4 takes every 4th position */
+  if (w < 4) {
+    float a[4][4];
+#pragma unroll
+    for (int h = 0; h < 4; h++)
+#pragma unroll
+      for (int i = 0; i < 4; i++) a[h][i] = 0.0f;
+    for (int t = w; t < T; t += 4) {
+      const uint32_t* cw = cs + t * CW;
+      int v[4];
+      if (B == 3) {
+        const uint32_t mb = cw[l >> 2] >> (8 * (l & 3)), sb = cw[8 + (l >> 3)] >> (4 * (l & 7));
+#pragma unroll
+        for (int i = 0; i < 4; i++) v[i] = ((mb >> (2 * i)) & 3) | (((sb >> i) & 1) << 2);
+      } else {
+        const uint32_t nb = cw[l >> 1] >> (16 * (l & 1));
+#pragma unroll
+        for (int i = 0; i < 4; i++) v[i] = (nb >> (4 * i)) & 15;
+      }
+      const float4 g = wt[t];
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const float e = cent[v[i]];
+        a[0][i] = fmaf(g.x, e, a[0][i]); a[1][i] = fmaf(g.y, e, a[1][i]);
+        a[2][i] = fmaf(g.z, e, a[2][i]); a[3][i] = fmaf(g.w, e, a[3][i]);
+      }
+    }
+#pragma unroll
+    for (int h = 0; h < 4; h++)
+      reinterpret_cast<float4*>(red[w][h])[l] = make_float4(a[h][0], a[h][1], a[h][2], a[h][3]);
+  }
+  __syncthreads();
+  if (w >= 4) return;
+  /* warp h: warp 0's sum + warps 1..3 in order (pq1_tq_pv), then pq1_tq_out */
+  const int h = w;
+  float4 r = reinterpret_cast<const float4*>(red[0][h])[l];
+  float y[4] = {r.x, r.y, r.z, r.w};
+#pragma unroll
+  for (int k = 1; k < 4; k++) {
+    r = reinterpret_cast<const float4*>(red[k][h])[l];
+    y[0] += r.x; y[1] += r.y; y[2] += r.z; y[3] += r.w;
+  }
+  float o4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  o4[0] += y[0]; o4[1] += y[1]; o4[2] += y[2]; o4[3] += y[3];
+  pq1_fwht128(o4, l);
+  const float k = inv[h] * 0.0883883476f;
+  float4 o;
+  o.x = pq1_tq_dsign(o4[0] * k, 4 * l); o.y = pq1_tq_dsign(o4[1] * k, 4 * l + 1);
+  o.z = pq1_tq_dsign(o4[2] * k, 4 * l + 2); o.w = pq1_tq_dsign(o4[3] * k, 4 * l + 3);
+  reinterpret_cast<float4*>(atto + (size_t)(kh * 4 + h) * 128)[l] = o;
+}
+template <int BK, int BV>
+static int pq1_tq_short_go(const float* qo_d, const unsigned short* stage_d, const uint8_t* par_d, uint32_t* kcode,
+                           float* ksc, uint32_t* vcode, float* vsc, float* sc_d, float* atto_d, int nkv, int ctx,
+                           cudaStream_t s) {
+  pq1_tq_qks<BK, BV><<<dim3(nkv, (ctx + PQ1_TQ_SB - 1) / PQ1_TQ_SB), PQ1_TQ_SB, 0, s>>>(
+      qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, nkv, ctx);
+  pq1_tq_tail<BV><<<nkv, 256, 0, s>>>(sc_d, vcode, vsc, par_d, atto_d, ctx);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+/* store of the staged rows at npos (from par) + attention, ctx <= PQ1_TQ_CH */
+extern "C" int pq1_tq_short_launch(int bits, const float* qo_d, const unsigned short* stage_d, const uint8_t* par_d,
+                                   uint32_t* kcode, float* ksc, uint32_t* vcode, float* vsc, float* sc_d,
+                                   float* atto_d, int nh, int nkv, int ctx, void* stream) {
+  cudaStream_t s = (cudaStream_t)stream;
+  if (nh != 4 * nkv || ctx <= 0 || ctx > PQ1_TQ_CH) return -2;
+  if (bits == 3) return pq1_tq_short_go<3, 3>(qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, atto_d, nkv, ctx, s);
+  if (bits == 4) return pq1_tq_short_go<4, 4>(qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, atto_d, nkv, ctx, s);
+  if (bits == 43) return pq1_tq_short_go<4, 3>(qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, atto_d, nkv, ctx, s);
+  return -2;
+}
 /* the store alone (host-path rows already staged; npos explicit) */
 extern "C" int pq1_tq_store_launch(int bits, const unsigned short* stage_d, int npos, uint32_t* kcode,
                                    float* ksc, uint32_t* vcode, float* vsc, int nkv, int ctx, void* stream) {
@@ -3394,6 +3605,10 @@ extern "C" int pq1_attn_tq_launch(int bits, const float* qkv_d, const float* nw_
   if (nh != 4 * nkv || nkv > 16 || nh + nkv > PQ1_APRE_MAXH || (bits != 3 && bits != 4 && bits != 43)) return -2;
   pq1_attn_pre3<<<(nh + nkv + 7) / 8, 256, 0, s>>>(qkv_d, nw_d, par_d, qo_d, stage_d,
                                                    stage_d + (size_t)nkv * 128, nh, nkv, -1, 0, NULL);
+  static int shortp = -1;   /* PQ1_TQSHORT=0: the long chain at every ctx (A/B) */
+  if (shortp < 0) shortp = getenv("PQ1_TQSHORT") ? atoi(getenv("PQ1_TQSHORT")) : 1;
+  if (ctx <= PQ1_TQ_CH && shortp)
+    return pq1_tq_short_launch(bits, qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, atto_d, nh, nkv, ctx, stream);
   if (pq1_tq_store_go(bits, stage_d, par_d, -1, kcode, ksc, vcode, vsc, nkv, ctx, s) != 0) return -1;
   return pq1_tq_fa_launch(bits, qo_d, par_d, kcode, ksc, vcode, vsc, sc_d, part_d, inv_d, atto_d, nh, nkv, ctx, stream);
 }

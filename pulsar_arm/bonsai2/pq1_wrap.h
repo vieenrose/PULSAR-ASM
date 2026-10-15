@@ -86,6 +86,9 @@ int pq1_tq_store_launch(int bits, const unsigned short *stage_d, int npos, unsig
 int pq1_tq_fa_launch(int bits, const float *qo_d, const unsigned char *par_d, unsigned int *kcode,
                      float *ksc, unsigned int *vcode, float *vsc, float *sc_d, float *part_d,
                      float *inv_d, float *atto_d, int nh, int nkv, int ctx, void *stream);
+int pq1_tq_short_launch(int bits, const float *qo_d, const unsigned short *stage_d, const unsigned char *par_d,
+                        unsigned int *kcode, float *ksc, unsigned int *vcode, float *vsc, float *sc_d,
+                        float *atto_d, int nh, int nkv, int ctx, void *stream);
 int pq1_attn_tq_launch(int bits, const float *qkv_d, const float *nw_d, const unsigned char *par_d,
                        float *qo_d, unsigned short *stage_d, unsigned int *kcode, float *ksc,
                        unsigned int *vcode, float *vsc, float *sc_d, float *part_d, float *inv_d,
