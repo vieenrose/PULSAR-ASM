@@ -301,70 +301,113 @@ h2f:
  * Clobbers x0-x7, w0-w7, s0-s5. */
     .align 2
 k2_q8_quant:
-    cbz x2, 9f
+    cbz x2, .Lq8_ret
     mov x3, #0                      /* block index */
-    lsr x8, x2, #8                  /* nb = k/256 (x2 gets clobbered below!) */
+    lsr x8, x2, #8                  /* nb = k/256 */
     mov x7, #292
-0:  /* max scan over 256 */
-    mov x4, #0                      /* j */
-    fmov s2, wzr                    /* amax */
-    fmov s3, wzr                    /* max */
-1:  ldr s0, [x0, x4, lsl #2]
-    fabs s1, s0
-    fcmp s1, s2
-    b.ls 2f
-    fmov s2, s1
-    fmov s3, s0
-2:  add x4, x4, #1
-    cmp x4, #256
-    b.ne 1b
-    /* yb = x1 + block*292 */
+.Lq8_blk:
+    /* pass 1 (Exp80, NEON): amax = max |x|. fmaxnm is exact and ignores NaN,
+       like the scalar `fcmp/b.ls` it replaces (amax starts at 0). */
+    mov x2, x0
+    mov x4, #16
+    movi v5.4s, #0
+.Lq8_max:
+    ldp q0, q1, [x2], #32
+    ldp q2, q3, [x2], #32
+    fabs v0.4s, v0.4s
+    fabs v1.4s, v1.4s
+    fabs v2.4s, v2.4s
+    fabs v3.4s, v3.4s
+    fmaxnm v0.4s, v0.4s, v1.4s
+    fmaxnm v2.4s, v2.4s, v3.4s
+    fmaxnm v0.4s, v0.4s, v2.4s
+    fmaxnm v5.4s, v5.4s, v0.4s
+    subs x4, x4, #1
+    b.ne .Lq8_max
+    fmaxnmv s2, v5.4s               /* amax */
     madd x5, x3, x7, x1             /* yb */
     fcmp s2, #0.0
-    b.ne 3f
+    b.ne .Lq8_nz
     /* zero block: d=0, qs=0 */
     str wzr, [x5]
     mov x4, #0
     mov x6, #0
-4:  str x6, [x5, x4]
+.Lq8_z:
+    str x6, [x5, x4]
     add x4, x4, #8
     cmp x4, #264                    /* covers d(4)+qs(256) */
-    b.ne 4b
-    b 8f
-3:  /* iscale = -127/max */
-    mov w4, #0xc2fe0000
-    fmov s4, w4          /* -127.0f */
+    b.ne .Lq8_z
+    b .Lq8_next
+.Lq8_nz:
+    /* s3 = signed value of the FIRST element with |x| == amax (strict-> max) */
+    dup v2.4s, v2.s[0]
+    mov x2, x0
+.Lq8_find:
+    ldr q0, [x2], #16
+    fabs v1.4s, v0.4s
+    fcmeq v1.4s, v1.4s, v2.4s
+    umaxv s3, v1.4s
+    fmov w10, s3
+    cbz w10, .Lq8_find
+    umov w10, v1.s[0]
+    cbz w10, 1f
+    mov s3, v0.s[0]
+    b .Lq8_have
+1:  umov w10, v1.s[1]
+    cbz w10, 2f
+    mov s3, v0.s[1]
+    b .Lq8_have
+2:  umov w10, v1.s[2]
+    cbz w10, 3f
+    mov s3, v0.s[2]
+    b .Lq8_have
+3:  mov s3, v0.s[3]
+.Lq8_have:
+    /* iscale = -127/max */
+    mov w10, #0xc2fe0000
+    fmov s4, w10                    /* -127.0f */
     fdiv s4, s4, s3
-    /* qs[j] = clamp(nearest_int(iscale*x[j])) */
-    mov x4, #0
+    dup v4.4s, v4.s[0]              /* lane 0 keeps iscale for the d = 1/iscale below */
+    mov w10, #0x4b40                /* 12582912.f = 0x4B400000 */
+    lsl w10, w10, #16
+    dup v1.4s, w10
+    mov w10, #0x42fe                /* 127.0f = 0x42FE0000 */
+    lsl w10, w10, #16
+    dup v2.4s, w10
     add x6, x5, #4                  /* qs */
-5:  ldr s0, [x0, x4, lsl #2]
-    mov w2, #0x4b40                 /* 12582912.f = 0x4B400000 */
-    lsl w2, w2, #16
-    fmov s1, w2
-    fmadd s0, s0, s4, s1             /* FUSED x*iscale + magic (gcc contracts
-                                        `iscale*x + 12582912.f` to one fmadd;
-                                        separate fmul+fadd double-rounds and
-                                        can flip near-.5 values by 1) */
-    fmov w2, s0
-    and w2, w2, #0x007fffff
-    sub w2, w2, #0x00400000         /* nearest_int */
-    mov w10, #127                   /* NOT w4: x4 = loop index j! */
-    cmp w2, #127
-    csel w2, w2, w10, lt            /* v < 127 ? v : 127 */
-    strb w2, [x6, x4]
-    add x4, x4, #1
-    cmp x4, #256
-    b.ne 5b
+    mov x2, x0
+    mov x4, #32
+.Lq8_q:
+    /* n = fcvtzs(min((x*iscale + magic) - magic, 127)). The fmla is fused like
+       the scalar fmadd; magic+n is exact, so the subtraction recovers n exactly. */
+    ldp q0, q3, [x2], #32
+    mov v5.16b, v1.16b
+    fmla v5.4s, v0.4s, v4.4s
+    fsub v5.4s, v5.4s, v1.4s
+    fmin v5.4s, v5.4s, v2.4s
+    fcvtzs v5.4s, v5.4s
+    mov v0.16b, v1.16b
+    fmla v0.4s, v3.4s, v4.4s
+    fsub v0.4s, v0.4s, v1.4s
+    fmin v0.4s, v0.4s, v2.4s
+    fcvtzs v0.4s, v0.4s
+    xtn v5.4h, v5.4s
+    xtn2 v5.8h, v0.4s
+    xtn v5.8b, v5.8h
+    str d5, [x6], #8
+    subs x4, x4, #1
+    b.ne .Lq8_q
     /* d = 1.0/iscale */
     fmov s0, #1.0
     fdiv s0, s0, s4
     str s0, [x5]
-8:  add x3, x3, #1
+.Lq8_next:
+    add x3, x3, #1
     add x0, x0, #1024
-    cmp x3, x8                      /* block < nb */
-    b.ne 0b
-9:  ret
+    cmp x3, x8
+    b.ne .Lq8_blk
+.Lq8_ret:
+    ret
 
 /* ---------------- k2q4_gemv_range (C signature):
  *   w0=r0, w1=r1, w2=cols, x3=w, x4=x(unused), x5=y, x6=xq
