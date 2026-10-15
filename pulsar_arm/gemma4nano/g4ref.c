@@ -120,20 +120,24 @@ static float h2f(uint16_t h) {
  * on every IEEE double machine; accurate to a few ulp, which is all the model
  * needs. */
 static double pow2i(int k) { uint64_t b = (uint64_t)(k + 1023) << 52; double d; memcpy(&d, &b, 8); return d; }
+/* exp constants at file scope: g4_host.S receives a table built from these same
+   definitions (g4_exp_table), so the assembly uses identical bits */
+static const double EXP_LOG2E = 1.4426950408889634, EXP_LN2HI = 6.93147180369123816490e-01,
+                    EXP_LN2LO = 1.90821492927058770002e-10, EXP_SH = 6755399441055744.0; /* 1.5*2^52 */
+static const double EXP_P0 = 1.0 / 6227020800.0;            /* 1/13! */
+static const double EXP_C[13] = {1.0 / 479001600.0, 1.0 / 39916800.0, 1.0 / 3628800.0,
+    1.0 / 362880.0, 1.0 / 40320.0, 1.0 / 5040.0, 1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0,
+    1.0 / 6.0, 0.5, 1.0, 1.0};
+static const double GELU_C1 = 1.5957691216057308, GELU_C3 = 0.07135481627462202;
 static double g4_exp(double x) {
     if (x != x) return x;
     if (x > 709.0) return INFINITY;
     if (x < -745.0) return 0.0;
-    const double LOG2E = 1.4426950408889634, LN2HI = 6.93147180369123816490e-01,
-                 LN2LO = 1.90821492927058770002e-10, SH = 6755399441055744.0; /* 1.5*2^52 */
-    double kd = (x * LOG2E + SH) - SH;          /* round to nearest integer */
+    double kd = (x * EXP_LOG2E + EXP_SH) - EXP_SH;          /* round to nearest integer */
     int k = (int)kd;
-    double r = (x - kd * LN2HI) - kd * LN2LO;   /* |r| <= ~0.347 */
-    double p = 1.0 / 6227020800.0;              /* 1/13! */
-    static const double C[13] = {1.0 / 479001600.0, 1.0 / 39916800.0, 1.0 / 3628800.0,
-        1.0 / 362880.0, 1.0 / 40320.0, 1.0 / 5040.0, 1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0,
-        1.0 / 6.0, 0.5, 1.0, 1.0};
-    for (int i = 0; i < 13; i++) p = p * r + C[i];
+    double r = (x - kd * EXP_LN2HI) - kd * EXP_LN2LO;       /* |r| <= ~0.347 */
+    double p = EXP_P0;
+    for (int i = 0; i < 13; i++) p = p * r + EXP_C[i];
     int k1 = k / 2, k2 = k - k1;                /* each in [-538, 512] */
     return (p * pow2i(k1)) * pow2i(k2);
 }
@@ -302,9 +306,8 @@ static void rmsnorm_noscale(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] = (float)((double)x[i] / r);
 }
 static float gelu(float xf) {
-    const double c1 = 1.5957691216057308, c3 = 0.07135481627462202;
     double x = xf;
-    return (float)(x / (1.0 + g4_exp(-(c1 * x + c3 * (x * x * x)))));
+    return (float)(x / (1.0 + g4_exp(-(GELU_C1 * x + GELU_C3 * (x * x * x)))));
 }
 static void rope(float *x, const float *c, const float *s, int hd) {
     int h = hd / 2;
@@ -327,6 +330,32 @@ static float xs[H], hb[H], qb[NH * HD_F], kb[HD_F], vb[HD_F], ab[NH * HD_F],
              gb[2 * INTER], ub[2 * INTER], pin[NL * PLE], projb[NL * PLE], pleg[PLE],
              rowe[NL * PLE], sc[MAXSEQ], logits[VOCAB];
 static uint8_t XQ[(2 * INTER / 256) * Q8B];
+
+/* One query head over cached positions [lo, pos]: scores as float fmaf chains over
+   d ascending, max, exp in float64 (g4_exp) with a sequential float64 sum,
+   p = (float)(e / sum), then o[d] = fmaf chain over t ascending. Scaling is 1.0. */
+static void attn_head_ref(const float *q, const float *K, const float *V, int lo, int pos, int hd, float *o) {
+    static double e[MAXSEQ];
+    float mx = -INFINITY;
+    for (int t = lo; t <= pos; t++) {
+        const float *k = K + (size_t)t * hd;
+        float s = 0.0f;
+        for (int d = 0; d < hd; d++) s = fmaf(k[d], q[d], s);
+        sc[t] = s; if (s > mx) mx = s;
+    }
+    double sum = 0;
+    for (int t = lo; t <= pos; t++) { e[t] = g4_exp((double)sc[t] - (double)mx); sum += e[t]; }
+    for (int d = 0; d < hd; d++) o[d] = 0.0f;
+    for (int t = lo; t <= pos; t++) {
+        float p = (float)(e[t] / sum);
+        const float *v = V + (size_t)t * hd;
+        for (int d = 0; d < hd; d++) o[d] = fmaf(p, v[d], o[d]);
+    }
+}
+/* g[i] = gelu(g[i]) * u[i]  (GeGLU of the MLP, and of the per-layer-input gate) */
+static void geglu_ref(float *g, const float *u, int n) { for (int i = 0; i < n; i++) g[i] = gelu(g[i]) * u[i]; }
+static void (*G_ATTN)(const float *, const float *, const float *, int, int, int, float *) = attn_head_ref;
+static void (*G_GEGLU)(float *, const float *, int) = geglu_ref;
 
 static void __attribute__((unused)) forward(int tok, int pos) {
     /* embedding and per-layer inputs */
@@ -372,25 +401,8 @@ static void __attribute__((unused)) forward(int tok, int pos) {
             memcpy(VC[il] + (size_t)pos * hd, vb, hd * 4);
         }
         int lo = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
-        for (int j = 0; j < NH; j++) {
-            const float *q = qb + j * hd;
-            float mx = -INFINITY;
-            for (int t = lo; t <= pos; t++) {
-                const float *k = KC[src] + (size_t)t * hd;
-                float s = 0.0f;
-                for (int d = 0; d < hd; d++) s = fmaf(k[d], q[d], s);
-                sc[t] = s; if (s > mx) mx = s;
-            }
-            double sum = 0, e[MAXSEQ];
-            for (int t = lo; t <= pos; t++) { e[t] = g4_exp((double)sc[t] - (double)mx); sum += e[t]; }
-            float *o = ab + j * hd;
-            for (int d = 0; d < hd; d++) o[d] = 0.0f;
-            for (int t = lo; t <= pos; t++) {
-                float p = (float)(e[t] / sum);
-                const float *v = VC[src] + (size_t)t * hd;
-                for (int d = 0; d < hd; d++) o[d] = fmaf(p, v[d], o[d]);
-            }
-        }
+        for (int j = 0; j < NH; j++)
+            G_ATTN(qb + j * hd, KC[src], VC[src], lo, pos, hd, ab + j * hd);
         q8k(ab, XQ, NH * hd);
         G_Q4(L->o, XQ, hb);
         { float t[H]; rmsnorm(hb, L->n_post_attn, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
@@ -398,14 +410,14 @@ static void __attribute__((unused)) forward(int tok, int pos) {
         rmsnorm(xs, L->n_ffn, hb, H);
         q8k(hb, XQ, H);
         { const tensor_t *ts[2] = {L->gate, L->up}; float *ys[2] = {gb, ub}; G_Q4N(2, ts, XQ, ys); }
-        for (int i = 0; i < inter; i++) gb[i] = gelu(gb[i]) * ub[i];
+        G_GEGLU(gb, ub, inter);
         q8k(gb, XQ, inter);
         G_Q4(L->down, XQ, hb);
         { float t[H]; rmsnorm(hb, L->n_post_ffw, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* per-layer input */
         q8k(xs, XQ, H);
         G_Q4(L->ig, XQ, pleg);
-        for (int i = 0; i < PLE; i++) pleg[i] = gelu(pleg[i]) * pin[il * PLE + i];
+        G_GEGLU(pleg, pin + il * PLE, PLE);
         q8k(pleg, XQ, PLE);
         G_Q4(L->proj, XQ, hb);
         { float t[H]; rmsnorm(hb, L->n_post, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }

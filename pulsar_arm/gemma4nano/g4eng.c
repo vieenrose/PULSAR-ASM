@@ -1,4 +1,5 @@
-/* g4eng.c - Gemma 4 E2B (text only) on the Jetson Nano: host + CUDA (driver API).
+/* g4eng.c - Gemma 4 E2B (text only) on the Jetson Nano: host + CUDA (driver API),
+ * hot host loops in AArch64 assembly (g4_host.S).
  *
  * The forward pass is g4ref.c's own forward() (included), with its three GEMV
  * hooks pointed at the GPU kernels that g4gemv_test proved bit-identical to the
@@ -10,7 +11,7 @@
  * after profiling.
  *
  * Build (Nano, driver only):
- *   gcc -O2 -fopenmp -ffp-contract=off -o g4eng g4eng.c -ldl -lm
+ *   gcc -O2 -fopenmp -ffp-contract=off -o g4eng g4eng.c g4_host.S -ldl -lm
  * Run:   ./g4eng <gemma.gguf> <rope.bin> <ids...> [--gen N]
  */
 #define G4REF_NO_MAIN
@@ -79,8 +80,12 @@ static void wait_stream(void) {
 static void copy_from_pinned(void *dst, const void *src, size_t n) {
     size_t q = (n / 256) * 64;
     char *d = (char *)dst; const char *s = (const char *)src;
+#if !defined(__aarch64__)
+    (void)d; (void)s; memcpy(dst, src, n); return;   /* host-side compile check only */
+#endif
     if (q < 64) { memcpy(dst, src, n); return; }
     for (size_t i = 0; i < q; i += 64) {
+#if defined(__aarch64__)
         __asm__ volatile(
             "ld1 {v0.16b-v3.16b}, [%4]\n\t" "ld1 {v4.16b-v7.16b}, [%5]\n\t"
             "ld1 {v16.16b-v19.16b}, [%6]\n\t" "ld1 {v20.16b-v23.16b}, [%7]\n\t"
@@ -89,6 +94,7 @@ static void copy_from_pinned(void *dst, const void *src, size_t n) {
             :: "r"(d + i), "r"(d + q + i), "r"(d + 2 * q + i), "r"(d + 3 * q + i),
                "r"(s + i), "r"(s + q + i), "r"(s + 2 * q + i), "r"(s + 3 * q + i)
             : "v0","v1","v2","v3","v4","v5","v6","v7","v16","v17","v18","v19","v20","v21","v22","v23","memory");
+#endif
     }
     if (4 * q < n) memcpy(d + 4 * q, s + 4 * q, n - 4 * q);
 }
@@ -112,6 +118,38 @@ static void q4_fast(uint64_t *w, uint64_t *s, uint32_t cols, uint32_t rows, cons
     copy_from_pinned(y, h_out, (size_t)rows * 4);
     if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
 }
+/* ------------------------------------------------- host kernels (g4_host.S) */
+extern void g4_exp_vec(const double *x, double *y, long n, const double *tab);
+extern void g4_geglu(float *g, const float *u, long n, const double *tab);
+extern void g4_attn_scores(const float *q, const float *K, long n, long hd, float *s);
+extern void g4_attn_pv(const float *p, const float *V, long n, long hd, float *o);
+static double TAB2[48];   /* exp/GELU constants from g4ref.c's own definitions, duplicated pairs */
+static void build_tab(void) {
+    double v[24] = {EXP_P0};
+    for (int i = 0; i < 13; i++) v[1 + i] = EXP_C[i];
+    v[14] = EXP_LOG2E; v[15] = EXP_SH; v[16] = EXP_LN2HI; v[17] = EXP_LN2LO;
+    v[18] = 709.0; v[19] = -745.0; v[20] = INFINITY; v[21] = GELU_C1; v[22] = GELU_C3; v[23] = 1.0;
+    for (int i = 0; i < 24; i++) TAB2[2 * i] = TAB2[2 * i + 1] = v[i];
+}
+static void geglu_asm(float *g, const float *u, int n) { g4_geglu(g, u, n, TAB2); }
+/* attn_head_ref with the hot loops in assembly; same operations in the same order */
+static void attn_head_asm(const float *q, const float *K, const float *V, int lo, int pos, int hd, float *o) {
+    static double xin[MAXSEQ], e[MAXSEQ];
+    static float pp[MAXSEQ];
+    int n = pos - lo + 1;
+    g4_attn_scores(q, K + (size_t)lo * hd, n, hd, sc + lo);
+    float mx = -INFINITY;
+    for (int t = lo; t <= pos; t++) if (sc[t] > mx) mx = sc[t];
+    for (int i = 0; i < n; i++) xin[i] = (double)sc[lo + i] - (double)mx;
+    int ne = n & ~1;
+    if (ne) g4_exp_vec(xin, e, ne, TAB2);
+    if (n & 1) e[n - 1] = g4_exp(xin[n - 1]);
+    double sum = 0;
+    for (int i = 0; i < n; i++) sum += e[i];
+    for (int i = 0; i < n; i++) pp[i] = (float)(e[i] / sum);
+    g4_attn_pv(pp, V + (size_t)lo * hd, n, hd, o);
+}
+
 /* ---------------------------------------------------------------- hooks */
 static void gpu_q4(const tensor_t *t, const uint8_t *xq, float *y) {
     int i = (int)(t - T);
@@ -292,6 +330,11 @@ static void gpu_init(void) {
     fprintf(stderr, "GPU: %d Q4_0 tensors + Q6_K head + F16 proj, %.1f MB on device, %.0f MB free of %.0f; load %.0f ms\n",
             nq4, dev_bytes / 1048576.0, fr / 1048576.0, tot / 1048576.0, now_ms() - t0);
     G_Q4 = gpu_q4; G_Q4N = gpu_q4n; G_HEAD = gpu_head; G_F16 = gpu_f16;
+    /* G4ASM=0 keeps the C host loops (A/B and fallback) */
+    if (!(getenv("G4ASM") && getenv("G4ASM")[0] == '0')) {
+        build_tab(); G_GEGLU = geglu_asm; G_ATTN = attn_head_asm;
+        fprintf(stderr, "host kernels: assembly (g4_host.S)\n");
+    }
 }
 
 int main(int argc, char **argv) {
