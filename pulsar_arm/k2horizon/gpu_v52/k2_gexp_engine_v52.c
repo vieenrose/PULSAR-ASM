@@ -35,6 +35,9 @@ static char jit_log[4096];
 static CUresult (*pModGetFunc)(CUfunction *, CUmodule, const char *);
 static CUresult (*pMemHostRegister_v2)(void *, size_t, unsigned);
 static CUresult (*pMemAllocManaged)(void **, size_t, unsigned);
+static CUresult (*pMemHostGetDevicePointer)(uint64_t *, void *, unsigned);
+static uint64_t h_out_dev;   /* Exp95: device alias of the DEVICEMAP-pinned h_out */
+static int y_direct;         /* kernel writes y straight into h_out: no D2H copy */
 static CUresult (*pMemAlloc)(uint64_t *, size_t);
 static CUresult (*pMemcpyDtoH)(void *, uint64_t, size_t);
 static CUresult (*pMemcpyHtoD)(uint64_t, const void *, size_t);
@@ -885,6 +888,8 @@ void cuda_init(void) {
     SYM(ModLoadData, "ModuleLoadData") SYM(ModGetFunc, "ModuleGetFunction")
     SYM(MemHostRegister_v2, "MemHostRegister_v2")
     pMemAllocManaged = dlsym(libcuda, "cuMemAllocManaged");
+    pMemHostGetDevicePointer = (CUresult (*)(uint64_t *, void *, unsigned))
+        dlsym(libcuda, "cuMemHostGetDevicePointer_v2");
     pMemAlloc = (CUresult (*)(uint64_t *, size_t))dlsym(libcuda, "cuMemAlloc_v2");
     pMemcpyDtoH = (CUresult (*)(void *, uint64_t, size_t))dlsym(libcuda, "cuMemcpyDtoH_v2");
     pMemcpyHtoD = dlsym(libcuda, "cuMemcpyHtoD_v2");
@@ -913,10 +918,19 @@ void cuda_init(void) {
       pCtxSetCurrent = (CUresult (*)(CUcontext))dlsym(libcuda, "cuCtxSetCurrent");
       if (pCtxSetCurrent && !pCtxSetCurrent(g_ctx)) ctx_current = 1;
       if (pMemHostAlloc && pMemcpyHtoDAsync && pMemcpyDtoHAsync) {
+          /* Exp95: allocate h_out DEVICEMAP so the kernel can store y into it directly.
+             Measured in isolation: kernel->pinned costs 37-44 us per call where
+             kernel->device + cuMemcpyDtoHAsync costs 68-88 us (the async D2H alone is
+             ~30-50 us). K2YDIRECT=0 keeps the old kernel->device + D2H path. */
+          int want_direct = !(getenv("K2YDIRECT") && getenv("K2YDIRECT")[0] == '0') &&
+                            pMemHostGetDevicePointer;
           if (!pMemHostAlloc(&h_in, XQ_CAP, CU_MEMHOSTALLOC_PORTABLE) &&
-              !pMemHostAlloc(&h_out, Y_CAP, CU_MEMHOSTALLOC_PORTABLE))
-              printf("CUDA pinned staging %u+%u B\n",
-                     (unsigned)XQ_CAP, (unsigned)Y_CAP);
+              !pMemHostAlloc(&h_out, Y_CAP, CU_MEMHOSTALLOC_PORTABLE | (want_direct ? 2 : 0))) {
+              if (want_direct && !pMemHostGetDevicePointer(&h_out_dev, h_out, 0)) y_direct = 1;
+              printf("CUDA pinned staging %u+%u B%s\n",
+                     (unsigned)XQ_CAP, (unsigned)Y_CAP,
+                     y_direct ? " (y written in place by the kernel)" : "");
+          }
           else { h_in = h_out = 0; printf("pinned staging unavailable (pageable)\n"); }
       }
       if (pStreamCreate && pEventCreate && pEventRecord && pEventQuery) {
@@ -1058,7 +1072,7 @@ void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
        classify value for the self-test's CPU reference (which can only rebuild
        one tensor), and use the requested count (r1-r0) for the real launch. */
     uint32_t rows_cls = rowsf;
-    uint64_t d_sc = dev_sc, d_xq = dev_xq, d_y = dev_y, scb;
+    uint64_t d_sc = dev_sc, d_xq = dev_xq, d_y = y_direct ? h_out_dev : dev_y, scb;
     size_t nrows, sc_bytes, xq_bytes;
     void *args[] = { &dev_w, &d_sc, &d_xq, &d_y, (void *)&r0, (void *)&r1,
                      (void *)&nb32, (void *)&rowsf };
@@ -1148,7 +1162,8 @@ void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
                  (unsigned long long)d_sc, (unsigned long long)d_xq,
                  (unsigned long long)d_y, grid); fflush(stdout); ngc++; } }
     if (!r) r = pLaunch(k_gemv, grid, 1, 1, 32, 8, 1, 0, g_stream, args, NULL);
-    if (!r && h_out)
+    if (!r && y_direct) { /* kernel stored y into h_out: nothing to copy back */ }
+    else if (!r && h_out)
         r = pMemcpyDtoHAsync(h_out, d_y + (uint64_t)r0 * 4, nrows * 4, g_stream);
     else if (!r && pMemcpyDtoHAsync)
         r = pMemcpyDtoHAsync((void *)(uintptr_t)(y + (uint64_t)r0 * 4),
