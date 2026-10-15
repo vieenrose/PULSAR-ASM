@@ -2580,8 +2580,16 @@ extern "C" int pq1_fa_launch(const float* qo_d, const unsigned short* kc_d,
 /* FAST (loop-261014-2216 row 22, PQ1_RMSV=0 keeps the old tail): lanes 0 and 1
  * form flo and fhi at once, and for n a power of two s/n is __dmul_rn(s, 1/n),
  * the same correctly rounded value of the same exact quotient (1/n exact), so
- * the two serial fp64 divide subroutines leave the critical path. */
-template <bool FAST>
+ * the two serial fp64 divide subroutines leave the critical path.
+ * V = 2 (default; PQ1_RMSV=1 is the row-22 kernel, 0 the original): no fp64 on
+ * the common path, as pq1_attn_pre2's head RMS. Each thread forms its 4 exact
+ * squares as fp32 pairs (TwoProd) and adds them in pair arithmetic, then 5 + 5
+ * shuffle levels: 13 levels of <= 2^-47 relative (terms >= 0), < 2^-43.3. The
+ * serial s is within 4095u < 2^-41.0 of the exact sum, so s lies within
+ * e = 2^-40 of H+L, and pre2's certificate (that interval inside H's float
+ * rounding interval, margin 1 - 2^-20) gives float(s/n) = H/n exactly for n a
+ * power of two and H in [2^-100, inf). Else lane 0 runs the serial chain. */
+template <int V>
 __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
                                                     const float* __restrict__ R,
                                                     const float* __restrict__ w,
@@ -2597,6 +2605,7 @@ __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
   __shared__ int sid[32];
   const int t = threadIdx.x, wp = t >> 5, l = t & 31, nw = blockDim.x >> 5;
   float4 v = reinterpret_cast<const float4*>(X)[t];
+  const float4 wv = reinterpret_cast<const float4*>(w)[t];   /* issued before the reduction */
   if (R) {
     const float4 r = reinterpret_cast<const float4*>(R)[t];
     v.x = pq1_fadd(v.x, r.x); v.y = pq1_fadd(v.y, r.y);
@@ -2604,49 +2613,98 @@ __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
     reinterpret_cast<float4*>(X)[t] = v;
   }
   reinterpret_cast<float4*>(sx)[t] = v;
-  double s;
-  {
-    const double a = pq1_f2d(v.x), b = pq1_f2d(v.y), c = pq1_f2d(v.z), d = pq1_f2d(v.w);
-    s = __fma_rn(d, d, __fma_rn(c, c, __fma_rn(b, b, __dmul_rn(a, a))));
-  }
-#pragma unroll
-  for (int o = 16; o; o >>= 1) s = __dadd_rn(s, __shfl_xor_sync(0xffffffffu, s, o));
-  if (l == 0) sw[wp] = s;
-  __syncthreads();
-  if (wp == 0) {
-    double S = l < nw ? sw[l] : 0.0;
-#pragma unroll
-    for (int o = 16; o; o >>= 1) S = __dadd_rn(S, __shfl_xor_sync(0xffffffffu, S, o));
-    const double dn = (double)n;
-    const bool p2 = FAST && (n & (n - 1)) == 0;
-    const double rn = 1.0 / dn;                     /* exact when p2 */
-    float flo, fhi;
-    if (FAST) {
-      const double Sd = l ? __dmul_ru(S, 1.0 + 1.0 / 1099511627776.0)
-                          : __dmul_rd(S, 1.0 - 1.0 / 1099511627776.0);
-      const float fl = pq1_d2f(p2 ? __dmul_rn(Sd, rn) : __ddiv_rn(Sd, dn));
-      flo = fl;
-      fhi = __shfl_sync(0xffffffffu, fl, 1);
+  if (V == 2) {
+    float H, L;
+    {
+      H = pq1_fmul(v.x, v.x); L = pq1_ffma(v.x, v.x, pq1_fneg(H));
+      float bh = pq1_fmul(v.y, v.y), bl = pq1_ffma(v.y, v.y, pq1_fneg(bh));
+      pq1_ff_add(H, L, bh, bl);
+      bh = pq1_fmul(v.z, v.z); bl = pq1_ffma(v.z, v.z, pq1_fneg(bh));
+      pq1_ff_add(H, L, bh, bl);
+      bh = pq1_fmul(v.w, v.w); bl = pq1_ffma(v.w, v.w, pq1_fneg(bh));
+      pq1_ff_add(H, L, bh, bl);
     }
-    if (l == 0) {
-      if (!FAST) {
-        flo = pq1_d2f(__ddiv_rn(__dmul_rd(S, 1.0 - 1.0 / 1099511627776.0), dn));
-        fhi = pq1_d2f(__ddiv_rn(__dmul_ru(S, 1.0 + 1.0 / 1099511627776.0), dn));
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      const float oh = __shfl_xor_sync(0xffffffffu, H, o), ol = __shfl_xor_sync(0xffffffffu, L, o);
+      pq1_ff_add(H, L, oh, ol);
+    }
+    if (l == 0) sw[wp] = __hiloint2double(__float_as_int(H), __float_as_int(L));
+    __syncthreads();
+    if (wp == 0) {
+      H = 0.f; L = 0.f;
+      if (l < nw) { const double p = sw[l]; H = __int_as_float(__double2hiint(p)); L = __int_as_float(__double2loint(p)); }
+#pragma unroll
+      for (int o = 16; o; o >>= 1) {
+        const float oh = __shfl_xor_sync(0xffffffffu, H, o), ol = __shfl_xor_sync(0xffffffffu, L, o);
+        pq1_ff_add(H, L, oh, ol);
       }
-      float f = flo;
-      if (serial || __float_as_uint(flo) != __float_as_uint(fhi) ||
-          (__float_as_uint(flo) & 0x7f800000u) == 0x7f800000u) {
-        double q = 0.0;
-        for (int j = 0; j < n; j++) { const double e = pq1_f2d(sx[j]); q = __fma_rn(e, e, q); }
-        f = pq1_d2f(p2 ? __dmul_rn(q, rn) : __ddiv_rn(q, dn));
-        if (nfb) atomicAdd(nfb, 1);
+      if (l == 0) {
+        const uint32_t hb = __float_as_uint(H);
+        /* n a power of two, finite, >= 2^-100: H / n is exact and normal */
+        int ok = !serial && (n & (n - 1)) == 0 && hb >= 0x0d800000u && hb < 0x7f800000u;
+        if (ok) {
+          const float ulp = __uint_as_float((hb & 0x7f800000u) - (23u << 23));
+          const float hup = pq1_fmul(ulp, 0.5f);
+          const float hdn = (hb & 0x007fffffu) ? hup : pq1_fmul(ulp, 0.25f);
+          const float eh = pq1_fmul(H, 1.0f / 1099511627776.0f);   /* e H, e = 2^-40 */
+          ok = pq1_fgt(pq1_fmul(hup, 0.99999904632568359375f), pq1_fadd(L, eh)) &&
+               pq1_fgt(pq1_fmul(hdn, 0.99999904632568359375f), pq1_fsub(eh, L));
+        }
+        float f = pq1_fmul(H, pq1_fdiv(1.0f, (float)n));   /* exact reciprocal when ok */
+        if (!ok) {
+          double q = 0.0;
+          for (int j = 0; j < n; j++) { const double e = pq1_f2d(sx[j]); q = __fma_rn(e, e, q); }
+          f = pq1_d2f(__ddiv_rn(q, (double)n));
+          if (nfb) atomicAdd(nfb, 1);
+        }
+        ssc = pq1_fdiv(1.0f, pq1_fsqrt(pq1_fadd(f, 1e-6f)));
       }
-      ssc = pq1_fdiv(1.0f, pq1_fsqrt(pq1_fadd(f, 1e-6f)));
+    }
+  } else {
+    double s;
+    {
+      const double a = pq1_f2d(v.x), b = pq1_f2d(v.y), c = pq1_f2d(v.z), d = pq1_f2d(v.w);
+      s = __fma_rn(d, d, __fma_rn(c, c, __fma_rn(b, b, __dmul_rn(a, a))));
+    }
+  #pragma unroll
+    for (int o = 16; o; o >>= 1) s = __dadd_rn(s, __shfl_xor_sync(0xffffffffu, s, o));
+    if (l == 0) sw[wp] = s;
+    __syncthreads();
+    if (wp == 0) {
+      double S = l < nw ? sw[l] : 0.0;
+  #pragma unroll
+      for (int o = 16; o; o >>= 1) S = __dadd_rn(S, __shfl_xor_sync(0xffffffffu, S, o));
+      const double dn = (double)n;
+      const bool p2 = (V == 1) && (n & (n - 1)) == 0;
+      const double rn = 1.0 / dn;                     /* exact when p2 */
+      float flo, fhi;
+      if ((V == 1)) {
+        const double Sd = l ? __dmul_ru(S, 1.0 + 1.0 / 1099511627776.0)
+                            : __dmul_rd(S, 1.0 - 1.0 / 1099511627776.0);
+        const float fl = pq1_d2f(p2 ? __dmul_rn(Sd, rn) : __ddiv_rn(Sd, dn));
+        flo = fl;
+        fhi = __shfl_sync(0xffffffffu, fl, 1);
+      }
+      if (l == 0) {
+        if (!(V == 1)) {
+          flo = pq1_d2f(__ddiv_rn(__dmul_rd(S, 1.0 - 1.0 / 1099511627776.0), dn));
+          fhi = pq1_d2f(__ddiv_rn(__dmul_ru(S, 1.0 + 1.0 / 1099511627776.0), dn));
+        }
+        float f = flo;
+        if (serial || __float_as_uint(flo) != __float_as_uint(fhi) ||
+            (__float_as_uint(flo) & 0x7f800000u) == 0x7f800000u) {
+          double q = 0.0;
+          for (int j = 0; j < n; j++) { const double e = pq1_f2d(sx[j]); q = __fma_rn(e, e, q); }
+          f = pq1_d2f(p2 ? __dmul_rn(q, rn) : __ddiv_rn(q, dn));
+          if (nfb) atomicAdd(nfb, 1);
+        }
+        ssc = pq1_fdiv(1.0f, pq1_fsqrt(pq1_fadd(f, 1e-6f)));
+      }
     }
   }
   __syncthreads();
   const float sc = ssc;
-  const float4 wv = reinterpret_cast<const float4*>(w)[t];
   float y[4];
   y[0] = pq1_fmul(pq1_fmul(v.x, sc), wv.x);
   y[1] = pq1_fmul(pq1_fmul(v.y, sc), wv.y);
@@ -2701,19 +2759,16 @@ __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
 
 static int pq1_rmsv(void) {
   static int v = -1;
-  if (v < 0) { const char* e = getenv("PQ1_RMSV"); v = e ? atoi(e) : 1; }
+  if (v < 0) { const char* e = getenv("PQ1_RMSV"); v = e ? atoi(e) : 2; }
   return v;
 }
 
 extern "C" int pq1_rms_q8k_launch(float* X_d, const float* R_d, const float* w_d, uint8_t* xq_d,
                                   int n, int serial, int* nfb_d, void* stream) {
   if (n < 256 || n > 4096 || (n & 255) != 0) return -2;
-  if (pq1_rmsv())
-    pq1_rms_q8k<true><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, serial, nfb_d,
-                                                           NULL, NULL);
-  else
-    pq1_rms_q8k<false><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, serial, nfb_d,
-                                                            NULL, NULL);
+#define PQ1_RMSL(V_) pq1_rms_q8k<V_><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, serial, nfb_d, NULL, NULL)
+  switch (pq1_rmsv()) { case 0: PQ1_RMSL(0); break; case 1: PQ1_RMSL(1); break; default: PQ1_RMSL(2); }
+#undef PQ1_RMSL
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
@@ -2722,12 +2777,9 @@ extern "C" int pq1_rms_q8k_pl_launch(float* X_d, const float* R_d, const float* 
                                      uint8_t* xq_d, uint32_t* pl_d, int* au_d, int n,
                                      void* stream) {
   if (n < 256 || n > 4096 || (n & 255) != 0) return -2;
-  if (pq1_rmsv())
-    pq1_rms_q8k<true><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, 0, NULL, pl_d,
-                                                           au_d);
-  else
-    pq1_rms_q8k<false><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, 0, NULL, pl_d,
-                                                            au_d);
+#define PQ1_RMSL(V_) pq1_rms_q8k<V_><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, 0, NULL, pl_d, au_d)
+  switch (pq1_rmsv()) { case 0: PQ1_RMSL(0); break; case 1: PQ1_RMSL(1); break; default: PQ1_RMSL(2); }
+#undef PQ1_RMSL
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
