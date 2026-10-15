@@ -308,6 +308,7 @@ static void rmsnorm_noscale(float *x, int n) {
 /* norm hooks (the engine points them at g4_host.S) */
 static void (*G_RMS)(const float *, const float *, float *, int) = rmsnorm;
 static void (*G_RMSNS)(float *, int) = rmsnorm_noscale;
+static void (*G_Q8K)(const float *, uint8_t *, int) = q8k;
 static float gelu(float xf) {
     double x = xf;
     return (float)(x / (1.0 + g4_exp(-(GELU_C1 * x + GELU_C3 * (x * x * x)))));
@@ -403,7 +404,7 @@ static void __attribute__((unused)) forward(int tok, int pos) {
         const float *cs = rope_cs(full, 0, pos), *sn = rope_cs(full, 1, pos);
         /* attention */
         G_RMS(xs, L->n_attn, hb, H);
-        q8k(hb, XQ, H);
+        G_Q8K(hb, XQ, H);
         if (il < FIRST_SHARED) {               /* q, k, v share the quantized input */
             const tensor_t *ts[3] = {L->q, L->k, L->v};
             float *ys[3] = {qb, kb, vb};
@@ -421,25 +422,25 @@ static void __attribute__((unused)) forward(int tok, int pos) {
         }
         int lo = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
         G_ATTNALL(qb, KC[src], VC[src], lo, pos, hd, ab);
-        q8k(ab, XQ, NH * hd);
+        G_Q8K(ab, XQ, NH * hd);
         G_Q4(L->o, XQ, hb);
         { float t[H]; G_RMS(hb, L->n_post_attn, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* MLP */
         G_RMS(xs, L->n_ffn, hb, H);
-        q8k(hb, XQ, H);
+        G_Q8K(hb, XQ, H);
         G_MLP(L, inter, hb);
         { float t[H]; G_RMS(hb, L->n_post_ffw, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* per-layer input */
-        q8k(xs, XQ, H);
+        G_Q8K(xs, XQ, H);
         G_Q4(L->ig, XQ, pleg);
         G_GEGLU(pleg, pin + il * PLE, PLE);
-        q8k(pleg, XQ, PLE);
+        G_Q8K(pleg, XQ, PLE);
         G_Q4(L->proj, XQ, hb);
         { float t[H]; G_RMS(hb, L->n_post, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         for (int i = 0; i < H; i++) xs[i] = xs[i] * L->scale;
     }
     G_RMS(xs, f32t(tens("output_norm.weight")), hb, H);
-    q8k(hb, XQ, H);
+    G_Q8K(hb, XQ, H);
     G_HEAD(emb, XQ, logits);   /* raw logits; soft-cap applied by the caller */
 }
 static float __attribute__((unused)) capped(float l) { return (float)(SOFTCAP * g4_tanh((double)l / SOFTCAP)); }

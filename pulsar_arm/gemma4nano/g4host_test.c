@@ -118,6 +118,25 @@ int main(void) {
         }
     }
     printf("g4_rmsnorm / _ns: %ld outputs, %ld mismatches\n", nrms, bad - b3);
+    long b4 = bad, nq8 = 0;
+    {   /* Q8_K: model sizes, zero blocks, +-ties of the max |x|, tiny and huge scales */
+        static float xv[2 * INTER];
+        static uint8_t q1[(2 * INTER / 256) * Q8B], q2[(2 * INTER / 256) * Q8B];
+        int sizes[] = {256, 1536, 2048, 4096, 6144, 12288};
+        for (int rep = 0; rep < 3000; rep++) {
+            int nn = sizes[rep % 6];
+            double sc_ = pow(10.0, -30.0 + 60.0 * ur());
+            for (int i = 0; i < nn; i++) xv[i] = (float)((ur() - 0.5) * sc_);
+            if (rep % 7 == 1) for (int i = 0; i < 256; i++) xv[i] = 0.0f;
+            if (rep % 7 == 2) { xv[5] = -3.0f * (float)sc_; xv[77] = 3.0f * (float)sc_; }
+            if (rep % 7 == 3) { xv[200] = 2.0f * (float)sc_; xv[13] = -2.0f * (float)sc_; }
+            memset(q1, 0xAA, sizeof q1); memset(q2, 0x55, sizeof q2);
+            q8k(xv, q1, nn); g4_q8k(xv, q2, nn);
+            if (memcmp(q1, q2, (size_t)(nn / 256) * Q8B)) { if (bad < 60) printf("  q8k n %d rep %d differs\n", nn, rep); bad++; }
+            nq8 += nn / 256;
+        }
+    }
+    printf("g4_q8k: %ld blocks (292 bytes each, compared whole), %ld mismatches\n", nq8, bad - b4);
     printf(bad ? "HOST ASM TEST: FAIL (%ld)\n" : "HOST ASM TEST: OK\n", bad);
     return bad != 0;
 }

@@ -338,7 +338,7 @@ static void gpu_init(void) {
     if (!(getenv("G4GPUMLP") && getenv("G4GPUMLP")[0] == '0')) { G_MLP = gpu_mlp; fprintf(stderr, "MLP: on the GPU (gate+up, GeGLU, Q8_K, down)\n"); }
     /* G4ASM=0 keeps the C host loops (A/B and fallback) */
     if (!(getenv("G4ASM") && getenv("G4ASM")[0] == '0')) {
-        build_tab(); G_GEGLU = geglu_asm; G_ATTN = attn_head_asm; G_ATTNALL = attn_all_asm; G_RMS = rms_asm; G_RMSNS = rmsns_asm;
+        build_tab(); G_GEGLU = geglu_asm; G_ATTN = attn_head_asm; G_ATTNALL = attn_all_asm; G_RMS = rms_asm; G_RMSNS = rmsns_asm; G_Q8K = q8k_asm;
         fprintf(stderr, "host kernels: assembly (g4_host.S)\n");
     }
 }

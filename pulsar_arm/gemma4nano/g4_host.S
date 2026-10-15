@@ -535,4 +535,126 @@ g4_rmsnorm_ns:
     ret
     .size g4_rmsnorm_ns, .-g4_rmsnorm_ns
 
+/* void g4_q8k(const float *x, uint8_t *y, long n) - g4ref.c q8k, bit for bit.
+ * The K2 engine's NEON quantizer (Exp80, proven bit-exact there), relabelled;
+ * same algorithm: max |x| (fmaxnm), the FIRST element holding it gives the signed
+ * max, iscale = -127/max, n = (fma(x, iscale, 0x1.8p23) - 0x1.8p23) clamped at 127
+ * (equal to the C bit trick: the fma result is an exact integer in that range),
+ * d = 1/iscale, 292-byte blocks. n % 256 == 0. Clobbers x0-x8, x10, x11, v0-v5. */
+    .global g4_q8k
+    .type g4_q8k, %function
+    .align 4
+g4_q8k:
+    cbz x2, .Lg8_ret
+    mov x3, #0                      /* block index */
+    lsr x8, x2, #8                  /* nb = k/256 */
+    mov x7, #292
+.Lg8_blk:
+    /* pass 1 (Exp80, NEON): amax = max |x|. fmaxnm is exact and ignores NaN,
+       like the scalar `fcmp/b.ls` it replaces (amax starts at 0). */
+    mov x2, x0
+    mov x4, #16
+    movi v5.4s, #0
+.Lg8_max:
+    ldp q0, q1, [x2], #32
+    ldp q2, q3, [x2], #32
+    fabs v0.4s, v0.4s
+    fabs v1.4s, v1.4s
+    fabs v2.4s, v2.4s
+    fabs v3.4s, v3.4s
+    fmaxnm v0.4s, v0.4s, v1.4s
+    fmaxnm v2.4s, v2.4s, v3.4s
+    fmaxnm v0.4s, v0.4s, v2.4s
+    fmaxnm v5.4s, v5.4s, v0.4s
+    subs x4, x4, #1
+    b.ne .Lg8_max
+    fmaxnmv s2, v5.4s               /* amax */
+    madd x5, x3, x7, x1             /* yb */
+    fcmp s2, #0.0
+    b.ne .Lg8_nz
+    /* zero block: d=0, qs=0 */
+    str wzr, [x5]
+    mov x4, #0
+    mov x6, #0
+.Lg8_z:
+    str x6, [x5, x4]
+    add x4, x4, #8
+    cmp x4, #264                    /* covers d(4)+qs(256) */
+    b.ne .Lg8_z
+    b .Lg8_next
+.Lg8_nz:
+    /* s3 = signed value of the FIRST element with |x| == amax (strict-> max) */
+    dup v2.4s, v2.s[0]
+    mov x2, x0
+.Lg8_find:
+    ldr q0, [x2], #16
+    fabs v1.4s, v0.4s
+    fcmeq v1.4s, v1.4s, v2.4s
+    umaxv s3, v1.4s
+    fmov w10, s3
+    cbz w10, .Lg8_find
+    umov w10, v1.s[0]
+    cbz w10, 1f
+    mov s3, v0.s[0]
+    b .Lg8_have
+1:  umov w10, v1.s[1]
+    cbz w10, 2f
+    mov s3, v0.s[1]
+    b .Lg8_have
+2:  umov w10, v1.s[2]
+    cbz w10, 3f
+    mov s3, v0.s[2]
+    b .Lg8_have
+3:  mov s3, v0.s[3]
+.Lg8_have:
+    /* iscale = -127/max */
+    mov w10, #0xc2fe0000
+    fmov s4, w10                    /* -127.0f */
+    fdiv s4, s4, s3
+    dup v4.4s, v4.s[0]              /* lane 0 keeps iscale for the d = 1/iscale below */
+    mov w10, #0x4b40                /* 12582912.f = 0x4B400000 */
+    lsl w10, w10, #16
+    dup v1.4s, w10
+    mov w10, #0x42fe                /* 127.0f = 0x42FE0000 */
+    lsl w10, w10, #16
+    dup v2.4s, w10
+    add x6, x5, #4                  /* qs */
+    mov x2, x0
+    mov x4, #32
+.Lg8_q:
+    /* n = fcvtzs(min((x*iscale + magic) - magic, 127)). The fmla is fused like
+       the scalar fmadd; magic+n is exact, so the subtraction recovers n exactly. */
+    ldp q0, q3, [x2], #32
+    mov v5.16b, v1.16b
+    fmla v5.4s, v0.4s, v4.4s
+    fsub v5.4s, v5.4s, v1.4s
+    fmin v5.4s, v5.4s, v2.4s
+    fcvtzs v5.4s, v5.4s
+    mov v0.16b, v1.16b
+    fmla v0.4s, v3.4s, v4.4s
+    fsub v0.4s, v0.4s, v1.4s
+    fmin v0.4s, v0.4s, v2.4s
+    fcvtzs v0.4s, v0.4s
+    xtn v5.4h, v5.4s
+    xtn2 v5.8h, v0.4s
+    xtn v5.8b, v5.8h
+    str d5, [x6], #8
+    subs x4, x4, #1
+    b.ne .Lg8_q
+    /* d = 1.0/iscale */
+    fmov s0, #1.0
+    fdiv s0, s0, s4
+    str s0, [x5]
+.Lg8_next:
+    add x11, x5, #260                /* bytes 260..291 unused: zero, as g4ref q8k */
+    stp xzr, xzr, [x11]
+    stp xzr, xzr, [x11, #16]
+    add x3, x3, #1
+    add x0, x0, #1024
+    cmp x3, x8
+    b.ne .Lg8_blk
+.Lg8_ret:
+    ret
+    .size g4_q8k, .-g4_q8k
+
     .section .note.GNU-stack,"",%progbits
