@@ -1119,3 +1119,17 @@ ids2k text: 6144 positions: arena 1717 MB, cache 231.9 MB, max RSS 224 MB, ms/to
 on a fresh build, TQ4 goldens unchanged, prompt A 16.44 tps (single cold sample; the hot path is
 unchanged so no A/B). The per-token cost grows ~13 ms per 1k positions: the TQ qk/pv kernels are
 far from the cache-streaming floor (612 MB at 16k = ~24 ms), next lever.
+
+53. TQ pv without the shared code copy (keep, long ctx). pq1_tq_pv staged the chunk's 256
+positions of V code words in 16 KB of shared memory (26 KB per block, 86 registers: 2 blocks,
+8 warps on the one SM). pq1_tq_pv2 reads each position's words straight from global (one
+transaction per warp), 10 KB smem, 52-57 registers: 6 blocks. Same fmaf chains and reduction
+tree, bit-identical: pq1_parity tq 3|4 compares the variant with the old kernels bitwise at
+every T to 16384 (0 differ). PQ1_TQV=0 is the old path. Layer time (parity harness, store
+excluded): T=16384 5.905 -> 4.630 ms, T=4096 1.638 -> 1.320 ms. Engine, 2040-id prompt + 16
+generated, order v1 v0 v0 v1: decode 84.53 / 90.50 / 90.60 / 84.49 ms (-6.7%, R = 1.071), greedy
+stream identical. Profile at T=16384 before the change (nvprof, per layer): pv 2.95, qk 2.65,
+sm 0.36, out 0.06 ms; the K or V code stream alone is 0.33 ms. qk is shared-bandwidth bound
+(lds.128 of a per-lane table entry = 4 wavefronts per term; floor ~2.3 ms): a bit-identical
+rewrite (inline fl(q c), several positions per thread) is worth <= ~15%; a 2x needs fp16
+arithmetic (HFMA2), which moves the TQ bits.

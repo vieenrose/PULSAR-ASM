@@ -596,6 +596,17 @@ static int tq_parity(int B) {
     int rc = pq1_tq_fa_launch(B, d_q, d_par, d_kc, d_ks, d_vc, d_vs, d_sc, d_part, d_inv, d_o, nh, nkv, ctx, 0);
     cudaDeviceSynchronize();
     cudaMemcpy(od, d_o, (size_t)nh * 512, cudaMemcpyDeviceToHost);
+    { /* every long-chain variant against the reference kernels, bitwise */
+      static float ov[32 * 128];
+      int vd = 0;
+      pq1_tq_variant(0);
+      cudaMemset(d_o, 0xff, (size_t)nh * 512);
+      pq1_tq_fa_launch(B, d_q, d_par, d_kc, d_ks, d_vc, d_vs, d_sc, d_part, d_inv, d_o, nh, nkv, ctx, 0);
+      cudaMemcpy(ov, d_o, (size_t)nh * 512, cudaMemcpyDeviceToHost);
+      pq1_tq_variant(getenv("PQ1_TQV") ? atoi(getenv("PQ1_TQV")) : 1);
+      for (int i = 0; i < nh * 128; i++) vd += memcmp(&ov[i], &od[i], 4) != 0;
+      if (vd) { printf("tq%d T=%d: variant differs from the reference kernels in %d / %d\n", B, T, vd, nh * 128); allok = 0; }
+    }
     double emax = 0, qe2 = 0, qn2 = 0;
     for (int h = 0; h < nh; h++) {
       const int kh = h / 4;

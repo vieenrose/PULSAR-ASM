@@ -3343,6 +3343,85 @@ __global__ __launch_bounds__(128) void pq1_tq_pv(const float* __restrict__ p, co
           make_float4(a[h][0], a[h][1], a[h][2], a[h][3]);
     }
 }
+/* pq1_tq_pv without the 16 KB shared copy of the chunk's code words: each
+ * warp reads a position's words straight from global (64 / 48 B, one
+ * transaction), so a block takes 10 KB of shared memory instead of 26 and the
+ * SM holds 6 blocks (24 warps) instead of 2; the 3 warps' sums go through
+ * shared memory as before. Same fmaf chains and reduction tree: bit-identical. */
+template <int B>
+__global__ __launch_bounds__(128) void pq1_tq_pv2(const float* __restrict__ p, const uint32_t* __restrict__ vcode,
+                                                  const float* __restrict__ vsc, const uint8_t* __restrict__ par,
+                                                  float* __restrict__ part, int nh, int ctx) {
+  enum { CW = pq1_tqc<B>::CW, NV = pq1_tqc<B>::NV };
+  __shared__ __align__(16) float4 wt[PQ1_TQ_CH];
+  __shared__ float cent[NV];
+  __shared__ __align__(16) float red[3][4][128];
+  const int kh = blockIdx.x, c = blockIdx.y, tid = threadIdx.x, w = tid >> 5, l = tid & 31;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  const int t0 = c * PQ1_TQ_CH, n = min(PQ1_TQ_CH, T - t0);
+  if (n <= 0) return;   /* block-uniform */
+  if (tid < NV) cent[tid] = pq1_tq_cent(B, tid);
+  const uint32_t* vb = vcode + ((size_t)kh * ctx + t0) * CW;
+  for (int t = tid; t < n; t += 128) {
+    const float s = __ldg(vsc + (size_t)kh * ctx + t0 + t);
+    const float* pp = p + (size_t)kh * 4 * ctx + t0 + t;
+    wt[t] = make_float4(pp[0] * s, pp[ctx] * s, pp[2 * (size_t)ctx] * s, pp[3 * (size_t)ctx] * s);
+  }
+  __syncthreads();
+  float a[4][4];
+#pragma unroll
+  for (int h = 0; h < 4; h++)
+#pragma unroll
+    for (int i = 0; i < 4; i++) a[h][i] = 0.0f;
+  /* the word this lane decodes: 4-bit, word l/2 half l&1; 3-bit, magnitude
+   * byte l&3 of word l/4 and sign nibble l&7 of word 8 + l/8 */
+  const int wa = B == 3 ? l >> 2 : l >> 1, wb = 8 + (l >> 3);
+#pragma unroll 4
+  for (int t = w; t < n; t += 4) {
+    const uint32_t* cw = vb + (size_t)t * CW;
+    int v[4];
+    if (B == 3) {
+      const uint32_t mb = __ldg(cw + wa) >> (8 * (l & 3)), sb = __ldg(cw + wb) >> (4 * (l & 7));
+#pragma unroll
+      for (int i = 0; i < 4; i++) v[i] = ((mb >> (2 * i)) & 3) | (((sb >> i) & 1) << 2);
+    } else {
+      const uint32_t nb = __ldg(cw + wa) >> (16 * (l & 1));
+#pragma unroll
+      for (int i = 0; i < 4; i++) v[i] = (nb >> (4 * i)) & 15;
+    }
+    const float4 g = wt[t];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const float e = cent[v[i]];
+      a[0][i] = fmaf(g.x, e, a[0][i]); a[1][i] = fmaf(g.y, e, a[1][i]);
+      a[2][i] = fmaf(g.z, e, a[2][i]); a[3][i] = fmaf(g.w, e, a[3][i]);
+    }
+  }
+  if (w)
+#pragma unroll
+    for (int h = 0; h < 4; h++)
+      reinterpret_cast<float4*>(red[w - 1][h])[l] = make_float4(a[h][0], a[h][1], a[h][2], a[h][3]);
+  __syncthreads();
+  if (!w)
+#pragma unroll
+    for (int h = 0; h < 4; h++) {
+#pragma unroll
+      for (int k = 0; k < 3; k++) {
+        const float4 r = reinterpret_cast<const float4*>(red[k][h])[l];
+        a[h][0] += r.x; a[h][1] += r.y; a[h][2] += r.z; a[h][3] += r.w;
+      }
+      reinterpret_cast<float4*>(part + ((size_t)c * nh + kh * 4 + h) * 128)[l] =
+          make_float4(a[h][0], a[h][1], a[h][2], a[h][3]);
+    }
+}
+/* kernel variants of the long chain, bit mask (1: pq1_tq_pv2); PQ1_TQV
+ * overrides, pq1_tq_variant() sets it for the parity A/B */
+static int PQ1_TQV = -1;
+extern "C" void pq1_tq_variant(int v) { PQ1_TQV = v; }
+static int pq1_tqv(void) {
+  if (PQ1_TQV < 0) PQ1_TQV = getenv("PQ1_TQV") ? atoi(getenv("PQ1_TQV")) : 1;
+  return PQ1_TQV;
+}
 /* per q head (one warp): sum the chunks, normalize, rotate back */
 __global__ void pq1_tq_out(const float* __restrict__ part, const float* __restrict__ inv,
                            const uint8_t* __restrict__ par, float* __restrict__ atto, int nh) {
@@ -3590,7 +3669,10 @@ extern "C" int pq1_tq_fa_launch(int bits, const float* qo_d, const uint8_t* par_
   if (bk == 3) pq1_tq_qk<3><<<gq, 256, 0, s>>>(qo_d, kcode, ksc, par_d, sc_d, ctx);
   else pq1_tq_qk<4><<<gq, 256, 0, s>>>(qo_d, kcode, ksc, par_d, sc_d, ctx);
   pq1_tq_sm<<<nh, 256, 0, s>>>(sc_d, par_d, inv_d, ctx);
-  if (bv == 3) pq1_tq_pv<3><<<gp, 128, 0, s>>>(sc_d, vcode, vsc, par_d, part_d, nh, ctx);
+  if (pq1_tqv() & 1) {
+    if (bv == 3) pq1_tq_pv2<3><<<gp, 128, 0, s>>>(sc_d, vcode, vsc, par_d, part_d, nh, ctx);
+    else pq1_tq_pv2<4><<<gp, 128, 0, s>>>(sc_d, vcode, vsc, par_d, part_d, nh, ctx);
+  } else if (bv == 3) pq1_tq_pv<3><<<gp, 128, 0, s>>>(sc_d, vcode, vsc, par_d, part_d, nh, ctx);
   else pq1_tq_pv<4><<<gp, 128, 0, s>>>(sc_d, vcode, vsc, par_d, part_d, nh, ctx);
   pq1_tq_out<<<nh, 32, 0, s>>>(part_d, inv_d, par_d, atto_d, nh);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
