@@ -9,7 +9,7 @@ on the GPU through kernels driven directly by the CUDA driver API.
 |---|---|
 | Model | `google/gemma-4-E2B-it-qat-q4_0-gguf`, file `gemma-4-E2B_q4_0-it.gguf`, 3,349,516,256 bytes, sha256 `fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634` |
 | Format | Google's own: layer projections Q4_0 (quantization-aware trained), token embedding / tied head and per-layer-input table Q6_K, per-layer projection F16 |
-| Engine | C + AArch64 assembly host (`pulsar_arm/gemma4nano/g4eng.c`, `g4_host.S`), GPU kernels as embedded PTX JIT-loaded by the driver. No CUDA toolkit, cuBLAS, llama.cpp or Python at runtime; links libc, libm, libdl and libgomp |
+| Engine | C + AArch64 assembly host (`pulsar_arm/gemma4nano/g4eng.c`, `g4_host.S`), GPU kernels as embedded PTX JIT-loaded by the driver (`libcuda` is opened with `dlopen`). No CUDA toolkit, cuBLAS, llama.cpp or Python at runtime; links only libc, libm, libdl, libpthread and libgomp |
 | Accuracy | every kernel, CPU and GPU, bit-identical to the engine's own scalar reference (`g4ref.c`); greedy streams frozen as goldens and checked by `gates.sh` |
 
 ## Demo
@@ -41,7 +41,7 @@ rendered at a fixed cadence, not in real time. Re-render with
 | | |
 |---|---|
 | Board | Jetson Nano Gen1: Tegra X1, 4x Cortex-A57, one Maxwell SM (sm_53), 4 GB LPDDR4 shared by CPU and GPU. L4T R32.5.1, CUDA 10.2 driver |
-| Decode | **6.83 tok/s** on the English gate prompt (76 steps); 6.17 and 6.56 tok/s on the demo prompts (291 and 117 steps); 5.5-6.0 tok/s at 500 steps (attention grows with context) |
+| Decode | **6.83 tok/s** on the English gate prompt (76 steps); 6.17 and 6.56 tok/s on the demo prompts (291 and 117 steps); 5.5-5.7 tok/s over 500 steps (attention grows with context) |
 | Prefill | 6.5-7.2 tok/s, token by token through the decode path |
 | Load | 4.0-6.2 s (weights repacked and uploaded) |
 | Memory | 1,474 MB on the GPU, peak RSS 729 MB; the 1.93 GB per-layer-input table stays memory-mapped, one 7.4 KB row read per token |
