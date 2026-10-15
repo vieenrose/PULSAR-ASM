@@ -125,7 +125,8 @@ static void stage_in(const void *src, size_t n, uint64_t dst) {
 static void launch_q4(int kind, uint64_t *w, uint64_t *s, uint64_t xq_dev, uint64_t y_dev, uint32_t cols, uint32_t rows) {
     if (kind) {
         int irows = (int)rows, icols = (int)cols;
-        unsigned sm = cols * 2 + cols / 32 * 4 + cols / 256 * 4;
+        const uint32_t kc = cols < 4096 ? cols : 4096;   /* q4i_gemv5 stages Q4I5_KC = 4096 columns at a time */
+        unsigned sm = kc * 2 + kc / 32 * 4 + cols / 256 * 4;
         void *a[] = {w, s, &xq_dev, &y_dev, &irows, &icols};
         CK(cuLaunchKernel_(fq4i, (rows + 255) / 256, 1, 1, 32, 8, 1, sm, stream, a, NULL));
     } else {

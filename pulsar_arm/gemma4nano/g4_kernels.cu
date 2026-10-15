@@ -577,53 +577,62 @@ __device__ __forceinline__ int dot2_s16(unsigned m, unsigned a, int s) {
         "mad.wide.s16 %0, q0, a0, %0;\n\tmad.wide.s16 %0, q1, a1, %0;\n\t}" : "+r"(s) : "r"(a), "r"(m));
     return s;
 }
+// Activations are staged Q4I5_KC columns at a time (8 KB of permuted pairs): with the
+// whole row staged, a 12288-column down projection took 24.6 KB of shared memory and
+// only two blocks fit on the SM. The weight prefetch ring runs on across chunks; each
+// row's float chain still visits the blocks in ascending order. nb % Q4I_PF == 0.
+#define Q4I5_KC 4096
 extern "C" __global__ void __launch_bounds__(256) q4i_gemv5(const uint4 *__restrict__ w,
         const unsigned short *__restrict__ sc, const uint8_t *__restrict__ xq,
         float *__restrict__ y, int rows, int cols) {
     extern __shared__ __align__(16) unsigned char smem[];
     const int nb = cols >> 5, tid = threadIdx.y * 32 + threadIdx.x;
-    unsigned *AW = (unsigned *)smem;                  /* nb * 16 permuted int16 pairs */
-    int *SA = (int *)(smem + cols * 2);
-    float *DA = (float *)(smem + cols * 2 + nb * 4);
-    for (int i = tid; i < nb * 16; i += 256) {
-        const int b = i >> 4, k = (i >> 2) & 3, c = i & 3;
-        const int e0 = b * 32 + ((c & 1) ? 16 : 0) + 4 * k + (c >> 1);
-        const int a0 = (int8_t)xq[(e0 >> 8) * 292 + 4 + (e0 & 255)];
-        const int a1 = (int8_t)xq[((e0 + 2) >> 8) * 292 + 4 + ((e0 + 2) & 255)];
-        AW[i] = (unsigned)(a0 & 0xffff) | ((unsigned)a1 << 16);
-    }
+    const int kcw = min(cols, Q4I5_KC), kbw = kcw >> 5;
+    unsigned *AW = (unsigned *)smem;                  /* kbw * 16 permuted int16 pairs */
+    int *SA = (int *)(smem + kcw * 2);
+    float *DA = (float *)(smem + kcw * 2 + kbw * 4);
     for (int i = tid; i < (cols >> 8); i += 256) DA[i] = *(const float *)(xq + i * 292);
-    __syncthreads();
-    for (int b = tid; b < nb; b += 256) {
-        int s = 0;
-        for (int j = 0; j < 16; j++) { const unsigned v = AW[b * 16 + j]; s += (int)(short)(v & 0xffffu) + ((int)v >> 16); }
-        SA[b] = s;
-    }
-    __syncthreads();
     const int tile = blockIdx.x * 8 + threadIdx.y;
     const int r = tile * 32 + threadIdx.x;
-    if (r >= rows) return;
+    const bool live = r < rows;
     const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
     const unsigned short *st = sc + (size_t)tile * nb * 32 + threadIdx.x;   /* fp16 block scales */
     const uint4 *A4 = (const uint4 *)AW;
     uint4 qr[Q4I_PF];
     unsigned short sr[Q4I_PF];
     #pragma unroll
-    for (int p = 0; p < Q4I_PF; p++) if (p < nb) { qr[p] = wt[(size_t)p * 32]; sr[p] = st[(size_t)p * 32]; }
+    for (int p = 0; p < Q4I_PF; p++) if (live && p < nb) { qr[p] = wt[(size_t)p * 32]; sr[p] = st[(size_t)p * 32]; }
     float acc = 0.0f;
-    for (int b0 = 0; b0 < nb; b0 += Q4I_PF) {
-        #pragma unroll
-        for (int p = 0; p < Q4I_PF; p++) {
-            const int b = b0 + p;
-            if (b < nb) {
+    for (int cb = 0; cb < nb; cb += kbw) {            /* chunk of blocks [cb, cb + kb) */
+        const int kb = min(kbw, nb - cb);
+        __syncthreads();
+        for (int i = tid; i < kb * 16; i += 256) {
+            const int bl = i >> 4, k = (i >> 2) & 3, c = i & 3;
+            const int e0 = (cb + bl) * 32 + ((c & 1) ? 16 : 0) + 4 * k + (c >> 1);
+            const int a0 = (int8_t)xq[(e0 >> 8) * 292 + 4 + (e0 & 255)];
+            const int a1 = (int8_t)xq[((e0 + 2) >> 8) * 292 + 4 + ((e0 + 2) & 255)];
+            AW[i] = (unsigned)(a0 & 0xffff) | ((unsigned)a1 << 16);
+        }
+        __syncthreads();
+        for (int bl = tid; bl < kb; bl += 256) {
+            int s = 0;
+            for (int j = 0; j < 16; j++) { const unsigned v = AW[bl * 16 + j]; s += (int)(short)(v & 0xffffu) + ((int)v >> 16); }
+            SA[bl] = s;
+        }
+        __syncthreads();
+        if (!live) continue;
+        for (int b0 = cb; b0 < cb + kb; b0 += Q4I_PF) {
+            #pragma unroll
+            for (int p = 0; p < Q4I_PF; p++) {
+                const int b = b0 + p, bl = b - cb;
                 const uint4 q = qr[p];
                 const float ws = __half2float(__ushort_as_half(sr[p]));   /* exact */
                 if (b + Q4I_PF < nb) { qr[p] = wt[(size_t)(b + Q4I_PF) * 32]; sr[p] = st[(size_t)(b + Q4I_PF) * 32]; }
                 const unsigned qw[4] = {q.x, q.y, q.z, q.w};
-                int s = -8 * SA[b];
+                int s = -8 * SA[bl];
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
-                    const uint4 a = A4[b * 4 + k];
+                    const uint4 a = A4[bl * 4 + k];
                     const unsigned m0 = qw[k] & 0x000F000Fu, m1 = (qw[k] >> 4) & 0x000F000Fu;
                     const unsigned m2 = (qw[k] >> 8) & 0x000F000Fu, m3 = (qw[k] >> 12) & 0x000F000Fu;
                     s = dot2_s16(m0, a.x, s);
@@ -635,7 +644,7 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv5(const uint4 *__restr
             }
         }
     }
-    y[r] = acc;
+    if (live) y[r] = acc;
 }
 
 // q6i activation order in shared memory: element i of each group of 4 stored at
