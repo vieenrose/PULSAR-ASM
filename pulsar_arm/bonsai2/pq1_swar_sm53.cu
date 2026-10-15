@@ -1942,6 +1942,7 @@ __global__ __launch_bounds__(128) void pq1_fa_qk4(const float* __restrict__ qo,
  * contiguous run of positions; the running max before the run is an exclusive
  * prefix of the per-run maxima (the same strict-> fold, so the same value; a
  * +0/-0 tie can flip the sign of a zero M, which changes no ms or vs below). */
+template <bool SCAN>
 __global__ __launch_bounds__(256) void pq1_fa_sm(const float* __restrict__ sc,
                                                  const uint8_t* __restrict__ par,
                                                  float2* __restrict__ mv, int ctx) {
@@ -1953,14 +1954,35 @@ __global__ __launch_bounds__(256) void pq1_fa_sm(const float* __restrict__ sc,
   const float NINF = __uint_as_float(0xff800000u);
   float m = NINF;
   for (int t = b; t < e; t++) m = pq1_fgtsel(m, s[t]);
-  sm[tid] = m;
-  __syncthreads();
-  if (tid == 0) {
-    float run = NINF;
-    for (int k = 0; k < 256; k++) { const float x = sm[k]; sm[k] = run; run = pq1_fgtsel(run, x); }
+  /* Exclusive prefix of the run maxima as a shuffle scan (was a 256-step serial
+   * loop on thread 0: ~11 us per wave of 8 blocks). Combining (a, b) ->
+   * fgtsel(a, b) keeps the left value unless the right is strictly greater;
+   * no summary is ever NaN (the fold starts at -inf and never takes a NaN),
+   * so the combine is associative and the scan equals the serial fold. */
+  float M = NINF;
+  if (SCAN) {
+    const int lane = tid & 31, w = tid >> 5;
+    float v = m;
+  #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      const float u = __shfl_up_sync(0xffffffffu, v, d);
+      if (lane >= d) v = pq1_fgtsel(u, v);
+    }
+    if (lane == 31) sm[w] = v;
+    __syncthreads();
+    for (int k = 0; k < w; k++) M = pq1_fgtsel(M, sm[k]);
+    const float vl = __shfl_up_sync(0xffffffffu, v, 1);
+    if (lane) M = pq1_fgtsel(M, vl);
+  } else {   /* PQ1_FAS=0: the serial fold on thread 0 (A/B arm) */
+    sm[tid] = m;
+    __syncthreads();
+    if (tid == 0) {
+      float run = NINF;
+      for (int k = 0; k < 256; k++) { const float x = sm[k]; sm[k] = run; run = pq1_fgtsel(run, x); }
+    }
+    __syncthreads();
+    M = sm[tid];
   }
-  __syncthreads();
-  float M = sm[tid];
   for (int t = b; t < e; t++) {
     const float x = s[t];
     float ms = 1.0f, vs = 1.0f;
@@ -2128,8 +2150,12 @@ extern "C" int pq1_fa_launch(const float* qo_d, const unsigned short* kc_d,
     else
       pq1_fa_qk<<<dim3(nkv, qb), 32 * G, 0, s>>>(qo_d, kc_d, par_d, sc_d, nh, nkv, ctx);
   }
-  if (pq1_fa_mask & 2)
-    pq1_fa_sm<<<nh, 256, 0, s>>>(sc_d, par_d, reinterpret_cast<float2*>(mv_d), ctx);
+  static int fas = -1;
+  if (fas < 0) { const char* e = getenv("PQ1_FAS"); fas = e ? atoi(e) : 1; }
+  if (pq1_fa_mask & 2) {
+    if (fas) pq1_fa_sm<true><<<nh, 256, 0, s>>>(sc_d, par_d, reinterpret_cast<float2*>(mv_d), ctx);
+    else pq1_fa_sm<false><<<nh, 256, 0, s>>>(sc_d, par_d, reinterpret_cast<float2*>(mv_d), ctx);
+  }
   if (pq1_fa_mask & 4)
     switch (G) {
 #define PQ1_PVG(g) case g: pq1_fa_pv_g<g>(vc_d, reinterpret_cast<const float2*>(mv_d), par_d, atto_d, nkv, ctx, s); break;
