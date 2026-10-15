@@ -90,6 +90,8 @@ int pq1_rms_q8k_launch(float *X_d, const float *R_d, const float *w_d, unsigned 
                        int n, int serial, int *nfb_d, void *stream);
 int pq1_rms_q8k_pl_launch(float *X_d, const float *R_d, const float *w_d, unsigned char *xq_d,
                           unsigned int *pl_d, int *au_d, int n, void *stream);
+/* fwd8's argmax() on the device: out_d[0] = index, out_d[1] = bits of v[index] */
+int pq1_argmax_launch(const float *v_d, int n, int *out_d, void *stream);
 /* exhaustive pq1_r16 check; bad_d = 2 zeroed u64 on the device */
 int pq1_r16_test_launch(unsigned long long *bad_d);
 

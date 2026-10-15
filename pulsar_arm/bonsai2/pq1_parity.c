@@ -322,6 +322,58 @@ static int fpl_parity(void) {
   printf("FPL PARITY: %s\n", bad ? "FAIL" : "PASS");
   return bad ? 1 : 0;
 }
+/* pq1_argmax_launch vs fwd8's argmax(): random logits with planted max ties,
+ * +0/-0 ties, -inf/+inf, NaN (also at v[0]) and all-NaN tails */
+static int argmax_ref(const float *v, int n) {
+  int bi = 0;
+  for (int i = 1; i < n; i++) if (v[i] > v[bi]) bi = i;
+  return bi;
+}
+static int argmax_parity(void) {
+  const int ns[] = {1, 2, 31, 1024, 1025, 4097, 151669};
+  float *v = malloc(151669 * 4), *d_v;
+  int *d_o, o[2], bad = 0, ncase = 0;
+  unsigned r = 12345;
+  cudaMalloc((void **)&d_v, 151669 * 4);
+  cudaMalloc((void **)&d_o, 8);
+  for (int ni = 0; ni < 7; ni++)
+    for (int kind = 0; kind < 12; kind++)
+      for (int rep = 0; rep < 6; rep++) {
+        const int n = ns[ni];
+        for (int i = 0; i < n; i++) {
+          r = r * 1664525u + 1013904223u;
+          v[i] = kind == 3 ? 0.f : ((int)(r >> 8) % 4001 - 2000) / 64.f;
+          if (kind == 4) v[i] = (r >> 9) & 1 ? 0.f : -0.f;
+          if (kind == 5) v[i] = -INFINITY;
+        }
+        for (int k = 0; k < 4; k++) {   /* planted ties at the max */
+          r = r * 1664525u + 1013904223u;
+          if (kind == 1 || kind == 2) v[r % n] = 40.f;
+        }
+        r = r * 1664525u + 1013904223u;
+        if (kind == 6) v[0] = NAN;
+        if (kind == 7) for (int i = 0; i < n; i += 3) v[i] = NAN;
+        if (kind == 8) for (int i = 1; i < n; i++) v[i] = NAN;
+        if (kind == 9) v[r % n] = INFINITY, v[(r >> 7) % n] = INFINITY;
+        if (kind == 10) for (int i = 0; i < n; i++) v[i] = -0.f, v[r % n] = 0.f;
+        if (kind == 11) v[n - 1] = 41.f;
+        cudaMemcpy(d_v, v, (size_t)n * 4, cudaMemcpyHostToDevice);
+        if (pq1_argmax_launch(d_v, n, d_o, 0) || cudaMemcpy(o, d_o, 8, cudaMemcpyDeviceToHost)) {
+          printf("argmax launch failed\n");
+          return 1;
+        }
+        const int e = argmax_ref(v, n);
+        unsigned eb;
+        memcpy(&eb, &v[e], 4);
+        ncase++;
+        if (o[0] != e || (unsigned)o[1] != eb) {
+          if (bad < 8) printf("  n=%d kind=%d rep=%d got %d want %d\n", n, kind, rep, o[0], e);
+          bad++;
+        }
+      }
+  printf("argmax: %d cases, bad=%d\nARGMAX PARITY: %s\n", ncase, bad, bad ? "FAIL" : "PASS");
+  return bad ? 1 : 0;
+}
 /* exhaustive: every float through pq1_expf_ff vs pq1_expf_dev (glibc-2.27 expf) */
 extern int pq1_expf_chk_launch(unsigned base, unsigned long long *c_d);
 static int expf_parity(void) {
@@ -346,6 +398,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "rms")) return rms_parity();
   if (argc > 1 && !strcmp(argv[1], "fpl")) return fpl_parity();
   if (argc > 1 && !strcmp(argv[1], "expf")) return expf_parity();
+  if (argc > 1 && !strcmp(argv[1], "argmax")) return argmax_parity();
 #endif
   int rows = argc > 1 ? atoi(argv[1]) : 256;
   int K = argc > 2 ? atoi(argv[2]) : 4096;

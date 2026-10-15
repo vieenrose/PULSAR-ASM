@@ -51,6 +51,11 @@ __attribute__((weak)) int pq1_token_fused(int nl, const unsigned char *const *wt
                                           const float *rcc, const float *rcs, const float *x,
                                           float *head);
 
+/* loop iter 22: need = 0 lets the token graph skip the logits D2H (greedy, no
+ * TOP40); pq1_head_top: the device argmax of the last fused token, or -1 */
+__attribute__((weak)) void pq1_head_need(int need);
+__attribute__((weak)) int pq1_head_top(float *val);
+
 #ifdef PQ1_USE_CUDA
 /* GPU-RAM report printed once at process exit (PQ1_STATS=1). Declared here
  * with no CUDA headers: this shim is -include'd into fwd8.c, which is built

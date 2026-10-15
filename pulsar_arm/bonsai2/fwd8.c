@@ -680,12 +680,16 @@ int main(int argc, char **argv) {
     if (pq1_kv_shape) pq1_kv_shape(NLAYER, NKV, KVCTX);
 #endif
     NPOS = 0;
+#ifdef PQ1_BUILD
+    if (pq1_head_need) pq1_head_need(STEMP > 0 || getenv("TOP40") != NULL);
+#endif
+    int top = -1;   /* the previous step's greedy argmax of HEAD */
     for (int step = 0; step < n0 + gen; step++) {
         BQ1_T0();
         ct_begin(step, n0);
         int id = step < n0 ? ids[step]
                : (STEMP > 0 ? sample_topkpp(HEAD, VOCAB, STEMP, STOPP, STopK, SMINP)
-                            : argmax(HEAD, VOCAB));
+                            : top >= 0 ? top : argmax(HEAD, VOCAB));
         if (step >= n0) ids[nids++] = id;
         ct_mark(CT_SAMPLE);
         embed(id);
@@ -793,9 +797,14 @@ int main(int argc, char **argv) {
             ct_mark(CT_RMS);
             gemvP(tw("output.weight"), VOCAB, HID, XN, HEAD);
         }
-        int top = argmax(HEAD, VOCAB);
+        float topv;
+        top = -1;
+#ifdef PQ1_BUILD
+        if (tfused && pq1_head_top) top = pq1_head_top(&topv);
+#endif
+        if (top < 0) { top = argmax(HEAD, VOCAB); topv = HEAD[top]; }
         ct_mark(CT_ARGMAX);
-        printf("step %d id_in=%d top=%d logit=%.4f\n", step, id, top, HEAD[top]);
+        printf("step %d id_in=%d top=%d logit=%.4f\n", step, id, top, topv);
         BQ1_T1(step);
         if (getenv("TOP40") && step == 22) {
             /* print top-40 (id:prob) under the configured sampler for comparison

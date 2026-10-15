@@ -1405,12 +1405,38 @@ static int PQ1_TOK = -1, PQ1_TOK_OK = 0;
 static float *d_X = NULL, *d_nw = NULL;
 static cudaGraphExec_t PQ1_TOK_EX;
 static const void *PQ1_TOK_WT, *PQ1_TOK_XH, *PQ1_TOK_HD;
+/* loop iter 22: fwd8's greedy argmax as the graph's last node (PQ1_GARG=0 is
+ * the A/B arm); the full logits D2H is kept only when the host reads them
+ * (sampling, TOP40: pq1_head_need(1), the default) */
+static int PQ1_GARG = -1, PQ1_HNEED = 1, PQ1_TOK_HN = -1, PQ1_TOPV = 0;
+static int *d_top = NULL, PQ1_TOPH[2];
 #endif
+void pq1_head_need(int need) {
+#ifdef PQ1_USE_CUDA
+  PQ1_HNEED = need != 0;
+#else
+  (void)need;
+#endif
+}
+/* the device argmax of the last fused token's logits, or -1 (caller scans HEAD) */
+int pq1_head_top(float *val) {
+#ifdef PQ1_USE_CUDA
+  if (!PQ1_TOPV) return -1;
+  PQ1_TOPV = 0;
+  memcpy(val, &PQ1_TOPH[1], 4);
+  return PQ1_TOPH[0];
+#else
+  (void)val;
+  return -1;
+#endif
+}
 int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *nw, int nh,
                     int nkv, int hid, int inter, int vocab, int ctx, int npos, const float *rcc,
                     const float *rcs, const float *x, float *head) {
 #ifdef PQ1_USE_CUDA
   if (PQ1_TOK < 0) { const char *e = getenv("PQ1_TOK"); PQ1_TOK = e ? atoi(e) : 1; }
+  if (PQ1_GARG < 0) { const char *e = getenv("PQ1_GARG"); PQ1_GARG = e ? atoi(e) != 0 : 1; }
+  PQ1_TOPV = 0;
   if (!PQ1_TOK || !d_kv || nl != PQ1KV_NL || nkv != PQ1KV_NKV || ctx != PQ1KV_CTX) return -1;
   if (npos < 0 || npos >= ctx) return -1;
   for (int il = 0; il < nl; il++)
@@ -1430,7 +1456,7 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
       !pq1_tm_bufs(hid, xqb, 0, 1) || !pq1_tm_bufs(qr, xob, 0, 1) || !pq1_tm_bufs(inter, xqb2, 0, 1))
     return -1;
   if (PQ1_TOK_OK && (PQ1_TOK_WT != (const void *)wt || PQ1_TOK_XH != (const void *)x ||
-                     PQ1_TOK_HD != (const void *)head)) {
+                     PQ1_TOK_HD != (const void *)head || PQ1_TOK_HN != PQ1_HNEED)) {
     cudaGraphExecDestroy(PQ1_TOK_EX);
     PQ1_TOK_OK = 0;
   }
@@ -1490,6 +1516,11 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
     }
     float *qkv = (float *)MDY, *qo = (float *)(MDY + q0), *atto = (float *)(MDY + a0);
     float *gu = (float *)MDY, *yh = (float *)(MDY + half);   /* yh: attn_output, then down */
+    if (PQ1_GARG && !d_top && cudaMalloc(&d_top, 256) != cudaSuccess) {   /* never while capturing */
+      cudaGetLastError();
+      d_top = NULL;
+      PQ1_GARG = 0;
+    }
     cudaGraph_t g = NULL;
     int rc = 0;
     if (cudaStreamBeginCapture(PQ1_CS, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
@@ -1530,12 +1561,18 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
     if (!rc) {
       rc |= PQ1_RMSQ(d_X, yh, d_nw + (size_t)(2 * nl) * hid, hid, vocab);
       rc |= pq1_tmx_launch(PQ1C[ch].d_codes, PQ1C[ch].d_scales, d_pl, d_au, d_y, hid, vocab, S);
-      rc |= cudaMemcpyAsync(head, d_y, (size_t)vocab * 4, cudaMemcpyDeviceToHost, S) != cudaSuccess;
+      if (PQ1_GARG) {
+        rc |= pq1_argmax_launch(d_y, vocab, d_top, S);
+        rc |= cudaMemcpyAsync(PQ1_TOPH, d_top, 8, cudaMemcpyDeviceToHost, S) != cudaSuccess;
+      }
+      if (PQ1_HNEED || !PQ1_GARG)
+        rc |= cudaMemcpyAsync(head, d_y, (size_t)vocab * 4, cudaMemcpyDeviceToHost, S) != cudaSuccess;
     }
     if (cudaStreamEndCapture(S, &g) != cudaSuccess) { rc = 1; g = NULL; }
     if (!rc && g && cudaGraphInstantiate(&PQ1_TOK_EX, g, NULL, NULL, 0) == cudaSuccess && PQ1_TOK_EX) {
       PQ1_TOK_OK = 1;
       PQ1_TOK_WT = wt; PQ1_TOK_XH = x; PQ1_TOK_HD = head;
+      PQ1_TOK_HN = PQ1_HNEED;
       PQ1_TOK_GRAPHS++;
     }
     if (g) cudaGraphDestroy(g);
@@ -1552,6 +1589,7 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
     exit(3);
   }
   for (int il = 0; il < nl; il++) PQ1KV_NEXT[il] = npos + 1;
+  PQ1_TOPV = PQ1_GARG;
   if (KTON > 0) pq1_kt_add(-3, hid, pq1_now() - kt0);   /* rows -3: the whole-token graph */
   PQ1_TOK_CALLS++;
   return 0;

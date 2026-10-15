@@ -2423,6 +2423,11 @@ extern "C" int pq1_fa_launch(const float* qo_d, const unsigned short* kc_d,
  * IS fwd8's; otherwise (~2^-15 of calls) thread 0 runs the serial chain over
  * the shared copy of x. serial=1 forces the chain (parity gate); nfb counts
  * the fallbacks when not NULL. */
+/* FAST (loop-261014-2216 row 22, PQ1_RMSV=0 keeps the old tail): lanes 0 and 1
+ * form flo and fhi at once, and for n a power of two s/n is __dmul_rn(s, 1/n),
+ * the same correctly rounded value of the same exact quotient (1/n exact), so
+ * the two serial fp64 divide subroutines leave the critical path. */
+template <bool FAST>
 __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
                                                     const float* __restrict__ R,
                                                     const float* __restrict__ w,
@@ -2458,16 +2463,28 @@ __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
     double S = l < nw ? sw[l] : 0.0;
 #pragma unroll
     for (int o = 16; o; o >>= 1) S = __dadd_rn(S, __shfl_xor_sync(0xffffffffu, S, o));
+    const double dn = (double)n;
+    const bool p2 = FAST && (n & (n - 1)) == 0;
+    const double rn = 1.0 / dn;                     /* exact when p2 */
+    float flo, fhi;
+    if (FAST) {
+      const double Sd = l ? __dmul_ru(S, 1.0 + 1.0 / 1099511627776.0)
+                          : __dmul_rd(S, 1.0 - 1.0 / 1099511627776.0);
+      const float fl = pq1_d2f(p2 ? __dmul_rn(Sd, rn) : __ddiv_rn(Sd, dn));
+      flo = fl;
+      fhi = __shfl_sync(0xffffffffu, fl, 1);
+    }
     if (l == 0) {
-      const double dn = (double)n;
-      const float flo = pq1_d2f(__ddiv_rn(__dmul_rd(S, 1.0 - 1.0 / 1099511627776.0), dn));
-      const float fhi = pq1_d2f(__ddiv_rn(__dmul_ru(S, 1.0 + 1.0 / 1099511627776.0), dn));
+      if (!FAST) {
+        flo = pq1_d2f(__ddiv_rn(__dmul_rd(S, 1.0 - 1.0 / 1099511627776.0), dn));
+        fhi = pq1_d2f(__ddiv_rn(__dmul_ru(S, 1.0 + 1.0 / 1099511627776.0), dn));
+      }
       float f = flo;
       if (serial || __float_as_uint(flo) != __float_as_uint(fhi) ||
           (__float_as_uint(flo) & 0x7f800000u) == 0x7f800000u) {
         double q = 0.0;
         for (int j = 0; j < n; j++) { const double e = pq1_f2d(sx[j]); q = __fma_rn(e, e, q); }
-        f = pq1_d2f(__ddiv_rn(q, dn));
+        f = pq1_d2f(p2 ? __dmul_rn(q, rn) : __ddiv_rn(q, dn));
         if (nfb) atomicAdd(nfb, 1);
       }
       ssc = pq1_fdiv(1.0f, pq1_fsqrt(pq1_fadd(f, 1e-6f)));
@@ -2528,11 +2545,21 @@ __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
   }
 }
 
+static int pq1_rmsv(void) {
+  static int v = -1;
+  if (v < 0) { const char* e = getenv("PQ1_RMSV"); v = e ? atoi(e) : 1; }
+  return v;
+}
+
 extern "C" int pq1_rms_q8k_launch(float* X_d, const float* R_d, const float* w_d, uint8_t* xq_d,
                                   int n, int serial, int* nfb_d, void* stream) {
   if (n < 256 || n > 4096 || (n & 255) != 0) return -2;
-  pq1_rms_q8k<<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, serial, nfb_d,
-                                                     NULL, NULL);
+  if (pq1_rmsv())
+    pq1_rms_q8k<true><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, serial, nfb_d,
+                                                           NULL, NULL);
+  else
+    pq1_rms_q8k<false><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, serial, nfb_d,
+                                                            NULL, NULL);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
@@ -2541,8 +2568,12 @@ extern "C" int pq1_rms_q8k_pl_launch(float* X_d, const float* R_d, const float* 
                                      uint8_t* xq_d, uint32_t* pl_d, int* au_d, int n,
                                      void* stream) {
   if (n < 256 || n > 4096 || (n & 255) != 0) return -2;
-  pq1_rms_q8k<<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, 0, NULL, pl_d,
-                                                     au_d);
+  if (pq1_rmsv())
+    pq1_rms_q8k<true><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, 0, NULL, pl_d,
+                                                           au_d);
+  else
+    pq1_rms_q8k<false><<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, 0, NULL, pl_d,
+                                                            au_d);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
@@ -2561,4 +2592,52 @@ extern "C" int pq1_r16_test_launch(unsigned long long* bad_d) {
     if (cudaGetLastError() != cudaSuccess) return -1;
   }
   return cudaDeviceSynchronize() == cudaSuccess ? 0 : -1;
+}
+
+/* greedy argmax of the head logits inside the token graph: fwd8's argmax()
+ * (bi = 0; v[i] > v[bi] -> bi = i) is the first index of the largest non-NaN
+ * value (+0/-0 tie: the earlier one), and 0 when v[0] is NaN. Each thread
+ * scans an ascending stride with the same strict >, then (value, index) pairs
+ * merge by larger value, ties to the smaller index; NaN never enters a pair.
+ * out[0] = index, out[1] = the bits of v[index]. One block of 1024. */
+__global__ void __launch_bounds__(1024) pq1_argmax_k(const float* __restrict__ v, int n,
+                                                      int* __restrict__ out) {
+  __shared__ float sv[32];
+  __shared__ int si[32];
+  const int t = threadIdx.x;
+  float bv = 0.f;
+  int bi = 0x7fffffff;
+#pragma unroll 4
+  for (int i = t; i < n; i += 1024) {
+    const float x = __ldg(v + i);
+    if (x == x && (bi == 0x7fffffff || x > bv)) { bv = x; bi = i; }
+  }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+    const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+    if (oi != 0x7fffffff && (bi == 0x7fffffff || ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
+  }
+  if ((t & 31) == 0) { sv[t >> 5] = bv; si[t >> 5] = bi; }
+  __syncthreads();
+  if (t < 32) {
+    bv = sv[t]; bi = si[t];
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+      if (oi != 0x7fffffff && (bi == 0x7fffffff || ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
+    }
+    if (t == 0) {
+      const float v0 = v[0];
+      if (v0 != v0 || bi == 0x7fffffff) bi = 0;
+      out[0] = bi;
+      out[1] = __float_as_int(v[bi]);
+    }
+  }
+}
+extern "C" int pq1_argmax_launch(const float* v_d, int n, int* out_d, void* stream) {
+  if (n <= 0) return -1;
+  pq1_argmax_k<<<1, 1024, 0, (cudaStream_t)stream>>>(v_d, n, out_d);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
