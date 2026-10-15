@@ -1019,6 +1019,34 @@ static void cuda_q4_ref(uint32_t rows, uint32_t cols, const uint8_t *w,
     }
 }
 
+/* Exp93: copy out of the pinned (CPU-UNCACHED on this Tegra) y staging buffer.
+   Measured: libc memcpy reads it at 0.72 GB/s, one 64 B ld1 stream 0.84, FOUR
+   interleaved 64 B streams 1.14-1.17 GB/s (2 and 8 streams do not help). About 2 MB
+   of results per token are read back, so the copy is worth ~1 ms/token. The four
+   streams are the four quarters of the buffer; the (<256 B) remainder uses memcpy. */
+static void copy_from_pinned(void *dst, const void *src, size_t n) {
+    size_t q = (n / 256) * 64;            /* bytes per stream, multiple of 64 */
+    char *d = (char *)dst; const char *s = (const char *)src;
+    size_t i;
+    if (q < 64) { memcpy(dst, src, n); return; }
+    for (i = 0; i < q; i += 64) {
+        __asm__ volatile(
+            "ld1 {v0.16b-v3.16b}, [%4]\n\t"
+            "ld1 {v4.16b-v7.16b}, [%5]\n\t"
+            "ld1 {v16.16b-v19.16b}, [%6]\n\t"
+            "ld1 {v20.16b-v23.16b}, [%7]\n\t"
+            "st1 {v0.16b-v3.16b}, [%0]\n\t"
+            "st1 {v4.16b-v7.16b}, [%1]\n\t"
+            "st1 {v16.16b-v19.16b}, [%2]\n\t"
+            "st1 {v20.16b-v23.16b}, [%3]\n\t"
+            :: "r"(d + i), "r"(d + q + i), "r"(d + 2 * q + i), "r"(d + 3 * q + i),
+               "r"(s + i), "r"(s + q + i), "r"(s + 2 * q + i), "r"(s + 3 * q + i)
+            : "v0","v1","v2","v3","v4","v5","v6","v7",
+              "v16","v17","v18","v19","v20","v21","v22","v23","memory");
+    }
+    if (4 * q < n) memcpy(d + 4 * q, s + 4 * q, n - 4 * q);
+}
+
 __attribute__((visibility("default")))
 void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
                uint64_t x_act_unused, uint64_t y, uint64_t xq) {
@@ -1140,7 +1168,7 @@ void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
         } else r = pCtxSync();
     }
     if (!r && h_out)
-        memcpy((void *)(uintptr_t)(y + (uint64_t)r0 * 4), h_out, nrows * 4);
+        copy_from_pinned((void *)(uintptr_t)(y + (uint64_t)r0 * 4), h_out, nrows * 4);
     if (!r && !pMemcpyDtoHAsync)
         r = pMemcpyDtoH((void *)(uintptr_t)(y + (uint64_t)r0 * 4),
                         d_y + (uint64_t)r0 * 4, nrows * 4);
