@@ -124,6 +124,9 @@ extern void k2q4_gemv_range(uint32_t, uint32_t, uint32_t, uint64_t, uint64_t,
                             uint64_t, uint64_t);
 static CUmodule mod;
 static CUfunction k_gemv;
+static CUfunction k_xqcopy;
+static uint64_t h_in_dev;   /* Exp96: device alias of the DEVICEMAP-pinned h_in */
+static int xq_copy_on;      /* stage xq with the xq_copy kernel instead of cuMemcpyHtoDAsync */
 static volatile int cuda_ok;
 static uint64_t blob_bytes;
 
@@ -847,6 +850,18 @@ static const char *ptx =
 	"@%p0 st.global.f32 [%rd16],%f1;\n"
 	"$done:\n"
 	"ret;\n"
+	"}\n"
+	/* Exp96: xq_copy - copies the staged activation block from the DEVICEMAP-pinned h_in alias
+	   into device memory, replacing cuMemcpyHtoDAsync (36 us vs 19 us in isolation) */
+	".visible .entry xq_copy(.param .u64 psrc, .param .u64 pdst, .param .u32 pn) {\n"
+	".reg .u64 %rd<6>; .reg .u32 %r<8>; .reg .pred %p<2>;\n"
+	"ld.param.u64 %rd1,[psrc]; ld.param.u64 %rd2,[pdst]; ld.param.u32 %r1,[pn];\n"
+	"mov.u32 %r2,%tid.x; mov.u32 %r3,%ctaid.x; mov.u32 %r4,%ntid.x; mad.lo.u32 %r5,%r3,%r4,%r2;\n"
+	"setp.ge.u32 %p1,%r5,%r1; @%p1 bra $xdone;\n"
+	"mul.wide.u32 %rd3,%r5,4; add.u64 %rd4,%rd1,%rd3; ld.global.u32 %r6,[%rd4];\n"
+	"add.u64 %rd5,%rd2,%rd3; st.global.u32 [%rd5],%r6;\n"
+	"$xdone:\n"
+	"ret;\n"
 	"}\n";
         static void ck(CUresult r, const char *m) {
     const char *s = 0;
@@ -924,9 +939,11 @@ void cuda_init(void) {
              ~30-50 us). K2YDIRECT=0 keeps the old kernel->device + D2H path. */
           int want_direct = !(getenv("K2YDIRECT") && getenv("K2YDIRECT")[0] == '0') &&
                             pMemHostGetDevicePointer;
-          if (!pMemHostAlloc(&h_in, XQ_CAP, CU_MEMHOSTALLOC_PORTABLE) &&
+          int want_xqc = !(getenv("K2XQCOPY") && getenv("K2XQCOPY")[0] == '0') && pMemHostGetDevicePointer;
+          if (!pMemHostAlloc(&h_in, XQ_CAP, CU_MEMHOSTALLOC_PORTABLE | (want_xqc ? 2 : 0)) &&
               !pMemHostAlloc(&h_out, Y_CAP, CU_MEMHOSTALLOC_PORTABLE | (want_direct ? 2 : 0))) {
               if (want_direct && !pMemHostGetDevicePointer(&h_out_dev, h_out, 0)) y_direct = 1;
+              if (want_xqc && pMemHostGetDevicePointer(&h_in_dev, h_in, 0)) h_in_dev = 0;
               printf("CUDA pinned staging %u+%u B%s\n",
                      (unsigned)XQ_CAP, (unsigned)Y_CAP,
                      y_direct ? " (y written in place by the kernel)" : "");
@@ -946,7 +963,10 @@ void cuda_init(void) {
           { CUresult r = pModLoadDataEx(&mod, ptx, 2, jit_opt, jit_val);
             if (r) { printf("PTX JIT failed %d: %.2000s\n", r, jit_log); return; } }
       } else if (pModLoadData(&mod, ptx)) { printf("PTX JIT failed (no log)\n"); return; }
-      if (pModGetFunc(&k_gemv, mod, "q4_gemv")) { printf("no kernel\n"); return; } }
+      if (pModGetFunc(&k_gemv, mod, "q4_gemv")) { printf("no kernel\n"); return; }
+      if (h_in_dev && !pModGetFunc(&k_xqcopy, mod, "xq_copy")) {
+          xq_copy_on = 1; printf("CUDA xq staged by kernel (xq_copy)\n"); }
+    }
     memcpy(h, (void *)(uintptr_t)g_LBASE, 40);
     { /* exact mapped size (any blob): find mapping containing LBASE */
       FILE *m = fopen("/proc/self/maps", "r");
@@ -1061,6 +1081,17 @@ static void copy_from_pinned(void *dst, const void *src, size_t n) {
     if (4 * q < n) memcpy(d + 4 * q, s + 4 * q, n - 4 * q);
 }
 
+/* Exp96: stage the activation block h_in -> device. The kernel route costs ~19 us per
+   call against ~36 us for cuMemcpyHtoDAsync (isolated measurement). */
+static CUresult stage_xq(uint64_t d_xq, size_t xq_bytes) {
+    if (xq_copy_on) {
+        uint32_t nwords = (uint32_t)(xq_bytes / 4);
+        void *a[] = { &h_in_dev, &d_xq, &nwords };
+        return pLaunch(k_xqcopy, (nwords + 255) / 256, 1, 1, 256, 1, 1, 0, g_stream, a, NULL);
+    }
+    return pMemcpyHtoDAsync(d_xq, h_in, xq_bytes, g_stream);
+}
+
 __attribute__((visibility("default")))
 void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
                uint64_t x_act_unused, uint64_t y, uint64_t xq) {
@@ -1142,7 +1173,7 @@ void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
             r = CUDA_SUCCESS;
         } else {
             memcpy(h_in, (void *)(uintptr_t)xq, xq_bytes);
-            r = pMemcpyHtoDAsync(d_xq, h_in, xq_bytes, g_stream);
+            r = stage_xq(d_xq, xq_bytes);
             if (!r) { xq_last_dst = d_xq; xq_last_len = xq_bytes;
                       xq_last_src = xq; xq_staged = 1; }
         }
@@ -1150,7 +1181,7 @@ void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
         if ((dd_calls & 4095) == 0) dd_dump();
     } else if (h_in) {
         memcpy(h_in, (void *)(uintptr_t)xq, xq_bytes);
-        r = pMemcpyHtoDAsync(d_xq, h_in, xq_bytes, g_stream);
+        r = stage_xq(d_xq, xq_bytes);
     } else if (pMemcpyHtoDAsync)
         r = pMemcpyHtoDAsync(d_xq, (void *)(uintptr_t)xq, xq_bytes, g_stream);
     else
