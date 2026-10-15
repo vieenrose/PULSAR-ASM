@@ -808,7 +808,9 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b2(const uint4 *__res
     __shared__ int SA[BMAX * (Q4B_KC / 32)];
     __shared__ float DA[BMAX * (Q4I_MAXCOLS / 256)];
     const int nb = cols >> 5, nd = cols >> 8, tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = tid; i < B * nd; i += 256) DA[i] = *(const float *)(xq + (i / nd) * xstride + (i % nd) * 292);
+    // slots t >= B are computed on zeros (and never stored): the token loop below then has
+    // no data-dependent branch, so the 8 independent XMAD chains can interleave
+    for (int i = tid; i < BMAX * nd; i += 256) DA[i] = i < B * nd ? *(const float *)(xq + (i / nd) * xstride + (i % nd) * 292) : 0.0f;
     const int tile = blockIdx.x * 8 + threadIdx.y;
     const int r = tile * 32 + threadIdx.x;
     const bool live = r < rows;
@@ -820,8 +822,9 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b2(const uint4 *__res
     for (int c0 = 0; c0 < cols; c0 += Q4B_KC) {
         const int kc = min(Q4B_KC, cols - c0), kb = kc >> 5, kw = kc >> 1;
         __syncthreads();
-        for (int i = tid; i < B * kw; i += 256) {
+        for (int i = tid; i < BMAX * kw; i += 256) {
             const int t = i / kw, wi = i % kw, bl = wi >> 4, k = (wi >> 2) & 3, cc = wi & 3;
+            if (t >= B) { AW[t * (Q4B_KC / 2) + wi] = 0u; continue; }
             const int e0 = c0 + bl * 32 + ((cc & 1) ? 16 : 0) + 4 * k + (cc >> 1), e1 = e0 + 2;
             const uint8_t *xt = xq + t * xstride;
             const int a0 = (int8_t)xt[(e0 >> 8) * 292 + 4 + (e0 & 255)];
@@ -829,7 +832,7 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b2(const uint4 *__res
             AW[t * (Q4B_KC / 2) + wi] = (unsigned)(a0 & 0xffff) | ((unsigned)a1 << 16);
         }
         __syncthreads();
-        for (int i = tid; i < B * kb; i += 256) {
+        for (int i = tid; i < BMAX * kb; i += 256) {
             const int t = i / kb, bl = i % kb;
             int s = 0;
             for (int j = 0; j < 16; j++) { const unsigned v = AW[t * (Q4B_KC / 2) + bl * 16 + j]; s += (int)(short)(v & 0xffffu) + ((int)v >> 16); }
@@ -850,17 +853,15 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b2(const uint4 *__res
                 }
                 #pragma unroll
                 for (int t = 0; t < BMAX; t++) {
-                    if (t < B) {
-                        const uint4 *A4 = (const uint4 *)(AW + t * (Q4B_KC / 2) + bl * 16);
-                        int s = -8 * SA[t * (Q4B_KC / 32) + bl];
-                        #pragma unroll
-                        for (int k = 0; k < 4; k++) {
-                            const uint4 a = A4[k];
-                            s = dot2_s16(m[4 * k + 0], a.x, s); s = dot2_s16(m[4 * k + 1], a.y, s);
-                            s = dot2_s16(m[4 * k + 2], a.z, s); s = dot2_s16(m[4 * k + 3], a.w, s);
-                        }
-                        acc[t] = __fmaf_rn(__fmul_rn(ws, DA[t * nd + (b >> 3)]), __int2float_rn(s), acc[t]);
+                    const uint4 *A4 = (const uint4 *)(AW + t * (Q4B_KC / 2) + bl * 16);
+                    int s = -8 * SA[t * (Q4B_KC / 32) + bl];
+                    #pragma unroll
+                    for (int k = 0; k < 4; k++) {
+                        const uint4 a = A4[k];
+                        s = dot2_s16(m[4 * k + 0], a.x, s); s = dot2_s16(m[4 * k + 1], a.y, s);
+                        s = dot2_s16(m[4 * k + 2], a.z, s); s = dot2_s16(m[4 * k + 3], a.w, s);
                     }
+                    acc[t] = __fmaf_rn(__fmul_rn(ws, DA[t * nd + (b >> 3)]), __int2float_rn(s), acc[t]);
                 }
             }
         }
@@ -880,13 +881,16 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__rest
     __shared__ int SA[BMAX * 96];
     __shared__ float DA[BMAX * 6];
     const int tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = tid; i < B * 1536; i += 256) {
+    // slots t >= B hold zeros and are never stored: no data-dependent branch in the
+    // token loops, so the per-token chains interleave (as q4i_gemv_b2)
+    for (int i = tid; i < BMAX * 1536; i += 256) {
         const int t = i / 1536, c = i % 1536;
+        if (t >= B) { A[i] = 0; continue; }
         A[t * 1536 + Q6P(c)] = (short)(int8_t)xq[t * xstride + (c >> 8) * 292 + 4 + (c & 255)];   // as q6i_gemv
     }
-    for (int i = tid; i < B * 6; i += 256) DA[i] = *(const float *)(xq + (i / 6) * xstride + (i % 6) * 292);
+    for (int i = tid; i < BMAX * 6; i += 256) DA[i] = i < B * 6 ? *(const float *)(xq + (i / 6) * xstride + (i % 6) * 292) : 0.0f;
     __syncthreads();
-    for (int i = tid; i < B * 96; i += 256) {
+    for (int i = tid; i < BMAX * 96; i += 256) {
         const int t = i / 96, bj = i % 96, b = bj >> 4, j = bj & 15, n = j >> 3, k = (j >> 1) & 3, lh = j & 1;
         int s = 0;
         for (int l = 16 * lh; l < 16 * lh + 16; l++) s += A[t * 1536 + b * 256 + 128 * n + 32 * k + l];
@@ -928,24 +932,22 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__rest
                     }
                     #pragma unroll
                     for (int t = 0; t < BMAX; t++) {
-                        if (t < B) {
-                            const uint2 *A2 = (const uint2 *)(A + t * 1536 + b * 256 + 128 * n + 32 * k + 16 * lh);
-                            int p = 0;
-                            #pragma unroll
-                            for (int g = 0; g < 4; g++) {
-                                const uint2 av = A2[g];
-                                p = dot2_s16(q[g] & 0x00FF00FFu, av.x, p);
-                                p = dot2_s16((q[g] >> 8) & 0x00FF00FFu, av.y, p);
-                            }
-                            s[t] += (int)scb[j] * (p - 32 * SA[t * 96 + b * 16 + j]);
+                        const uint2 *A2 = (const uint2 *)(A + t * 1536 + b * 256 + 128 * n + 32 * k + 16 * lh);
+                        int p = 0;
+                        #pragma unroll
+                        for (int g = 0; g < 4; g++) {
+                            const uint2 av = A2[g];
+                            p = dot2_s16(q[g] & 0x00FF00FFu, av.x, p);
+                            p = dot2_s16((q[g] >> 8) & 0x00FF00FFu, av.y, p);
                         }
+                        s[t] += (int)scb[j] * (p - 32 * SA[t * 96 + b * 16 + j]);
                     }
                 }
             }
         }
         const float dw = __half2float(*(const __half *)(u + 52));
         #pragma unroll
-        for (int t = 0; t < BMAX; t++) if (t < B) acc[t] = __fmaf_rn(__fmul_rn(dw, DA[t * 6 + b]), __int2float_rn(s[t]), acc[t]);
+        for (int t = 0; t < BMAX; t++) acc[t] = __fmaf_rn(__fmul_rn(dw, DA[t * 6 + b]), __int2float_rn(s[t]), acc[t]);
     }
     #pragma unroll
     for (int t = 0; t < BMAX; t++) if (t < B) y[(size_t)t * ystride + r] = acc[t];
