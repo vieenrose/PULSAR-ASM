@@ -184,3 +184,8 @@ load 4.6-6.4 s, 1,456 MB on the GPU, peak RSS 700 MB; decode 3.22 tok/s (en, 76 
 Tried and dropped (2026-10-15): head v5, splitting the six-bit values into 16-bit halves
 with byte permutes and mad.wide.s16 (meant to map to one XMAD per pair). Bit-identical,
 but 44.3 ms vs v4's 41.9 ms: nvcc kept the byte extracts and added shifts. v4 stays.
+
+Tried and dropped: q4i with an 8- or 16-block load ring (64 / 116 registers). Fewer
+resident warps made most shapes slower (e.g. ffn_gate 12288x1536: 0.78 -> 0.94 / 1.11 ms);
+only down at 12288 columns improved (16-deep: 1.018 ms vs K2's 1.048), ~0.6 ms per token,
+not worth a third kernel.
