@@ -106,3 +106,18 @@ Q4_0 rule must reproduce the GGUF's Q4_0 bytes exactly, which checks both files 
 Revised budget: GPU 1.06 GB (Q4_0 layers) + 0.33 GB (Q6_K head) + 0.03 GB (F16) = 1.42 GB;
 PLE table 1.93 GB Q6_K, memory-mapped, one 7.4 KB row per token. Fits the 3.4 GB available.
 Cost: one more GPU kernel (Q6_K GEMV for the 262144-row head) besides the K2 Q4_0 kernel.
+
+## M1 result (2026-10-15)
+
+- Files verified against Hugging Face's LFS sha256:
+  `model.safetensors` (QAT bf16) 10,208,852,878 B, `33fe0cec…0137`;
+  `gemma-4-E2B_q4_0-it.gguf` 3,349,516,256 B, `fa401b55…6634`.
+- `g4_gguf.py`: 541 tensors tile the GGUF exactly (header 15,815,552 B + tensors +
+  980 B alignment padding = file size).
+- `g4_q4check.py`: **275/275 Q4_0 tensors are byte-identical** to ggml's
+  `quantize_row_q4_0_ref` applied to the QAT bf16 weights, all with strict C rounding
+  (`x*id` rounded to f32, then `+8.5f`), none needing FMA contraction. Runs in 13 s.
+  So the GGUF's Q4_0 layers are exactly "the QAT weights in Q4_0", and our quantizer
+  reproduces Google's.
+- Not yet cross-checked: the two Q6_K tensors (head, PLE table) and the F16 projection;
+  they will be checked by dequantizing against the bf16 source (error bound) in M2.
