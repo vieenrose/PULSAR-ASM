@@ -202,11 +202,10 @@ static void gpu_attno(const layer_t *L, int src, const float *q, int lo, int pos
         CK(cuLaunchKernel_(fxc, (nw + 255) / 256, 1, 1, 256, 1, 1, 0, stream, c2, NULL));
         dsync[src] = pos + 1;
     }
-    int n = pos - lo + 1, ihd = hd;
-    uint64_t kl = dKC[src] + (uint64_t)lo * hd * 4, vl = dVC[src] + (uint64_t)lo * hd * 4;
-    void *a1[] = {&dQa, &kl, &dSa, &n, &ihd};
+    int n = pos - lo + 1, ihd = hd, ipos = pos, win = lo > 0 ? pos + 1 - lo : 0, sstr = 0;   /* win reproduces lo */
+    void *a1[] = {&dQa, &dKC[src], &dSa, &ipos, &win, &ihd, &sstr};
     CK(cuLaunchKernel_(fasc, (n * NH + 255) / 256, 1, 1, 256, 1, 1, (unsigned)(NH * hd * 4), stream, a1, NULL));
-    void *a2[] = {&dSa, &vl, &dOa, &n, &ihd, &dTab};
+    void *a2[] = {&dSa, &dVC[src], &dOa, &ipos, &win, &ihd, &dTab, &sstr};
     CK(cuLaunchKernel_(fapv, NH, 1, 1, 256, 1, 1, (unsigned)(n * 12), stream, a2, NULL));
     void *a3[] = {&dOa, &dX2};
     CK(cuLaunchKernel_(fq8k, NH * hd / 256, 1, 1, 256, 1, 1, 0, stream, a3, NULL));
@@ -215,6 +214,41 @@ static void gpu_attno(const layer_t *L, int src, const float *q, int lo, int pos
     wait_stream();
     double c_ = prof ? now_ms() : 0;
     copy_from_pinned(out, h_out, (size_t)H * 4);
+    if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
+}
+
+/* attention + o projection for B prompt tokens on the GPU, one wait: the batch's new
+   kv rows go up, the B query blocks (packed), then attn_scores / attn_softmax_pv over a
+   (., B) grid, q8k_dev on the B outputs, q4i_gemv_b2 for o */
+static uint64_t dQb, dSb, dOb;
+static float QPK[BATCH_MAX * NH * HD_F];
+static void gpu_attno_b(const layer_t *L, int src, int pos0, int B, int hd, int full, float *out) {
+    const int io = (int)(L->o - T), last = pos0 + B - 1;
+    if (!fast || !gpu_attn || last >= G_CAP || !KIND[io]) { attno_b_ref(L, src, pos0, B, hd, full, out); return; }
+    double a_ = prof ? now_ms() : 0;
+    if (dsync[src] <= last) {
+        size_t r0 = (size_t)dsync[src], nr = (size_t)last + 1 - r0;
+        CK(cuMemcpyHtoD_(dKC[src] + r0 * hd * 4, KC[src] + r0 * hd, nr * hd * 4));
+        CK(cuMemcpyHtoD_(dVC[src] + r0 * hd * 4, VC[src] + r0 * hd, nr * hd * 4));
+        dsync[src] = last + 1;
+    }
+    for (int t = 0; t < B; t++) memcpy(QPK + (size_t)t * NH * hd, QBB[t], (size_t)NH * hd * 4);
+    CK(cuMemcpyHtoD_(dQb, QPK, (size_t)B * NH * hd * 4));
+    int ipos0 = pos0, win = full ? 0 : WINDOW, ihd = hd, sstr = G_CAP * NH;
+    const int nmax = last - (full || last + 1 <= WINDOW ? 0 : last + 1 - WINDOW) + 1;
+    void *a1[] = {&dQb, &dKC[src], &dSb, &ipos0, &win, &ihd, &sstr};
+    CK(cuLaunchKernel_(fasc, (nmax * NH + 255) / 256, B, 1, 256, 1, 1, (unsigned)(NH * hd * 4), stream, a1, NULL));
+    void *a2[] = {&dSb, &dVC[src], &dOb, &ipos0, &win, &ihd, &dTab, &sstr};
+    CK(cuLaunchKernel_(fapv, NH, B, 1, 256, 1, 1, (unsigned)(nmax * 12), stream, a2, NULL));
+    void *a3[] = {&dOb, &dX2B};
+    CK(cuLaunchKernel_(fq8k, B * NH * hd / 256, 1, 1, 256, 1, 1, 0, stream, a3, NULL));
+    int rH = H, cO = NH * hd, ib = B, xs = (NH * hd / 256) * Q8B, ys = H;
+    void *a4[] = {&DW[io], &DS[io], &dX2B, &h_out_dev, &rH, &cO, &ib, &xs, &ys};
+    CK(cuLaunchKernel_(fq4ib, (H + 255) / 256, 1, 1, 32, 8, 1, 0, stream, a4, NULL));
+    double b_ = prof ? now_ms() : 0;
+    wait_stream();
+    double c_ = prof ? now_ms() : 0;
+    copy_from_pinned(out, h_out, (size_t)B * H * 4);
     if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
 }
 
@@ -581,6 +615,8 @@ static void gpu_init(void) {
             dKC[i] = dalloc(b); dVC[i] = dalloc(b);
         }
         dQa = dalloc((size_t)(NH * HD_F + 2 * HD_F) * 4); dSa = dalloc((size_t)G_CAP * NH * 4); dOa = dalloc((size_t)NH * HD_F * 4);
+        dQb = dalloc((size_t)BATCH_MAX * NH * HD_F * 4); dSb = dalloc((size_t)BATCH_MAX * G_CAP * NH * 4);
+        dOb = dalloc((size_t)BATCH_MAX * NH * HD_F * 4);
         gpu_attn = 1;
         fprintf(stderr, "decode attention: on the GPU (kv cache %d positions)\n", G_CAP);
     }
@@ -592,7 +628,7 @@ static void gpu_init(void) {
             nq4, dev_bytes / 1048576.0, fr / 1048576.0, tot / 1048576.0, now_ms() - t0);
     G_Q4 = gpu_q4; G_Q4N = gpu_q4n; G_HEAD = gpu_head; G_F16 = gpu_f16;
     G_Q4N_B = gpu_q4n_b; G_MLP_B = gpu_mlp_b; G_HEAD_B = gpu_head_b; G_F16_B = gpu_f16_b;
-    if (gpu_attn) { G_ATTNO = gpu_attno; pf_on = 0; }
+    if (gpu_attn) { G_ATTNO = gpu_attno; G_ATTNO_B = gpu_attno_b; pf_on = 0; }
     if (!(getenv("G4GPUMLP") && getenv("G4GPUMLP")[0] == '0')) { G_MLP = gpu_mlp; fprintf(stderr, "MLP: on the GPU (gate+up, GeGLU, Q8_K, down)\n"); }
     /* G4ASM=0 keeps the C host loops (A/B and fallback) */
     if (!(getenv("G4ASM") && getenv("G4ASM")[0] == '0')) {

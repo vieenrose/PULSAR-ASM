@@ -564,12 +564,32 @@ static void head_b_seq(const tensor_t *emb, const uint8_t *xq, int xs, int B, in
     }
 }
 static void (*G_HEAD_B)(const tensor_t *, const uint8_t *, int, int, int) = head_b_seq;
+/* attention + o projection for B prompt tokens (queries in QBB, K/V rows already
+   stored up to pos0 + B - 1): per token, in order, attention over its own range;
+   then Q8_K and the o GEMV for all of them -> out[t * H] */
+static void attno_b_ref(const layer_t *L, int src, int pos0, int B, int hd, int full, float *out);
+static void (*G_ATTNO_B)(const layer_t *, int, int, int, int, int, float *) = attno_b_ref;
 /* F16 GEMV for B tokens: x token t at x + t*cols, y token t at y + t*rows */
 static void f16_b_seq(const tensor_t *w, const float *x, float *y, int B) {
     for (int t = 0; t < B; t++) G_F16(w, x + (size_t)t * w->dims[0], y + (size_t)t * w->dims[1]);
 }
 static void (*G_F16_B)(const tensor_t *, const float *, float *, int) = f16_b_seq;
 static float PROJBB[BATCH_MAX][NL * PLE];
+
+static void attno_b_ref(const layer_t *L, int src, int pos0, int B, int hd, int full, float *out) {
+    PFOR
+    for (int t = 0; t < B; t++) {          /* per token: attention over positions <= its own */
+        int pos = pos0 + t;
+        int lo = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
+        G_ATTNALL(QBB[t], KC[src], VC[src], lo, pos, hd, ABB[t]);
+    }
+    const int xsO = (NH * hd / 256) * Q8B;
+    PFOR
+    for (int t = 0; t < B; t++) G_Q8K(ABB[t], XQB + (size_t)t * xsO, NH * hd);
+    const tensor_t *ts[1] = {L->o};
+    float *ys[1] = {out};
+    G_Q4N_B(1, ts, XQB, xsO, B, ys);
+}
 
 static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int B, int keep) {
     const tensor_t *emb = tens("token_embd.weight");
@@ -637,21 +657,9 @@ static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int
                 memcpy(VC[il] + (size_t)pos * hd, VBB[t], hd * 4);
             }
         }
-        PFOR
-        for (int t = 0; t < B; t++) {          /* per token: attention over positions <= its own */
-            int pos = pos0 + t;
-            int lo = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
-            G_ATTNALL(QBB[t], KC[src], VC[src], lo, pos, hd, ABB[t]);
-        }
-        /* o projection */
-        const int xsO = (NH * hd / 256) * Q8B;
-        PFOR
-        for (int t = 0; t < B; t++) G_Q8K(ABB[t], XQB + (size_t)t * xsO, NH * hd);
         {
             static float otmp[BATCH_MAX * H];
-            const tensor_t *ts[1] = {L->o};
-            float *ys[1] = {otmp};
-            G_Q4N_B(1, ts, XQB, xsO, B, ys);
+            G_ATTNO_B(L, src, pos0, B, hd, full, otmp);   /* attention + o projection */
             PFOR
             for (int t = 0; t < B; t++) {
                 float tt[H]; G_RMS(otmp + (size_t)t * H, L->n_post_attn, tt, H);

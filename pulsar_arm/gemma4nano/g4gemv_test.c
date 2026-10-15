@@ -368,11 +368,10 @@ static int test_attn(void) {
         for (int j = 0; j < NH; j++) attn_head_ref(q + j * hd, K, V, lo, pos, hd, o1 + j * hd);
         CK(cuMemcpyHtoD_(dQ, q, (size_t)NH * hd * 4));
         CK(cuMemcpyHtoD_(dK, K, (size_t)NP * hd * 4)); CK(cuMemcpyHtoD_(dV, V, (size_t)NP * hd * 4));
-        uint64_t kl = dK + (uint64_t)lo * hd * 4, vl = dV + (uint64_t)lo * hd * 4;
-        int in = n, ihd = hd;
-        void *a1[] = {&dQ, &kl, &dS, &in, &ihd};
+        int ipos = pos, win = lo > 0 ? pos + 1 - lo : 0, ihd = hd, sstr = 0;
+        void *a1[] = {&dQ, &dK, &dS, &ipos, &win, &ihd, &sstr};
         CK(cuLaunchKernel_(fasc, (n * NH + 255) / 256, 1, 1, 256, 1, 1, (unsigned)(NH * hd * 4), NULL, a1, NULL));
-        void *a2[] = {&dS, &vl, &dO, &in, &ihd, &dTab};
+        void *a2[] = {&dS, &dV, &dO, &ipos, &win, &ihd, &dTab, &sstr};
         CK(cuLaunchKernel_(fapv, NH, 1, 1, 256, 1, 1, (unsigned)(n * 12), NULL, a2, NULL));
         CK(cuCtxSynchronize_());
         CK(cuMemcpyDtoH_(o2, dO, (size_t)NH * hd * 4));
@@ -380,7 +379,37 @@ static int test_attn(void) {
         if (d >= 0) { bad++; printf("  attn hd %d lo %d pos %d: first diff at %d (%a vs %a)\n", hd, lo, pos, d, o1[d], o2[d]); }
         ncase++;
     }
-    printf("  attention: %d cases (n 1..512, hd 256/512, lo > 0), %d mismatches\n", ncase, bad);
+    /* batched: 8 tokens at pos0..pos0+7, each attending its own causal (windowed) range */
+    {
+        const int bc[][3] = {{256, 300, 512}, {512, 200, 0}, {256, 508, 512}, {256, 0, 512}};
+        static float qb[8 * NH * HD_F], ob[8 * NH * HD_F];
+        uint64_t dQ8, dS8, dO8;
+        CK(cuMemAlloc_(&dQ8, sizeof qb)); CK(cuMemAlloc_(&dS8, (size_t)8 * NP * NH * 4)); CK(cuMemAlloc_(&dO8, sizeof ob));
+        for (unsigned c = 0; c < sizeof bc / sizeof *bc; c++) {
+            const int hd = bc[c][0], pos0 = bc[c][1], win = bc[c][2], B = 8;
+            for (int i = 0; i < NP * hd; i++) { K[i] = (float)((urand() - 0.5) * 2.0); V[i] = (float)((urand() - 0.5) * 4.0); }
+            for (int i = 0; i < B * NH * hd; i++) qb[i] = (float)((urand() - 0.5) * 6.0);
+            CK(cuMemcpyHtoD_(dQ8, qb, (size_t)B * NH * hd * 4));
+            CK(cuMemcpyHtoD_(dK, K, (size_t)NP * hd * 4)); CK(cuMemcpyHtoD_(dV, V, (size_t)NP * hd * 4));
+            const int last = pos0 + B - 1, nmax = last - ((win > 0 && last + 1 > win) ? last + 1 - win : 0) + 1;
+            int ip = pos0, iw = win, ihd = hd, sstr = NP * NH;
+            void *a1[] = {&dQ8, &dK, &dS8, &ip, &iw, &ihd, &sstr};
+            CK(cuLaunchKernel_(fasc, (nmax * NH + 255) / 256, B, 1, 256, 1, 1, (unsigned)(NH * hd * 4), NULL, a1, NULL));
+            void *a2[] = {&dS8, &dV, &dO8, &ip, &iw, &ihd, &dTab, &sstr};
+            CK(cuLaunchKernel_(fapv, NH, B, 1, 256, 1, 1, (unsigned)(nmax * 12), NULL, a2, NULL));
+            CK(cuCtxSynchronize_());
+            CK(cuMemcpyDtoH_(ob, dO8, (size_t)B * NH * hd * 4));
+            for (int t = 0; t < B; t++) {
+                const int pos = pos0 + t, lo = (win > 0 && pos + 1 > win) ? pos + 1 - win : 0;
+                for (int j = 0; j < NH; j++) attn_head_ref(qb + (size_t)t * NH * hd + j * hd, K, V, lo, pos, hd, o1 + j * hd);
+                int d = first_diff(o1, ob + (size_t)t * NH * hd, NH * hd);
+                if (d >= 0) { bad++; printf("  attn batched hd %d pos %d (win %d): first diff at %d\n", hd, pos, win, d); }
+            }
+            ncase += B;
+        }
+        CK(cuMemFree_(dQ8)); CK(cuMemFree_(dS8)); CK(cuMemFree_(dO8));
+    }
+    printf("  attention: %d cases (n 1..512, hd 256/512, lo > 0, batched 4 x 8 tokens incl. window crossing), %d mismatches\n", ncase, bad);
     free(K); free(V);
     return bad;
 }
@@ -556,25 +585,6 @@ static void perfb(void) {
     printf("  %-26s single %.3f ms/token, batched %.3f ms/token (x%.2f)\n", "head", t1, tb / B, t1 / (tb / B));
 }
 
-static void perfattn(void) {
-    double v[24] = {EXP_P0};
-    for (int i = 0; i < 13; i++) v[1 + i] = EXP_C[i];
-    v[14] = EXP_LOG2E; v[15] = EXP_SH; v[16] = EXP_LN2HI; v[17] = EXP_LN2LO;
-    uint64_t dTab, dQ, dK, dV, dS, dO;
-    CK(cuMemAlloc_(&dTab, sizeof v)); CK(cuMemcpyHtoD_(dTab, v, sizeof v));
-    CK(cuMemAlloc_(&dQ, NH * HD_F * 4)); CK(cuMemAlloc_(&dK, 512 * HD_F * 4)); CK(cuMemAlloc_(&dV, 512 * HD_F * 4));
-    CK(cuMemAlloc_(&dS, 512 * NH * 4)); CK(cuMemAlloc_(&dO, NH * HD_F * 4));
-    int hds[2] = {256, 512};
-    for (int k = 0; k < 2; k++) {
-        int n = 300, hd = hds[k];
-        void *a1[] = {&dQ, &dK, &dS, &n, &hd};
-        smem_bytes = NH * hd * 4; double t1 = time_launch(fasc, (n * NH + 255) / 256, 256, 1, a1);
-        void *a2[] = {&dS, &dV, &dO, &n, &hd, &dTab};
-        smem_bytes = n * 12; double t2 = time_launch(fapv, NH, 256, 1, a2);
-        smem_bytes = 0;
-        printf("  attention n=%d hd=%d: scores %.3f ms, softmax+pv %.3f ms\n", n, hd, t1, t2);
-    }
-}
 
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s <gguf> <g4_kernels.ptx> [q4|head|f16|all|perf]\n", argv[0]); return 2; }
@@ -612,7 +622,6 @@ int main(int argc, char **argv) {
     if (!strcmp(what, "perf")) { perf(); return 0; }
     if (!strcmp(what, "perfi")) { use_q4i = 1; perf(); return 0; }
     if (!strcmp(what, "perfb")) { perfb(); perfb(); return 0; }
-    if (!strcmp(what, "perfattn")) { perfattn(); perfattn(); return 0; }
     printf(fails ? "M3 GATE: FAIL (%d)\n" : "M3 GATE: OK\n", fails);
     return fails ? 1 : 0;
 }
