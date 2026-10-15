@@ -78,6 +78,18 @@ int pq1_fa_launch(const float *qo_d, const unsigned short *kc_d, const unsigned 
                   float *sc_d, float *mv_d, const unsigned char *par_d, float *atto_d, int nh,
                   int nkv, int ctx, void *stream);
 extern int pq1_fa_mask;   /* bit 0 qk, 1 softmax parameters, 2 V accumulation */
+/* TurboQuant K/V cache (PQ1_KVTQ=3|4|43, lossy, opt-in; pq1_swar_sm53.cu): bits
+ * 3 or 4 for K and V, 43 = 4-bit K + 3-bit V. Per layer K codes [nkv][ctx][CW]
+ * u32 (CW = 12 at 3 bits, 16 at 4), V codes, K scales [nkv][ctx] f32, V scales. stage_d = 2 nkv f16 rows (K rows, then V rows). */
+int pq1_tq_store_launch(int bits, const unsigned short *stage_d, int npos, unsigned int *kcode,
+                        float *ksc, unsigned int *vcode, float *vsc, int nkv, int ctx, void *stream);
+int pq1_tq_fa_launch(int bits, const float *qo_d, const unsigned char *par_d, unsigned int *kcode,
+                     float *ksc, unsigned int *vcode, float *vsc, float *sc_d, float *part_d,
+                     float *inv_d, float *atto_d, int nh, int nkv, int ctx, void *stream);
+int pq1_attn_tq_launch(int bits, const float *qkv_d, const float *nw_d, const unsigned char *par_d,
+                       float *qo_d, unsigned short *stage_d, unsigned int *kcode, float *ksc,
+                       unsigned int *vcode, float *vsc, float *sc_d, float *part_d, float *inv_d,
+                       float *atto_d, int nh, int nkv, int ctx, void *stream);
 /* host reference (pq1_host.c) */
 void pq1_f2h_row(const float *x, uint16_t *h, int n);
 void pq1_fa16_head(const float *q, const uint16_t *K, const uint16_t *V, int T, float scale,

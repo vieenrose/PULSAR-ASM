@@ -1056,3 +1056,19 @@ heads, one warp each, reading the scores through L2 (__ldcg). It is bit-exact: f
 tail (atomic, fence, L2 reread of sc, expf chain on 8 blocks) costs more than the ~1.5 us launch
 gap it removes. Conclusion: launch gaps between attention kernels are not worth fusing on this
 board, so the same goes for fusing pv or q8k_w<0>.
+
+## Feature: TurboQuant K/V cache (PQ1_KVTQ=3|4|43, opt-in, lossy)
+
+Random sign flip + 128-point Walsh-Hadamard rotation, then each coordinate snapped to a
+Lloyd-Max codebook for the d=128 sphere marginal (3 or 4 bits), plus one f32 norm per row
+(MSE variant, no QJL residual). 43 = 4-bit K + 3-bit V. Kernels pq1_tq_{store,qk,sm,pv,out};
+pq1_parity tq 3|4 checks device codes vs the host encoder (0 differ) and the kernel vs fp64
+attention on the decoded cache (max err 1.2e-5). K relative MSE 0.0307 / 0.0085 (theory 0.034 / 0.0093).
+Measured on the real 8B (teacher-forced on 2048 f16-generated tokens, top-1 vs f16):
+TQ3 90.8%, K4V3 95.0%, TQ4 95.9%. Prompt A: all three generate the same 24 tokens as f16.
+ms/tok at ~100 / ~1050 / ~1970 positions: f16 62.1 / 88.4 / 117.0; TQ3 64.0 / 78.7 / 92.5;
+K4V3 65.8 / 92.0 / 116.2; TQ4 65.7 / 91.3 / 114.8 (qk<4> is the slow kernel).
+GPU used at ctx 2112: f16 1314.6 MB, TQ3 1077.9, K4V3 1087.2, TQ4 1096.5.
+Host RSS follows the arena size, not the cache: a 1280 MB arena gave 795 MB RSS vs 694 MB at
+1426 with the same used_mb, so TQ keeps the f16 arena sizing (RSS 684 vs f16 665 at 2k).
+Open: qk<4> speed (fp16 LUT), and a larger default arena may cut default-path RSS by ~100 MB.

@@ -2262,6 +2262,8 @@ __global__ __launch_bounds__(256) void pq1_attn_pre2(const float* __restrict__ q
     }
   }
 }
+/* ctx < 0 (the TurboQuant KV path): the f16 K and V rows go to a staging
+ * area, row h of kc / vc, for pq1_tq_store; the arithmetic is unchanged. */
 /* pre3 (PQ1_APRE=3, default): pre2 spread over ceil(nqk / 8) blocks, one q/k
  * head per warp (pre2 runs 5 heads in series on each of its 8 warps, each with
  * a lane-0 certificate tail, in one CTA); V is converted by all blocks. Every
@@ -2302,7 +2304,7 @@ __global__ __launch_bounds__(256) void pq1_attn_pre3(const float* __restrict__ q
         const int h = i >> 5, d = (i & 31) * 4;
         const uint32_t lo = pq1_f2h(vv[k].x) | ((uint32_t)pq1_f2h(vv[k].y) << 16);
         const uint32_t hi = pq1_f2h(vv[k].z) | ((uint32_t)pq1_f2h(vv[k].w) << 16);
-        *reinterpret_cast<uint2*>(vc + ((size_t)h * ctx + npos) * 128 + d) = make_uint2(lo, hi);
+        *reinterpret_cast<uint2*>(vc + (ctx < 0 ? (size_t)h : (size_t)h * ctx + npos) * 128 + d) = make_uint2(lo, hi);
       }
     }
     if (t < 64) reinterpret_cast<float4*>(swn)[t] = aux;
@@ -2366,7 +2368,7 @@ __global__ __launch_bounds__(256) void pq1_attn_pre3(const float* __restrict__ q
       qo[(size_t)hh * 128 + j] = o0;
       qo[(size_t)hh * 128 + j + 64] = o1;
     } else {
-      unsigned short* dst = kc + ((size_t)(hh - nh) * ctx + npos) * 128;
+      unsigned short* dst = kc + (ctx < 0 ? (size_t)(hh - nh) : (size_t)(hh - nh) * ctx + npos) * 128;
       dst[j] = pq1_f2h(o0);
       dst[j + 64] = pq1_f2h(o1);
     }
@@ -3059,4 +3061,332 @@ extern "C" int pq1_argmax_launch(const float* v_d, int n, int* out_d, void* stre
   if (n <= 0) return -1;
   pq1_argmax_k<<<1, 1024, 0, (cudaStream_t)stream>>>(v_d, n, out_d);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+/* ---- TurboQuant K/V cache (PQ1_KVTQ=3|4; lossy, opt-in, off the bit-exact path)
+ * Zandieh et al., "TurboQuant" (2025), the MSE variant: every 128-dim K or V
+ * head row x is rotated, y = R x with R = H D / sqrt(128) (H the Sylvester
+ * Hadamard matrix, D a fixed random +-1 diagonal, PQ1_TQ_D), so that the
+ * coordinates of y / |x| * sqrt(128) are ~N(0, 1) whatever x looks like (the
+ * K outlier channels are spread over all 128 dims). Each coordinate is then
+ * replaced by the nearest Lloyd-Max centroid for that distribution (the exact
+ * sphere marginal for d = 128, 2^b levels, symmetric: b-1 magnitude bits + a
+ * sign bit) and the row keeps one f32 scale s = |x| / |c|, so the decoded row
+ * s c has the norm of x. Row = 12 words at 3 bits (2-bit magnitude plane,
+ * then the sign plane), 16 at 4 bits (one nibble per dim: magnitude | sign<<3),
+ * + 4 bytes: 52 / 68 bytes vs 256 for f16.
+ * Attention never rotates the cache back: q.k = (R q).(R k), so each block
+ * rotates its q heads once and builds a lookup table q_r[j] * c[v] (the 1/sqrt
+ * (128) score scale folded in); V is accumulated in the rotated domain and
+ * R^T applied once per head at the end. Softmax is the plain max / exp / sum
+ * (no fork order to follow here); the V sum is split over 256-position chunks.
+ * Layout per layer: K codes [kv][ctx][CW], V codes, K scales [kv][ctx], V scales. */
+__constant__ float PQ1_TQC3[4] = {0.24444127f, 0.75336427f, 1.33664119f, 2.13151002f};
+__constant__ float PQ1_TQT3[3] = {0.49890277f, 1.04500270f, 1.73407555f};
+__constant__ float PQ1_TQC4[8] = {0.12788960f, 0.38643676f, 0.65370631f, 0.93720949f,
+                                  1.24789774f, 1.60447431f, 2.04605246f, 2.68896675f};
+__constant__ float PQ1_TQT4[7] = {0.25716320f, 0.52007151f, 0.79545790f, 1.09255362f,
+                                  1.42618608f, 1.82526338f, 2.36750960f};
+__constant__ uint32_t PQ1_TQ_D[4] = {0xb5297a4du, 0x68e31da4u, 0x1b56c4e9u, 0xf3c2a581u};
+#define PQ1_TQ_CH 256   /* positions per V-sum chunk */
+#define PQ1_TQ_QB 16    /* max q.k blocks per kv head */
+template <int B> struct pq1_tqc { enum { CW = B == 3 ? 12 : 16, NV = 1 << B }; };
+__device__ __forceinline__ float pq1_tq_cent(int B, int v) {   /* signed centroid of code v */
+  const float m = B == 3 ? PQ1_TQC3[v & 3] : PQ1_TQC4[v & 7];
+  return (v >> (B - 1)) & 1 ? -m : m;
+}
+/* x[i] = element 4 lane + i of a 128-vector held by a warp; in place, x <- H x */
+__device__ __forceinline__ void pq1_fwht128(float x[4], int lane) {
+  float a = x[0] + x[1], b = x[0] - x[1], c = x[2] + x[3], d = x[2] - x[3];
+  x[0] = a + c; x[1] = b + d; x[2] = a - c; x[3] = b - d;
+#pragma unroll
+  for (int m = 1; m < 32; m <<= 1) {
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const float p = __shfl_xor_sync(0xffffffffu, x[i], m);
+      x[i] = (lane & m) ? p - x[i] : x[i] + p;
+    }
+  }
+}
+__device__ __forceinline__ float pq1_tq_dsign(float v, int j) {
+  return (PQ1_TQ_D[j >> 5] >> (j & 31)) & 1 ? -v : v;
+}
+/* one warp quantizes one staged f16 row into code words cw and scale *sc */
+template <int B>
+__device__ __forceinline__ void pq1_tq_row(const unsigned short* __restrict__ row, uint32_t* __restrict__ cw,
+                                           float* __restrict__ sc, int l) {
+  const uint2 u = reinterpret_cast<const uint2*>(row)[l];
+  float x[4] = {pq1_h2f((unsigned short)(u.x & 0xffffu)), pq1_h2f((unsigned short)(u.x >> 16)),
+                pq1_h2f((unsigned short)(u.y & 0xffffu)), pq1_h2f((unsigned short)(u.y >> 16))};
+  float n2 = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) { n2 = fmaf(x[i], x[i], n2); x[i] = pq1_tq_dsign(x[i], 4 * l + i); }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) n2 += __shfl_xor_sync(0xffffffffu, n2, o);
+  pq1_fwht128(x, l);
+  const float nrm = sqrtf(n2), inv = nrm > 0.0f ? 1.0f / nrm : 0.0f;
+  int v[4];
+  float c2 = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const float z = x[i] * inv, a = fabsf(z);
+    int m;
+    if (B == 3) m = (a > PQ1_TQT3[0]) + (a > PQ1_TQT3[1]) + (a > PQ1_TQT3[2]);
+    else {
+      m = 0;
+#pragma unroll
+      for (int k = 0; k < 7; k++) m += a > PQ1_TQT4[k];
+    }
+    const float c = B == 3 ? PQ1_TQC3[m] : PQ1_TQC4[m];
+    c2 = fmaf(c, c, c2);
+    v[i] = m | ((z < 0.0f) << (B - 1));
+  }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) c2 += __shfl_xor_sync(0xffffffffu, c2, o);
+  if (B == 3) {
+    uint32_t mw = (uint32_t)((v[0] & 3) | (v[1] & 3) << 2 | (v[2] & 3) << 4 | (v[3] & 3) << 6) << (8 * (l & 3));
+    uint32_t sw = (uint32_t)((v[0] >> 2) | (v[1] >> 2) << 1 | (v[2] >> 2) << 2 | (v[3] >> 2) << 3) << (4 * (l & 7));
+    mw |= __shfl_xor_sync(0xffffffffu, mw, 1); mw |= __shfl_xor_sync(0xffffffffu, mw, 2);
+    sw |= __shfl_xor_sync(0xffffffffu, sw, 1); sw |= __shfl_xor_sync(0xffffffffu, sw, 2);
+    sw |= __shfl_xor_sync(0xffffffffu, sw, 4);
+    if (!(l & 3)) cw[l >> 2] = mw;
+    if (!(l & 7)) cw[8 + (l >> 3)] = sw;
+  } else {
+    uint32_t nw = (uint32_t)(v[0] | v[1] << 4 | v[2] << 8 | v[3] << 12) << (16 * (l & 1));
+    nw |= __shfl_xor_sync(0xffffffffu, nw, 1);
+    if (!(l & 1)) cw[l >> 1] = nw;
+  }
+  if (l == 0) *sc = c2 > 0.0f ? nrm * rsqrtf(c2) : 0.0f;
+}
+/* quantize the 2 nkv staged f16 rows (K rows at BK bits, then V rows at BV
+ * bits) into position npos; one warp per row. npos_h < 0: npos from par. */
+template <int BK, int BV>
+__global__ void pq1_tq_store(const unsigned short* __restrict__ stage, const uint8_t* __restrict__ par,
+                             int npos_h, uint32_t* __restrict__ kcode, float* __restrict__ ksc,
+                             uint32_t* __restrict__ vcode, float* __restrict__ vsc, int nkv, int ctx) {
+  const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+  if (w >= 2 * nkv) return;
+  const int npos = npos_h >= 0 ? npos_h : *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS);
+  const unsigned short* row = stage + (size_t)w * 128;
+  if (w >= nkv) {
+    const size_t r = (size_t)(w - nkv) * ctx + npos;
+    pq1_tq_row<BV>(row, vcode + r * pq1_tqc<BV>::CW, vsc + r, l);
+  } else {
+    const size_t r = (size_t)w * ctx + npos;
+    pq1_tq_row<BK>(row, kcode + r * pq1_tqc<BK>::CW, ksc + r, l);
+  }
+}
+/* bits: 3 or 4 for K and V alike, 43 for 4-bit K with 3-bit V */
+static __host__ __forceinline__ int pq1_tq_bk(int bits) { return bits == 43 ? 4 : bits; }
+static __host__ __forceinline__ int pq1_tq_bv(int bits) { return bits == 43 ? 3 : bits; }
+static int pq1_tq_store_go(int bits, const unsigned short* stage, const uint8_t* par, int npos, uint32_t* kcode,
+                           float* ksc, uint32_t* vcode, float* vsc, int nkv, int ctx, cudaStream_t s) {
+  if (bits == 3) pq1_tq_store<3, 3><<<1, 64 * nkv, 0, s>>>(stage, par, npos, kcode, ksc, vcode, vsc, nkv, ctx);
+  else if (bits == 4) pq1_tq_store<4, 4><<<1, 64 * nkv, 0, s>>>(stage, par, npos, kcode, ksc, vcode, vsc, nkv, ctx);
+  else if (bits == 43) pq1_tq_store<4, 3><<<1, 64 * nkv, 0, s>>>(stage, par, npos, kcode, ksc, vcode, vsc, nkv, ctx);
+  else return -2;
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+/* scores sc[h][t] = s_t * sum_j q_r[h][j] c[code_tj] / sqrt(128), G = 4 q heads
+ * per kv head, lane = position; table lut[j][v] = the 4 heads' q_r[h][j] c[v]
+ * as a float4 (one 128-bit shared load per dim), filled conflict-free from the
+ * rotated q rows; 256 threads share one table. */
+template <int B>
+__global__ __launch_bounds__(256, 2) void pq1_tq_qk(const float* __restrict__ qo, const uint32_t* __restrict__ kcode,
+                                                    const float* __restrict__ ksc, const uint8_t* __restrict__ par,
+                                                    float* __restrict__ sc, int ctx) {
+  enum { CW = pq1_tqc<B>::CW, NV = pq1_tqc<B>::NV };
+  __shared__ __align__(16) float4 lut[128 * NV];
+  __shared__ __align__(16) float qr[4][128];
+  const int kh = blockIdx.x, tid = threadIdx.x, w = tid >> 5, l = tid & 31;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  if ((int)blockIdx.y * 256 >= T) return;   /* block-uniform */
+  if (w < 4) {
+    const float4 q4 = reinterpret_cast<const float4*>(qo + (size_t)(kh * 4 + w) * 128)[l];
+    float x[4] = {pq1_tq_dsign(q4.x, 4 * l), pq1_tq_dsign(q4.y, 4 * l + 1),
+                  pq1_tq_dsign(q4.z, 4 * l + 2), pq1_tq_dsign(q4.w, 4 * l + 3)};
+    pq1_fwht128(x, l);
+    /* R's 1/sqrt(128), then the score scale */
+    reinterpret_cast<float4*>(qr[w])[l] = make_float4(x[0] * 0.0078125f, x[1] * 0.0078125f,
+                                                      x[2] * 0.0078125f, x[3] * 0.0078125f);
+  }
+  __syncthreads();
+  for (int e = tid; e < 128 * NV; e += 256) {
+    const int j = e / NV;
+    const float c = pq1_tq_cent(B, e % NV);
+    lut[e] = make_float4(qr[0][j] * c, qr[1][j] * c, qr[2][j] * c, qr[3][j] * c);
+  }
+  __syncthreads();
+  const uint32_t* kb = kcode + (size_t)kh * ctx * CW;
+  for (int t = blockIdx.y * 256 + tid; t < T; t += gridDim.y * 256) {
+    uint32_t cw[CW];
+#pragma unroll
+    for (int k = 0; k < CW / 4; k++) {
+      const uint4 u = __ldg(reinterpret_cast<const uint4*>(kb + (size_t)t * CW) + k);
+      cw[4 * k] = u.x; cw[4 * k + 1] = u.y; cw[4 * k + 2] = u.z; cw[4 * k + 3] = u.w;
+    }
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 128; j++) {
+      int v;
+      if (B == 3) v = ((cw[j >> 4] >> (2 * (j & 15))) & 3) | (((cw[8 + (j >> 5)] >> (j & 31)) & 1) << 2);
+      else v = (cw[j >> 3] >> (4 * (j & 7))) & 15;
+      const float4 e = lut[j * NV + v];
+      a0 += e.x; a1 += e.y; a2 += e.z; a3 += e.w;
+    }
+    const float s = __ldg(ksc + (size_t)kh * ctx + t);
+    float* so = sc + (size_t)kh * 4 * ctx + t;
+    so[0] = a0 * s; so[ctx] = a1 * s; so[2 * (size_t)ctx] = a2 * s; so[3 * (size_t)ctx] = a3 * s;
+  }
+}
+/* per q head: p_t = exp(s_t - max) in place, inv[h] = 1 / sum p */
+__global__ __launch_bounds__(256) void pq1_tq_sm(float* __restrict__ sc, const uint8_t* __restrict__ par,
+                                                 float* __restrict__ inv, int ctx) {
+  __shared__ float red[8];
+  const int h = blockIdx.x, tid = threadIdx.x, l = tid & 31, w = tid >> 5;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  float* s = sc + (size_t)h * ctx;
+  float m = -INFINITY;
+  for (int t = tid; t < T; t += 256) m = fmaxf(m, s[t]);
+#pragma unroll
+  for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+  if (!l) red[w] = m;
+  __syncthreads();
+  m = red[0];
+#pragma unroll
+  for (int k = 1; k < 8; k++) m = fmaxf(m, red[k]);
+  __syncthreads();
+  float sum = 0.0f;
+  for (int t = tid; t < T; t += 256) { const float p = expf(s[t] - m); s[t] = p; sum += p; }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+  if (!l) red[w] = sum;
+  __syncthreads();
+  if (!tid) {
+    float z = 0.0f;
+    for (int k = 0; k < 8; k++) z += red[k];
+    inv[h] = 1.0f / z;
+  }
+}
+/* rotated V partial sums of one 256-position chunk: lane = dims 4l..4l+3 of
+ * the 4 heads (16 accumulators), warp w takes every 4th position of the chunk,
+ * the 4 warps' sums are added through shared memory at the end */
+template <int B>
+__global__ __launch_bounds__(128) void pq1_tq_pv(const float* __restrict__ p, const uint32_t* __restrict__ vcode,
+                                                 const float* __restrict__ vsc, const uint8_t* __restrict__ par,
+                                                 float* __restrict__ part, int nh, int ctx) {
+  enum { CW = pq1_tqc<B>::CW, NV = pq1_tqc<B>::NV };
+  __shared__ __align__(16) float4 wt[PQ1_TQ_CH];
+  __shared__ __align__(16) uint32_t cs[PQ1_TQ_CH * CW];
+  __shared__ float cent[NV];
+  __shared__ __align__(16) float red[3][4][128];
+  const int kh = blockIdx.x, c = blockIdx.y, tid = threadIdx.x, w = tid >> 5, l = tid & 31;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  const int t0 = c * PQ1_TQ_CH, n = min(PQ1_TQ_CH, T - t0);
+  if (n <= 0) return;   /* block-uniform */
+  if (tid < NV) cent[tid] = pq1_tq_cent(B, tid);
+  const uint32_t* vb = vcode + ((size_t)kh * ctx + t0) * CW;
+  for (int i = tid; i < n * CW / 4; i += 128)
+    reinterpret_cast<uint4*>(cs)[i] = __ldg(reinterpret_cast<const uint4*>(vb) + i);
+  for (int t = tid; t < n; t += 128) {
+    const float s = __ldg(vsc + (size_t)kh * ctx + t0 + t);
+    const float* pp = p + (size_t)kh * 4 * ctx + t0 + t;
+    wt[t] = make_float4(pp[0] * s, pp[ctx] * s, pp[2 * (size_t)ctx] * s, pp[3 * (size_t)ctx] * s);
+  }
+  __syncthreads();
+  float a[4][4];
+#pragma unroll
+  for (int h = 0; h < 4; h++)
+#pragma unroll
+    for (int i = 0; i < 4; i++) a[h][i] = 0.0f;
+  for (int t = w; t < n; t += 4) {
+    const uint32_t* cw = cs + t * CW;
+    int v[4];
+    if (B == 3) {
+      const uint32_t mb = cw[l >> 2] >> (8 * (l & 3)), sb = cw[8 + (l >> 3)] >> (4 * (l & 7));
+#pragma unroll
+      for (int i = 0; i < 4; i++) v[i] = ((mb >> (2 * i)) & 3) | (((sb >> i) & 1) << 2);
+    } else {
+      const uint32_t nb = cw[l >> 1] >> (16 * (l & 1));
+#pragma unroll
+      for (int i = 0; i < 4; i++) v[i] = (nb >> (4 * i)) & 15;
+    }
+    const float4 g = wt[t];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const float e = cent[v[i]];
+      a[0][i] = fmaf(g.x, e, a[0][i]); a[1][i] = fmaf(g.y, e, a[1][i]);
+      a[2][i] = fmaf(g.z, e, a[2][i]); a[3][i] = fmaf(g.w, e, a[3][i]);
+    }
+  }
+  if (w)
+#pragma unroll
+    for (int h = 0; h < 4; h++)
+      reinterpret_cast<float4*>(red[w - 1][h])[l] = make_float4(a[h][0], a[h][1], a[h][2], a[h][3]);
+  __syncthreads();
+  if (!w)
+#pragma unroll
+    for (int h = 0; h < 4; h++) {
+#pragma unroll
+      for (int k = 0; k < 3; k++) {
+        const float4 r = reinterpret_cast<const float4*>(red[k][h])[l];
+        a[h][0] += r.x; a[h][1] += r.y; a[h][2] += r.z; a[h][3] += r.w;
+      }
+      reinterpret_cast<float4*>(part + ((size_t)c * nh + kh * 4 + h) * 128)[l] =
+          make_float4(a[h][0], a[h][1], a[h][2], a[h][3]);
+    }
+}
+/* per q head (one warp): sum the chunks, normalize, rotate back */
+__global__ void pq1_tq_out(const float* __restrict__ part, const float* __restrict__ inv,
+                           const uint8_t* __restrict__ par, float* __restrict__ atto, int nh) {
+  const int h = blockIdx.x, l = threadIdx.x;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  const int nc = (T + PQ1_TQ_CH - 1) / PQ1_TQ_CH;
+  float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int c = 0; c < nc; c++) {
+    const float4 u = reinterpret_cast<const float4*>(part + ((size_t)c * nh + h) * 128)[l];
+    x[0] += u.x; x[1] += u.y; x[2] += u.z; x[3] += u.w;
+  }
+  pq1_fwht128(x, l);
+  const float k = inv[h] * 0.0883883476f;
+  float4 o;
+  o.x = pq1_tq_dsign(x[0] * k, 4 * l); o.y = pq1_tq_dsign(x[1] * k, 4 * l + 1);
+  o.z = pq1_tq_dsign(x[2] * k, 4 * l + 2); o.w = pq1_tq_dsign(x[3] * k, 4 * l + 3);
+  reinterpret_cast<float4*>(atto + (size_t)h * 128)[l] = o;
+}
+/* the store alone (host-path rows already staged; npos explicit) */
+extern "C" int pq1_tq_store_launch(int bits, const unsigned short* stage_d, int npos, uint32_t* kcode,
+                                   float* ksc, uint32_t* vcode, float* vsc, int nkv, int ctx, void* stream) {
+  cudaStream_t s = (cudaStream_t)stream;
+  if (nkv <= 0 || nkv > 16) return -2;
+  return pq1_tq_store_go(bits, stage_d, NULL, npos, kcode, ksc, vcode, vsc, nkv, ctx, s);
+}
+/* attention on the TurboQuant cache, post-rope q in qo_d (pq1_fa_launch's role) */
+extern "C" int pq1_tq_fa_launch(int bits, const float* qo_d, const uint8_t* par_d, uint32_t* kcode,
+                                float* ksc, uint32_t* vcode, float* vsc, float* sc_d, float* part_d,
+                                float* inv_d, float* atto_d, int nh, int nkv, int ctx, void* stream) {
+  cudaStream_t s = (cudaStream_t)stream;
+  if (nh != 4 * nkv || ctx <= 0 || (bits != 3 && bits != 4 && bits != 43)) return -2;
+  const int bk = pq1_tq_bk(bits), bv = pq1_tq_bv(bits);
+  const dim3 gq(nkv, min((ctx + 255) / 256, PQ1_TQ_QB)), gp(nkv, (ctx + PQ1_TQ_CH - 1) / PQ1_TQ_CH);
+  if (bk == 3) pq1_tq_qk<3><<<gq, 256, 0, s>>>(qo_d, kcode, ksc, par_d, sc_d, ctx);
+  else pq1_tq_qk<4><<<gq, 256, 0, s>>>(qo_d, kcode, ksc, par_d, sc_d, ctx);
+  pq1_tq_sm<<<nh, 256, 0, s>>>(sc_d, par_d, inv_d, ctx);
+  if (bv == 3) pq1_tq_pv<3><<<gp, 128, 0, s>>>(sc_d, vcode, vsc, par_d, part_d, nh, ctx);
+  else pq1_tq_pv<4><<<gp, 128, 0, s>>>(sc_d, vcode, vsc, par_d, part_d, nh, ctx);
+  pq1_tq_out<<<nh, 32, 0, s>>>(part_d, inv_d, par_d, atto_d, nh);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+/* the whole attention block with the TurboQuant cache: pre3 (head norms, rope,
+ * K/V rows to stage_d), the row store at npos, then pq1_tq_fa_launch */
+extern "C" int pq1_attn_tq_launch(int bits, const float* qkv_d, const float* nw_d, const uint8_t* par_d,
+                                  float* qo_d, unsigned short* stage_d, uint32_t* kcode, float* ksc,
+                                  uint32_t* vcode, float* vsc, float* sc_d, float* part_d, float* inv_d,
+                                  float* atto_d, int nh, int nkv, int ctx, void* stream) {
+  cudaStream_t s = (cudaStream_t)stream;
+  if (nh != 4 * nkv || nkv > 16 || nh + nkv > PQ1_APRE_MAXH || (bits != 3 && bits != 4 && bits != 43)) return -2;
+  pq1_attn_pre3<<<(nh + nkv + 7) / 8, 256, 0, s>>>(qkv_d, nw_d, par_d, qo_d, stage_d,
+                                                   stage_d + (size_t)nkv * 128, nh, nkv, -1, 0, NULL);
+  if (pq1_tq_store_go(bits, stage_d, par_d, -1, kcode, ksc, vcode, vsc, nkv, ctx, s) != 0) return -1;
+  return pq1_tq_fa_launch(bits, qo_d, par_d, kcode, ksc, vcode, vsc, sc_d, part_d, inv_d, atto_d, nh, nkv, ctx, stream);
 }

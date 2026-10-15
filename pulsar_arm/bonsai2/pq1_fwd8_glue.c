@@ -204,8 +204,27 @@ static size_t PQ1ACUR = 0, PQ1ALIM = 0;
  * first device call). The f16 cache plus attention scratch beyond the 75.5 MB
  * that the ctx-512 f32 cache used to take is added to the arena. */
 static int PQ1KVS_NL = 0, PQ1KVS_NKV = 0, PQ1KVS_CTX = 0;
-static size_t pq1_kv_bytes(int nl, int nkv, int ctx) {
-  return (size_t)nl * 2 * nkv * ctx * 128 * 2 + (size_t)PQ1_FA_MAXH * ctx * 12;
+/* PQ1_KVTQ=3|4|43: TurboQuant K/V cache (random sign + Walsh-Hadamard rotation,
+ * Lloyd-Max codebook per coordinate, one f32 norm per row; pq1_tq_* kernels).
+ * Off by default: it changes the attention values, so the goldens only hold
+ * at PQ1_KVTQ=0. 43 keeps K at 4 bits and V at 3 (3.5 bits/value). Layout per run: all K/V code rows (layer, K|V, kv head, pos,
+ * CW words), then all row scales in the same order, then the 2 nkv x 128 f16
+ * staging rows that pre3 writes and pq1_tq_store encodes. */
+static int PQ1_KVTQ = -1;
+static int pq1_kvtq(void) {
+  if (PQ1_KVTQ < 0) {
+    const char *e = getenv("PQ1_KVTQ");
+    PQ1_KVTQ = e ? atoi(e) : 0;
+    if (PQ1_KVTQ != 3 && PQ1_KVTQ != 4 && PQ1_KVTQ != 43) PQ1_KVTQ = 0;
+  }
+  return PQ1_KVTQ;
+}
+/* code words per row of K (v = 0) or V (v = 1); 43 = 4-bit K, 3-bit V */
+static int pq1_tq_cw(int v) { return (pq1_kvtq() == 3 || (pq1_kvtq() == 43 && v)) ? 12 : 16; }
+static size_t pq1_kv_cache_bytes(int nl, int nkv, int ctx) {
+  if (!pq1_kvtq()) return (size_t)nl * 2 * nkv * ctx * 128 * 2;
+  return ((size_t)nl * nkv * ctx * ((pq1_tq_cw(0) + pq1_tq_cw(1)) * 4 + 8) + (size_t)2 * nkv * 256 + 255) /
+         256 * 256;
 }
 void pq1_kv_shape(int nl, int nkv, int ctx) { PQ1KVS_NL = nl; PQ1KVS_NKV = nkv; PQ1KVS_CTX = ctx; }
 static uint8_t *d_xq = NULL;
@@ -475,7 +494,11 @@ static int pq1_arena_init(size_t need) {
   const char *e = getenv("PQ1_ARENA_MB");
   size_t mb = e ? (size_t)atoi(e) : 1280;
   if (!e && PQ1KVS_CTX > 0) {
-    const size_t kvb = pq1_kv_bytes(PQ1KVS_NL, PQ1KVS_NKV, PQ1KVS_CTX);
+    /* sized for the f16 cache even under PQ1_KVTQ: the unused tail costs no
+     * device memory (PQ1GPU used_mb unchanged), while a 1280 MB arena instead
+     * of 1426 raised max RSS by ~100 MB (TQ3, ctx 256: 795 vs 694 MB) */
+    const size_t kvb = (size_t)PQ1KVS_NL * 2 * PQ1KVS_NKV * PQ1KVS_CTX * 256 +
+                       (size_t)PQ1_FA_MAXH * PQ1KVS_CTX * 12;
     const size_t old = (size_t)36 * 2 * 8 * 512 * 128 * 4;   /* the ctx-512 f32 cache */
     if (kvb > old) mb += (kvb - old + (1u << 20) - 1) >> 20;
   }
@@ -1228,7 +1251,7 @@ static uint8_t PQ1_AIN[PQ1_APAR_BYTES] __attribute__((aligned(64)));
 static int pq1_kv_alloc(int nl, int nkv, int ctx) {
   if (d_kv) return (nl == PQ1KV_NL && nkv == PQ1KV_NKV && ctx == PQ1KV_CTX) ? 0 : -1;
   if (PQ1KV_DEAD || nl <= 0 || nl > PQ1_AL_MAX || nkv <= 0 || ctx <= 0) return -1;
-  size_t kvb = (size_t)nl * 2 * nkv * ctx * 128 * 2, nwb = (size_t)nl * 256 * 4;
+  size_t kvb = pq1_kv_cache_bytes(nl, nkv, ctx), nwb = (size_t)nl * 256 * 4;
   size_t fab = (size_t)PQ1_FA_MAXH * ctx * 4;   /* scores; (ms, vs) pairs take 2x */
   size_t need = (kvb + 3 * fab + nwb + PQ1_APAR_BYTES + 255) / 256 * 256;
   if (!PQ1ARENA || PQ1ACUR + need > PQ1ALIM || pq1_arena_init(need) != 0) { PQ1KV_DEAD = 1; return -1; }
@@ -1240,10 +1263,35 @@ static int pq1_kv_alloc(int nl, int nkv, int ctx) {
   PQ1ACUR += need;
   if (PQ1ACUR > P2PEAK) P2PEAK = PQ1ACUR;
   PQ1KV_NL = nl; PQ1KV_NKV = nkv; PQ1KV_CTX = ctx;
+  if (pq1_kvtq())
+    fprintf(stderr, "pq1: TurboQuant K%d/V%d-bit cache, %.1f MB (f16 would be %.1f MB)\n",
+            pq1_tq_cw(0) == 12 ? 3 : 4, pq1_tq_cw(1) == 12 ? 3 : 4,
+            kvb / 1048576.0, (double)nl * 2 * nkv * ctx * 256 / 1048576.0);
   return 0;
 }
 static uint16_t *pq1_kv_layer(int il, int v) {
   return d_kv + ((size_t)il * 2 + v) * PQ1KV_NKV * PQ1KV_CTX * 128;
+}
+static uint32_t *pq1_tq_code(int il, int v) {
+  return (uint32_t *)d_kv + ((size_t)il * (pq1_tq_cw(0) + pq1_tq_cw(1)) + (v ? pq1_tq_cw(0) : 0)) *
+                                PQ1KV_NKV * PQ1KV_CTX;
+}
+static float *pq1_tq_scale(int il, int v) {
+  return (float *)pq1_tq_code(PQ1KV_NL, 0) + ((size_t)il * 2 + v) * PQ1KV_NKV * PQ1KV_CTX;
+}
+static uint16_t *pq1_tq_stage(void) { return (uint16_t *)pq1_tq_scale(PQ1KV_NL, 0); }
+/* the attention block of layer il on the f16 or the TurboQuant cache; the TQ
+ * scores reuse d_fas, its per-chunk partial outputs and 1/sum the d_fam pairs */
+static int pq1_attn_any(int il, const float *qkv, float *qo, float *atto, int nh, int nkv,
+                        int ctx, cudaStream_t S) {
+  if (!pq1_kvtq())
+    return pq1_attn_launch(qkv, d_anw + (size_t)il * 256, d_ain, qo, pq1_kv_layer(il, 0),
+                           pq1_kv_layer(il, 1), d_fas, d_fam, atto, nh, nkv, ctx, S);
+  return pq1_attn_tq_launch(pq1_kvtq(), qkv, d_anw + (size_t)il * 256, d_ain, qo, pq1_tq_stage(),
+                            pq1_tq_code(il, 0), pq1_tq_scale(il, 0), pq1_tq_code(il, 1),
+                            pq1_tq_scale(il, 1), d_fas, d_fam,
+                            d_fam + (size_t)2 * PQ1_FA_MAXH * ctx - PQ1_FA_MAXH, atto, nh, nkv,
+                            ctx, S);
 }
 #endif
 
@@ -1258,6 +1306,20 @@ int pq1_attn_kv_put(int il, int nl, int nkv, int ctx, int npos, const uint16_t *
     exit(3);
   }
   if (pq1_kv_alloc(nl, nkv, ctx) != 0 || npos != PQ1KV_NEXT[il] || npos >= ctx) return -1;
+  if (pq1_kvtq()) {   /* stage the f16 rows, encode them at npos */
+    uint16_t *st = pq1_tq_stage();
+    if (cudaMemcpy(st, k, (size_t)nkv * 256, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(st + (size_t)nkv * 128, v, (size_t)nkv * 256, cudaMemcpyHostToDevice) != cudaSuccess ||
+        pq1_tq_store_launch(pq1_kvtq(), st, npos, pq1_tq_code(il, 0), pq1_tq_scale(il, 0),
+                            pq1_tq_code(il, 1), pq1_tq_scale(il, 1), nkv, ctx, NULL) != 0 ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+      cudaGetLastError();
+      PQ1KV_NEXT[il] = -1;
+      return -1;
+    }
+    PQ1KV_NEXT[il]++;
+    return 0;
+  }
   const size_t pitch = (size_t)ctx * 128 * 2;
   if (cudaMemcpy2D(pq1_kv_layer(il, 0) + (size_t)npos * 128, pitch, k, 256, 256, nkv,
                    cudaMemcpyHostToDevice) != cudaSuccess ||
@@ -1330,8 +1392,7 @@ int pq1_attn_fused(int il, const unsigned char *wq, const unsigned char *wk,
         pq1_tm_prep_launch(d_ain + PQ1_APAR_XQ, d_pl, d_au, hid, PQ1_CS) == 0 &&
         pq1_tmx_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, qkv, hid,
                            qr + 2 * kr, PQ1_CS) == 0 &&
-        pq1_attn_launch(qkv, d_anw + (size_t)il * 256, d_ain, qo, pq1_kv_layer(il, 0),
-                        pq1_kv_layer(il, 1), d_fas, d_fam, atto, nh, nkv, ctx, PQ1_CS) == 0 &&
+        pq1_attn_any(il, qkv, qo, atto, nh, nkv, ctx, PQ1_CS) == 0 &&
         pq1_q8k_launch(atto, qr, d_xq, PQ1_CS) == 0 &&
         pq1_tm_prep_launch(d_xq, d_pl, d_au, qr, PQ1_CS) == 0 &&
         pq1_tmx_launch(PQ1C[ci].d_codes, PQ1C[ci].d_scales, d_pl, d_au, yo, qr, hid,
@@ -1374,7 +1435,7 @@ int pq1_attn_fused(int il, const unsigned char *wq, const unsigned char *wk,
 void pq1_attn_dbg(int il, int npos, uint16_t *k, uint16_t *v, float *q, float *atto, int nh) {
 #ifdef PQ1_USE_CUDA
   const size_t pitch = (size_t)PQ1KV_CTX * 128 * 2;
-  if (!d_kv || il < 0 || il >= PQ1KV_NL) return;
+  if (!d_kv || il < 0 || il >= PQ1KV_NL || pq1_kvtq()) return;   /* no f16 rows under TQ */
   cudaMemcpy2D(k, 256, pq1_kv_layer(il, 0) + (size_t)npos * 128, pitch, 256, PQ1KV_NKV, cudaMemcpyDeviceToHost);
   cudaMemcpy2D(v, 256, pq1_kv_layer(il, 1) + (size_t)npos * 128, pitch, 256, PQ1KV_NKV, cudaMemcpyDeviceToHost);
   cudaMemcpy(q, MDY + 64 * 1024, (size_t)nh * 512, cudaMemcpyDeviceToHost);
@@ -1548,8 +1609,7 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
       rc |= PQ1_RMSQ(d_X, il ? yh : NULL, d_nw + (size_t)(2 * il) * hid, hid, qr + 2 * kr);
       rc |= pq1_tmx_launch(PQ1M[mq[il]].d_codes, PQ1M[mq[il]].d_scales, d_pl, d_au, qkv, hid,
                            qr + 2 * kr, S);
-      rc |= pq1_attn_launch(qkv, d_anw + (size_t)il * 256, d_ain, qo, pq1_kv_layer(il, 0),
-                            pq1_kv_layer(il, 1), d_fas, d_fam, atto, nh, nkv, ctx, S);
+      rc |= pq1_attn_any(il, qkv, qo, atto, nh, nkv, ctx, S);
       rc |= PQ1_SQ(0, atto, qr, hid);
       rc |= pq1_tmx_launch(PQ1C[co[il]].d_codes, PQ1C[co[il]].d_scales, d_pl, d_au, yh, qr, hid, S);
       rc |= PQ1_RMSQ(d_X, yh, d_nw + (size_t)(2 * il + 1) * hid, hid, 2 * inter);

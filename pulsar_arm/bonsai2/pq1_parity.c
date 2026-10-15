@@ -469,6 +469,181 @@ static int expf_parity(void) {
   return (c[0] || c[1]) ? 1 : 0;
 }
 
+/* `pq1_parity tq [3|4]`: the TurboQuant K/V path (lossy, so no bit-exact gate).
+ * (1) the device codes vs a host encoder (same rotation, thresholds), (2) the
+ * device attention vs fp64 attention over the device's own decoded cache, which
+ * isolates the kernels (tolerance 2e-5 relative), (3) the quantization error
+ * itself: relative L2 error of the attention output vs exact attention on the
+ * f16 rows, and of the decoded K rows (theory: 0.034 / 0.0093 at 3 / 4 bits). */
+static const float TQC3[4] = {0.24444127f, 0.75336427f, 1.33664119f, 2.13151002f};
+static const float TQT3[3] = {0.49890277f, 1.04500270f, 1.73407555f};
+static const float TQC4[8] = {0.12788960f, 0.38643676f, 0.65370631f, 0.93720949f,
+                              1.24789774f, 1.60447431f, 2.04605246f, 2.68896675f};
+static const float TQT4[7] = {0.25716320f, 0.52007151f, 0.79545790f, 1.09255362f,
+                              1.42618608f, 1.82526338f, 2.36750960f};
+static const uint32_t TQD[4] = {0xb5297a4du, 0x68e31da4u, 0x1b56c4e9u, 0xf3c2a581u};
+static void tq_fwht(double *x) {
+  for (int h = 1; h < 128; h <<= 1)
+    for (int i = 0; i < 128; i += 2 * h)
+      for (int j = i; j < i + h; j++) { const double a = x[j], b = x[j + h]; x[j] = a + b; x[j + h] = a - b; }
+}
+static double tq_sgn(int j) { return (TQD[j >> 5] >> (j & 31)) & 1 ? -1.0 : 1.0; }
+static double tq_cent(int B, int v) {
+  const double m = B == 3 ? TQC3[v & 3] : TQC4[v & 7];
+  return (v >> (B - 1)) & 1 ? -m : m;
+}
+static int tq_code(int B, const uint32_t *cw, int j) {
+  return B == 3 ? (int)(((cw[j >> 4] >> (2 * (j & 15))) & 3) | (((cw[8 + (j >> 5)] >> (j & 31)) & 1) << 2))
+                : (int)((cw[j >> 3] >> (4 * (j & 7))) & 15);
+}
+/* decoded row in the original domain: x = R^T (s c) */
+static void tq_decode(int B, const uint32_t *cw, float s, double *x) {
+  for (int j = 0; j < 128; j++) x[j] = s * tq_cent(B, tq_code(B, cw, j));
+  tq_fwht(x);
+  for (int j = 0; j < 128; j++) x[j] *= tq_sgn(j) / sqrt(128.0);
+}
+static void tq_encode_codes(int B, const float *x, int *v) {
+  double y[128], n2 = 0;
+  for (int j = 0; j < 128; j++) { n2 += (double)x[j] * x[j]; y[j] = x[j] * tq_sgn(j); }
+  tq_fwht(y);
+  const double inv = n2 > 0 ? 1.0 / sqrt(n2) : 0;
+  for (int j = 0; j < 128; j++) {
+    const double z = y[j] * inv, a = fabs(z);
+    int m = 0;
+    for (int k = 0; k < (B == 3 ? 3 : 7); k++) m += a > (B == 3 ? TQT3[k] : TQT4[k]);
+    v[j] = m | ((z < 0) << (B - 1));
+  }
+}
+static int tq_parity(int B) {
+  const int nh = 32, nkv = 8, ctx = 2048, CW = B == 3 ? 12 : 16;
+  const int Ts[] = {1, 2, 33, 255, 256, 257, 700, 2048};
+  float *q = malloc((size_t)nh * 128 * 4), *od = malloc((size_t)nh * 128 * 4);
+  uint16_t *K = malloc((size_t)nkv * ctx * 256), *V = malloc((size_t)nkv * ctx * 256);
+  uint32_t *kc = malloc((size_t)nkv * ctx * CW * 4), *vc = malloc((size_t)nkv * ctx * CW * 4);
+  float *ks = malloc((size_t)nkv * ctx * 4), *vs = malloc((size_t)nkv * ctx * 4);
+  double *Kd = malloc((size_t)nkv * ctx * 128 * 8), *Vd = malloc((size_t)nkv * ctx * 128 * 8);
+  unsigned char par[PQ1_APAR_BYTES];
+  float *d_q, *d_sc, *d_part, *d_inv, *d_o, *d_ks, *d_vs;
+  unsigned int *d_kc, *d_vc;
+  unsigned short *d_st;
+  unsigned char *d_par;
+  cudaMalloc((void **)&d_q, (size_t)nh * 512); cudaMalloc((void **)&d_o, (size_t)nh * 512);
+  cudaMalloc((void **)&d_kc, (size_t)nkv * ctx * CW * 4); cudaMalloc((void **)&d_vc, (size_t)nkv * ctx * CW * 4);
+  cudaMalloc((void **)&d_ks, (size_t)nkv * ctx * 4); cudaMalloc((void **)&d_vs, (size_t)nkv * ctx * 4);
+  cudaMalloc((void **)&d_sc, (size_t)nh * ctx * 4); cudaMalloc((void **)&d_part, (size_t)nh * ctx * 4);
+  cudaMalloc((void **)&d_inv, 4096); cudaMalloc((void **)&d_st, (size_t)2 * nkv * 256);
+  cudaMalloc((void **)&d_par, sizeof par);
+  srand(777);
+  /* rows with a few large outlier channels (as post-norm Qwen3 K has), V plain */
+  for (int h = 0; h < nkv; h++)
+    for (int t = 0; t < ctx; t++)
+      for (int j = 0; j < 128; j++) {
+        const size_t i = ((size_t)h * ctx + t) * 128 + j;
+        float k = ((rand() % 20001) - 10000) / 4000.0f * (j % 37 == 3 ? 8.0f : 1.0f) + (j == 5 ? 6.0f : 0.0f);
+        float v = ((rand() % 20001) - 10000) / 3000.0f;
+        pq1_f2h_row(&k, &K[i], 1);
+        pq1_f2h_row(&v, &V[i], 1);
+      }
+  for (int i = 0; i < nh * 128; i++) q[i] = ((rand() % 20001) - 10000) / 3000.0f * (i % 37 == 3 ? 3.0f : 1.0f);
+  cudaMemcpy(d_q, q, (size_t)nh * 512, cudaMemcpyHostToDevice);
+  /* store every position through the store kernel (host-path entry: explicit npos) */
+  uint16_t st[2 * 8 * 128];
+  for (int t = 0; t < ctx; t++) {
+    for (int h = 0; h < nkv; h++) {
+      memcpy(st + h * 128, K + ((size_t)h * ctx + t) * 128, 256);
+      memcpy(st + (nkv + h) * 128, V + ((size_t)h * ctx + t) * 128, 256);
+    }
+    cudaMemcpy(d_st, st, sizeof st, cudaMemcpyHostToDevice);
+    if (pq1_tq_store_launch(B, d_st, t, d_kc, d_ks, d_vc, d_vs, nkv, ctx, 0)) { printf("store launch failed\n"); return 1; }
+  }
+  cudaDeviceSynchronize();
+  cudaMemcpy(kc, d_kc, (size_t)nkv * ctx * CW * 4, cudaMemcpyDeviceToHost);
+  cudaMemcpy(vc, d_vc, (size_t)nkv * ctx * CW * 4, cudaMemcpyDeviceToHost);
+  cudaMemcpy(ks, d_ks, (size_t)nkv * ctx * 4, cudaMemcpyDeviceToHost);
+  cudaMemcpy(vs, d_vs, (size_t)nkv * ctx * 4, cudaMemcpyDeviceToHost);
+  /* (1) codes vs the host encoder; decoded rows and their error */
+  long cbad = 0;
+  double ke2 = 0, kn2 = 0;
+  for (int w = 0; w < 2; w++)
+    for (size_t r = 0; r < (size_t)nkv * ctx; r++) {
+      const uint16_t *src = (w ? V : K) + r * 128;
+      float x[128];
+      int v[128];
+      for (int j = 0; j < 128; j++) x[j] = pq1_h2f(src[j]);
+      tq_encode_codes(B, x, v);
+      const uint32_t *cw = (w ? vc : kc) + r * CW;
+      for (int j = 0; j < 128; j++) cbad += tq_code(B, cw, j) != v[j];
+      double *xd = (w ? Vd : Kd) + r * 128;
+      tq_decode(B, cw, (w ? vs : ks)[r], xd);
+      if (!w)
+        for (int j = 0; j < 128; j++) { ke2 += (xd[j] - x[j]) * (xd[j] - x[j]); kn2 += (double)x[j] * x[j]; }
+    }
+  printf("tq%d codes vs host encoder: %ld / %ld differ (threshold ties of the float rotation)\n", B, cbad,
+         (long)2 * nkv * ctx * 128);
+  printf("tq%d K rows: relative MSE %.5f (theory %.4f)\n", B, ke2 / kn2, B == 3 ? 0.0340 : 0.0093);
+  int allok = cbad * 10000 < (long)2 * nkv * ctx * 128;   /* < 1e-4 of the codes */
+  for (unsigned ti = 0; ti < sizeof Ts / sizeof Ts[0]; ti++) {
+    const int T = Ts[ti], npos = T - 1;
+    memset(par, 0, sizeof par);
+    memcpy(par + PQ1_APAR_NPOS, &npos, 4);
+    cudaMemcpy(d_par, par, sizeof par, cudaMemcpyHostToDevice);
+    cudaMemset(d_o, 0xff, (size_t)nh * 512);
+    int rc = pq1_tq_fa_launch(B, d_q, d_par, d_kc, d_ks, d_vc, d_vs, d_sc, d_part, d_inv, d_o, nh, nkv, ctx, 0);
+    cudaDeviceSynchronize();
+    cudaMemcpy(od, d_o, (size_t)nh * 512, cudaMemcpyDeviceToHost);
+    double emax = 0, qe2 = 0, qn2 = 0;
+    for (int h = 0; h < nh; h++) {
+      const int kh = h / 4;
+      double o1[128] = {0}, o2[128] = {0}, s1[4096], s2[4096], m1 = -1e300, m2 = -1e300, z1 = 0, z2 = 0;
+      for (int t = 0; t < T; t++) {
+        const double *kd = Kd + ((size_t)kh * ctx + t) * 128;
+        const uint16_t *kf = K + ((size_t)kh * ctx + t) * 128;
+        double a = 0, b = 0;
+        for (int j = 0; j < 128; j++) { a += q[h * 128 + j] * kd[j]; b += q[h * 128 + j] * (double)pq1_h2f(kf[j]); }
+        s1[t] = a / sqrt(128.0); s2[t] = b / sqrt(128.0);
+        if (s1[t] > m1) m1 = s1[t];
+        if (s2[t] > m2) m2 = s2[t];
+      }
+      for (int t = 0; t < T; t++) {
+        const double p1 = exp(s1[t] - m1), p2 = exp(s2[t] - m2);
+        z1 += p1; z2 += p2;
+        const double *vd = Vd + ((size_t)kh * ctx + t) * 128;
+        const uint16_t *vf = V + ((size_t)kh * ctx + t) * 128;
+        for (int j = 0; j < 128; j++) { o1[j] += p1 * vd[j]; o2[j] += p2 * pq1_h2f(vf[j]); }
+      }
+      double on = 0;
+      for (int j = 0; j < 128; j++) { o1[j] /= z1; o2[j] /= z2; on += o1[j] * o1[j]; }
+      on = sqrt(on / 128) + 1e-30;
+      for (int j = 0; j < 128; j++) {
+        const double e = fabs(od[h * 128 + j] - o1[j]) / on;
+        if (!(e <= emax)) emax = e;   /* NaN-safe */
+        qe2 += (o1[j] - o2[j]) * (o1[j] - o2[j]); qn2 += o2[j] * o2[j];
+      }
+    }
+    const int ok = rc == 0 && emax < 2e-5;
+    printf("tq%d T=%4d rc=%d kernel vs fp64-on-decoded: max err %.2e (rms-relative) %s | quant vs exact f16 attn: rel L2 %.4f\n",
+           B, T, rc, emax, ok ? "OK" : "MISMATCH", sqrt(qe2 / qn2));
+    if (!ok) allok = 0;
+  }
+  if (getenv("PQ1_TQ_TIME")) {
+    for (int T = 64; T <= ctx; T *= 4) {
+      const int npos = T - 1;
+      memcpy(par + PQ1_APAR_NPOS, &npos, 4);
+      cudaMemcpy(d_par, par, sizeof par, cudaMemcpyHostToDevice);
+      cudaEvent_t e0, e1;
+      cudaEventCreate(&e0); cudaEventCreate(&e1);
+      cudaEventRecord(e0, 0);
+      for (int r = 0; r < 20; r++) pq1_tq_fa_launch(B, d_q, d_par, d_kc, d_ks, d_vc, d_vs, d_sc, d_part, d_inv, d_o, nh, nkv, ctx, 0);
+      cudaEventRecord(e1, 0);
+      cudaEventSynchronize(e1);
+      float ms;
+      cudaEventElapsedTime(&ms, e0, e1);
+      printf("   tq%d T=%4d: %.3f ms per layer (ctx %d grids)\n", B, T, ms / 20, ctx);
+    }
+  }
+  printf("TQ%d PARITY: %s\n", B, allok ? "PASS" : "FAIL");
+  return allok ? 0 : 1;
+}
 int main(int argc, char **argv) {
 #if defined(PQ1_REAL_CUDA)
   if (argc > 1 && !strcmp(argv[1], "fa")) return fa_parity();
@@ -477,6 +652,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "fpl")) return fpl_parity();
   if (argc > 1 && !strcmp(argv[1], "expf")) return expf_parity();
   if (argc > 1 && !strcmp(argv[1], "argmax")) return argmax_parity();
+  if (argc > 1 && !strcmp(argv[1], "tq")) return tq_parity(argc > 2 ? atoi(argv[2]) : 3);
 #endif
   int rows = argc > 1 ? atoi(argv[1]) : 256;
   int K = argc > 2 ? atoi(argv[2]) : 4096;
