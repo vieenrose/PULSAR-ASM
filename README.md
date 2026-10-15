@@ -1,6 +1,6 @@
 # PULSAR-ASM: Bonsai-8B 1-bit on a Jetson Nano
 
-An 8-billion-parameter language model running at **14.1 tokens/s on a
+An 8-billion-parameter language model running at **16.1 tokens/s on a
 Jetson Nano Gen1**, the 2019 4 GB board, using its 128-core Maxwell GPU.
 The model is PrismML's **Bonsai-8B** (Qwen3-8B architecture) in the
 `Q1_0` format: true 1-bit weights, one sign bit per weight plus one f16
@@ -20,17 +20,17 @@ produced it, using the per-step times from the run's own log. Loading
 (weight repack + upload) and prompt processing are shown at their measured
 durations too.
 
-**English** (seed 7, 106 tokens, decode 13.5 tok/s)
+**English** (seed 7, 106 tokens, decode 15.3 tok/s)
 
 ![Bonsai-8B Q1_0 on a Jetson Nano, English prompt](doc/bonsai8b-q1-nano-chat-en.gif)
 
-**Traditional Chinese** (seed 123, 251 tokens, decode 13.2 tok/s)
+**Traditional Chinese** (seed 123, 251 tokens, decode 15.0 tok/s)
 
 ![Bonsai-8B Q1_0 on a Jetson Nano, Traditional Chinese prompt](doc/bonsai8b-q1-nano-chat-zh-tw.gif)
 
 How the clips were made:
 
-- Engine code is the committed `bonsai-jetson-nano` HEAD (072d109),
+- Engine code is the committed `bonsai-jetson-nano` HEAD (11806d3),
   built with `.auto/build_q1.sh`, on a Nano with `jetson_clocks`
   (GPU 921.6 MHz, CPU 1.479 GHz), L4T R32.5.1, CUDA 10.2.
 - The prompts are "List the four seasons and one thing that changes in
@@ -50,9 +50,9 @@ How the clips were made:
 - The text is the model's output, detokenized and not edited. The
   Chinese answer has 1-bit-model slips, kept as generated: "溫度
   gradually 上升", "蜂群越winter", and winter given "長日" (long days).
-- 13.5 and 13.2 tok/s are lower than the 14.07 headline below because
+- 15.3 and 15.0 tok/s are lower than the 16.11 headline below because
   these runs go deeper into the context (up to position 275, against 44 in
-  the harness; attention grows with it, steps go from ~72 to ~82 ms),
+  the harness; attention grows with it, steps go from ~63 to ~75 ms),
   sample on the host from the full logits (0.4 ms/token), and ran in a
   different hour on the same board, which drifts 2–6 %. The headline is
   the greedy harness number.
@@ -67,12 +67,12 @@ How the clips were made:
 | | |
 |---|---|
 | Board | Jetson Nano Gen1: Tegra X1, 4× Cortex-A57, one Maxwell SM (sm_53, 128 cores), 4 GB LPDDR4 shared by CPU and GPU; measured streaming ceiling 21.9 GB/s |
-| Decode | **14.07 tok/s** (~71 ms/token), up from 2.13 at the first working build |
-| Prefill | 13.85 tok/s (token by token through the decode path) |
-| Startup | ~2.3–2.4 s (repack + upload + first forward) |
-| Peak RSS | 325–540 MB, set by the board's page-cache state rather than the code: in one interleaved job the f2cb48e build read 539/505 MB and 072d109 542/542 MB. GGUF pages are dropped once each tensor is on the GPU |
+| Decode | **16.11 tok/s** (62.1 ms/token), up from 2.13 at the first working build |
+| Prefill | 15.85 tok/s (token by token through the decode path) |
+| Startup | ~2.4–2.5 s (repack + upload + first forward) |
+| Peak RSS | 325–770 MB, set by the board's page-cache state rather than the code: unchanged binaries read 596, 680, 730 and 770 MB over one session, and in the A/B for 11806d3 both arms read ~770 MB. GGUF pages are dropped once each tensor is on the GPU |
 | GPU memory | 1280 MB arena, 1025.1 MB used (weights, K/V cache, staging) |
-| Bandwidth | ~14.9 GB/s of 21.9 (68 %); the GEMV kernels alone run at 15–18 GB/s and are near their ALU issue floor on the single SM |
+| Bandwidth | ~17.1 GB/s of 21.9 (78 %); the GEMV kernels alone run at 16.5–20.6 GB/s, up to 94 % of the ceiling |
 | Conditions | cold harness run, prompt A (20 prompt ids + 24 greedy tokens), `jetson_clocks`, cpuidle c7 off |
 
 ## How it works
@@ -109,11 +109,11 @@ on the host.
 - **FFN on the GPU:** gate+up, silu(g)·u with an `expf` that reproduces
   glibc's bit for bit, activation quantization and the down projection.
 
-GEMV time per token (nvprof, prompt A): q+k+v 215 µs, o 160 µs, gate+up
-801 µs, down 456 µs, each × 36 layers, plus the head at 4.9 ms. That is
-~64 ms of the ~71 ms step (~90 %), at 15–18 GB/s per kernel, close to the
-kernels' ALU issue floor. A memory-only variant of the same kernel reaches
-18–21 GB/s. The rest is attention, norms and the silu `expf`.
+GEMV time per token (nvprof, prompt A): q+k+v 196 µs, o 143 µs, gate+up
+691 µs, down 406 µs, each × 36 layers, plus the head at 4.2 ms (11806d3).
+That is ~56 ms of the ~62 ms step (~90 %), at 16.5–20.6 GB/s per kernel
+against the 21.9 GB/s streaming ceiling; the big shapes keep their whole
+row batch's loads in flight at 24 resident warps. The rest is attention, norms and the silu `expf`.
 
 Every step above was kept only after an order-balanced A/B on the same
 board in the same hour, with all three accuracy gates green on a fresh
