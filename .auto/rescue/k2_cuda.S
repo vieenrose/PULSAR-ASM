@@ -956,30 +956,41 @@ attention_range:
     adrp x1, f_n1e30
     ldr s11, [x1, :lo12:f_n1e30]     /* mx = -1e30f */
     /* ---- scores: t = 0..pos ----
-       Probe Exp68: 2-way interleaved dots. Each dot keeps its own exact
-       element order (fmul/fadd non-fused, ascending i) so results are
-       bit-identical; only two independent t values share the pipeline
-       (halves Q loads, hides the serial fadd chain latency). */
+       Probe Exp69: 16B LD1 loads + 4-lane FMUL, but the accumulation stays
+       SCALAR and in exact ascending element order (lane extraction via DUP):
+       bit-identical by construction, just fewer instructions/loads. */
     mov x27, xzr
-    bic x12, x20, #1                 /* largest even value <= pos */
+    bic x12, x20, #1
 .LattnR_score_t2:
     cmp x27, x12
     b.hs .LattnR_score_tail
-    add x9, x22, x27, lsl #11        /* KCA row t */
-    add x9, x9, x2                   /* + khoff */
-    add x13, x9, #2048               /* KCA row t+1 */
-    mov x10, x24                     /* Q walk */
-    fmov s4, wzr                     /* dot t   (element order) */
-    fmov s5, wzr                     /* dot t+1 (element order) */
-    mov x11, #64
+    add x9, x22, x27, lsl #11
+    add x9, x9, x2
+    add x13, x9, #2048
+    mov x10, x24
+    fmov s4, wzr
+    fmov s5, wzr
+    mov x11, #16
 .LattnR_score_i2:
-    ldr s0, [x10], #4
-    ldr s1, [x9], #4
-    ldr s3, [x13], #4
-    fmul s2, s0, s1
-    fmul s6, s0, s3
+    ld1 {v0.4s}, [x10], #16
+    ld1 {v1.4s}, [x9], #16
+    ld1 {v3.4s}, [x13], #16
+    fmul v2.4s, v0.4s, v1.4s
+    fmul v6.4s, v0.4s, v3.4s
     fadd s4, s4, s2
+    dup s7, v2.s[1]
+    fadd s4, s4, s7
+    dup s7, v2.s[2]
+    fadd s4, s4, s7
+    dup s7, v2.s[3]
+    fadd s4, s4, s7
     fadd s5, s5, s6
+    dup s7, v6.s[1]
+    fadd s5, s5, s7
+    dup s7, v6.s[2]
+    fadd s5, s5, s7
+    dup s7, v6.s[3]
+    fadd s5, s5, s7
     subs x11, x11, #1
     b.ne .LattnR_score_i2
     fmov s7, #0.125
@@ -1005,12 +1016,18 @@ attention_range:
     add x9, x9, x2
     mov x10, x24
     fmov s4, wzr
-    mov x11, #64
+    mov x11, #16
 .LattnR_score_i1:
-    ldr s0, [x10], #4
-    ldr s1, [x9], #4
-    fmul s2, s0, s1
+    ld1 {v0.4s}, [x10], #16
+    ld1 {v1.4s}, [x9], #16
+    fmul v2.4s, v0.4s, v1.4s
     fadd s4, s4, s2
+    dup s7, v2.s[1]
+    fadd s4, s4, s7
+    dup s7, v2.s[2]
+    fadd s4, s4, s7
+    dup s7, v2.s[3]
+    fadd s4, s4, s7
     subs x11, x11, #1
     b.ne .LattnR_score_i1
     fmov s7, #0.125
