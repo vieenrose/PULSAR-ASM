@@ -512,8 +512,32 @@ static void gpu_init(void) {
     G_PAR = !(getenv("G4PAR") && getenv("G4PAR")[0] == '0') && G_ATTNALL == attn_all_asm;   /* thread-safe host kernels only */
 }
 
+/* G4PROF: time the CPU-side hooks of single-token forwards (calls made outside a
+   parallel region, i.e. decode); [0] rms [1] rmsns [2] q8k [3] attention [4] geglu */
+static double PC_t[5]; static long PC_n[5];
+static void (*o_rms)(const float *, const float *, float *, int);
+static void (*o_rmsns)(float *, int);
+static void (*o_q8k)(const float *, uint8_t *, int);
+static void (*o_attn)(const float *, const float *, const float *, int, int, int, float *);
+static void (*o_geglu)(float *, const float *, int);
+#define PC_WRAP(k, call) do { if (omp_in_parallel()) { call; break; } double t_ = now_ms(); call; PC_t[k] += now_ms() - t_; PC_n[k]++; } while (0)
+static void w_rms(const float *x, const float *w, float *y, int n) { PC_WRAP(0, o_rms(x, w, y, n)); }
+static void w_rmsns(float *x, int n) { PC_WRAP(1, o_rmsns(x, n)); }
+static void w_q8k(const float *x, uint8_t *y, int n) { PC_WRAP(2, o_q8k(x, y, n)); }
+static void w_attn(const float *q, const float *K, const float *V, int lo, int pos, int hd, float *o) { PC_WRAP(3, o_attn(q, K, V, lo, pos, hd, o)); }
+static void w_geglu(float *g, const float *u, int n) { PC_WRAP(4, o_geglu(g, u, n)); }
+
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: %s <gguf> <rope.bin> <ids...> [--gen N] [--batch B] [--sample temp topk topp seed]\n", argv[0]); return 2; }
+    /* OpenMP workers must not busy-wait between parallel regions: libgomp's default
+       spin (~300k iterations) keeps 3 cores hot while the main thread waits on the
+       GPU and slows decode ~6% (shared DRAM / power budget). libgomp reads its
+       environment once at load, so set a short spin and re-exec once; a user value
+       of GOMP_SPINCOUNT or OMP_WAIT_POLICY is respected. */
+    if (!getenv("GOMP_SPINCOUNT") && !getenv("OMP_WAIT_POLICY")) {
+        setenv("GOMP_SPINCOUNT", "10000", 1);
+        execv("/proc/self/exe", argv);   /* returns only on failure: run with the default */
+    }
     int gen = 0, n = 0, batch = BATCH_MAX;   /* prefill in chunks of 8 by default; --batch 1 = token by token */
     static int ids[MAXSEQ];
     for (int i = 3; i < argc; i++) {
@@ -536,6 +560,10 @@ int main(int argc, char **argv) {
       close(fd); ROPE = m; }
     prof = getenv("G4PROF") && getenv("G4PROF")[0] == '1';
     gpu_init();
+    if (prof) {
+        o_rms = G_RMS; G_RMS = w_rms; o_rmsns = G_RMSNS; G_RMSNS = w_rmsns; o_q8k = G_Q8K; G_Q8K = w_q8k;
+        o_attn = G_ATTNALL; G_ATTNALL = w_attn; o_geglu = G_GEGLU; G_GEGLU = w_geglu;
+    }
     int n_prompt = n;
     double tp = 0, tg = 0;
     G_CLOCK = now_ms;
@@ -549,6 +577,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "PROF %-4s calls %6ld  h2d %8.0f ms  kernel+sync %8.0f ms  d2h %8.0f ms  (%.2f ms/token)\n",
                     nm[k], P_n[k], P_h2d[k], P_k[k], P_d2h[k], (P_h2d[k] + P_k[k] + P_d2h[k]) / pos);
         }
+        const char *cn[5] = {"rms", "rmsns", "q8k", "attn", "geglu"};
+        for (int k = 0; k < 5; k++) fprintf(stderr, "PROF cpu %-5s calls %7ld  %8.1f ms  (%.2f ms per decode step)\n", cn[k], PC_n[k], PC_t[k], ng > 0 ? PC_t[k] / ng : 0.0);
         fprintf(stderr, "PROF forward total %.0f ms over %d steps: GPU hooks %.1f ms/token, everything else (CPU stages) %.1f ms/token\n",
                 tg_all, pos, hk / pos, (tg_all - hk) / pos);
     }
