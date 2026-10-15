@@ -6,3 +6,7 @@ __pycache__/
 .auto/last_*.txt
 .auto/last_build.log
 .pi/tasks/
+
+# partial model downloads (Exp42 committed a 324 MB one by accident; GitHub rejects >100 MB)
+.auto/rescue/*.part
+*.blob.part
