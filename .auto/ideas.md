@@ -1009,3 +1009,23 @@ either alone loses. Measured out: cache-policy loads, magic I2F, pinned staging,
 kernel-only token graph, NR=2 tile (504 us vs 435), block-wide reduction (592 vs 435),
 batched expf q8k_w<3> (35.2 vs 31.0 us in-engine), K=12288 re-sweep at PD=RB (all >= 437
 vs 406 us). Peak RSS drifts 596 -> 770 MB on identical binaries over one session.
+
+## Loop 261014-2216 rows 36-44 (16.11 -> 16.51 decode tps)
+Kept: hs K=4096 deferred row reduction (a645bbd), out-of-line silu/expf fallback in q8k_w<2>
+(2e685da, SASS 1836 -> 762, 31.8 -> 22.6 us), attn_pre3 one q/k head per warp over 5 blocks
+(bfabc8a, 25.0 -> 10.25 us). Measured out: rms_q8k serial fallback __noinline__ (launch failure,
+not debugged) or unroll 1 (no change, 15.2 us); fa_pv register prefetch ring PD=4 (18.1 -> 21.6
+us, fa_pv is conversion-pipe bound, ~2.2 us per 8 positions); PQ1_PV_ALU mix (noise).
+Both hs GEMVs are issue-bound (IPC 3.89, 77% issue slots; gu ~24.3, down ~28.9 thread-instr
+per weight word vs <= ~21.5 needed for the 21.9 GB/s ceiling at 921 MHz).
+Open levers: fuse rms_q8k/q8k_w into the next GEMV prologue (~1.1 ms); attention mega-fusion or
+qk4 wave-quantization fix (~2 ms total); down SEG reduction lane use (4/32); CPU-shares-rows
+co-execution to break the GPU issue bound (48.4 ms bus floor).
+
+## Feature backlog (user, 2026-10-15), beyond decode speed
+1. 3/4-bit TurboQuant KV cache (replace the f16 K/V cache; cuts the attention bytes and arena,
+   needs its own accuracy gate since it is not bit-exact against the f16 reference).
+2. Bonsai-8B ternary checkpoint support on the Nano (pq2/TQ path exists for Spark CPU and the
+   earlier exact 2-bit Nano path; needs the current hs/graph chain ported).
+3. N > 1 concurrent users: batched decode over N sequences (weights streamed once per step for
+   all N, per-user KV caches); the batch GEMV variant in pq1_swar_sm53.cu is the starting point.
