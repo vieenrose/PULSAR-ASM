@@ -12,7 +12,7 @@
  *
  * Build (Nano, driver only):
  *   gcc -O2 -fopenmp -ffp-contract=off -o g4eng g4eng.c g4_host.S -ldl -lm
- * Run:   ./g4eng <gemma.gguf> <rope.bin> <ids...> [--gen N]
+ * Run:   ./g4eng <gemma.gguf> <rope.bin> <ids...> [--gen N] [--sample temp topk topp seed]
  */
 #define G4REF_NO_MAIN
 #include "g4ref.c"
@@ -405,11 +405,12 @@ static void gpu_init(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: %s <gguf> <rope.bin> <ids...> [--gen N]\n", argv[0]); return 2; }
+    if (argc < 4) { fprintf(stderr, "usage: %s <gguf> <rope.bin> <ids...> [--gen N] [--sample temp topk topp seed]\n", argv[0]); return 2; }
     int gen = 0, n = 0;
     static int ids[MAXSEQ];
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); continue; }
+        if (parse_sample(argc, argv, &i)) continue;
         ids[n++] = atoi(argv[i]);
     }
     gguf_open(argv[1]);
@@ -430,14 +431,16 @@ int main(int argc, char **argv) {
         forward(tok, pos);
         int top = 0;
         for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
+        int next = (SMP.on && pos + 1 >= n) ? sample_next(logits) : top;
         double dt = now_ms() - t0;
         if (pos < n_prompt) tp += dt; else tg += dt;
-        printf("step %d id_in=%d top=%d logit=%.4f\n", pos, tok, top, capped(logits[top]));
+        if (SMP.on) printf("step %d id_in=%d top=%d logit=%.4f pick=%d\n", pos, tok, top, capped(logits[top]), next);
+        else printf("step %d id_in=%d top=%d logit=%.4f\n", pos, tok, top, capped(logits[top]));
         fflush(stdout);
         pos++;
         if (pos >= n) {
-            if (n - n_prompt >= gen || top == 1 || top == 106) break;
-            ids[n++] = top;
+            if (n - n_prompt >= gen || next == 1 || next == 106) break;
+            ids[n++] = next;
         }
     }
     int ng = pos - n_prompt;

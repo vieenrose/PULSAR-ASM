@@ -107,7 +107,9 @@ each proved bit-identical:
 - `g4gemv_test`: all 275 Q4_0 tensors, the full 262,144-row head and the F16 projection on three
   activation vectors each, plus the GPU GeGLU and Q8_K kernels, all identical.
 - `gates.sh` runs both tests and checks the engine's English (97 steps) and Traditional Chinese
-  (222 steps) greedy streams against `golden_en.txt` / `golden_zh.txt`.
+  (222 steps) greedy streams against `golden_en.txt` / `golden_zh.txt`, and a sampled English
+  stream (temperature 1.0, top-k 64, top-p 0.95, seed 7; 135 steps) against `golden_en_s7.txt`:
+  the reference on x86 and the engine on the Nano draw the same tokens.
 
 **What "bit-exact" does not cover.** It is exact against `g4ref.c`, not against Hugging Face or
 llama.cpp. Quantizing activations to Q8_K changes the logits slightly: against a float reference
@@ -122,8 +124,9 @@ exactly "the QAT weights in Q4_0".
 
 ## Limits
 
-- **Greedy only.** The engine has no sampler yet; the model card recommends temperature 1.0,
-  top-k 64, top-p 0.95.
+- The demos are greedy. Sampling exists (`--sample temp topk topp seed`, Hugging Face's order:
+  cap, temperature, top-k, top-p, one xorshift64* draw) and is deterministic per seed, but it
+  has not been evaluated for quality here; the model card recommends 1.0 / 64 / 0.95.
 - One sequence; 2048-position context; prefill one token at a time.
 - Measured on an unpinned board: absolute numbers move a few percent between runs.
 - The model's own ceiling: multi-step arithmetic is unreliable (see the probes), long answers
@@ -138,8 +141,8 @@ cd pulsar_arm/gemma4nano
 sh build.sh                                              # g4eng, g4gemv_test, g4host_test
 python3 -I g4_rope.py g4_rope_2048.bin 2048              # rope tables (any machine with numpy)
 sh gates.sh gemma-4-E2B_q4_0-it.gguf g4_rope_2048.bin    # all accuracy gates
-./g4eng gemma-4-E2B_q4_0-it.gguf g4_rope_2048.bin <prompt ids...> --gen N
-# prints: step <n> id_in=<id> top=<id> logit=<x.xxxx>   (logit after the 30*tanh(x/30) cap)
+./g4eng gemma-4-E2B_q4_0-it.gguf g4_rope_2048.bin <prompt ids...> --gen N [--sample 1.0 64 0.95 <seed>]
+# prints: step <n> id_in=<id> top=<id> logit=<x.xxxx> [pick=<id>]   (logit after the 30*tanh(x/30) cap)
 ```
 
 Prompt ids come from the model's `tokenizer.json` with the chat template

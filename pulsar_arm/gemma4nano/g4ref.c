@@ -17,7 +17,7 @@
  *    chains in ascending order.
  *  - Rope cos/sin come from a baked table (g4_rope.py), not computed here.
  *
- * Usage: g4ref <gemma.gguf> <rope.bin> <ids...> [--gen N]
+ * Usage: g4ref <gemma.gguf> <rope.bin> <ids...> [--gen N] [--sample temp topk topp seed]
  * Prints: step <n> id_in=<id> top=<id> logit=<x.xxxx>   (logit after soft-cap)
  */
 #define _GNU_SOURCE
@@ -445,6 +445,59 @@ static void __attribute__((unused)) forward(int tok, int pos) {
 }
 static float __attribute__((unused)) capped(float l) { return (float)(SOFTCAP * g4_tanh((double)l / SOFTCAP)); }
 
+/* Sampler (optional, --sample temp topk topp seed), in Hugging Face's order on the
+ * model's capped logits: temperature, top-k, top-p, then one draw.
+ *  - top-k on the RAW logits (the cap 30*tanh(x/30) is monotone, so the set and its
+ *    order are the same), largest first, ties broken by the lower token id;
+ *  - z = cap(logit) / temp in float64 for those k only, p = exp(z - z_max) / sum
+ *    (g4_exp, sequential sums);
+ *  - top-p keeps the shortest prefix whose cumulative probability reaches topp;
+ *  - u = xorshift64* draw in [0, 1) times the kept mass; the first token whose running
+ *    sum exceeds u is chosen.
+ * Deterministic for a given seed, so the reference and the engine draw the same tokens. */
+typedef struct { double temp, topp; int topk, on; uint64_t state; } sampler_t;
+static sampler_t SMP;
+static uint64_t xs64star(void) {
+    uint64_t x = SMP.state;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    SMP.state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+static int __attribute__((unused)) sample_next(const float *lg) {
+    enum { KMAX = 1024 };
+    static int idx[KMAX];
+    static float val[KMAX];
+    static double z[KMAX], pr[KMAX];
+    int k = SMP.topk < 1 ? 1 : (SMP.topk > KMAX ? KMAX : SMP.topk), m = 0;
+    for (int v = 0; v < VOCAB; v++) {
+        float x = lg[v];
+        if (m == k && !(x > val[m - 1])) continue;
+        int j = m < k ? m++ : m - 1;
+        while (j > 0 && x > val[j - 1]) { val[j] = val[j - 1]; idx[j] = idx[j - 1]; j--; }
+        val[j] = x; idx[j] = v;
+    }
+    for (int i = 0; i < m; i++) z[i] = SOFTCAP * g4_tanh((double)val[i] / SOFTCAP) / SMP.temp;
+    double sum = 0;
+    for (int i = 0; i < m; i++) { pr[i] = g4_exp(z[i] - z[0]); sum += pr[i]; }
+    for (int i = 0; i < m; i++) pr[i] = pr[i] / sum;
+    int keep = m;
+    double c = 0;
+    for (int i = 0; i < m; i++) { c += pr[i]; if (c >= SMP.topp) { keep = i + 1; break; } }
+    double mass = 0;
+    for (int i = 0; i < keep; i++) mass += pr[i];
+    double u = (double)(xs64star() >> 11) * 0x1p-53 * mass, a = 0;
+    for (int i = 0; i < keep; i++) { a += pr[i]; if (u < a) return idx[i]; }
+    return idx[keep - 1];
+}
+static int __attribute__((unused)) parse_sample(int argc, char **argv, int *i) {
+    if (strcmp(argv[*i], "--sample") || *i + 4 >= argc) return 0;
+    SMP.temp = atof(argv[*i + 1]); SMP.topk = atoi(argv[*i + 2]); SMP.topp = atof(argv[*i + 3]);
+    SMP.state = strtoull(argv[*i + 4], NULL, 10) * 0x9E3779B97F4A7C15ULL + 1;
+    SMP.on = SMP.temp > 0;
+    *i += 4;
+    return 1;
+}
+
 #ifndef G4REF_NO_MAIN   /* g4gemv_test.c includes this file for its numerics */
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: %s <gguf> <rope.bin> <ids...> [--gen N]\n", argv[0]); return 2; }
@@ -452,6 +505,7 @@ int main(int argc, char **argv) {
     static int ids[MAXSEQ];
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); continue; }
+        if (parse_sample(argc, argv, &i)) continue;
         ids[n++] = atoi(argv[i]);
     }
     gguf_open(argv[1]);
@@ -470,12 +524,14 @@ int main(int argc, char **argv) {
         for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
         /* greedy: argmax of the RAW logits (first max wins); the cap is monotone,
            and applying it first could merge distinct values in float32 */
-        printf("step %d id_in=%d top=%d logit=%.4f\n", pos, tok, top, capped(logits[top]));
+        int next = (SMP.on && pos + 1 >= n) ? sample_next(logits) : top;
+        if (SMP.on) printf("step %d id_in=%d top=%d logit=%.4f pick=%d\n", pos, tok, top, capped(logits[top]), next);
+        else printf("step %d id_in=%d top=%d logit=%.4f\n", pos, tok, top, capped(logits[top]));
         fflush(stdout);
         pos++;
         if (pos >= n) {
-            if (n - n_prompt >= gen || top == 1 || top == 106) break;   /* gen = tokens generated */
-            ids[n++] = top;
+            if (n - n_prompt >= gen || next == 1 || next == 106) break;   /* gen = tokens generated */
+            ids[n++] = next;
         }
     }
     return 0;
