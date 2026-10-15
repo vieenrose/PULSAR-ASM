@@ -3195,7 +3195,9 @@ template <int B>
 __global__ __launch_bounds__(256, 2) void pq1_tq_qk(const float* __restrict__ qo, const uint32_t* __restrict__ kcode,
                                                     const float* __restrict__ ksc, const uint8_t* __restrict__ par,
                                                     float* __restrict__ sc, int ctx) {
-  enum { CW = pq1_tqc<B>::CW, NV = pq1_tqc<B>::NV };
+  /* the table holds the 2^(B-1) magnitudes only (8 / 16 KB, 2 blocks per SM
+   * at 4 bits, conflict-free rows) and the code's sign bit picks +-1 per term */
+  enum { CW = pq1_tqc<B>::CW, NV = pq1_tqc<B>::NV / 2 };
   __shared__ __align__(16) float4 lut[128 * NV];
   __shared__ __align__(16) float qr[4][128];
   const int kh = blockIdx.x, tid = threadIdx.x, w = tid >> 5, l = tid & 31;
@@ -3228,11 +3230,16 @@ __global__ __launch_bounds__(256, 2) void pq1_tq_qk(const float* __restrict__ qo
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 #pragma unroll
     for (int j = 0; j < 128; j++) {
-      int v;
-      if (B == 3) v = ((cw[j >> 4] >> (2 * (j & 15))) & 3) | (((cw[8 + (j >> 5)] >> (j & 31)) & 1) << 2);
-      else v = (cw[j >> 3] >> (4 * (j & 7))) & 15;
-      const float4 e = lut[j * NV + v];
-      a0 += e.x; a1 += e.y; a2 += e.z; a3 += e.w;
+      if (B == 3) {
+        const float4 e = lut[j * NV + ((cw[j >> 4] >> (2 * (j & 15))) & 3)];
+        const float g = __int_as_float(0x3f800000 | (((cw[8 + (j >> 5)] >> (j & 31)) & 1) << 31));
+        a0 = fmaf(g, e.x, a0); a1 = fmaf(g, e.y, a1); a2 = fmaf(g, e.z, a2); a3 = fmaf(g, e.w, a3);
+      } else {
+        const uint32_t v = cw[j >> 3] >> (4 * (j & 7));
+        const float4 e = lut[j * NV + (v & 7)];
+        const float g = __int_as_float(0x3f800000 | ((v & 8) << 28));
+        a0 = fmaf(g, e.x, a0); a1 = fmaf(g, e.y, a1); a2 = fmaf(g, e.z, a2); a3 = fmaf(g, e.w, a3);
+      }
     }
     const float s = __ldg(ksc + (size_t)kh * ctx + t);
     float* so = sc + (size_t)kh * 4 * ctx + t;

@@ -1072,3 +1072,9 @@ GPU used at ctx 2112: f16 1314.6 MB, TQ3 1077.9, K4V3 1087.2, TQ4 1096.5.
 Host RSS follows the arena size, not the cache: a 1280 MB arena gave 795 MB RSS vs 694 MB at
 1426 with the same used_mb, so TQ keeps the f16 arena sizing (RSS 684 vs f16 665 at 2k).
 Open: qk<4> speed (fp16 LUT), and a larger default arena may cut default-path RSS by ~100 MB.
+TQ follow-up (qk magnitude table): pq1_tq_qk keeps only the 2^(B-1) magnitudes in its smem
+table and applies the code's sign bit as fmaf(+-1, e, a) (exactly a +- e, outputs bit-identical).
+4-bit table 32 KB -> 16 KB (1 -> 2 blocks/SM, 16-entry rows had 2-way bank conflicts):
+parity-timed tq4 per layer at T=1024 0.920 -> 0.437 ms, tq3 0.489 -> 0.472. Engine, TF-2048,
+ms/tok @~1970: f16 117.1, TQ3 91.0, K4V3 90.3, TQ4 88.8 (top-1 90.8 / 95.0 / 96.0%, unchanged).
+TQ4 is now the best arm: fastest at long context and most accurate.
