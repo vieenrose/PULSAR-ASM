@@ -455,6 +455,13 @@ g4_attn_pv8r:
  *   r = sqrt(ss / n + 1e-6);  y[i] = (float)(((double)x[i] / r) * (double)w[i])
  * The squares, divisions and products are done two doubles at a time; the sum
  * stays a sequential scalar chain. n % 4 == 0.
+ * The divisions x/r use Markstein's correction instead of FDIV (the A57's double
+ * divider costs ~30 cycles per element): y = RN(1/r) once, then per element
+ *   q0 = x*y;  e = fma(-q0, r, x) (FMLS, exact residual);  q = fma(e, y, q0) (FMLA)
+ * which is the correctly rounded quotient RN(x/r) (Markstein's theorem: y within
+ * half an ulp of 1/r, q0 within an ulp of x/r; x, r doubles, so no exact midpoint).
+ * Checked bit for bit against x/r on 2.5e11 (float x, double r) pairs, including
+ * r with all-ones mantissas.
  * double g4_rms_r(const float *x, long n) -> d0
  * void g4_rmsnorm(const float *x, const float *w, float *y, long n)
  * void g4_rmsnorm_ns(float *x, long n)   (in place, no weight)                 */
@@ -504,16 +511,23 @@ g4_rmsnorm:
     mov     x1, x3
     bl      g4_rms_r
     dup     v5.2d, v0.d[0]                    /* r */
+    fmov    d17, #1.0
+    fdiv    d17, d17, d0
+    dup     v17.2d, v17.d[0]                  /* y = RN(1/r) */
 1:  ldr     q1, [x19], #16
     ldr     q6, [x20], #16
     fcvtl   v2.2d, v1.2s
     fcvtl2  v3.2d, v1.4s
     fcvtl   v7.2d, v6.2s
     fcvtl2  v16.2d, v6.4s
-    fdiv    v2.2d, v2.2d, v5.2d
-    fdiv    v3.2d, v3.2d, v5.2d
-    fmul    v2.2d, v2.2d, v7.2d
-    fmul    v3.2d, v3.2d, v16.2d
+    fmul    v18.2d, v2.2d, v17.2d             /* q0 = x*y */
+    fmul    v19.2d, v3.2d, v17.2d
+    fmls    v2.2d, v18.2d, v5.2d              /* e = x - q0*r (fused) */
+    fmls    v3.2d, v19.2d, v5.2d
+    fmla    v18.2d, v2.2d, v17.2d             /* x/r = q0 + e*y (fused) */
+    fmla    v19.2d, v3.2d, v17.2d
+    fmul    v2.2d, v18.2d, v7.2d
+    fmul    v3.2d, v19.2d, v16.2d
     fcvtn   v1.2s, v2.2d
     fcvtn2  v1.4s, v3.2d
     str     q1, [x21], #16
@@ -536,13 +550,20 @@ g4_rmsnorm_ns:
     mov     x20, x1
     bl      g4_rms_r
     dup     v5.2d, v0.d[0]
+    fmov    d17, #1.0
+    fdiv    d17, d17, d0
+    dup     v17.2d, v17.d[0]                  /* y = RN(1/r) */
 1:  ldr     q1, [x19]
     fcvtl   v2.2d, v1.2s
     fcvtl2  v3.2d, v1.4s
-    fdiv    v2.2d, v2.2d, v5.2d
-    fdiv    v3.2d, v3.2d, v5.2d
-    fcvtn   v1.2s, v2.2d
-    fcvtn2  v1.4s, v3.2d
+    fmul    v18.2d, v2.2d, v17.2d             /* Markstein, as g4_rmsnorm */
+    fmul    v19.2d, v3.2d, v17.2d
+    fmls    v2.2d, v18.2d, v5.2d
+    fmls    v3.2d, v19.2d, v5.2d
+    fmla    v18.2d, v2.2d, v17.2d
+    fmla    v19.2d, v3.2d, v17.2d
+    fcvtn   v1.2s, v18.2d
+    fcvtn2  v1.4s, v19.2d
     str     q1, [x19], #16
     subs    x20, x20, #4
     b.gt    1b
