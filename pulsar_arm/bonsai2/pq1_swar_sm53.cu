@@ -3246,6 +3246,81 @@ __global__ __launch_bounds__(256, 2) void pq1_tq_qk(const float* __restrict__ qo
     so[0] = a0 * s; so[ctx] = a1 * s; so[2 * (size_t)ctx] = a2 * s; so[3 * (size_t)ctx] = a3 * s;
   }
 }
+/* pq1_tq_qk without the 4-head product table: each term is fl(q_r[h][j] c[v])
+ * computed inline from a broadcast float4 of the 4 heads' q_r[j] and a
+ * signed-centroid load (both one wavefront, against the table's lds.128 = 4);
+ * a + fl(q (+-c)) is exactly fmaf(+-1, fl(q c), a), the chain of pq1_tq_qk /
+ * pq1_tq_qks: bit-identical */
+template <int B>
+__global__ __launch_bounds__(256) void pq1_tq_qk2(const float* __restrict__ qo, const uint32_t* __restrict__ kcode,
+                                                  const float* __restrict__ ksc, const uint8_t* __restrict__ par,
+                                                  float* __restrict__ sc, int ctx) {
+  enum { CW = pq1_tqc<B>::CW, NV = pq1_tqc<B>::NV };
+  __shared__ __align__(16) float4 qr[128];
+  __shared__ float cm[NV];
+  const int kh = blockIdx.x, tid = threadIdx.x, w = tid >> 5, l = tid & 31;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  if ((int)blockIdx.y * 512 >= T) return;   /* block-uniform */
+  if (w < 4) {
+    const float4 q4 = reinterpret_cast<const float4*>(qo + (size_t)(kh * 4 + w) * 128)[l];
+    float x[4] = {pq1_tq_dsign(q4.x, 4 * l), pq1_tq_dsign(q4.y, 4 * l + 1),
+                  pq1_tq_dsign(q4.z, 4 * l + 2), pq1_tq_dsign(q4.w, 4 * l + 3)};
+    pq1_fwht128(x, l);
+    float* qf = reinterpret_cast<float*>(qr);
+#pragma unroll
+    for (int i = 0; i < 4; i++) qf[(4 * l + i) * 4 + w] = x[i] * 0.0078125f;
+  }
+  if (tid < NV) cm[tid] = pq1_tq_cent(B, tid);
+  __syncthreads();
+  /* two positions per thread (t, t + 256 of the block's 512-span) share each
+   * q load; u duplicates t past T */
+  for (int t = blockIdx.y * 512 + tid; t < T; t += gridDim.y * 512) {
+    const int u = t + 256 < T ? t + 256 : t;
+    const uint32_t* kb = kcode + ((size_t)kh * ctx + t) * CW;
+    const uint32_t* kc = kcode + ((size_t)kh * ctx + u) * CW;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+    if (B == 3) {
+#pragma unroll 1
+      for (int k = 0; k < 8; k++) {
+        const uint32_t mw = __ldg(kb + k), sw = __ldg(kb + 8 + (k >> 1)) >> (16 * (k & 1));
+        const uint32_t mx = __ldg(kc + k), sx = __ldg(kc + 8 + (k >> 1)) >> (16 * (k & 1));
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+          const float4 q = qr[16 * k + i];
+          const float c = cm[((mw >> (2 * i)) & 3) | (((sw >> i) & 1) << 2)];
+          const float d = cm[((mx >> (2 * i)) & 3) | (((sx >> i) & 1) << 2)];
+          a0 = __fadd_rn(a0, __fmul_rn(q.x, c)); a1 = __fadd_rn(a1, __fmul_rn(q.y, c));
+          a2 = __fadd_rn(a2, __fmul_rn(q.z, c)); a3 = __fadd_rn(a3, __fmul_rn(q.w, c));
+          b0 = __fadd_rn(b0, __fmul_rn(q.x, d)); b1 = __fadd_rn(b1, __fmul_rn(q.y, d));
+          b2 = __fadd_rn(b2, __fmul_rn(q.z, d)); b3 = __fadd_rn(b3, __fmul_rn(q.w, d));
+        }
+      }
+    } else {
+#pragma unroll 1
+      for (int k = 0; k < 16; k++) {
+        const uint32_t wv = __ldg(kb + k), wx = __ldg(kc + k);
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          const float4 q = qr[8 * k + i];
+          const float c = cm[(wv >> (4 * i)) & 15], d = cm[(wx >> (4 * i)) & 15];
+          a0 = __fadd_rn(a0, __fmul_rn(q.x, c)); a1 = __fadd_rn(a1, __fmul_rn(q.y, c));
+          a2 = __fadd_rn(a2, __fmul_rn(q.z, c)); a3 = __fadd_rn(a3, __fmul_rn(q.w, c));
+          b0 = __fadd_rn(b0, __fmul_rn(q.x, d)); b1 = __fadd_rn(b1, __fmul_rn(q.y, d));
+          b2 = __fadd_rn(b2, __fmul_rn(q.z, d)); b3 = __fadd_rn(b3, __fmul_rn(q.w, d));
+        }
+      }
+    }
+    const float s = __ldg(ksc + (size_t)kh * ctx + t);
+    float* so = sc + (size_t)kh * 4 * ctx + t;
+    so[0] = a0 * s; so[ctx] = a1 * s; so[2 * (size_t)ctx] = a2 * s; so[3 * (size_t)ctx] = a3 * s;
+    if (u != t) {
+      const float r = __ldg(ksc + (size_t)kh * ctx + u);
+      float* sp = sc + (size_t)kh * 4 * ctx + u;
+      sp[0] = b0 * r; sp[ctx] = b1 * r; sp[2 * (size_t)ctx] = b2 * r; sp[3 * (size_t)ctx] = b3 * r;
+    }
+  }
+}
+
 /* per q head: p_t = exp(s_t - max) in place, inv[h] = 1 / sum p */
 __global__ __launch_bounds__(256) void pq1_tq_sm(float* __restrict__ sc, const uint8_t* __restrict__ par,
                                                  float* __restrict__ inv, int ctx) {
@@ -3414,12 +3489,12 @@ __global__ __launch_bounds__(128) void pq1_tq_pv2(const float* __restrict__ p, c
           make_float4(a[h][0], a[h][1], a[h][2], a[h][3]);
     }
 }
-/* kernel variants of the long chain, bit mask (1: pq1_tq_pv2); PQ1_TQV
+/* kernel variants of the long chain, bit mask (1: pq1_tq_pv2, 2: pq1_tq_qk2); PQ1_TQV
  * overrides, pq1_tq_variant() sets it for the parity A/B */
 static int PQ1_TQV = -1;
 extern "C" void pq1_tq_variant(int v) { PQ1_TQV = v; }
 static int pq1_tqv(void) {
-  if (PQ1_TQV < 0) PQ1_TQV = getenv("PQ1_TQV") ? atoi(getenv("PQ1_TQV")) : 1;
+  if (PQ1_TQV < 0) PQ1_TQV = getenv("PQ1_TQV") ? atoi(getenv("PQ1_TQV")) : 3;
   return PQ1_TQV;
 }
 /* per q head (one warp): sum the chunks, normalize, rotate back */
@@ -3667,7 +3742,11 @@ extern "C" int pq1_tq_fa_launch(int bits, const float* qo_d, const uint8_t* par_
   if (nh != 4 * nkv || ctx <= 0 || (bits != 3 && bits != 4 && bits != 43)) return -2;
   const int bk = pq1_tq_bk(bits), bv = pq1_tq_bv(bits);
   const dim3 gq(nkv, min((ctx + 255) / 256, PQ1_TQ_QB)), gp(nkv, (ctx + PQ1_TQ_CH - 1) / PQ1_TQ_CH);
-  if (bk == 3) pq1_tq_qk<3><<<gq, 256, 0, s>>>(qo_d, kcode, ksc, par_d, sc_d, ctx);
+  if (pq1_tqv() & 2) {
+    const dim3 gq(nkv, min((ctx + 511) / 512, PQ1_TQ_QB));
+    if (bk == 3) pq1_tq_qk2<3><<<gq, 256, 0, s>>>(qo_d, kcode, ksc, par_d, sc_d, ctx);
+    else pq1_tq_qk2<4><<<gq, 256, 0, s>>>(qo_d, kcode, ksc, par_d, sc_d, ctx);
+  } else if (bk == 3) pq1_tq_qk<3><<<gq, 256, 0, s>>>(qo_d, kcode, ksc, par_d, sc_d, ctx);
   else pq1_tq_qk<4><<<gq, 256, 0, s>>>(qo_d, kcode, ksc, par_d, sc_d, ctx);
   pq1_tq_sm<<<nh, 256, 0, s>>>(sc_d, par_d, inv_d, ctx);
   if (pq1_tqv() & 1) {

@@ -1144,3 +1144,18 @@ stride 2048): tq3/tq4/tq43 0 words differ. Engine, TQ4, prompt A + 300 generated
 order v1 v0 v0 v1: steps 20..255 61.59 / 63.03 / 63.16 / 61.80 ms (-2.2%); steps >= 257 64.93 vs
 64.96 (equal; step 256 carries the one-time 2nd capture, 108.7 ms). Greedy stream md5 identical.
 Gates green on a fresh build, 16.53 tps (f16 gate run, path unaffected).
+
+55. TQ qk2: no product table, two positions per thread (keep, TQ ctx > 256). pq1_tq_qk read a
+float4 table entry (the 4 heads' fl(q_r[j] c[v])) per term: lds.128 at a per-lane address = 4
+wavefronts, shared-bandwidth bound. pq1_tq_qk2 forms each product inline: a broadcast float4 of
+q_r[j] (1 wavefront) and a signed 16-entry centroid table (1 wavefront), a = fl(a + fl(q (+-c))),
+which is exactly fmaf(+-1, fl(q c), a), the old chain (sign flip exact, signed zeros equal).
+One position per thread: -17% (T=4096) / -10% (16384) per layer; the sign-float build dropped by
+the signed table is part of that. Two positions per thread (t, t+256 of a block's 512-span,
+grid y = min(ctx/512, 16)) share the q load: per layer T=700 0.264 -> 0.233, T=4096 1.336 ->
+1.011, T=16384 4.68 -> 3.90 ms (order v1 v3 v3 v1). A first P=2 attempt paired t with t + grid
+stride, all duplicates when T <= 4096 (1.45 ms at 4096): pair inside the block. More blocks per
+kv head (32, 64) are slower; 8 is within 2%. pq1_parity tq 3/4/43: variant == old kernels
+bitwise at every T to 16384. Engine, TQ4, 2040 ids + 16 generated, order v3 v1 v1 v3: 78.82 /
+84.54 / 84.68 / 78.74 ms (-6.9%, R = 1.074), stream identical. Default PQ1_TQV 1 -> 3. Gates
+green on a fresh build, 16.44 tps (f16 gate run, path unaffected).
