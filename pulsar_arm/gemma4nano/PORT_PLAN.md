@@ -84,3 +84,25 @@ asm + C + CUDA engine for K2-Horizon-0.9B (`.auto/rescue/k2_cuda.S`,
 - **Context cap** (1024 or 2048 positions; KV is cheap, but prefill is token by token).
 - Whether the K2 asm engine is forked (copy and edit) or generalized into one engine with a
   per-model table; forking is faster to a first result and is the plan unless told otherwise.
+
+## Update 2026-10-15: QAT checkpoint and Google's own Q4_0 file
+
+User decisions: Q4, using the **QAT** release, context cap 2048.
+
+- `google/gemma-4-E2B-it` (non-QAT) was downloaded and verified (sha256 `2db5482b…c550`),
+  then deleted for disk space; it is no longer the source.
+- Source now: `google/gemma-4-E2B-it-qat-q4_0-unquantized` (bf16 weights trained for Q4_0,
+  identical text_config) and Google's quantized release `google/gemma-4-E2B-it-qat-q4_0-gguf`
+  (`gemma-4-E2B_q4_0-it.gguf`, 3.35 GB). Both ungated, in `/home/user/g4qat/`.
+- Header of Google's "Q4_0" GGUF (read by HTTP range): **only the layer projections are Q4_0**
+  (q, k, v, o, gate, up, down, PLE gate and proj). The token embedding / tied head and the PLE
+  table are **Q6_K**, `per_layer_model_proj` is F16, norms and layer scalars F32.
+  So "all Q4_0" would quantize the head and the PLE table more coarsely than Google does.
+
+Revised M1: take the weights from Google's GGUF as they are (this *is* the official Q4 model),
+and use the QAT bf16 file only as the reference: re-quantizing its layer tensors with ggml's
+Q4_0 rule must reproduce the GGUF's Q4_0 bytes exactly, which checks both files and our quantizer.
+
+Revised budget: GPU 1.06 GB (Q4_0 layers) + 0.33 GB (Q6_K head) + 0.03 GB (F16) = 1.42 GB;
+PLE table 1.93 GB Q6_K, memory-mapped, one 7.4 KB row per token. Fits the 3.4 GB available.
+Cost: one more GPU kernel (Q6_K GEMV for the 262144-row head) besides the K2 Q4_0 kernel.
