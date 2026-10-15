@@ -1134,6 +1134,12 @@ static void cuda_gemv_impl(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
         if (pEventElapsedTime(&ms, g_event2, g_event) == 0) {
             static double gtot = 0, pgtot = 0; static unsigned long gcnt = 0;
             gtot += ms; gcnt++;
+            if (getenv("K2GWIN")) {
+                unsigned long lo = 0, hi = 0; sscanf(getenv("K2GWIN"), "%lu:%lu", &lo, &hi);
+                if (gcnt >= lo && gcnt <= hi)
+                    printf("GCALL n=%lu ms=%.3f rows=%u cols=%u\n", gcnt, ms, r1-r0, cols);
+                if (gcnt == hi) fflush(stdout);
+            }
             if ((gcnt % 197) == 0) {
                 printf("GTIME fwd=%lu call_us=%.1f fwd_ms=%.1f\n", gcnt/197, ms*1000.0, gtot - pgtot);
                 fflush(stdout); pgtot = gtot;

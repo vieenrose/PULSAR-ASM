@@ -1025,6 +1025,11 @@ void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
     uint32_t nb32 = cols >> 5;
     uint64_t dev_w = 0;
     uint32_t rowsf = q4_classify(w, &dev_w);
+    /* Exp70: rowsf from classify() is the row count of the SINGLE tensor that
+       contains w; a merged-group call (kind 9/10) asks for more rows. Keep the
+       classify value for the self-test's CPU reference (which can only rebuild
+       one tensor), and use the requested count (r1-r0) for the real launch. */
+    uint32_t rows_cls = rowsf;
     uint64_t d_sc = dev_sc, d_xq = dev_xq, d_y = dev_y, scb;
     size_t nrows, sc_bytes, xq_bytes;
     void *args[] = { &dev_w, &d_sc, &d_xq, &d_y, (void *)&r0, (void *)&r1,
@@ -1034,10 +1039,22 @@ void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
     extern uint32_t g_nthreads;
     if (!cuda_ok || !rowsf || g_nthreads != 1) {
         /* CPU path (bit-exact): GPU stays threads-1 only — at threads>1
-           per-call staging + one global lock serialize the workers. */
+           per-call staging + one global lock serialize the workers.
+           NOTE (Exp70): a merged-group call (rows=3072 q+k+v / 10240 gate+up)
+           is NOT valid on this fallback, which walks the SOURCE 18B-stride
+           layout where the tensors are separated by the fp16/fp32 norms. The
+           GPU image is compact (q4_build running-sum) so only the GPU path can
+           span tensors. A GPU loss therefore fails the golden gate loudly. */
         k2q4_gemv_range(r0, r1, cols, w, x_act_unused, y, xq);
         return;
     }
+    /* Exp70: merged tensor groups request MORE rows than q4_classify() matched
+       (it returns the row count of the single tensor containing w). The kernel
+       ignores prf, and the only other use of rowsf is the sc-region bounds test
+       below, which must see the true requested row count. For every pre-existing
+       call r1-r0 == tbl_krows[kind] == the classify result, so this is a no-op
+       there. */
+    rowsf = r1 - r0;
     grid = (r1 > r0) ? (r1 - r0 + 31) / 32 : 0;
     if (!grid) return;
     nrows = (size_t)(r1 - r0);
@@ -1134,8 +1151,8 @@ void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
     if (cuda_ok && selftest_remaining > 0) {
         static float s_gpu[65536], s_cpu[65536];
         static uint64_t dev_s = 0;
-        uint32_t t_r0 = 0, t_r1 = rowsf;
-        size_t full = (size_t)rowsf * 4;
+        uint32_t t_r0 = 0, t_r1 = rows_cls;
+        size_t full = (size_t)rows_cls * 4;
         void *targs[] = { &dev_w, &d_sc, &d_xq, &dev_s,
                           &t_r0, &t_r1, &nb32, &rowsf };
         CUresult r2 = 0;
@@ -1149,14 +1166,14 @@ void cuda_gemv(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
             }
         }
         if (pass) {
-            r2 = pLaunch(k_gemv, (rowsf + 15) / 16, 1, 1, 32, 8, 1,
+            r2 = pLaunch(k_gemv, (rows_cls + 15) / 16, 1, 1, 32, 8, 1,
                          0, NULL, targs, NULL);
             if (!r2) r2 = pCtxSync();
             if (!r2) r2 = pMemcpyDtoH(s_gpu, dev_s, full);
             if (r2) { ck(r2, "selftest-path"); pass = 0; }
         }
         if (pass) {
-            cuda_q4_ref(rowsf, cols, (const uint8_t *)(uintptr_t)w,
+            cuda_q4_ref(rows_cls, cols, (const uint8_t *)(uintptr_t)w,
                         scb, (const int8_t *)(uintptr_t)xq, s_cpu);
             if (memcmp(s_gpu, s_cpu, full)) {
                 size_t i, nf = full / 4;

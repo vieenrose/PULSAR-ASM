@@ -1179,27 +1179,20 @@ layer_forward:
     adrp x3, b_XN
     add x3, x3, :lo12:b_XN
     bl rms
-    /* q, k, v */
+    /* q, k, v -- Exp70: ONE merged launch (kind 9) instead of three.
+       The device repack (q4_build, running-sum offsets) lays every Q4 tensor
+       compactly in kind order, so q(2048 rows)/k(512)/v(512) form one
+       contiguous nb32=48 run at q's base, and the sc region is contiguous the
+       same way (tbl_scoff 0/393216/491520).  b_QF(0x26000,+8192)/b_KF(+2048)/
+       b_VF(+2048) are adjacent in .bss (nm-verified), so rows=3072 writes
+       q[0,2048) k[2048,2560) v[2560,3072) exactly where the model reads them.
+       Per-row math, row order, FMA chains: unchanged => bit-exact. */
     mov w0, w19
-    mov w1, #1
+    mov w1, #9
     adrp x2, b_XN
     add x2, x2, :lo12:b_XN
     adrp x3, b_QF
     add x3, x3, :lo12:b_QF
-    bl gemvW
-    mov w0, w19
-    mov w1, #2
-    adrp x2, b_XN
-    add x2, x2, :lo12:b_XN
-    adrp x3, b_KF
-    add x3, x3, :lo12:b_KF
-    bl gemvW
-    mov w0, w19
-    mov w1, #3
-    adrp x2, b_XN
-    add x2, x2, :lo12:b_XN
-    adrp x3, b_VF
-    add x3, x3, :lo12:b_VF
     bl gemvW
     /* rope Q (32 heads), K (8 heads) */
     adrp x0, b_QF
@@ -1272,20 +1265,15 @@ layer_forward:
     adrp x3, b_XN
     add x3, x3, :lo12:b_XN
     bl rms
-    /* gate, up */
+    /* gate, up -- Exp70: ONE merged launch (kind 10), same reasoning (b_LG
+       0x2b000,+20480 and b_LU 0x30000,+20480 are adjacent in .bss;
+       tbl_scoff 983040/1966080 contiguous).  rows = 5120+5120 = 10240. */
     mov w0, w19
-    mov w1, #6
+    mov w1, #10
     adrp x2, b_XN
     add x2, x2, :lo12:b_XN
     adrp x3, b_LG
     add x3, x3, :lo12:b_LG
-    bl gemvW
-    mov w0, w19
-    mov w1, #7
-    adrp x2, b_XN
-    add x2, x2, :lo12:b_XN
-    adrp x3, b_LU
-    add x3, x3, :lo12:b_LU
     bl gemvW
     /* silu: LU[i] = (LG[i] / (1.0f + expf(-LG[i]))) * LU[i] */
     adrp x20, b_LG
@@ -2874,11 +2862,16 @@ m_minp:         .asciz "k2_core: minp>0 unsupported (logf not ported)"
 m_usage:        .asciz "usage: k2_core <k2h_q4.blob> <id...> [--gen N] [--sample temp topp topk seed [minp]]"
     .align 3
 tbl_koff:       .quad 0, 6144, 1775616, 2217984, 2660352, 4429824, 4435968, 8859648, 13283328
+    /* Exp70 merged groups: k=9 q+k+v (starts at q), k=10 gate+up (starts at gate) */
+    .quad 6144, 4435968
     .align 2
 tbl_scoff:      .quad 0, 0, 393216, 491520, 589824, 983040, 983040, 1966080, 2949120
+    .quad 0, 983040
     /* per-matrix f32-scale byte offsets within a layer (k=0,5 unused) */
 tbl_krows:      .word 1536, 2048, 512, 512, 1536, 1536, 5120, 5120, 1536
+    .word 3072, 10240
 tbl_kcols:      .word 0, 1536, 1536, 1536, 2048, 0, 1536, 1536, 5120
+    .word 1536, 1536
 
 /* ---------------- .bss ---------------- */
     .bss
