@@ -2045,6 +2045,157 @@ __global__ __launch_bounds__(256) void pq1_attn_pre1(const float* __restrict__ q
   }
 }
 
+/* Loop iter 27 (PQ1_APRE=2, default; 1 is the A/B arm): pq1_attn_pre1's math with
+ * its latency taken out. pre1 (33 us/layer in the engine) is dominated by
+ * dependent waits, not arithmetic: its qkv copy loop issues one global load at
+ * a time (24 per thread), the rope stage re-reads wn/cos/sin from global per
+ * pair, and each head's 128 serial double fma run on one thread. Here every
+ * thread issues its 6 float4 qkv loads at once (q/k rows to shared, v rows to
+ * the cache as 8-byte f16 stores), wn and cos/sin are staged in shared, and
+ * the head RMS is certified instead of chained:
+ *   warp w takes heads w, w+8, ...; lane l forms the exact squares of dims l,
+ *   l+32, l+64, l+96 as fp32 pairs (TwoProd), adds them and then the 5 shuffle
+ *   levels in pair arithmetic (TwoSum + one rounded tail add, Fast2Sum
+ *   renormalization): (H, L) is the sum within ~2^-44 relative (all terms
+ *   >= 0, 8 levels of <= 2^-47), and pre1's serial s within 127u (u = 2^-53).
+ *   So s lies in [(H+L)(1-e), (H+L)(1+e)] with e = 2^-40, and when that whole
+ *   interval is inside H's float rounding interval (half an ulp up, half the
+ *   ulp below H down: a quarter ulp of H at a power of two), rn_f32(s/128) =
+ *   H/128 exactly (H >= 2^-100: the /128 and the ulp are exact). Otherwise
+ *   (non-finite or tiny H, near a boundary, or serial != 0: the parity gate)
+ *   lane 0 runs pre1's double chain over the shared row. nfb counts those.
+ * The rope/scale stage and the K/V values are pre1's, element for element. */
+#define PQ1_AP2_S 132   /* q/k row stride in shared: 16-byte rows */
+__device__ __forceinline__ void pq1_two_sum(float a, float b, float& s, float& e) {
+  s = pq1_fadd(a, b);
+  const float bb = pq1_fsub(s, a);
+  e = pq1_fadd(pq1_fsub(a, pq1_fsub(s, bb)), pq1_fsub(b, bb));
+}
+/* (ah, al) += (bh, bl), both normalized and >= 0 */
+__device__ __forceinline__ void pq1_ff_add(float& ah, float& al, float bh, float bl) {
+  float s, e;
+  pq1_two_sum(ah, bh, s, e);
+  e = pq1_fadd(e, pq1_fadd(al, bl));
+  ah = pq1_fadd(s, e);
+  al = pq1_fsub(e, pq1_fsub(ah, s));
+}
+__global__ __launch_bounds__(256) void pq1_attn_pre2(const float* __restrict__ qkv,
+                                                    const float* __restrict__ nw,
+                                                    const uint8_t* __restrict__ par,
+                                                    float* __restrict__ qo,
+                                                    unsigned short* __restrict__ kc,
+                                                    unsigned short* __restrict__ vc, int nh,
+                                                    int nkv, int ctx, int serial,
+                                                    int* __restrict__ nfb) {
+  extern __shared__ __align__(16) float sx[]; /* [nqk][PQ1_AP2_S] */
+  __shared__ float ssc[PQ1_APRE_MAXH];
+  __shared__ __align__(16) float swn[256], src_[128];
+  const int nqk = nh + nkv, t = threadIdx.x, wp = t >> 5, l = t & 31;
+  const int nq4 = (nqk + nkv) * 32;
+  const int npos = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS);
+  {
+    float4 v[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+      const int i = t + 256 * k;
+      if (i < nq4) v[k] = reinterpret_cast<const float4*>(qkv)[i];
+    }
+    float4 aux;
+    if (t < 64) aux = reinterpret_cast<const float4*>(nw)[t];
+    else if (t < 96) aux = reinterpret_cast<const float4*>(par + PQ1_APAR_ROPE)[t - 64];
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+      const int i = t + 256 * k;
+      if (i >= nq4) break;
+      const int h = i >> 5, d = (i & 31) * 4;
+      if (h < nqk) {
+        *reinterpret_cast<float4*>(sx + h * PQ1_AP2_S + d) = v[k];
+      } else {
+        const uint32_t lo = pq1_f2h(v[k].x) | ((uint32_t)pq1_f2h(v[k].y) << 16);
+        const uint32_t hi = pq1_f2h(v[k].z) | ((uint32_t)pq1_f2h(v[k].w) << 16);
+        *reinterpret_cast<uint2*>(vc + ((size_t)(h - nqk) * ctx + npos) * 128 + d) = make_uint2(lo, hi);
+      }
+    }
+    if (t < 64) reinterpret_cast<float4*>(swn)[t] = aux;
+    else if (t < 96) reinterpret_cast<float4*>(src_)[t - 64] = aux;
+  }
+  __syncthreads();
+  for (int h = wp; h < nqk; h += 8) {   /* warp-uniform */
+    const float* r = sx + h * PQ1_AP2_S;
+    float H, L;
+    {
+      const float x0 = r[l], x1 = r[l + 32], x2 = r[l + 64], x3 = r[l + 96];
+      H = pq1_fmul(x0, x0); L = pq1_ffma(x0, x0, pq1_fneg(H));
+      float bh = pq1_fmul(x1, x1), bl = pq1_ffma(x1, x1, pq1_fneg(bh));
+      pq1_ff_add(H, L, bh, bl);
+      bh = pq1_fmul(x2, x2); bl = pq1_ffma(x2, x2, pq1_fneg(bh));
+      pq1_ff_add(H, L, bh, bl);
+      bh = pq1_fmul(x3, x3); bl = pq1_ffma(x3, x3, pq1_fneg(bh));
+      pq1_ff_add(H, L, bh, bl);
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      const float oh = __shfl_xor_sync(0xffffffffu, H, o), ol = __shfl_xor_sync(0xffffffffu, L, o);
+      pq1_ff_add(H, L, oh, ol);
+    }
+    if (l == 0) {
+      const uint32_t hb = __float_as_uint(H);
+      /* finite and >= 2^-100 (sign clear: all terms >= 0, NaN fails too) */
+      int ok = !serial && hb >= 0x0d800000u && hb < 0x7f800000u;
+      if (ok) {
+        const float ulp = __uint_as_float((hb & 0x7f800000u) - (23u << 23));
+        const float hup = pq1_fmul(ulp, 0.5f);
+        const float hdn = (hb & 0x007fffffu) ? hup : pq1_fmul(ulp, 0.25f);
+        const float eh = pq1_fmul(H, 1.0f / 1099511627776.0f);   /* e H, e = 2^-40 */
+        /* margin 1 - 2^-20: the two sums below are within 2^-24 relative of exact */
+        ok = pq1_fgt(pq1_fmul(hup, 0.99999904632568359375f), pq1_fadd(L, eh)) &&
+             pq1_fgt(pq1_fmul(hdn, 0.99999904632568359375f), pq1_fsub(eh, L));
+      }
+      float f = pq1_fmul(H, 0.0078125f);
+      if (!ok) {
+        double sd = 0.0;
+        for (int j = 0; j < 128; j++) { const double e = pq1_f2d(r[j]); sd = __fma_rn(e, e, sd); }
+        f = pq1_d2f(__ddiv_rn(sd, 128.0));
+        if (nfb) atomicAdd(nfb, 1);
+      }
+      ssc[h] = pq1_fdiv(1.0f, pq1_fsqrt(pq1_fadd(f, 1e-6f)));
+    }
+  }
+  __syncthreads();
+  for (int i = t; i < nqk * 64; i += 256) {   /* pair (j, j+64) of head hh */
+    const int hh = i >> 6, j = i & 63;
+    const float sc = ssc[hh];
+    const float* wn = swn + (hh < nh ? 0 : 128);
+    const float a = pq1_fmul(pq1_fmul(sc, sx[hh * PQ1_AP2_S + j]), wn[j]);
+    const float b = pq1_fmul(pq1_fmul(sc, sx[hh * PQ1_AP2_S + j + 64]), wn[j + 64]);
+    const float c = src_[j], sn = src_[64 + j];
+    const float o0 = pq1_ffma(a, c, pq1_fneg(pq1_fmul(b, sn)));
+    const float o1 = pq1_ffma(a, sn, pq1_fmul(b, c));
+    if (hh < nh) {
+      qo[(size_t)hh * 128 + j] = o0;
+      qo[(size_t)hh * 128 + j + 64] = o1;
+    } else {
+      unsigned short* dst = kc + ((size_t)(hh - nh) * ctx + npos) * 128;
+      dst[j] = pq1_f2h(o0);
+      dst[j + 64] = pq1_f2h(o1);
+    }
+  }
+}
+/* pq1_parity apre: ver 1 = pq1_attn_pre1, 2 = pq1_attn_pre2 (serial forces its chain) */
+extern "C" int pq1_attn_pre_launch(int ver, int serial, int* nfb_d, const float* qkv_d,
+                                   const float* nw_d, const uint8_t* par_d, float* qo_d,
+                                   unsigned short* kc_d, unsigned short* vc_d, int nh, int nkv,
+                                   int ctx, void* stream) {
+  if (nh + nkv > PQ1_APRE_MAXH) return -2;
+  cudaStream_t s = (cudaStream_t)stream;
+  const size_t sh = (nh + nkv) * (ver == 2 ? PQ1_AP2_S : 129) * sizeof(float);
+  if (ver == 2)
+    pq1_attn_pre2<<<1, 256, sh, s>>>(qkv_d, nw_d, par_d, qo_d, kc_d, vc_d, nh, nkv, ctx, serial, nfb_d);
+  else
+    pq1_attn_pre1<<<1, 256, sh, s>>>(qkv_d, nw_d, par_d, qo_d, kc_d, vc_d, nh, nkv, ctx);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
 /* q.k scores. Block = (kv head, tile stride), 32*G threads (G = nh/nkv query
  * heads, one warp each); a tile is 32 positions, lane = position. The K tile is
  * widened to f32 in shared memory, dim-major ([dim][pos], padded), so lane reads
@@ -2364,8 +2515,11 @@ extern "C" int pq1_attn_launch(const float* qkv_d, const float* nw_d, const uint
     return -2;
   cudaStream_t s = (cudaStream_t)stream;
   static int apre = -1;
-  if (apre < 0) { const char* e = getenv("PQ1_APRE"); apre = e ? atoi(e) : 1; }
-  if (apre && nh + nkv <= PQ1_APRE_MAXH)
+  if (apre < 0) { const char* e = getenv("PQ1_APRE"); apre = e ? atoi(e) : 2; }
+  if (apre == 2 && nh + nkv <= PQ1_APRE_MAXH)
+    pq1_attn_pre2<<<1, 256, (nh + nkv) * PQ1_AP2_S * sizeof(float), s>>>(qkv_d, nw_d, par_d, qo_d, kc_d,
+                                                                   vc_d, nh, nkv, ctx, 0, NULL);
+  else if (apre && nh + nkv <= PQ1_APRE_MAXH)
     pq1_attn_pre1<<<1, 256, (nh + nkv) * 129 * sizeof(float), s>>>(qkv_d, nw_d, par_d, qo_d, kc_d,
                                                                    vc_d, nh, nkv, ctx);
   else

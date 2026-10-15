@@ -322,6 +322,83 @@ static int fpl_parity(void) {
   printf("FPL PARITY: %s\n", bad ? "FAIL" : "PASS");
   return bad ? 1 : 0;
 }
+/* `pq1_parity apre`: pq1_attn_pre2 (certified tree, and with its serial chain
+ * forced) against pq1_attn_pre1 (the serial chain the goldens validate), bit
+ * for bit on q out, the K row and the V row, over random heads whose
+ * magnitudes span 2^-40..2^40 (plus zero, one-hot and overflowing heads). */
+static unsigned apre_rng = 12345u;
+static unsigned apre_r(void) { apre_rng = apre_rng * 1664525u + 1013904223u; return apre_rng >> 8; }
+static int apre_parity(void) {
+  const int nh = 32, nkv = 8, ctx = 64, nq = (nh + 2 * nkv) * 128;
+  const int trials = getenv("PQ1_APRE_N") ? atoi(getenv("PQ1_APRE_N")) : 3000;
+  float *qkv = malloc((size_t)nq * 4), nw[256], *o[3];
+  unsigned short *kv[3];
+  unsigned char par[PQ1_APAR_BYTES];
+  float *d_qkv, *d_nw, *d_qo;
+  unsigned short *d_kc, *d_vc;
+  unsigned char *d_par;
+  int *d_nfb, nfb[2] = {0, 0};
+  cudaMalloc((void **)&d_qkv, (size_t)nq * 4); cudaMalloc((void **)&d_nw, 1024);
+  cudaMalloc((void **)&d_qo, (size_t)nh * 512); cudaMalloc((void **)&d_par, sizeof par);
+  cudaMalloc((void **)&d_kc, (size_t)nkv * ctx * 256); cudaMalloc((void **)&d_vc, (size_t)nkv * ctx * 256);
+  cudaMalloc((void **)&d_nfb, 8);
+  cudaMemset(d_nfb, 0, 8);
+  for (int v = 0; v < 3; v++) {
+    o[v] = malloc((size_t)nh * 512);
+    kv[v] = malloc((size_t)nkv * ctx * 512);
+  }
+  long bad = 0;
+  for (int tr = 0; tr < trials; tr++) {
+    for (int h = 0; h < nh + 2 * nkv; h++) {
+      const int kind = apre_r() % 16;
+      const float sc = ldexpf(1.0f, (int)(apre_r() % 81) - 40);
+      for (int d = 0; d < 128; d++) {
+        float x = ((float)(apre_r() & 0xffffff) / 8388608.0f - 1.0f) * sc;
+        if (kind == 0) x = 0.0f;
+        if (kind == 1) x = d == (tr & 127) ? sc : 0.0f;
+        if (kind == 2) x *= 1e19f;   /* sum of squares overflows the float */
+        if (kind == 3 && (d & 1)) x = -x;
+        qkv[h * 128 + d] = x;
+      }
+    }
+    for (int i = 0; i < 256; i++) nw[i] = 0.5f + (float)(apre_r() % 1000) / 1000.0f;
+    const int npos = tr % ctx;
+    memset(par, 0, sizeof par);
+    for (int j = 0; j < 64; j++) {
+      const float th = (float)npos * powf(1000000.0f, -(float)j / 64.0f);
+      ((float *)(par + PQ1_APAR_ROPE))[j] = cosf(th);
+      ((float *)(par + PQ1_APAR_ROPE))[64 + j] = sinf(th);
+    }
+    memcpy(par + PQ1_APAR_NPOS, &npos, 4);
+    cudaMemcpy(d_qkv, qkv, (size_t)nq * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nw, nw, 1024, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_par, par, sizeof par, cudaMemcpyHostToDevice);
+    for (int v = 0; v < 3; v++) {
+      cudaMemset(d_qo, 0xff, (size_t)nh * 512);
+      cudaMemset(d_kc, 0xff, (size_t)nkv * ctx * 256);
+      cudaMemset(d_vc, 0xff, (size_t)nkv * ctx * 256);
+      if (pq1_attn_pre_launch(v ? 2 : 1, v == 2, d_nfb + (v == 2), d_qkv, d_nw, d_par, d_qo, d_kc, d_vc,
+                              nh, nkv, ctx, 0) || cudaDeviceSynchronize()) {
+        printf("apre launch failed\n");
+        return 1;
+      }
+      cudaMemcpy(o[v], d_qo, (size_t)nh * 512, cudaMemcpyDeviceToHost);
+      cudaMemcpy(kv[v], d_kc, (size_t)nkv * ctx * 256, cudaMemcpyDeviceToHost);
+      cudaMemcpy(kv[v] + (size_t)nkv * ctx * 128, d_vc, (size_t)nkv * ctx * 256, cudaMemcpyDeviceToHost);
+    }
+    for (int v = 1; v < 3; v++) {
+      const int b = memcmp(o[0], o[v], (size_t)nh * 512) || memcmp(kv[0], kv[v], (size_t)nkv * ctx * 512);
+      if (b && bad < 5) printf("apre trial %d ver2%s MISMATCH\n", tr, v == 2 ? " serial" : "");
+      bad += b;
+    }
+  }
+  cudaMemcpy(nfb, d_nfb, 8, cudaMemcpyDeviceToHost);
+  printf("apre: %d trials x %d heads, tree fallbacks %d, serial-forced chains %d, mismatches %ld\n",
+         trials, nh + nkv, nfb[0], nfb[1], bad);
+  printf("APRE PARITY: %s\n", bad ? "FAIL" : "PASS");
+  return bad ? 1 : 0;
+}
+
 /* pq1_argmax_launch vs fwd8's argmax(): random logits with planted max ties,
  * +0/-0 ties, -inf/+inf, NaN (also at v[0]) and all-NaN tails */
 static int argmax_ref(const float *v, int n) {
@@ -395,6 +472,7 @@ static int expf_parity(void) {
 int main(int argc, char **argv) {
 #if defined(PQ1_REAL_CUDA)
   if (argc > 1 && !strcmp(argv[1], "fa")) return fa_parity();
+  if (argc > 1 && !strcmp(argv[1], "apre")) return apre_parity();
   if (argc > 1 && !strcmp(argv[1], "rms")) return rms_parity();
   if (argc > 1 && !strcmp(argv[1], "fpl")) return fpl_parity();
   if (argc > 1 && !strcmp(argv[1], "expf")) return expf_parity();
