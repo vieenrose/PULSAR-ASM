@@ -636,30 +636,3 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv(const uint4 *__restri
     }
     y[r] = acc;
 }
-
-// Greedy argmax of the raw logits on the GPU, so a greedy step copies back 8 bytes
-// instead of 1 MB of logits. Same rule as the host loop in g4ref.c (top = 0; if
-// (y[v] > y[top]) top = v): the FIRST index holding the maximum. Each thread scans
-// a strided subset in ascending order (first max of its subset), then a tree
-// reduction keeps the larger value, or the lower index on equal values.
-// out[0] = the value (as float bits), out[1] = the index. One block of 1024 threads.
-extern "C" __global__ void __launch_bounds__(1024) argmax_dev(const float *__restrict__ y, int n,
-                                                              unsigned *__restrict__ out) {
-    __shared__ float sv[1024];
-    __shared__ int si[1024];
-    const int t = threadIdx.x;
-    float best = -__int_as_float(0x7f800000);
-    int bi = 0x7fffffff;
-    for (int i = t; i < n; i += 1024) { const float v = y[i]; if (v > best) { best = v; bi = i; } }
-    sv[t] = best; si[t] = bi;
-    __syncthreads();
-    for (int s = 512; s; s >>= 1) {
-        if (t < s) {
-            const float a = sv[t], b = sv[t + s];
-            const int ia = si[t], ib = si[t + s];
-            if (b > a || (b == a && ib < ia)) { sv[t] = b; si[t] = ib; }
-        }
-        __syncthreads();
-    }
-    if (t == 0) { out[0] = __float_as_uint(sv[0]); out[1] = (unsigned)si[0]; }
-}
