@@ -985,7 +985,8 @@ attention_range:
 .LattnR_head:
     /* khoff = (h>>2)<<8 */
     lsr w2, w21, #2
-    lsl x2, x2, #8                   /* khoff bytes */
+    mov x1, #393216                  /* Exp86: KV plane stride = CTX*256 */
+    mul x2, x2, x1                   /* kv-head plane offset */
     /* zero ATTO head: 256 B */
     movi v0.2d, #0
     stp q0, q0, [x26]
@@ -1008,28 +1009,28 @@ attention_range:
 .LattnR_score_t4:
     cmp x27, x12
     b.hs .LattnR_score_t2entry
-    add x9, x22, x27, lsl #11
+    add x9, x22, x27, lsl #8
     add x9, x9, x2
-    add x13, x9, #2048
-    add x14, x13, #2048
-    add x15, x14, #2048
+    add x13, x9, #256
+    add x14, x13, #256
+    add x15, x14, #256
     /* Exp74: prefetch the NEXT quad's 4 K rows (4 lines each, 8192B ahead) */
-    prfm pldl1keep, [x9, #8192]
-    prfm pldl1keep, [x9, #8256]
-    prfm pldl1keep, [x9, #8320]
-    prfm pldl1keep, [x9, #8384]
-    prfm pldl1keep, [x13, #8192]
-    prfm pldl1keep, [x13, #8256]
-    prfm pldl1keep, [x13, #8320]
-    prfm pldl1keep, [x13, #8384]
-    prfm pldl1keep, [x14, #8192]
-    prfm pldl1keep, [x14, #8256]
-    prfm pldl1keep, [x14, #8320]
-    prfm pldl1keep, [x14, #8384]
-    prfm pldl1keep, [x15, #8192]
-    prfm pldl1keep, [x15, #8256]
-    prfm pldl1keep, [x15, #8320]
-    prfm pldl1keep, [x15, #8384]
+    prfm pldl1keep, [x9, #1024]
+    prfm pldl1keep, [x9, #1088]
+    prfm pldl1keep, [x9, #1152]
+    prfm pldl1keep, [x9, #1216]
+    prfm pldl1keep, [x13, #1024]
+    prfm pldl1keep, [x13, #1088]
+    prfm pldl1keep, [x13, #1152]
+    prfm pldl1keep, [x13, #1216]
+    prfm pldl1keep, [x14, #1024]
+    prfm pldl1keep, [x14, #1088]
+    prfm pldl1keep, [x14, #1152]
+    prfm pldl1keep, [x14, #1216]
+    prfm pldl1keep, [x15, #1024]
+    prfm pldl1keep, [x15, #1088]
+    prfm pldl1keep, [x15, #1152]
+    prfm pldl1keep, [x15, #1216]
     mov x10, x24
     fmov s4, wzr
     fmov s5, wzr
@@ -1111,9 +1112,9 @@ attention_range:
 .LattnR_score_t2:
     cmp x27, x12
     b.hs .LattnR_score_tail
-    add x9, x22, x27, lsl #11
+    add x9, x22, x27, lsl #8
     add x9, x9, x2
-    add x13, x9, #2048
+    add x13, x9, #256
     mov x10, x24
     fmov s4, wzr
     fmov s5, wzr
@@ -1159,7 +1160,7 @@ attention_range:
 .LattnR_score_tail:
     cmp x27, x20
     b.hi .LattnR_score_done
-    add x9, x22, x27, lsl #11
+    add x9, x22, x27, lsl #8
     add x9, x9, x2
     mov x10, x24
     fmov s4, wzr
@@ -1225,17 +1226,18 @@ attention_range:
     movi v31.2d, #0
     mov x27, xzr
     lsr w3, w21, #2
-    lsl x3, x3, #8                   /* khoff (x2 dead across expf) */
+    mov x1, #393216
+    mul x3, x3, x1                   /* kv-head plane offset (x2 dead across expf) */
 .LattnR_p_t:
     ldr s2, [x25, x27, lsl #2]       /* e (stashed; bit-identical, no expf) */
     fdiv s2, s2, s10                 /* p */
-    add x9, x23, x27, lsl #11        /* VCA row */
+    add x9, x23, x27, lsl #8         /* VCA row */
     add x9, x9, x3
     /* Exp74: prefetch the V row 8 ahead (4 lines) */
-    prfm pldl1keep, [x9, #16384]
-    prfm pldl1keep, [x9, #16448]
-    prfm pldl1keep, [x9, #16512]
-    prfm pldl1keep, [x9, #16576]
+    prfm pldl1keep, [x9, #2048]
+    prfm pldl1keep, [x9, #2112]
+    prfm pldl1keep, [x9, #2176]
+    prfm pldl1keep, [x9, #2240]
     dup v2.4s, v2.s[0]
     ld1 {v0.4s}, [x9], #16
     fmla v16.4s, v2.4s, v0.4s
@@ -1423,12 +1425,19 @@ layer_forward:
     add x1, x1, x21
     adrp x2, g_pos
     ldr x2, [x2, :lo12:g_pos]
-    add x1, x1, x2, lsl #11          /* dst = KCA + (il layer) + pos*2048 */
+    add x1, x1, x2, lsl #8           /* Exp86: dst = KCA + layer + pos*256, 8 head planes */
     adrp x0, b_KF
     add x0, x0, :lo12:b_KF
-    mov x2, #64
-1:  ldp q0, q1, [x0], #32
+    mov x2, #8
+1:  mov x3, #4
+2:  ldp q0, q1, [x0], #32
+    ldp q2, q3, [x0], #32
     stp q0, q1, [x1], #32
+    stp q2, q3, [x1], #32
+    subs x3, x3, #1
+    b.ne 2b
+    add x1, x1, #0x60, lsl #12       /* next kv-head plane (+393216) ... */
+    sub x1, x1, #256                 /* ... minus the 256 B just written */
     subs x2, x2, #1
     b.ne 1b
     adrp x1, g_VCA
@@ -1436,12 +1445,19 @@ layer_forward:
     add x1, x1, x21
     adrp x2, g_pos
     ldr x2, [x2, :lo12:g_pos]
-    add x1, x1, x2, lsl #11
+    add x1, x1, x2, lsl #8
     adrp x0, b_VF
     add x0, x0, :lo12:b_VF
-    mov x2, #64
-1:  ldp q0, q1, [x0], #32
+    mov x2, #8
+1:  mov x3, #4
+2:  ldp q0, q1, [x0], #32
+    ldp q2, q3, [x0], #32
     stp q0, q1, [x1], #32
+    stp q2, q3, [x1], #32
+    subs x3, x3, #1
+    b.ne 2b
+    add x1, x1, #0x60, lsl #12
+    sub x1, x1, #256
     subs x2, x2, #1
     b.ne 1b
     /* attention (row-parallel over the 32 heads) */
@@ -3466,7 +3482,11 @@ main:
     cmp w22, #4096
     b.hs .Lusage
     b .Lfwd_id
-/* ---- batched prefill: process min(g_batch, n0-step) prompt tokens ---- */
+/* ---- batched prefill: process min(g_batch, n0-step) prompt tokens ----
+   WARNING (Exp86): this path is DEAD (main branches around it) and still assumes the old
+   KV layout [t][kv_head][64] (row stride 2048 B). attention_range and the single-token KV
+   store now use [kv_head][t][64] (plane stride 393216 B, row stride 256 B). Migrate
+   layer_forward_batch's KV store and the old `attention` before re-enabling it. */
 .Lchunk:
     cmp x25, x24
     b.hs .Lloop                      /* generation phase -> single-token path */
