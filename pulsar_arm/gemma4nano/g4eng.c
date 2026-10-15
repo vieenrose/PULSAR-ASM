@@ -420,7 +420,9 @@ static void gpu_init(void) {
             size_t grows = 0;
             for (int k = 0; k < 3 && grp[g][k]; k++) grows += grp[g][k]->dims[1];
             int gcols = (int)grp[g][0]->dims[0];
-            int kind = use_q4i && grows >= 1536 && gcols <= 6144 && grows % 32 == 0;
+            /* q4i for every group since the paired-nibble kernels (v5/b2): faster than
+               K2 also for 256-row inp_gate and 12288-column down; 12288 = Q4I_MAXCOLS */
+            int kind = use_q4i && gcols <= 12288 && grows % 32 == 0;
             if (kind) {   /* q4i: tile-interleave the whole group: [tile][block][32 rows] */
                 int nbq = gcols / 32;
                 uint8_t *nib = malloc(tot * 16); float *scl = malloc(tot * 4);
