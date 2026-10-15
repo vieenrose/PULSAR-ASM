@@ -906,8 +906,14 @@ __device__ __forceinline__ void hs_seg_step(float (*tiles)[RB * PS], float (*sac
  * K = 12288 (down, segmented): RB 4 / PD 4 / MINB 4, every row of a batch in
  * flight, 80 registers and a 12.9 KB tile ring, so 4 blocks (24 warps) are
  * resident instead of 2 (RB 8 / PD 2 / MINB 1 took 120 registers and 25.9 KB;
- * PQ1_HS3O=1 keeps it): 458 -> 407 us per call. */
-template <int WR, int TPB, int MINB, int RB, int PD, bool SM, bool SEG = false>
+ * PQ1_HS3O=1 keeps it): 458 -> 407 us per call.
+ * NT (K = 4096, default 3, PQ1_HSNT=1 is the A/B arm): the products of NT
+ * consecutive batches of the warp stay in an NT-slot tile and are summed once,
+ * by NT * RB lanes instead of RB, cutting the serial 32-FADD row reductions to
+ * one per NT batches (slot k holds batch bi - (sub - k) * stride, so no row
+ * base is kept in a register: with two held bases the kernel spilled 24 B at the
+ * 80-register cap and ran 43 % slower). hs<1> 379.7 -> 376.0 us per call. */
+template <int WR, int TPB, int MINB, int RB, int PD, bool SM, bool SEG = false, int NT = 1>
 __global__ __launch_bounds__(32 * WR * TPB, MINB)
 void pq1_gemv_hs(const uint8_t* __restrict__ w_codes,
                  const __half* __restrict__ w_scales,
@@ -918,7 +924,8 @@ void pq1_gemv_hs(const uint8_t* __restrict__ w_codes,
   constexpr int PS = G + 4;    /* tile stride: 16-byte rows, conflict-free */
   static_assert(!SEG || WR > 1, "segmented reduction needs WR > 1");
   constexpr int NBUF = SEG ? 4 : WR > 1 ? 2 : 1;
-  __shared__ __align__(16) float sh_p[TPB][NBUF][RB * PS];
+  static_assert(NT == 1 || (WR == 1 && NT * RB <= 32), "NT: single-warp rows only");
+  __shared__ __align__(16) float sh_p[TPB][NBUF][NT * RB * PS];
   __shared__ float sacc[TPB][SEG ? 4 : 1][RB];
   const int warp = (int)threadIdx.x >> 5, lane = (int)threadIdx.x & 31;
   const int team = warp / WR, wt = warp - team * WR;
@@ -974,6 +981,7 @@ void pq1_gemv_hs(const uint8_t* __restrict__ w_codes,
   for (int i = 0; i < PD; i++) { cwr[i] = __ldg(wb + i * G); wsr[i] = __ldg(sb + i * G); }
   int buf = 0;
   int jb = 0, rh1 = 0, rh2 = 0;   /* SEG: batch index, row bases of batches jb-1, jb-2 */
+  int sub = 0;                    /* NT > 1: tile slot of this batch */
   for (;;) {
     const int bnext = bi + stride;
     const int rn0 = bnext < nbatch ? min(bnext * RB, N - RB) : r0;
@@ -984,7 +992,7 @@ void pq1_gemv_hs(const uint8_t* __restrict__ w_codes,
     const uint4* wn = wq + (size_t)rn0 * G;
     const __half* sn = sq + (size_t)rn0 * G;
 #endif
-    float* P = sh_p[team][buf];
+    float* P = sh_p[team][buf] + (NT > 1 ? sub * RB * PS : 0);
 #pragma unroll
     for (int rr = 0; rr < RB; rr++) {
       const uint4 cw = cwr[rr % PD];
@@ -1014,20 +1022,48 @@ void pq1_gemv_hs(const uint8_t* __restrict__ w_codes,
     if (WR == 1) __syncwarp();
     else asm volatile("bar.sync %0, %1;" ::"r"(team + 1), "r"(WR * 32));
     if (SEG) {
-      hs_seg_step<WR, RB, PS>(sh_p[team], sacc[team], y, jb, jb, wt, lane, WR == 3 ? rh2 : rh1);
+      hs_seg_step<WR, RB, PS>(reinterpret_cast<float (*)[RB * PS]>(sh_p[team]), sacc[team], y, jb, jb, wt, lane, WR == 3 ? rh2 : rh1);
       if (bnext >= nbatch) {
         /* drain: the last WR-1 segments of the last WR-1 batches */
 #pragma unroll
         for (int d = 1; d < WR; d++) {
           asm volatile("bar.sync %0, %1;" ::"r"(team + 1), "r"(WR * 32));
           const int bl = WR - 1 - d;   /* the storing warp's batch is jb - bl */
-          hs_seg_step<WR, RB, PS>(sh_p[team], sacc[team], y, jb + d, jb, wt, lane,
+          hs_seg_step<WR, RB, PS>(reinterpret_cast<float (*)[RB * PS]>(sh_p[team]), sacc[team], y, jb + d, jb, wt, lane,
                                   bl == 2 ? rh2 : bl == 1 ? rh1 : r0);
         }
         break;
       }
       rh2 = rh1; rh1 = r0; jb++;
       buf = jb & 3;
+      bi = bnext; r0 = rn0; wb = wn; sb = sn;
+      continue;
+    }
+    if (NT > 1) {
+      if (sub < NT - 1 && bnext < nbatch) {
+        sub++;
+        bi = bnext; r0 = rn0; wb = wn; sb = sn;
+        continue;
+      }
+      /* slot k holds batch bi - (sub - k) * stride; lane sums one row of it */
+      if (lane < (sub + 1) * RB) {
+        const int k = lane / RB;
+        const int base = min((bi - (sub - k) * stride) * RB, N - RB);
+        const float4* src = reinterpret_cast<const float4*>(sh_p[team][0] + lane * PS);
+        float acc = 0.0f;
+#pragma unroll
+        for (int q = 0; q < G / 4; q++) {
+          float4 v = src[q];
+          acc = __fadd_rn(acc, v.x);
+          acc = __fadd_rn(acc, v.y);
+          acc = __fadd_rn(acc, v.z);
+          acc = __fadd_rn(acc, v.w);
+        }
+        y[base + lane - k * RB] = acc;
+      }
+      if (bnext >= nbatch) break;
+      __syncwarp();
+      sub = 0;
       bi = bnext; r0 = rn0; wb = wn; sb = sn;
       continue;
     }
@@ -1059,13 +1095,13 @@ void pq1_gemv_hs(const uint8_t* __restrict__ w_codes,
   }
 }
 
-template <int WR, int TPB, int MINB, int RB, int PD, bool SM, bool SEG = false>
+template <int WR, int TPB, int MINB, int RB, int PD, bool SM, bool SEG = false, int NT = 1>
 static int hs_launch(const uint8_t* w_codes, const __half* w_scales, const uint32_t* xpl,
                      const int* xau, float* y, int N, cudaStream_t s) {
   static int nres = 0;
   if (nres == 0) {
     int per = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, pq1_gemv_hs<WR, TPB, MINB, RB, PD, SM, SEG>,
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, pq1_gemv_hs<WR, TPB, MINB, RB, PD, SM, SEG, NT>,
                                                   32 * WR * TPB, 0);
     int dev = 0, nsm = 1;
     cudaGetDevice(&dev);
@@ -1075,7 +1111,7 @@ static int hs_launch(const uint8_t* w_codes, const __half* w_scales, const uint3
   int nbatch = (N + RB - 1) / RB;
   int nblk = (nbatch + TPB - 1) / TPB;
   if (nblk > nres) nblk = nres;
-  pq1_gemv_hs<WR, TPB, MINB, RB, PD, SM, SEG><<<nblk, 32 * WR * TPB, 0, s>>>(w_codes, w_scales, xpl,
+  pq1_gemv_hs<WR, TPB, MINB, RB, PD, SM, SEG, NT><<<nblk, 32 * WR * TPB, 0, s>>>(w_codes, w_scales, xpl,
                                                                          xau, y, N);
   return 0;
 }
@@ -1096,7 +1132,10 @@ extern "C" int pq1_gemv_hs_launch(const uint8_t* w_codes,
   if (K == 4096) {
     static int ho = -1;
     if (ho < 0) { const char* e = getenv("PQ1_HS1O"); ho = e ? atoi(e) : 0; }
+    static int nt = -1;
+    if (nt < 0) { const char* e = getenv("PQ1_HSNT"); nt = e ? atoi(e) : 3; }
     if (hv && ho) hs_launch<1, 8, 4, 6, 3, true>(w_codes, ws, xpl, xau, y, N, s);
+    else if (hv && nt == 3) hs_launch<1, HS_TPB1, HS_MINB1, HS_RB1, HS_PD1, true, false, 3>(w_codes, ws, xpl, xau, y, N, s);
     else if (hv) hs_launch<1, HS_TPB1, HS_MINB1, HS_RB1, HS_PD1, true>(w_codes, ws, xpl, xau, y, N, s);
     else hs_launch<1, 8, 4, 8, 2, false>(w_codes, ws, xpl, xau, y, N, s);
   } else if (K == 12288) {
