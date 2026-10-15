@@ -304,15 +304,12 @@ SPECS = {
 }
 
 # ---- K2-Horizon-0.9B on the Jetson Nano (Tegra X1 GPU + asm host) ----------
-# Same two ceiling prompts as the phone clips (the neural-network explainer in
-# English; the four season names in Traditional Chinese). The greedy streams
-# are the ones frozen in .auto/k2nano_golden.txt (216 steps) and
-# .auto/k2nano_golden_zh.txt (114 steps), re-run on the committed engine and
-# detokenized with the base tokenizer: the decoded text is byte-identical to
-# the phone transcripts above, which is why the responses are reused verbatim.
-# Rates are decode only, from paired runs on the Nano (`--gen N` against
-# `--gen 0`, median of 3, jetson_clocks): en 18972-3101 ms over 195 generated
-# steps = 81.4 ms/token; zh 10397-3473 ms over 88 steps = 78.7 ms/token.
+# English pane: the same ceiling prompt as the phone clip (neural-network explainer).
+# Its greedy stream is .auto/k2nano_golden.txt (216 steps), re-run on the committed
+# engine and detokenized with the base tokenizer; the text is byte-identical to the
+# phone transcript, so that response is reused verbatim. Rate is decode only, from
+# paired runs (`--gen 200` against `--gen 0`, median of 3, jetson_clocks):
+# 18972-3101 ms over 195 generated steps = 81.4 ms/token.
 _K2_EN_IDS = ("64018 2985 200 21127 542 1426 265 30066 4318 394 316 1662 37398 "
               "15 64019 64018 612 10102 200 64029 200")
 _K2_ZH_IDS = ("64018 2985 200 2226 294 3957 29181 316 43658 10627 13 1546 294 "
@@ -327,13 +324,23 @@ SPECS["k2nano-neural"] = dict(
     cmd="$ ./k2_gexp k2h_09_q4.blob " + _K2_EN_IDS + " --gen 200 --threads 1 --batch 8",
     tpl="prompt ids: " + _K2_EN_IDS + _K2_TPL,
     status="12.3 tok/s \u00b7 greedy \u00b7 Jetson Nano, 128-core Maxwell GPU + asm host")
+# zh-TW pane: the prompt itself is written in Traditional Chinese. Ceiling hunt on
+# the Nano (greedy, 19 zh-TW probes, 2026-10-15): this is the hardest one answered
+# correctly - a full sentence naming red/green/blue for light. Disclosed slips: the
+# English deliberation misquotes the prompt (drops 說) and the answer has one
+# simplified character (颜). Rate: 249 generated steps, (24760-2907) ms median of 3
+# against --gen 0 = 87.8 ms/token.
+_K2_ZH_IDS = "64018 2985 200 42520 26970 3335 14126 920 8454 10310 9036 854 64019 64018 612 10102 200 64029 200"
 SPECS["k2nano-zh"] = dict(
     SPECS["k2base-zh"],
     out="k2horizon-jetson-nano-zh-tw.gif",
     title="pulsar \u00b7 K2-Horizon-0.9B \u00b7 Jetson Nano GPU",
-    cmd="$ ./k2_gexp k2h_09_q4.blob " + _K2_ZH_IDS + " --gen 100 --threads 1 --batch 8",
+    cmd="$ ./k2_gexp k2h_09_q4.blob " + _K2_ZH_IDS + " --gen 300 --threads 1 --batch 8",
+    you="> 請說出光的三原色。",
     tpl="prompt ids: " + _K2_ZH_IDS + _K2_TPL,
-    status="12.7 tok/s \u00b7 greedy \u00b7 Jetson Nano, 128-core Maxwell GPU + asm host")
+    response='We have a conversation: The user says: "請出光的三原色". That is Chinese: "請出光的三原色". Means "Please give me the three colors of light". So the user wants the three colors of light. Likely they want the three primary colors of light: red, green, blue. Or maybe they want the three primary colors of light: red, green, blue. Or maybe they want the three colors of light in Chinese? The phrase "三原色" is "three primary colors". In Chinese, primary colors are red, green, blue. So answer: red, green, blue. Possibly also mention that these are the primary colors of light. So answer: 紅, 綠, 藍. Or maybe they want the three colors of light in English: red, green, blue. So answer accordingly.\n\nThus respond: The three primary colors of light are red, green, and blue. Possibly also mention that these are the primary colors used in photography, etc.\n\nThus answer succinctly.\n</ifm|think>\n三原色（三主要颜色）是**紅、綠、藍**。',
+    status="11.4 tok/s \u00b7 greedy \u00b7 Jetson Nano, 128-core Maxwell GPU + asm host",
+    wrap="word")
 SPECS["k2-nano"] = dict(
     out="k2horizon-jetson-nano-en-zh.gif",
     panes=("k2nano-neural", "k2nano-zh"))

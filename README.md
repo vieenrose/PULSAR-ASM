@@ -1,6 +1,6 @@
 # PULSAR-ASM: K2-Horizon-0.9B on a Jetson Nano
 
-A 0.9-billion-parameter language model running at **12.3 tokens/s decode on a
+A 0.9-billion-parameter language model running at **11-12 tokens/s decode on a
 Jetson Nano Gen1**, the 2019 4 GB board, using its 128-core Maxwell GPU. The model
 is IFM's **K2-Horizon-0.9B** (dense Llama-style decoder, GQA), quantized to Q4.
 The host side of the engine is hand-written AArch64 assembly; the GPU side is
@@ -23,28 +23,31 @@ prompts it answers correctly in each language (found by probing, see
 
 - **English:** "Explain what a neural network is in two sentences." (the seasons
   list loops and a haiku rambles under greedy decoding, so they don't qualify).
-- **Traditional Chinese:** "Name the four seasons in Traditional Chinese, only the
-  four names, no explanation." Twelve zh probes were tried; this is the longest
-  answer the base model gets right. It is an English-leaning model: it deliberates
-  in English, then answers 春 夏 秋 冬 and stops.
+- **Traditional Chinese:** 「請說出光的三原色。」 ("Name the three primary colors of
+  light."), written in Traditional Chinese. Of 19 zh-TW probes
+  (`pulsar_arm/k2horizon/eval/ZH_TW_PROMPT_CEILING_NANO.md`) it is the hardest one
+  answered correctly, and the only one answered with a full sentence:
+  三原色（三主要颜色）是紅、綠、藍。 The model is English-leaning: it deliberates in
+  English first. Two slips are kept as generated: the deliberation misquotes the
+  prompt as 請出光的三原色, and the answer contains one simplified character (颜).
 
 ```sh
 ./k2_gexp k2h_09_q4.blob 64018 2985 200 21127 542 1426 265 30066 4318 394 316 1662 37398 15 64019 64018 612 10102 200 64029 200 --gen 200 --threads 1 --batch 8   # en
-./k2_gexp k2h_09_q4.blob 64018 2985 200 2226 294 3957 29181 316 43658 10627 13 1546 294 3957 8045 13 1026 28045 15 64019 64018 612 10102 200 64029 200 --gen 100 --threads 1 --batch 8   # zh-TW
+./k2_gexp k2h_09_q4.blob 64018 2985 200 42520 26970 3335 14126 920 8454 10310 9036 854 64019 64018 612 10102 200 64029 200 --gen 300 --threads 1 --batch 8   # zh-TW
 ```
 
 How the clip was made, and what it is not:
 
 - The streams come from the committed engine on the Nano (`jetson_clocks`; GPU
-  921.6 MHz and CPU 1.479 GHz observed during decode). They match
-  `.auto/k2nano_golden.txt` (216 steps) and `.auto/k2nano_golden_zh.txt`
-  (114 steps) exactly, and were detokenized with the base tokenizer. The text is
-  identical to the phone transcripts of the same prompts, which is the expected
-  result of the bit-exact design.
+  921.6 MHz and CPU 1.479 GHz observed during decode), detokenized with the base
+  tokenizer. The English one matches `.auto/k2nano_golden.txt` (216 steps) exactly
+  and is identical to the phone transcript of the same prompt. The zh-TW one
+  (268 steps) reruns byte-identical; it is not one of the gate's goldens.
 - The status bar shows **decode-only** rates, measured as the difference between a
   `--gen N` run and a `--gen 0` run (median of 3): English 81.4 ms/token
-  (12.3 tok/s) over 195 generated steps, Chinese 78.7 ms/token (12.7 tok/s)
-  over 88 steps.
+  (12.3 tok/s) over 195 generated steps, Chinese 87.8 ms/token (11.4 tok/s) over
+  249 steps. The Chinese run is slower because it goes deeper into the context,
+  and attention grows with it.
 - The frames are rendered at a fixed cadence, **not** in real time; only the
   pacing is a liberty. The transcripts are literals in
   `pulsar_arm/tools/make_chat_gif.py`, so re-rendering can only reproduce these
@@ -56,7 +59,7 @@ How the clip was made, and what it is not:
 | | |
 |---|---|
 | Board | Jetson Nano Gen1: Tegra X1, 4x Cortex-A57, one Maxwell SM (sm_53, 128 cores), 4 GB LPDDR4 shared by CPU and GPU. L4T R32.5.1, CUDA 10.2 |
-| Decode | **12.3 tok/s** en / 12.7 tok/s zh-TW (about 80 ms/token) |
+| Decode | **12.3 tok/s** on the English demo (195 steps), 11.4 tok/s on the zh-TW demo (249 steps, deeper context) |
 | Whole-run benchmark | **11.2 tok/s** (89-90 ms/step): 216 greedy steps on the English prompt, startup and the 21-token prefill included. This is the number the repository's bench reports |
 | Prefill | token by token through the decode path, about the same speed as decode. `--gen 0` (startup plus the 21-token prompt) takes 3.1 s |
 | CPU only | 1.11 tok/s on the same board (single A57 core, `k2_core_a57.S`) |
