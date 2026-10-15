@@ -46,7 +46,7 @@ static void make_x(float *x, int n, int kind) {
 }
 static int first_diff(const float *a, const float *b, int n) { for (int i = 0; i < n; i++) if (memcmp(a + i, b + i, 4)) return i; return -1; }
 
-static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k, *fq4i;
+static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k, *fq4i, *fq6i;
 static uint64_t dWi, dSi;
 static uint64_t dW, dS, dX, dY;
 
@@ -110,6 +110,19 @@ static uint8_t *repack_q6_212(const tensor_t *t) {
     for (size_t i = 0; i < nblk; i++) memcpy(o + i * 212, t->data + i * 210, 210);
     return o;
 }
+/* q6i layout: [tile][block][chunk 0..13][32 lanes] x 16 B, blocks padded 210 -> 224 */
+static uint8_t *repack_q6i(const tensor_t *t) {
+    size_t rows = t->dims[1];
+    uint8_t *o = calloc(rows * 6, 224);
+    for (size_t r = 0; r < rows; r++) for (int b = 0; b < 6; b++) {
+        const uint8_t *src = t->data + (r * 6 + b) * 210;
+        uint8_t blk[224] = {0};
+        memcpy(blk, src, 210);
+        for (int k = 0; k < 14; k++)
+            memcpy(o + ((((r / 32) * 6 + b) * 14 + k) * 32 + (r % 32)) * 16, blk + 16 * k, 16);
+    }
+    return o;
+}
 static int test_head(void) {
     const tensor_t *t = tens("token_embd.weight");
     int cols = (int)t->dims[0], rows = (int)t->dims[1], nb = cols / 256;
@@ -152,6 +165,17 @@ static int test_head(void) {
         int d4 = first_diff(ycpu, ygpu2, rows);
         printf("  head x%d: v4 %s\n", kind, d4 < 0 ? "262144/262144 identical" : "MISMATCH");
         if (d4 >= 0) bad++;
+        {
+            static uint64_t dHi = 0;
+            if (!dHi) { uint8_t *rp = repack_q6i(t); CK(cuMemAlloc_(&dHi, (size_t)rows * 6 * 224)); CK(cuMemcpyHtoD_(dHi, rp, (size_t)rows * 6 * 224)); free(rp); }
+            void *ai[] = {&dHi, &dX, &dY, &irows2};
+            CK(cuLaunchKernel_(fq6i, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, NULL, ai, NULL));
+            CK(cuCtxSynchronize_());
+            CK(cuMemcpyDtoH_(ygpu2, dY, (size_t)rows * 4));
+            int di = first_diff(ycpu, ygpu2, rows);
+            printf("  head x%d: q6i %s\n", kind, di < 0 ? "262144/262144 identical" : "MISMATCH");
+            if (di >= 0) { bad++; printf("    q6i row %d cpu %.9g gpu %.9g\n", di, ycpu[di], ygpu2[di]); }
+        }
         printf("  head x%d: v1 %s, v2 %s  (cpu ref %.0f ms)\n", kind,
                d < 0 ? "262144/262144 identical" : "MISMATCH", d2 < 0 ? "262144/262144 identical" : "MISMATCH", t1 - t0);
         (void)t2; (void)t3;
@@ -292,6 +316,12 @@ static void perf(void) {
     double head = time_launch(fq64, (irows + 31) / 32, 32, 8, ah2);
     printf("  %-28s %6d x %-6d %7.3f ms  %5.2f GB/s\n", "head Q6_K v4", irows, 1536, head, (double)irows * 1272 / 1e9 / (head / 1e3));
     CK(cuMemFree_(dH));
+    CK(cuMemAlloc_(&dH, (size_t)irows * 6 * 224));
+    { uint8_t *rp = repack_q6i(hd); CK(cuMemcpyHtoD_(dH, rp, (size_t)irows * 6 * 224)); free(rp); }
+    void *ahi[] = {&dH, &dX, &dY, &irows};
+    double headi = time_launch(fq6i, (irows + 255) / 256, 32, 8, ahi);
+    printf("  %-28s %6d x %-6d %7.3f ms  %5.2f GB/s\n", "head Q6_K q6i", irows, 1536, headi, (double)irows * 1344 / 1e9 / (headi / 1e3));
+    CK(cuMemFree_(dH));
     /* schedule: layers 0-14 own KV (12 sliding, 3 full); 15-34 shared (16 sliding, 4 full) */
     double tot = 12 * s_att + 3 * f_att + 16 * sh_s + 4 * sh_f + 15 * mlp1 + 20 * mlp2 + 35 * pl + head;
     printf("per-token GPU GEMV estimate: %.1f ms (layers %.1f + head %.1f), %.1f tok/s ceiling from GEMVs alone\n",
@@ -315,7 +345,7 @@ int main(int argc, char **argv) {
     { FILE *f = fopen(argv[2], "rb"); if (!f) { perror(argv[2]); return 2; }
       static char ptx[1 << 20]; size_t n = fread(ptx, 1, sizeof ptx - 1, f); fclose(f); ptx[n] = 0;
       CK(cuModuleLoadData_(&m6, ptx)); }
-    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : getenv("Q4I")[0] == '2' ? "q4i_gemv2" : getenv("Q4I")[0] == '3' ? "q4i_gemv3" : "q4i_gemv4") : "q4i_gemv3")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq6i, m6, "q6i_gemv")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : getenv("Q4I")[0] == '2' ? "q4i_gemv2" : getenv("Q4I")[0] == '3' ? "q4i_gemv3" : "q4i_gemv4") : "q4i_gemv3")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
     CK(cuMemAlloc_(&dW, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dS, (size_t)2 * INTER * (H / 32) * 4));
     CK(cuMemAlloc_(&dX, sizeof XQ));
     CK(cuMemAlloc_(&dWi, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dSi, (size_t)2 * INTER * (H / 32) * 4)); CK(cuMemAlloc_(&dY, (size_t)VOCAB * 4));

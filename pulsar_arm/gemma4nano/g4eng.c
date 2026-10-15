@@ -223,7 +223,7 @@ static void gpu_head(const tensor_t *t, const uint8_t *xq, float *y) {
         stage_in(xq, (size_t)(t->dims[0] / 256) * Q8B, dX);
         void *args[] = {&dHead, &dX, &h_out_dev, &rows};
         double b_ = prof ? now_ms() : 0;
-        CK(cuLaunchKernel_(fq6, (rows + 31) / 32, 1, 1, 32, 8, 1, 0, stream, args, NULL));
+        CK(cuLaunchKernel_(fq6, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, stream, args, NULL));   /* q6i_gemv */
         wait_stream();
         double c_ = prof ? now_ms() : 0;
         copy_from_pinned(y, h_out, (size_t)rows * 4);
@@ -234,7 +234,7 @@ static void gpu_head(const tensor_t *t, const uint8_t *xq, float *y) {
     CK(cuMemcpyHtoD_(dX, xq, (size_t)(t->dims[0] / 256) * Q8B));
     void *args[] = {&dHead, &dX, &dY, &rows};
     double b_ = prof ? now_ms() : 0;
-    CK(cuLaunchKernel_(fq6, (rows + 31) / 32, 1, 1, 32, 8, 1, 0, NULL, args, NULL));
+    CK(cuLaunchKernel_(fq6, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, NULL, args, NULL));   /* q6i_gemv */
     CK(cuCtxSynchronize_());
     double c_ = prof ? now_ms() : 0;
     CK(cuMemcpyDtoH_(y, dY, (size_t)rows * 4));
@@ -294,9 +294,10 @@ static void gpu_init(void) {
         CK(cuMemHostGetDevicePointer_(&h_out_dev, h_out, 0));
     }
     CK(cuModuleLoadData_(&mk, G4_PTX_K));
-    CK(cuModuleGetFunction_(&fq6, mk, "q6k_gemv4")); CK(cuModuleGetFunction_(&ff16, mk, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&ff16, mk, "f16_gemv_t"));
     CK(cuModuleGetFunction_(&fgeglu, mk, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, mk, "q8k_dev"));
     CK(cuModuleGetFunction_(&fq4i, mk, "q4i_gemv4"));
+    CK(cuModuleGetFunction_(&fq6, mk, "q6i_gemv"));
     dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
     {   /* exp/GELU constants for geglu_dev: g4ref.c's own definitions */
         double v[24] = {EXP_P0};
@@ -362,13 +363,20 @@ static void gpu_init(void) {
             }
         }
     }
-    /* Q6_K head, blocks padded 210 -> 212 bytes (q6k_gemv4 layout) */
+    /* Q6_K head, q6i_gemv layout: rows in tiles of 32, each 210-byte block padded to
+       224 and stored as [tile][block][16-byte chunk][32 rows] (warp loads 512 B) */
     {
         const tensor_t *t = tens("token_embd.weight");
-        size_t nblk = (size_t)t->dims[1] * (t->dims[0] / 256);
-        uint8_t *rp = calloc(nblk, 212);
-        for (size_t b = 0; b < nblk; b++) memcpy(rp + b * 212, t->data + b * 210, 210);
-        dHead = dalloc(nblk * 212); CK(cuMemcpyHtoD_(dHead, rp, nblk * 212)); free(rp);
+        size_t rows = t->dims[1];
+        if (t->dims[0] != 1536 || rows % 32) { fprintf(stderr, "head shape unexpected\n"); exit(2); }
+        uint8_t *rp = calloc(rows * 6, 224);
+        for (size_t r = 0; r < rows; r++) for (int b = 0; b < 6; b++) {
+            uint8_t blk[224] = {0};
+            memcpy(blk, t->data + (r * 6 + b) * 210, 210);
+            for (int k = 0; k < 14; k++)
+                memcpy(rp + ((((r / 32) * 6 + b) * 14 + k) * 32 + (r % 32)) * 16, blk + 16 * k, 16);
+        }
+        dHead = dalloc(rows * 6 * 224); CK(cuMemcpyHtoD_(dHead, rp, rows * 6 * 224)); free(rp);
         /* not dropped: the embedding row of each token is still read on the host */
     }
     /* F16 per_layer_model_proj, transposed */

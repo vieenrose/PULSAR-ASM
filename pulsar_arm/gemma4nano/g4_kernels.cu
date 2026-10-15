@@ -562,3 +562,77 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv4(const uint4 *__restr
     }
     y[r] = acc;
 }
+
+// ------------------------------------------------------------------------------
+// Q6_K tied head, row-per-lane ("q6i"): same arithmetic as gemv_q6k_rows in
+// g4ref.c - per 256-block, isum = sum_j sc_j * sum_{t in sub-block j} (q_t-32)*a_t
+// (exact int32), then acc = fma(d_w * d_a, (float)isum, acc) over blocks in order.
+// Layout (built at load): rows in tiles of 32; for tile t, block b, the block's
+// 210 bytes (padded to 224 = 14 x 16) are stored as [chunk k = 0..13][lane 0..31]
+// x 16 B, so warp load k reads 512 contiguous bytes. A lane owns one row.
+// Values are decoded four per u32 (one ql word, one qh word -> 4 six-bit bytes);
+// the four values of a word share one sub-block. The -32 offset is applied per
+// sub-block with precomputed activation sums.
+extern "C" __global__ void __launch_bounds__(256) q6i_gemv(const uint4 *__restrict__ w,
+        const uint8_t *__restrict__ xq, float *__restrict__ y, int rows) {
+    __shared__ __align__(16) short A[1536];
+    __shared__ int SA[96];                   // 6 blocks x 16 sub-blocks
+    __shared__ float DA[6];
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = tid; i < 1536; i += 256) A[i] = (short)(int8_t)xq[(i >> 8) * 292 + 4 + (i & 255)];
+    if (tid < 6) DA[tid] = *(const float *)(xq + tid * 292);
+    __syncthreads();
+    if (tid < 96) {
+        // sub-block j of block b holds t = 128n + 32k + l with j = 8n + 2k + l/16
+        const int b = tid >> 4, j = tid & 15, n = j >> 3, k = (j >> 1) & 3, lh = j & 1;
+        int s = 0;
+        for (int l = 16 * lh; l < 16 * lh + 16; l++) s += A[b * 256 + 128 * n + 32 * k + l];
+        SA[tid] = s;
+    }
+    __syncthreads();
+    const int tile = blockIdx.x * 8 + threadIdx.y;
+    const int r = tile * 32 + threadIdx.x;
+    if (r >= rows) return;
+    const uint4 *wt = w + (size_t)tile * 6 * 14 * 32 + threadIdx.x;
+    float acc = 0.0f;
+    for (int b = 0; b < 6; b++) {
+        uint4 c[14];
+        #pragma unroll
+        for (int k = 0; k < 14; k++) c[k] = wt[((size_t)b * 14 + k) * 32];
+        const unsigned *u = (const unsigned *)c;      // the block's bytes as 56 words
+        // ql: words 0..31 (128 B), qh: words 32..47 (64 B), scales: words 48..51, d: word 52 low half
+        int p[16];
+        #pragma unroll
+        for (int j = 0; j < 16; j++) p[j] = 0;
+        const uint2 *A2 = (const uint2 *)(A + b * 256);
+        #pragma unroll
+        for (int n = 0; n < 2; n++) {
+            #pragma unroll
+            for (int lg = 0; lg < 8; lg++) {
+                const unsigned L0 = u[16 * n + lg], L1 = u[16 * n + 8 + lg], Hh = u[32 + 8 * n + lg];
+                const unsigned qk[4] = {
+                    (L0 & 0x0F0F0F0Fu) | ((Hh << 4) & 0x30303030u),
+                    (L1 & 0x0F0F0F0Fu) | ((Hh << 2) & 0x30303030u),
+                    ((L0 >> 4) & 0x0F0F0F0Fu) | (Hh & 0x30303030u),
+                    ((L1 >> 4) & 0x0F0F0F0Fu) | ((Hh >> 2) & 0x30303030u)};
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const uint2 av = A2[(128 * n + 32 * k + 4 * lg) >> 2];   // 4 int16 activations
+                    const int a0 = (int)(short)(av.x & 0xffffu), a1 = (int)av.x >> 16;
+                    const int a2 = (int)(short)(av.y & 0xffffu), a3 = (int)av.y >> 16;
+                    const unsigned q = qk[k];
+                    const int j = 8 * n + 2 * k + (lg >> 2);
+                    p[j] += (int)(q & 0xffu) * a0 + (int)((q >> 8) & 0xffu) * a1
+                          + (int)((q >> 16) & 0xffu) * a2 + (int)(q >> 24) * a3;
+                }
+            }
+        }
+        const int8_t *scb = (const int8_t *)(u + 48);
+        int s = 0;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) s += (int)scb[j] * (p[j] - 32 * SA[b * 16 + j]);
+        const float dw = __half2float(*(const __half *)(u + 52));
+        acc = __fmaf_rn(__fmul_rn(dw, DA[b]), __int2float_rn(s), acc);
+    }
+    y[r] = acc;
+}
