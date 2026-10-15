@@ -1029,3 +1029,12 @@ co-execution to break the GPU issue bound (48.4 ms bus floor).
    earlier exact 2-bit Nano path; needs the current hs/graph chain ported).
 3. N > 1 concurrent users: batched decode over N sequences (weights streamed once per step for
    all N, per-user KV caches); the batch GEMV variant in pq1_swar_sm53.cu is the starting point.
+
+## Note: why the out-of-line silu fallback (2e685da) won (nvprof metrics, pq1_parity fpl, 215 calls)
+q8k_w<2> (SNI=1) vs q8k_w<3> (SNI=0, old): inst_executed avg 53658 vs 57961 (-7.4%), max 80674 vs
+83026; IPC 2.98 vs 3.20; warp exec eff 91.0 vs 92.8%. The 31.8 -> 22.6 us win is mostly not
+executed instructions but code size (SASS 1836 -> 762: the inlined, never-taken fallback was
+evicting the hot loop from the instruction cache). Engine-side metrics are not obtainable:
+nvprof --metrics does not see kernels inside the token graph, and with PQ1_GRAPH=0 the engine
+launches no q8k_w at all (only tm_prep_w and the two hs GEMVs). The earlier job bvf8gopr1's
+"engine" numbers were in fact the par_fl (parity) half.
