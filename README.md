@@ -1,205 +1,164 @@
-# PULSAR-ASM: K2-Horizon-0.9B on a Jetson Nano
+# PULSAR-ASM: Gemma 4 E2B on a Jetson Nano
 
-A 0.9-billion-parameter language model running at **11-12 tokens/s decode on a
-Jetson Nano Gen1**, the 2019 4 GB board, using its 128-core Maxwell GPU. The model
-is IFM's **K2-Horizon-0.9B** (dense Llama-style decoder, GQA), quantized to Q4.
-The host side of the engine is hand-written AArch64 assembly; the GPU side is
-a hand-written PTX kernel driven from a small C runtime.
+Google's **Gemma 4 E2B** (text only, the QAT Q4_0 release) running at **6.2 to 6.8 tokens/s
+decode on a Jetson Nano Gen1**, the 2019 4 GB board, with its 128-core Maxwell GPU. The host
+side is C with the hot loops in hand-written AArch64 assembly; the GEMVs and the MLP chain run
+on the GPU through kernels driven directly by the CUDA driver API.
 
 | | |
 |---|---|
-| Model | `IFM/K2-Horizon-0.9B`: 28 layers, hidden 1536, intermediate 5120, 32 q-heads / 8 kv-heads, head_dim 64, vocab 64256 |
-| Weights | Q4_0-style blocks (32 weights, fp16 scale), `k2h_09_q4.blob`, 748,976,168 bytes, md5 `1b026978510f9111bb0a6a6607f3c50d` |
-| Engine | AArch64 assembly (`.auto/rescue/k2_cuda.S`) + C runtime (`pulsar_arm/k2horizon/gpu_v52/k2_gexp_engine_v52.c`) that `dlopen`s the L4T `libcuda` and JIT-loads one PTX kernel (sm_50 PTX, runs on sm_53). No CUDA toolkit, cuBLAS or Python at runtime |
-| Accuracy | every GEMV bit-identical to the engine's own scalar CPU reference; greedy streams frozen as goldens (logits to 4 decimals) and enforced by a gate on every change |
+| Model | `google/gemma-4-E2B-it-qat-q4_0-gguf`, file `gemma-4-E2B_q4_0-it.gguf`, 3,349,516,256 bytes, sha256 `fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634` |
+| Format | Google's own: layer projections Q4_0 (quantization-aware trained), token embedding / tied head and per-layer-input table Q6_K, per-layer projection F16 |
+| Engine | C + AArch64 assembly host (`pulsar_arm/gemma4nano/g4eng.c`, `g4_host.S`), GPU kernels as embedded PTX JIT-loaded by the driver. No CUDA toolkit, cuBLAS, llama.cpp or Python at runtime; links libc, libm, libdl and libgomp |
+| Accuracy | every kernel, CPU and GPU, bit-identical to the engine's own scalar reference (`g4ref.c`); greedy streams frozen as goldens and checked by `gates.sh` |
 
 ## Demo
 
-![K2-Horizon-0.9B on a Jetson Nano, English over Traditional Chinese](doc/k2horizon-jetson-nano-en-zh.gif)
+![Gemma 4 E2B on a Jetson Nano, English over Traditional Chinese](doc/gemma4-e2b-jetson-nano-en-zh.gif)
 
-Both runs are greedy and use the model's **ceiling prompts**, the hardest
-prompts it answers correctly in each language (found by probing, see
-`pulsar_arm/k2horizon/eval/ZH_CEILING.md`):
+Both runs are greedy and use **ceiling prompts**: the hardest of 16 probes the model answers
+correctly and completely (`pulsar_arm/gemma4nano/CEILING_NANO.md`):
 
-- **English:** "Explain what a neural network is in two sentences." (the seasons
-  list loops and a haiku rambles under greedy decoding, so they don't qualify).
-- **Traditional Chinese:** 「請說出光的三原色。」 ("Name the three primary colors of
-  light."), written in Traditional Chinese. Of 19 zh-TW probes
-  (`pulsar_arm/k2horizon/eval/ZH_TW_PROMPT_CEILING_NANO.md`) it is the hardest one
-  answered correctly, and the only one answered with a full sentence:
-  三原色（三主要颜色）是紅、綠、藍。 The model is English-leaning: it deliberates in
-  English first. Two slips are kept as generated: the deliberation misquotes the
-  prompt as 請出光的三原色, and the answer contains one simplified character (颜).
+- **English:** "A shirt costs $25 after a 20% discount. What was the original price? Show your
+  work." It answers $31.25 and checks it.
+- **Traditional Chinese:** 「一列火車下午3點15分出發，車程2小時50分鐘，幾點抵達？」 It answers
+  下午6點5分.
 
-```sh
-./k2_gexp k2h_09_q4.blob 64018 2985 200 21127 542 1426 265 30066 4318 394 316 1662 37398 15 64019 64018 612 10102 200 64029 200 --gen 200 --threads 1 --batch 8   # en
-./k2_gexp k2h_09_q4.blob 64018 2985 200 42520 26970 3335 14126 920 8454 10310 9036 854 64019 64018 612 10102 200 64029 200 --gen 300 --threads 1 --batch 8   # zh-TW
-```
+The probes also show where the model fails, and those failures are part of the record: the same
+train problem asked in English gets 7:05 pm (it adds the carried hour twice), the same discount
+problem asked in Chinese starts with 2500 and corrects itself only later, the haiku breaks the
+5-7-5 form, and the French translation contains wrong forms.
 
-How the clip was made, and what it is not:
-
-- The streams come from the committed engine on the Nano (`jetson_clocks`; GPU
-  921.6 MHz and CPU 1.479 GHz observed during decode), detokenized with the base
-  tokenizer. The English one matches `.auto/k2nano_golden.txt` (216 steps) exactly
-  and is identical to the phone transcript of the same prompt. The zh-TW one
-  (268 steps) reruns byte-identical; it is not one of the gate's goldens.
-- The status bar shows **decode-only** rates, measured as the difference between a
-  `--gen N` run and a `--gen 0` run (median of 3): English 81.4 ms/token
-  (12.3 tok/s) over 195 generated steps, Chinese 87.8 ms/token (11.4 tok/s) over
-  249 steps. The Chinese run is slower because it goes deeper into the context,
-  and attention grows with it.
-- The frames are rendered at a fixed cadence, **not** in real time; only the
-  pacing is a liberty. The transcripts are literals in
-  `pulsar_arm/tools/make_chat_gif.py`, so re-rendering can only reproduce these
-  frames: `python3 -I pulsar_arm/tools/make_chat_gif.py k2-nano` (Pillow and
-  ffmpeg needed).
+How the clip was made: the committed engine on the Nano; both runs rerun byte-identical
+(`pulsar_arm/gemma4nano/probes/*_steps.txt`); the text is the detokenized output up to the
+end-of-turn token, unedited (the English answer's LaTeX is shown raw, as generated). The status
+line shows the engine's own decode rate (generated steps over their wall time). Frames are
+rendered at a fixed cadence, not in real time. Re-render with
+`python3 -I pulsar_arm/tools/make_chat_gif.py g4-nano` (Pillow and ffmpeg).
 
 ## At a glance
 
 | | |
 |---|---|
-| Board | Jetson Nano Gen1: Tegra X1, 4x Cortex-A57, one Maxwell SM (sm_53, 128 cores), 4 GB LPDDR4 shared by CPU and GPU. L4T R32.5.1, CUDA 10.2 |
-| Decode | **12.3 tok/s** on the English demo (195 steps), 11.4 tok/s on the zh-TW demo (249 steps, deeper context) |
-| Whole-run benchmark | **11.2 tok/s** (89-90 ms/step): 216 greedy steps on the English prompt, startup and the 21-token prefill included. This is the number the repository's bench reports |
-| Prefill | token by token through the decode path, about the same speed as decode. `--gen 0` (startup plus the 21-token prompt) takes 3.1 s |
-| CPU only | 1.11 tok/s on the same board (single A57 core, `k2_core_a57.S`) |
-| Memory | about 850 MB peak RSS in the GPU run; context capped at 1536 positions |
-| Conditions | `--threads 1` (the GPU path is single-thread by design), greedy, one sequence |
+| Board | Jetson Nano Gen1: Tegra X1, 4x Cortex-A57, one Maxwell SM (sm_53), 4 GB LPDDR4 shared by CPU and GPU. L4T R32.5.1, CUDA 10.2 driver |
+| Decode | **6.83 tok/s** on the English gate prompt (76 steps); 6.17 and 6.56 tok/s on the demo prompts (291 and 117 steps); 5.5-6.0 tok/s at 500 steps (attention grows with context) |
+| Prefill | 6.5-7.2 tok/s, token by token through the decode path |
+| Load | 4.0-6.2 s (weights repacked and uploaded) |
+| Memory | 1,474 MB on the GPU, peak RSS 729 MB; the 1.93 GB per-layer-input table stays memory-mapped, one 7.4 KB row read per token |
+| Context | 2048 positions; KV cache only on the 15 layers that own one (the other 20 share) |
+| Clocks | not pinned (no root for `jetson_clocks`): the GPU sits at 921.6 MHz under load, the CPU governor is `schedutil`, so CPU-side timings vary by a few ms between runs |
 
 ## How it works
 
-At startup the Q4 weights are repacked once into 16-byte blocks in device memory
-(single copy, no mirror). A decoded token then costs **113 GPU launches**: per layer
-one merged q+k+v GEMV, the o projection, one merged gate+up GEMV and the down
-projection (28 x 4), plus the 64256-row output head.
+A token goes through 35 layers. Per layer:
 
-- **GPU (hand-written PTX).** One warp covers four rows. Each block of 32 Q4
-  weights is unpacked with `bfe` and multiplied against Q8_K-quantized
-  activations with `mad.lo.s32`, so the integer dots are exact. The float
-  epilogue (`fmul` of the two scales, then `fma` accumulation, blocks in order) is
-  the same arithmetic, in the same order, as the CPU scalar reference. That is what
-  makes the output bit-identical, and it means the kernel's float chain cannot be
-  reassociated.
-- **CPU (assembly).** Embedding, RMS norms, RoPE, the KV-cache store, grouped-query
-  attention with an f64 softmax sum, SwiGLU (with an `expf` that reproduces glibc's
-  bit for bit), the Q8_K activation quantizer, the argmax or sampler. Attention
-  is the largest CPU cost (about 8 ms/token); it is strictly ordered scalar
-  arithmetic too, so it was made fast by data layout and loop structure, not by
-  reassociation.
-- **Per-call driver path.** Each GEMV round trip is: the activation block is written
-  into mapped pinned memory and a tiny copy kernel moves it to the device (skipped
-  when the bytes are unchanged, which happens on a large share of calls); the GEMV kernel writes its
-  result straight into mapped pinned memory; completion is a timing-free CUDA
-  event polled by the host; the result is read back with four interleaved 64-byte
-  NEON streams, because that memory is uncached for the CPU and a plain `memcpy`
-  reads it at 0.72 GB/s. Switches: `K2XQCOPY=0`, `K2YDIRECT=0`, `K2DEDUP=0` restore
-  the older paths for A/B.
-- **Where a token goes** (about 90 ms): roughly 61 ms of GPU kernel time, 15-20 ms of
-  CPU work (attention first) and the rest driver submission and waiting. CPU and
-  GPU work barely overlap, because every GEMV output feeds the next stage.
+- **GPU** (driver API: one non-blocking stream, a timing-free event polled by the host,
+  inputs and outputs in mapped pinned memory, about 5 synchronizations per layer):
+  - the merged q+k+v GEMV, the o projection, the per-layer-input gate and projection;
+  - the **whole MLP chain in one go**: merged gate+up GEMV, GeGLU, Q8_K quantization, down
+    GEMV, with no CPU round trip in between;
+  - after the last layer, the 262,144-row Q6_K tied head.
+- **CPU, AArch64 NEON assembly** (`g4_host.S`): RMS norms, attention for all 8 query heads in
+  one pass over the single KV head (8-row transposed score tiles, p·V with 16 accumulators),
+  softmax with a two-lane double-precision `exp`, Q8_K quantization. RoPE, the per-layer-input
+  mixing and argmax are C.
 
-## Speed history
+The GPU kernels:
 
-Every step below was kept only after the golden gate passed. Same-board A/B was
-used throughout; the board drifts by a few percent from hour to hour, so only
-figures from the same job are comparable.
+| kernel | what | speed (warm GPU) |
+|---|---|---|
+| `q4i_gemv4` | Q4_0 GEMV, one row per lane, weights tile-interleaved so a warp reads 512 contiguous bytes, int16 activations in shared memory, 4-block load ring | 12.6-15.4 GB/s, 220 of 275 tensors |
+| `q4_gemv` (from the K2 engine) | Q4_0 GEMV for the shapes where it is faster (down at 12288 columns, the per-layer-input gate) | 10.5-11.3 GB/s, 55 tensors |
+| `q6i_gemv` | Q6_K head, one row per lane, four 6-bit values decoded per word | 18.0 ms per token, 19.6 GB/s |
+| `geglu_dev`, `q8k_dev` | GeGLU with the same double-precision `exp`, Q8_K quantization | part of the MLP chain |
+| `f16_gemv_t` | per-layer-input projection, weights transposed | 3.7 ms per token |
 
-| stage | tok/s (whole-run bench) |
+Where a token's ~146 ms go (English gate prompt): Q4_0 GEMVs and the MLP chain ~103 ms, head
+~19 ms, F16 projection ~4 ms, CPU stages ~20 ms.
+
+### Speed history (English gate prompt, decode)
+
+| step | tok/s |
 |---|---|
-| first GPU build (one thread per row, strided loads) | 1.19 |
-| 4-row blocking with a single-copy 16-byte repack | 3.73 |
-| event-based completion plus kernel tuning | 6.5-7.0 |
-| merged q+k+v and gate+up launches (197 to 113 per token) | 8.6 |
-| attention rewrite (interleaved score chains, register-resident accumulators, prefetch) | 10.3 |
-| NEON quantizer, contiguous per-head KV layout, 16-row transposed score block, vector divide | 11.1 |
-| 4-stream readback | 11.2 |
-| timing-free event, direct result write, copy-kernel staging | 11.2 (about 1.3-2 ms/step more by paired timing; the bench's 1 ms resolution cannot show it) |
+| first light: shared forward, one synchronous copy + launch + sync per GEMV, CPU stages in C | 3.23 |
+| merged q+k+v and gate+up launches | 3.49 |
+| K2's driver path (stream, timing-free event, mapped pinned I/O, copy kernel) | 3.97 |
+| NEON assembly: exp, GeGLU, attention scores and p·V | 4.44 |
+| MLP chain on the GPU | 4.98 |
+| attention for all 8 heads in one pass; NEON RMS norm and Q8_K | 5.1-5.3 |
+| `q4i` row-per-lane Q4_0 kernel | 5.7-5.9 |
+| `q6i` row-per-lane head (41.7 -> 18.0 ms) | 6.8-6.9 |
 
-## Limits, measured and estimated
-
-- **Measured dead ends.** Batched prefill through one `grid.z` launch gave about
-  1 % (the cost is per-slot ALU work, not launch count); whole-step CUDA graph
-  replay (0.87 tok/s), activations read straight from host memory by the GEMV
-  kernel (5x slower), a managed-memory result buffer (8 % slower), L2-only or deeper
-  attention prefetch, an 8-way score interleave and a 2-wide `expf` were all
-  measured and discarded. The record is in
-  `.auto/log.jsonl` and `.auto/ideas.md`.
-- **Estimated ceiling, not measured:** from the SASS instruction mix the GEMV kernel
-  looks ALU-issue bound (BFE and XMAD dominate; sm_53 has no `dp4a`), and removing
-  every remaining CPU and driver cost would land near 14 tok/s with this
-  arithmetic. Hardware counters are not available without root, so this is an
-  inference from the instruction mix, not a profile.
-- Prefill is not batched, so a long prompt costs about 80 ms per token.
-- Context is capped at 1536 tokens; one sequence at a time; `--threads 1` only.
-- The base model is English-leaning. Chinese answers longer than a few words loop or
-  err (`eval/ZH_CEILING.md`); the meeting-agent fine-tune
-  (`k2h_ft_q4`) runs on the same engine but is shown on the phone page.
+Tried and dropped (details in `pulsar_arm/gemma4nano/PORT_PLAN.md`): a head kernel built on
+16-bit multiplies (slower, the compiler kept the byte extracts), deeper load rings for `q4i`
+(register pressure cost more than it gained).
 
 ## Accuracy
 
-`bash .auto/measure.sh` builds on the Nano, runs four interleaved legs
-(GPU, CPU, CPU, GPU) and compares the 216-step English greedy stream with the
-golden, line by line (token ids and logits to four decimals). `bash .auto/checks.sh`
-then runs the held-out Traditional Chinese stream (114 steps) against its golden.
-At startup the engine also checks its first 8 GEMV calls against the scalar CPU
-reference ("CUDA self-test OK (8/8 bit-exact)") and falls back to the CPU path if
-they differ. None of these gates is ever overridden.
+`g4ref.c` is the scalar reference that **defines** the engine's arithmetic: activations
+quantized to Q8_K, exact integer dots with fixed-order float accumulation, float64 norms,
+softmax and GeGLU through its own `exp` (only IEEE `+ - * /` and exponent assembly, within 1
+ulp of libm), baked rope tables, greedy argmax on the raw logits. The engine runs that same
+forward pass (shared code) with its GEMVs and hot loops swapped for GPU kernels and assembly,
+each proved bit-identical:
 
-**What "bit-exact" means here.** It is bit-exact against this engine's own Q4
-scalar reference, not against the bf16 checkpoint: the weights are quantized to
-Q4 and the activations to Q8_K, so logits differ from a bf16 transformers run.
-Earlier work checked the Q4 asm engine against the scalar C reference
-(`pulsar_arm/k2horizon/fwd_k2.c`, logits included); see
-`pulsar_arm/k2horizon/HANDOFF.md`.
+- `g4host_test`: 16.8 M `exp` values, 4.2 M GeGLU values, attention at 12 window
+  configurations and both head sizes, 3.07 M RMS-norm outputs, 51,500 Q8_K blocks, all identical.
+- `g4gemv_test`: all 275 Q4_0 tensors, the full 262,144-row head and the F16 projection on three
+  activation vectors each, plus the GPU GeGLU and Q8_K kernels, all identical.
+- `gates.sh` runs both tests and checks the engine's English (97 steps) and Traditional Chinese
+  (222 steps) greedy streams against `golden_en.txt` / `golden_zh.txt`.
+
+**What "bit-exact" does not cover.** It is exact against `g4ref.c`, not against Hugging Face or
+llama.cpp. Quantizing activations to Q8_K changes the logits slightly: against a float reference
+on the same dequantized weights (`g4_np.py`, which mirrors the x86 port's HF-checked reference),
+the English answer is token-for-token identical, while the Chinese one is identical up to
+generated token 32, then takes a different but equally correct path. The contract also excludes
+non-finite inputs (NaN payloads differ between ARM and the GPU); GEMV outputs are always finite.
+
+Before anything was built, `g4_q4check.py` checked the source: all 275 Q4_0 tensors in Google's
+GGUF are byte-identical to ggml's Q4_0 quantization of the QAT bf16 checkpoint, so the GGUF is
+exactly "the QAT weights in Q4_0".
+
+## Limits
+
+- **Greedy only.** The engine has no sampler yet; the model card recommends temperature 1.0,
+  top-k 64, top-p 0.95.
+- One sequence; 2048-position context; prefill one token at a time.
+- Measured on an unpinned board: absolute numbers move a few percent between runs.
+- The model's own ceiling: multi-step arithmetic is unreliable (see the probes), long answers
+  and code often exceed 500 tokens.
 
 ## Build and run
 
-On the Nano (gcc 7.5, the L4T driver; no toolkit needed):
+On the Nano (gcc 7.5 and the L4T driver; no toolkit needed):
 
 ```sh
-cd pulsar_arm/k2horizon
-as -march=armv8-a ../../.auto/rescue/k2_cuda.S -o k2.o
-gcc -O2 -c gpu_v52/k2_gexp_engine_v52.c -o k2c.o
-gcc -nostartfiles -o k2_gexp k2.o k2c.o -ldl
+cd pulsar_arm/gemma4nano
+sh build.sh                                              # g4eng, g4gemv_test, g4host_test
+python3 -I g4_rope.py g4_rope_2048.bin 2048              # rope tables (any machine with numpy)
+sh gates.sh gemma-4-E2B_q4_0-it.gguf g4_rope_2048.bin    # all accuracy gates
+./g4eng gemma-4-E2B_q4_0-it.gguf g4_rope_2048.bin <prompt ids...> --gen N
+# prints: step <n> id_in=<id> top=<id> logit=<x.xxxx>   (logit after the 30*tanh(x/30) cap)
 ```
 
-The weights come from the published safetensors (convert on any machine):
-
-```sh
-python3 k2_convert.py <IFM-K2-Horizon-0.9B snapshot> k2h_09_q4.blob [rope tables] --q4   # see the script's docstring
-```
-
-Run (token ids in, step lines out; tokenize on another machine with the IFM
-tokenizer and chat template, which ends with `assistant\n<ifm|think>\n`):
-
-```sh
-sudo jetson_clocks
-./k2_gexp k2h_09_q4.blob <prompt ids...> --gen N --threads 1 --batch 8
-# prints: step <n> id_in=<id> top=<id> logit=<x.xxxx>
-```
-
-The CPU-only engine used as the reference leg of the bench is
-`pulsar_arm/k2horizon/k2_core_a57.S`; `pulsar_arm/k2horizon/k2_core.S` is the
-pure-assembly phone build. `bash .auto/k2nano_preflight.sh` checks that every
-asset the bench needs is in place on both machines.
+Prompt ids come from the model's `tokenizer.json` with the chat template
+`<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n` (`pulsar_arm/gemma4nano/prompts.json` has two
+examples). Switches for A/B: `G4FAST=0` (plain synchronous copies), `G4Q4I=0` (K2 kernel only),
+`G4GPUMLP=0` (MLP stages on the CPU), `G4ASM=0` (C host loops), `G4PROF=1` (per-hook timing).
+`g4_kernels.ptx` is regenerated from `g4_kernels.cu` with
+`nvcc -arch=compute_53 -ptx -fmad=false -O3` and embedded by `g4_embed_ptx.py`.
 
 ## Layout
 
 ```
-.auto/rescue/k2_cuda.S               host engine (assembly): CPU stages, loader, sampler, driver glue
-pulsar_arm/k2horizon/gpu_v52/        C runtime: libcuda via dlopen, PTX GEMV kernel, staging, completion
-pulsar_arm/k2horizon/gpu_v*/         earlier kernel generations and driver probes, kept for the record
-pulsar_arm/k2horizon/k2_core*.S      CPU-only assembly engines (Cortex-A57 and phone builds)
-pulsar_arm/k2horizon/k2_convert.py   safetensors to Q4 blob; fwd_k2.c scalar C reference; k2_oracle.py
-pulsar_arm/k2horizon/eval/           prompt probes (ceiling hunt) and fine-tune quality notes
-pulsar_arm/tools/make_chat_gif.py    demo renderer; transcripts are literals
-.auto/                               bench, gates, goldens, preflight, log.jsonl, ideas.md
-doc/                                 demo GIFs; OTHER_ENGINES.md
+pulsar_arm/gemma4nano/g4ref.c         the reference: GGUF loader, arithmetic contract, forward pass, hooks
+pulsar_arm/gemma4nano/g4eng.c         the engine: GPU upload and kernels behind the hooks, driver path
+pulsar_arm/gemma4nano/g4_host.S       AArch64 NEON host kernels; g4_hostglue.h is their C side
+pulsar_arm/gemma4nano/g4_kernels.cu   GPU kernels (q4i, q6i, GeGLU, Q8_K, F16); g4_ptx_q4.h is K2's kernel
+pulsar_arm/gemma4nano/g4*_test.c      bit-exactness tests; gates.sh, build.sh
+pulsar_arm/gemma4nano/*.py            GGUF reader, Q4_0 cross-check, dequantizer, float reference, rope tables
+pulsar_arm/gemma4nano/PORT_PLAN.md    the port's log: milestones, measurements, what was dropped and why
+doc/K2_HORIZON_JETSON_NANO.md         the K2-Horizon-0.9B Nano engine this port builds on
+doc/OTHER_ENGINES.md                  the earlier engines (Pi 4 Gemma-3, Bonsai, phone)
 ```
-
-## Other engines in this repository
-
-The repository started as pure-assembly engines for other models and boards:
-Gemma-3 on a Raspberry Pi 4 (a single static AArch64 binary with no libc), FunctionGemma,
-the C + NEON Ternary-Bonsai 8B and 27B ports, and K2-Horizon on a phone CPU.
-They still work and are documented in [doc/OTHER_ENGINES.md](doc/OTHER_ENGINES.md).
