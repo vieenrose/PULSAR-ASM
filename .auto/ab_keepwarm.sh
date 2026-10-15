@@ -13,7 +13,7 @@ for i in $(seq 1 "$N"); do
   for m in ctrl kw; do
     E=""
     [ "$m" = kw ] && E="PQ1_KEEPWARM=1 PQ1_KW_SPIN_MS=${PQ1_KW_SPIN_MS:-1} PQ1_KW_GAP=${PQ1_KW_GAP:-200}"
-    ssh -o ConnectTimeout=25 "$NANO" "cd $R && (for j in \$(seq 1 400); do cat $G; sleep 0.05; done > clk_${m}_$i.log & CP=\$!; OMP_NUM_THREADS=4 $E timeout 900 ./fwd8_q1 $MODEL '$IDS' --gen 24 > ${m}_$i.log 2>${m}_$i.err; kill \$CP 2>/dev/null; grep -m1 'BQ1TIME step=43' ${m}_$i.log >/dev/null; echo done)" >/dev/null 2>&1
+    ssh -o ConnectTimeout=25 "$NANO" "cd $R && (for j in \$(seq 1 400); do cat $G; sleep 0.05; done > clk_${m}_$i.log & CP=\$!; PQ1_KVTQ=0 OMP_NUM_THREADS=4 $E timeout 900 ./fwd8_q1 $MODEL '$IDS' --gen 24 > ${m}_$i.log 2>${m}_$i.err; kill \$CP 2>/dev/null; grep -m1 'BQ1TIME step=43' ${m}_$i.log >/dev/null; echo done)" >/dev/null 2>&1
     echo "RUN $m $i done"
   done
 done

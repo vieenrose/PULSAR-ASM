@@ -39,11 +39,11 @@ bash .auto/ab_pair.sh "PQ1_TM=0" 2   # order-balanced A/B of an env switch, N re
 bash .auto/ab_env.sh PQ1_R128 3      # simpler interleaved A/B (fixed order; ~1.6% second-arm bias, use ab_pair for <2% effects)
 ```
 
-Engine env vars reach the remote **only** through `PQ1_EXTRA="VAR=1 VAR2=0" bash .auto/measure.sh`; a bare `VAR=1 bash .auto/measure.sh` does nothing. Knobs: `PQ1_TM` (0 SWAR everywhere, 4 default shape gate, 1 all shapes), `PQ1_GRAPH=0`, `PQ1_MERGED_CAP`, `PQ1_SWAR=1`, `PQ1_R128`, `PQ1_KTIME=1|2|3` (per-shape / per-phase / API timing), `PQ1_TRACE=1`, `PQ1_STATS=1` (GPU memory line `PQ1GPU ...` at exit).
+Engine env vars reach the remote **only** through `PQ1_EXTRA="VAR=1 VAR2=0" bash .auto/measure.sh`; a bare `VAR=1 bash .auto/measure.sh` does nothing. Knobs: `PQ1_KVTQ` (K/V cache: **4 = TurboQuant 4-bit, the engine default**, 3, 43 = 4-bit K + 3-bit V, 0 = exact f16; every `.auto` script pins 0, so `PQ1_EXTRA="PQ1_KVTQ=4"` measures the shipped default), `PQ1_TM` (0 SWAR everywhere, 4 default shape gate, 1 all shapes), `PQ1_GRAPH=0`, `PQ1_MERGED_CAP`, `PQ1_SWAR=1`, `PQ1_R128`, `PQ1_KTIME=1|2|3` (per-shape / per-phase / API timing), `PQ1_TRACE=1`, `PQ1_STATS=1` (GPU memory line `PQ1GPU ...` at exit).
 
 `build_q1.sh` and the inline recipe in `measure.sh` are byte-identical by design; change compiler flags in both.
 
-The three gates, never overridable: (1) `pq1_parity` all four kernels bit-exact at K=4096 (256/256) and K=12288 (512/512); (2) greedy stream on prompt A equals `.auto/golden_q1_A.txt` (44 tokens); (3) held-out prompt B equals `.auto/golden_q1_B.txt` (26 tokens). A gate failure is information, not something to work around; the tooling auto-reverts it.
+The three gates, never overridable: (1) `pq1_parity` all four kernels bit-exact at K=4096 (256/256) and K=12288 (512/512); (2) greedy stream on prompt A equals `.auto/golden_q1_A.txt` (44 tokens); (3) held-out prompt B equals `.auto/golden_q1_B.txt` (26 tokens). Gates 2-3 run with the exact f16 cache (`PQ1_KVTQ=0`). `checks.sh` also checks the lossy TQ4 default against `.auto/golden_q1_{A,B}_tq4.txt`; regenerate those only with a recorded reason. A gate failure is information, not something to work around; the tooling auto-reverts it.
 
 ## Measurement discipline (the expensive lessons)
 

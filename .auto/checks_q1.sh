@@ -30,7 +30,7 @@ echo "checks: pq1 kernel BIT-EXACT at K=4096 (256/256) and K=12288 (512/512)"
 
 # --- 2. greedy stream goldens ------------------------------------------------
 ssh -o ConnectTimeout=25 "$NANO" \
-  "cd $R && OMP_NUM_THREADS=4 timeout 900 ./fwd8_q1 $MODEL $B_IDS --gen 10 2>/dev/null | grep '^step'" \
+  "cd $R && PQ1_KVTQ=0 OMP_NUM_THREADS=4 timeout 900 ./fwd8_q1 $MODEL $B_IDS --gen 10 2>/dev/null | grep '^step'" \
   > "$REPO/.auto/last_B.txt"
 A_TOPS=$(grep '^step' "$REPO/.auto/last_run_log.txt" | sed 's/.*top=//;s/ .*//' | grep -E '^[0-9]+$')
 B_TOPS=$(sed 's/.*top=//;s/ .*//' "$REPO/.auto/last_B.txt" | grep -E '^[0-9]+$')

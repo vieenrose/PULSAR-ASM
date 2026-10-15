@@ -35,7 +35,7 @@ for i in $(seq 1 "$N"); do
     if [ "$order" = newfirst ]; then first=kp_new; second=kp_old; label="new-first"
     else first=kp_old; second=kp_new; label="new-second"; fi
     for b in "$first" "$second"; do
-      t=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && OMP_NUM_THREADS=4 timeout 900 ./$b $MODEL '$IDS' --gen 24 2>/dev/null" \
+      t=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && PQ1_KVTQ=0 OMP_NUM_THREADS=4 timeout 900 ./$b $MODEL '$IDS' --gen 24 2>/dev/null" \
           | python3 -c "
 import re, sys
 v=[float(m.group(2)) for m in (re.match(r'BQ1TIME step=(\d+) ms=([0-9.]+)', l) for l in sys.stdin) if m and int(m.group(1))>=20]

@@ -206,15 +206,17 @@ static size_t PQ1ACUR = 0, PQ1ALIM = 0;
 static int PQ1KVS_NL = 0, PQ1KVS_NKV = 0, PQ1KVS_CTX = 0;
 /* PQ1_KVTQ=3|4|43: TurboQuant K/V cache (random sign + Walsh-Hadamard rotation,
  * Lloyd-Max codebook per coordinate, one f32 norm per row; pq1_tq_* kernels).
- * Off by default: it changes the attention values, so the goldens only hold
- * at PQ1_KVTQ=0. 43 keeps K at 4 bits and V at 3 (3.5 bits/value). Layout per run: all K/V code rows (layer, K|V, kv head, pos,
+ * ON by default at 4 bits (user decision after c4f5382: 96.0% top-1 vs f16
+ * teacher-forced over 2k tokens, -24% ms/tok at 2k context). It changes the
+ * attention values, so the bit-exact goldens only hold at PQ1_KVTQ=0, which
+ * the .auto harness pins; the TQ4 default has its own goldens. 43 keeps K at 4 bits and V at 3 (3.5 bits/value). Layout per run: all K/V code rows (layer, K|V, kv head, pos,
  * CW words), then all row scales in the same order, then the 2 nkv x 128 f16
  * staging rows that pre3 writes and pq1_tq_store encodes. */
 static int PQ1_KVTQ = -1;
 static int pq1_kvtq(void) {
   if (PQ1_KVTQ < 0) {
     const char *e = getenv("PQ1_KVTQ");
-    PQ1_KVTQ = e ? atoi(e) : 0;
+    PQ1_KVTQ = e ? atoi(e) : 4;   /* default 4-bit since c4f5382; 0 = exact f16 cache */
     if (PQ1_KVTQ != 3 && PQ1_KVTQ != 4 && PQ1_KVTQ != 43) PQ1_KVTQ = 0;
   }
   return PQ1_KVTQ;

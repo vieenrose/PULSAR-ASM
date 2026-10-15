@@ -47,7 +47,7 @@ echo "checks: pq1 kernels (swar, r128, r256, tm, hs) BIT-EXACT at K=4096 (256/25
 
 # --- 2. greedy stream goldens ------------------------------------------------
 ssh -o ConnectTimeout=25 "$NANO" \
-  "cd $R && OMP_NUM_THREADS=4 timeout 900 ./fwd8_q1 $MODEL $B_IDS --gen 10 2>/dev/null | grep '^step'" \
+  "cd $R && PQ1_KVTQ=0 OMP_NUM_THREADS=4 timeout 900 ./fwd8_q1 $MODEL $B_IDS --gen 10 2>/dev/null | grep '^step'" \
   > "$REPO/.auto/last_B.txt"
 A_TOPS=$(grep '^step' "$REPO/.auto/last_run_log.txt" | sed 's/.*top=//;s/ .*//' | grep -E '^[0-9]+$')
 B_TOPS=$(sed 's/.*top=//;s/ .*//' "$REPO/.auto/last_B.txt" | grep -E '^[0-9]+$')
@@ -69,4 +69,22 @@ if ! diff <(echo "$B_TOPS") "$REPO/.auto/golden_q1_B.txt" > /dev/null; then
   fail "held-out prompt B greedy stream differs from golden"
 fi
 echo "checks: held-out prompt B greedy stream exact ($GB/$GB)"
+
+# --- 3. the shipped default: TurboQuant 4-bit K/V cache ------------------------
+# Every run above pins PQ1_KVTQ=0 (exact f16 cache, the bit-exact reference).
+# The engine default is PQ1_KVTQ=4, which is lossy by design; its greedy
+# streams are frozen in golden_q1_{A,B}_tq4.txt (made at the commit that made
+# it the default). A regeneration needs a recorded reason in the commit.
+for P in A B; do
+  if [ $P = A ]; then IDS_P="$A_IDS"; G_P=24; else IDS_P="$B_IDS"; G_P=10; fi
+  T_TOPS=$(ssh -o ConnectTimeout=25 "$NANO" \
+    "cd $R && OMP_NUM_THREADS=4 timeout 900 ./fwd8_q1 $MODEL $IDS_P --gen $G_P 2>/dev/null | grep '^step'" 2>/dev/null |
+    sed 's/.*top=//;s/ .*//' | grep -E '^[0-9]+$')
+  GT="$REPO/.auto/golden_q1_${P}_tq4.txt"
+  if ! diff <(echo "$T_TOPS") "$GT" > /dev/null; then
+    diff <(echo "$T_TOPS") "$GT" | head -n 5
+    fail "default (PQ1_KVTQ=4) prompt $P stream differs from golden_q1_${P}_tq4"
+  fi
+  echo "checks: default TQ4 prompt $P stream matches its golden ($(wc -l < "$GT")/$(wc -l < "$GT"))"
+done
 exit 0

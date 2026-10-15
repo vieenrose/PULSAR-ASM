@@ -34,7 +34,7 @@ cat > /tmp/kv_run.sh <<EOS
 cd $R || exit 1
 for i in \$(seq 1 $N); do
   for b in old new; do
-    OMP_NUM_THREADS=4 PQ1_STATS=1 /usr/bin/time -v ./qk_\$b "$MODEL" "$IDS" --gen 24 > kv_\${b}_\$i.log 2> kv_\${b}_\$i.time
+    PQ1_KVTQ=0 OMP_NUM_THREADS=4 PQ1_STATS=1 /usr/bin/time -v ./qk_\$b "$MODEL" "$IDS" --gen 24 > kv_\${b}_\$i.log 2> kv_\${b}_\$i.time
     echo "RUN \$b \$i rc=\$?"
   done
 done

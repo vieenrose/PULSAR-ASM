@@ -26,7 +26,7 @@ ssh -o ConnectTimeout 25 "$NANO" "cd $R && export PATH=/usr/local/cuda-10.2/bin:
 # one ssh session, interleaved old/new so both see the same thermal state
 ssh -o ConnectTimeout 25 "$NANO" "cd $R && for i in 1 2; do
   for b in old new; do
-    OMP_NUM_THREADS=4 PQ1_STATS=1 ./$R/q1_$b $MODEL '$IDS' --gen 24 > ab_${b}_$i.log 2>&1
+    PQ1_KVTQ=0 OMP_NUM_THREADS=4 PQ1_STATS=1 ./$R/q1_$b $MODEL '$IDS' --gen 24 > ab_${b}_$i.log 2>&1
     echo \"RUN \$b \$i rc=\$?\"
   done
 done" 2>&1

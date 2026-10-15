@@ -28,7 +28,7 @@ IDS="151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 624 151645
 cd "$R" || exit 1
 for i in 1 2 3; do
   for b in old new; do
-    OMP_NUM_THREADS=4 PQ1_STATS=1 /usr/bin/time -v "./q1_$b" "$MODEL" "$IDS" --gen 24 > "rs_${b}_$i.log" 2> "rs_${b}_$i.time"
+    PQ1_KVTQ=0 OMP_NUM_THREADS=4 PQ1_STATS=1 /usr/bin/time -v "./q1_$b" "$MODEL" "$IDS" --gen 24 > "rs_${b}_$i.log" 2> "rs_${b}_$i.time"
     echo "RUN $b $i rc=$?"
   done
 done
