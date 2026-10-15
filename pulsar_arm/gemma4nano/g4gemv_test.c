@@ -46,7 +46,7 @@ static void make_x(float *x, int n, int kind) {
 }
 static int first_diff(const float *a, const float *b, int n) { for (int i = 0; i < n; i++) if (memcmp(a + i, b + i, 4)) return i; return -1; }
 
-static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k, *fq4i, *fq6i, *fq4ib, *fq6ib, *fgeglub, *fargb, *fasc, *fapv;
+static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k, *fq4i, *fq6i, *fq4ib, *fq6ib, *fgeglub, *fargb, *fasc, *fapv, *ff162, *ff16b;
 static uint64_t dWi, dSi, dSh;   /* q4i nibbles; scales f32 (v1-v4, b) and fp16 (v5, b2) */
 static uint64_t dW, dS, dX, dY;
 
@@ -407,6 +407,47 @@ static int test_f16(void) {
         int d = first_diff(ycpu, ygpu, rows);
         printf("  per_layer_model_proj x%d: %s\n", kind, d < 0 ? "8960/8960 rows identical" : "MISMATCH");
         if (d >= 0) { bad++; printf("    row %d cpu %.9g gpu %.9g\n", d, ycpu[d], ygpu[d]); }
+        void *a2[] = {&dT, &dXf, &dY, &irows, &icols};
+        CK(cuLaunchKernel_(ff162, (rows / 2 + 255) / 256, 1, 1, 256, 1, 1, (unsigned)cols * 4, NULL, a2, NULL));
+        CK(cuCtxSynchronize_());
+        CK(cuMemcpyDtoH_(ygpu, dY, (size_t)rows * 4));
+        d = first_diff(ycpu, ygpu, rows);
+        if (d >= 0) { bad++; printf("    f16_gemv_t2 row %d cpu %.9g gpu %.9g\n", d, ycpu[d], ygpu[d]); }
+    }
+    {   /* batched: 8 tokens (and 5, partial), each against gemv_f16 */
+        static float xb[8 * H], yb[8 * NL * PLE];
+        uint64_t dXb; CK(cuMemAlloc_(&dXb, sizeof xb));
+        for (int B = 8; B >= 5; B -= 3) {
+            for (int b = 0; b < B; b++) make_x(xb + b * cols, cols, b % 3);
+            CK(cuMemcpyHtoD_(dXb, xb, (size_t)B * cols * 4));
+            int irows = rows, icols = cols, ib = B;
+            void *a[] = {&dT, &dXb, &dY, &irows, &icols, &ib};
+            CK(cuLaunchKernel_(ff16b, (rows / 2 + 255) / 256, 1, 1, 256, 1, 1, 0, NULL, a, NULL));
+            CK(cuCtxSynchronize_());
+            CK(cuMemcpyDtoH_(yb, dY, (size_t)B * rows * 4));
+            for (int b = 0; b < B; b++) {
+                gemv_f16(t, xb + b * cols, ycpu);
+                int d = first_diff(ycpu, yb + (size_t)b * rows, rows);
+                if (d >= 0) { bad++; printf("    f16_gemv_tb B %d token %d row %d\n", B, b, d); }
+            }
+        }
+        printf("  f16_gemv_t2 + f16_gemv_tb (8 and 5 tokens): %s\n", bad ? "MISMATCH" : "identical");
+        if (getenv("F16PERF")) {
+            int irows = rows, icols = cols, ib = 8;
+            void *a1[] = {&dT, &dXf, &dY, &irows, &icols};
+            void *a[] = {&dT, &dXb, &dY, &irows, &icols, &ib};
+            for (int rep = 0; rep < 2; rep++) {
+                double t0 = now_ms();
+                for (int i = 0; i < 20; i++) CK(cuLaunchKernel_(ff16, (rows + 127) / 128, 1, 1, 128, 1, 1, 0, NULL, a1, NULL));
+                CK(cuCtxSynchronize_()); double t1 = now_ms();
+                for (int i = 0; i < 20; i++) CK(cuLaunchKernel_(ff162, (rows / 2 + 255) / 256, 1, 1, 256, 1, 1, (unsigned)cols * 4, NULL, a1, NULL));
+                CK(cuCtxSynchronize_()); double t2 = now_ms();
+                for (int i = 0; i < 20; i++) CK(cuLaunchKernel_(ff16b, (rows / 2 + 255) / 256, 1, 1, 256, 1, 1, 0, NULL, a, NULL));
+                CK(cuCtxSynchronize_()); double t3 = now_ms();
+                printf("  f16 time: v1 %.3f ms, t2 %.3f ms, tb %.3f ms per 8 tokens (%.3f per token)\n", (t1 - t0) / 20, (t2 - t1) / 20, (t3 - t2) / 20, (t3 - t2) / 160);
+            }
+        }
+        CK(cuMemFree_(dXb));
     }
     CK(cuMemFree_(dT)); CK(cuMemFree_(dXf)); free(wt);
     return bad;
@@ -552,7 +593,7 @@ int main(int argc, char **argv) {
     { FILE *f = fopen(argv[2], "rb"); if (!f) { perror(argv[2]); return 2; }
       static char ptx[1 << 20]; size_t n = fread(ptx, 1, sizeof ptx - 1, f); fclose(f); ptx[n] = 0;
       CK(cuModuleLoadData_(&m6, ptx)); }
-    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq6i, m6, "q6i_gemv")); CK(cuModuleGetFunction_(&fq4ib, m6, getenv("Q4B1") ? "q4i_gemv_b" : "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fq6ib, m6, "q6i_gemv_b")); CK(cuModuleGetFunction_(&fgeglub, m6, "geglu_b")); CK(cuModuleGetFunction_(&fargb, m6, "argmax_b")); CK(cuModuleGetFunction_(&fasc, m6, "attn_scores")); CK(cuModuleGetFunction_(&fapv, m6, "attn_softmax_pv")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : getenv("Q4I")[0] == '2' ? "q4i_gemv2" : getenv("Q4I")[0] == '3' ? "q4i_gemv3" : getenv("Q4I")[0] == '5' ? "q4i_gemv5" : "q4i_gemv4") : "q4i_gemv5")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq6i, m6, "q6i_gemv")); CK(cuModuleGetFunction_(&fq4ib, m6, getenv("Q4B1") ? "q4i_gemv_b" : "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fq6ib, m6, "q6i_gemv_b")); CK(cuModuleGetFunction_(&fgeglub, m6, "geglu_b")); CK(cuModuleGetFunction_(&fargb, m6, "argmax_b")); CK(cuModuleGetFunction_(&fasc, m6, "attn_scores")); CK(cuModuleGetFunction_(&ff162, m6, "f16_gemv_t2")); CK(cuModuleGetFunction_(&ff16b, m6, "f16_gemv_tb")); CK(cuModuleGetFunction_(&fapv, m6, "attn_softmax_pv")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : getenv("Q4I")[0] == '2' ? "q4i_gemv2" : getenv("Q4I")[0] == '3' ? "q4i_gemv3" : getenv("Q4I")[0] == '5' ? "q4i_gemv5" : "q4i_gemv4") : "q4i_gemv5")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
     CK(cuMemAlloc_(&dW, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dS, (size_t)2 * INTER * (H / 32) * 4));
     CK(cuMemAlloc_(&dX, sizeof XQ));
     CK(cuMemAlloc_(&dWi, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dSi, (size_t)2 * INTER * (H / 32) * 4)); CK(cuMemAlloc_(&dSh, (size_t)2 * INTER * (H / 32) * 2)); CK(cuMemAlloc_(&dY, (size_t)VOCAB * 4));

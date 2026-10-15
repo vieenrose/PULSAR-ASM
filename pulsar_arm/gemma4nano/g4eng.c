@@ -45,7 +45,7 @@ static CUresult (*cuMemHostGetDevicePointer_)(uint64_t *, void *, unsigned);
 static void *sym(void *h, const char *n) { void *p = dlsym(h, n); if (!p) { fprintf(stderr, "no %s\n", n); exit(3); } return p; }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
-static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i, *fq4ib, *fgeglub, *fargb, *fq6ib, *fasc, *fapv;
+static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i, *fq4ib, *fgeglub, *fargb, *fq6ib, *fasc, *fapv, *ff162, *ff16b;
 /* decode attention on the GPU: device copies of the kv caches (rows [0, dsync[i]) valid),
    sized for the run's positions (G_CAP) */
 static uint64_t dKC[FIRST_SHARED], dVC[FIRST_SHARED], dQa, dSa, dOa;
@@ -316,6 +316,22 @@ static void gpu_head_b(const tensor_t *emb, const uint8_t *xq, int xs, int B, in
     if (prof) { double d_ = now_ms(); P_h2d[1] += b_ - a_; P_k[1] += c_ - b_; P_d2h[1] += d_ - c_; P_n[1]++; }
 }
 
+/* per_layer_model_proj for B prompt tokens: f16_gemv_tb reads each weight once */
+static void gpu_f16_b(const tensor_t *t, const float *x, float *y, int B) {
+    int rows = (int)t->dims[1], cols = (int)t->dims[0];
+    if (!fast || B > 8 || (size_t)B * cols * 4 > 65536) { f16_b_seq(t, x, y, B); return; }
+    double a_ = prof ? now_ms() : 0;
+    stage_in(x, (size_t)B * cols * 4, dX);
+    int ib = B;
+    void *a[] = {&dF16, &dX, &h_out_dev, &rows, &cols, &ib};
+    double b_ = prof ? now_ms() : 0;
+    CK(cuLaunchKernel_(ff16b, (rows / 2 + 255) / 256, 1, 1, 256, 1, 1, 0, stream, a, NULL));
+    wait_stream();
+    double c_ = prof ? now_ms() : 0;
+    copy_from_pinned(y, h_out, (size_t)B * rows * 4);
+    if (prof) { double d_ = now_ms(); P_h2d[2] += b_ - a_; P_k[2] += c_ - b_; P_d2h[2] += d_ - c_; P_n[2]++; }
+}
+
 /* ---------------------------------------------------------------- hooks */
 static void gpu_q4(const tensor_t *t, const uint8_t *xq, float *y) {
     int i = (int)(t - T);
@@ -405,7 +421,8 @@ static void gpu_f16(const tensor_t *t, const float *x, float *y) {
         stage_in(x, (size_t)cols * 4, dXf);
         void *args[] = {&dF16, &dXf, &h_out_dev, &rows, &cols};
         double b_ = prof ? now_ms() : 0;
-        CK(cuLaunchKernel_(ff16, (rows + 127) / 128, 1, 1, 128, 1, 1, 0, stream, args, NULL));
+        /* f16_gemv_t2: two rows per thread (half2), x in shared memory; same chains */
+        CK(cuLaunchKernel_(ff162, (rows / 2 + 255) / 256, 1, 1, 256, 1, 1, (unsigned)cols * 4, stream, args, NULL));
         wait_stream();
         double c_ = prof ? now_ms() : 0;
         copy_from_pinned(y, h_out, (size_t)rows * 4);
@@ -458,6 +475,7 @@ static void gpu_init(void) {
     CK(cuModuleGetFunction_(&fq6, mk, "q6i_gemv"));
     CK(cuModuleGetFunction_(&fq4ib, mk, "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fgeglub, mk, "geglu_b"));
     CK(cuModuleGetFunction_(&fargb, mk, "argmax_b")); CK(cuModuleGetFunction_(&fq6ib, mk, "q6i_gemv_b"));
+    CK(cuModuleGetFunction_(&ff162, mk, "f16_gemv_t2")); CK(cuModuleGetFunction_(&ff16b, mk, "f16_gemv_tb"));
     CK(cuModuleGetFunction_(&fasc, mk, "attn_scores")); CK(cuModuleGetFunction_(&fapv, mk, "attn_softmax_pv"));
     dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
     dYdevB = dalloc((size_t)BATCH_MAX * 4 * INTER * 4); dHdevB = dalloc((size_t)BATCH_MAX * 2 * INTER * 4);
@@ -572,7 +590,7 @@ static void gpu_init(void) {
     fprintf(stderr, "GPU: %d Q4_0 tensors + Q6_K head + F16 proj, %.1f MB on device, %.0f MB free of %.0f; load %.0f ms\n",
             nq4, dev_bytes / 1048576.0, fr / 1048576.0, tot / 1048576.0, now_ms() - t0);
     G_Q4 = gpu_q4; G_Q4N = gpu_q4n; G_HEAD = gpu_head; G_F16 = gpu_f16;
-    G_Q4N_B = gpu_q4n_b; G_MLP_B = gpu_mlp_b; G_HEAD_B = gpu_head_b;
+    G_Q4N_B = gpu_q4n_b; G_MLP_B = gpu_mlp_b; G_HEAD_B = gpu_head_b; G_F16_B = gpu_f16_b;
     if (gpu_attn) { G_ATTNO = gpu_attno; pf_on = 0; }
     if (!(getenv("G4GPUMLP") && getenv("G4GPUMLP")[0] == '0')) { G_MLP = gpu_mlp; fprintf(stderr, "MLP: on the GPU (gate+up, GeGLU, Q8_K, down)\n"); }
     /* G4ASM=0 keeps the C host loops (A/B and fallback) */

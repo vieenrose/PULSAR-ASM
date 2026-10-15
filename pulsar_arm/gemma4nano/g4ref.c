@@ -535,7 +535,7 @@ static int TOPI[BATCH_MAX];
 static float TOPV[BATCH_MAX];
 static float XSB[BATCH_MAX][H], PINB[BATCH_MAX][NL * PLE], QBB[BATCH_MAX][NH * HD_F], KBB[BATCH_MAX][HD_F],
              VBB[BATCH_MAX][HD_F], ABB[BATCH_MAX][NH * HD_F], HBB[BATCH_MAX][H], PLEGB[BATCH_MAX][PLE],
-             PROJB[NL * PLE], ROWEB[NL * PLE];
+             ROWEB[NL * PLE];
 static uint8_t XQB[BATCH_MAX * (NH * HD_F / 256) * Q8B];
 /* n tensors sharing each token's quantized input; token t's input at xq + t*xs, its
    output for tensor k at ys[k] + t * rows_k */
@@ -564,6 +564,12 @@ static void head_b_seq(const tensor_t *emb, const uint8_t *xq, int xs, int B, in
     }
 }
 static void (*G_HEAD_B)(const tensor_t *, const uint8_t *, int, int, int) = head_b_seq;
+/* F16 GEMV for B tokens: x token t at x + t*cols, y token t at y + t*rows */
+static void f16_b_seq(const tensor_t *w, const float *x, float *y, int B) {
+    for (int t = 0; t < B; t++) G_F16(w, x + (size_t)t * w->dims[0], y + (size_t)t * w->dims[1]);
+}
+static void (*G_F16_B)(const tensor_t *, const float *, float *, int) = f16_b_seq;
+static float PROJBB[BATCH_MAX][NL * PLE];
 
 static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int B, int keep) {
     const tensor_t *emb = tens("token_embd.weight");
@@ -572,11 +578,14 @@ static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int
         float *xt = XSB[t];
         row_q6k(emb, toks[t], xt);
         for (int i = 0; i < H; i++) xt[i] = (float)((double)xt[i] * sqrt(1536.0));
-        G_F16(tens("per_layer_model_proj.weight"), xt, PROJB);
+    }
+    G_F16_B(tens("per_layer_model_proj.weight"), XSB[0], PROJBB[0], B);
+    for (int t = 0; t < B; t++) {
+        const float *PROJB_t = PROJBB[t];
         row_q6k(tens("per_layer_token_embd.weight"), toks[t], ROWEB);
         for (int l = 0; l < NL; l++) {
             double sl[PLE], ss = 0;
-            for (int i = 0; i < PLE; i++) { sl[i] = (double)PROJB[l * PLE + i] * (1.0 / sqrt(1536.0)); ss += sl[i] * sl[i]; }
+            for (int i = 0; i < PLE; i++) { sl[i] = (double)PROJB_t[l * PLE + i] * (1.0 / sqrt(1536.0)); ss += sl[i] * sl[i]; }
             double r = sqrt(ss / PLE + EPS);
             for (int i = 0; i < PLE; i++) {
                 double nrm = sl[i] / r * (double)pnw[i];

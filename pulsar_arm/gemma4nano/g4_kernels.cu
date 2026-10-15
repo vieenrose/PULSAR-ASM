@@ -953,6 +953,61 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__rest
     for (int t = 0; t < BMAX; t++) if (t < B) y[(size_t)t * ystride + r] = acc[t];
 }
 
+// f16_gemv_t2: f16_gemv_t with two adjacent rows per thread (one half2 load per k
+// covers both: a warp reads 128 contiguous bytes) and x staged in shared memory.
+// Each row keeps f16_gemv_t's chain: acc = fma(w[k][r], x[k], acc), k ascending.
+// rows must be even.
+extern "C" __global__ void __launch_bounds__(256) f16_gemv_t2(const __half2 *__restrict__ wt,
+        const float *__restrict__ x, float *__restrict__ y, int rows, int cols) {
+    extern __shared__ float xs[];
+    for (int k = threadIdx.x; k < cols; k += 256) xs[k] = x[k];
+    __syncthreads();
+    const int p = blockIdx.x * 256 + threadIdx.x, hr = rows >> 1;   // p: row pair
+    if (p >= hr) return;
+    float a0 = 0.0f, a1 = 0.0f;
+    #pragma unroll 8
+    for (int k = 0; k < cols; k++) {
+        const float2 w = __half22float2(wt[(size_t)k * hr + p]);
+        a0 = __fmaf_rn(w.x, xs[k], a0);
+        a1 = __fmaf_rn(w.y, xs[k], a1);
+    }
+    y[2 * p] = a0; y[2 * p + 1] = a1;
+}
+// f16_gemv_tb: f16_gemv_t2 for B <= 8 tokens (x: token t at x + t*cols, y: token t at
+// y + t*rows); x staged 512 columns at a time; slots t >= B run on zeros, never stored
+#define F16B_KC 512
+extern "C" __global__ void __launch_bounds__(256) f16_gemv_tb(const __half2 *__restrict__ wt,
+        const float *__restrict__ x, float *__restrict__ y, int rows, int cols, int B) {
+    __shared__ float xs[BMAX * F16B_KC];
+    const int p = blockIdx.x * 256 + threadIdx.x, hr = rows >> 1;
+    float a0[BMAX], a1[BMAX];
+    #pragma unroll
+    for (int t = 0; t < BMAX; t++) { a0[t] = 0.0f; a1[t] = 0.0f; }
+    for (int c0 = 0; c0 < cols; c0 += F16B_KC) {
+        const int kc = min(F16B_KC, cols - c0);
+        __syncthreads();
+        for (int i = threadIdx.x; i < BMAX * F16B_KC; i += 256) {
+            const int t = i / F16B_KC, k = i % F16B_KC;
+            xs[i] = (t < B && k < kc) ? x[(size_t)t * cols + c0 + k] : 0.0f;
+        }
+        __syncthreads();
+        if (p < hr) {
+            for (int k = 0; k < kc; k++) {
+                const float2 w = __half22float2(wt[(size_t)(c0 + k) * hr + p]);
+                #pragma unroll
+                for (int t = 0; t < BMAX; t++) {
+                    a0[t] = __fmaf_rn(w.x, xs[t * F16B_KC + k], a0[t]);
+                    a1[t] = __fmaf_rn(w.y, xs[t * F16B_KC + k], a1[t]);
+                }
+            }
+        }
+    }
+    if (p < hr) {
+        #pragma unroll
+        for (int t = 0; t < BMAX; t++) if (t < B) { y[(size_t)t * rows + 2 * p] = a0[t]; y[(size_t)t * rows + 2 * p + 1] = a1[t]; }
+    }
+}
+
 // GeGLU for B tokens: y is [token][gate (n) | up (n)], h is [token][n].
 extern "C" __global__ void geglu_b(const float *__restrict__ y, float *__restrict__ h,
                                    int n, int B, const double *__restrict__ tab) {
