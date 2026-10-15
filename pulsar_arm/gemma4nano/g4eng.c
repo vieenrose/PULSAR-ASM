@@ -45,7 +45,12 @@ static CUresult (*cuMemHostGetDevicePointer_)(uint64_t *, void *, unsigned);
 static void *sym(void *h, const char *n) { void *p = dlsym(h, n); if (!p) { fprintf(stderr, "no %s\n", n); exit(3); } return p; }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
-static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i;
+static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i, *fargmax;
+/* greedy steps: the head's argmax is computed on the GPU (argmax_dev, same first-max
+   rule as the host loop); only index and raw value come back. G4GPUARGMAX=0 disables. */
+static int gpu_argmax = 1, top_valid;
+static int top_idx;
+static float top_val;
 /* per tensor: 0 = K2 q4_gemv layout, 1 = q4i_gemv3 (q4i_gemv4: row-per-lane, tile-interleaved).
    Chosen per weight group at load: q4i where it measured faster (>= 1536 rows and
    <= 6144 columns), K2 elsewhere (k/v alone, inp_gate, down at 12288 columns). */
@@ -218,6 +223,23 @@ static void gpu_q4n(int n, const tensor_t **ts, const uint8_t *xq, float **ys) {
 }
 static void gpu_head(const tensor_t *t, const uint8_t *xq, float *y) {
     int rows = (int)t->dims[1];
+    top_valid = 0;
+    if (fast && gpu_argmax && !SMP.on) {
+        double a_ = prof ? now_ms() : 0;
+        stage_in(xq, (size_t)(t->dims[0] / 256) * Q8B, dX);
+        void *args[] = {&dHead, &dX, &dY, &rows};
+        double b_ = prof ? now_ms() : 0;
+        CK(cuLaunchKernel_(fq6, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, stream, args, NULL));   /* q6i_gemv */
+        void *aa[] = {&dY, &rows, &h_out_dev};
+        CK(cuLaunchKernel_(fargmax, 1, 1, 1, 1024, 1, 1, 0, stream, aa, NULL));
+        wait_stream();
+        double c_ = prof ? now_ms() : 0;
+        unsigned r2[2]; memcpy(r2, h_out, 8);
+        memcpy(&top_val, &r2[0], 4); top_idx = (int)r2[1]; top_valid = 1;
+        y[top_idx] = top_val;   /* the only logit a greedy step reads */
+        if (prof) { double d_ = now_ms(); P_h2d[1] += b_ - a_; P_k[1] += c_ - b_; P_d2h[1] += d_ - c_; P_n[1]++; }
+        return;
+    }
     if (fast) {
         double a_ = prof ? now_ms() : 0;
         stage_in(xq, (size_t)(t->dims[0] / 256) * Q8B, dX);
@@ -298,6 +320,8 @@ static void gpu_init(void) {
     CK(cuModuleGetFunction_(&fgeglu, mk, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, mk, "q8k_dev"));
     CK(cuModuleGetFunction_(&fq4i, mk, "q4i_gemv4"));
     CK(cuModuleGetFunction_(&fq6, mk, "q6i_gemv"));
+    CK(cuModuleGetFunction_(&fargmax, mk, "argmax_dev"));
+    gpu_argmax = !(getenv("G4GPUARGMAX") && getenv("G4GPUARGMAX")[0] == '0');
     dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
     {   /* exp/GELU constants for geglu_dev: g4ref.c's own definitions */
         double v[24] = {EXP_P0};
@@ -430,7 +454,8 @@ int main(int argc, char **argv) {
         double t0 = now_ms();
         forward(tok, pos);
         int top = 0;
-        for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
+        if (top_valid) top = top_idx;
+        else for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
         int next = (SMP.on && pos + 1 >= n) ? sample_next(logits) : top;
         double dt = now_ms() - t0;
         if (pos < n_prompt) tp += dt; else tg += dt;

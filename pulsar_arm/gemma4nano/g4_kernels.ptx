@@ -22,6 +22,8 @@
 // _ZZ8q6i_gemvE1A has been demoted
 // _ZZ8q6i_gemvE2SA has been demoted
 // _ZZ8q6i_gemvE2DA has been demoted
+// _ZZ10argmax_devE2sv has been demoted
+// _ZZ10argmax_devE2si has been demoted
 .extern .shared .align 1 .b8 smem[];
 
 .visible .entry q6k_gemv(
@@ -6765,6 +6767,355 @@ BB11_25:
 	st.global.f32 	[%rd31], %f9;
 
 BB11_27:
+	ret;
+}
+
+	// .globl	argmax_dev
+.visible .entry argmax_dev(
+	.param .u64 argmax_dev_param_0,
+	.param .u32 argmax_dev_param_1,
+	.param .u64 argmax_dev_param_2
+)
+.maxntid 1024, 1, 1
+{
+	.reg .pred 	%p<65>;
+	.reg .f32 	%f<53>;
+	.reg .b32 	%r<74>;
+	.reg .b64 	%rd<16>;
+	// demoted variable
+	.shared .align 4 .b8 _ZZ10argmax_devE2sv[4096];
+	// demoted variable
+	.shared .align 4 .b8 _ZZ10argmax_devE2si[4096];
+
+	ld.param.u64 	%rd6, [argmax_dev_param_0];
+	ld.param.u32 	%r34, [argmax_dev_param_1];
+	ld.param.u64 	%rd5, [argmax_dev_param_2];
+	cvta.to.global.u64 	%rd1, %rd6;
+	mov.u32 	%r1, %tid.x;
+	mov.f32 	%f52, 0fFF800000;
+	mov.u32 	%r73, 2147483647;
+	setp.ge.s32	%p1, %r1, %r34;
+	@%p1 bra 	BB12_10;
+
+	add.s32 	%r38, %r34, -1;
+	sub.s32 	%r39, %r38, %r1;
+	shr.u32 	%r40, %r39, 10;
+	add.s32 	%r2, %r40, 1;
+	and.b32  	%r3, %r2, 3;
+	setp.eq.s32	%p2, %r3, 0;
+	mov.f32 	%f52, 0f00000000;
+	mov.u32 	%r73, 0;
+	mov.f32 	%f49, 0fFF800000;
+	mov.u32 	%r69, 2147483647;
+	mov.u32 	%r71, %r1;
+	@%p2 bra 	BB12_7;
+
+	setp.eq.s32	%p3, %r3, 1;
+	mov.f32 	%f48, 0fFF800000;
+	mov.u32 	%r67, 2147483647;
+	mov.u32 	%r66, %r1;
+	@%p3 bra 	BB12_6;
+
+	setp.eq.s32	%p4, %r3, 2;
+	mov.f32 	%f47, 0fFF800000;
+	mov.u32 	%r65, 2147483647;
+	mov.u32 	%r64, %r1;
+	@%p4 bra 	BB12_5;
+
+	mul.wide.s32 	%rd7, %r1, 4;
+	add.s64 	%rd8, %rd1, %rd7;
+	ld.global.nc.f32 	%f36, [%rd8];
+	setp.gt.f32	%p5, %f36, 0fFF800000;
+	selp.f32	%f47, %f36, 0fFF800000, %p5;
+	selp.b32	%r65, %r1, 2147483647, %p5;
+	add.s32 	%r64, %r1, 1024;
+
+BB12_5:
+	mul.wide.s32 	%rd9, %r64, 4;
+	add.s64 	%rd10, %rd1, %rd9;
+	ld.global.nc.f32 	%f37, [%rd10];
+	setp.gt.f32	%p6, %f37, %f47;
+	selp.f32	%f48, %f37, %f47, %p6;
+	selp.b32	%r67, %r64, %r65, %p6;
+	add.s32 	%r66, %r64, 1024;
+
+BB12_6:
+	mul.wide.s32 	%rd11, %r66, 4;
+	add.s64 	%rd12, %rd1, %rd11;
+	ld.global.nc.f32 	%f38, [%rd12];
+	setp.gt.f32	%p7, %f38, %f48;
+	selp.f32	%f49, %f38, %f48, %p7;
+	selp.b32	%r69, %r66, %r67, %p7;
+	add.s32 	%r71, %r66, 1024;
+	mov.u32 	%r73, %r69;
+	mov.f32 	%f52, %f49;
+
+BB12_7:
+	setp.lt.u32	%p8, %r2, 4;
+	@%p8 bra 	BB12_10;
+
+	mul.wide.s32 	%rd13, %r71, 4;
+	add.s64 	%rd15, %rd1, %rd13;
+	mov.u32 	%r73, %r69;
+	mov.f32 	%f52, %f49;
+
+BB12_9:
+	ld.global.nc.f32 	%f39, [%rd15];
+	setp.gt.f32	%p9, %f39, %f52;
+	selp.f32	%f40, %f39, %f52, %p9;
+	selp.b32	%r43, %r71, %r73, %p9;
+	ld.global.nc.f32 	%f41, [%rd15+4096];
+	setp.gt.f32	%p10, %f41, %f40;
+	selp.f32	%f42, %f41, %f40, %p10;
+	add.s32 	%r44, %r71, 1024;
+	selp.b32	%r45, %r44, %r43, %p10;
+	ld.global.nc.f32 	%f43, [%rd15+8192];
+	setp.gt.f32	%p11, %f43, %f42;
+	selp.f32	%f44, %f43, %f42, %p11;
+	add.s32 	%r46, %r71, 2048;
+	selp.b32	%r47, %r46, %r45, %p11;
+	ld.global.nc.f32 	%f45, [%rd15+12288];
+	setp.gt.f32	%p12, %f45, %f44;
+	selp.f32	%f52, %f45, %f44, %p12;
+	add.s32 	%r48, %r71, 3072;
+	selp.b32	%r73, %r48, %r47, %p12;
+	add.s64 	%rd15, %rd15, 16384;
+	add.s32 	%r71, %r71, 4096;
+	setp.lt.s32	%p13, %r71, %r34;
+	@%p13 bra 	BB12_9;
+
+BB12_10:
+	shl.b32 	%r49, %r1, 2;
+	mov.u32 	%r50, _ZZ10argmax_devE2sv;
+	add.s32 	%r22, %r50, %r49;
+	st.shared.f32 	[%r22], %f52;
+	mov.u32 	%r51, _ZZ10argmax_devE2si;
+	add.s32 	%r23, %r51, %r49;
+	st.shared.u32 	[%r23], %r73;
+	bar.sync 	0;
+	setp.gt.s32	%p14, %r1, 511;
+	@%p14 bra 	BB12_14;
+
+	ld.shared.f32 	%f11, [%r22];
+	ld.shared.u32 	%r24, [%r23+2048];
+	ld.shared.f32 	%f12, [%r22+2048];
+	setp.gt.f32	%p15, %f12, %f11;
+	@%p15 bra 	BB12_13;
+
+	ld.shared.u32 	%r52, [%r23];
+	setp.ge.s32	%p16, %r24, %r52;
+	setp.neu.f32	%p17, %f12, %f11;
+	or.pred  	%p18, %p17, %p16;
+	@%p18 bra 	BB12_14;
+
+BB12_13:
+	st.shared.f32 	[%r22], %f12;
+	st.shared.u32 	[%r23], %r24;
+
+BB12_14:
+	bar.sync 	0;
+	setp.gt.s32	%p19, %r1, 255;
+	@%p19 bra 	BB12_18;
+
+	ld.shared.f32 	%f13, [%r22];
+	ld.shared.u32 	%r25, [%r23+1024];
+	ld.shared.f32 	%f14, [%r22+1024];
+	setp.gt.f32	%p20, %f14, %f13;
+	@%p20 bra 	BB12_17;
+
+	ld.shared.u32 	%r53, [%r23];
+	setp.ge.s32	%p21, %r25, %r53;
+	setp.neu.f32	%p22, %f14, %f13;
+	or.pred  	%p23, %p22, %p21;
+	@%p23 bra 	BB12_18;
+
+BB12_17:
+	st.shared.f32 	[%r22], %f14;
+	st.shared.u32 	[%r23], %r25;
+
+BB12_18:
+	bar.sync 	0;
+	setp.gt.s32	%p24, %r1, 127;
+	@%p24 bra 	BB12_22;
+
+	ld.shared.f32 	%f15, [%r22];
+	ld.shared.u32 	%r26, [%r23+512];
+	ld.shared.f32 	%f16, [%r22+512];
+	setp.gt.f32	%p25, %f16, %f15;
+	@%p25 bra 	BB12_21;
+
+	ld.shared.u32 	%r54, [%r23];
+	setp.ge.s32	%p26, %r26, %r54;
+	setp.neu.f32	%p27, %f16, %f15;
+	or.pred  	%p28, %p27, %p26;
+	@%p28 bra 	BB12_22;
+
+BB12_21:
+	st.shared.f32 	[%r22], %f16;
+	st.shared.u32 	[%r23], %r26;
+
+BB12_22:
+	bar.sync 	0;
+	setp.gt.s32	%p29, %r1, 63;
+	@%p29 bra 	BB12_26;
+
+	ld.shared.f32 	%f17, [%r22];
+	ld.shared.u32 	%r27, [%r23+256];
+	ld.shared.f32 	%f18, [%r22+256];
+	setp.gt.f32	%p30, %f18, %f17;
+	@%p30 bra 	BB12_25;
+
+	ld.shared.u32 	%r55, [%r23];
+	setp.ge.s32	%p31, %r27, %r55;
+	setp.neu.f32	%p32, %f18, %f17;
+	or.pred  	%p33, %p32, %p31;
+	@%p33 bra 	BB12_26;
+
+BB12_25:
+	st.shared.f32 	[%r22], %f18;
+	st.shared.u32 	[%r23], %r27;
+
+BB12_26:
+	bar.sync 	0;
+	setp.gt.s32	%p34, %r1, 31;
+	@%p34 bra 	BB12_30;
+
+	ld.shared.f32 	%f19, [%r22];
+	ld.shared.u32 	%r28, [%r23+128];
+	ld.shared.f32 	%f20, [%r22+128];
+	setp.gt.f32	%p35, %f20, %f19;
+	@%p35 bra 	BB12_29;
+
+	ld.shared.u32 	%r56, [%r23];
+	setp.ge.s32	%p36, %r28, %r56;
+	setp.neu.f32	%p37, %f20, %f19;
+	or.pred  	%p38, %p37, %p36;
+	@%p38 bra 	BB12_30;
+
+BB12_29:
+	st.shared.f32 	[%r22], %f20;
+	st.shared.u32 	[%r23], %r28;
+
+BB12_30:
+	bar.sync 	0;
+	setp.gt.s32	%p39, %r1, 15;
+	@%p39 bra 	BB12_34;
+
+	ld.shared.f32 	%f21, [%r22];
+	ld.shared.u32 	%r29, [%r23+64];
+	ld.shared.f32 	%f22, [%r22+64];
+	setp.gt.f32	%p40, %f22, %f21;
+	@%p40 bra 	BB12_33;
+
+	ld.shared.u32 	%r57, [%r23];
+	setp.ge.s32	%p41, %r29, %r57;
+	setp.neu.f32	%p42, %f22, %f21;
+	or.pred  	%p43, %p42, %p41;
+	@%p43 bra 	BB12_34;
+
+BB12_33:
+	st.shared.f32 	[%r22], %f22;
+	st.shared.u32 	[%r23], %r29;
+
+BB12_34:
+	bar.sync 	0;
+	setp.gt.s32	%p44, %r1, 7;
+	@%p44 bra 	BB12_38;
+
+	ld.shared.f32 	%f23, [%r22];
+	ld.shared.u32 	%r30, [%r23+32];
+	ld.shared.f32 	%f24, [%r22+32];
+	setp.gt.f32	%p45, %f24, %f23;
+	@%p45 bra 	BB12_37;
+
+	ld.shared.u32 	%r58, [%r23];
+	setp.ge.s32	%p46, %r30, %r58;
+	setp.neu.f32	%p47, %f24, %f23;
+	or.pred  	%p48, %p47, %p46;
+	@%p48 bra 	BB12_38;
+
+BB12_37:
+	st.shared.f32 	[%r22], %f24;
+	st.shared.u32 	[%r23], %r30;
+
+BB12_38:
+	bar.sync 	0;
+	setp.gt.s32	%p49, %r1, 3;
+	@%p49 bra 	BB12_42;
+
+	ld.shared.f32 	%f25, [%r22];
+	ld.shared.u32 	%r31, [%r23+16];
+	ld.shared.f32 	%f26, [%r22+16];
+	setp.gt.f32	%p50, %f26, %f25;
+	@%p50 bra 	BB12_41;
+
+	ld.shared.u32 	%r59, [%r23];
+	setp.ge.s32	%p51, %r31, %r59;
+	setp.neu.f32	%p52, %f26, %f25;
+	or.pred  	%p53, %p52, %p51;
+	@%p53 bra 	BB12_42;
+
+BB12_41:
+	st.shared.f32 	[%r22], %f26;
+	st.shared.u32 	[%r23], %r31;
+
+BB12_42:
+	bar.sync 	0;
+	setp.gt.s32	%p54, %r1, 1;
+	@%p54 bra 	BB12_46;
+
+	ld.shared.f32 	%f27, [%r22];
+	ld.shared.u32 	%r32, [%r23+8];
+	ld.shared.f32 	%f28, [%r22+8];
+	setp.gt.f32	%p55, %f28, %f27;
+	@%p55 bra 	BB12_45;
+
+	ld.shared.u32 	%r60, [%r23];
+	setp.ge.s32	%p56, %r32, %r60;
+	setp.neu.f32	%p57, %f28, %f27;
+	or.pred  	%p58, %p57, %p56;
+	@%p58 bra 	BB12_46;
+
+BB12_45:
+	st.shared.f32 	[%r22], %f28;
+	st.shared.u32 	[%r23], %r32;
+
+BB12_46:
+	bar.sync 	0;
+	setp.gt.s32	%p59, %r1, 0;
+	@%p59 bra 	BB12_50;
+
+	ld.shared.f32 	%f29, [%r22];
+	ld.shared.u32 	%r33, [%r23+4];
+	ld.shared.f32 	%f30, [%r22+4];
+	setp.gt.f32	%p60, %f30, %f29;
+	@%p60 bra 	BB12_49;
+
+	ld.shared.u32 	%r61, [%r23];
+	setp.ge.s32	%p61, %r33, %r61;
+	setp.neu.f32	%p62, %f30, %f29;
+	or.pred  	%p63, %p62, %p61;
+	@%p63 bra 	BB12_50;
+
+BB12_49:
+	st.shared.f32 	[%r22], %f30;
+	st.shared.u32 	[%r23], %r33;
+
+BB12_50:
+	bar.sync 	0;
+	setp.ne.s32	%p64, %r1, 0;
+	@%p64 bra 	BB12_52;
+
+	cvta.to.global.u64 	%rd14, %rd5;
+	ld.shared.f32 	%f46, [_ZZ10argmax_devE2sv];
+	// inline asm
+	mov.b32 	%r62, %f46;
+	// inline asm
+	st.global.u32 	[%rd14], %r62;
+	ld.shared.u32 	%r63, [_ZZ10argmax_devE2si];
+	st.global.u32 	[%rd14+4], %r63;
+
+BB12_52:
 	ret;
 }
 
