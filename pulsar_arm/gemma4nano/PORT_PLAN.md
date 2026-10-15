@@ -180,3 +180,7 @@ reference's tokens and printed logits.
 First version (all CPU stages in C, one synchronous H2D + launch + sync + D2H per GEMV):
 load 4.6-6.4 s, 1,456 MB on the GPU, peak RSS 700 MB; decode 3.22 tok/s (en, 76 steps),
 2.96 tok/s (zh, 200 steps); prefill 2.76 tok/s. Next: profile and optimize.
+
+Tried and dropped (2026-10-15): head v5, splitting the six-bit values into 16-bit halves
+with byte permutes and mad.wide.s16 (meant to map to one XMAD per pair). Bit-identical,
+but 44.3 ms vs v4's 41.9 ms: nvcc kept the byte extracts and added shifts. v4 stays.
