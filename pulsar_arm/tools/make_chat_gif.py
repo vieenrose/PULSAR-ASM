@@ -345,6 +345,35 @@ SPECS["k2-nano"] = dict(
     out="k2horizon-jetson-nano-en-zh.gif",
     panes=("k2nano-neural", "k2nano-zh"))
 
+# ---- Gemma 4 E2B (Google's QAT Q4_0) on the Jetson Nano: GPU GEMVs + asm host ----
+# Ceiling prompts from pulsar_arm/gemma4nano/CEILING_NANO.md (16 greedy probes): the
+# hardest prompts answered correctly and completely, both arithmetic word problems.
+# Greedy, the committed engine; both runs rerun byte-identical. Transcripts are the
+# detokenized steps up to (not including) <turn|>. Rates are the engine's own
+# decode figures (wall time over the generated steps, load and prefill excluded).
+_G4_TPL = (" \u2014 Gemma 4 chat template: <bos><|turn>user\\n...<turn|>\\n<|turn>model\\n")
+SPECS["g4nano-en"] = dict(
+    out="gemma4-e2b-jetson-nano-en.gif",
+    title="pulsar \u00b7 Gemma 4 E2B (QAT Q4_0) \u00b7 Jetson Nano GPU",
+    cmd="$ ./g4eng gemma-4-E2B_q4_0-it.gguf g4_rope_2048.bin 2 105 2364 107 236776 8334 5384 609 236778 236810 1308 496 236743 236778 236771 236908 12223 236761 2900 691 506 3303 3385 236881 8754 822 981 236761 106 107 105 4368 107 --gen 500",
+    you="> " + "A shirt costs $25 after a 20% discount. What was the original price? Show your work.",
+    tpl="prompt ids: 2 105 2364 107 236776 8334 5384 609 236778 236810 1308 496 236743 236778 236771 236908 12223 236761 2900 691 506 3303 3385 236881 8754 822 981 236761 106 107 105 4368 107" + _G4_TPL,
+    response="Here is how to find the original price of the shirt:\n\n**1. Understand the relationship between the discount and the final price:**\n\nIf the shirt has a 20% discount, the customer is paying $100\\% - 20\\% = 80\\%$ of the original price.\n\n**2. Set up the equation:**\n\nLet $P$ be the original price.\nWe know that 80% of the original price is equal to the discounted price ($25).\n\n$$0.80 \\times P = 25$$\n\n**3. Solve for the original price ($P$):**\n\nTo find $P$, divide the discounted price by the percentage paid (as a decimal):\n\n$$P = \\frac{25}{0.80}$$\n\n**4. Calculate the result:**\n\n$$P = 31.25$$\n\n**Answer:**\n\nThe original price of the shirt was **\\$31.25**.\n\n***\n\n**Check the work:**\n\n* Original Price: \\$31.25\n* Discount (20% of \\$31.25): $0.20 \\times 31.25 = \\$6.25$\n* Sale Price: $\\$31.25 - \\$6.25 = \\$25.00$ (This matches the given information.)",
+    status="6.2 tok/s \u00b7 greedy \u00b7 Jetson Nano, 128-core Maxwell GPU + asm host",
+    wrap="word")
+SPECS["g4nano-zh"] = dict(
+    out="gemma4-e2b-jetson-nano-zh-tw.gif",
+    title="pulsar \u00b7 Gemma 4 E2B (QAT Q4_0) \u00b7 Jetson Nano GPU",
+    cmd="$ ./g4eng gemma-4-E2B_q4_0-it.gguf g4_rope_2048.bin 2 105 2364 107 237009 238046 238469 238139 73160 236800 238745 236770 236810 237237 237191 238623 236900 238139 237587 236778 107948 236810 236771 113722 236900 239903 238745 240449 238970 237536 106 107 105 4368 107 --gen 500",
+    you="> " + "一列火車下午3點15分出發，車程2小時50分鐘，幾點抵達？",
+    tpl="prompt ids: 2 105 2364 107 237009 238046 238469 238139 73160 236800 238745 236770 236810 237237 237191 238623 236900 238139 237587 236778 107948 236810 236771 113722 236900 239903 238745 240449 238970 237536 106 107 105 4368 107" + _G4_TPL,
+    response="火車下午3點15分出發，車程2小時50分鐘。\n\n計算抵達時間：\n\n* **小時計算：** 3點 + 2小時 = 5點\n* **分鐘計算：** 15分 + 50分 = 65分\n\n65分鐘等於1小時和5分鐘。\n\n所以，抵達時間是：5點 + 1小時和5分鐘 = **6點5分**。\n\n**答案：火車將在下午6點5分抵達。**",
+    status="6.6 tok/s \u00b7 greedy \u00b7 Jetson Nano, 128-core Maxwell GPU + asm host",
+    wrap="char")
+SPECS["g4-nano"] = dict(
+    out="gemma4-e2b-jetson-nano-en-zh.gif",
+    panes=("g4nano-en", "g4nano-zh"))
+
 
 def _is_cjk(ch):
     o = ord(ch)

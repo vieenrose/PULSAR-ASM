@@ -10,9 +10,9 @@ extern double g4_rms_r(const float *x, long n);
 extern void g4_rmsnorm(const float *x, const float *w, float *y, long n);
 extern void g4_rmsnorm_ns(float *x, long n);
 extern void g4_q8k(const float *x, uint8_t *y, long n);
-static void q8k_asm(const float *x, uint8_t *y, int n) { g4_q8k(x, y, n); }
-static void rms_asm(const float *x, const float *w, float *y, int n) { g4_rmsnorm(x, w, y, n); }
-static void rmsns_asm(float *x, int n) { g4_rmsnorm_ns(x, n); }
+static inline void q8k_asm(const float *x, uint8_t *y, int n) { g4_q8k(x, y, n); }
+static inline void rms_asm(const float *x, const float *w, float *y, int n) { g4_rmsnorm(x, w, y, n); }
+static inline void rmsns_asm(float *x, int n) { g4_rmsnorm_ns(x, n); }
 static double TAB2[48];   /* exp/GELU constants from g4ref.c's own definitions, duplicated pairs */
 static void build_tab(void) {
     double v[24] = {EXP_P0};
@@ -21,9 +21,9 @@ static void build_tab(void) {
     v[18] = 709.0; v[19] = -745.0; v[20] = INFINITY; v[21] = GELU_C1; v[22] = GELU_C3; v[23] = 1.0;
     for (int i = 0; i < 24; i++) TAB2[2 * i] = TAB2[2 * i + 1] = v[i];
 }
-static void geglu_asm(float *g, const float *u, int n) { g4_geglu(g, u, n, TAB2); }
+static inline void geglu_asm(float *g, const float *u, int n) { g4_geglu(g, u, n, TAB2); }
 /* attn_head_ref with the hot loops in assembly; same operations in the same order */
-static void attn_head_asm(const float *q, const float *K, const float *V, int lo, int pos, int hd, float *o) {
+static inline void attn_head_asm(const float *q, const float *K, const float *V, int lo, int pos, int hd, float *o) {
     static double xin[MAXSEQ], e[MAXSEQ];
     static float pp[MAXSEQ];
     int n = pos - lo + 1;

@@ -78,7 +78,7 @@ static const tensor_t *tens(const char *name) {
     for (int i = 0; i < NT; i++) if (!strcmp(T[i].name, name)) return &T[i];
     fprintf(stderr, "missing tensor %s\n", name); exit(2);
 }
-static void gguf_open(const char *path) {
+static void __attribute__((unused)) gguf_open(const char *path) {
     int fd = open(path, O_RDONLY); struct stat s;
     if (fd < 0 || fstat(fd, &s)) { perror(path); exit(2); }
     const uint8_t *base = mmap(NULL, s.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -275,7 +275,7 @@ typedef struct {
     float scale;
 } layer_t;
 static layer_t LT[NL];
-static void layer_table(void) {
+static void __attribute__((unused)) layer_table(void) {
     char b[96];
 #define W(kind) (snprintf(b, sizeof b, "blk.%d.%s.weight", il, kind), tens(b))
     for (int il = 0; il < NL; il++) {
