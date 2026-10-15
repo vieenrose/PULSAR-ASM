@@ -45,7 +45,11 @@ static CUresult (*cuMemHostGetDevicePointer_)(uint64_t *, void *, unsigned);
 static void *sym(void *h, const char *n) { void *p = dlsym(h, n); if (!p) { fprintf(stderr, "no %s\n", n); exit(3); } return p; }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
-static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i, *fq4ib, *fgeglub, *fargb, *fq6ib;
+static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i, *fq4ib, *fgeglub, *fargb, *fq6ib, *fasc, *fapv;
+/* decode attention on the GPU: device copies of the kv caches (rows [0, dsync[i]) valid),
+   sized for the run's positions (G_CAP) */
+static uint64_t dKC[FIRST_SHARED], dVC[FIRST_SHARED], dQa, dSa, dOa;
+static int dsync[FIRST_SHARED], G_CAP = MAXSEQ, pf_on = 1, gpu_attn;
 static uint64_t dYdevB, dHdevB, dX2B, dLogB;   /* batched prefill intermediates (BATCH_MAX tokens) */
 /* per tensor: 0 = K2 q4_gemv layout, 1 = q4i_gemv3 (q4i_gemv4: row-per-lane, tile-interleaved).
    Chosen per weight group at load: q4i where it measured faster (>= 1536 rows and
@@ -80,7 +84,7 @@ static uint64_t dalloc(size_t n) { uint64_t d; CK(cuMemAlloc_(&d, n)); dev_bytes
 
 static void wait_stream(void) {
     CK(cuEventRecord_(event, stream));
-    if (PF_N[0] | PF_N[1]) {   /* use the GPU wait: pull the next attention's K/V into L2 */
+    if ((PF_N[0] | PF_N[1]) && pf_on) {   /* use the GPU wait: pull the next attention's K/V into L2 */
         for (int k = 0; k < 2; k++)
             for (size_t o = 0; o < PF_N[k]; o += 64) __builtin_prefetch(PF_P[k] + o, 0, 2);
         PF_N[0] = PF_N[1] = 0;
@@ -157,6 +161,55 @@ static void gpu_mlp(const layer_t *L, int inter, float *out) {
     void *a3[] = {&dHdev, &dX2};
     CK(cuLaunchKernel_(fq8k, n / 256, 1, 1, 256, 1, 1, 0, stream, a3, NULL));
     launch_q4(KIND[id], &DW[id], &DS[id], dX2, h_out_dev, (uint32_t)inter, H);
+    double b_ = prof ? now_ms() : 0;
+    wait_stream();
+    double c_ = prof ? now_ms() : 0;
+    copy_from_pinned(out, h_out, (size_t)H * 4);
+    if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
+}
+
+/* attention + o projection of one token on the GPU, one wait. Rows of the host kv
+   cache not yet on the device are copied first (the prompt's rows, written by the
+   batched prefill, go up once at the first decode step); the newest row (pos, just
+   stored by forward()) travels with q in the staging buffer. Kernels: attn_scores,
+   attn_softmax_pv (attn_head_ref bit for bit), q8k_dev, the o GEMV. */
+static void gpu_attno(const layer_t *L, int src, const float *q, int lo, int pos, int hd, float *out) {
+    const int io = (int)(L->o - T);
+    if (!fast || pos >= G_CAP || !KIND[io]) { attno_ref(L, src, q, lo, pos, hd, out); return; }
+    double a_ = prof ? now_ms() : 0;
+    static float pk[NH * HD_F + 2 * HD_F];
+    int newrow = 0;
+    if (dsync[src] < pos) {   /* catch-up: rows [dsync, pos) */
+        size_t r0 = (size_t)dsync[src], nr = (size_t)pos - r0;
+        CK(cuMemcpyHtoD_(dKC[src] + r0 * hd * 4, KC[src] + r0 * hd, nr * hd * 4));
+        CK(cuMemcpyHtoD_(dVC[src] + r0 * hd * 4, VC[src] + r0 * hd, nr * hd * 4));
+        dsync[src] = pos;
+    }
+    memcpy(pk, q, (size_t)NH * hd * 4);
+    if (dsync[src] == pos) {   /* the newest row */
+        memcpy(pk + NH * hd, KC[src] + (size_t)pos * hd, (size_t)hd * 4);
+        memcpy(pk + NH * hd + hd, VC[src] + (size_t)pos * hd, (size_t)hd * 4);
+        newrow = 1;
+    }
+    stage_in(pk, (size_t)(NH * hd + (newrow ? 2 * hd : 0)) * 4, dQa);
+    if (newrow) {
+        uint64_t ks = dQa + (uint64_t)NH * hd * 4, vs = ks + (uint64_t)hd * 4;
+        uint64_t kd = dKC[src] + (uint64_t)pos * hd * 4, vd = dVC[src] + (uint64_t)pos * hd * 4;
+        uint32_t nw = (uint32_t)hd;
+        void *c1[] = {&ks, &kd, &nw}, *c2[] = {&vs, &vd, &nw};
+        CK(cuLaunchKernel_(fxc, (nw + 255) / 256, 1, 1, 256, 1, 1, 0, stream, c1, NULL));
+        CK(cuLaunchKernel_(fxc, (nw + 255) / 256, 1, 1, 256, 1, 1, 0, stream, c2, NULL));
+        dsync[src] = pos + 1;
+    }
+    int n = pos - lo + 1, ihd = hd;
+    uint64_t kl = dKC[src] + (uint64_t)lo * hd * 4, vl = dVC[src] + (uint64_t)lo * hd * 4;
+    void *a1[] = {&dQa, &kl, &dSa, &n, &ihd};
+    CK(cuLaunchKernel_(fasc, (n * NH + 255) / 256, 1, 1, 256, 1, 1, (unsigned)(NH * hd * 4), stream, a1, NULL));
+    void *a2[] = {&dSa, &vl, &dOa, &n, &ihd, &dTab};
+    CK(cuLaunchKernel_(fapv, NH, 1, 1, 256, 1, 1, (unsigned)(n * 12), stream, a2, NULL));
+    void *a3[] = {&dOa, &dX2};
+    CK(cuLaunchKernel_(fq8k, NH * hd / 256, 1, 1, 256, 1, 1, 0, stream, a3, NULL));
+    launch_q4(1, &DW[io], &DS[io], dX2, h_out_dev, (uint32_t)(NH * hd), H);
     double b_ = prof ? now_ms() : 0;
     wait_stream();
     double c_ = prof ? now_ms() : 0;
@@ -405,6 +458,7 @@ static void gpu_init(void) {
     CK(cuModuleGetFunction_(&fq6, mk, "q6i_gemv"));
     CK(cuModuleGetFunction_(&fq4ib, mk, getenv("G4Q4I4") ? "q4i_gemv_b" : "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fgeglub, mk, "geglu_b"));
     CK(cuModuleGetFunction_(&fargb, mk, "argmax_b")); CK(cuModuleGetFunction_(&fq6ib, mk, "q6i_gemv_b"));
+    CK(cuModuleGetFunction_(&fasc, mk, "attn_scores")); CK(cuModuleGetFunction_(&fapv, mk, "attn_softmax_pv"));
     dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
     dYdevB = dalloc((size_t)BATCH_MAX * 4 * INTER * 4); dHdevB = dalloc((size_t)BATCH_MAX * 2 * INTER * 4);
     dX2B = dalloc((size_t)BATCH_MAX * sizeof XQ); dLogB = dalloc((size_t)BATCH_MAX * VOCAB * 4);
@@ -500,6 +554,15 @@ static void gpu_init(void) {
         dF16 = dalloc((size_t)rows * cols * 2); CK(cuMemcpyHtoD_(dF16, wt, (size_t)rows * cols * 2)); free(wt);
         drop_pages(t->data, (size_t)rows * cols * 2);
     }
+    if (!(getenv("G4GPUATTN") && getenv("G4GPUATTN")[0] == '0')) {   /* G4GPUATTN=0: CPU attention */
+        for (int i = 0; i < FIRST_SHARED; i++) {
+            size_t b = (size_t)G_CAP * (SLIDING[i] ? HD_S : HD_F) * 4;
+            dKC[i] = dalloc(b); dVC[i] = dalloc(b);
+        }
+        dQa = dalloc((size_t)(NH * HD_F + 2 * HD_F) * 4); dSa = dalloc((size_t)G_CAP * NH * 4); dOa = dalloc((size_t)NH * HD_F * 4);
+        gpu_attn = 1;
+        fprintf(stderr, "decode attention: on the GPU (kv cache %d positions)\n", G_CAP);
+    }
     size_t fr = 0, tot = 0; cuMemGetInfo_(&fr, &tot);
     if (fast) fprintf(stderr, "GPU driver path: fast (stream, timing-free event, mapped pinned I/O)\n");
     { int nk = 0; for (int i = 0; i < NT; i++) nk += KIND[i];
@@ -508,6 +571,7 @@ static void gpu_init(void) {
             nq4, dev_bytes / 1048576.0, fr / 1048576.0, tot / 1048576.0, now_ms() - t0);
     G_Q4 = gpu_q4; G_Q4N = gpu_q4n; G_HEAD = gpu_head; G_F16 = gpu_f16;
     G_Q4N_B = gpu_q4n_b; G_MLP_B = gpu_mlp_b; G_HEAD_B = gpu_head_b;
+    if (gpu_attn) { G_ATTNO = gpu_attno; pf_on = 0; }
     if (!(getenv("G4GPUMLP") && getenv("G4GPUMLP")[0] == '0')) { G_MLP = gpu_mlp; fprintf(stderr, "MLP: on the GPU (gate+up, GeGLU, Q8_K, down)\n"); }
     /* G4ASM=0 keeps the C host loops (A/B and fallback) */
     if (!(getenv("G4ASM") && getenv("G4ASM")[0] == '0')) {
@@ -564,6 +628,7 @@ int main(int argc, char **argv) {
       if (m == MAP_FAILED) { fprintf(stderr, "rope table %s: mmap failed\n", argv[2]); return 2; }
       close(fd); ROPE = m; }
     prof = getenv("G4PROF") && getenv("G4PROF")[0] == '1';
+    G_CAP = n + gen + 1 < MAXSEQ ? n + gen + 1 : MAXSEQ;   /* positions this run can reach */
     gpu_init();
     if (prof) {
         o_rms = G_RMS; G_RMS = w_rms; o_rmsns = G_RMSNS; G_RMSNS = w_rmsns; o_q8k = G_Q8K; G_Q8K = w_q8k;

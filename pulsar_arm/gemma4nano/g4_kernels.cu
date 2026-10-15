@@ -989,3 +989,64 @@ extern "C" __global__ void __launch_bounds__(1024) argmax_b(const float *__restr
     }
     if (t == 0) { out[2 * blockIdx.x] = __float_as_uint(sv[0]); out[2 * blockIdx.x + 1] = (unsigned)si[0]; }
 }
+
+// ==============================================================================
+// Decode attention (all NH query heads against one kv head), exactly attn_head_ref
+// in g4ref.c: s_t = fmaf chain over d ascending of k[d]*q[d] from 0; mx = max s_t;
+// e_t = g4_exp((double)s_t - (double)mx); sum = serial double sum over t ascending;
+// p_t = (float)(e_t / sum); o[d] = fmaf chain over t ascending of p_t*v[d] from 0.
+// K, V point at row lo; n = pos - lo + 1 rows.
+// attn_scores: one thread per (t, h); S[t * NH + h]. q is staged in shared memory
+// transposed as float4 [d/4][h] (the 8 heads of a warp read 128 contiguous bytes, no
+// bank conflicts) and K is read as float4; the fmaf chain stays d-ascending.
+extern "C" __global__ void __launch_bounds__(256) attn_scores(const float *__restrict__ q,
+        const float *__restrict__ K, float *__restrict__ S, int n, int hd) {
+    extern __shared__ __align__(16) float4 q4[];
+    for (int i = threadIdx.x; i < 2 * hd; i += 256) {   // i = (d/4) * 8 + h
+        const int h = i & 7, d4 = i >> 3;
+        q4[i] = *(const float4 *)(q + h * hd + 4 * d4);
+    }
+    __syncthreads();
+    const int idx = blockIdx.x * 256 + threadIdx.x, t = idx >> 3, h = idx & 7;
+    if (t >= n) return;
+    const float4 *k = (const float4 *)(K + (size_t)t * hd);
+    float s = 0.0f;
+    for (int d4 = 0; d4 < hd / 4; d4++) {
+        const float4 kv = __ldg(k + d4), qv = q4[d4 * 8 + h];
+        s = __fmaf_rn(kv.x, qv.x, s); s = __fmaf_rn(kv.y, qv.y, s);
+        s = __fmaf_rn(kv.z, qv.z, s); s = __fmaf_rn(kv.w, qv.w, s);
+    }
+    S[idx] = s;
+}
+// attn_softmax_pv: one 256-thread block per head h. Shared: e[n] doubles, p[n] floats.
+extern "C" __global__ void __launch_bounds__(256) attn_softmax_pv(const float *__restrict__ S,
+        const float *__restrict__ V, float *__restrict__ O, int n, int hd, const double *__restrict__ tab) {
+    extern __shared__ __align__(16) unsigned char sm[];
+    double *e = (double *)sm;
+    float *p = (float *)(sm + (size_t)n * 8);
+    __shared__ float red[256];
+    __shared__ double sum_s;
+    const int h = blockIdx.x, tid = threadIdx.x;
+    float m = -INFINITY;
+    for (int t = tid; t < n; t += 256) { const float s = S[t * 8 + h]; if (s > m) m = s; }
+    red[tid] = m;
+    __syncthreads();
+    for (int w = 128; w > 0; w >>= 1) {
+        if (tid < w && red[tid + w] > red[tid]) red[tid] = red[tid + w];
+        __syncthreads();
+    }
+    const double mx = (double)red[0];
+    for (int t = tid; t < n; t += 256) e[t] = g4_exp_dev(__dsub_rn((double)S[t * 8 + h], mx), tab);
+    __syncthreads();
+    if (tid == 0) { double s = 0.0; for (int t = 0; t < n; t++) s = __dadd_rn(s, e[t]); sum_s = s; }
+    __syncthreads();
+    const double sum = sum_s;
+    for (int t = tid; t < n; t += 256) p[t] = __double2float_rn(__ddiv_rn(e[t], sum));
+    __syncthreads();
+    for (int d = tid; d < hd; d += 256) {
+        float o = 0.0f;
+        const float *v = V + d;
+        for (int t = 0; t < n; t++) o = __fmaf_rn(p[t], __ldg(v + (size_t)t * hd), o);
+        O[h * hd + d] = o;
+    }
+}

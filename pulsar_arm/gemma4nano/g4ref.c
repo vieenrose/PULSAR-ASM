@@ -381,6 +381,13 @@ static void mlp_ref(const layer_t *L, int inter, float *out) {
     G_Q4(L->down, XQ, out);
 }
 static void (*G_MLP)(const layer_t *, int, float *) = mlp_ref;
+/* attention of one token (all heads, kv cache `src`, rows lo..pos) + o projection -> out */
+static void attno_ref(const layer_t *L, int src, const float *q, int lo, int pos, int hd, float *out) {
+    G_ATTNALL(q, KC[src], VC[src], lo, pos, hd, ab);
+    G_Q8K(ab, XQ, NH * hd);
+    G_Q4(L->o, XQ, out);
+}
+static void (*G_ATTNO)(const layer_t *, int, const float *, int, int, int, float *) = attno_ref;
 
 static void __attribute__((unused)) forward(int tok, int pos) {
     /* embedding and per-layer inputs */
@@ -432,9 +439,7 @@ static void __attribute__((unused)) forward(int tok, int pos) {
             memcpy(VC[il] + (size_t)pos * hd, vb, hd * 4);
         }
         int lo = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
-        G_ATTNALL(qb, KC[src], VC[src], lo, pos, hd, ab);
-        G_Q8K(ab, XQ, NH * hd);
-        G_Q4(L->o, XQ, hb);
+        G_ATTNO(L, src, qb, lo, pos, hd, hb);
         { float t[H]; G_RMS(hb, L->n_post_attn, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* MLP */
         G_RMS(xs, L->n_ffn, hb, H);
