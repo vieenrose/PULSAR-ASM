@@ -381,6 +381,15 @@ static void mlp_ref(const layer_t *L, int inter, float *out) {
     G_Q4(L->down, XQ, out);
 }
 static void (*G_MLP)(const layer_t *, int, float *) = mlp_ref;
+/* per-layer input on the quantized residual in XQ: inp_gate, GeGLU against the
+   layer's per-layer input row, Q8_K, proj -> out (H floats) */
+static void ple_ref(const layer_t *L, const float *pinrow, float *out) {
+    G_Q4(L->ig, XQ, pleg);
+    G_GEGLU(pleg, pinrow, PLE);
+    G_Q8K(pleg, XQ, PLE);
+    G_Q4(L->proj, XQ, out);
+}
+static void (*G_PLE)(const layer_t *, const float *, float *) = ple_ref;
 /* attention of one token (all heads, kv cache `src`, rows lo..pos) + o projection -> out */
 static void attno_ref(const layer_t *L, int src, const float *q, int lo, int pos, int hd, float *out) {
     G_ATTNALL(q, KC[src], VC[src], lo, pos, hd, ab);
@@ -448,10 +457,7 @@ static void __attribute__((unused)) forward(int tok, int pos) {
         { float t[H]; G_RMS(hb, L->n_post_ffw, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* per-layer input */
         G_Q8K(xs, XQ, H);
-        G_Q4(L->ig, XQ, pleg);
-        G_GEGLU(pleg, pin + il * PLE, PLE);
-        G_Q8K(pleg, XQ, PLE);
-        G_Q4(L->proj, XQ, hb);
+        G_PLE(L, pin + il * PLE, hb);
         { float t[H]; G_RMS(hb, L->n_post, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         for (int i = 0; i < H; i++) xs[i] = xs[i] * L->scale;
     }
@@ -576,6 +582,25 @@ static void f16_b_seq(const tensor_t *w, const float *x, float *y, int B) {
 static void (*G_F16_B)(const tensor_t *, const float *, float *, int) = f16_b_seq;
 static float PROJBB[BATCH_MAX][NL * PLE];
 
+/* per-layer input for B tokens (quantized residuals in XQB, stride (H/256)*Q8B) -> out[t*H] */
+static void ple_b_ref(const layer_t *L, int il, int B, float *out) {
+    const int xsH = (H / 256) * Q8B, xsP = (PLE / 256) * Q8B;
+    static float gtmp[BATCH_MAX * PLE];
+    const tensor_t *ts[1] = {L->ig};
+    float *ys[1] = {gtmp};
+    G_Q4N_B(1, ts, XQB, xsH, B, ys);
+    PFOR
+    for (int t = 0; t < B; t++) {
+        memcpy(PLEGB[t], gtmp + (size_t)t * PLE, PLE * 4);
+        G_GEGLU(PLEGB[t], PINB[t] + il * PLE, PLE);
+        G_Q8K(PLEGB[t], XQB + (size_t)t * xsP, PLE);
+    }
+    const tensor_t *tp[1] = {L->proj};
+    float *yp[1] = {out};
+    G_Q4N_B(1, tp, XQB, xsP, B, yp);
+}
+static void (*G_PLE_B)(const layer_t *, int, int, float *) = ple_b_ref;
+
 static void attno_b_ref(const layer_t *L, int src, int pos0, int B, int hd, int full, float *out) {
     PFOR
     for (int t = 0; t < B; t++) {          /* per token: attention over positions <= its own */
@@ -682,21 +707,8 @@ static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int
         PFOR
         for (int t = 0; t < B; t++) G_Q8K(XSB[t], XQB + (size_t)t * xsH, H);
         {
-            static float gtmp[BATCH_MAX * PLE];
-            const tensor_t *ts[1] = {L->ig};
-            float *ys[1] = {gtmp};
-            G_Q4N_B(1, ts, XQB, xsH, B, ys);
-            const int xsP = (PLE / 256) * Q8B;
-            PFOR
-            for (int t = 0; t < B; t++) {
-                memcpy(PLEGB[t], gtmp + (size_t)t * PLE, PLE * 4);
-                G_GEGLU(PLEGB[t], PINB[t] + il * PLE, PLE);
-                G_Q8K(PLEGB[t], XQB + (size_t)t * xsP, PLE);
-            }
             static float ptmp[BATCH_MAX * H];
-            const tensor_t *tp[1] = {L->proj};
-            float *yp[1] = {ptmp};
-            G_Q4N_B(1, tp, XQB, xsP, B, yp);
+            G_PLE_B(L, il, B, ptmp);   /* inp_gate, GeGLU with the per-layer inputs, Q8_K, proj */
             PFOR
             for (int t = 0; t < B; t++) {
                 float tt[H]; G_RMS(ptmp + (size_t)t * H, L->n_post, tt, H);

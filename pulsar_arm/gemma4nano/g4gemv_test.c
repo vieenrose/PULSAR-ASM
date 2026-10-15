@@ -46,7 +46,7 @@ static void make_x(float *x, int n, int kind) {
 }
 static int first_diff(const float *a, const float *b, int n) { for (int i = 0; i < n; i++) if (memcmp(a + i, b + i, 4)) return i; return -1; }
 
-static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k, *fq4i, *fq6i, *fq4ib, *fq6ib, *fgeglub, *fargb, *fasc, *fapv, *ff162, *ff16b;
+static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k, *fq4i, *fq6i, *fq4ib, *fq6ib, *fgeglub, *fargb, *fasc, *fapv, *ff162, *ff16b, *fgq2;
 static uint64_t dWi, dSi, dSh;   /* q4i nibbles; scales f32 (v1-v4, b) and fp16 (v5, b2) */
 static uint64_t dW, dS, dX, dY;
 
@@ -338,7 +338,23 @@ static int test_batch(void) {
             geglu_ref(g, yy + (size_t)b * 2 * n + n, n);
             if (first_diff(g, hgo + (size_t)b * n, n) >= 0) { bad++; printf("  geglu_b token %d\n", b); }
         }
-        printf("  geglu_b: 8 tokens x %d, %d mismatches\n", n, bad - b2);
+        {   /* geglu_q8k2 on the same 8 tokens ([gate|up] layout) vs geglu_ref + q8k */
+            static uint8_t qc[INTER / 256 * Q8B], qg[8 * INTER / 256 * Q8B];
+            uint64_t dQ; CK(cuMemAlloc_(&dQ, sizeof qg));
+            int gs = 2 * n; uint64_t up = dG + (uint64_t)n * 4;
+            void *a[] = {&dG, &gs, &up, &gs, &dQ, &in, &dTab};
+            CK(cuLaunchKernel_(fgq2, B * n / 256, 1, 1, 256, 1, 1, 0, NULL, a, NULL));
+            CK(cuCtxSynchronize_());
+            CK(cuMemcpyDtoH_(qg, dQ, sizeof qg));
+            for (int b = 0; b < B; b++) {
+                memcpy(g, yy + (size_t)b * 2 * n, n * 4);
+                geglu_ref(g, yy + (size_t)b * 2 * n + n, n);
+                q8k(g, qc, n);
+                if (memcmp(qc, qg + (size_t)b * (n / 256) * Q8B, (size_t)(n / 256) * Q8B)) { bad++; printf("  geglu_q8k2 token %d\n", b); }
+            }
+            CK(cuMemFree_(dQ));
+        }
+        printf("  geglu_b + geglu_q8k2: 8 tokens x %d, %d mismatches\n", n, bad - b2);
     }
     return bad;
 }
@@ -410,6 +426,23 @@ static int test_attn(void) {
         CK(cuMemFree_(dQ8)); CK(cuMemFree_(dS8)); CK(cuMemFree_(dO8));
     }
     printf("  attention: %d cases (n 1..512, hd 256/512, lo > 0, batched 4 x 8 tokens incl. window crossing), %d mismatches\n", ncase, bad);
+    if (getenv("ATTNPERF")) {   /* warm timing at decode shapes (n = 300) */
+        for (int hd = 256; hd <= 512; hd *= 2) {
+            int ip = 299, iw = 0, ihd = hd, sstr = 0;
+            void *a1[] = {&dQ, &dK, &dS, &ip, &iw, &ihd, &sstr};
+            void *a2[] = {&dS, &dV, &dO, &ip, &iw, &ihd, &dTab, &sstr};
+            double t0 = now_ms();
+            while (now_ms() - t0 < 1500) { CK(cuLaunchKernel_(fasc, (300 * NH + 255) / 256, 1, 1, 256, 1, 1, (unsigned)(NH * hd * 4), NULL, a1, NULL)); CK(cuCtxSynchronize_()); }
+            for (int rep = 0; rep < 2; rep++) {
+                double t1 = now_ms();
+                for (int i = 0; i < 100; i++) CK(cuLaunchKernel_(fasc, (300 * NH + 255) / 256, 1, 1, 256, 1, 1, (unsigned)(NH * hd * 4), NULL, a1, NULL));
+                CK(cuCtxSynchronize_()); double t2 = now_ms();
+                for (int i = 0; i < 100; i++) CK(cuLaunchKernel_(fapv, NH, 1, 1, 256, 1, 1, 300 * 12, NULL, a2, NULL));
+                CK(cuCtxSynchronize_()); double t3 = now_ms();
+                printf("  warm n=300 hd=%d: scores %.1f us, softmax+pv %.1f us\n", hd, (t2 - t1) * 10, (t3 - t2) * 10);
+            }
+        }
+    }
     free(K); free(V);
     return bad;
 }
@@ -603,7 +636,7 @@ int main(int argc, char **argv) {
     { FILE *f = fopen(argv[2], "rb"); if (!f) { perror(argv[2]); return 2; }
       static char ptx[1 << 20]; size_t n = fread(ptx, 1, sizeof ptx - 1, f); fclose(f); ptx[n] = 0;
       CK(cuModuleLoadData_(&m6, ptx)); }
-    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq6i, m6, "q6i_gemv")); CK(cuModuleGetFunction_(&fq4ib, m6, getenv("Q4B1") ? "q4i_gemv_b" : "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fq6ib, m6, "q6i_gemv_b")); CK(cuModuleGetFunction_(&fgeglub, m6, "geglu_b")); CK(cuModuleGetFunction_(&fargb, m6, "argmax_b")); CK(cuModuleGetFunction_(&fasc, m6, "attn_scores")); CK(cuModuleGetFunction_(&ff162, m6, "f16_gemv_t2")); CK(cuModuleGetFunction_(&ff16b, m6, "f16_gemv_tb")); CK(cuModuleGetFunction_(&fapv, m6, "attn_softmax_pv")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : getenv("Q4I")[0] == '2' ? "q4i_gemv2" : getenv("Q4I")[0] == '3' ? "q4i_gemv3" : getenv("Q4I")[0] == '5' ? "q4i_gemv5" : "q4i_gemv4") : "q4i_gemv5")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq6i, m6, "q6i_gemv")); CK(cuModuleGetFunction_(&fq4ib, m6, getenv("Q4B1") ? "q4i_gemv_b" : "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fq6ib, m6, "q6i_gemv_b")); CK(cuModuleGetFunction_(&fgeglub, m6, "geglu_b")); CK(cuModuleGetFunction_(&fargb, m6, "argmax_b")); CK(cuModuleGetFunction_(&fasc, m6, "attn_scores")); CK(cuModuleGetFunction_(&fgq2, m6, "geglu_q8k2")); CK(cuModuleGetFunction_(&ff162, m6, "f16_gemv_t2")); CK(cuModuleGetFunction_(&ff16b, m6, "f16_gemv_tb")); CK(cuModuleGetFunction_(&fapv, m6, "attn_softmax_pv")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : getenv("Q4I")[0] == '2' ? "q4i_gemv2" : getenv("Q4I")[0] == '3' ? "q4i_gemv3" : getenv("Q4I")[0] == '5' ? "q4i_gemv5" : "q4i_gemv4") : "q4i_gemv5")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
     CK(cuMemAlloc_(&dW, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dS, (size_t)2 * INTER * (H / 32) * 4));
     CK(cuMemAlloc_(&dX, sizeof XQ));
     CK(cuMemAlloc_(&dWi, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dSi, (size_t)2 * INTER * (H / 32) * 4)); CK(cuMemAlloc_(&dSh, (size_t)2 * INTER * (H / 32) * 2)); CK(cuMemAlloc_(&dY, (size_t)VOCAB * 4));

@@ -1032,6 +1032,51 @@ extern "C" __global__ void geglu_b(const float *__restrict__ y, float *__restric
     h[i] = __fmul_rn(gl, uu);
 }
 
+// Q8_K of one 256-value block held one value per thread (256 threads): q8k_dev's
+// algorithm and operations exactly (first index of the largest |x|, iscale = -127/mx,
+// q = nearest_int(fmaf(iscale, x, 0x1.8p23)) clamped below 127, d = 1/iscale).
+// All 256 threads must reach it (it synchronizes).
+__device__ __forceinline__ void q8k_block256(float v, uint8_t *__restrict__ yb, float *sa, int *si, float *sv) {
+    const int j = threadIdx.x;
+    const float a = fabsf(v);
+    sa[j] = a; sv[j] = v;
+    __syncthreads();
+    for (int s = 128; s; s >>= 1) { if (j < s) sa[j] = fmaxf(sa[j], sa[j + s]); __syncthreads(); }
+    const float amax = sa[0];
+    si[j] = (a == amax) ? j : 256;
+    __syncthreads();
+    for (int s = 128; s; s >>= 1) { if (j < s) si[j] = min(si[j], si[j + s]); __syncthreads(); }
+    if (j < 32) yb[260 + j] = 0;
+    if (!(amax > 0.0f)) {                       // all zero: d = 0, q = 0
+        if (j < 4) yb[j] = 0;
+        yb[4 + j] = 0;
+        return;
+    }
+    const float mx = sv[si[0]];
+    const float iscale = __fdiv_rn(-127.f, mx);
+    const float f = __fmaf_rn(iscale, v, 12582912.f);
+    int q = (__float_as_int(f) & 0x007fffff) - 0x00400000;
+    q = q < 127 ? q : 127;
+    yb[4 + j] = (uint8_t)(int8_t)q;
+    if (j == 0) { const float dd = __fdiv_rn(1.0f, iscale); *(float *)yb = dd; }
+}
+// geglu_q8k2: GeGLU (as geglu_dev / geglu_b) then Q8_K (as q8k_dev) in one launch.
+// Token t's gate values at g + t*gs, up values at u + t*us, n per token (n % 256 == 0);
+// block k makes Q8_K block k of the [token][n] result.
+extern "C" __global__ void __launch_bounds__(256) geglu_q8k2(const float *__restrict__ g, int gs,
+        const float *__restrict__ u, int us, uint8_t *__restrict__ xq, int n, const double *__restrict__ tab) {
+    __shared__ float sa[256], sv[256];
+    __shared__ int si[256];
+    const int nb = n >> 8, t = blockIdx.x / nb, j = (blockIdx.x % nb) * 256 + threadIdx.x;
+    const float gg = g[(size_t)t * gs + j], uu = u[(size_t)t * us + j];
+    const double x = (double)gg;
+    const double x3 = __dmul_rn(__dmul_rn(x, x), x);
+    const double tt = -__dadd_rn(__dmul_rn(tab[21], x), __dmul_rn(tab[22], x3));
+    const double e = g4_exp_dev(tt, tab);
+    const float gl = __double2float_rn(__ddiv_rn(x, __dadd_rn(1.0, e)));
+    q8k_block256(__fmul_rn(gl, uu), xq + (size_t)blockIdx.x * 292, sa, si, sv);
+}
+
 // Per-token argmax of the raw logits (block t handles y + t*n); same first-max rule
 // as the host loop. out[2t] = value bits, out[2t+1] = index.
 extern "C" __global__ void __launch_bounds__(1024) argmax_b(const float *__restrict__ y, int n,
