@@ -1133,3 +1133,14 @@ sm 0.36, out 0.06 ms; the K or V code stream alone is 0.33 ms. qk is shared-band
 (lds.128 of a per-lane table entry = 4 wavefronts per term; floor ~2.3 ms): a bit-identical
 rewrite (inline fl(q c), several positions per thread) is worth <= ~15%; a 2x needs fp16
 arithmetic (HFMA2), which moves the TQ bits.
+
+54. TQ short pair per step (keep, TQ ctx > 256). The qks + tail pair (row 51) only ran when the
+whole run fit in 256 positions; ctx is just the cache row stride for it, so it is valid for any
+step with T <= 256. pq1_token_fused now keeps two graph slots (PQ1_TOK_OKV/EXV[2]) when TQ is on,
+ctx > 256 and PQ1_TQSHORT is set: slot 1 is captured with pq1_tq_short_next(1) for the steps with
+npos < 256, slot 0 with the long chain after that. qks grid y is sized from min(ctx, 256).
+pq1_parity tq now checks the short pair against the long chain at its own ctx (T <= 256 at
+stride 2048): tq3/tq4/tq43 0 words differ. Engine, TQ4, prompt A + 300 generated (ctx 320),
+order v1 v0 v0 v1: steps 20..255 61.59 / 63.03 / 63.16 / 61.80 ms (-2.2%); steps >= 257 64.93 vs
+64.96 (equal; step 256 carries the one-time 2nd capture, 108.7 ms). Greedy stream md5 identical.
+Gates green on a fresh build, 16.53 tps (f16 gate run, path unaffected).

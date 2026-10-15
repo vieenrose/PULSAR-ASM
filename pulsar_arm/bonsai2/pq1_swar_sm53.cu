@@ -3635,17 +3635,18 @@ template <int BK, int BV>
 static int pq1_tq_short_go(const float* qo_d, const unsigned short* stage_d, const uint8_t* par_d, uint32_t* kcode,
                            float* ksc, uint32_t* vcode, float* vsc, float* sc_d, float* atto_d, int nkv, int ctx,
                            cudaStream_t s) {
-  pq1_tq_qks<BK, BV><<<dim3(nkv, (ctx + PQ1_TQ_SB - 1) / PQ1_TQ_SB), PQ1_TQ_SB, 0, s>>>(
+  pq1_tq_qks<BK, BV><<<dim3(nkv, (min(ctx, PQ1_TQ_CH) + PQ1_TQ_SB - 1) / PQ1_TQ_SB), PQ1_TQ_SB, 0, s>>>(
       qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, nkv, ctx);
   pq1_tq_tail<BV><<<nkv, 256, 0, s>>>(sc_d, vcode, vsc, par_d, atto_d, ctx);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
-/* store of the staged rows at npos (from par) + attention, ctx <= PQ1_TQ_CH */
+/* store of the staged rows at npos (from par) + attention for T = npos + 1 <=
+ * PQ1_TQ_CH; ctx is the cache's position stride and may exceed PQ1_TQ_CH */
 extern "C" int pq1_tq_short_launch(int bits, const float* qo_d, const unsigned short* stage_d, const uint8_t* par_d,
                                    uint32_t* kcode, float* ksc, uint32_t* vcode, float* vsc, float* sc_d,
                                    float* atto_d, int nh, int nkv, int ctx, void* stream) {
   cudaStream_t s = (cudaStream_t)stream;
-  if (nh != 4 * nkv || ctx <= 0 || ctx > PQ1_TQ_CH) return -2;
+  if (nh != 4 * nkv || ctx <= 0) return -2;
   if (bits == 3) return pq1_tq_short_go<3, 3>(qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, atto_d, nkv, ctx, s);
   if (bits == 4) return pq1_tq_short_go<4, 4>(qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, atto_d, nkv, ctx, s);
   if (bits == 43) return pq1_tq_short_go<4, 3>(qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, atto_d, nkv, ctx, s);
@@ -3677,6 +3678,13 @@ extern "C" int pq1_tq_fa_launch(int bits, const float* qo_d, const uint8_t* par_
   pq1_tq_out<<<nh, 32, 0, s>>>(part_d, inv_d, par_d, atto_d, nh);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
+/* set while the host captures a graph for a step with npos < PQ1_TQ_CH on a
+ * larger cache: the short pair is valid there (ctx is only a stride) */
+static int PQ1_TQ_SHORTNEXT = 0;
+extern "C" void pq1_tq_short_next(int on) { PQ1_TQ_SHORTNEXT = on; }
+extern "C" int pq1_tq_short_ok(void) {
+  return getenv("PQ1_TQSHORT") ? atoi(getenv("PQ1_TQSHORT")) != 0 : 1;
+}
 /* the whole attention block with the TurboQuant cache: pre3 (head norms, rope,
  * K/V rows to stage_d), the row store at npos, then pq1_tq_fa_launch */
 extern "C" int pq1_attn_tq_launch(int bits, const float* qkv_d, const float* nw_d, const uint8_t* par_d,
@@ -3689,7 +3697,7 @@ extern "C" int pq1_attn_tq_launch(int bits, const float* qkv_d, const float* nw_
                                                    stage_d + (size_t)nkv * 128, nh, nkv, -1, 0, NULL);
   static int shortp = -1;   /* PQ1_TQSHORT=0: the long chain at every ctx (A/B) */
   if (shortp < 0) shortp = getenv("PQ1_TQSHORT") ? atoi(getenv("PQ1_TQSHORT")) : 1;
-  if (ctx <= PQ1_TQ_CH && shortp)
+  if ((ctx <= PQ1_TQ_CH || PQ1_TQ_SHORTNEXT) && shortp)
     return pq1_tq_short_launch(bits, qo_d, stage_d, par_d, kcode, ksc, vcode, vsc, sc_d, atto_d, nh, nkv, ctx, stream);
   if (pq1_tq_store_go(bits, stage_d, par_d, -1, kcode, ksc, vcode, vsc, nkv, ctx, s) != 0) return -1;
   return pq1_tq_fa_launch(bits, qo_d, par_d, kcode, ksc, vcode, vsc, sc_d, part_d, inv_d, atto_d, nh, nkv, ctx, stream);

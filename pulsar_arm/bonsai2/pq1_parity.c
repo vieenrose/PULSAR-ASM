@@ -641,13 +641,14 @@ static int tq_parity(int B) {
            B, T, rc, emax, ok ? "OK" : "MISMATCH", sqrt(qe2 / qn2));
     if (!ok) allok = 0;
   }
-  if (ctx <= 256) {
-    /* the short-context path (store + 2 kernels) must equal store + the long chain bit for bit */
+  {
+    /* the short-context path (store + 2 kernels) must equal store + the long chain bit for bit;
+     * past ctx 256 the engine takes it per step while T <= 256, ctx being only the row stride */
     float *o1 = malloc((size_t)nh * 512), *o2 = malloc((size_t)nh * 512);
     long sbad = 0;
     for (unsigned ti = 0; ti < sizeof Ts / sizeof Ts[0]; ti++) {
       const int T = Ts[ti], npos = T - 1;
-      if (T > ctx) continue;
+      if (T > ctx || (ctx > 256 && T > 256)) continue;
       memset(par, 0, sizeof par);
       memcpy(par + PQ1_APAR_NPOS, &npos, 4);
       cudaMemcpy(d_par, par, sizeof par, cudaMemcpyHostToDevice);

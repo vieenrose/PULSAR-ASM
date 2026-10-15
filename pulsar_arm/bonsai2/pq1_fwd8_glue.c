@@ -1478,9 +1478,9 @@ void pq1_attn_dbg(int il, int npos, uint16_t *k, uint16_t *v, float *q, float *a
  * Allocates (2 nl + 2) hid floats of the arena once (1.2 MB for the 8B).
  * PQ1_TOK=0 is the A/B arm. */
 #ifdef PQ1_USE_CUDA
-static int PQ1_TOK = -1, PQ1_TOK_OK = 0;
+static int PQ1_TOK = -1, PQ1_TOK_OKV[2];
 static float *d_X = NULL, *d_nw = NULL;
-static cudaGraphExec_t PQ1_TOK_EX;
+static cudaGraphExec_t PQ1_TOK_EXV[2];
 static const void *PQ1_TOK_WT, *PQ1_TOK_XH, *PQ1_TOK_HD;
 /* loop iter 22: fwd8's greedy argmax as the graph's last node (PQ1_GARG=0 is
  * the A/B arm); the full logits D2H is kept only when the host reads them
@@ -1532,10 +1532,19 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
       (size_t)inter * 8 > half || (size_t)hid * 4 > half || (size_t)vocab * 4 > P2YMAX ||
       !pq1_tm_bufs(hid, xqb, 0, 1) || !pq1_tm_bufs(qr, xob, 0, 1) || !pq1_tm_bufs(inter, xqb2, 0, 1))
     return -1;
-  if (PQ1_TOK_OK && (PQ1_TOK_WT != (const void *)wt || PQ1_TOK_XH != (const void *)x ||
-                     PQ1_TOK_HD != (const void *)head || PQ1_TOK_HN != PQ1_HNEED)) {
-    cudaGraphExecDestroy(PQ1_TOK_EX);
-    PQ1_TOK_OK = 0;
+  /* two token graphs on a TurboQuant cache longer than 256 positions: steps
+   * with npos < 256 take the short qks + tail pair (bit-identical), the rest
+   * the long chain; slot 0 is the only one otherwise */
+  static int tqs = -1;
+  if (tqs < 0) tqs = pq1_tq_short_ok();
+  const int sp = pq1_kvtq() && tqs && ctx > 256 && npos < 256;
+#define PQ1_TOK_OK PQ1_TOK_OKV[sp]
+#define PQ1_TOK_EX PQ1_TOK_EXV[sp]
+  if ((PQ1_TOK_OKV[0] || PQ1_TOK_OKV[1]) &&
+      (PQ1_TOK_WT != (const void *)wt || PQ1_TOK_XH != (const void *)x ||
+       PQ1_TOK_HD != (const void *)head || PQ1_TOK_HN != PQ1_HNEED)) {
+    for (int k = 0; k < 2; k++)
+      if (PQ1_TOK_OKV[k]) { cudaGraphExecDestroy(PQ1_TOK_EXV[k]); PQ1_TOK_OKV[k] = 0; }
   }
   if (!PQ1_TOK_OK) {
     /* every tensor must already live in the arena: merged q+k+v and gate+up,
@@ -1621,6 +1630,7 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
           pq1_tm_prep_launch(d_xq, d_pl, d_au, n_, S)))
     rc |= cudaMemcpyAsync(d_ain, PQ1_AIN, PQ1_APAR_XQ, cudaMemcpyHostToDevice, S) != cudaSuccess;
     rc |= cudaMemcpyAsync(d_X, x, (size_t)hid * 4, cudaMemcpyHostToDevice, S) != cudaSuccess;
+    pq1_tq_short_next(sp);
     for (int il = 0; il < nl && !rc; il++) {
       rc |= PQ1_RMSQ(d_X, il ? yh : NULL, d_nw + (size_t)(2 * il) * hid, hid, qr + 2 * kr);
       rc |= pq1_tmx_launch(PQ1M[mq[il]].d_codes, PQ1M[mq[il]].d_scales, d_pl, d_au, qkv, hid,
@@ -1644,6 +1654,7 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
       if (PQ1_HNEED || !PQ1_GARG)
         rc |= cudaMemcpyAsync(head, d_y, (size_t)vocab * 4, cudaMemcpyDeviceToHost, S) != cudaSuccess;
     }
+    pq1_tq_short_next(0);
     if (cudaStreamEndCapture(S, &g) != cudaSuccess) { rc = 1; g = NULL; }
     if (!rc && g && cudaGraphInstantiate(&PQ1_TOK_EX, g, NULL, NULL, 0) == cudaSuccess && PQ1_TOK_EX) {
       PQ1_TOK_OK = 1;
@@ -1669,6 +1680,8 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
   if (KTON > 0) pq1_kt_add(-3, hid, pq1_now() - kt0);   /* rows -3: the whole-token graph */
   PQ1_TOK_CALLS++;
   return 0;
+#undef PQ1_TOK_OK
+#undef PQ1_TOK_EX
 #else
   (void)nl; (void)wt; (void)nw; (void)nh; (void)nkv; (void)hid; (void)inter; (void)vocab;
   (void)ctx; (void)npos; (void)rcc; (void)rcs; (void)x; (void)head;
