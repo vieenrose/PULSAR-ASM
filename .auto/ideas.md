@@ -1038,3 +1038,13 @@ evicting the hot loop from the instruction cache). Engine-side metrics are not o
 nvprof --metrics does not see kernels inside the token graph, and with PQ1_GRAPH=0 the engine
 launches no q8k_w at all (only tm_prep_w and the two hs GEMVs). The earlier job bvf8gopr1's
 "engine" numbers were in fact the par_fl (parity) half.
+
+## Measured out (row 45): down GEMV reduction lane use (private tile rings + NT batches per SEG step)
+Down and gate+up are equally issue-bound (77% issue slots, IPC 3.89); down executes 19% more
+instructions per weight word (0.90 vs 0.76 warp-instr/word). Upper bound for the 4-lane SEG
+reduction: cutting it to 1 of 8 steps (wrong output) takes the kernel 405 -> 374 us, ~1.1 ms/token.
+pq1_gemv_hs3n (each warp keeps only its own wt+1 tile slots, so 2 batches fit per slot: 8 reduction
+lanes, half the barriers), all bit-exact 4096/4096, nvprof parity: old 405-408 us, NT=1 442-447,
+NT=2 423-427, NT=2 with uniform per-team batch counts 506. NT=2 runs 3.7% fewer instructions but IPC
+falls 3.90 -> 3.65 as memory-dependency stalls rise 5 -> 18%: the per-batch reduction gap was also
+covering load latency. Patch kept as scratchpad row45_hs3n_private_ring.patch (not in the repo).
