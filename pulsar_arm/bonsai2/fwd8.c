@@ -462,6 +462,9 @@ static int sample_topkpp(const float *lg, int n, float temp, float topp, int top
     int m = 0;
     for (int i = 0; i < n; i++) {
         float v = lg[i];
+        /* full list and v <= its last (smallest) entry: the walk below would
+         * pass every slot and reject v; skip it (NaN fails <= and walks) */
+        if (m == topk && v <= sc[topk - 1]) continue;
         int k = 0;
         while (k < m && v <= sc[k]) k++;
         if (k >= topk) continue;
