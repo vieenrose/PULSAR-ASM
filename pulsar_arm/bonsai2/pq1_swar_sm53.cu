@@ -1461,6 +1461,8 @@ __device__ __forceinline__ float pq1_fadd(float a, float b) { float r; asm("add.
 __device__ __forceinline__ float pq1_fsub(float a, float b) { float r; asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ __forceinline__ float pq1_fmul(float a, float b) { float r; asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ __forceinline__ float pq1_fdiv(float a, float b) { float r; asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+/* 1/b correctly rounded: the same IEEE value as pq1_fdiv(1.0f, b) for every b */
+__device__ __forceinline__ float pq1_frcp(float b) { float r; asm("rcp.rn.f32 %0, %1;" : "=f"(r) : "f"(b)); return r; }
 __device__ __forceinline__ float pq1_ffma(float a, float b, float c) { float r; asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c)); return r; }
 /* q8_K's nearest_int on the image of fma(v, iscale, 1.5*2^23), capped at 127.
  * 0 * inf (iscale overflows when a block has 0 < amax < 127/FLT_MAX and an exact
@@ -1735,7 +1737,7 @@ __global__ __launch_bounds__(256) void pq1_q8k_w(const float* __restrict__ gu, i
       const float u = src[n + 32 * j];
       const float mg = __uint_as_float(__float_as_uint(x) ^ 0x80000000u);
       const float e = SILU == 2 ? pq1_expf_ff(mg, stab) : pq1_expf_dev(mg);
-      const float sg = pq1_fdiv(1.0f, pq1_fadd(1.0f, e));
+      const float sg = pq1_frcp(pq1_fadd(1.0f, e));
       v[j] = pq1_fmul(pq1_fmul(x, sg), u);
     } else {
       v[j] = x;
@@ -2333,14 +2335,19 @@ __global__ __launch_bounds__(128) void pq1_fa_qk4(const float* __restrict__ qo,
  * contiguous run of positions; the running max before the run is an exclusive
  * prefix of the per-run maxima (the same strict-> fold, so the same value; a
  * +0/-0 tie can flip the sign of a zero M, which changes no ms or vs below). */
-template <bool SCAN>
-__global__ __launch_bounds__(256) void pq1_fa_sm(const float* __restrict__ sc,
+/* FF (PQ1_FAX=1, default): the exponentials through pq1_expf_ff, the certified
+ * fp32 path equal to pq1_expf_dev on all 2^32 inputs (pq1_parity expf), so the
+ * fp64 chain (1/32 rate) leaves the common path. */
+template <bool SCAN, bool FF = false, int NT = 256>
+__global__ __launch_bounds__(NT) void pq1_fa_sm(const float* __restrict__ sc,
                                                  const uint8_t* __restrict__ par,
                                                  float2* __restrict__ mv, int ctx) {
   __shared__ float sm[256];
+  __shared__ float stab[FF ? 64 : 1];
   const int h = blockIdx.x, tid = threadIdx.x;
+  if (FF) pq1_expf_tab(stab, tid);   /* ordered by the scan's barrier below */
   const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
-  const int per = (T + 255) >> 8, b = tid * per, e = min(T, b + per);
+  const int per = (T + NT - 1) / NT, b = tid * per, e = min(T, b + per);
   const float* s = sc + (size_t)h * ctx;
   const float NINF = __uint_as_float(0xff800000u);
   float m = NINF;
@@ -2374,11 +2381,18 @@ __global__ __launch_bounds__(256) void pq1_fa_sm(const float* __restrict__ sc,
     __syncthreads();
     M = sm[tid];
   }
+  if (FF && !SCAN) __syncthreads();
   for (int t = b; t < e; t++) {
     const float x = s[t];
     float ms = 1.0f, vs = 1.0f;
-    if (pq1_fgt(x, M)) { ms = pq1_expf_dev(pq1_fsub(M, x)); M = x; }
-    else vs = pq1_expf_dev(pq1_fsub(x, M));
+    if (FF) {
+      const bool up = pq1_fgt(x, M);
+      const float ex = pq1_expf_ff(up ? pq1_fsub(M, x) : pq1_fsub(x, M), stab);
+      if (up) { ms = ex; M = x; } else vs = ex;
+    } else {
+      if (pq1_fgt(x, M)) { ms = pq1_expf_dev(pq1_fsub(M, x)); M = x; }
+      else vs = pq1_expf_dev(pq1_fsub(x, M));
+    }
     mv[(size_t)h * ctx + t] = make_float2(ms, vs);
   }
 }
@@ -2547,7 +2561,11 @@ extern "C" int pq1_fa_launch(const float* qo_d, const unsigned short* kc_d,
   static int fas = -1;
   if (fas < 0) { const char* e = getenv("PQ1_FAS"); fas = e ? atoi(e) : 1; }
   if (pq1_fa_mask & 2) {
-    if (fas) pq1_fa_sm<true><<<nh, 256, 0, s>>>(sc_d, par_d, reinterpret_cast<float2*>(mv_d), ctx);
+    static int fax = -1;
+    if (fax < 0) { const char* e = getenv("PQ1_FAX"); fax = e ? atoi(e) : 2; }
+    if (fas && fax == 2) pq1_fa_sm<true, true, 64><<<nh, 64, 0, s>>>(sc_d, par_d, reinterpret_cast<float2*>(mv_d), ctx);
+    else if (fas && fax) pq1_fa_sm<true, true><<<nh, 256, 0, s>>>(sc_d, par_d, reinterpret_cast<float2*>(mv_d), ctx);
+    else if (fas) pq1_fa_sm<true><<<nh, 256, 0, s>>>(sc_d, par_d, reinterpret_cast<float2*>(mv_d), ctx);
     else pq1_fa_sm<false><<<nh, 256, 0, s>>>(sc_d, par_d, reinterpret_cast<float2*>(mv_d), ctx);
   }
   if (pq1_fa_mask & 4)
