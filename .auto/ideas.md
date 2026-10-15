@@ -528,3 +528,36 @@ Next hypothesis (v55): batch consecutive engine calls that share identical xq CO
 len-8/len-5 runs found by K2DEDUP: 197+394 runs/token) into ONE launch covering 8x/5x the
 rows with per-item y offsets; ~7.6% fewer launches. Secondary: the engine's own d_xq
 double-buffering so the CPU runs ahead on non-deduped calls (WAR removal).
+
+## Exp68 (run #81, 2026-10-15): ATTENTION SCORE LOOP = the CPU wall — KEPT +15.3%
+- 6.99 -> 8.06 tok/s (143 -> 124 ms/token), EN 216/216 + ZH 114/114 bit-identical.
+- Profiling (new capability, .auto/probe_ctime.c = v52 engine + 3 probes):
+  * K2CTIME: per-call wall = glue (CPU .S between calls) + submit + GPU + poll; per forward.
+  * K2GTIME: cuEventRecord before launch + cuEventElapsedTime = GPU-side ms per call.
+  * K2PROFOUT: SIGPROF PC sampler (2 ms, ITIMER_PROF) -> /proc/self/maps dump; symbolise with `nm -n` + maps.
+- MEASURED SPLIT (v52, 216 forwards, gen 200): forward 144.5 ms = 88.5 ms per-call
+  (GPU 65.8 ms = 7.1 GB/s effective; host submit/poll ~22.7 ms) + 56 ms CPU glue.
+  CPU busy 15.37 s total = 71 ms/forward: libcuda 43.8% (event-poll spin = GPU wait, NOT extra
+  wall), k2ctime(.S engine) 38.1%, libc 10.9% (dedup memcmp 40 KB/call ~5.6 ms/fwd),
+  libpthread 6.7% (sched_yield after 50000 poll spins).
+  Inside the engine: attention_range 2385/3030 samples = 79% -> ~22 ms/forward, the #1 .S cost.
+  Hot PCs 0x4017e8/0x4017ec (1475 samples = 13.7 ms/fwd) = the SCALAR score dot loop.
+- ROOT CAUSE: attention_range's score dot was a 64-element SERIAL fmul/fadd chain
+  (1 float/iter, 4-cycle fadd latency -> ~256 cycles per (head,t)), plus one Q reload per t.
+- FIX (bit-exact by construction): 2-way interleave over t (dots t and t+1 advance in
+  parallel, each keeping its own ascending element order and non-fused fmul/fadd; Q row loaded
+  once per pair). Even-limit `bic x12,x20,#1` + odd tail single-dot path. -12% wall in a
+  standalone gen-200 run, -15.3% on the bench. Registers used: x13,x14,s3,s5,s6.
+- NEXT CANDIDATES (in priority order):
+  1. Re-profile after this change; attention_range should now be ~half. Then the next CPU item
+     (k2_q8_quant 220 smp ~2 ms/fwd, expf 254 smp, rms) and the residual score-loop cost.
+  2. Score dot 2-way -> keep at 2 (fadd latency 4c is covered with 2 chains; 3-4 way adds
+     loads/instructions for no latency gain). Do NOT try fmla/fma (rounding change = not bit-exact).
+  3. The es-loop's `bl expf` per t: a function call per element; the .S has its own expf (line 188)
+     but the call overhead + spill may dominate. Consider inlining a bit-exact copy (same table).
+  4. The p-loop (V accumulation) is already 4-wide ld1/fmla/st1 — 16 iterations of 4 floats.
+     Could be 2-row-blocked but it is not the current hot spot.
+  5. GPU-side 7.1 GB/s vs probe94's 8.45 GB/s ceiling (~10 ms/fwd of headroom) — still the v57
+     wide-load question; measure in-engine with K2GTIME rather than end-to-end.
+  6. Host submit/poll 22.7 ms/fwd: launch count is the only lever left; graphs/persistence/dedup
+     all proved dead (runs #63/#75/#76/#77).

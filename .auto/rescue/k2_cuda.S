@@ -955,31 +955,74 @@ attention_range:
     stp q0, q0, [x26, #224]
     adrp x1, f_n1e30
     ldr s11, [x1, :lo12:f_n1e30]     /* mx = -1e30f */
-    /* ---- scores: t = 0..pos ---- */
+    /* ---- scores: t = 0..pos ----
+       Probe Exp68: 2-way interleaved dots. Each dot keeps its own exact
+       element order (fmul/fadd non-fused, ascending i) so results are
+       bit-identical; only two independent t values share the pipeline
+       (halves Q loads, hides the serial fadd chain latency). */
     mov x27, xzr
-.LattnR_score_t:
-    add x9, x22, x27, lsl #11        /* KCA row */
+    bic x12, x20, #1                 /* largest even value <= pos */
+.LattnR_score_t2:
+    cmp x27, x12
+    b.hs .LattnR_score_tail
+    add x9, x22, x27, lsl #11        /* KCA row t */
     add x9, x9, x2                   /* + khoff */
+    add x13, x9, #2048               /* KCA row t+1 */
     mov x10, x24                     /* Q walk */
-    fmov s4, wzr                     /* dot acc (element order) */
+    fmov s4, wzr                     /* dot t   (element order) */
+    fmov s5, wzr                     /* dot t+1 (element order) */
     mov x11, #64
-.LattnR_score_i:
+.LattnR_score_i2:
+    ldr s0, [x10], #4
+    ldr s1, [x9], #4
+    ldr s3, [x13], #4
+    fmul s2, s0, s1
+    fmul s6, s0, s3
+    fadd s4, s4, s2
+    fadd s5, s5, s6
+    subs x11, x11, #1
+    b.ne .LattnR_score_i2
+    fmov s7, #0.125
+    fmul s0, s4, s7
+    str s0, [x25, x27, lsl #2]
+    fcmp s0, s11
+    b.le .LattnR_score_next2
+    fmov s11, s0
+.LattnR_score_next2:
+    fmul s0, s5, s7
+    add x14, x27, #1
+    str s0, [x25, x14, lsl #2]
+    fcmp s0, s11
+    b.le .LattnR_score_next3
+    fmov s11, s0
+.LattnR_score_next3:
+    add x27, x27, #2
+    b .LattnR_score_t2
+.LattnR_score_tail:
+    cmp x27, x20
+    b.hi .LattnR_score_done
+    add x9, x22, x27, lsl #11
+    add x9, x9, x2
+    mov x10, x24
+    fmov s4, wzr
+    mov x11, #64
+.LattnR_score_i1:
     ldr s0, [x10], #4
     ldr s1, [x9], #4
     fmul s2, s0, s1
     fadd s4, s4, s2
     subs x11, x11, #1
-    b.ne .LattnR_score_i
+    b.ne .LattnR_score_i1
     fmov s7, #0.125
-    fmul s0, s4, s7                  /* sc = s*0.125 */
+    fmul s0, s4, s7
     str s0, [x25, x27, lsl #2]
     fcmp s0, s11
-    b.le .LattnR_score_next          /* update iff sc > mx (C: if (sc > mx)) */
-    fmov s11, s0                     /* mx = sc  (b.le also catches NaN -> keep) */
-.LattnR_score_next:
+    b.le .LattnR_score_next1
+    fmov s11, s0
+.LattnR_score_next1:
     add x27, x27, #1
-    cmp x27, x20
-    b.ls .LattnR_score_t             /* t <= pos */
+    b .LattnR_score_tail
+.LattnR_score_done:
     /* ---- es = sum expf(sc-mx) in f64 ---- */
     fmov d10, xzr
     mov x27, xzr
