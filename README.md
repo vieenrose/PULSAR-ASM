@@ -1,335 +1,202 @@
-# PULSAR-ASM
+# PULSAR-ASM: K2-Horizon-0.9B on a Jetson Nano
 
-**Inference hardware for every demo below: a Samsung Galaxy Note 10+
-(Snapdragon 855, 4 big cores, CPU-only) — except `Ternary-Bonsai-2-27B`
-(5.95 GB), which streams 5.9 GB per token and runs on the DGX Spark's 20
-Cortex-X925 cores, CPU-only.** The gemma-3 and FunctionGemma panes are the one
-carve-out: still the Pi's bytes, because that checkpoint set is no longer on
-any reachable machine — their Note10+ re-shoot is pending, not abandoned.
+A 0.9-billion-parameter language model running at **12.3 tokens/s decode on a
+Jetson Nano Gen1**, the 2019 4 GB board, using its 128-core Maxwell GPU. The model
+is IFM's **K2-Horizon-0.9B** (dense Llama-style decoder, GQA), quantized to Q4.
+The host side of the engine is hand-written AArch64 assembly; the GPU side is
+a hand-written PTX kernel driven from a small C runtime.
 
-K2-Horizon-0.9B runs on the phone too, through the pure-assembly runtime in
-`pulsar_arm/k2horizon/` (greedy streams identical to the scalar C reference,
-token for token, logits included):
+| | |
+|---|---|
+| Model | `IFM/K2-Horizon-0.9B`: 28 layers, hidden 1536, intermediate 5120, 32 q-heads / 8 kv-heads, head_dim 64, vocab 64256 |
+| Weights | Q4_0-style blocks (32 weights, fp16 scale), `k2h_09_q4.blob`, 748,976,168 bytes, md5 `1b026978510f9111bb0a6a6607f3c50d` |
+| Engine | AArch64 assembly (`.auto/rescue/k2_cuda.S`) + C runtime (`pulsar_arm/k2horizon/gpu_v52/k2_gexp_engine_v52.c`) that `dlopen`s the L4T `libcuda` and JIT-loads one PTX kernel (sm_50 PTX, runs on sm_53). No CUDA toolkit, cuBLAS or Python at runtime |
+| Accuracy | every GEMV bit-identical to the engine's own scalar CPU reference; greedy streams frozen as goldens (logits to 4 decimals) and enforced by a gate on every change |
 
-| checkpoint | hidden | intermediate | layers | bytes | decode (phone) |
-|---|---|---|---|---|---|
-| `k2h_09_q4` (original) | 1536 | 5120 | 28 | 749 MB | **~51 ms/token** (4-thread decode, short context) |
-| `k2h_ft_q4` (meeting-agent FT) | 1536 | 5120 | 28 | 769 MB | same engine; long-context cost in demos |
+## Demo
 
-Two Bonsai checkpoints run on the C + NEON port in `pulsar_arm/bonsai2/`
-(greedy streams identical to the reference server, token for token), with
-dimensions coming from the GGUF header so one binary covers each family:
+![K2-Horizon-0.9B on a Jetson Nano, English over Traditional Chinese](doc/k2horizon-jetson-nano-en-zh.gif)
 
-| checkpoint | hidden | intermediate | layers | bytes | decode |
-|---|---|---|---|---|---|
-| `Ternary-Bonsai-2-27B-PTQ1_0` | 5120 | 17408 | 64 | 5.95 GB | **~0.10 s/token** (9.7 tok/s decode, 8 threads, Spark) |
-| `Ternary-Bonsai-8B-PQ2_0` | 4096 | 12288 | 36 | 2.18 GB | **~35 ms/token** (28 tok/s, 6 threads Spark; 4.7 tok/s phone) |
+Both runs are greedy and use the model's **ceiling prompts**, the hardest
+prompts it answers correctly in each language (found by probing, see
+`pulsar_arm/k2horizon/eval/ZH_CEILING.md`):
 
-Three gemma checkpoints run unmodified on the Pi engine, which reads its
-dimensions from the safetensors header, so one binary covers all of them:
+- **English:** "Explain what a neural network is in two sentences." (the seasons
+  list loops and a haiku rambles under greedy decoding, so they don't qualify).
+- **Traditional Chinese:** "Name the four seasons in Traditional Chinese, only the
+  four names, no explanation." Twelve zh probes were tried; this is the longest
+  answer the base model gets right. It is an English-leaning model: it deliberates
+  in English, then answers 春 夏 秋 冬 and stops.
 
-| checkpoint | hidden | intermediate | layers | bytes/token | decode |
-|---|---|---|---|---|---|
-| `google/gemma-3-1b-it-qat-q4_0-unquantized` | 1152 | 6912 | 26 | 2.00 GB | **~543 ms/token** (1.8 tok/s) |
-| `google/gemma-3-270m-it-qat-q4_0-unquantized` | 640 | 2048 | 18 | 536 MB | ~147 ms/token (6.8 tok/s) |
-| `google/functiongemma-270m-it` | 640 | 2048 | 18 | 536 MB | same as 270m |
+```sh
+./k2_gexp k2h_09_q4.blob 64018 2985 200 21127 542 1426 265 30066 4318 394 316 1662 37398 15 64019 64018 612 10102 200 64029 200 --gen 200 --threads 1 --batch 8   # en
+./k2_gexp k2h_09_q4.blob 64018 2985 200 2226 294 3957 29181 316 43658 10627 13 1546 294 3957 8045 13 1026 28045 15 64019 64018 612 10102 200 64029 200 --gen 100 --threads 1 --batch 8   # zh-TW
+```
+
+How the clip was made, and what it is not:
+
+- The streams come from the committed engine on the Nano (`jetson_clocks`; GPU
+  921.6 MHz and CPU 1.479 GHz observed during decode). They match
+  `.auto/k2nano_golden.txt` (216 steps) and `.auto/k2nano_golden_zh.txt`
+  (114 steps) exactly, and were detokenized with the base tokenizer. The text is
+  identical to the phone transcripts of the same prompts, which is the expected
+  result of the bit-exact design.
+- The status bar shows **decode-only** rates, measured as the difference between a
+  `--gen N` run and a `--gen 0` run (median of 3): English 81.4 ms/token
+  (12.3 tok/s) over 195 generated steps, Chinese 78.7 ms/token (12.7 tok/s)
+  over 88 steps.
+- The frames are rendered at a fixed cadence, **not** in real time; only the
+  pacing is a liberty. The transcripts are literals in
+  `pulsar_arm/tools/make_chat_gif.py`, so re-rendering can only reproduce these
+  frames: `python3 -I pulsar_arm/tools/make_chat_gif.py k2-nano` (Pillow and
+  ffmpeg needed).
 
 ## At a glance
 
 | | |
 |---|---|
-| Target | Samsung Galaxy Note 10+, Snapdragon 855 / 4 big cores, CPU-only — every demo except the 27B; DGX Spark, 20 Cortex-X925 cores, CPU-only — for the 27B (gemma panes still Pi-shot, re-shoot pending) |
-| Engine | one static binary: `as` + `ld`, direct syscalls, zero dependencies (K2-Horizon `k2_core.S`, gemma `core.S`); C + NEON + OpenMP in `pulsar_arm/bonsai2/` (Bonsai) |
-| Bandwidth | ~3.6–3.9 GB/s of a measured 3.93 GB/s streaming ceiling (92–98 %) |
-| Parity | greedy output identical to transformers, token for token (1B bf16, 270m fp32); greedy Bonsai streams identical to the reference server, token for token (27B 17/17, 8B 5/5), plus a full top-20 distribution match |
-| Determinism | fixed seed ⇒ byte-identical transcripts across runs |
+| Board | Jetson Nano Gen1: Tegra X1, 4x Cortex-A57, one Maxwell SM (sm_53, 128 cores), 4 GB LPDDR4 shared by CPU and GPU. L4T R32.5.1, CUDA 10.2 |
+| Decode | **12.3 tok/s** en / 12.7 tok/s zh-TW (about 80 ms/token) |
+| Whole-run benchmark | **11.2 tok/s** (89-90 ms/step): 216 greedy steps on the English prompt, startup and the 21-token prefill included. This is the number the repository's bench reports |
+| Prefill | token by token through the decode path, about the same speed as decode. `--gen 0` (startup plus the 21-token prompt) takes 3.1 s |
+| CPU only | 1.11 tok/s on the same board (single A57 core, `k2_core_a57.S`) |
+| Memory | about 850 MB peak RSS in the GPU run; context capped at 1536 positions |
+| Conditions | `--threads 1` (the GPU path is single-thread by design), greedy, one sequence |
 
-## Quick start
+## How it works
 
-```sh
-# 1. build the engine
-cd pulsar_arm/asm
-as -o core.o core.S && ld -static -o core core.o
+At startup the Q4 weights are repacked once into 16-byte blocks in device memory
+(single copy, no mirror). A decoded token then costs **113 GPU launches**: per layer
+one merged q+k+v GEMV, the o projection, one merged gate+up GEMV and the down
+projection (28 x 4), plus the 64256-row output head.
 
-# 2. tokenizer blobs, once (the gemma-3 checkpoints share one tokenizer)
-python3 ../tools/mkvocab.py <tokenizer.json> vocab.bin   # surfaces + byte fallback
-python3 ../tools/mkbpe.py   <tokenizer.json> bpe.bin     # 514,906 merge rules
+- **GPU (hand-written PTX).** One warp covers four rows. Each block of 32 Q4
+  weights is unpacked with `bfe` and multiplied against Q8_K-quantized
+  activations with `mad.lo.s32`, so the integer dots are exact. The float
+  epilogue (`fmul` of the two scales, then `fma` accumulation, blocks in order) is
+  the same arithmetic, in the same order, as the CPU scalar reference. That is what
+  makes the output bit-identical, and it means the kernel's float chain cannot be
+  reassociated.
+- **CPU (assembly).** Embedding, RMS norms, RoPE, the KV-cache store, grouped-query
+  attention with an f64 softmax sum, SwiGLU (with an `expf` that reproduces glibc's
+  bit for bit), the Q8_K activation quantizer, the argmax or sampler. Attention
+  is the largest CPU cost (about 8 ms/token); it is strictly ordered scalar
+  arithmetic too, so it was made fast by data layout and loop structure, not by
+  reassociation.
+- **Per-call driver path.** Each GEMV round trip is: the activation block is written
+  into mapped pinned memory and a tiny copy kernel moves it to the device (skipped
+  when the bytes are unchanged, which happens on a large share of calls); the GEMV kernel writes its
+  result straight into mapped pinned memory; completion is a timing-free CUDA
+  event polled by the host; the result is read back with four interleaved 64-byte
+  NEON streams, because that memory is uncached for the CPU and a plain `memcpy`
+  reads it at 0.72 GB/s. Switches: `K2XQCOPY=0`, `K2YDIRECT=0`, `K2DEDUP=0` restore
+  the older paths for A/B.
+- **Where a token goes** (about 90 ms): roughly 61 ms of GPU kernel time, 15-20 ms of
+  CPU work (attention first) and the rest driver submission and waiting. CPU and
+  GPU work barely overlap, because every GEMV output feeds the next stage.
 
-# 3. greedy bench: 8-token prompt, 32 decode steps, ids + ms/token
-./core gemma-3-270m-it-qat-q4_0.safetensors vocab.bin
-./core gemma-3-1b-it-qat-q4_0.safetensors   vocab.bin
+## Speed history
 
-# 4. chat REPL (needs bpe.bin)
-./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48
+Every step below was kept only after the golden gate passed. Same-board A/B was
+used throughout; the board drifts by a few percent from hour to hour, so only
+figures from the same job are comparable.
 
-# 5. file mode: raw prompt on stdin, greedy, one shot (needs bpe.bin)
-./core functiongemma-270m-it.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16 < prompt.txt
-```
-
-`functiongemma-270m-it` uses its own `fcvocab.bin` / `fcbpe.bin`, built from its
-own `tokenizer.json` with the same two tools.
-
-## Bonsai quick start (aarch64 with ARMv8.2+dotprod, e.g. the Spark)
-
-```sh
-cd pulsar_arm/bonsai2
-LB=<llama.cpp>/build/bin   # fork libs, quantization helpers + oracles only
-python3 sign_extract.py Ternary-Bonsai-2-27B-PTQ1_0.gguf  # -> /tmp/sign{5120,6144,17408}.bin
-# 27B engine:
-gcc -O2 -fopenmp -march=armv8.2-a+dotprod -DTQ_XGEMV_LIB -Dmain=tq_neon_main \
-  -c tq_gemv_neon.c -o fwd_neon_mt.o
-gcc -O2 -fopenmp -march=armv8.2-a+dotprod -c fwd.c -o fwd.o
-gcc -O2 -fopenmp -o fwd fwd.o fwd_neon_mt.o fwht.S \
-  -L$LB -lggml-base -lggml-cpu -Wl,-rpath,$LB -lm
-# prompt ids from the checkpoint's own template + tokenizer:
-./tokdetok tokstr Ternary-Bonsai-2-27B-PTQ1_0.gguf <prompt words...>
-# greedy (deterministic, the reference behaviour) then sampled:
-OMP_NUM_THREADS=20 ./fwd Ternary-Bonsai-2-27B-PTQ1_0.gguf <ids...> --gen 200
-OMP_NUM_THREADS=20 ./fwd Ternary-Bonsai-2-27B-PTQ1_0.gguf <ids...> --gen 200 \
-  --sample 0.5 0.85 20 <seed> 0.05
-```
-
-The sampler follows the fork chain order (top-k → top-p → min-p on raw
-logits, temperature scale last); the server default min-p is 0.05. The 8B
-engine builds the same way from `pq2_gemv.c` + `fwd8.c` (no sign tables —
-that checkpoint carries no Hadamard transform).
-
-## Modes and flags
-
-```
-./core <model.safetensors> <vocab.bin> [tok] [mode] [bpe.bin] [temp_milli] [topp_milli] [gencap]
-```
-
-| arg | meaning |
+| stage | tok/s (whole-run bench) |
 |---|---|
-| `tok` | token id for the startup layer-0 signature self-test (the bench prompt itself is built in) |
-| `mode` | `0` greedy bench (default) · `1` sampled bench · `c` chat REPL · `f` file mode |
-| `bpe.bin` | required by `c` and `f` |
-| `temp_milli` | sampling temperature ×1000 (default 1000, min 50) |
-| `topp_milli` | top-p ×1000 (default 950) |
-| `gencap` | max generated tokens (default 128, max 400) |
+| first GPU build (one thread per row, strided loads) | 1.19 |
+| 4-row blocking with a single-copy 16-byte repack | 3.73 |
+| event-based completion plus kernel tuning | 6.5-7.0 |
+| merged q+k+v and gate+up launches (197 to 113 per token) | 8.6 |
+| attention rewrite (interleaved score chains, register-resident accumulators, prefetch) | 10.3 |
+| NEON quantizer, contiguous per-head KV layout, 16-row transposed score block, vector divide | 11.1 |
+| 4-stream readback | 11.2 |
+| timing-free event, direct result write, copy-kernel staging | 11.2 (about 1.3-2 ms/step more by paired timing; the bench's 1 ms resolution cannot show it) |
 
-Sampling follows the model card: temperature 1.0, **top-k 64**, top-p 0.95
-(min-p 0), which is what the sampler implements. Measured guidance beyond that:
-keep temp ≥ 0.7 (0.5 degenerates into token loops), top-p is neutral here
-(0.5 / 0.95 / 1.0 all stay diverse), and gencap bounds output cleanly. The chat template (SOT/EOT roles) is verified id-exact
-against HF, and every run prints its prefill ids as `tpl:` for transparency.
+## Limits, measured and estimated
 
-## Demos
+- **Measured dead ends.** Batched prefill through one `grid.z` launch gave about
+  1 % (the cost is per-slot ALU work, not launch count); whole-step CUDA graph
+  replay (0.87 tok/s), activations read straight from host memory by the GEMV
+  kernel (5x slower), a managed-memory result buffer (8 % slower), L2-only or deeper
+  attention prefetch, an 8-way score interleave and a 2-wide `expf` were all
+  measured and discarded. The record is in
+  `.auto/log.jsonl` and `.auto/ideas.md`.
+- **Estimated ceiling, not measured:** from the SASS instruction mix the GEMV kernel
+  looks ALU-issue bound (BFE and XMAD dominate; sm_53 has no `dp4a`), and removing
+  every remaining CPU and driver cost would land near 14 tok/s with this
+  arithmetic. Hardware counters are not available without root, so this is an
+  inference from the instruction mix, not a profile.
+- Prefill is not batched, so a long prompt costs about 80 ms per token.
+- Context is capped at 1536 tokens; one sequence at a time; `--threads 1` only.
+- The base model is English-leaning. Chinese answers longer than a few words loop or
+  err (`eval/ZH_CEILING.md`); the meeting-agent fine-tune
+  (`k2h_ft_q4`) runs on the same engine but is shown on the phone page.
 
-Every frame is a real run: prompt, `tpl:` ids and response are the engine's own
-bytes, and the status bar carries that session's measured rate. The amber `>`
-line is the user turn — in the FunctionGemma panes it is the user message
-inside the prompt file, which file mode does not echo, and those panes also
-show the system turn verbatim, i.e. where the tool is defined.
+## Accuracy
 
-Each model gets **one GIF with both language runs stacked**: English above,
-Traditional Chinese below; K2-Horizon keeps two GIFs, original then fine-tune.
-The panes share a timeline, and only pacing is libertied. All clips share one
-font size and one typeface — DejaVu Sans Mono, with WenQuanYi Zen Hei used
-only for the CJK glyphs DejaVu lacks, at the same size and line height.
+`bash .auto/measure.sh` builds on the Nano, runs four interleaved legs
+(GPU, CPU, CPU, GPU) and compares the 216-step English greedy stream with the
+golden, line by line (token ids and logits to four decimals). `bash .auto/checks.sh`
+then runs the held-out Traditional Chinese stream (114 steps) against its golden.
+At startup the engine also checks its first 8 GEMV calls against the scalar CPU
+reference ("CUDA self-test OK (8/8 bit-exact)") and falls back to the CPU path if
+they differ. None of these gates is ever overridden.
 
-**K2-Horizon-0.9B** — 0.9B dense decoder (IFM, Llama arch), plain RMS norms,
-YaRN rope, vocab 64256; shown in its **original** form and as a zh-TW
-meeting-agent **fine-tune (FT)**, each bilingual (English over Traditional
-Chinese). All four runs are the pure-assembly engine
-(`pulsar_arm/k2horizon/k2_core.S` — `as` + `ld -static`, no libc, syscalls
-only, glibc-bit-identical `expf`/`%.4f`) on the phone's big cores: greedy,
-4-thread decode, 8-token prefill chunks.
+**What "bit-exact" means here.** It is bit-exact against this engine's own Q4
+scalar reference, not against the bf16 checkpoint: the weights are quantized to
+Q4 and the activations to Q8_K, so logits differ from a bf16 transformers run.
+Earlier work checked the Q4 asm engine against the scalar C reference
+(`pulsar_arm/k2horizon/fwd_k2.c`, logits included); see
+`pulsar_arm/k2horizon/HANDOFF.md`.
 
-*Original* — the ceiling prompt is the two-sentence neural explainer in
-English (seasons loops and haiku rambles under greedy, so they don't
-qualify), and the four season names in Traditional Chinese — the strongest zh
-prompt the base model answers correctly (twelve greedy probes; everything
-longer loops, errs, or never answers). 20 tok/s en, 23 tok/s zh; both prompts
-prefill in about a second.
+## Build and run
 
-```sh
-adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 ... --gen 400 --threads 4 --batch 8"   # en
-adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_09_q4.blob 64018 2985 ... --gen 200 --threads 4 --batch 8"   # zh
-```
-
-![K2-Horizon original, en over zh-TW](doc/k2horizon-original-en-zh.gif)
-
-*Fine-tune (FT)* — zh-TW only: the weights were trained specifically on a
-Traditional Chinese meeting corpus, so this demo stays with the language they
-know. The same 0.9B trained for live meeting reading (NOTE/REVISE/NEXT),
-converted from the published int4-QAT safetensors to our own Q4 blob and run
-on the same engine. The run shows the full 6-turn window verbatim, so every
-NOTE can be checked line by line: all five cite genuine timestamps and the
-turn stops at NEXT. The 680-token prefill takes ~25 s of the 69 s run;
-decode averages 8.9 tok/s over positions 680–1080. An English window was
-tried and dropped — these weights degrade off-corpus. Given the same window
-the original model deliberates 150 tokens without emitting a single NOTE —
-that behavioral gap is what the fine-tune buys.
+On the Nano (gcc 7.5, the L4T driver; no toolkit needed):
 
 ```sh
-adb shell "cd /data/local/tmp && taskset f0 ./k2_core k2h_ft_q4.blob $(cat ft_ids680.txt) --gen 400 --threads 4 --batch 8"
+cd pulsar_arm/k2horizon
+as -march=armv8-a ../../.auto/rescue/k2_cuda.S -o k2.o
+gcc -O2 -c gpu_v52/k2_gexp_engine_v52.c -o k2c.o
+gcc -nostartfiles -o k2_gexp k2.o k2c.o -ldl
 ```
 
-![K2-Horizon fine-tune](doc/k2horizon-meeting-zh-tw.gif)
-
-Both K2 blobs are bit-identical on Spark to the scalar C reference
-(`neural2.txt`), logits included.
-
-**Ternary-Bonsai-8B** — 1.58-bit ternary, Qwen3-8B base, Qwen3 sampling
-(temp 0.6, top-p 0.95, top-k 20), 2.18 GB. Native engine
-(`pulsar_arm/bonsai2/`) on the same phone — 4 big cores, no GPU: 4.7 tok/s en,
-4.0 tok/s zh-TW. The same seeds rerun byte-identical on the Spark, so the clip
-is both machines' bytes at once.
-
-![Bonsai 8B chat, en over zh-TW](doc/bonsai8b-chat-en-zh.gif)
+The weights come from the published safetensors (convert on any machine):
 
 ```sh
-adb shell "cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 ... --gen 400 --sample 0.6 0.95 20 7"    # en
-adb shell "cd /data/local/tmp && PQ2_THREADS=4 taskset f0 ./fwd8fresh b8.gguf 151644 872 ... --gen 400 --sample 0.6 0.95 20 123"  # zh-TW
+python3 k2_convert.py <IFM-K2-Horizon-0.9B snapshot> k2h_09_q4.blob [rope tables] --q4   # see the script's docstring
 ```
 
-**Ternary-Bonsai-2-27B** — 1.72 bits/weight end to end, Qwen3.8-27B base, card
-config (temp 0.5, top-p 0.85, top-k 20), 5.95 GB PTQ1_0. Native engine on the
-DGX Spark CPU-only, 8 threads: 7.9 tok/s en, 7.5 tok/s zh-TW. This is the one
-clip that stays off the phone — the 27B streams 5.9 GB per token and needs the
-Spark's 20 cores.
-
-![Bonsai 2 27B chat, en over zh-TW](doc/bonsai2-27b-chat-en-zh.gif)
+Run (token ids in, step lines out; tokenize on another machine with the IFM
+tokenizer and chat template, which ends with `assistant\n<ifm|think>\n`):
 
 ```sh
-./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 826 279 ... --gen 400 --sample 0.5 0.85 20 7      # en
-./fwd_exp Ternary-Bonsai-2-27B-PTQ1_0.gguf 99270 115992 ... --gen 400 --sample 0.5 0.85 20 123  # zh-TW
+sudo jetson_clocks
+./k2_gexp k2h_09_q4.blob <prompt ids...> --gen N --threads 1 --batch 8
+# prints: step <n> id_in=<id> top=<id> logit=<x.xxxx>
 ```
 
-Both Bonsai clips are PULSAR-ASM engine bytes end to end (the predecessor set
-ran the PrismML `llama.cpp` fork and is superseded): the 27B reproduces the fork
-server token for token at temp 0 (20/20 on the probe prompt), the 8B phone
-binary reproduces the Spark engine bit-for-bit including logits, and both rerun
-deterministically from the seeded command in the title card. The 1.7B/4B
-checkpoints were evaluated and set aside over output quality. The zh-TW panes
-ask the same four-seasons question: the 27B answers with a compact table
-including its reasoning trace, the 8B with a longer four-section list.
-
-**gemma-3-1b-it** — the most complex prompt the checkpoint answers *correctly*
-in each language (a four-item structured list; a three-item one in zh-TW), both
-complete and clean:
-
-![1B chat, en over zh-TW](doc/gemma3-1b-chat-en-zh.gif)
-
-```sh
-printf 'List the four seasons and one thing that changes in each.\n' | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 123
-printf '請列出保持健康的三個要點。\n'                                | ./core gemma-3-1b-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 172
-```
-
-The gen caps end each run on the model's closing line; the sampler is the
-checkpoint's recommended configuration (temperature 1.0, top-k 64, top-p 0.95),
-which is what the engine implements.
-
-**gemma-3-270m-it** — same binary, 18 layers:
-
-![270m chat, en over zh-TW](doc/gemma3-270m-chat-en-zh.gif)
-
-```sh
-printf 'Explain gravity in two sentences for a child.\n' | ./core gemma-3-270m-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48
-printf '請用一句話解釋什麼是量子力學。\n'                 | ./core gemma-3-270m-it-qat-q4_0.safetensors vocab.bin 2 c bpe.bin 1000 950 48
-```
-
-**FunctionGemma-270m-it** — an English and a Traditional-Chinese question
-become the same tool call (one schema; only the user turn differs):
-
-![FunctionGemma tool call, en over zh-TW](doc/functiongemma-toolcall-en-zh.gif)
-
-```sh
-python3 pulsar_arm/tools/fc_write.py   # -> /tmp/tool_official.txt, /tmp/tool_official_zhtw.txt
-./core functiongemma.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16 < /tmp/tool_official.txt
-./core functiongemma.safetensors fcvocab.bin 2 f fcbpe.bin 1000 950 16 < /tmp/tool_official_zhtw.txt
-```
-
-The gemma and FunctionGemma panes above are still the Pi's bytes (their Note10+
-re-shoot is pending the checkpoint files). Re-render any subset with
-`python3 pulsar_arm/tools/make_chat_gif.py` (needs PIL + ffmpeg); the
-transcripts are literals in that file, so a re-run can only reproduce these
-frames, never invent them.
-
-## Verified gates
-
-- **Bonsai greedy parity.** 27B: 17-token stream exact vs the reference
-  server at temp-0; 8B: 5/5 exact. Full top-20 distribution match at a
-  sampled position (19/20 same ids, same order) — the engines' logits are
-  the fork's logits, so sampling draws from the same distribution.
-- **Bonsai kernels.** PTQ1_0 decoder, FWHT-1024, full 89M-weight projection
-  and both NEON GEMVs bit-exact vs the fork (26.0 ms / 0.29 ns/w PTQ1_0,
-  7.3 ms / 0.15 ns/w PQ2_0, single pinned core); GDN and both ropes at
-  fp32-vs-op level. See `pulsar_arm/bonsai2/README.md` for the ledger.
-- **HF-exact decode.** Greedy output is identical to transformers token for
-  token: 32/32 bench tokens for both 270m (fp32) and 1B (bf16), and complete
-  chat transcripts — 1B answers *"The capital of France is **Paris**."* exactly
-  as HF does. The 270m residual also matches an fp64 oracle to ~1e-7 at every
-  layer and every position.
-- **One binary, header-driven dims.** `dims hid/inter/layers/vocab: 1152 6912
-  26 262144` and `640 2048 18 262144` from the same build — hidden width,
-  intermediate width, layer count, vocab, the folded-norm stride, every kernel
-  dimension and the full-attention set (`i mod 6 == 5`) all come from the file.
-- **BPE encode** 18/18 exact vs HF (char-level init, rank-order merges,
-  leftmost tie-break, byte fallback).
-- **Determinism.** Greedy, sampled and full chat transcripts reproduce
-  bit-for-bit across runs at a fixed seed.
-- **Robustness.** Empty / whitespace / CRLF input, 203-token prefill, 8-turn
-  depth with automatic context reset, EOF and exit paths, gen-cap boundary.
-- **asm at C parity.** GEMV reaches 3.88 GB/s using a single SHLL instruction
-  for bf16 widening; the bit-identical wins the C port proved (fused
-  elementwise passes, one layer body per call, precomputed tables) are present
-  in the asm path too.
-
-## Performance
-
-- **Bonsai wall.** The 27B streams ~5.9 GB/token of ternary weights;
-  single-core cost is ~7.6 s/token, OpenMP over GEMV rows brings it to
-  ~0.71 s/token on 20 cores (bit-identical tops). The NEON integer kernel
-  does 0.29 ns/weight (PTQ1_0) and 0.15 ns/weight (PQ2_0) — 5.3× and more
-  over the scalar paths, which is what makes the port practical; the float
-  path it replaced ran 153 ms per 89M-weight projection.
-- **The wall.** A numpy streaming-sum ceiling of 3.93 GB/s was measured on this
-  Pi. The driver moves 536 MB/token for 270m and 2.00 GB/token for 1B, i.e.
-  3.6–3.9 GB/s depending on the run — the same bus saturation at both sizes,
-  so the floor is ~136 ms/token for 270m and ~510 ms/token for 1B here.
-- **Multi-core is not the answer.** A 3-thread static-partition GEMV is 4.2 %
-  *slower* (same-job A/B, twice): the bus is already saturated.
-- **Thermal drift.** Absolute numbers move 5–18 % between sessions; compare
-  same-job A/B ratios, never absolutes.
+The CPU-only engine used as the reference leg of the bench is
+`pulsar_arm/k2horizon/k2_core_a57.S`; `pulsar_arm/k2horizon/k2_core.S` is the
+pure-assembly phone build. `bash .auto/k2nano_preflight.sh` checks that every
+asset the bench needs is in place on both machines.
 
 ## Layout
 
 ```
-pulsar_arm/asm/core.S        the engine: mmap stage → kernels → layer forward
-                             → sampler → BPE → chat / bench / file drivers
-pulsar_arm/tools/            build-time converters (mkvocab, mkbpe, fc_write),
-                             oracles (fwd_ref, l0_any, hf_greedy), the per-layer
-                             debug probe patch, demo renderer
-pulsar_arm/kernels, runtime  C reference path — parity oracle only, NOT shipped
-pulsar_arm/bonsai2/          Bonsai ternary port (C + NEON, CPU-only): fwd/fwd8
-                             engines, NEON GEMVs, FWHT asm, GGUF/tokenizer
-                             tools, fork-graph oracle, own README + ledger
-pulsar_arm/k2horizon/        K2-Horizon-0.9B port: pure-asm runtime (k2_core.S:
-                             threaded decode + chunked prefill), Q4 converter,
-                             fine-tune conversion, oracle + eval harness
-pulsar_arm/tests/            parity tests (Pi-side, need torch + HF cache)
-doc/                         demo GIFs and write-ups
+.auto/rescue/k2_cuda.S               host engine (assembly): CPU stages, loader, sampler, driver glue
+pulsar_arm/k2horizon/gpu_v52/        C runtime: libcuda via dlopen, PTX GEMV kernel, staging, completion
+pulsar_arm/k2horizon/gpu_v*/         earlier kernel generations and driver probes, kept for the record
+pulsar_arm/k2horizon/k2_core*.S      CPU-only assembly engines (Cortex-A57 and phone builds)
+pulsar_arm/k2horizon/k2_convert.py   safetensors to Q4 blob; fwd_k2.c scalar C reference; k2_oracle.py
+pulsar_arm/k2horizon/eval/           prompt probes (ceiling hunt) and fine-tune quality notes
+pulsar_arm/tools/make_chat_gif.py    demo renderer; transcripts are literals
+.auto/                               bench, gates, goldens, preflight, log.jsonl, ideas.md
+doc/                                 demo GIFs; OTHER_ENGINES.md
 ```
 
-## Disclosures
+## Other engines in this repository
 
-- Every demo clip is the in-tree engine's own bytes (no reference runtime):
-  transcripts are verified programmatically against the run logs, never
-  hand-typed. The K2, Bonsai 8B and Bonsai 27B clips are phone (SD855, big
-  cores) and Spark shots; the gemma and FunctionGemma series is still the
-  Pi's bytes, because that checkpoint set is no longer on any reachable
-  machine — their re-shoot is pending, not abandoned.
-- The 27B is a reasoning model: its raw stream opens inside `<think>`;
-  clips show the answer content as the server renders it (reasoning kept
-  out of frame, same convention).
-- The 1B answers multi-item and explanatory prompts (see demos); the 270m
-  manages one-line factual answers and degrades beyond that — checkpoint size,
-  not the engine, whose greedy path is HF-identical for both.
-- The chat path feeds `<bos>` separately on the first turn, so it is not part
-  of the printed `tpl:` list; in file mode `<bos>` is literal text in the
-  prompt file, so it is.
-- Sampling above temp 0.7 stays coherent; greedy is the reference behaviour
-  and what all parity claims use.
+The repository started as pure-assembly engines for other models and boards:
+Gemma-3 on a Raspberry Pi 4 (a single static AArch64 binary with no libc), FunctionGemma,
+the C + NEON Ternary-Bonsai 8B and 27B ports, and K2-Horizon on a phone CPU.
+They still work and are documented in [doc/OTHER_ENGINES.md](doc/OTHER_ENGINES.md).

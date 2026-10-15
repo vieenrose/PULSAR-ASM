@@ -303,6 +303,41 @@ SPECS = {
         panes=("fc-en", "fc-zh-tw")),
 }
 
+# ---- K2-Horizon-0.9B on the Jetson Nano (Tegra X1 GPU + asm host) ----------
+# Same two ceiling prompts as the phone clips (the neural-network explainer in
+# English; the four season names in Traditional Chinese). The greedy streams
+# are the ones frozen in .auto/k2nano_golden.txt (216 steps) and
+# .auto/k2nano_golden_zh.txt (114 steps), re-run on the committed engine and
+# detokenized with the base tokenizer: the decoded text is byte-identical to
+# the phone transcripts above, which is why the responses are reused verbatim.
+# Rates are decode only, from paired runs on the Nano (`--gen N` against
+# `--gen 0`, median of 3, jetson_clocks): en 18972-3101 ms over 195 generated
+# steps = 81.4 ms/token; zh 10397-3473 ms over 88 steps = 78.7 ms/token.
+_K2_EN_IDS = ("64018 2985 200 21127 542 1426 265 30066 4318 394 316 1662 37398 "
+              "15 64019 64018 612 10102 200 64029 200")
+_K2_ZH_IDS = ("64018 2985 200 2226 294 3957 29181 316 43658 10627 13 1546 294 "
+              "3957 8045 13 1026 28045 15 64019 64018 612 10102 200 64029 200")
+_K2_TPL = (" \u2014 IFM chat template ends with assistant\\n<ifm|think>\\n"
+           " (id 64029), so generation starts inside the think block and"
+           " only the closer </ifm|think> is generated")
+SPECS["k2nano-neural"] = dict(
+    SPECS["k2base-neural"],
+    out="k2horizon-jetson-nano-en.gif",
+    title="pulsar \u00b7 K2-Horizon-0.9B \u00b7 Jetson Nano GPU",
+    cmd="$ ./k2_gexp k2h_09_q4.blob " + _K2_EN_IDS + " --gen 200 --threads 1 --batch 8",
+    tpl="prompt ids: " + _K2_EN_IDS + _K2_TPL,
+    status="12.3 tok/s \u00b7 greedy \u00b7 Jetson Nano, 128-core Maxwell GPU + asm host")
+SPECS["k2nano-zh"] = dict(
+    SPECS["k2base-zh"],
+    out="k2horizon-jetson-nano-zh-tw.gif",
+    title="pulsar \u00b7 K2-Horizon-0.9B \u00b7 Jetson Nano GPU",
+    cmd="$ ./k2_gexp k2h_09_q4.blob " + _K2_ZH_IDS + " --gen 100 --threads 1 --batch 8",
+    tpl="prompt ids: " + _K2_ZH_IDS + _K2_TPL,
+    status="12.7 tok/s \u00b7 greedy \u00b7 Jetson Nano, 128-core Maxwell GPU + asm host")
+SPECS["k2-nano"] = dict(
+    out="k2horizon-jetson-nano-en-zh.gif",
+    panes=("k2nano-neural", "k2nano-zh"))
+
 
 def _is_cjk(ch):
     o = ord(ch)
