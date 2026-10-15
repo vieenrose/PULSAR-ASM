@@ -638,6 +638,9 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv5(const uint4 *__restr
     y[r] = acc;
 }
 
+// q6i activation order in shared memory: element i of each group of 4 stored at
+// position (a0, a2, a1, a3); sub-block sums (16 aligned elements) are unchanged
+#define Q6P(i) (((i) & ~3) | (((i) & 1) << 1) | (((i) >> 1) & 1))
 // ------------------------------------------------------------------------------
 // Q6_K tied head, row-per-lane ("q6i"): same arithmetic as gemv_q6k_rows in
 // g4ref.c - per 256-block, isum = sum_j sc_j * sum_{t in sub-block j} (q_t-32)*a_t
@@ -654,7 +657,9 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv(const uint4 *__restri
     __shared__ int SA[96];                   // 6 blocks x 16 sub-blocks
     __shared__ float DA[6];
     const int tid = threadIdx.y * 32 + threadIdx.x;
-    for (int i = tid; i < 1536; i += 256) A[i] = (short)(int8_t)xq[(i >> 8) * 292 + 4 + (i & 255)];
+    // stored permuted within each group of 4 as (a0, a2, a1, a3): word x of a uint2
+    // pairs with bytes 0, 2 of a value word, word y with bytes 1, 3 (dot2_s16)
+    for (int i = tid; i < 1536; i += 256) A[Q6P(i)] = (short)(int8_t)xq[(i >> 8) * 292 + 4 + (i & 255)];
     if (tid < 6) DA[tid] = *(const float *)(xq + tid * 292);
     __syncthreads();
     if (tid < 96) {
@@ -692,13 +697,11 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv(const uint4 *__restri
                     ((L1 >> 4) & 0x0F0F0F0Fu) | ((Hh >> 2) & 0x30303030u)};
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
-                    const uint2 av = A2[(128 * n + 32 * k + 4 * lg) >> 2];   // 4 int16 activations
-                    const int a0 = (int)(short)(av.x & 0xffffu), a1 = (int)av.x >> 16;
-                    const int a2 = (int)(short)(av.y & 0xffffu), a3 = (int)av.y >> 16;
+                    const uint2 av = A2[(128 * n + 32 * k + 4 * lg) >> 2];   // (a0,a2), (a1,a3)
                     const unsigned q = qk[k];
                     const int j = 8 * n + 2 * k + (lg >> 2);
-                    p[j] += (int)(q & 0xffu) * a0 + (int)((q >> 8) & 0xffu) * a1
-                          + (int)((q >> 16) & 0xffu) * a2 + (int)(q >> 24) * a3;
+                    p[j] = dot2_s16(q & 0x00FF00FFu, av.x, p[j]);
+                    p[j] = dot2_s16((q >> 8) & 0x00FF00FFu, av.y, p[j]);
                 }
             }
         }
@@ -879,7 +882,7 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__rest
     const int tid = threadIdx.y * 32 + threadIdx.x;
     for (int i = tid; i < B * 1536; i += 256) {
         const int t = i / 1536, c = i % 1536;
-        A[i] = (short)(int8_t)xq[t * xstride + (c >> 8) * 292 + 4 + (c & 255)];
+        A[t * 1536 + Q6P(c)] = (short)(int8_t)xq[t * xstride + (c >> 8) * 292 + 4 + (c & 255)];   // as q6i_gemv
     }
     for (int i = tid; i < B * 6; i += 256) DA[i] = *(const float *)(xq + (i / 6) * xstride + (i % 6) * 292);
     __syncthreads();
@@ -931,10 +934,8 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__rest
                             #pragma unroll
                             for (int g = 0; g < 4; g++) {
                                 const uint2 av = A2[g];
-                                p += (int)(q[g] & 0xffu) * (int)(short)(av.x & 0xffffu)
-                                   + (int)((q[g] >> 8) & 0xffu) * ((int)av.x >> 16)
-                                   + (int)((q[g] >> 16) & 0xffu) * (int)(short)(av.y & 0xffffu)
-                                   + (int)(q[g] >> 24) * ((int)av.y >> 16);
+                                p = dot2_s16(q[g] & 0x00FF00FFu, av.x, p);
+                                p = dot2_s16((q[g] >> 8) & 0x00FF00FFu, av.y, p);
                             }
                             s[t] += (int)scb[j] * (p - 32 * SA[t * 96 + b * 16 + j]);
                         }

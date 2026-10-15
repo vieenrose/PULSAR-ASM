@@ -45,7 +45,7 @@ static CUresult (*cuMemHostGetDevicePointer_)(uint64_t *, void *, unsigned);
 static void *sym(void *h, const char *n) { void *p = dlsym(h, n); if (!p) { fprintf(stderr, "no %s\n", n); exit(3); } return p; }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
-static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i, *fq4ib, *fgeglub, *fargb;
+static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i, *fq4ib, *fgeglub, *fargb, *fq6ib;
 static uint64_t dYdevB, dHdevB, dX2B, dLogB;   /* batched prefill intermediates (BATCH_MAX tokens) */
 /* per tensor: 0 = K2 q4_gemv layout, 1 = q4i_gemv3 (q4i_gemv4: row-per-lane, tile-interleaved).
    Chosen per weight group at load: q4i where it measured faster (>= 1536 rows and
@@ -236,7 +236,13 @@ static void gpu_head_b(const tensor_t *emb, const uint8_t *xq, int xs, int B, in
     double a_ = prof ? now_ms() : 0;
     stage_in(xq, (size_t)B * xs, dX);
     double b_ = prof ? now_ms() : 0;
-    for (int t = 0; t < B; t++) {
+    /* one q6i_gemv_b launch: each weight block read once for all B tokens (paired
+       6-bit decode made it faster than B single launches); G4HEAD1=1: B launches */
+    if (!getenv("G4HEAD1")) {
+        int ib = B, ixs = xs, iys = VOCAB;
+        void *a[] = {&dHead, &dX, &dLogB, &rows, &ib, &ixs, &iys};
+        CK(cuLaunchKernel_(fq6ib, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, stream, a, NULL));
+    } else for (int t = 0; t < B; t++) {
         uint64_t xt = dX + (uint64_t)t * xs, yt = dLogB + (uint64_t)t * VOCAB * 4;
         void *a[] = {&dHead, &xt, &yt, &rows};
         CK(cuLaunchKernel_(fq6, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, stream, a, NULL));
@@ -393,7 +399,7 @@ static void gpu_init(void) {
     CK(cuModuleGetFunction_(&fq4i, mk, getenv("G4Q4I4") ? "q4i_gemv4" : "q4i_gemv5"));   /* G4Q4I4=1: previous kernel (A/B) */
     CK(cuModuleGetFunction_(&fq6, mk, "q6i_gemv"));
     CK(cuModuleGetFunction_(&fq4ib, mk, getenv("G4Q4I4") ? "q4i_gemv_b" : "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fgeglub, mk, "geglu_b"));
-    CK(cuModuleGetFunction_(&fargb, mk, "argmax_b"));
+    CK(cuModuleGetFunction_(&fargb, mk, "argmax_b")); CK(cuModuleGetFunction_(&fq6ib, mk, "q6i_gemv_b"));
     dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
     dYdevB = dalloc((size_t)BATCH_MAX * 4 * INTER * 4); dHdevB = dalloc((size_t)BATCH_MAX * 2 * INTER * 4);
     dX2B = dalloc((size_t)BATCH_MAX * sizeof XQ); dLogB = dalloc((size_t)BATCH_MAX * VOCAB * 4);
