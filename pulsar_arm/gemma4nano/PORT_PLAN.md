@@ -121,3 +121,25 @@ Cost: one more GPU kernel (Q6_K GEMV for the 262144-row head) besides the K2 Q4_
   reproduces Google's.
 - Not yet cross-checked: the two Q6_K tensors (head, PLE table) and the F16 projection;
   they will be checked by dequantizing against the bf16 source (error bound) in M2.
+
+## M2 result (2026-10-15)
+
+- `g4_dequant.py` (Q4_0 / Q6_K / F16 dequantization, ggml order) and the remaining M1 checks:
+  F16 `per_layer_model_proj` is the bf16 source exactly; the two Q6_K tensors are the bf16
+  source at 1.4 % relative RMS error (2000 random rows each), as expected for 6-bit.
+  GGUF norms are stored as is (no +1 offset); `rope_freqs` (64 ones, then 1e30) is the
+  proportional rope of HF.
+- `g4_np.py`: float reference on the dequantized GGUF weights (same equations and precision
+  as the x86 port's HF-checked `ref_gemma4_np.py`). English prompt: a correct four-season
+  answer that ends cleanly on `<turn|>`.
+- `g4ref.c`: the **bit-exact reference** that defines the engine arithmetic (contract in its
+  header: Q8_K activations, K2's Q4_0 GEMV, integer Q6_K head, F16 fmaf chains, float64 stages
+  with an own `g4_exp`, baked rope tables from `g4_rope.py`, greedy argmax on raw logits).
+  `g4_exp` is within 1 ulp of libm over the whole normal range (mean 0.10 ulp, 19.5 M points).
+  Deterministic: identical output at 1, 3 and 20 OpenMP threads.
+- Agreement with the float reference: English, all generated tokens identical (the one
+  differing argmax is a prompt position, a near-tie 26.40 vs 26.42); Traditional Chinese,
+  identical up to generated step 32, then a different but equally correct answer: the
+  expected effect of quantizing activations to Q8_K.
+- Goldens (from `g4ref`): `golden_en.txt` (97 steps, ends on `<turn|>`),
+  `golden_zh.txt` (222 steps, `--gen 200`); prompts and ids in `prompts.json`.
