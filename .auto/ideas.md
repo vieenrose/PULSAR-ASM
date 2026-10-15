@@ -1159,3 +1159,21 @@ kv head (32, 64) are slower; 8 is within 2%. pq1_parity tq 3/4/43: variant == ol
 bitwise at every T to 16384. Engine, TQ4, 2040 ids + 16 generated, order v3 v1 v1 v3: 78.82 /
 84.54 / 84.68 / 78.74 ms (-6.9%, R = 1.074), stream identical. Default PQ1_TQV 1 -> 3. Gates
 green on a fresh build, 16.44 tps (f16 gate run, path unaffected).
+
+56. N>1 users, batched decode GEMV (measured out) + down GEMV unsegmented (keep, +1.83%).
+Prototype pq1_gemv_hsn<NB,...> (.auto/hsn_batch_proto.patch): one weight pass serves NB
+activation plane sets; warp 0 lanes < NB*RB run the row chains, the lane's set is lane / RB.
+Bit-identical per set to pq1_gemv_hs (pq1_parity hsn, 0 words differ on every shape below).
+Time of one NB-set call vs NB single calls (20 iterations, cudaEvent): gate+up 24576x4096 NB=2
+0.72-0.93x (best tile RB 2/PD 2/MINB 3), NB=3 0.74x, NB=4 0.76x; qkv 6144x4096 NB=2..4
+0.75-0.80x; down 4096x12288 NB=2 0.76x. Slower than separate calls at every NB: hs is
+issue-bound at N=1 (IPC 3.89), sharing the weight load saves bus time the kernel is not waiting
+on, and the NB-wide plane registers cut residency. Batched decode would lower aggregate tokens/s
+on this GPU, so N>1 is not built; concurrent users can only time-slice the N=1 engine.
+The probe exposed that hsn<1> at K=12288 (unsegmented chain) beat the default segmented hs<3>:
+375 vs 400 us per call, holding with the timing order reversed; PQ1_HSG=0 (hs<3,...,SEG=false>)
+gives the same 375. The SEG win (row 41-era, 69 us of 472) predates the RB 4/PD 4/MINB 4 retune;
+at that occupancy warp 0 no longer straggles. Engine A/B PQ1_HSG=0, ab_pair 1 pair: 16.75/16.74
+vs 16.45/16.44 tps (+1.83% both orders). nvprof in the engine: hs<3> 411.7 -> 384.9 us per call
+(576 calls, SEG=1 -> SEG=0 instance). Same chain, same order: default PQ1_HSG 1 -> 0. Gates green
+on a fresh build, 16.72 tps.

@@ -889,7 +889,7 @@ __device__ __forceinline__ void hs_seg_step(float (*tiles)[RB * PS], float (*sac
   else sacc[b & 3][lane] = acc;
 }
 
-/* SEG (WR > 1, PQ1_HSG=1 default): the row chain over the G group partials is
+/* SEG (WR > 1, PQ1_HSG=1; default 0 since the down retune below): the row chain over the G group partials is
  * split by warp segment instead of run whole by warp 0. After batch j's
  * barrier warp w adds its own 32 partials of batch j-w onto the running sum
  * warp w-1 left for that batch (sacc), and the last warp stores y. Same chain,
@@ -906,7 +906,9 @@ __device__ __forceinline__ void hs_seg_step(float (*tiles)[RB * PS], float (*sac
  * K = 12288 (down, segmented): RB 4 / PD 4 / MINB 4, every row of a batch in
  * flight, 80 registers and a 12.9 KB tile ring, so 4 blocks (24 warps) are
  * resident instead of 2 (RB 8 / PD 2 / MINB 1 took 120 registers and 25.9 KB;
- * PQ1_HS3O=1 keeps it): 458 -> 407 us per call.
+ * PQ1_HS3O=1 keeps it): 458 -> 407 us per call. At this occupancy the whole
+ * chain on warp 0 no longer straggles: non-SEG 375 us vs SEG 400 us per call
+ * (order-reversed probe), engine +1.83 % both orders, so PQ1_HSG defaults to 0.
  * NT (K = 4096, default 3, PQ1_HSNT=1 is the A/B arm): the products of NT
  * consecutive batches of the warp stay in an NT-slot tile and are summed once,
  * by NT * RB lanes instead of RB, cutting the serial 32-FADD row reductions to
@@ -1125,7 +1127,7 @@ extern "C" int pq1_gemv_hs_launch(const uint8_t* w_codes,
   static int hv = -1;
   if (hv < 0) { const char* e = getenv("PQ1_HSV"); hv = e ? atoi(e) : 1; }
   static int hg = -1;
-  if (hg < 0) { const char* e = getenv("PQ1_HSG"); hg = e ? atoi(e) : 1; }
+  if (hg < 0) { const char* e = getenv("PQ1_HSG"); hg = e ? atoi(e) : 0; }
   if (N < 16) return pq1_gemv_tm_launch(w_codes, w_scales_h, xpl, xau, y, K, N, stream);
   const __half* ws = reinterpret_cast<const __half*>(w_scales_h);
   cudaStream_t s = (cudaStream_t)stream;

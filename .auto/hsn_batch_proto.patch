@@ -1,0 +1,253 @@
+diff --git a/pulsar_arm/bonsai2/pq1_parity.c b/pulsar_arm/bonsai2/pq1_parity.c
+index e7dff19..afbab9b 100644
+--- a/pulsar_arm/bonsai2/pq1_parity.c
++++ b/pulsar_arm/bonsai2/pq1_parity.c
+@@ -732,6 +732,77 @@ static int tq_parity(int B) {
+   printf("TQ%d PARITY: %s\n", B, allok ? "PASS" : "FAIL");
+   return allok ? 0 : 1;
+ }
++#if defined(PQ1_REAL_CUDA)
++/* hsn: the multi-token hs against nb single-token hs calls (bitwise), and the
++ * time of one nb-set call vs nb single calls; pq1_parity hsn <rows> <K> [cfg] */
++static int hsn_probe(int rows, int K, int cfg) {
++  const int nb = K / 128, NBM = 4;
++  const size_t q1b = (size_t)rows * nb * 18, plw = (size_t)(K / 256) * 73;
++  uint8_t *q1 = malloc(q1b), *xq = malloc((size_t)(K / 256) * 292);
++  uint32_t *wb = malloc((size_t)rows * (K / 32) * 4);
++  uint16_t *sc = malloc((size_t)rows * nb * 2);
++  float *yr = malloc((size_t)NBM * rows * 4), *yn = malloc((size_t)NBM * rows * 4);
++  if (!q1 || !xq || !wb || !sc || !yr || !yn) { printf("oom\n"); return 2; }
++  srand(4242);
++  for (size_t i = 0; i < q1b; i++) q1[i] = (uint8_t)(rand() & 0xFF);
++  for (int r = 0; r < rows; r++)
++    for (int b = 0; b < nb; b++) {
++      uint16_t h = (uint16_t)(0x2800 + (rand() % 0x1000));
++      memcpy(q1 + ((size_t)r * nb + b) * 18, &h, 2);
++    }
++  pq1_split_repack(q1, rows, K, wb, sc);
++  uint8_t *d_wb, *d_xq; uint16_t *d_sc; uint32_t *d_pl; int *d_au; float *d_y, *d_yn;
++  cudaMalloc((void **)&d_wb, (size_t)rows * (K / 32) * 4);
++  cudaMalloc((void **)&d_sc, (size_t)rows * nb * 2);
++  cudaMalloc((void **)&d_xq, (size_t)(K / 256) * 292);
++  cudaMalloc((void **)&d_pl, NBM * plw * 4);
++  cudaMalloc((void **)&d_au, (size_t)(K / 128) * 4);
++  cudaMalloc((void **)&d_y, (size_t)NBM * rows * 4);
++  cudaMalloc((void **)&d_yn, (size_t)NBM * rows * 4);
++  cudaMemcpy(d_wb, wb, (size_t)rows * (K / 32) * 4, cudaMemcpyHostToDevice);
++  cudaMemcpy(d_sc, sc, (size_t)rows * nb * 2, cudaMemcpyHostToDevice);
++  cudaMemset(d_pl, 0, NBM * plw * 4);
++  for (int b = 0; b < NBM; b++) {
++    mk_q8k(xq, K, 99 + 17 * b);
++    cudaMemcpy(d_xq, xq, (size_t)(K / 256) * 292, cudaMemcpyHostToDevice);
++    pq1_tm_prep_launch(d_xq, d_pl + b * plw, d_au, K, NULL);
++    pq1_gemv_hs_launch(d_wb, d_sc, d_pl + b * plw, d_au, d_y + (size_t)b * rows, K, rows, NULL);
++  }
++  if (cudaDeviceSynchronize() != cudaSuccess) { printf("ref: %s\n", cudaGetErrorString(cudaGetLastError())); return 1; }
++  cudaMemcpy(yr, d_y, (size_t)NBM * rows * 4, cudaMemcpyDeviceToHost);
++  int bad = 0;
++  for (int n = 1; n <= NBM; n++) {
++    cudaMemset(d_yn, 0xff, (size_t)NBM * rows * 4);
++    int rc = pq1_gemv_hsn_launch(d_wb, d_sc, d_pl, (int)plw, d_yn, rows, K, rows, n, cfg, NULL);
++    if (rc == -2) continue;
++    if (rc || cudaDeviceSynchronize() != cudaSuccess) { printf("hsn nb=%d: launch %d %s\n", n, rc, cudaGetErrorString(cudaGetLastError())); return 1; }
++    cudaMemcpy(yn, d_yn, (size_t)n * rows * 4, cudaMemcpyDeviceToHost);
++    long nd = 0;
++    for (long i = 0; i < (long)n * rows; i++) nd += memcmp(yn + i, yr + i, 4) != 0;
++    cudaEvent_t e0, e1;
++    cudaEventCreate(&e0); cudaEventCreate(&e1);
++    float ms1, msn;
++    if (getenv("HSN_REV")) {
++      cudaEventRecord(e0, 0);
++      for (int it = 0; it < 20; it++) pq1_gemv_hsn_launch(d_wb, d_sc, d_pl, (int)plw, d_yn, rows, K, rows, n, cfg, NULL);
++      cudaEventRecord(e1, 0); cudaEventSynchronize(e1);
++    }
++    cudaEventRecord(e0, 0);
++    for (int it = 0; it < 20; it++)
++      for (int b = 0; b < n; b++)
++        pq1_gemv_hs_launch(d_wb, d_sc, d_pl + b * plw, d_au, d_y + (size_t)b * rows, K, rows, NULL);
++    cudaEventRecord(e1, 0); cudaEventSynchronize(e1); cudaEventElapsedTime(&ms1, e0, e1);
++    cudaEventRecord(e0, 0);
++    for (int it = 0; it < 20; it++) pq1_gemv_hsn_launch(d_wb, d_sc, d_pl, (int)plw, d_yn, rows, K, rows, n, cfg, NULL);
++    cudaEventRecord(e1, 0); cudaEventSynchronize(e1); cudaEventElapsedTime(&msn, e0, e1);
++    printf("hsn rows=%d K=%d nb=%d cfg=%d: %ld / %ld differ | %d x hs %.1f us, hsn %.1f us (%.3fx, per token %.1f us)\n",
++           rows, K, n, cfg, nd, (long)n * rows, n, ms1 * 50, msn * 50, ms1 / msn, msn * 50 / n);
++    bad += nd != 0;
++  }
++  printf("HSN PARITY: %s\n", bad ? "FAIL" : "PASS");
++  return bad ? 1 : 0;
++}
++#endif
+ int main(int argc, char **argv) {
+ #if defined(PQ1_REAL_CUDA)
+   if (argc > 1 && !strcmp(argv[1], "fa")) return fa_parity();
+@@ -741,6 +812,7 @@ int main(int argc, char **argv) {
+   if (argc > 1 && !strcmp(argv[1], "expf")) return expf_parity();
+   if (argc > 1 && !strcmp(argv[1], "argmax")) return argmax_parity();
+   if (argc > 1 && !strcmp(argv[1], "tq")) return tq_parity(argc > 2 ? atoi(argv[2]) : 3);
++  if (argc > 3 && !strcmp(argv[1], "hsn")) return hsn_probe(atoi(argv[2]), atoi(argv[3]), argc > 4 ? atoi(argv[4]) : 0);
+ #endif
+   int rows = argc > 1 ? atoi(argv[1]) : 256;
+   int K = argc > 2 ? atoi(argv[2]) : 4096;
+diff --git a/pulsar_arm/bonsai2/pq1_swar_sm53.cu b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+index 95cb18b..680b3b2 100644
+--- a/pulsar_arm/bonsai2/pq1_swar_sm53.cu
++++ b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+@@ -1116,6 +1116,142 @@ static int hs_launch(const uint8_t* w_codes, const __half* w_scales, const uint3
+   return 0;
+ }
+ 
++/* Multi-token hs (prototype for N > 1 sequences): NB activation plane sets
++ * (stride pls words) share every loaded weight word. Per set the integer
++ * group sums, the fl(fl(ws db) isum) products and the ascending-group row
++ * chain are those of pq1_gemv_hs (SM form), so each set's y is bit-identical
++ * to its own single-token call. WR warps per row team, warp 0 sums the rows
++ * (the non-SEG chain: same order as SEG). */
++template <int NB, int WR, int TPB, int MINB, int RB, int PD>
++__global__ __launch_bounds__(32 * WR * TPB, MINB)
++void pq1_gemv_hsn(const uint8_t* __restrict__ w_codes, const __half* __restrict__ w_scales,
++                  const uint32_t* __restrict__ xpl, int pls, float* __restrict__ y, int ys, int N) {
++  static_assert(RB % PD == 0 && NB * RB <= 32, "ring / reduction lanes");
++  constexpr int G = 32 * WR, PS = G + 4;
++  __shared__ __align__(16) float sh_p[TPB][2][NB * RB * PS];
++  const int warp = (int)threadIdx.x >> 5, lane = (int)threadIdx.x & 31;
++  const int team = warp / WR, wt = warp - team * WR;
++  const int g = wt * 32 + lane;
++  uint32_t p[NB][8][4], n[NB][4];
++  int cg[NB];
++  float db[NB];
++#pragma unroll
++  for (int b = 0; b < NB; b++) {
++    const uint32_t* pb = xpl + (size_t)b * pls + (g >> 1) * 73 + 1 + (g & 1) * 32;
++#pragma unroll
++    for (int j = 0; j < 4; j++)
++#pragma unroll
++      for (int q = 0; q < 8; q++) p[b][q][j] = __ldg(pb + j * 8 + q);
++    db[b] = __int_as_float((int)__ldg(xpl + (size_t)b * pls + (g >> 1) * 73));
++    int asum = 0;
++#pragma unroll
++    for (int j = 0; j < 4; j++) {
++      n[b][j] = ~p[b][7][j];
++      uint32_t c = n[b][j];
++#pragma unroll
++      for (int q = 0; q < 7; q++) {
++        const uint32_t t = p[b][q][j] ^ n[b][j];
++        p[b][q][j] = t ^ c;
++        c &= t;
++        asum += __popc(p[b][q][j]) << q;
++      }
++    }
++    cg[b] = -asum;
++  }
++  const int nbatch = (N + RB - 1) / RB;
++  const int stride = (int)gridDim.x * TPB;
++  int bi = (int)blockIdx.x * TPB + team;
++  if (bi >= nbatch) return;
++  const uint4* wq = reinterpret_cast<const uint4*>(w_codes) + g;
++  const __half* sq = w_scales + g;
++  int r0 = min(bi * RB, N - RB);
++  const uint4* wb = wq + (size_t)r0 * G;
++  const __half* sb = sq + (size_t)r0 * G;
++  uint4 cwr[PD];
++  __half wsr[PD];
++#pragma unroll
++  for (int i = 0; i < PD; i++) { cwr[i] = __ldg(wb + i * G); wsr[i] = __ldg(sb + i * G); }
++  int buf = 0;
++  for (;;) {
++    const int bnext = bi + stride;
++    const int rn0 = bnext < nbatch ? min(bnext * RB, N - RB) : r0;
++    const uint4* wn = wq + (size_t)rn0 * G;
++    const __half* sn = sq + (size_t)rn0 * G;
++    float* P = sh_p[team][buf];
++#pragma unroll
++    for (int rr = 0; rr < RB; rr++) {
++      const uint4 cw = cwr[rr % PD];
++      const float ws = __half2float(wsr[rr % PD]);
++      if (rr + PD < RB) {
++        cwr[rr % PD] = __ldg(wb + (rr + PD) * G);
++        wsr[rr % PD] = __ldg(sb + (rr + PD) * G);
++      } else {
++        cwr[rr % PD] = __ldg(wn + (rr + PD - RB) * G);
++        wsr[rr % PD] = __ldg(sn + (rr + PD - RB) * G);
++      }
++#pragma unroll
++      for (int b = 0; b < NB; b++) {
++        const int isum = 2 * hs_group_s(p[b], n[b], cw) + cg[b];
++        P[(b * RB + rr) * PS + g] = __fmul_rn(__fmul_rn(ws, db[b]), (float)isum);
++      }
++    }
++    if (WR == 1) __syncwarp();
++    else asm volatile("bar.sync %0, %1;" ::"r"(team + 1), "r"(WR * 32));
++    if (wt == 0 && lane < NB * RB) {
++      const float4* src = reinterpret_cast<const float4*>(P + lane * PS);
++      float acc = 0.0f;
++#pragma unroll
++      for (int k = 0; k < G / 4; k++) {
++        const float4 v = src[k];
++        acc = __fadd_rn(acc, v.x);
++        acc = __fadd_rn(acc, v.y);
++        acc = __fadd_rn(acc, v.z);
++        acc = __fadd_rn(acc, v.w);
++      }
++      y[(size_t)(lane / RB) * ys + r0 + lane % RB] = acc;
++    }
++    if (bnext >= nbatch) break;
++    if (WR == 1) __syncwarp();
++    else buf ^= 1;
++    bi = bnext; r0 = rn0; wb = wn; sb = sn;
++  }
++}
++template <int NB, int WR, int TPB, int MINB, int RB, int PD>
++static int hsn_go(const uint8_t* w, const __half* ws, const uint32_t* xpl, int pls, float* y, int ys,
++                  int N, cudaStream_t s) {
++  static int nres = 0;
++  if (!nres) {
++    int per = 0;
++    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, pq1_gemv_hsn<NB, WR, TPB, MINB, RB, PD>, 32 * WR * TPB, 0);
++    nres = per > 0 ? per : 1;
++  }
++  int nblk = ((N + RB - 1) / RB + TPB - 1) / TPB;
++  if (nblk > nres) nblk = nres;
++  pq1_gemv_hsn<NB, WR, TPB, MINB, RB, PD><<<nblk, 32 * WR * TPB, 0, s>>>(w, ws, xpl, pls, y, ys, N);
++  return cudaGetLastError() == cudaSuccess ? 0 : -1;
++}
++/* nb plane sets at xpl + b * pls words, outputs at y + b * ys floats; K 4096 or 12288 */
++extern "C" int pq1_gemv_hsn_launch(const uint8_t* w_codes, const unsigned short* w_scales_h, const uint32_t* xpl,
++                                   int pls, float* y, int ys, int K, int N, int nb, int cfg, void* stream) {
++  const __half* ws = reinterpret_cast<const __half*>(w_scales_h);
++  cudaStream_t s = (cudaStream_t)stream;
++  if (N < 16) return -2;
++  if (K == 4096) {
++    if (nb == 1) return hsn_go<1, 1, 4, 6, 6, 6>(w_codes, ws, xpl, pls, y, ys, N, s);
++    if (nb == 2) {
++      if (cfg == 1) return hsn_go<2, 1, 4, 2, 4, 4>(w_codes, ws, xpl, pls, y, ys, N, s);
++      if (cfg == 2) return hsn_go<2, 1, 4, 3, 2, 2>(w_codes, ws, xpl, pls, y, ys, N, s);
++      return hsn_go<2, 1, 4, 2, 6, 3>(w_codes, ws, xpl, pls, y, ys, N, s);
++    }
++    if (nb == 3) return hsn_go<3, 1, 4, 2, 4, 2>(w_codes, ws, xpl, pls, y, ys, N, s);
++    if (nb == 4) return hsn_go<4, 1, 4, 1, 4, 2>(w_codes, ws, xpl, pls, y, ys, N, s);
++  } else if (K == 12288) {
++    if (nb == 1) return hsn_go<1, 3, 2, 4, 4, 4>(w_codes, ws, xpl, pls, y, ys, N, s);
++    if (nb == 2) return hsn_go<2, 3, 2, 2, 4, 2>(w_codes, ws, xpl, pls, y, ys, N, s);
++  }
++  return -2;
++}
++
+ /* PQ1_HSV=0 is the A/B arm: the offset-form tree at RB 8 / PD 2, the kernel
+  * of loop-261014-2216 row 12. */
+ extern "C" int pq1_gemv_hs_launch(const uint8_t* w_codes,
+diff --git a/pulsar_arm/bonsai2/pq1_wrap.h b/pulsar_arm/bonsai2/pq1_wrap.h
+index df96eed..3cc0dc0 100644
+--- a/pulsar_arm/bonsai2/pq1_wrap.h
++++ b/pulsar_arm/bonsai2/pq1_wrap.h
+@@ -40,6 +40,11 @@ int pq1_gemv_tm_launch(const unsigned char *w_bits,
+ int pq1_gemv_hs_launch(const unsigned char *w_bits,
+                        const unsigned short *w_scales_h, const unsigned int *xpl,
+                        const int *xau, float *y, int K, int N, void *stream);
++/* hs over nb activation plane sets (xpl + b * pls words, y + b * ys floats),
++ * each set's y bit-identical to its own pq1_gemv_hs_launch; K 4096 / 12288 */
++int pq1_gemv_hsn_launch(const unsigned char *w_bits, const unsigned short *w_scales_h,
++                        const unsigned int *xpl, int pls, float *y, int ys, int K, int N,
++                        int nb, int cfg, void *stream);
+ int pq1_tmx_launch(const unsigned char *w_bits,
+                    const unsigned short *w_scales_h, const unsigned int *xpl,
+                    const int *xau, float *y, int K, int N, void *stream);
