@@ -956,10 +956,97 @@ attention_range:
     adrp x1, f_n1e30
     ldr s11, [x1, :lo12:f_n1e30]     /* mx = -1e30f */
     /* ---- scores: t = 0..pos ----
-       Probe Exp69: 16B LD1 loads + 4-lane FMUL, but the accumulation stays
-       SCALAR and in exact ascending element order (lane extraction via DUP):
-       bit-identical by construction, just fewer instructions/loads. */
+       Exp73: 4-way t interleave (4 independent scalar accumulation chains
+       s4/s5/s8/s9 + 4 K rows in flight) on top of the Exp69 16B LD1 + 4-lane
+       FMUL + ordered scalar adds. Bit-identical by construction: every t keeps
+       its own ascending 64-element fadd chain (lane 0 first, then DUP lanes). */
     mov x27, xzr
+    bic x12, x20, #3
+.LattnR_score_t4:
+    cmp x27, x12
+    b.hs .LattnR_score_t2entry
+    add x9, x22, x27, lsl #11
+    add x9, x9, x2
+    add x13, x9, #2048
+    add x14, x13, #2048
+    add x15, x14, #2048
+    mov x10, x24
+    fmov s4, wzr
+    fmov s5, wzr
+    fmov s8, wzr
+    fmov s9, wzr
+    mov x11, #16
+.LattnR_score_i4:
+    ld1 {v0.4s}, [x10], #16
+    ld1 {v1.4s}, [x9], #16
+    ld1 {v3.4s}, [x13], #16
+    ld1 {v12.4s}, [x14], #16
+    ld1 {v13.4s}, [x15], #16
+    fmul v2.4s, v0.4s, v1.4s
+    fmul v6.4s, v0.4s, v3.4s
+    fmul v14.4s, v0.4s, v12.4s
+    fmul v15.4s, v0.4s, v13.4s
+    fadd s4, s4, s2
+    dup s7, v2.s[1]
+    fadd s4, s4, s7
+    dup s7, v2.s[2]
+    fadd s4, s4, s7
+    dup s7, v2.s[3]
+    fadd s4, s4, s7
+    fadd s5, s5, s6
+    dup s7, v6.s[1]
+    fadd s5, s5, s7
+    dup s7, v6.s[2]
+    fadd s5, s5, s7
+    dup s7, v6.s[3]
+    fadd s5, s5, s7
+    fadd s8, s8, s14
+    dup s7, v14.s[1]
+    fadd s8, s8, s7
+    dup s7, v14.s[2]
+    fadd s8, s8, s7
+    dup s7, v14.s[3]
+    fadd s8, s8, s7
+    fadd s9, s9, s15
+    dup s7, v15.s[1]
+    fadd s9, s9, s7
+    dup s7, v15.s[2]
+    fadd s9, s9, s7
+    dup s7, v15.s[3]
+    fadd s9, s9, s7
+    subs x11, x11, #1
+    b.ne .LattnR_score_i4
+    fmov s7, #0.125
+    fmul s0, s4, s7
+    str s0, [x25, x27, lsl #2]
+    fcmp s0, s11
+    b.le .LattnR_s4n
+    fmov s11, s0
+.LattnR_s4n:
+    add x14, x27, #1
+    fmul s0, s5, s7
+    str s0, [x25, x14, lsl #2]
+    fcmp s0, s11
+    b.le .LattnR_s5n
+    fmov s11, s0
+.LattnR_s5n:
+    add x14, x27, #2
+    fmul s0, s8, s7
+    str s0, [x25, x14, lsl #2]
+    fcmp s0, s11
+    b.le .LattnR_s8n
+    fmov s11, s0
+.LattnR_s8n:
+    add x14, x27, #3
+    fmul s0, s9, s7
+    str s0, [x25, x14, lsl #2]
+    fcmp s0, s11
+    b.le .LattnR_s9n
+    fmov s11, s0
+.LattnR_s9n:
+    add x27, x27, #4
+    b .LattnR_score_t4
+.LattnR_score_t2entry:
     bic x12, x20, #1
 .LattnR_score_t2:
     cmp x27, x12
