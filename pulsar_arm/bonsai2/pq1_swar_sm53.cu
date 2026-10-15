@@ -751,7 +751,7 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
 #define HS_TPB3 2
 #endif
 #ifndef HS_MINB3
-#define HS_MINB3 1
+#define HS_MINB3 4
 #endif
 __device__ __forceinline__ uint32_t hs_x3(uint32_t a, uint32_t b, uint32_t c) {
   uint32_t r;
@@ -860,10 +860,10 @@ __device__ __forceinline__ int hs_group_s(const uint32_t (&p)[8][4], const uint3
 #define HS_PD1 3
 #endif
 #ifndef HS_RB3
-#define HS_RB3 8
+#define HS_RB3 4
 #endif
 #ifndef HS_PD3
-#define HS_PD3 2
+#define HS_PD3 4
 #endif
 
 /* step j of the segmented reduction (below): warp wt adds its 32 partials of
@@ -898,7 +898,11 @@ __device__ __forceinline__ void hs_seg_step(float (*tiles)[RB * PS], float (*sac
  * the K=12288 launch ~69 us of 472). A tile lives 4 batches (NBUF 4). */
 /* RB rows per batch, PD rows in flight per lane (a ring of PD load slots
  * that must restart aligned at every batch: RB % PD == 0). RB 6 / PD 3 at
- * K = 4096: deeper prefetch in the same 64 registers (offset form: 8 / 2). */
+ * K = 4096: deeper prefetch in the same 64 registers (offset form: 8 / 2).
+ * K = 12288 (down, segmented): RB 4 / PD 4 / MINB 4, every row of a batch in
+ * flight, 80 registers and a 12.9 KB tile ring, so 4 blocks (24 warps) are
+ * resident instead of 2 (RB 8 / PD 2 / MINB 1 took 120 registers and 25.9 KB;
+ * PQ1_HS3O=1 keeps it): 458 -> 407 us per call. */
 template <int WR, int TPB, int MINB, int RB, int PD, bool SM, bool SEG = false>
 __global__ __launch_bounds__(32 * WR * TPB, MINB)
 void pq1_gemv_hs(const uint8_t* __restrict__ w_codes,
@@ -1089,7 +1093,10 @@ extern "C" int pq1_gemv_hs_launch(const uint8_t* w_codes,
     if (hv) hs_launch<1, HS_TPB1, HS_MINB1, HS_RB1, HS_PD1, true>(w_codes, ws, xpl, xau, y, N, s);
     else hs_launch<1, 8, 4, 8, 2, false>(w_codes, ws, xpl, xau, y, N, s);
   } else if (K == 12288) {
-    if (hv && hg) hs_launch<3, HS_TPB3, HS_MINB3, HS_RB3, HS_PD3, true, true>(w_codes, ws, xpl, xau, y, N, s);
+    static int ho = -1;
+    if (ho < 0) { const char* e = getenv("PQ1_HS3O"); ho = e ? atoi(e) : 0; }
+    if (hv && hg && ho) hs_launch<3, 2, 1, 8, 2, true, true>(w_codes, ws, xpl, xau, y, N, s);
+    else if (hv && hg) hs_launch<3, HS_TPB3, HS_MINB3, HS_RB3, HS_PD3, true, true>(w_codes, ws, xpl, xau, y, N, s);
     else if (hv) hs_launch<3, HS_TPB3, HS_MINB3, HS_RB3, HS_PD3, true>(w_codes, ws, xpl, xau, y, N, s);
     else hs_launch<3, 2, 1, 8, 2, false>(w_codes, ws, xpl, xau, y, N, s);
   } else {
