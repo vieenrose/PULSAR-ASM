@@ -970,6 +970,23 @@ attention_range:
     add x13, x9, #2048
     add x14, x13, #2048
     add x15, x14, #2048
+    /* Exp74: prefetch the NEXT quad's 4 K rows (4 lines each, 8192B ahead) */
+    prfm pldl1keep, [x9, #8192]
+    prfm pldl1keep, [x9, #8256]
+    prfm pldl1keep, [x9, #8320]
+    prfm pldl1keep, [x9, #8384]
+    prfm pldl1keep, [x13, #8192]
+    prfm pldl1keep, [x13, #8256]
+    prfm pldl1keep, [x13, #8320]
+    prfm pldl1keep, [x13, #8384]
+    prfm pldl1keep, [x14, #8192]
+    prfm pldl1keep, [x14, #8256]
+    prfm pldl1keep, [x14, #8320]
+    prfm pldl1keep, [x14, #8384]
+    prfm pldl1keep, [x15, #8192]
+    prfm pldl1keep, [x15, #8256]
+    prfm pldl1keep, [x15, #8320]
+    prfm pldl1keep, [x15, #8384]
     mov x10, x24
     fmov s4, wzr
     fmov s5, wzr
@@ -1171,6 +1188,11 @@ attention_range:
     fdiv s2, s2, s10                 /* p */
     add x9, x23, x27, lsl #11        /* VCA row */
     add x9, x9, x3
+    /* Exp74: prefetch the V row 8 ahead (4 lines) */
+    prfm pldl1keep, [x9, #16384]
+    prfm pldl1keep, [x9, #16448]
+    prfm pldl1keep, [x9, #16512]
+    prfm pldl1keep, [x9, #16576]
     dup v2.4s, v2.s[0]
     ld1 {v0.4s}, [x9], #16
     fmla v16.4s, v2.4s, v0.4s
