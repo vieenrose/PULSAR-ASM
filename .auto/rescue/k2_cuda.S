@@ -1054,29 +1054,89 @@ attention_range:
     cmp x27, x20
     b.ls .LattnR_es_t
     fcvt s10, d10                    /* (f32)es */
-    /* ---- p-loop: o += p * V ---- */
+    /* ---- p-loop: o += p * V ----
+       Exp72: the 64 accumulators live in v16..v31 (4 lanes x 16 regs) for the
+       whole t-sweep instead of being re-loaded and stored to ATTO once per t:
+       each t issues 16 LD1 + 16 FMLA with no ATTO traffic and no per-chunk
+       pointer walk.  Each lane's FMA sequence over t is unchanged (ascending t,
+       exactly one fma per lane per t) => bit-identical. */
+    movi v16.2d, #0
+    movi v17.2d, #0
+    movi v18.2d, #0
+    movi v19.2d, #0
+    movi v20.2d, #0
+    movi v21.2d, #0
+    movi v22.2d, #0
+    movi v23.2d, #0
+    movi v24.2d, #0
+    movi v25.2d, #0
+    movi v26.2d, #0
+    movi v27.2d, #0
+    movi v28.2d, #0
+    movi v29.2d, #0
+    movi v30.2d, #0
+    movi v31.2d, #0
     mov x27, xzr
+    lsr w3, w21, #2
+    lsl x3, x3, #8                   /* khoff (x2 dead across expf) */
 .LattnR_p_t:
     ldr s2, [x25, x27, lsl #2]       /* e (stashed; bit-identical, no expf) */
     fdiv s2, s2, s10                 /* p */
     add x9, x23, x27, lsl #11        /* VCA row */
-    lsr w3, w21, #2
-    lsl x3, x3, #8                   /* khoff (x2 dead across expf) */
     add x9, x9, x3
-    mov x11, x26                     /* o walk */
     dup v2.4s, v2.s[0]
-    mov x12, #16                     /* 16 x 16B = 64 floats */
-.LattnR_p_i:
-    ld1 {v0.4s}, [x11]
-    ld1 {v1.4s}, [x9]
-    fmla v0.4s, v2.4s, v1.4s
-    st1 {v0.4s}, [x11], #16
-    add x9, x9, #16
-    subs x12, x12, #1
-    b.ne .LattnR_p_i
+    ld1 {v0.4s}, [x9], #16
+    fmla v16.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v17.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v18.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v19.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v20.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v21.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v22.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v23.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v24.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v25.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v26.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v27.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v28.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v29.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v30.4s, v2.4s, v0.4s
+    ld1 {v0.4s}, [x9], #16
+    fmla v31.4s, v2.4s, v0.4s
     add x27, x27, #1
     cmp x27, x20
     b.ls .LattnR_p_t
+    mov x11, x26                     /* o walk (ATTO head) */
+    st1 {v16.4s}, [x11], #16
+    st1 {v17.4s}, [x11], #16
+    st1 {v18.4s}, [x11], #16
+    st1 {v19.4s}, [x11], #16
+    st1 {v20.4s}, [x11], #16
+    st1 {v21.4s}, [x11], #16
+    st1 {v22.4s}, [x11], #16
+    st1 {v23.4s}, [x11], #16
+    st1 {v24.4s}, [x11], #16
+    st1 {v25.4s}, [x11], #16
+    st1 {v26.4s}, [x11], #16
+    st1 {v27.4s}, [x11], #16
+    st1 {v28.4s}, [x11], #16
+    st1 {v29.4s}, [x11], #16
+    st1 {v30.4s}, [x11], #16
+    st1 {v31.4s}, [x11], #16
     add x24, x24, #256               /* next Q head */
     add x26, x26, #256               /* next ATTO head */
     add w21, w21, #1
