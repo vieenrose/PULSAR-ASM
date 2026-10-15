@@ -434,4 +434,105 @@ g4_attn_pv8:
     ret
     .size g4_attn_pv8, .-g4_attn_pv8
 
+/* RMS norm, g4ref.c rms_r + rmsnorm / rmsnorm_noscale:
+ *   ss = sum of (double)x[i]*(double)x[i], strictly in order (one fadd chain);
+ *   r = sqrt(ss / n + 1e-6);  y[i] = (float)(((double)x[i] / r) * (double)w[i])
+ * The squares, divisions and products are done two doubles at a time; the sum
+ * stays a sequential scalar chain. n % 4 == 0.
+ * double g4_rms_r(const float *x, long n) -> d0
+ * void g4_rmsnorm(const float *x, const float *w, float *y, long n)
+ * void g4_rmsnorm_ns(float *x, long n)   (in place, no weight)                 */
+    .global g4_rms_r
+    .type g4_rms_r, %function
+    .align 4
+g4_rms_r:
+    fmov    d0, xzr                           /* ss = 0 (+0.0, as the C init) */
+    mov     x2, x0
+    mov     x3, x1
+1:  ldr     q1, [x2], #16
+    fcvtl   v2.2d, v1.2s
+    fcvtl2  v3.2d, v1.4s
+    fmul    v2.2d, v2.2d, v2.2d
+    fmul    v3.2d, v3.2d, v3.2d
+    fadd    d0, d0, d2                        /* x0^2 */
+    mov     d4, v2.d[1]
+    fadd    d0, d0, d4                        /* x1^2 */
+    fadd    d0, d0, d3                        /* x2^2 */
+    mov     d4, v3.d[1]
+    fadd    d0, d0, d4                        /* x3^2 */
+    subs    x3, x3, #4
+    b.gt    1b
+    scvtf   d1, x1                            /* (double)n */
+    fdiv    d0, d0, d1
+    adr     x4, .Leps
+    ldr     d1, [x4]
+    fadd    d0, d0, d1
+    fsqrt   d0, d0
+    ret
+    .size g4_rms_r, .-g4_rms_r
+    .align 3
+.Leps: .double 1e-6
+
+    .global g4_rmsnorm
+    .type g4_rmsnorm, %function
+    .align 4
+g4_rmsnorm:
+    stp     x29, x30, [sp, #-48]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    mov     x19, x0
+    mov     x20, x1
+    mov     x21, x2
+    mov     x22, x3
+    mov     x1, x3
+    bl      g4_rms_r
+    dup     v5.2d, v0.d[0]                    /* r */
+1:  ldr     q1, [x19], #16
+    ldr     q6, [x20], #16
+    fcvtl   v2.2d, v1.2s
+    fcvtl2  v3.2d, v1.4s
+    fcvtl   v7.2d, v6.2s
+    fcvtl2  v16.2d, v6.4s
+    fdiv    v2.2d, v2.2d, v5.2d
+    fdiv    v3.2d, v3.2d, v5.2d
+    fmul    v2.2d, v2.2d, v7.2d
+    fmul    v3.2d, v3.2d, v16.2d
+    fcvtn   v1.2s, v2.2d
+    fcvtn2  v1.4s, v3.2d
+    str     q1, [x21], #16
+    subs    x22, x22, #4
+    b.gt    1b
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #48
+    ret
+    .size g4_rmsnorm, .-g4_rmsnorm
+
+    .global g4_rmsnorm_ns
+    .type g4_rmsnorm_ns, %function
+    .align 4
+g4_rmsnorm_ns:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    mov     x19, x0
+    mov     x20, x1
+    bl      g4_rms_r
+    dup     v5.2d, v0.d[0]
+1:  ldr     q1, [x19]
+    fcvtl   v2.2d, v1.2s
+    fcvtl2  v3.2d, v1.4s
+    fdiv    v2.2d, v2.2d, v5.2d
+    fdiv    v3.2d, v3.2d, v5.2d
+    fcvtn   v1.2s, v2.2d
+    fcvtn2  v1.4s, v3.2d
+    str     q1, [x19], #16
+    subs    x20, x20, #4
+    b.gt    1b
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+    .size g4_rmsnorm_ns, .-g4_rmsnorm_ns
+
     .section .note.GNU-stack,"",%progbits

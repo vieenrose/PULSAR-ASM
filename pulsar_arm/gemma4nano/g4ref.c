@@ -305,6 +305,9 @@ static void rmsnorm_noscale(float *x, int n) {
     double r = rms_r(x, n);
     for (int i = 0; i < n; i++) x[i] = (float)((double)x[i] / r);
 }
+/* norm hooks (the engine points them at g4_host.S) */
+static void (*G_RMS)(const float *, const float *, float *, int) = rmsnorm;
+static void (*G_RMSNS)(float *, int) = rmsnorm_noscale;
 static float gelu(float xf) {
     double x = xf;
     return (float)(x / (1.0 + g4_exp(-(GELU_C1 * x + GELU_C3 * (x * x * x)))));
@@ -399,7 +402,7 @@ static void __attribute__((unused)) forward(int tok, int pos) {
         const layer_t *L = &LT[il];
         const float *cs = rope_cs(full, 0, pos), *sn = rope_cs(full, 1, pos);
         /* attention */
-        rmsnorm(xs, L->n_attn, hb, H);
+        G_RMS(xs, L->n_attn, hb, H);
         q8k(hb, XQ, H);
         if (il < FIRST_SHARED) {               /* q, k, v share the quantized input */
             const tensor_t *ts[3] = {L->q, L->k, L->v};
@@ -407,35 +410,35 @@ static void __attribute__((unused)) forward(int tok, int pos) {
             G_Q4N(3, ts, XQ, ys);
         } else G_Q4(L->q, XQ, qb);
         const float *qn = L->n_q;
-        for (int j = 0; j < NH; j++) { float t[HD_F]; rmsnorm(qb + j * hd, qn, t, hd); memcpy(qb + j * hd, t, hd * 4); rope(qb + j * hd, cs, sn, hd); }
+        for (int j = 0; j < NH; j++) { float t[HD_F]; G_RMS(qb + j * hd, qn, t, hd); memcpy(qb + j * hd, t, hd * 4); rope(qb + j * hd, cs, sn, hd); }
         int src = il < FIRST_SHARED ? il : (full ? store_f : store_s);
         if (il < FIRST_SHARED) {
             float t[HD_F];
-            rmsnorm(kb, L->n_k, t, hd); rope(t, cs, sn, hd);
+            G_RMS(kb, L->n_k, t, hd); rope(t, cs, sn, hd);
             memcpy(KC[il] + (size_t)pos * hd, t, hd * 4);
-            rmsnorm_noscale(vb, hd);
+            G_RMSNS(vb, hd);
             memcpy(VC[il] + (size_t)pos * hd, vb, hd * 4);
         }
         int lo = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
         G_ATTNALL(qb, KC[src], VC[src], lo, pos, hd, ab);
         q8k(ab, XQ, NH * hd);
         G_Q4(L->o, XQ, hb);
-        { float t[H]; rmsnorm(hb, L->n_post_attn, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
+        { float t[H]; G_RMS(hb, L->n_post_attn, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* MLP */
-        rmsnorm(xs, L->n_ffn, hb, H);
+        G_RMS(xs, L->n_ffn, hb, H);
         q8k(hb, XQ, H);
         G_MLP(L, inter, hb);
-        { float t[H]; rmsnorm(hb, L->n_post_ffw, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
+        { float t[H]; G_RMS(hb, L->n_post_ffw, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* per-layer input */
         q8k(xs, XQ, H);
         G_Q4(L->ig, XQ, pleg);
         G_GEGLU(pleg, pin + il * PLE, PLE);
         q8k(pleg, XQ, PLE);
         G_Q4(L->proj, XQ, hb);
-        { float t[H]; rmsnorm(hb, L->n_post, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
+        { float t[H]; G_RMS(hb, L->n_post, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         for (int i = 0; i < H; i++) xs[i] = xs[i] * L->scale;
     }
-    rmsnorm(xs, f32t(tens("output_norm.weight")), hb, H);
+    G_RMS(xs, f32t(tens("output_norm.weight")), hb, H);
     q8k(hb, XQ, H);
     G_HEAD(emb, XQ, logits);   /* raw logits; soft-cap applied by the caller */
 }

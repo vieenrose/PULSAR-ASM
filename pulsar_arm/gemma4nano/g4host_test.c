@@ -101,6 +101,23 @@ int main(void) {
         }
     }
     printf("attn_all_asm (8 heads, one pass): %ld outputs, %ld mismatches\n", nall, bad - b2);
+    long b3 = bad, nrms = 0;
+    {   /* RMS norm: sizes used by the model, magnitudes from tiny to huge */
+        static float xr_[HD_F * NH], w_[H], y1[H > HD_F ? H : HD_F], y2[H > HD_F ? H : HD_F];
+        int sizes[] = {256, 512, 1536};
+        for (int rep = 0; rep < 2000; rep++) {
+            int nn = sizes[rep % 3];
+            double sc_ = pow(10.0, -20.0 + 40.0 * ur());
+            for (int i = 0; i < nn; i++) { xr_[i] = (float)((ur() - 0.5) * sc_); w_[i] = (float)((ur() - 0.2) * 3); }
+            rmsnorm(xr_, w_, y1, nn); g4_rmsnorm(xr_, w_, y2, nn);
+            for (int i = 0; i < nn; i++) if (memcmp(&y1[i], &y2[i], 4)) { if (bad < 50) printf("  rmsnorm n %d i %d\n", nn, i); bad++; }
+            memcpy(y1, xr_, nn * 4); memcpy(y2, xr_, nn * 4);
+            rmsnorm_noscale(y1, nn); g4_rmsnorm_ns(y2, nn);
+            for (int i = 0; i < nn; i++) if (memcmp(&y1[i], &y2[i], 4)) { if (bad < 50) printf("  rmsnorm_ns n %d i %d\n", nn, i); bad++; }
+            nrms += 2 * nn;
+        }
+    }
+    printf("g4_rmsnorm / _ns: %ld outputs, %ld mismatches\n", nrms, bad - b3);
     printf(bad ? "HOST ASM TEST: FAIL (%ld)\n" : "HOST ASM TEST: OK\n", bad);
     return bad != 0;
 }

@@ -6,6 +6,11 @@ extern void g4_attn_scores(const float *q, const float *K, long n, long hd, floa
 extern void g4_attn_pv(const float *p, const float *V, long n, long hd, float *o);
 extern void g4_attn_scores8(const float *qT, const float *K, long n, long hd, float *S);
 extern void g4_attn_pv8(const float *P, const float *V, long n, long hd, float *O);
+extern double g4_rms_r(const float *x, long n);
+extern void g4_rmsnorm(const float *x, const float *w, float *y, long n);
+extern void g4_rmsnorm_ns(float *x, long n);
+static void rms_asm(const float *x, const float *w, float *y, int n) { g4_rmsnorm(x, w, y, n); }
+static void rmsns_asm(float *x, int n) { g4_rmsnorm_ns(x, n); }
 static double TAB2[48];   /* exp/GELU constants from g4ref.c's own definitions, duplicated pairs */
 static void build_tab(void) {
     double v[24] = {EXP_P0};
