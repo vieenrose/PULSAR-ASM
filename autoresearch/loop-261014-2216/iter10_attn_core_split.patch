@@ -1,0 +1,105 @@
+diff --git a/pulsar_arm/bonsai2/pq1_swar_sm53.cu b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+index aef1bc5..3cf727a 100644
+--- a/pulsar_arm/bonsai2/pq1_swar_sm53.cu
++++ b/pulsar_arm/bonsai2/pq1_swar_sm53.cu
+@@ -1335,6 +1335,81 @@ __global__ __launch_bounds__(128) void pq1_attn_core(const float* __restrict__ q
+   atto[(size_t)h * 128 + t0] = c;
+ }
+ 
++/* Loop iter 10 (PQ1_ACORE=1, default; 0 is the A/B arm): pq1_attn_core in three
++ * launches so the serial double softmax sum runs one head per LANE (the
++ * one-lane-per-block form cost 32 blocks x T x 2 full-warp DP issues).
++ * es[h] keeps the exact order t = 0..T-1; everything else is pq1_attn_core's
++ * arithmetic verbatim. Scratch e[nh][PQ1_ACTX] + esf[nh] follows atto. */
++__global__ __launch_bounds__(128) void pq1_attn_qk(const float* __restrict__ qo,
++                                                   const float* __restrict__ kc,
++                                                   const uint8_t* __restrict__ par,
++                                                   float* __restrict__ ebuf, int nh, int nkv,
++                                                   int ctx) {
++  __shared__ __align__(16) float sq[128];
++  __shared__ float smx[4];
++  const int h = blockIdx.x, t0 = threadIdx.x;
++  const int kh = h / (nh / nkv);
++  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
++  sq[t0] = qo[(size_t)h * 128 + t0];
++  __syncthreads();
++  const float* kb = kc + (size_t)kh * ctx * 128;
++  float* sp = ebuf + (size_t)h * PQ1_ACTX;
++  float mx = -1e30f;
++  for (int t = t0; t < T; t += 128) {
++    const float4* kr = reinterpret_cast<const float4*>(kb + (size_t)t * 128);
++    const float4* q4 = reinterpret_cast<const float4*>(sq);
++    float a = 0.0f;
++#pragma unroll 8
++    for (int i4 = 0; i4 < 32; i4++) {
++      const float4 k4 = __ldg(kr + i4), qq = q4[i4];
++      a = pq1_ffma(qq.x, k4.x, a);
++      a = pq1_ffma(qq.y, k4.y, a);
++      a = pq1_ffma(qq.z, k4.z, a);
++      a = pq1_ffma(qq.w, k4.w, a);
++    }
++    const float sc = pq1_fmul(a, 0.0883883476f);
++    sp[t] = sc;
++    mx = pq1_fgtsel(mx, sc);
++  }
++#pragma unroll
++  for (int o = 16; o; o >>= 1) mx = pq1_fgtsel(mx, __shfl_xor_sync(0xffffffffu, mx, o));
++  if ((t0 & 31) == 0) smx[t0 >> 5] = mx;
++  __syncthreads();
++  mx = pq1_fgtsel(pq1_fgtsel(pq1_fgtsel(smx[0], smx[1]), smx[2]), smx[3]);
++  for (int t = t0; t < T; t += 128) sp[t] = pq1_expf_dev(pq1_fsub(sp[t], mx));
++}
++__global__ __launch_bounds__(64) void pq1_attn_es(const float* __restrict__ ebuf,
++                                                  const uint8_t* __restrict__ par,
++                                                  float* __restrict__ esf, int nh) {
++  const int h = threadIdx.x;
++  if (h >= nh) return;
++  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
++  const float* sp = ebuf + (size_t)h * PQ1_ACTX;
++  double es = 0.0;
++  for (int t = 0; t < T; t++) es = __dadd_rn(es, pq1_f2d(sp[t]));
++  esf[h] = pq1_d2f(es);
++}
++__global__ __launch_bounds__(128) void pq1_attn_pv(const float* __restrict__ vc,
++                                                   const uint8_t* __restrict__ par,
++                                                   const float* __restrict__ ebuf,
++                                                   const float* __restrict__ esfb,
++                                                   float* __restrict__ atto, int nh, int nkv,
++                                                   int ctx) {
++  __shared__ float sp[PQ1_ACTX];
++  const int h = blockIdx.x, t0 = threadIdx.x;
++  const int kh = h / (nh / nkv);
++  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
++  const float esf = esfb[h];
++  const float* eb = ebuf + (size_t)h * PQ1_ACTX;
++  for (int t = t0; t < T; t += 128) sp[t] = pq1_fdiv(eb[t], esf);
++  __syncthreads();
++  const float* vr = vc + (size_t)kh * ctx * 128 + t0;
++  float c = 0.0f;
++#pragma unroll 4
++  for (int t = 0; t < T; t++) c = pq1_ffma(__ldg(vr + (size_t)t * 128), sp[t], c);
++  atto[(size_t)h * 128 + t0] = c;
++}
++
+ extern "C" int pq1_attn_launch(const float* qkv_d, const float* nw_d, const uint8_t* par_d,
+                                float* qo_d, float* kc_d, float* vc_d, float* atto_d, int nh,
+                                int nkv, int ctx, void* stream) {
+@@ -1349,6 +1424,18 @@ extern "C" int pq1_attn_launch(const float* qkv_d, const float* nw_d, const uint
+   else
+     pq1_attn_pre<<<(nh + 2 * nkv) / 4, 128, 0, s>>>(qkv_d, nw_d, par_d, qo_d, kc_d, vc_d, nh, nkv, ctx);
+   if (cudaGetLastError() != cudaSuccess) return -1;
++  static int acore = -1;
++  if (acore < 0) { const char* e = getenv("PQ1_ACORE"); acore = e ? atoi(e) : 1; }
++  if (acore && nh <= 64) {
++    float* eb = atto_d + (size_t)nh * 128;          /* scratch after atto */
++    float* esf = eb + (size_t)nh * PQ1_ACTX;
++    pq1_attn_qk<<<nh, 128, 0, s>>>(qo_d, kc_d, par_d, eb, nh, nkv, ctx);
++    if (cudaGetLastError() != cudaSuccess) return -1;
++    pq1_attn_es<<<1, 64, 0, s>>>(eb, par_d, esf, nh);
++    if (cudaGetLastError() != cudaSuccess) return -1;
++    pq1_attn_pv<<<nh, 128, 0, s>>>(vc_d, par_d, eb, esf, atto_d, nh, nkv, ctx);
++    return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
++  }
+   pq1_attn_core<<<nh, 128, 0, s>>>(qo_d, kc_d, vc_d, par_d, atto_d, nh, nkv, ctx);
+   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+ }

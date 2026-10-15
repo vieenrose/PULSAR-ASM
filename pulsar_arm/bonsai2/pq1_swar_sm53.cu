@@ -1150,8 +1150,8 @@ extern "C" int pq1_q8k_launch(const float* x_d, int n, uint8_t* xq_d, void* stre
 }
 
 /* ---- loop iter 4: the attention block on the device ------------------------
- * fwd8's CPU attention, bit for bit (its object code was read to pin every
- * contraction: gcc 7.5 -O2 -mcpu=cortex-a57, default -ffp-contract=fast):
+ * Head rms + rope as fwd8's host path, bit for bit (its object code was read to
+ * pin every contraction: gcc 7.5 -O2 -mcpu=cortex-a57, default -ffp-contract=fast):
  *  head rms   s = fma(double(x), double(x), s) serially over the 128 dims (the
  *             products are exact), sc = 1/sqrtf(float(s/128) + 1e-6f),
  *             y = (sc*x)*w                         [rms(): fmadd d; fdiv d; fcvt;
@@ -1159,17 +1159,18 @@ extern "C" int pq1_q8k_launch(const float* x_d, int n, uint8_t* xq_d, void* stre
  *  rope       x[j] = fma(a, c, -(b*s)), x[j+64] = fma(a, s, b*c)
  *                                                  [rope_yarn_apply: fmul; fnmsub;
  *                                                   fmul; fmadd]
- *  q.k        a = fma(q[i], k[i], a) over i in order, score = a * 0.0883883476f
- *  softmax    mx = fold of (s > mx ? s : mx) from -1e30f (NaN never taken: fcmp +
- *             fcsel le), e = expf(s - mx), es = serial double sum of e, p = e/(float)es
- *  p.v        o[i] = fma(v_t[i], p_t, o) over t in order
- * The max is a block reduction of the same strict-> fold: the value is the true
- * maximum; only the sign of a zero maximum can differ from the serial fold, and
- * x - (+0) == x - (-0) for every x except x = -0, where expf gives 1 either way.
- * As in pq1_silu_q8k every f32 op is inline PTX without .ftz. The cos/sin table,
- * npos and the Q8_K activation arrive in one H2D (layout PQ1_APAR_*, pq1_wrap.h);
- * K/V caches are [kv head][ctx][128] per layer in the arena. */
-#define PQ1_ACTX 512
+ * 4k-context rework: K and V rows are stored as f16 (RNE) and the attention is
+ * the fork's flash-attention decode (pq1_fa16_head in pq1_host.c is the bit-exact
+ * host reference; the arithmetic is documented there), split in three kernels
+ * whose grids depend on ctx only, so one captured graph serves every position:
+ *  pq1_fa_qk  s[h][t] = vec_dot_f16(K_t, f16(q_h)) * scale (16 chains, fork reduce)
+ *  pq1_fa_sm  per (h, t): the running max M before t is an exclusive prefix max;
+ *             s > M ? (ms = expf(M - s), vs = 1) : (ms = 1, vs = expf(s - M))
+ *  pq1_fa_pv  per (h, d), t in order: VKQ = r16(VKQ * ms) when ms != 1, then
+ *             VKQ = r16(fma(V, vs, VKQ)); S = fma(S, ms, vs); out = VKQ * (1/S)
+ * As in pq1_silu_q8k every f32 op and compare is inline PTX without .ftz. The
+ * cos/sin table, npos and the Q8_K activation arrive in one H2D (layout
+ * PQ1_APAR_*, pq1_wrap.h); K/V caches are [kv head][ctx][128] halves per layer. */
 #ifndef PQ1_APAR_ROPE   /* per-token parameter block layout: the same values as pq1_wrap.h */
 #define PQ1_APAR_ROPE 0
 #define PQ1_APAR_NPOS 512
@@ -1184,14 +1185,50 @@ __device__ __forceinline__ float pq1_fgtsel(float m, float s) {
   asm("{ .reg .pred p; setp.gt.f32 p, %2, %1; selp.f32 %0, %2, %1, p; }" : "=f"(r) : "f"(m), "f"(s));
   return r;
 }
+/* a > b, IEEE (no ftz): false on NaN */
+__device__ __forceinline__ int pq1_fgt(float a, float b) {
+  int r;
+  asm("{ .reg .pred p; setp.gt.f32 p, %1, %2; selp.s32 %0, 1, 0, p; }" : "=r"(r) : "f"(a), "f"(b));
+  return r;
+}
+/* f32 -> f16 bits, round to nearest even (overflow -> inf, f16 subnormals kept) */
+__device__ __forceinline__ unsigned short pq1_f2h(float a) {
+  unsigned short r;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(r) : "f"(a));
+  return r;
+}
+__device__ __forceinline__ float pq1_h2f(unsigned short h) {
+  float r;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(r) : "h"(h));
+  return r;
+}
+/* pq1_h2f(pq1_f2h(x)) for every non-NaN x, without the two conversions (which
+ * issue at 1/4 the FP32 rate on sm_53): x + C - C with C = 1.5 * 2^(E+13), E =
+ * max(exponent(x), -14), rounds x to a multiple of the f16 ulp 2^(E-10), ties
+ * to even (C / ulp is even); the sign is OR-ed back so that values rounding to
+ * zero keep it (-0, as the conversion gives), and |x| >= 65520 becomes inf.
+ * Checked against the conversion pair for all 2^32 inputs (pq1_r16_test). */
+__device__ __forceinline__ float pq1_r16(float x) {
+  const unsigned ux = __float_as_uint(x);
+  const unsigned e = max(ux & 0x7f800000u, 0x38800000u);
+  const float C = __uint_as_float(e + 0x06C00000u);
+  int big;   /* |x| >= 65520 (false for NaN): IEEE compare on |x|, no ftz */
+  asm("{ .reg .pred p; setp.ge.f32 p, %1, 0f477FF000; selp.s32 %0, 1, 0, p; }" : "=r"(big) : "f"(fabsf(x)));
+  const unsigned r = big ? 0x7f800000u : __float_as_uint(pq1_fsub(pq1_fadd(x, C), C));
+  return __uint_as_float(r | (ux & 0x80000000u));
+}
+
+__device__ __forceinline__ float pq1_rcv(float x) { return pq1_h2f(pq1_f2h(x)); }
 
 /* one warp per head: warps [0, nh+nkv) are q then k heads (rms + rope; k goes to
  * the cache row npos), warps [nh+nkv, nh+2nkv) copy the v heads to their row */
 __global__ __launch_bounds__(128) void pq1_attn_pre(const float* __restrict__ qkv,
                                                     const float* __restrict__ nw,
                                                     const uint8_t* __restrict__ par,
-                                                    float* __restrict__ qo, float* __restrict__ kc,
-                                                    float* __restrict__ vc, int nh, int nkv, int ctx) {
+                                                    float* __restrict__ qo,
+                                                    unsigned short* __restrict__ kc,
+                                                    unsigned short* __restrict__ vc, int nh,
+                                                    int nkv, int ctx) {
   __shared__ float sx[4][128];
   const int w = threadIdx.x >> 5, l = threadIdx.x & 31;
   const int hh = blockIdx.x * 4 + w;
@@ -1199,9 +1236,9 @@ __global__ __launch_bounds__(128) void pq1_attn_pre(const float* __restrict__ qk
   const int npos = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS);
   const float* src = qkv + (size_t)hh * 128;
   if (hh >= nh + nkv) {
-    float* dst = vc + ((size_t)(hh - nh - nkv) * ctx + npos) * 128;
+    unsigned short* dst = vc + ((size_t)(hh - nh - nkv) * ctx + npos) * 128;
 #pragma unroll
-    for (int k = 0; k < 4; k++) dst[l + 32 * k] = src[l + 32 * k];
+    for (int k = 0; k < 4; k++) dst[l + 32 * k] = pq1_f2h(src[l + 32 * k]);
     return;
   }
   float x[4];
@@ -1227,9 +1264,14 @@ __global__ __launch_bounds__(128) void pq1_attn_pre(const float* __restrict__ qk
     o[k] = pq1_ffma(a, c, pq1_fneg(pq1_fmul(b, sn)));
     o[k + 2] = pq1_ffma(a, sn, pq1_fmul(b, c));
   }
-  float* dst = hh < nh ? qo + (size_t)hh * 128 : kc + ((size_t)(hh - nh) * ctx + npos) * 128;
+  if (hh < nh) {
 #pragma unroll
-  for (int k = 0; k < 4; k++) dst[l + 32 * k] = o[k];
+    for (int k = 0; k < 4; k++) qo[(size_t)hh * 128 + l + 32 * k] = o[k];
+  } else {
+    unsigned short* dst = kc + ((size_t)(hh - nh) * ctx + npos) * 128;
+#pragma unroll
+    for (int k = 0; k < 4; k++) dst[l + 32 * k] = pq1_f2h(o[k]);
+  }
 }
 
 /* Loop iter 7 (PQ1_APRE=1, default; 0 is the A/B arm): the same per-head math
@@ -1243,8 +1285,10 @@ __global__ __launch_bounds__(128) void pq1_attn_pre(const float* __restrict__ qk
 __global__ __launch_bounds__(256) void pq1_attn_pre1(const float* __restrict__ qkv,
                                                     const float* __restrict__ nw,
                                                     const uint8_t* __restrict__ par,
-                                                    float* __restrict__ qo, float* __restrict__ kc,
-                                                    float* __restrict__ vc, int nh, int nkv, int ctx) {
+                                                    float* __restrict__ qo,
+                                                    unsigned short* __restrict__ kc,
+                                                    unsigned short* __restrict__ vc, int nh,
+                                                    int nkv, int ctx) {
   extern __shared__ float sx[]; /* [nqk][129] */
   __shared__ float ssc[PQ1_APRE_MAXH];
   const int nqk = nh + nkv, t = threadIdx.x;
@@ -1252,7 +1296,7 @@ __global__ __launch_bounds__(256) void pq1_attn_pre1(const float* __restrict__ q
   for (int i = t; i < nqk * 128; i += 256) sx[(i >> 7) * 129 + (i & 127)] = qkv[i];
   for (int i = t; i < nkv * 128; i += 256) {
     const int h = i >> 7, d = i & 127;
-    vc[((size_t)h * ctx + npos) * 128 + d] = qkv[(size_t)(nqk + h) * 128 + d];
+    vc[((size_t)h * ctx + npos) * 128 + d] = pq1_f2h(qkv[(size_t)(nqk + h) * 128 + d]);
   }
   __syncthreads();
   if (t < nqk) {
@@ -1270,75 +1314,313 @@ __global__ __launch_bounds__(256) void pq1_attn_pre1(const float* __restrict__ q
     const float a = pq1_fmul(pq1_fmul(sc, sx[hh * 129 + j]), wn[j]);
     const float b = pq1_fmul(pq1_fmul(sc, sx[hh * 129 + j + 64]), wn[j + 64]);
     const float c = rc[j], sn = rc[64 + j];
-    float* dst = hh < nh ? qo + (size_t)hh * 128 : kc + ((size_t)(hh - nh) * ctx + npos) * 128;
-    dst[j] = pq1_ffma(a, c, pq1_fneg(pq1_fmul(b, sn)));
-    dst[j + 64] = pq1_ffma(a, sn, pq1_fmul(b, c));
-  }
-}
-
-/* one block per query head, 128 threads: thread = position for q.k / softmax,
- * thread = output dim for p.v */
-__global__ __launch_bounds__(128) void pq1_attn_core(const float* __restrict__ qo,
-                                                     const float* __restrict__ kc,
-                                                     const float* __restrict__ vc,
-                                                     const uint8_t* __restrict__ par,
-                                                     float* __restrict__ atto, int nh, int nkv,
-                                                     int ctx) {
-  __shared__ __align__(16) float sq[128];
-  __shared__ float sp[PQ1_ACTX];
-  __shared__ float smx[4];
-  __shared__ float ses;
-  const int h = blockIdx.x, t0 = threadIdx.x;
-  const int kh = h / (nh / nkv);
-  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
-  sq[t0] = qo[(size_t)h * 128 + t0];
-  __syncthreads();
-  const float* kb = kc + (size_t)kh * ctx * 128;
-  const float* vb = vc + (size_t)kh * ctx * 128;
-  float mx = -1e30f;
-  for (int t = t0; t < T; t += 128) {
-    const float4* kr = reinterpret_cast<const float4*>(kb + (size_t)t * 128);
-    const float4* q4 = reinterpret_cast<const float4*>(sq);
-    float a = 0.0f;
-#pragma unroll 8
-    for (int i4 = 0; i4 < 32; i4++) {
-      const float4 k4 = __ldg(kr + i4), qq = q4[i4];
-      a = pq1_ffma(qq.x, k4.x, a);
-      a = pq1_ffma(qq.y, k4.y, a);
-      a = pq1_ffma(qq.z, k4.z, a);
-      a = pq1_ffma(qq.w, k4.w, a);
+    const float o0 = pq1_ffma(a, c, pq1_fneg(pq1_fmul(b, sn)));
+    const float o1 = pq1_ffma(a, sn, pq1_fmul(b, c));
+    if (hh < nh) {
+      qo[(size_t)hh * 128 + j] = o0;
+      qo[(size_t)hh * 128 + j + 64] = o1;
+    } else {
+      unsigned short* dst = kc + ((size_t)(hh - nh) * ctx + npos) * 128;
+      dst[j] = pq1_f2h(o0);
+      dst[j + 64] = pq1_f2h(o1);
     }
-    const float s = pq1_fmul(a, 0.0883883476f);
-    sp[t] = s;
-    mx = pq1_fgtsel(mx, s);
   }
-#pragma unroll
-  for (int o = 16; o; o >>= 1) mx = pq1_fgtsel(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-  if ((t0 & 31) == 0) smx[t0 >> 5] = mx;
-  __syncthreads();
-  mx = pq1_fgtsel(pq1_fgtsel(pq1_fgtsel(smx[0], smx[1]), smx[2]), smx[3]);
-  for (int t = t0; t < T; t += 128) sp[t] = pq1_expf_dev(pq1_fsub(sp[t], mx));
-  __syncthreads();
-  if (t0 == 0) {
-    double es = 0.0;
-    for (int t = 0; t < T; t++) es = __dadd_rn(es, pq1_f2d(sp[t]));
-    ses = pq1_d2f(es);
-  }
-  __syncthreads();
-  const float esf = ses;
-  for (int t = t0; t < T; t += 128) sp[t] = pq1_fdiv(sp[t], esf);
-  __syncthreads();
-  const float* vr = vb + t0;
-  float c = 0.0f;
-#pragma unroll 4
-  for (int t = 0; t < T; t++) c = pq1_ffma(__ldg(vr + (size_t)t * 128), sp[t], c);
-  atto[(size_t)h * 128 + t0] = c;
 }
 
+/* q.k scores. Block = (kv head, tile stride), 32*G threads (G = nh/nkv query
+ * heads, one warp each); a tile is 32 positions, lane = position. The K tile is
+ * widened to f32 in shared memory, dim-major ([dim][pos], padded), so lane reads
+ * are conflict-free and q (f16-rounded, f32 in smem) is a broadcast. */
+#define PQ1_FA_QB 16
+__global__ __launch_bounds__(256) void pq1_fa_qk(const float* __restrict__ qo,
+                                                 const unsigned short* __restrict__ kc,
+                                                 const uint8_t* __restrict__ par,
+                                                 float* __restrict__ sc, int nh, int nkv,
+                                                 int ctx) {
+  __shared__ float sk[128][33];
+  __shared__ __align__(16) float sq[8][128];
+  const int G = nh / nkv, kh = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+  const int w = tid >> 5, l = tid & 31;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  if ((int)blockIdx.y * 32 >= T) return;   /* block-uniform, before any barrier */
+  for (int i = tid; i < G * 128; i += nt)
+    sq[i >> 7][i & 127] = pq1_h2f(pq1_f2h(qo[(size_t)kh * G * 128 + i]));
+  const unsigned short* kb = kc + (size_t)kh * ctx * 128;
+  for (int t0 = blockIdx.y * 32; t0 < T; t0 += gridDim.y * 32) {
+    __syncthreads();
+    for (int idx = tid; idx < 512; idx += nt) {
+      const int p = idx >> 4, c = idx & 15;
+      uint4 u = make_uint4(0u, 0u, 0u, 0u);
+      if (t0 + p < T) u = __ldg(reinterpret_cast<const uint4*>(kb + (size_t)(t0 + p) * 128) + c);
+      const unsigned wv[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        sk[c * 8 + 2 * e][p] = pq1_h2f((unsigned short)(wv[e] & 0xffffu));
+        sk[c * 8 + 2 * e + 1][p] = pq1_h2f((unsigned short)(wv[e] >> 16));
+      }
+    }
+    __syncthreads();
+    float a[16];
+#pragma unroll
+    for (int c = 0; c < 16; c++) a[c] = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+#pragma unroll
+      for (int c = 0; c < 16; c++) a[c] = pq1_ffma(sk[16 * j + c][l], sq[w][16 * j + c], a[c]);
+    float r[4];
+#pragma unroll
+    for (int q = 0; q < 4; q++) r[q] = pq1_fadd(pq1_fadd(a[q], a[8 + q]), pq1_fadd(a[4 + q], a[12 + q]));
+    const float s = pq1_fadd(pq1_fadd(r[0], r[1]), pq1_fadd(r[2], r[3]));
+    if (t0 + l < T) sc[(size_t)(kh * G + w) * ctx + t0 + l] = pq1_fmul(s, 0.0883883476f);
+  }
+}
+
+/* q.k scores for G = 4 (Bonsai-8B: 32 q / 8 kv heads), q held in registers.
+ * Lane = (position half hf, chain c): the fork's chain c sums dims 16j + c,
+ * j = 0..7, so a thread keeps q[h][16j + c] of the 4 heads (32 registers,
+ * f16-rounded) and every K element it reads from shared memory feeds 4 fmas.
+ * The 16 chains of a position live in 16 lanes and the fork's reduction tree
+ *   r_l = (a_l + a_{8+l}) + (a_{4+l} + a_{12+l}),  s = (r0 + r1) + (r2 + r3)
+ * is a butterfly xor 8, xor 4, xor 1, xor 2; the first two stages also split
+ * the heads between the partners (each lane forwards the half it drops), so
+ * the 4 heads cost 5 shuffles instead of 16 (fadd is commutative bitwise).
+ * Block = (kv head, tile stride), 128 threads, tiles of 16 K rows widened to
+ * f32 in shared memory with a 144-float row pitch (the two half-warps' rows
+ * land on disjoint banks). */
+#define PQ1_QK4_TR 16
+#define PQ1_QK4_QB 12
+__global__ __launch_bounds__(128) void pq1_fa_qk4(const float* __restrict__ qo,
+                                                  const unsigned short* __restrict__ kc,
+                                                  const uint8_t* __restrict__ par,
+                                                  float* __restrict__ sc, int ctx) {
+  __shared__ __align__(16) float sk[PQ1_QK4_TR][144];
+  const int kh = blockIdx.x, tid = threadIdx.x, w = tid >> 5, l = tid & 31;
+  const int hf = l >> 4, c = l & 15;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  if ((int)blockIdx.y * PQ1_QK4_TR >= T) return;   /* block-uniform, before any barrier */
+  float q[4][8];
+#pragma unroll
+  for (int h = 0; h < 4; h++)
+#pragma unroll
+    for (int j = 0; j < 8; j++) q[h][j] = pq1_rcv(qo[(size_t)(kh * 4 + h) * 128 + 16 * j + c]);
+  const unsigned short* kb = kc + (size_t)kh * ctx * 128;
+  float* so = sc + (size_t)kh * 4 * ctx;
+  const bool lo8 = !(c & 8), lo4 = !(c & 4);
+  const int hw = c >> 2;   /* the head a lane holds after the two splitting stages */
+  uint4 pu[2];
+  auto fetch = [&](int t0) {
+    const int n = min(PQ1_QK4_TR, T - t0);
+#pragma unroll
+    for (int i = 0; i < 2; i++) {   /* 16 rows x 16 uint4 = 256 loads, 2 per thread */
+      const int idx = tid + i * 128, p = idx >> 4, cc = idx & 15;
+      pu[i] = make_uint4(0u, 0u, 0u, 0u);
+      if (p < n) pu[i] = __ldg(reinterpret_cast<const uint4*>(kb + (size_t)(t0 + p) * 128) + cc);
+    }
+  };
+  fetch(blockIdx.y * PQ1_QK4_TR);
+  for (int t0 = blockIdx.y * PQ1_QK4_TR; t0 < T; t0 += gridDim.y * PQ1_QK4_TR) {
+    const int n = min(PQ1_QK4_TR, T - t0);
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+      const int idx = tid + i * 128, p = idx >> 4, cc = idx & 15;
+      const unsigned uu[4] = {pu[i].x, pu[i].y, pu[i].z, pu[i].w};
+      float f[8];
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        f[2 * e] = pq1_h2f((unsigned short)(uu[e] & 0xffffu));
+        f[2 * e + 1] = pq1_h2f((unsigned short)(uu[e] >> 16));
+      }
+      reinterpret_cast<float4*>(sk[p])[2 * cc] = make_float4(f[0], f[1], f[2], f[3]);
+      reinterpret_cast<float4*>(sk[p])[2 * cc + 1] = make_float4(f[4], f[5], f[6], f[7]);
+    }
+    __syncthreads();
+    if (t0 + gridDim.y * PQ1_QK4_TR < T) fetch(t0 + gridDim.y * PQ1_QK4_TR);
+#pragma unroll
+    for (int st = 0; st < PQ1_QK4_TR / 8; st++) {   /* 4 warps x 2 positions per step */
+      const int p = st * 8 + w * 2 + hf;
+      float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        const float k = sk[p][16 * j + c];
+#pragma unroll
+        for (int h = 0; h < 4; h++) a[h] = pq1_ffma(k, q[h][j], a[h]);
+      }
+      /* xor 8: lanes c < 8 keep heads 0,1, lanes c >= 8 keep heads 2,3 */
+      const float s0 = __shfl_xor_sync(0xffffffffu, lo8 ? a[2] : a[0], 8);
+      const float s1 = __shfl_xor_sync(0xffffffffu, lo8 ? a[3] : a[1], 8);
+      const float b0 = pq1_fadd(lo8 ? a[0] : a[2], s0), b1 = pq1_fadd(lo8 ? a[1] : a[3], s1);
+      /* xor 4: lanes with c & 4 clear keep the first of their two heads */
+      const float s2 = __shfl_xor_sync(0xffffffffu, lo4 ? b1 : b0, 4);
+      const float d = pq1_fadd(lo4 ? b0 : b1, s2);   /* r_(c & 3) of head hw */
+      const float e = pq1_fadd(d, __shfl_xor_sync(0xffffffffu, d, 1));
+      const float f = pq1_fadd(e, __shfl_xor_sync(0xffffffffu, e, 2));
+      if (!(c & 3) && p < n) so[(size_t)hw * ctx + t0 + p] = pq1_fmul(f, 0.0883883476f);
+    }
+  }
+}
+
+/* online-softmax parameters, one block per query head: each thread owns a
+ * contiguous run of positions; the running max before the run is an exclusive
+ * prefix of the per-run maxima (the same strict-> fold, so the same value; a
+ * +0/-0 tie can flip the sign of a zero M, which changes no ms or vs below). */
+__global__ __launch_bounds__(256) void pq1_fa_sm(const float* __restrict__ sc,
+                                                 const uint8_t* __restrict__ par,
+                                                 float2* __restrict__ mv, int ctx) {
+  __shared__ float sm[256];
+  const int h = blockIdx.x, tid = threadIdx.x;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  const int per = (T + 255) >> 8, b = tid * per, e = min(T, b + per);
+  const float* s = sc + (size_t)h * ctx;
+  const float NINF = __uint_as_float(0xff800000u);
+  float m = NINF;
+  for (int t = b; t < e; t++) m = pq1_fgtsel(m, s[t]);
+  sm[tid] = m;
+  __syncthreads();
+  if (tid == 0) {
+    float run = NINF;
+    for (int k = 0; k < 256; k++) { const float x = sm[k]; sm[k] = run; run = pq1_fgtsel(run, x); }
+  }
+  __syncthreads();
+  float M = sm[tid];
+  for (int t = b; t < e; t++) {
+    const float x = s[t];
+    float ms = 1.0f, vs = 1.0f;
+    if (pq1_fgt(x, M)) { ms = pq1_expf_dev(pq1_fsub(M, x)); M = x; }
+    else vs = pq1_expf_dev(pq1_fsub(x, M));
+    mv[(size_t)h * ctx + t] = make_float2(ms, vs);
+  }
+}
+
+/* V accumulation: block = kv head, 32*G threads, thread = (query head w, dims
+ * 4l..4l+3): four independent chains share each (ms, vs) and V load. Positions
+ * strictly in order (each step rounds VKQ to f16). V tiles of PQ1_PV_TR rows are
+ * widened to f32 once in shared memory, the next tile is prefetched into
+ * registers while the current one runs, and a tile in which no head rescales
+ * (every ms == 1, the common case after the first positions) takes a branch-free
+ * path. The f16 rounding of chain i < 4 - NALU uses the cvt pair (the conversion
+ * pipe), the rest pq1_r16 (the ALU pipe); the two are bitwise equal. */
+#define PQ1_PV_TR 8   /* 8 blocks x (4 KB + G*64 B) fit the one SM (64 KB) */
+template <int G, int NALU>
+__global__ __launch_bounds__(32 * G) void pq1_fa_pv(const unsigned short* __restrict__ vc,
+                                                     const float2* __restrict__ mv,
+                                                     const uint8_t* __restrict__ par,
+                                                     float* __restrict__ atto, int ctx) {
+  constexpr int NT = 32 * G, NV = (PQ1_PV_TR * 16 + NT - 1) / NT, NM = (G * PQ1_PV_TR + NT - 1) / NT;
+  __shared__ __align__(16) float sv[PQ1_PV_TR][128];
+  __shared__ float2 smv[G][PQ1_PV_TR];
+  const int kh = blockIdx.x, tid = threadIdx.x, w = tid >> 5, l = tid & 31, h = kh * G + w;
+  const int T = *reinterpret_cast<const int*>(par + PQ1_APAR_NPOS) + 1;
+  const unsigned short* vb = vc + (size_t)kh * ctx * 128;
+  const float2* mb = mv + (size_t)kh * G * ctx;
+  uint4 pu[NV];
+  float2 pm[NM];
+  auto fetch = [&](int t0) {
+    const int n = min(PQ1_PV_TR, T - t0);
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+      const int idx = tid + i * NT, p = idx >> 4, c = idx & 15;
+      pu[i] = make_uint4(0u, 0u, 0u, 0u);
+      if (idx < PQ1_PV_TR * 16 && p < n)
+        pu[i] = __ldg(reinterpret_cast<const uint4*>(vb + (size_t)(t0 + p) * 128) + c);
+    }
+#pragma unroll
+    for (int i = 0; i < NM; i++) {
+      const int idx = tid + i * NT, hw = idx / PQ1_PV_TR, p = idx % PQ1_PV_TR;
+      pm[i] = make_float2(1.0f, 0.0f);
+      if (idx < G * PQ1_PV_TR && p < n) pm[i] = __ldg(mb + (size_t)hw * ctx + t0 + p);
+    }
+  };
+  float a[4] = {0.0f, 0.0f, 0.0f, 0.0f}, S = 0.0f;
+  if (T > 0) fetch(0);
+  for (int t0 = 0; t0 < T; t0 += PQ1_PV_TR) {
+    const int n = min(PQ1_PV_TR, T - t0);
+    __syncthreads();
+    int resc = 0;
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+      const int idx = tid + i * NT, p = idx >> 4, c = idx & 15;
+      if (idx < PQ1_PV_TR * 16) {
+        const unsigned u[4] = {pu[i].x, pu[i].y, pu[i].z, pu[i].w};
+        float f[8];
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+          f[2 * e] = pq1_h2f((unsigned short)(u[e] & 0xffffu));
+          f[2 * e + 1] = pq1_h2f((unsigned short)(u[e] >> 16));
+        }
+        reinterpret_cast<float4*>(sv[p])[2 * c] = make_float4(f[0], f[1], f[2], f[3]);
+        reinterpret_cast<float4*>(sv[p])[2 * c + 1] = make_float4(f[4], f[5], f[6], f[7]);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < NM; i++) {
+      const int idx = tid + i * NT;
+      if (idx < G * PQ1_PV_TR) {
+        smv[idx / PQ1_PV_TR][idx % PQ1_PV_TR] = pm[i];
+        resc |= __float_as_uint(pm[i].x) != 0x3f800000u;
+      }
+    }
+    resc = __syncthreads_or(resc);
+    if (t0 + PQ1_PV_TR < T) fetch(t0 + PQ1_PV_TR);
+    if (!resc && n == PQ1_PV_TR) {
+#pragma unroll
+      for (int p = 0; p < PQ1_PV_TR; p++) {
+        const float2 m = smv[w][p];
+        const float4 v = reinterpret_cast<const float4*>(sv[p])[l];
+        const float vv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          const float y = pq1_ffma(vv[i], m.y, a[i]);
+          a[i] = (i < 4 - NALU) ? pq1_rcv(y) : pq1_r16(y);
+        }
+        S = pq1_ffma(S, m.x, m.y);
+      }
+    } else {
+      for (int p = 0; p < n; p++) {
+        const float2 m = smv[w][p];
+        const float4 v = reinterpret_cast<const float4*>(sv[p])[l];
+        const float vv[4] = {v.x, v.y, v.z, v.w};
+        if (__float_as_uint(m.x) != 0x3f800000u) {
+#pragma unroll
+          for (int i = 0; i < 4; i++) a[i] = pq1_rcv(pq1_fmul(a[i], m.x));
+        }
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          const float y = pq1_ffma(vv[i], m.y, a[i]);
+          a[i] = (i < 4 - NALU) ? pq1_rcv(y) : pq1_r16(y);
+        }
+        S = pq1_ffma(S, m.x, m.y);
+      }
+    }
+  }
+  const float si = (__float_as_uint(S) & 0x7fffffffu) ? pq1_fdiv(1.0f, S) : 0.0f;
+  reinterpret_cast<float4*>(atto + (size_t)h * 128)[l] =
+      make_float4(pq1_fmul(a[0], si), pq1_fmul(a[1], si), pq1_fmul(a[2], si), pq1_fmul(a[3], si));
+}
+
+template <int G>
+static void pq1_fa_pv_g(const unsigned short* vc, const float2* mv, const uint8_t* par, float* atto,
+                        int nkv, int ctx, cudaStream_t s) {
+  static int nalu = -1;
+  if (nalu < 0) { const char* e = getenv("PQ1_PV_ALU"); nalu = e ? atoi(e) : 0; }
+  switch (nalu) {
+    case 0: pq1_fa_pv<G, 0><<<nkv, 32 * G, 0, s>>>(vc, mv, par, atto, ctx); break;
+    case 2: pq1_fa_pv<G, 2><<<nkv, 32 * G, 0, s>>>(vc, mv, par, atto, ctx); break;
+    case 4: pq1_fa_pv<G, 4><<<nkv, 32 * G, 0, s>>>(vc, mv, par, atto, ctx); break;
+    default: pq1_fa_pv<G, 1><<<nkv, 32 * G, 0, s>>>(vc, mv, par, atto, ctx); break;
+  }
+}
+
+extern "C" int pq1_fa_launch(const float* qo_d, const unsigned short* kc_d,
+                             const unsigned short* vc_d, float* sc_d, float* mv_d,
+                             const uint8_t* par_d, float* atto_d, int nh, int nkv, int ctx,
+                             void* stream);
+extern "C" int pq1_fa_mask = 7;   /* pq1_parity timing: which of qk|sm|pv to launch */
 extern "C" int pq1_attn_launch(const float* qkv_d, const float* nw_d, const uint8_t* par_d,
-                               float* qo_d, float* kc_d, float* vc_d, float* atto_d, int nh,
-                               int nkv, int ctx, void* stream) {
-  if (nh <= 0 || nkv <= 0 || (nh % nkv) || ((nh + 2 * nkv) & 3) || ctx <= 0 || ctx > PQ1_ACTX)
+                               float* qo_d, unsigned short* kc_d, unsigned short* vc_d,
+                               float* sc_d, float* mv_d, float* atto_d, int nh, int nkv, int ctx,
+                               void* stream) {
+  if (nh <= 0 || nkv <= 0 || (nh % nkv) || nh / nkv > 8 || ((nh + 2 * nkv) & 3) || ctx <= 0)
     return -2;
   cudaStream_t s = (cudaStream_t)stream;
   static int apre = -1;
@@ -1349,6 +1631,49 @@ extern "C" int pq1_attn_launch(const float* qkv_d, const float* nw_d, const uint
   else
     pq1_attn_pre<<<(nh + 2 * nkv) / 4, 128, 0, s>>>(qkv_d, nw_d, par_d, qo_d, kc_d, vc_d, nh, nkv, ctx);
   if (cudaGetLastError() != cudaSuccess) return -1;
-  pq1_attn_core<<<nh, 128, 0, s>>>(qo_d, kc_d, vc_d, par_d, atto_d, nh, nkv, ctx);
+  return pq1_fa_launch(qo_d, kc_d, vc_d, sc_d, mv_d, par_d, atto_d, nh, nkv, ctx, stream);
+}
+
+extern "C" int pq1_fa_launch(const float* qo_d, const unsigned short* kc_d,
+                             const unsigned short* vc_d, float* sc_d, float* mv_d,
+                             const uint8_t* par_d, float* atto_d, int nh, int nkv, int ctx,
+                             void* stream) {
+  if (nh <= 0 || nkv <= 0 || (nh % nkv) || nh / nkv > 8 || ctx <= 0) return -2;
+  cudaStream_t s = (cudaStream_t)stream;
+  const int G = nh / nkv, qb = min((ctx + 31) / 32, PQ1_FA_QB);
+  static int qk4 = -1;
+  if (qk4 < 0) { const char* e = getenv("PQ1_QK4"); qk4 = e ? atoi(e) : 1; }
+  if (pq1_fa_mask & 1) {
+    if (G == 4 && qk4)
+      pq1_fa_qk4<<<dim3(nkv, min((ctx + PQ1_QK4_TR - 1) / PQ1_QK4_TR, PQ1_QK4_QB)), 128, 0, s>>>(
+          qo_d, kc_d, par_d, sc_d, ctx);
+    else
+      pq1_fa_qk<<<dim3(nkv, qb), 32 * G, 0, s>>>(qo_d, kc_d, par_d, sc_d, nh, nkv, ctx);
+  }
+  if (pq1_fa_mask & 2)
+    pq1_fa_sm<<<nh, 256, 0, s>>>(sc_d, par_d, reinterpret_cast<float2*>(mv_d), ctx);
+  if (pq1_fa_mask & 4)
+    switch (G) {
+#define PQ1_PVG(g) case g: pq1_fa_pv_g<g>(vc_d, reinterpret_cast<const float2*>(mv_d), par_d, atto_d, nkv, ctx, s); break;
+      PQ1_PVG(1) PQ1_PVG(2) PQ1_PVG(3) PQ1_PVG(4) PQ1_PVG(5) PQ1_PVG(6) PQ1_PVG(7) PQ1_PVG(8)
+#undef PQ1_PVG
+    }
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+/* exhaustive check of pq1_r16 against the conversion pair: every non-NaN f32
+ * bit pattern; bad[0] counts mismatches, bad[1] holds the first one */
+__global__ void pq1_r16_test(unsigned long long base, unsigned long long* bad) {
+  const unsigned long long i = base + (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const float x = __uint_as_float((unsigned)i);
+  if ((((unsigned)i) & 0x7fffffffu) > 0x7f800000u) return;   /* NaN */
+  const unsigned a = __float_as_uint(pq1_r16(x)), b = __float_as_uint(pq1_h2f(pq1_f2h(x)));
+  if (a != b && atomicAdd(&bad[0], 1ull) == 0ull) bad[1] = i;
+}
+extern "C" int pq1_r16_test_launch(unsigned long long* bad_d) {
+  for (unsigned long long base = 0; base < (1ull << 32); base += (1ull << 24)) {
+    pq1_r16_test<<<(1 << 24) / 256, 256>>>(base, bad_d);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+  }
+  return cudaDeviceSynchronize() == cudaSuccess ? 0 : -1;
 }

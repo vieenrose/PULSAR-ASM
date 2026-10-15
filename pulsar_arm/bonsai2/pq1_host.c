@@ -315,3 +315,66 @@ void pq1_hyb_run(const uint32_t *codes, const float *scales_f, int rows, int K,
   pq1_hyb_start(codes, scales_f, rows, K, xq, y);
   pq1_hyb_wait();
 }
+
+/* ---- 4k context: f16 K/V cache, the fork's flash-attention decode -----------
+ * One query head over positions 0..T-1 of its kv head, written as the PrismML
+ * fork computes it for a decode token (ggml_compute_forward_flash_attn_ext_f16
+ * _one_chunk, f16 K/V, CPU backend, 1 thread: the split-KV reduction is then a
+ * single partial with scale 1, i.e. the identity), with its NEON F32Cx4 path
+ * (GCC 13.3 -O3 -mcpu=native on the Spark: no FP16 vector arithmetic):
+ *  Q        rounded to f16 (RNE), K/V rows stored as f16 (RNE)
+ *  q.k      ggml_vec_dot_f16: 16 fma chains, chain c = elements 16j+c, j
+ *           ascending; reduce r_l = (c_l + c_8+l) + (c_4+l + c_12+l), then
+ *           s = (r0 + r1) + (r2 + r3) (vaddvq = faddp, faddp)
+ *  s        s * scale (mask 0, no softcap)
+ *  online   s > M: M = s, ms = expf(Mold - M), VKQ = f16(f32(VKQ) * ms), vs = 1
+ *           else  vs = expf(s - M)
+ *           VKQ = f16(fma(V, vs, VKQ)); S = fma(S, ms, vs)
+ *  out      VKQ * (S == 0 ? 0 : 1/S)
+ * This file is built with -ffp-contract=off, so every fma below is the one
+ * written. The device kernels (pq1_fa_*, pq1_swar_sm53.cu) match it bit for bit. */
+static inline uint16_t pq1_f2h16(float f) {
+    __fp16 x = (__fp16)f;
+    uint16_t h;
+    memcpy(&h, &x, 2);
+    return h;
+}
+static inline float pq1_h2f16(uint16_t h) {
+    __fp16 x;
+    memcpy(&x, &h, 2);
+    return (float)x;
+}
+void pq1_f2h_row(const float *x, uint16_t *h, int n) {
+    for (int i = 0; i < n; i++) h[i] = pq1_f2h16(x[i]);
+}
+void pq1_fa16_head(const float *q, const uint16_t *K, const uint16_t *V, int T, float scale,
+                   float *out) {
+    float qh[128], vkq[128];
+    for (int i = 0; i < 128; i++) { qh[i] = pq1_h2f16(pq1_f2h16(q[i])); vkq[i] = 0.0f; }
+    float S = 0.0f, M = -INFINITY;
+    for (int t = 0; t < T; t++) {
+        const uint16_t *k = K + (size_t)t * 128, *v = V + (size_t)t * 128;
+        float a[16];
+        for (int c = 0; c < 16; c++) a[c] = 0.0f;
+        for (int j = 0; j < 8; j++)
+            for (int c = 0; c < 16; c++) a[c] = fmaf(pq1_h2f16(k[16 * j + c]), qh[16 * j + c], a[c]);
+        float r[4];
+        for (int l = 0; l < 4; l++) r[l] = (a[l] + a[8 + l]) + (a[4 + l] + a[12 + l]);
+        float s = (r[0] + r[1]) + (r[2] + r[3]);
+        s = s * scale;
+        float ms = 1.0f, vs = 1.0f;
+        const float Mold = M;
+        if (s > M) {
+            M = s;
+            ms = expf(Mold - M);
+            for (int d = 0; d < 128; d++) vkq[d] = pq1_h2f16(pq1_f2h16(vkq[d] * ms));
+        } else {
+            vs = expf(s - M);
+        }
+        for (int d = 0; d < 128; d++)
+            vkq[d] = pq1_h2f16(pq1_f2h16(fmaf(pq1_h2f16(v[d]), vs, vkq[d])));
+        S = fmaf(S, ms, vs);
+    }
+    const float si = S == 0.0f ? 0.0f : 1.0f / S;
+    for (int d = 0; d < 128; d++) out[d] = vkq[d] * si;
+}

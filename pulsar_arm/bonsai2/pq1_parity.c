@@ -22,7 +22,99 @@ static void mk_q8k(uint8_t *xq, int K, unsigned seed) {
   }
 }
 
+#if defined(PQ1_REAL_CUDA)
+/* `pq1_parity fa`: the f16 flash-attention kernels against pq1_fa16_head on
+ * random q/K/V (8 kv heads x 4 query heads, ctx 4096) at several depths, bit
+ * for bit; plus the exhaustive pq1_r16 check */
+static int fa_parity(void) {
+  const int nh = 32, nkv = 8, ctx = 4096;
+  const int Ts[] = {1, 2, 31, 32, 33, 97, 512, 1500, 4096};
+  float *q = malloc((size_t)nh * 128 * 4), *o = malloc((size_t)nh * 128 * 4);
+  float *od = malloc((size_t)nh * 128 * 4), *tmp = malloc((size_t)ctx * 128 * 4);
+  uint16_t *K = malloc((size_t)nkv * ctx * 128 * 2), *V = malloc((size_t)nkv * ctx * 128 * 2);
+  unsigned char par[PQ1_APAR_BYTES];
+  float *d_q, *d_sc, *d_mv, *d_o;
+  unsigned short *d_k, *d_v;
+  unsigned char *d_par;
+  unsigned long long *d_bad, bad[2] = {0, 0};
+  cudaMalloc((void **)&d_q, (size_t)nh * 512); cudaMalloc((void **)&d_o, (size_t)nh * 512);
+  cudaMalloc((void **)&d_k, (size_t)nkv * ctx * 256); cudaMalloc((void **)&d_v, (size_t)nkv * ctx * 256);
+  cudaMalloc((void **)&d_sc, (size_t)nh * ctx * 4); cudaMalloc((void **)&d_mv, (size_t)nh * ctx * 8);
+  cudaMalloc((void **)&d_par, sizeof par); cudaMalloc((void **)&d_bad, 16);
+  srand(4242);
+  /* K post-norm-like magnitudes; a few large q dims so that the scores span a
+   * wide range (new maxima late in the sequence, tiny vs, exact ties) */
+  for (size_t i = 0; i < (size_t)nkv * ctx * 128; i++) {
+    float k = ((rand() % 20001) - 10000) / 4000.0f, v = ((rand() % 20001) - 10000) / 1000.0f;
+    if (i % 977 == 5) k = 0.0f;
+    if (i % 1231 == 7) v = -0.0f;
+    pq1_f2h_row(&k, &K[i], 1);
+    pq1_f2h_row(&v, &V[i], 1);
+  }
+  /* repeat a K row: identical scores (s > M is strict) */
+  memcpy(K + 700 * 128, K + 300 * 128, 256);
+  for (int i = 0; i < nh * 128; i++) q[i] = ((rand() % 20001) - 10000) / 2500.0f * (i % 16 == 3 ? 6.0f : 1.0f);
+  cudaMemcpy(d_q, q, (size_t)nh * 512, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_k, K, (size_t)nkv * ctx * 256, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_v, V, (size_t)nkv * ctx * 256, cudaMemcpyHostToDevice);
+  int allok = 1;
+  for (unsigned ti = 0; ti < sizeof Ts / sizeof Ts[0]; ti++) {
+    const int T = Ts[ti], npos = T - 1;
+    if (getenv("PQ1_FA_T") && atoi(getenv("PQ1_FA_T")) != T) continue;
+    memset(par, 0, sizeof par);
+    memcpy(par + PQ1_APAR_NPOS, &npos, 4);
+    cudaMemcpy(d_par, par, sizeof par, cudaMemcpyHostToDevice);
+    cudaMemset(d_o, 0xff, (size_t)nh * 512);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = pq1_fa_launch(d_q, d_k, d_v, d_sc, d_mv, d_par, d_o, nh, nkv, ctx, 0);
+    cudaDeviceSynchronize();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    cudaMemcpy(od, d_o, (size_t)nh * 512, cudaMemcpyDeviceToHost);
+    int badn = 0, first = -1;
+    for (int h = 0; h < nh; h++) {
+      pq1_fa16_head(q + h * 128, K + (size_t)(h / 4) * ctx * 128, V + (size_t)(h / 4) * ctx * 128, T,
+                    0.0883883476f, o + h * 128);
+      for (int d = 0; d < 128; d++)
+        if (memcmp(&o[h * 128 + d], &od[h * 128 + d], 4)) { if (first < 0) first = h * 128 + d; badn++; }
+    }
+    printf("fa T=%4d rc=%d bad=%d/%d %s  (%.3f ms)", T, rc, badn, nh * 128, (rc == 0 && !badn) ? "OK" : "MISMATCH",
+           (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6);
+    if (first >= 0) printf("  first [%d] host %.9g dev %.9g", first, o[first], od[first]);
+    printf("\n");
+    if (rc || badn) allok = 0;
+    if (getenv("PQ1_FA_TIME")) {   /* per-kernel time, 20 reps each */
+      cudaEvent_t e0, e1;
+      cudaEventCreate(&e0); cudaEventCreate(&e1);
+      float ms3[3];
+      for (int k = 0; k < 3; k++) {
+        pq1_fa_mask = 1 << k;
+        cudaEventRecord(e0, 0);
+        for (int r = 0; r < 20; r++) pq1_fa_launch(d_q, d_k, d_v, d_sc, d_mv, d_par, d_o, nh, nkv, ctx, 0);
+        cudaEventRecord(e1, 0);
+        cudaEventSynchronize(e1);
+        cudaEventElapsedTime(&ms3[k], e0, e1);
+        ms3[k] /= 20;
+      }
+      pq1_fa_mask = 7;
+      printf("   per layer: qk %.3f  sm %.3f  pv %.3f ms\n", ms3[0], ms3[1], ms3[2]);
+    }
+  }
+  cudaMemset(d_bad, 0, 16);
+  int rc = pq1_r16_test_launch(d_bad);
+  cudaMemcpy(bad, d_bad, 16, cudaMemcpyDeviceToHost);
+  printf("r16 all 2^32 inputs: rc=%d bad=%llu%s first=0x%08llx\n", rc, bad[0], bad[0] ? " MISMATCH" : " OK", bad[1]);
+  if (rc || bad[0]) allok = 0;
+  (void)tmp;
+  printf("FA PARITY: %s\n", allok ? "PASS" : "FAIL");
+  return allok ? 0 : 1;
+}
+#endif
+
 int main(int argc, char **argv) {
+#if defined(PQ1_REAL_CUDA)
+  if (argc > 1 && !strcmp(argv[1], "fa")) return fa_parity();
+#endif
   int rows = argc > 1 ? atoi(argv[1]) : 256;
   int K = argc > 2 ? atoi(argv[2]) : 4096;
   int nb = K / 128;

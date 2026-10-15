@@ -199,6 +199,14 @@ void pq1_hist_report(unsigned long *code);
 #ifdef PQ1_USE_CUDA
 static uint8_t *PQ1ARENA = NULL;
 static size_t PQ1ACUR = 0, PQ1ALIM = 0;
+/* 4k context: the run's K/V cache shape (pq1_kv_shape, set by fwd8 before the
+ * first device call). The f16 cache plus attention scratch beyond the 75.5 MB
+ * that the ctx-512 f32 cache used to take is added to the arena. */
+static int PQ1KVS_NL = 0, PQ1KVS_NKV = 0, PQ1KVS_CTX = 0;
+static size_t pq1_kv_bytes(int nl, int nkv, int ctx) {
+  return (size_t)nl * 2 * nkv * ctx * 128 * 2 + (size_t)PQ1_FA_MAXH * ctx * 12;
+}
+void pq1_kv_shape(int nl, int nkv, int ctx) { PQ1KVS_NL = nl; PQ1KVS_NKV = nkv; PQ1KVS_CTX = ctx; }
 static uint8_t *d_xq = NULL;
 static float *d_y = NULL;
 static size_t P2XQMAX = 0, P2YMAX = 0;
@@ -465,6 +473,11 @@ static int pq1_arena_init(size_t need) {
    * with PQ1_ARENA_MB. */
   const char *e = getenv("PQ1_ARENA_MB");
   size_t mb = e ? (size_t)atoi(e) : 1280;
+  if (!e && PQ1KVS_CTX > 0) {
+    const size_t kvb = pq1_kv_bytes(PQ1KVS_NL, PQ1KVS_NKV, PQ1KVS_CTX);
+    const size_t old = (size_t)36 * 2 * 8 * 512 * 128 * 4;   /* the ctx-512 f32 cache */
+    if (kvb > old) mb += (kvb - old + (1u << 20) - 1) >> 20;
+  }
   void *ar = NULL;
   cudaError_t rc = cudaMalloc(&ar, mb << 20);
   if (rc != cudaSuccess) {
@@ -1190,9 +1203,10 @@ void pq1_ffn_dbg_xq(unsigned char *dst, unsigned long n) {
  * attn_output -> MDY+512KB, D2H -> ao}. Replaces, per layer: the q/k/v D2H +
  * sync, the CPU head norms, rope, K/V copy and attention (11.6 ms/tok), the CPU
  * quant of the attention output and the attn_output H2D + sync.
- * The K/V cache lives in the arena ([layer][k|v][kv head][ctx][128] floats,
- * 75.5 MB at ctx 512). Tokens that run the host path (the first one: the merged
- * q+k+v tensor does not exist before it) push their post-rope K and V rows with
+ * The K/V cache lives in the arena ([layer][k|v][kv head][ctx][128] f16 since
+ * the 4k-context rework: 37.7 MB at ctx 512, 604 MB at 4096). Tokens that run
+ * the host path (the first one: the merged q+k+v tensor does not exist before
+ * it) push their post-rope K and V rows with
  * pq1_attn_kv_put, so the device cache is always complete; PQ1KV_NEXT[il] is the
  * next position the device cache expects, and the graph only runs when it equals
  * npos. Once a layer has run on the device its HOST cache is stale, so a later
@@ -1203,7 +1217,8 @@ void pq1_ffn_dbg_xq(unsigned char *dst, unsigned long n) {
 typedef struct { const void *wq, *wo, *xq; float *ao; int ok; cudaGraphExec_t ex; } pq1_attg;
 static pq1_attg PQ1AG[PQ1_AL_MAX];
 static int PQ1_ATT = -1;
-static float *d_kv = NULL, *d_anw = NULL;
+static uint16_t *d_kv = NULL;
+static float *d_anw = NULL, *d_fas = NULL, *d_fam = NULL;
 static uint8_t *d_ain = NULL;
 static int PQ1KV_NL = 0, PQ1KV_NKV = 0, PQ1KV_CTX = 0, PQ1KV_DEAD = 0;
 static int PQ1KV_NEXT[PQ1_AL_MAX], PQ1KV_LIVE[PQ1_AL_MAX];
@@ -1212,24 +1227,28 @@ static uint8_t PQ1_AIN[PQ1_APAR_BYTES] __attribute__((aligned(64)));
 static int pq1_kv_alloc(int nl, int nkv, int ctx) {
   if (d_kv) return (nl == PQ1KV_NL && nkv == PQ1KV_NKV && ctx == PQ1KV_CTX) ? 0 : -1;
   if (PQ1KV_DEAD || nl <= 0 || nl > PQ1_AL_MAX || nkv <= 0 || ctx <= 0) return -1;
-  size_t kvb = (size_t)nl * 2 * nkv * ctx * 128 * 4, nwb = (size_t)nl * 256 * 4;
-  size_t need = (kvb + nwb + PQ1_APAR_BYTES + 255) / 256 * 256;
+  size_t kvb = (size_t)nl * 2 * nkv * ctx * 128 * 2, nwb = (size_t)nl * 256 * 4;
+  size_t fab = (size_t)PQ1_FA_MAXH * ctx * 4;   /* scores; (ms, vs) pairs take 2x */
+  size_t need = (kvb + 3 * fab + nwb + PQ1_APAR_BYTES + 255) / 256 * 256;
   if (!PQ1ARENA || PQ1ACUR + need > PQ1ALIM || pq1_arena_init(need) != 0) { PQ1KV_DEAD = 1; return -1; }
-  d_kv = (float *)(PQ1ARENA + PQ1ACUR);
-  d_anw = (float *)((uint8_t *)d_kv + kvb);
+  d_kv = (uint16_t *)(PQ1ARENA + PQ1ACUR);
+  d_fas = (float *)((uint8_t *)d_kv + kvb);
+  d_fam = d_fas + (size_t)PQ1_FA_MAXH * ctx;
+  d_anw = d_fam + (size_t)2 * PQ1_FA_MAXH * ctx;
   d_ain = (uint8_t *)d_anw + nwb;
   PQ1ACUR += need;
   if (PQ1ACUR > P2PEAK) P2PEAK = PQ1ACUR;
   PQ1KV_NL = nl; PQ1KV_NKV = nkv; PQ1KV_CTX = ctx;
   return 0;
 }
-static float *pq1_kv_layer(int il, int v) {
+static uint16_t *pq1_kv_layer(int il, int v) {
   return d_kv + ((size_t)il * 2 + v) * PQ1KV_NKV * PQ1KV_CTX * 128;
 }
 #endif
 
-/* host path: k and v are nkv x 128 post-rope rows of position npos */
-int pq1_attn_kv_put(int il, int nl, int nkv, int ctx, int npos, const float *k, const float *v) {
+/* host path: k and v are nkv x 128 post-rope f16 rows of position npos */
+int pq1_attn_kv_put(int il, int nl, int nkv, int ctx, int npos, const uint16_t *k,
+                    const uint16_t *v) {
 #ifdef PQ1_USE_CUDA
   if (il < 0 || il >= PQ1_AL_MAX) return -1;
   if (PQ1KV_LIVE[il]) {
@@ -1238,10 +1257,10 @@ int pq1_attn_kv_put(int il, int nl, int nkv, int ctx, int npos, const float *k, 
     exit(3);
   }
   if (pq1_kv_alloc(nl, nkv, ctx) != 0 || npos != PQ1KV_NEXT[il] || npos >= ctx) return -1;
-  const size_t pitch = (size_t)ctx * 128 * 4;
-  if (cudaMemcpy2D(pq1_kv_layer(il, 0) + (size_t)npos * 128, pitch, k, 512, 512, nkv,
+  const size_t pitch = (size_t)ctx * 128 * 2;
+  if (cudaMemcpy2D(pq1_kv_layer(il, 0) + (size_t)npos * 128, pitch, k, 256, 256, nkv,
                    cudaMemcpyHostToDevice) != cudaSuccess ||
-      cudaMemcpy2D(pq1_kv_layer(il, 1) + (size_t)npos * 128, pitch, v, 512, 512, nkv,
+      cudaMemcpy2D(pq1_kv_layer(il, 1) + (size_t)npos * 128, pitch, v, 256, 256, nkv,
                    cudaMemcpyHostToDevice) != cudaSuccess) {
     cudaGetLastError();
     PQ1KV_NEXT[il] = -1;   /* this layer's device cache has a hole: never fuse it */
@@ -1281,7 +1300,7 @@ int pq1_attn_fused(int il, const unsigned char *wq, const unsigned char *wk,
   const size_t half = PQ1_GRAPH_YB / 2, q0 = 64 * 1024, a0 = 128 * 1024;
   if (!d_xq || !MDY || PQ1_APAR_XQ + xqb > PQ1_APAR_BYTES || xob > P2XQMAX ||
       (size_t)(qr + 2 * kr) * 4 > q0 || (size_t)qr * 4 > a0 - q0 || a0 + (size_t)qr * 4 > half ||
-      (size_t)hid * 4 > half || !pq1_tm_bufs(hid, xqb, 0, 1) || !pq1_tm_bufs(qr, xob, 0, 1))
+      (size_t)hid * 4 > half || nh > PQ1_FA_MAXH || !pq1_tm_bufs(hid, xqb, 0, 1) || !pq1_tm_bufs(qr, xob, 0, 1))
     return -1;
   pq1_attg *A = &PQ1AG[il];
   if (A->ok && (A->wq != wq || A->wo != wo || A->xq != xq || A->ao != ao)) {
@@ -1311,7 +1330,7 @@ int pq1_attn_fused(int il, const unsigned char *wq, const unsigned char *wk,
         pq1_gemv_tm_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, qkv, hid,
                            qr + 2 * kr, PQ1_CS) == 0 &&
         pq1_attn_launch(qkv, d_anw + (size_t)il * 256, d_ain, qo, pq1_kv_layer(il, 0),
-                        pq1_kv_layer(il, 1), atto, nh, nkv, ctx, PQ1_CS) == 0 &&
+                        pq1_kv_layer(il, 1), d_fas, d_fam, atto, nh, nkv, ctx, PQ1_CS) == 0 &&
         pq1_q8k_launch(atto, qr, d_xq, PQ1_CS) == 0 &&
         pq1_tm_prep_launch(d_xq, d_pl, d_au, qr, PQ1_CS) == 0 &&
         pq1_gemv_tm_launch(PQ1C[ci].d_codes, PQ1C[ci].d_scales, d_pl, d_au, yo, qr, hid,
@@ -1349,15 +1368,17 @@ int pq1_attn_fused(int il, const unsigned char *wq, const unsigned char *wk,
 #endif
 }
 
-/* PQ1_ATT_CHECK support: the device's K/V rows at npos and attention output */
-void pq1_attn_dbg(int il, int npos, float *k, float *v, float *atto, int nh) {
+/* PQ1_ATT_CHECK support: the device's f16 K/V rows at npos, post-rope q and
+ * attention output */
+void pq1_attn_dbg(int il, int npos, uint16_t *k, uint16_t *v, float *q, float *atto, int nh) {
 #ifdef PQ1_USE_CUDA
-  const size_t pitch = (size_t)PQ1KV_CTX * 128 * 4;
+  const size_t pitch = (size_t)PQ1KV_CTX * 128 * 2;
   if (!d_kv || il < 0 || il >= PQ1KV_NL) return;
-  cudaMemcpy2D(k, 512, pq1_kv_layer(il, 0) + (size_t)npos * 128, pitch, 512, PQ1KV_NKV, cudaMemcpyDeviceToHost);
-  cudaMemcpy2D(v, 512, pq1_kv_layer(il, 1) + (size_t)npos * 128, pitch, 512, PQ1KV_NKV, cudaMemcpyDeviceToHost);
+  cudaMemcpy2D(k, 256, pq1_kv_layer(il, 0) + (size_t)npos * 128, pitch, 256, PQ1KV_NKV, cudaMemcpyDeviceToHost);
+  cudaMemcpy2D(v, 256, pq1_kv_layer(il, 1) + (size_t)npos * 128, pitch, 256, PQ1KV_NKV, cudaMemcpyDeviceToHost);
+  cudaMemcpy(q, MDY + 64 * 1024, (size_t)nh * 512, cudaMemcpyDeviceToHost);
   cudaMemcpy(atto, MDY + 128 * 1024, (size_t)nh * 512, cudaMemcpyDeviceToHost);
 #else
-  (void)il; (void)npos; (void)k; (void)v; (void)atto; (void)nh;
+  (void)il; (void)npos; (void)k; (void)v; (void)q; (void)atto; (void)nh;
 #endif
 }

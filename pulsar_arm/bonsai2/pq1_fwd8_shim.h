@@ -35,8 +35,12 @@ __attribute__((weak)) int pq1_attn_fused(int il, const unsigned char *wq, const 
                                          int hid, int ctx, int npos, const float *rcc,
                                          const float *rcs, const unsigned char *xq, float *ao);
 __attribute__((weak)) int pq1_attn_kv_put(int il, int nl, int nkv, int ctx, int npos,
-                                          const float *k, const float *v);
-__attribute__((weak)) void pq1_attn_dbg(int il, int npos, float *k, float *v, float *atto, int nh);
+                                          const uint16_t *k16, const uint16_t *v16);
+__attribute__((weak)) void pq1_attn_dbg(int il, int npos, uint16_t *k16, uint16_t *v16, float *q,
+                                        float *atto, int nh);
+/* 4k context: the run's K/V cache shape, before the first device call (the
+ * arena is sized from it) */
+__attribute__((weak)) void pq1_kv_shape(int nl, int nkv, int ctx);
 
 #ifdef PQ1_USE_CUDA
 /* GPU-RAM report printed once at process exit (PQ1_STATS=1). Declared here

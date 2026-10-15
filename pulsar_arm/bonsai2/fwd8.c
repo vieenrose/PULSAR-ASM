@@ -33,7 +33,13 @@
 #define NKV 8
 #define NLAYER 36
 #define VOCAB 151669
+#ifdef PQ1_BUILD
+/* f16 K/V cache and the fork's flash-attention decode arithmetic (pq1_host.c
+ * pq1_fa16_head); the device cache is sized per run (KVCTX) */
+#define CTX 4096
+#else
 #define CTX 512
+#endif
 #define YARN_FACTOR 4.0f
 #define YARN_ORIG 16384
 #define FREQ_BASE 1000000.0f
@@ -389,11 +395,21 @@ static float HEAD[VOCAB];
  * vfmaq_f32(acc, dup(q[i]), K^T[i][t..]) is exactly fmaf(q[i], K[t][i], acc)
  * in the same i order as the serial reference. Same 75 MB as the row layout. */
 #define KTB 16                       /* positions per contiguous K^T tile */
+#ifdef PQ1_BUILD
+/* f16 K/V rows, [layer][kv head][position][dim] (the fork's cache type and the
+ * device layout). BSS: only the rows the host path writes become resident. */
+static uint16_t K16[36][NKV][CTX][HDIM], V16[36][NKV][CTX][HDIM];
+static int KVCTX = CTX;   /* device cache positions for this run */
+void pq1_f2h_row(const float *x, uint16_t *h, int n);
+void pq1_fa16_head(const float *q, const uint16_t *K, const uint16_t *V, int T, float scale,
+                   float *out);
+#else
 static float KTC[36][NKV][CTX / KTB][HDIM][KTB];   /* [layer][kh][tile][i][t%16] */
 /* V cache kv-head major (#74): a head's p.v walks a contiguous 512 B/position
  * slab (22 KB at 44 positions) that stays in L1 across its 4 passes and the 4
  * query heads sharing the kv head; the row layout strode 4 KB (L1 set alias). */
 static float VCA[36][NKV][CTX][HDIM];
+#endif
 static int NPOS;
 
 static void embed(int id) {
@@ -503,15 +519,27 @@ static void attn_cpu(int il, int put) {
     rope_yarn_apply(QF, NHEAD, NPOS);
     rope_yarn_apply(KF, NKV, NPOS);
     ct_mark(CT_ROPE);
+#ifdef PQ1_BUILD
+    {
+        static uint16_t kr[NKV * HDIM], vr[NKV * HDIM];
+        pq1_f2h_row(KF, kr, NKV * HDIM);
+        pq1_f2h_row(VF, vr, NKV * HDIM);
+        for (int kh = 0; kh < NKV; kh++) {
+            memcpy(K16[il][kh][NPOS], kr + kh * HDIM, HDIM * 2);
+            memcpy(V16[il][kh][NPOS], vr + kh * HDIM, HDIM * 2);
+        }
+        /* loop iter 4: keep the device K/V cache complete for the fused path */
+        if (put && pq1_attn_kv_put) pq1_attn_kv_put(il, NLAYER, NKV, KVCTX, NPOS, kr, vr);
+    }
+    ct_mark(CT_KVCPY);
+    for (int h = 0; h < NHEAD; h++)
+        pq1_fa16_head(QF + h * 128, K16[il][h / 4][0], V16[il][h / 4][0], NPOS + 1, 0.0883883476f,
+                      ATTO + h * 128);
+#else
+    (void)put;
     for (int kh = 0; kh < NKV; kh++)
         for (int i = 0; i < HDIM; i++) KTC[il][kh][NPOS / KTB][i][NPOS % KTB] = KF[kh * 128 + i];
     for (int kh = 0; kh < NKV; kh++) memcpy(VCA[il][kh][NPOS], VF + kh * HDIM, HDIM * 4);
-#ifdef PQ1_BUILD
-    /* loop iter 4: keep the device K/V cache complete for the fused path */
-    if (put && pq1_attn_kv_put) pq1_attn_kv_put(il, NLAYER, NKV, CTX, NPOS, KF, VF);
-#else
-    (void)put;
-#endif
     ct_mark(CT_KVCPY);
     /* Same arithmetic as the serial reference (kept in
      * fwd8_cpu_parity.c), reorganised for the A57:
@@ -581,6 +609,7 @@ static void attn_cpu(int il, int put) {
             vst1q_f32(o + ib + 24, c6); vst1q_f32(o + ib + 28, c7);
         }
     }
+#endif
     ct_mark(CT_ATTN);
     gemvP(TW(il, "attn_output.weight"), HID, HID, ATTO, AO);
     if (TRACE) { V8("attnout", AO); V8R("attnout", AO, 1000); }
@@ -589,10 +618,10 @@ static void attn_cpu(int il, int put) {
 #ifdef PQ1_BUILD
 /* PQ1_ATT_CHECK=1: after every fused attention graph, rerun the host path and
  * compare, bit for bit, the device's K and V rows, attention output and AO. */
-static long ATTCHK_N = 0, ATTCHK_K = 0, ATTCHK_V = 0, ATTCHK_O = 0, ATTCHK_AO = 0;
+static long ATTCHK_N = 0, ATTCHK_K = 0, ATTCHK_V = 0, ATTCHK_Q = 0, ATTCHK_O = 0, ATTCHK_AO = 0;
 static void att_check_report(void) {
-    fprintf(stderr, "ATTCHK layers=%ld k_bad=%ld v_bad=%ld atto_bad=%ld ao_bad=%ld\n",
-            ATTCHK_N, ATTCHK_K, ATTCHK_V, ATTCHK_O, ATTCHK_AO);
+    fprintf(stderr, "ATTCHK layers=%ld k_bad=%ld v_bad=%ld q_bad=%ld atto_bad=%ld ao_bad=%ld\n",
+            ATTCHK_N, ATTCHK_K, ATTCHK_V, ATTCHK_Q, ATTCHK_O, ATTCHK_AO);
 }
 static int att_check_on(void) {
     static int on = -1;
@@ -603,16 +632,19 @@ static int att_check_on(void) {
     return on;
 }
 static void att_check(int il) {
-    static float AOF[HID], KD[NKV * HDIM], VD[NKV * HDIM], OD[NHEAD * HDIM];
+    static float AOF[HID], QD[NHEAD * HDIM], OD[NHEAD * HDIM];
+    static uint16_t KD[NKV * HDIM], VD[NKV * HDIM];
     memcpy(AOF, AO, sizeof AOF);
-    pq1_attn_dbg(il, NPOS, KD, VD, OD, NHEAD);
+    pq1_attn_dbg(il, NPOS, KD, VD, QD, OD, NHEAD);
     attn_cpu(il, 0);
     for (int i = 0; i < NKV * HDIM; i++) {
-        if (memcmp(&KD[i], &KF[i], 4)) ATTCHK_K++;
-        if (memcmp(&VD[i], &VF[i], 4)) ATTCHK_V++;
+        if (KD[i] != K16[il][i / HDIM][NPOS][i % HDIM]) ATTCHK_K++;
+        if (VD[i] != V16[il][i / HDIM][NPOS][i % HDIM]) ATTCHK_V++;
     }
-    for (int i = 0; i < NHEAD * HDIM; i++)
+    for (int i = 0; i < NHEAD * HDIM; i++) {
+        if (memcmp(&QD[i], &QF[i], 4)) ATTCHK_Q++;
         if (memcmp(&OD[i], &ATTO[i], 4)) ATTCHK_O++;
+    }
     for (int i = 0; i < HID; i++)
         if (memcmp(&AOF[i], &AO[i], 4)) ATTCHK_AO++;
     ATTCHK_N++;
@@ -622,7 +654,8 @@ static void att_check(int il) {
 int main(int argc, char **argv) {
     gguf_table(argv[1]);
     XQ = malloc(((size_t)INTER / 256) * 292);
-    int ids[1200], nids = 0, gen = 0;
+    static int ids[CTX + 8];
+    int nids = 0, gen = 0;
     for (int a = 2; a < argc; a++) {
         if (!strcmp(argv[a], "--gen")) gen = atoi(argv[++a]);
         else if (!strcmp(argv[a], "--trace")) TRACE = 1;
@@ -631,9 +664,21 @@ int main(int argc, char **argv) {
             STopK = atoi(argv[++a]); RS = strtoull(argv[++a], 0, 10);
             if (a + 1 < argc && argv[a+1][0] != '-') SMINP = atof(argv[++a]);
         }
-        else ids[nids++] = atoi(argv[a]);
+        else if (nids < CTX) ids[nids++] = atoi(argv[a]);
+        else { fprintf(stderr, "prompt longer than the %d-position context\n", CTX); return 2; }
     }
     int n0 = nids;
+    if (n0 + gen > CTX) {
+        fprintf(stderr, "context %d: generation capped at %d tokens\n", CTX, CTX - n0);
+        gen = CTX - n0;
+    }
+#ifdef PQ1_BUILD
+    /* the device K/V cache holds this run's positions only (64-aligned): the
+     * arena grows by the excess over the old 75.5 MB f32 ctx-512 cache only */
+    KVCTX = (n0 + gen + 63) / 64 * 64;
+    if (KVCTX > CTX) KVCTX = CTX;
+    if (pq1_kv_shape) pq1_kv_shape(NLAYER, NKV, KVCTX);
+#endif
     NPOS = 0;
     for (int step = 0; step < n0 + gen; step++) {
         BQ1_T0();
@@ -663,7 +708,7 @@ int main(int argc, char **argv) {
                                         TW(il, "attn_v.weight"), TW(il, "attn_output.weight"),
                                         (float *)TW(il, "attn_q_norm.weight"),
                                         (float *)TW(il, "attn_k_norm.weight"), NHEAD, NKV, HID,
-                                        CTX, NPOS, RC_C, RC_S, XQ, AO) == 0;
+                                        KVCTX, NPOS, RC_C, RC_S, XQ, AO) == 0;
                 if (afused) { ct_mark(CT_GEMV); if (att_check_on()) att_check(il); }
             }
 #endif

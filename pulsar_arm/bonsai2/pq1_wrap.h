@@ -53,9 +53,25 @@ int pq1_q8k_launch(const float *x_d, int n, unsigned char *xq_d, void *stream);
 #define PQ1_APAR_NPOS 512
 #define PQ1_APAR_XQ 576
 #define PQ1_APAR_BYTES (576 + 8192)
+/* 4k context: K/V caches are f16 rows ([kv head][ctx][128] halves per layer);
+ * sc_d ([nh][ctx] f32 scores) and mv_d ([nh][ctx] (ms, vs) float pairs) are
+ * scratch. The grids depend on ctx only, never on npos (graph-capturable). */
+#define PQ1_FA_MAXH 64
 int pq1_attn_launch(const float *qkv_d, const float *nw_d, const unsigned char *par_d,
-                    float *qo_d, float *kc_d, float *vc_d, float *atto_d, int nh, int nkv,
-                    int ctx, void *stream);
+                    float *qo_d, unsigned short *kc_d, unsigned short *vc_d, float *sc_d,
+                    float *mv_d, float *atto_d, int nh, int nkv, int ctx, void *stream);
+/* the attention part alone (q.k, softmax parameters, V accumulation) on post-rope
+ * q (qo_d) and the f16 caches; npos is read from par_d + PQ1_APAR_NPOS */
+int pq1_fa_launch(const float *qo_d, const unsigned short *kc_d, const unsigned short *vc_d,
+                  float *sc_d, float *mv_d, const unsigned char *par_d, float *atto_d, int nh,
+                  int nkv, int ctx, void *stream);
+extern int pq1_fa_mask;   /* bit 0 qk, 1 softmax parameters, 2 V accumulation */
+/* host reference (pq1_host.c) */
+void pq1_f2h_row(const float *x, uint16_t *h, int n);
+void pq1_fa16_head(const float *q, const uint16_t *K, const uint16_t *V, int T, float scale,
+                   float *out);
+/* exhaustive pq1_r16 check; bad_d = 2 zeroed u64 on the device */
+int pq1_r16_test_launch(unsigned long long *bad_d);
 
 /* 128-rows-per-block variant (run #45): same math, 2 lanes/row. */
 int pq1_gemv_r128_launch(const unsigned char *w_bits,
