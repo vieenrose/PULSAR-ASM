@@ -563,6 +563,81 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv4(const uint4 *__restr
     y[r] = acc;
 }
 
+// q4i v5: v4 with paired nibble extraction. A word masked with 0x000F000F holds two
+// nibbles, one per 16-bit half, so 4 masks (3 shifts) yield the 8 nibbles of a word
+// (v4: one shift/BFE per nibble). The activations are stored permuted so that each
+// 32-bit smem word pairs, half by half, with one masked word: for weight word k
+// (bytes 4k..4k+3) the words are (a[4k], a[4k+2]), (a[16+4k], a[16+4k+2]),
+// (a[4k+1], a[4k+3]), (a[17+4k], a[19+4k]). Each product q*a is the same integer as
+// in v4 and int32 addition is exact in any order, so s (and y) are bit-identical.
+// s + lo16(m)*lo16(a) + hi16(m)*hi16(a), signed 16-bit halves (exact int32):
+// mad.wide.s16 on register halves maps to XMAD with half selects, no unpacking
+__device__ __forceinline__ int dot2_s16(unsigned m, unsigned a, int s) {
+    asm("{\n\t.reg .s16 a0, a1, q0, q1;\n\tmov.b32 {a0, a1}, %1;\n\tmov.b32 {q0, q1}, %2;\n\t"
+        "mad.wide.s16 %0, q0, a0, %0;\n\tmad.wide.s16 %0, q1, a1, %0;\n\t}" : "+r"(s) : "r"(a), "r"(m));
+    return s;
+}
+extern "C" __global__ void __launch_bounds__(256) q4i_gemv5(const uint4 *__restrict__ w,
+        const float *__restrict__ sc, const uint8_t *__restrict__ xq,
+        float *__restrict__ y, int rows, int cols) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int nb = cols >> 5, tid = threadIdx.y * 32 + threadIdx.x;
+    unsigned *AW = (unsigned *)smem;                  /* nb * 16 permuted int16 pairs */
+    int *SA = (int *)(smem + cols * 2);
+    float *DA = (float *)(smem + cols * 2 + nb * 4);
+    for (int i = tid; i < nb * 16; i += 256) {
+        const int b = i >> 4, k = (i >> 2) & 3, c = i & 3;
+        const int e0 = b * 32 + ((c & 1) ? 16 : 0) + 4 * k + (c >> 1);
+        const int a0 = (int8_t)xq[(e0 >> 8) * 292 + 4 + (e0 & 255)];
+        const int a1 = (int8_t)xq[((e0 + 2) >> 8) * 292 + 4 + ((e0 + 2) & 255)];
+        AW[i] = (unsigned)(a0 & 0xffff) | ((unsigned)a1 << 16);
+    }
+    for (int i = tid; i < (cols >> 8); i += 256) DA[i] = *(const float *)(xq + i * 292);
+    __syncthreads();
+    for (int b = tid; b < nb; b += 256) {
+        int s = 0;
+        for (int j = 0; j < 16; j++) { const unsigned v = AW[b * 16 + j]; s += (int)(short)(v & 0xffffu) + ((int)v >> 16); }
+        SA[b] = s;
+    }
+    __syncthreads();
+    const int tile = blockIdx.x * 8 + threadIdx.y;
+    const int r = tile * 32 + threadIdx.x;
+    if (r >= rows) return;
+    const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
+    const float *st = sc + (size_t)tile * nb * 32 + threadIdx.x;
+    const uint4 *A4 = (const uint4 *)AW;
+    uint4 qr[Q4I_PF];
+    float sr[Q4I_PF];
+    #pragma unroll
+    for (int p = 0; p < Q4I_PF; p++) if (p < nb) { qr[p] = wt[(size_t)p * 32]; sr[p] = st[(size_t)p * 32]; }
+    float acc = 0.0f;
+    for (int b0 = 0; b0 < nb; b0 += Q4I_PF) {
+        #pragma unroll
+        for (int p = 0; p < Q4I_PF; p++) {
+            const int b = b0 + p;
+            if (b < nb) {
+                const uint4 q = qr[p];
+                const float ws = sr[p];
+                if (b + Q4I_PF < nb) { qr[p] = wt[(size_t)(b + Q4I_PF) * 32]; sr[p] = st[(size_t)(b + Q4I_PF) * 32]; }
+                const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+                int s = -8 * SA[b];
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const uint4 a = A4[b * 4 + k];
+                    const unsigned m0 = qw[k] & 0x000F000Fu, m1 = (qw[k] >> 4) & 0x000F000Fu;
+                    const unsigned m2 = (qw[k] >> 8) & 0x000F000Fu, m3 = (qw[k] >> 12) & 0x000F000Fu;
+                    s = dot2_s16(m0, a.x, s);
+                    s = dot2_s16(m1, a.y, s);
+                    s = dot2_s16(m2, a.z, s);
+                    s = dot2_s16(m3, a.w, s);
+                }
+                acc = __fmaf_rn(__fmul_rn(ws, DA[b >> 3]), __int2float_rn(s), acc);
+            }
+        }
+    }
+    y[r] = acc;
+}
+
 // ------------------------------------------------------------------------------
 // Q6_K tied head, row-per-lane ("q6i"): same arithmetic as gemv_q6k_rows in
 // g4ref.c - per 256-block, isum = sum_j sc_j * sum_{t in sub-block j} (q_t-32)*a_t
@@ -706,6 +781,80 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b(const uint4 *__rest
                             const int al = (e & 1) ? ((int)pl >> 16) : (int)(short)(pl & 0xffffu);
                             const int ah = (e & 1) ? ((int)ph >> 16) : (int)(short)(ph & 0xffffu);
                             s += nl[e] * al + nh[e] * ah;
+                        }
+                        acc[t] = __fmaf_rn(__fmul_rn(ws, DA[t * nd + (b >> 3)]), __int2float_rn(s), acc[t]);
+                    }
+                }
+            }
+        }
+    }
+    if (live) {
+        #pragma unroll
+        for (int t = 0; t < BMAX; t++) if (t < B) y[(size_t)t * ystride + r] = acc[t];
+    }
+}
+
+// q4i_gemv_b2: q4i_gemv_b with v5's paired nibbles. Per block the 16 masked words
+// (two nibbles each, see q4i_gemv5) are computed once and dotted with every token's
+// permuted activation words (two XMADs per word); same integer products, exact int32
+// sums, same float chain per token, so y is bit-identical to q4i_gemv_b.
+extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b2(const uint4 *__restrict__ w,
+        const float *__restrict__ sc, const uint8_t *__restrict__ xq, float *__restrict__ y,
+        int rows, int cols, int B, int xstride, int ystride) {
+    __shared__ __align__(16) unsigned AW[BMAX * Q4B_KC / 2];
+    __shared__ int SA[BMAX * (Q4B_KC / 32)];
+    __shared__ float DA[BMAX * (Q4I_MAXCOLS / 256)];
+    const int nb = cols >> 5, nd = cols >> 8, tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = tid; i < B * nd; i += 256) DA[i] = *(const float *)(xq + (i / nd) * xstride + (i % nd) * 292);
+    const int tile = blockIdx.x * 8 + threadIdx.y;
+    const int r = tile * 32 + threadIdx.x;
+    const bool live = r < rows;
+    const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
+    const float *st = sc + (size_t)tile * nb * 32 + threadIdx.x;
+    float acc[BMAX];
+    #pragma unroll
+    for (int t = 0; t < BMAX; t++) acc[t] = 0.0f;
+    for (int c0 = 0; c0 < cols; c0 += Q4B_KC) {
+        const int kc = min(Q4B_KC, cols - c0), kb = kc >> 5, kw = kc >> 1;
+        __syncthreads();
+        for (int i = tid; i < B * kw; i += 256) {
+            const int t = i / kw, wi = i % kw, bl = wi >> 4, k = (wi >> 2) & 3, cc = wi & 3;
+            const int e0 = c0 + bl * 32 + ((cc & 1) ? 16 : 0) + 4 * k + (cc >> 1), e1 = e0 + 2;
+            const uint8_t *xt = xq + t * xstride;
+            const int a0 = (int8_t)xt[(e0 >> 8) * 292 + 4 + (e0 & 255)];
+            const int a1 = (int8_t)xt[(e1 >> 8) * 292 + 4 + (e1 & 255)];
+            AW[t * (Q4B_KC / 2) + wi] = (unsigned)(a0 & 0xffff) | ((unsigned)a1 << 16);
+        }
+        __syncthreads();
+        for (int i = tid; i < B * kb; i += 256) {
+            const int t = i / kb, bl = i % kb;
+            int s = 0;
+            for (int j = 0; j < 16; j++) { const unsigned v = AW[t * (Q4B_KC / 2) + bl * 16 + j]; s += (int)(short)(v & 0xffffu) + ((int)v >> 16); }
+            SA[t * (Q4B_KC / 32) + bl] = s;
+        }
+        __syncthreads();
+        if (live) {
+            for (int bl = 0; bl < kb; bl++) {
+                const int b = (c0 >> 5) + bl;
+                const uint4 q = wt[(size_t)b * 32];
+                const float ws = st[(size_t)b * 32];
+                const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+                unsigned m[16];
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    m[4 * k + 0] = qw[k] & 0x000F000Fu;         m[4 * k + 1] = (qw[k] >> 4) & 0x000F000Fu;
+                    m[4 * k + 2] = (qw[k] >> 8) & 0x000F000Fu;  m[4 * k + 3] = (qw[k] >> 12) & 0x000F000Fu;
+                }
+                #pragma unroll
+                for (int t = 0; t < BMAX; t++) {
+                    if (t < B) {
+                        const uint4 *A4 = (const uint4 *)(AW + t * (Q4B_KC / 2) + bl * 16);
+                        int s = -8 * SA[t * (Q4B_KC / 32) + bl];
+                        #pragma unroll
+                        for (int k = 0; k < 4; k++) {
+                            const uint4 a = A4[k];
+                            s = dot2_s16(m[4 * k + 0], a.x, s); s = dot2_s16(m[4 * k + 1], a.y, s);
+                            s = dot2_s16(m[4 * k + 2], a.z, s); s = dot2_s16(m[4 * k + 3], a.w, s);
                         }
                         acc[t] = __fmaf_rn(__fmul_rn(ws, DA[t * nd + (b >> 3)]), __int2float_rn(s), acc[t]);
                     }

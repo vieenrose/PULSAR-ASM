@@ -390,9 +390,9 @@ static void gpu_init(void) {
     CK(cuModuleLoadData_(&mk, G4_PTX_K));
     CK(cuModuleGetFunction_(&ff16, mk, "f16_gemv_t"));
     CK(cuModuleGetFunction_(&fgeglu, mk, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, mk, "q8k_dev"));
-    CK(cuModuleGetFunction_(&fq4i, mk, "q4i_gemv4"));
+    CK(cuModuleGetFunction_(&fq4i, mk, getenv("G4Q4I4") ? "q4i_gemv4" : "q4i_gemv5"));   /* G4Q4I4=1: previous kernel (A/B) */
     CK(cuModuleGetFunction_(&fq6, mk, "q6i_gemv"));
-    CK(cuModuleGetFunction_(&fq4ib, mk, "q4i_gemv_b")); CK(cuModuleGetFunction_(&fgeglub, mk, "geglu_b"));
+    CK(cuModuleGetFunction_(&fq4ib, mk, getenv("G4Q4I4") ? "q4i_gemv_b" : "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fgeglub, mk, "geglu_b"));
     CK(cuModuleGetFunction_(&fargb, mk, "argmax_b"));
     dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
     dYdevB = dalloc((size_t)BATCH_MAX * 4 * INTER * 4); dHdevB = dalloc((size_t)BATCH_MAX * 2 * INTER * 4);
@@ -490,7 +490,7 @@ static void gpu_init(void) {
     size_t fr = 0, tot = 0; cuMemGetInfo_(&fr, &tot);
     if (fast) fprintf(stderr, "GPU driver path: fast (stream, timing-free event, mapped pinned I/O)\n");
     { int nk = 0; for (int i = 0; i < NT; i++) nk += KIND[i];
-      fprintf(stderr, "Q4_0 kernels: %d tensors on q4i_gemv4, %d on K2 q4_gemv\n", nk, nq4 - nk); }
+      fprintf(stderr, "Q4_0 kernels: %d tensors on q4i_gemv5, %d on K2 q4_gemv\n", nk, nq4 - nk); }
     fprintf(stderr, "GPU: %d Q4_0 tensors + Q6_K head + F16 proj, %.1f MB on device, %.0f MB free of %.0f; load %.0f ms\n",
             nq4, dev_bytes / 1048576.0, fr / 1048576.0, tot / 1048576.0, now_ms() - t0);
     G_Q4 = gpu_q4; G_Q4N = gpu_q4n; G_HEAD = gpu_head; G_F16 = gpu_f16;
