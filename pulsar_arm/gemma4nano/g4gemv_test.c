@@ -9,7 +9,7 @@
  *
  * Build on the Nano (driver only, no CUDA toolkit at runtime):
  *   gcc -O2 -fopenmp -ffp-contract=off -o g4gemv_test g4gemv_test.c -ldl -lm
- * Run:   ./g4gemv_test <gemma.gguf> <g4_kernels.ptx> [q4|head|f16|all]
+ * Run:   ./g4gemv_test <gemma.gguf> <g4_kernels.ptx> [q4|head|f16|all|perf]
  */
 #define G4REF_NO_MAIN
 #include "g4ref.c"
@@ -46,7 +46,7 @@ static void make_x(float *x, int n, int kind) {
 }
 static int first_diff(const float *a, const float *b, int n) { for (int i = 0; i < n; i++) if (memcmp(a + i, b + i, 4)) return i; return -1; }
 
-static void *fq4, *fq6, *ff16;
+static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16;
 static uint64_t dW, dS, dX, dY;
 
 static int test_q4(const tensor_t *t) {
@@ -79,11 +79,20 @@ static int test_q4(const tensor_t *t) {
     return bad;
 }
 
+/* q6k_gemv2 layout: each 210-byte Q6_K block padded to 212 bytes (content unchanged) */
+static uint8_t *repack_q6_212(const tensor_t *t) {
+    size_t nblk = (size_t)t->dims[1] * (t->dims[0] / 256);
+    uint8_t *o = calloc(nblk, 212);
+    for (size_t i = 0; i < nblk; i++) memcpy(o + i * 212, t->data + i * 210, 210);
+    return o;
+}
 static int test_head(void) {
     const tensor_t *t = tens("token_embd.weight");
     int cols = (int)t->dims[0], rows = (int)t->dims[1], nb = cols / 256;
-    uint64_t dH; CK(cuMemAlloc_(&dH, (size_t)rows * nb * 210));
+    uint64_t dH, dH2; CK(cuMemAlloc_(&dH, (size_t)rows * nb * 210)); CK(cuMemAlloc_(&dH2, (size_t)rows * nb * 212));
     CK(cuMemcpyHtoD_(dH, t->data, (size_t)rows * nb * 210));
+    { uint8_t *rp = repack_q6_212(t); CK(cuMemcpyHtoD_(dH2, rp, (size_t)rows * nb * 212)); free(rp); }
+    float *ygpu2 = malloc((size_t)rows * 4);
     float *ycpu = malloc((size_t)rows * 4), *ygpu = malloc((size_t)rows * 4);
     static float x[H];
     int bad = 0;
@@ -101,12 +110,31 @@ static int test_head(void) {
         CK(cuCtxSynchronize_());
         double t3 = now_ms();
         CK(cuMemcpyDtoH_(ygpu, dY, (size_t)rows * 4));
-        int d = first_diff(ycpu, ygpu, rows);
-        printf("  head x%d: %s  (cpu ref %.0f ms, gpu kernel %.1f ms)\n", kind,
-               d < 0 ? "262144/262144 rows identical" : "MISMATCH", t1 - t0, t3 - t2);
-        if (d >= 0) { bad++; printf("    row %d cpu %.9g gpu %.9g\n", d, ycpu[d], ygpu[d]); }
+        int irows2 = rows;
+        void *args2[] = {&dH2, &dX, &dY, &irows2};
+        CK(cuLaunchKernel_(fq62, (rows + 31) / 32, 1, 1, 32, 8, 1, 0, NULL, args2, NULL));
+        CK(cuCtxSynchronize_());
+        CK(cuMemcpyDtoH_(ygpu2, dY, (size_t)rows * 4));
+        int d = first_diff(ycpu, ygpu, rows), d2 = first_diff(ycpu, ygpu2, rows);
+        CK(cuLaunchKernel_(fq63, (rows + 31) / 32, 1, 1, 32, 8, 1, 0, NULL, args2, NULL));
+        CK(cuCtxSynchronize_());
+        CK(cuMemcpyDtoH_(ygpu2, dY, (size_t)rows * 4));
+        int d3 = first_diff(ycpu, ygpu2, rows);
+        printf("  head x%d: v3 %s\n", kind, d3 < 0 ? "262144/262144 identical" : "MISMATCH");
+        if (d3 >= 0) bad++;
+        CK(cuLaunchKernel_(fq64, (rows + 31) / 32, 1, 1, 32, 8, 1, 0, NULL, args2, NULL));
+        CK(cuCtxSynchronize_());
+        CK(cuMemcpyDtoH_(ygpu2, dY, (size_t)rows * 4));
+        int d4 = first_diff(ycpu, ygpu2, rows);
+        printf("  head x%d: v4 %s\n", kind, d4 < 0 ? "262144/262144 identical" : "MISMATCH");
+        if (d4 >= 0) bad++;
+        printf("  head x%d: v1 %s, v2 %s  (cpu ref %.0f ms)\n", kind,
+               d < 0 ? "262144/262144 identical" : "MISMATCH", d2 < 0 ? "262144/262144 identical" : "MISMATCH", t1 - t0);
+        (void)t2; (void)t3;
+        if (d >= 0) { bad++; printf("    v1 row %d cpu %.9g gpu %.9g\n", d, ycpu[d], ygpu[d]); }
+        if (d2 >= 0) { bad++; printf("    v2 row %d cpu %.9g gpu %.9g\n", d2, ycpu[d2], ygpu2[d2]); }
     }
-    CK(cuMemFree_(dH)); free(ycpu); free(ygpu);
+    CK(cuMemFree_(dH)); CK(cuMemFree_(dH2)); free(ycpu); free(ygpu); free(ygpu2);
     return bad;
 }
 
@@ -137,8 +165,59 @@ static int test_f16(void) {
     return bad;
 }
 
+
+/* perf mode: kernel-only time per shape (20 launches after a warm-up), and the
+   per-token GPU estimate from the layer schedule. Not a gate. */
+static double time_launch(void *f, unsigned gx, unsigned bx, unsigned by, void **args) {
+    CK(cuLaunchKernel_(f, gx, 1, 1, bx, by, 1, 0, NULL, args, NULL)); CK(cuCtxSynchronize_());
+    double t0 = now_ms();
+    for (int i = 0; i < 20; i++) CK(cuLaunchKernel_(f, gx, 1, 1, bx, by, 1, 0, NULL, args, NULL));
+    CK(cuCtxSynchronize_());
+    return (now_ms() - t0) / 20;
+}
+static double perf_q4(const char *name) {
+    const tensor_t *t = tens(name);
+    uint32_t r0 = 0, r1 = (uint32_t)t->dims[1], nb = (uint32_t)t->dims[0] / 32, rf = r1;
+    void *args[] = {&dW, &dS, &dX, &dY, &r0, &r1, &nb, &rf};
+    double ms = time_launch(fq4, (r1 + 31) / 32, 32, 8, args);
+    double gb = (double)r1 * nb * 20 / 1e9;   /* 16 B nibbles + 4 B f32 scale per block */
+    printf("  %-28s %6u x %-6u %7.3f ms  %5.2f GB/s\n", name, r1, nb * 32, ms, gb / (ms / 1e3));
+    return ms;
+}
+static void perf(void) {
+    printf("kernel times (weights only; contents irrelevant for timing):\n");
+    double s_att = perf_q4("blk.0.attn_q.weight") + perf_q4("blk.0.attn_k.weight") + perf_q4("blk.0.attn_v.weight") + perf_q4("blk.0.attn_output.weight");
+    double f_att = perf_q4("blk.4.attn_q.weight") + perf_q4("blk.4.attn_k.weight") + perf_q4("blk.4.attn_v.weight") + perf_q4("blk.4.attn_output.weight");
+    double sh_s = perf_q4("blk.15.attn_q.weight") + perf_q4("blk.15.attn_output.weight");
+    double sh_f = perf_q4("blk.19.attn_q.weight") + perf_q4("blk.19.attn_output.weight");
+    double mlp1 = perf_q4("blk.0.ffn_gate.weight") * 2 + perf_q4("blk.0.ffn_down.weight");
+    double mlp2 = perf_q4("blk.20.ffn_gate.weight") * 2 + perf_q4("blk.20.ffn_down.weight");
+    double pl = perf_q4("blk.0.inp_gate.weight") + perf_q4("blk.0.proj.weight");
+    const tensor_t *hd = tens("token_embd.weight");
+    uint64_t dH; CK(cuMemAlloc_(&dH, (size_t)hd->dims[1] * 6 * 210)); CK(cuMemcpyHtoD_(dH, hd->data, (size_t)hd->dims[1] * 6 * 210));
+    int irows = (int)hd->dims[1], inb = 6;
+    void *ah[] = {&dH, &dX, &dY, &irows, &inb};
+    double head1 = time_launch(fq6, (irows + 7) / 8, 32, 8, ah);
+    printf("  %-28s %6d x %-6d %7.3f ms  %5.2f GB/s\n", "head Q6_K v1", irows, 1536, head1, (double)irows * 1260 / 1e9 / (head1 / 1e3));
+    CK(cuMemFree_(dH));
+    CK(cuMemAlloc_(&dH, (size_t)irows * 6 * 212));
+    { uint8_t *rp = repack_q6_212(hd); CK(cuMemcpyHtoD_(dH, rp, (size_t)irows * 6 * 212)); free(rp); }
+    void *ah2[] = {&dH, &dX, &dY, &irows};
+    double head2 = time_launch(fq62, (irows + 31) / 32, 32, 8, ah2);
+    printf("  %-28s %6d x %-6d %7.3f ms  %5.2f GB/s\n", "head Q6_K v2", irows, 1536, head2, (double)irows * 1272 / 1e9 / (head2 / 1e3));
+    double head3 = time_launch(fq63, (irows + 31) / 32, 32, 8, ah2);
+    printf("  %-28s %6d x %-6d %7.3f ms  %5.2f GB/s\n", "head Q6_K v3", irows, 1536, head3, (double)irows * 1272 / 1e9 / (head3 / 1e3));
+    double head = time_launch(fq64, (irows + 31) / 32, 32, 8, ah2);
+    printf("  %-28s %6d x %-6d %7.3f ms  %5.2f GB/s\n", "head Q6_K v4", irows, 1536, head, (double)irows * 1272 / 1e9 / (head / 1e3));
+    CK(cuMemFree_(dH));
+    /* schedule: layers 0-14 own KV (12 sliding, 3 full); 15-34 shared (16 sliding, 4 full) */
+    double tot = 12 * s_att + 3 * f_att + 16 * sh_s + 4 * sh_f + 15 * mlp1 + 20 * mlp2 + 35 * pl + head;
+    printf("per-token GPU GEMV estimate: %.1f ms (layers %.1f + head %.1f), %.1f tok/s ceiling from GEMVs alone\n",
+           tot, tot - head, head, 1000 / tot);
+}
+
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "usage: %s <gguf> <g4_kernels.ptx> [q4|head|f16|all]\n", argv[0]); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: %s <gguf> <g4_kernels.ptx> [q4|head|f16|all|perf]\n", argv[0]); return 2; }
     const char *what = argc > 3 ? argv[3] : "all";
     gguf_open(argv[1]);
     void *h = dlopen("libcuda.so.1", RTLD_NOW);
@@ -154,7 +233,7 @@ int main(int argc, char **argv) {
     { FILE *f = fopen(argv[2], "rb"); if (!f) { perror(argv[2]); return 2; }
       static char ptx[1 << 20]; size_t n = fread(ptx, 1, sizeof ptx - 1, f); fclose(f); ptx[n] = 0;
       CK(cuModuleLoadData_(&m6, ptx)); }
-    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
     CK(cuMemAlloc_(&dW, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dS, (size_t)2 * INTER * (H / 32) * 4));
     CK(cuMemAlloc_(&dX, sizeof XQ)); CK(cuMemAlloc_(&dY, (size_t)VOCAB * 4));
     int fails = 0;
@@ -166,6 +245,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(what, "head") || !strcmp(what, "all")) fails += test_head();
     if (!strcmp(what, "f16") || !strcmp(what, "all")) fails += test_f16();
+    if (!strcmp(what, "perf")) { perf(); return 0; }
     printf(fails ? "M3 GATE: FAIL (%d)\n" : "M3 GATE: OK\n", fails);
     return fails ? 1 : 0;
 }

@@ -143,3 +143,29 @@ Cost: one more GPU kernel (Q6_K GEMV for the 262144-row head) besides the K2 Q4_
   expected effect of quantizing activations to Q8_K.
 - Goldens (from `g4ref`): `golden_en.txt` (97 steps, ends on `<turn|>`),
   `golden_zh.txt` (222 steps, `--gen 200`); prompts and ids in `prompts.json`.
+
+## M3 result (2026-10-15): GPU GEMVs bit-identical to g4ref.c
+
+`g4gemv_test` (on the Nano, driver API through dlopen, no toolkit at runtime) compares
+every GPU GEMV with the g4ref.c function itself (included, main compiled out), on the real
+weights, with three activation vectors each (two Gaussian-like, one with 1 % outliers x40):
+
+- Q4_0, K2's `q4_gemv` kernel (`g4_ptx_q4.h`): **275/275 tensors bit-identical**.
+- Q6_K tied head, all 262144 rows: v1..v4 all **bit-identical** (`g4_kernels.cu`).
+- F16 `per_layer_model_proj` (`f16_gemv_t`, weights stored transposed): 8960/8960 identical.
+
+Kernel times, warm GPU at 921.6 MHz (clocks not pinned: no sudo for jetson_clocks; the first
+run of a session starts at 76.8 MHz and must be discarded):
+
+| kernel | time | effective |
+|---|---|---|
+| Q4_0 layers, per shape | 0.03-1.10 ms | 8.6-11.6 GB/s |
+| head Q6_K v1 (byte loads) | 99.4 ms | 3.3 GB/s |
+| head v2 (212-byte padded blocks, u32 loads, activations in registers) | 57.1 ms | 5.8 GB/s |
+| head v3 (v2 + interleaved block reductions) | 56.0 ms | 6.0 GB/s |
+| **head v4** (4 values per u32 decoded with byte masks, -32 offset hoisted) | **41.4 ms** | **8.1 GB/s** |
+
+The head was issue-bound, not memory-bound (one SM, ~100 instructions per block per lane in
+v1-v3); v4 cut the decode work. Per-token GEMV estimate from the layer schedule: layers
+108.7 ms + head 41.4 ms = **150 ms, a 6.7 tok/s ceiling from GEMVs alone**, before the CPU
+stages and driver overhead. The engine will use `q6k_gemv4`; v1-v3 stay as parity records.
