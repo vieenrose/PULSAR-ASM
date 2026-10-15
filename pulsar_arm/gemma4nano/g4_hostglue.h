@@ -1,3 +1,4 @@
+#include <omp.h>
 /* g4_hostglue.h - C side of the AArch64 host kernels (g4_host.S), shared by the
  * engine (g4eng.c) and the unit test (g4host_test.c). Include after g4ref.c. */
 extern void g4_exp_vec(const double *x, double *y, long n, const double *tab);
@@ -6,6 +7,7 @@ extern void g4_attn_scores(const float *q, const float *K, long n, long hd, floa
 extern void g4_attn_pv(const float *p, const float *V, long n, long hd, float *o);
 extern void g4_attn_scores8(const float *qT, const float *K, long n, long hd, float *S);
 extern void g4_attn_pv8(const float *P, const float *V, long n, long hd, float *O);
+extern void g4_attn_pv8r(const float *P, const float *V, long n, long hd, float *O, long d0, long d1);
 extern double g4_rms_r(const float *x, long n);
 extern void g4_rmsnorm(const float *x, const float *w, float *y, long n);
 extern void g4_rmsnorm_ns(float *x, long n);
@@ -44,21 +46,38 @@ static inline void attn_head_asm(const float *q, const float *K, const float *V,
    scores per head = the same fmaf chains; softmax per head as attn_head_ref;
    p.V per head and dim = the same fmaf chain over t. */
 static void attn_all_asm(const float *q, const float *K, const float *V, int lo, int pos, int hd, float *o) {
-    static __thread float qT[HD_F * NH], S8[MAXSEQ * NH], P8[MAXSEQ * NH];   /* per thread: forward_batch */
-    static __thread double xin[MAXSEQ], e[MAXSEQ];                          /* may run tokens in parallel */
+    static __thread float qT[HD_F * NH];
+    static float S8[MAXSEQ * NH], P8[MAXSEQ * NH];       /* single call (decode) */
+    static __thread float S8t[MAXSEQ * NH], P8t[MAXSEQ * NH];
     int n = pos - lo + 1;
+    /* inside forward_batch's parallel loop (prefill): one thread per token, own scratch;
+       outside (decode): this call's work is split over the cores - scores by rows t,
+       softmax by head, p.V by 8-dim chunks. Every score, softmax and output chain is
+       the serial one, so the split cannot change a bit. */
+    int par = G_PAR && !omp_in_parallel() && n >= 32;
+    float *s8 = par ? S8 : S8t, *p8 = par ? P8 : P8t;
     for (int h = 0; h < NH; h++) for (int d = 0; d < hd; d++) qT[d * NH + h] = q[h * hd + d];
-    g4_attn_scores8(qT, K + (size_t)lo * hd, n, hd, S8);
-    for (int h = 0; h < NH; h++) {
-        float mx = -INFINITY;
-        for (int t = 0; t < n; t++) if (S8[t * NH + h] > mx) mx = S8[t * NH + h];
-        for (int t = 0; t < n; t++) xin[t] = (double)S8[t * NH + h] - (double)mx;
-        int ne = n & ~1;
-        if (ne) g4_exp_vec(xin, e, ne, TAB2);
-        if (n & 1) e[n - 1] = g4_exp(xin[n - 1]);
-        double sum = 0;
-        for (int t = 0; t < n; t++) sum += e[t];
-        for (int t = 0; t < n; t++) P8[t * NH + h] = (float)(e[t] / sum);
+    const float *qq = qT;
+    #pragma omp parallel if(par) num_threads(4)
+    {
+        int nt = omp_get_num_threads(), id = omp_get_thread_num();
+        int t0 = (int)((long)n * id / nt), t1 = (int)((long)n * (id + 1) / nt);
+        if (t1 > t0) g4_attn_scores8(qq, K + (size_t)(lo + t0) * hd, t1 - t0, hd, s8 + (size_t)t0 * NH);
+        #pragma omp barrier
+        #pragma omp for schedule(static)
+        for (int h = 0; h < NH; h++) {
+            static __thread double xin[MAXSEQ], e[MAXSEQ];
+            float mx = -INFINITY;
+            for (int t = 0; t < n; t++) if (s8[t * NH + h] > mx) mx = s8[t * NH + h];
+            for (int t = 0; t < n; t++) xin[t] = (double)s8[t * NH + h] - (double)mx;
+            int ne = n & ~1;
+            if (ne) g4_exp_vec(xin, e, ne, TAB2);
+            if (n & 1) e[n - 1] = g4_exp(xin[n - 1]);
+            double sum = 0;
+            for (int t = 0; t < n; t++) sum += e[t];
+            for (int t = 0; t < n; t++) p8[t * NH + h] = (float)(e[t] / sum);
+        }
+        int nc = hd / 8, c0 = nc * id / nt, c1 = nc * (id + 1) / nt;
+        if (c1 > c0) g4_attn_pv8r(p8, V + (size_t)lo * hd, n, hd, o, 8L * c0, 8L * c1);
     }
-    g4_attn_pv8(P8, V + (size_t)lo * hd, n, hd, o);
 }

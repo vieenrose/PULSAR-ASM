@@ -371,6 +371,22 @@ g4_attn_pv8:
     SAVE_D8_D15
     lsl     x5, x3, #2                        /* V row bytes = O head stride */
     mov     x9, #0                            /* byte offset of this 8-dim chunk */
+    mov     x11, x5                           /* end offset: all hd dims */
+    b       .Lpv8_chunk
+    .size g4_attn_pv8, .-g4_attn_pv8
+
+/* void g4_attn_pv8r(const float *P, const float *V, long n, long hd, float *O, long d0, long d1)
+ * g4_attn_pv8 restricted to dims [d0, d1) (multiples of 8): the same per-(h, d)
+ * chains, so any split of the dims gives the full call's O exactly. */
+    .global g4_attn_pv8r
+    .type g4_attn_pv8r, %function
+    .align 4
+g4_attn_pv8r:
+    SAVE_D8_D15
+    lsl     x9, x5, #2                        /* start offset d0 */
+    lsl     x11, x6, #2                       /* end offset d1 */
+    lsl     x5, x3, #2                        /* V row bytes = O head stride */
+.Lpv8_chunk:
 1:  movi    v16.4s, #0
     movi    v17.4s, #0
     movi    v18.4s, #0
@@ -428,11 +444,11 @@ g4_attn_pv8:
     add     x10, x10, x5
     st1     {v30.4s, v31.4s}, [x10]
     add     x9, x9, #32
-    cmp     x9, x5
+    cmp     x9, x11
     b.lt    1b
     RESTORE_D8_D15
     ret
-    .size g4_attn_pv8, .-g4_attn_pv8
+    .size g4_attn_pv8r, .-g4_attn_pv8r
 
 /* RMS norm, g4ref.c rms_r + rmsnorm / rmsnorm_noscale:
  *   ss = sum of (double)x[i]*(double)x[i], strictly in order (one fadd chain);
