@@ -691,7 +691,37 @@ int main(int argc, char **argv) {
         embed(id);
         ct_mark(CT_EMBED);
         if (TRACE) { MAG("emb", X, HID); V8("emb", X); }
-        for (int il = 0; il < NLAYER; il++) {
+        int tfused = 0;
+#ifdef PQ1_BUILD
+        /* loop iter 14: every layer, output_norm and the head as ONE device
+         * graph (residual adds, rms norms and Q8_K included, X kept on the
+         * device); declines on the first token (merged tensors and the device
+         * K/V cache are built by it), under TRACE and the per-layer checks */
+        if (!TRACE && pq1_token_fused && !att_check_on() && !ffn_check_on()) {
+            static const unsigned char **WT;
+            static const float **NW;
+            if (!WT) {
+                static const char *const wk[7] = {"attn_q.weight", "attn_k.weight", "attn_v.weight",
+                                                  "attn_output.weight", "ffn_gate.weight",
+                                                  "ffn_up.weight", "ffn_down.weight"};
+                static const char *const nk[4] = {"attn_norm.weight", "ffn_norm.weight",
+                                                  "attn_q_norm.weight", "attn_k_norm.weight"};
+                WT = malloc((7 * (size_t)NLAYER + 1) * sizeof *WT);
+                NW = malloc((4 * (size_t)NLAYER + 1) * sizeof *NW);
+                for (int il = 0; il < NLAYER; il++) {
+                    for (int j = 0; j < 7; j++) WT[7 * il + j] = TW(il, wk[j]);
+                    for (int j = 0; j < 4; j++) NW[4 * il + j] = (const float *)TW(il, nk[j]);
+                }
+                WT[7 * NLAYER] = tw("output.weight");
+                NW[4 * NLAYER] = (const float *)tw("output_norm.weight");
+            }
+            if (RC_POS != NPOS) rope_table(NPOS);
+            tfused = pq1_token_fused(NLAYER, WT, NW, NHEAD, NKV, HID, INTER, VOCAB, KVCTX, NPOS,
+                                     RC_C, RC_S, X, HEAD) == 0;
+            if (tfused) ct_mark(CT_GEMV);
+        }
+#endif
+        for (int il = 0; il < NLAYER && !tfused; il++) {
             float *anw = (float *)TW(il, "attn_norm.weight");
             rms(X, anw, HID, XN);
             ct_mark(CT_RMS);
@@ -757,10 +787,12 @@ int main(int argc, char **argv) {
             for (int i = 0; i < HID; i++) X[i] += FO[i];
             ct_mark(CT_RESID);
         }
-        float *onw = (float *)tw("output_norm.weight");
-        rms(X, onw, HID, XN);
-        ct_mark(CT_RMS);
-        gemvP(tw("output.weight"), VOCAB, HID, XN, HEAD);
+        if (!tfused) {
+            float *onw = (float *)tw("output_norm.weight");
+            rms(X, onw, HID, XN);
+            ct_mark(CT_RMS);
+            gemvP(tw("output.weight"), VOCAB, HID, XN, HEAD);
+        }
         int top = argmax(HEAD, VOCAB);
         ct_mark(CT_ARGMAX);
         printf("step %d id_in=%d top=%d logit=%.4f\n", step, id, top, HEAD[top]);

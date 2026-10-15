@@ -1373,6 +1373,15 @@ __device__ __forceinline__ float pq1_fadd(float a, float b) { float r; asm("add.
 __device__ __forceinline__ float pq1_fmul(float a, float b) { float r; asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ __forceinline__ float pq1_fdiv(float a, float b) { float r; asm("div.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
 __device__ __forceinline__ float pq1_ffma(float a, float b, float c) { float r; asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c)); return r; }
+/* q8_K's nearest_int on the image of fma(v, iscale, 1.5*2^23), capped at 127.
+ * 0 * inf (iscale overflows when a block has 0 < amax < 127/FLT_MAX and an exact
+ * zero) is the default NaN 0x7fc00000 on the A57 (q = 0) but 0x7fffffff on
+ * sm_53 (q = 127): every NaN maps to the A57's. */
+__device__ __forceinline__ int pq1_q8n(float v, float iscale) {
+  unsigned u = __float_as_uint(pq1_ffma(v, iscale, 12582912.0f));
+  if ((u & 0x7fffffffu) > 0x7f800000u) u = 0x7fc00000u;
+  return min((int)(u & 0x007fffffu) - 0x00400000, 127);
+}
 __device__ __forceinline__ double pq1_f2d(float a) { double r; asm("cvt.f64.f32 %0, %1;" : "=d"(r) : "f"(a)); return r; }
 __device__ __forceinline__ float pq1_d2f(double a) { float r; asm("cvt.rn.f32.f64 %0, %1;" : "=f"(r) : "d"(a)); return r; }
 
@@ -1444,8 +1453,7 @@ __global__ __launch_bounds__(256) void pq1_silu_q8k(const float* __restrict__ gu
 #pragma unroll
   for (int k = 1; k < 8; k++) first = min(first, si[k]);
   const float iscale = pq1_fdiv(-127.0f, sv[first]);
-  int q = (int)(__float_as_uint(pq1_ffma(v, iscale, 12582912.0f)) & 0x007fffffu) - 0x00400000;
-  yb[4 + t] = (uint8_t)(int8_t)min(q, 127);
+  yb[4 + t] = (uint8_t)(int8_t)pq1_q8n(v, iscale);
   if (t == 0) *reinterpret_cast<float*>(yb) = pq1_fdiv(1.0f, iscale);
 }
 
@@ -1971,6 +1979,119 @@ extern "C" int pq1_fa_launch(const float* qo_d, const unsigned short* kc_d,
       PQ1_PVG(1) PQ1_PVG(2) PQ1_PVG(3) PQ1_PVG(4) PQ1_PVG(5) PQ1_PVG(6) PQ1_PVG(7) PQ1_PVG(8)
 #undef PQ1_PVG
     }
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+/* ---- whole-token graph: residual add + RMS norm + Q8_K in one kernel --------
+ * One block of n/4 threads (n = 4096 for the 8B: 1024 threads), thread t owns
+ * x[4t..4t+3]. x = X (+ R: fwd8's X[i] += AO[i] / FO[i], one rn add, stored
+ * back to X), then fwd8's rms():
+ *   s = fma(double(x_i), double(x_i), s) serially in index order (each product
+ *   is exact in double), sc = 1/sqrtf(float(s/n) + 1e-6f), y = (x*sc)*w,
+ * then q8_K_quant(y) exactly as pq1_silu_q8k<0> (Q8_K block b = threads
+ * [64b, 64b+64), qs stored as one word per thread).
+ * The serial double sum is the only order-dependent step, and 4096 dependent DP
+ * adds on one lane would take ~200 us. Instead the block sums the same exact
+ * squares as a tree (4-term chains, then 5 + 5 shuffle levels), S. All terms
+ * are >= 0, so the serial s and S are within (n-1)u and 13u (u = 2^-53,
+ * relative) of the exact sum, hence s is in [S(1-2^-40), S(1+2^-40)] for
+ * n <= 4096 ((4095+13)u < 2^-41.0). float(rn(s/n)) is monotone in s, so when
+ * both ends of that interval (rounded outward) give the same float, that float
+ * IS fwd8's; otherwise (~2^-15 of calls) thread 0 runs the serial chain over
+ * the shared copy of x. serial=1 forces the chain (parity gate); nfb counts
+ * the fallbacks when not NULL. */
+__global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
+                                                    const float* __restrict__ R,
+                                                    const float* __restrict__ w,
+                                                    uint8_t* __restrict__ xq, int n, int serial,
+                                                    int* __restrict__ nfb) {
+  __shared__ float sx[4096];
+  __shared__ double sw[32];
+  __shared__ float ssc;
+  __shared__ unsigned sam[32];
+  __shared__ int sid[32];
+  const int t = threadIdx.x, wp = t >> 5, l = t & 31, nw = blockDim.x >> 5;
+  float4 v = reinterpret_cast<const float4*>(X)[t];
+  if (R) {
+    const float4 r = reinterpret_cast<const float4*>(R)[t];
+    v.x = pq1_fadd(v.x, r.x); v.y = pq1_fadd(v.y, r.y);
+    v.z = pq1_fadd(v.z, r.z); v.w = pq1_fadd(v.w, r.w);
+    reinterpret_cast<float4*>(X)[t] = v;
+  }
+  reinterpret_cast<float4*>(sx)[t] = v;
+  double s;
+  {
+    const double a = pq1_f2d(v.x), b = pq1_f2d(v.y), c = pq1_f2d(v.z), d = pq1_f2d(v.w);
+    s = __fma_rn(d, d, __fma_rn(c, c, __fma_rn(b, b, __dmul_rn(a, a))));
+  }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) s = __dadd_rn(s, __shfl_xor_sync(0xffffffffu, s, o));
+  if (l == 0) sw[wp] = s;
+  __syncthreads();
+  if (wp == 0) {
+    double S = l < nw ? sw[l] : 0.0;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) S = __dadd_rn(S, __shfl_xor_sync(0xffffffffu, S, o));
+    if (l == 0) {
+      const double dn = (double)n;
+      const float flo = pq1_d2f(__ddiv_rn(__dmul_rd(S, 1.0 - 1.0 / 1099511627776.0), dn));
+      const float fhi = pq1_d2f(__ddiv_rn(__dmul_ru(S, 1.0 + 1.0 / 1099511627776.0), dn));
+      float f = flo;
+      if (serial || __float_as_uint(flo) != __float_as_uint(fhi) ||
+          (__float_as_uint(flo) & 0x7f800000u) == 0x7f800000u) {
+        double q = 0.0;
+        for (int j = 0; j < n; j++) { const double e = pq1_f2d(sx[j]); q = __fma_rn(e, e, q); }
+        f = pq1_d2f(__ddiv_rn(q, dn));
+        if (nfb) atomicAdd(nfb, 1);
+      }
+      ssc = pq1_fdiv(1.0f, pq1_fsqrt(pq1_fadd(f, 1e-6f)));
+    }
+  }
+  __syncthreads();
+  const float sc = ssc;
+  const float4 wv = reinterpret_cast<const float4*>(w)[t];
+  float y[4];
+  y[0] = pq1_fmul(pq1_fmul(v.x, sc), wv.x);
+  y[1] = pq1_fmul(pq1_fmul(v.y, sc), wv.y);
+  y[2] = pq1_fmul(pq1_fmul(v.z, sc), wv.z);
+  y[3] = pq1_fmul(pq1_fmul(v.w, sc), wv.w);
+  /* sx is free again (the serial chain finished before the barrier) */
+  reinterpret_cast<float4*>(sx)[t] = make_float4(y[0], y[1], y[2], y[3]);
+  unsigned a[4], m = 0u;
+#pragma unroll
+  for (int k = 0; k < 4; k++) { a[k] = __float_as_uint(y[k]) & 0x7fffffffu; m = max(m, a[k]); }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) m = max(m, __shfl_xor_sync(0xffffffffu, m, o));
+  if (l == 0) sam[wp] = m;
+  __syncthreads();
+  const int b = t >> 6, lt = t & 63;
+  const unsigned am = max(sam[2 * b], sam[2 * b + 1]);
+  int idx = 256;
+#pragma unroll
+  for (int k = 3; k >= 0; k--) if (a[k] == am) idx = 4 * lt + k;
+#pragma unroll
+  for (int o = 16; o; o >>= 1) idx = min(idx, __shfl_xor_sync(0xffffffffu, idx, o));
+  if (l == 0) sid[wp] = idx;
+  __syncthreads();
+  uint8_t* yb = xq + (size_t)b * 292;
+  if (am == 0u) {                                   /* fork: d = 0, qs = 0 */
+    if (lt == 0) *reinterpret_cast<uint32_t*>(yb) = 0u;
+    reinterpret_cast<uint32_t*>(yb + 4)[lt] = 0u;
+    return;
+  }
+  const int first = min(sid[2 * b], sid[2 * b + 1]);
+  const float iscale = pq1_fdiv(-127.0f, sx[b * 256 + first]);
+  uint32_t word = 0u;
+#pragma unroll
+  for (int k = 0; k < 4; k++) word |= (uint32_t)(uint8_t)(int8_t)pq1_q8n(y[k], iscale) << (8 * k);
+  reinterpret_cast<uint32_t*>(yb + 4)[lt] = word;
+  if (lt == 0) *reinterpret_cast<float*>(yb) = pq1_fdiv(1.0f, iscale);
+}
+
+extern "C" int pq1_rms_q8k_launch(float* X_d, const float* R_d, const float* w_d, uint8_t* xq_d,
+                                  int n, int serial, int* nfb_d, void* stream) {
+  if (n < 256 || n > 4096 || (n & 255) != 0) return -2;
+  pq1_rms_q8k<<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, serial, nfb_d);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 

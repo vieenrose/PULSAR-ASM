@@ -109,11 +109,139 @@ static int fa_parity(void) {
   printf("FA PARITY: %s\n", allok ? "PASS" : "FAIL");
   return allok ? 0 : 1;
 }
+/* `pq1_parity rms`: pq1_rms_q8k against fwd8's chain on the host (X += R,
+ * rms(): serial double sum, sc = 1/sqrtf(float(s/n) + 1e-6f), y = (x*sc)*w,
+ * then q8_K_quant with fwd8's fused magic add), byte for byte on X and on the
+ * d + qs bytes of every Q8_K block. Each vector runs with the certified tree sum
+ * and with the forced serial chain; a third of them are steered so that s/n
+ * lands within 2^-38..2^-46 (relative) of a float rounding midpoint, where the
+ * tree sum alone cannot decide the float and must fall back. */
+static double rms_ser(const float *x, int n) {
+  double s = 0;
+  for (int i = 0; i < n; i++) s = fma((double)x[i], (double)x[i], s);
+  return s;
+}
+static void rms_ref(float *x, const float *r, const float *w, int n, uint8_t *xq) {
+  float y[4096];
+  if (r) for (int i = 0; i < n; i++) x[i] = x[i] + r[i];
+  const double s = rms_ser(x, n);
+  const float sc = 1.0f / sqrtf((float)(s / n) + 1e-6f);
+  for (int i = 0; i < n; i++) y[i] = (x[i] * sc) * w[i];
+  for (int b = 0; b < n / 256; b++) {
+    const float *yb = y + b * 256;
+    uint8_t *qb = xq + (size_t)b * 292;
+    float amax = 0, mx = 0;
+    for (int j = 0; j < 256; j++) if (fabsf(yb[j]) > amax) { amax = fabsf(yb[j]); mx = yb[j]; }
+    if (!amax) { memset(qb, 0, 260); continue; }
+    const float iscale = -127.f / mx;
+    for (int j = 0; j < 256; j++) {
+      const float v = fmaf(yb[j], iscale, 12582912.f);
+      int q;
+      memcpy(&q, &v, 4);
+      q = (q & 0x007fffff) - 0x00400000;
+      ((int8_t *)(qb + 4))[j] = (int8_t)(q < 127 ? q : 127);
+    }
+    const float d = 1.0f / iscale;
+    memcpy(qb, &d, 4);
+  }
+}
+static float frand(void) { return ((rand() % 2000001) - 1000000) / 1000000.0f; }
+/* steer the serial sum of x to T*(1+delta), T = n * (a float midpoint near s/n),
+ * by choosing the last two elements (both small); returns 0 if it gave up */
+static int steer(float *x, int n, double delta) {
+  x[n - 2] = 0.0f; x[n - 1] = 0.0f;
+  const double s0 = rms_ser(x, n);
+  float f = (float)(s0 / n);
+  const float f2 = nextafterf(f, INFINITY);
+  const double T = ((double)f + (double)f2) * 0.5 * n * (1.0 + delta);
+  double P = rms_ser(x, n - 2);
+  float a = (float)sqrt(T - P);
+  for (int it = 0; it < 64; it++) {
+    const double P2 = P + (double)a * a;
+    const double D2 = T - P2;
+    if (D2 >= 0) {
+      x[n - 2] = a;
+      x[n - 1] = (float)sqrt(D2);
+      return 1;
+    }
+    a = nextafterf(a, 0.0f);
+  }
+  return 0;
+}
+static int rms_parity(void) {
+  const int n = 4096, NV = 600;
+  float *X = malloc(n * 4), *R = malloc(n * 4), *W = malloc(n * 4), *Xh = malloc(n * 4), *Xd = malloc(n * 4);
+  const size_t qb = (size_t)(n / 256) * 292;
+  uint8_t *qh = malloc(qb), *qd = malloc(qb);
+  float *d_X, *d_R, *d_W;
+  uint8_t *d_q;
+  int *d_nfb, nfb[2] = {0, 0};
+  cudaMalloc((void **)&d_X, n * 4); cudaMalloc((void **)&d_R, n * 4); cudaMalloc((void **)&d_W, n * 4);
+  cudaMalloc((void **)&d_q, qb); cudaMalloc((void **)&d_nfb, 8);
+  cudaMemset(d_nfb, 0, 8);
+  srand(777);
+  int bad = 0, steered = 0, nres = 0;
+  for (int v = 0; v < NV; v++) {
+    const int kind = v % 6;
+    const float sx = powf(2.0f, (float)(rand() % 24) - 12.0f);
+    for (int i = 0; i < n; i++) {
+      X[i] = frand() * sx * (i % 97 == 13 ? 60.0f : 1.0f);
+      R[i] = frand() * sx;
+      W[i] = 0.25f + 2.0f * fabsf(frand());
+    }
+    if (kind == 1) for (int i = 512; i < 768; i++) R[i] = -X[i];          /* a zero Q8_K block */
+    if (kind == 2) { X[1030] = -1e4f * sx; X[1100] = 1e4f * sx; R[1030] = R[1100] = 0; } /* amax tie */
+    if (kind == 3) for (int i = 0; i < 256; i++) { X[i] *= 1e-38f; R[i] *= 1e-38f; } /* subnormals */
+    const int useR = (kind != 4);
+    if (v % 3 == 0) {   /* steer x = X + R onto a midpoint: fold R into X first */
+      for (int i = 0; i < n; i++) { X[i] = X[i] + R[i]; R[i] = 0.0f; }
+      const double e = ldexp(1.0 + (rand() % 1000) / 1000.0, -(38 + rand() % 9)) * (rand() & 1 ? 1 : -1);
+      steered += steer(X, n, e);
+    }
+    nres += useR;
+    for (int mode = 0; mode < 2; mode++) {
+      memcpy(Xh, X, n * 4);
+      rms_ref(Xh, useR ? R : NULL, W, n, qh);
+      cudaMemcpy(d_X, X, n * 4, cudaMemcpyHostToDevice);
+      cudaMemcpy(d_R, R, n * 4, cudaMemcpyHostToDevice);
+      cudaMemcpy(d_W, W, n * 4, cudaMemcpyHostToDevice);
+      cudaMemset(d_q, 0xA5, qb);
+      int rc = pq1_rms_q8k_launch(d_X, useR ? d_R : NULL, d_W, d_q, n, mode, d_nfb + mode, 0);
+      cudaDeviceSynchronize();
+      cudaMemcpy(Xd, d_X, n * 4, cudaMemcpyDeviceToHost);
+      cudaMemcpy(qd, d_q, qb, cudaMemcpyDeviceToHost);
+      int b1 = rc != 0 || memcmp(Xd, Xh, n * 4);
+      for (int b = 0; b < n / 256; b++) b1 |= memcmp(qd + b * 292, qh + b * 292, 260) != 0;
+      if (b1 && bad < 5) {
+        for (int i = 0; i < n; i++)
+          if (memcmp(&Xd[i], &Xh[i], 4)) { printf("  X[%d] host %08x dev %08x\n", i, *(unsigned *)&Xh[i], *(unsigned *)&Xd[i]); break; }
+        for (size_t j = 0; j < qb; j++)
+          if (j % 292 < 260 && qd[j] != qh[j]) { printf("  q byte %zu (blk %zu off %zu) host %02x dev %02x d host %08x dev %08x\n", j, j / 292, j % 292, qh[j], qd[j], *(unsigned *)(qh + j / 292 * 292), *(unsigned *)(qd + j / 292 * 292)); break; }
+      }
+      if (b1 && bad++ < 5) printf("rms vec %d kind %d mode %d MISMATCH rc=%d\n", v, kind, mode, rc);
+    }
+  }
+  cudaMemcpy(nfb, d_nfb, 8, cudaMemcpyDeviceToHost);
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0); cudaEventCreate(&e1);
+  cudaEventRecord(e0, 0);
+  for (int r = 0; r < 200; r++) pq1_rms_q8k_launch(d_X, d_R, d_W, d_q, n, 0, NULL, 0);
+  cudaEventRecord(e1, 0);
+  cudaEventSynchronize(e1);
+  float ms = 0;
+  cudaEventElapsedTime(&ms, e0, e1);
+  printf("rms_q8k n=%d: %d vectors x {tree, serial}, %d steered to a midpoint, %d with residual; "
+         "tree fell back %d times (serial arm %d); bad=%d; %.2f us/call\n",
+         n, NV, steered, nres, nfb[0], nfb[1], bad, ms * 1000 / 200);
+  printf("RMS PARITY: %s\n", bad ? "FAIL" : "PASS");
+  return bad ? 1 : 0;
+}
 #endif
 
 int main(int argc, char **argv) {
 #if defined(PQ1_REAL_CUDA)
   if (argc > 1 && !strcmp(argv[1], "fa")) return fa_parity();
+  if (argc > 1 && !strcmp(argv[1], "rms")) return rms_parity();
 #endif
   int rows = argc > 1 ? atoi(argv[1]) : 256;
   int K = argc > 2 ? atoi(argv[2]) : 4096;

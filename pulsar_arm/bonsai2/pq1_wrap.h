@@ -79,6 +79,12 @@ extern int pq1_fa_mask;   /* bit 0 qk, 1 softmax parameters, 2 V accumulation */
 void pq1_f2h_row(const float *x, uint16_t *h, int n);
 void pq1_fa16_head(const float *q, const uint16_t *K, const uint16_t *V, int T, float scale,
                    float *out);
+/* whole-token graph: X (+= R when R_d is not NULL, stored back), then fwd8's
+ * rms(X, w) and q8_K_quant into xq_d, bit-exact; one block, n % 256 == 0,
+ * n <= 4096. serial=1 forces the serial double sum (parity), nfb_d (may be
+ * NULL) counts the calls that needed it. */
+int pq1_rms_q8k_launch(float *X_d, const float *R_d, const float *w_d, unsigned char *xq_d,
+                       int n, int serial, int *nfb_d, void *stream);
 /* exhaustive pq1_r16 check; bad_d = 2 zeroed u64 on the device */
 int pq1_r16_test_launch(unsigned long long *bad_d);
 

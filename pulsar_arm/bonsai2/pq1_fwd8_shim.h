@@ -41,6 +41,15 @@ __attribute__((weak)) void pq1_attn_dbg(int il, int npos, uint16_t *k16, uint16_
 /* 4k context: the run's K/V cache shape, before the first device call (the
  * arena is sized from it) */
 __attribute__((weak)) void pq1_kv_shape(int nl, int nkv, int ctx);
+/* loop iter 14: the whole token (every layer, output_norm, head) as one device
+ * graph; wt = 7 tensors per layer (q k v o gate up down) + output.weight, nw = 4
+ * norms per layer (attn ffn q k) + output_norm. 0 = ran, HEAD written and the
+ * device residual stream advanced; non-zero = caller runs the per-layer path. */
+__attribute__((weak)) int pq1_token_fused(int nl, const unsigned char *const *wt,
+                                          const float *const *nw, int nh, int nkv, int hid,
+                                          int inter, int vocab, int ctx, int npos,
+                                          const float *rcc, const float *rcs, const float *x,
+                                          float *head);
 
 #ifdef PQ1_USE_CUDA
 /* GPU-RAM report printed once at process exit (PQ1_STATS=1). Declared here
@@ -52,7 +61,7 @@ __attribute__((weak)) void pq1_kv_shape(int nl, int nkv, int ctx);
 const char *pq1_gpu_stats_mb(char *buf, int n);
 static void pq1_gpu_stats_dump(void) {
   if (!getenv("PQ1_STATS")) return;
-  char b[256];
+  char b[512];
   fprintf(stderr, "%s\n", pq1_gpu_stats_mb(b, sizeof b));
 }
 __attribute__((constructor)) static void pq1_gpu_stats_init(void) {

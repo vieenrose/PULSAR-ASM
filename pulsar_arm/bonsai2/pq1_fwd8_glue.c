@@ -55,6 +55,7 @@ static long PQ1_GRAPH_OK = 0, PQ1_GRAPH_CALLS = 0; /* graphs instantiated / laun
 static cudaStream_t PQ1_CS = NULL; /* capture stream, created on first use */
 static long PQ1_FFN_GRAPHS = 0, PQ1_FFN_CALLS = 0; /* loop iter 2: fused FFN graphs built / launched */
 static long PQ1_ATT_GRAPHS = 0, PQ1_ATT_CALLS = 0; /* loop iter 4: fused attention graphs built / launched */
+static long PQ1_TOK_GRAPHS = 0, PQ1_TOK_CALLS = 0; /* loop iter 14: whole-token graphs built / launched */
 static uint32_t *d_pl; static int *d_au; /* T-MAC device prep buffers (defined below) */
 
 #ifdef PQ1_USE_CUDA
@@ -433,12 +434,12 @@ const char *pq1_gpu_stats_mb(char *buf, int n) {
   }
   snprintf(buf, n,
            "PQ1GPU used_mb=%.1f arena_mb=%.1f peak_mb=%.1f free_mb=%s "
-           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld zc=%d zcfail=%d batch=%ld brows=%ld graphs=%ld/%ld hyb=%ld hrows=%ld gpu_ms=%.1f hwait_ms=%.1f ffn=%ld/%ld att=%ld/%ld",
+           "total_mb=%s tensors=%d tm=%ld r128=%ld r256=%ld swar=%ld zc=%d zcfail=%d batch=%ld brows=%ld graphs=%ld/%ld hyb=%ld hrows=%ld gpu_ms=%.1f hwait_ms=%.1f ffn=%ld/%ld att=%ld/%ld tok=%ld/%ld",
            PQ1ACUR / 1048576.0, PQ1ALIM / 1048576.0, P2PEAK / 1048576.0,
            fs, ts, PQ1N, PQ1_TM_CALLS, PQ1_R128_CALLS, PQ1_R256_CALLS,
            PQ1_SWAR_CALLS, NZC, ZCFAIL, PQ1_BATCH_CALLS, PQ1_BATCH_ROWS,
            PQ1_GRAPH_OK, PQ1_GRAPH_CALLS, PQ1_HYB_CALLS, PQ1_HYB_ROWS, PQ1_HYB_US * 1e-3, PQ1_HSYNC_US * 1e-3,
-           PQ1_FFN_GRAPHS, PQ1_FFN_CALLS, PQ1_ATT_GRAPHS, PQ1_ATT_CALLS);
+           PQ1_FFN_GRAPHS, PQ1_FFN_CALLS, PQ1_ATT_GRAPHS, PQ1_ATT_CALLS, PQ1_TOK_GRAPHS, PQ1_TOK_CALLS);
   return buf;
 }
 #endif
@@ -1380,5 +1381,174 @@ void pq1_attn_dbg(int il, int npos, uint16_t *k, uint16_t *v, float *q, float *a
   cudaMemcpy(atto, MDY + 128 * 1024, (size_t)nh * 512, cudaMemcpyDeviceToHost);
 #else
   (void)il; (void)npos; (void)k; (void)v; (void)q; (void)atto; (void)nh;
+#endif
+}
+
+/* ---- loop iter 14: the WHOLE token as ONE captured graph --------------------
+ * {H2D (cos|sin, npos), H2D x = embedding}, then per layer: pq1_rms_q8k (the
+ * residual add of the previous block, attn_norm and Q8_K, X kept on the device),
+ * the attention graph's nodes (prep, merged q+k+v, pq1_attn_launch, Q8_K, prep,
+ * attn_output), pq1_rms_q8k (+= attention output, ffn_norm, Q8_K), the FFN
+ * graph's nodes (prep, gate+up, silu*u + Q8_K, prep, down); then pq1_rms_q8k
+ * (+= the last down output, output_norm, Q8_K), prep, the head, D2H -> head.
+ * Replaces, per token, 72 graph launches + syncs and the host rms (2.0 ms/tok),
+ * Q8_K quant (1.4 ms) and residual adds (0.7 ms) that ran between them: the
+ * GPU no longer idles while the A57 works. Values: the same device kernels as
+ * the per-layer graphs, and pq1_rms_q8k is bit-exact with fwd8's X += ..., rms()
+ * and q8_K_quant (pq1_parity rms). It declines (-1, caller runs the per-layer
+ * path) until every tensor and the K/V rows of all layers exist on the device,
+ * i.e. from the second token on, and outside the default T-MAC/graph config.
+ * Allocates (2 nl + 2) hid floats of the arena once (1.2 MB for the 8B).
+ * PQ1_TOK=0 is the A/B arm. */
+#ifdef PQ1_USE_CUDA
+static int PQ1_TOK = -1, PQ1_TOK_OK = 0;
+static float *d_X = NULL, *d_nw = NULL;
+static cudaGraphExec_t PQ1_TOK_EX;
+static const void *PQ1_TOK_WT, *PQ1_TOK_XH, *PQ1_TOK_HD;
+#endif
+int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *nw, int nh,
+                    int nkv, int hid, int inter, int vocab, int ctx, int npos, const float *rcc,
+                    const float *rcs, const float *x, float *head) {
+#ifdef PQ1_USE_CUDA
+  if (PQ1_TOK < 0) { const char *e = getenv("PQ1_TOK"); PQ1_TOK = e ? atoi(e) : 1; }
+  if (!PQ1_TOK || !d_kv || nl != PQ1KV_NL || nkv != PQ1KV_NKV || ctx != PQ1KV_CTX) return -1;
+  if (npos < 0 || npos >= ctx) return -1;
+  for (int il = 0; il < nl; il++)
+    if (PQ1KV_NEXT[il] != npos) return -1;
+  if (PQ1_GRAPH < 0) pq1_graph_init();
+  if (PQ1_GRAPH == 0 || PQ1_TM != 1) return -1;
+  const int qr = nh * 128, kr = nkv * 128;
+  if ((hid & 255) || hid < 256 || hid > 4096 || (qr & 255) || (inter & 255) || inter <= 0 ||
+      nh > PQ1_FA_MAXH || vocab <= 0)
+    return -1;
+  const size_t xqb = (size_t)(hid / 256) * 292, xob = (size_t)(qr / 256) * 292;
+  const size_t xqb2 = (size_t)(inter / 256) * 292;
+  const size_t half = PQ1_GRAPH_YB / 2, q0 = 64 * 1024, a0 = 128 * 1024;
+  if (!d_xq || !MDY || !d_y || xqb > P2XQMAX || xob > P2XQMAX || xqb2 > P2XQMAX ||
+      (size_t)(qr + 2 * kr) * 4 > q0 || (size_t)qr * 4 > a0 - q0 || a0 + (size_t)qr * 4 > half ||
+      (size_t)inter * 8 > half || (size_t)hid * 4 > half || (size_t)vocab * 4 > P2YMAX ||
+      !pq1_tm_bufs(hid, xqb, 0, 1) || !pq1_tm_bufs(qr, xob, 0, 1) || !pq1_tm_bufs(inter, xqb2, 0, 1))
+    return -1;
+  if (PQ1_TOK_OK && (PQ1_TOK_WT != (const void *)wt || PQ1_TOK_XH != (const void *)x ||
+                     PQ1_TOK_HD != (const void *)head)) {
+    cudaGraphExecDestroy(PQ1_TOK_EX);
+    PQ1_TOK_OK = 0;
+  }
+  if (!PQ1_TOK_OK) {
+    /* every tensor must already live in the arena: merged q+k+v and gate+up,
+     * scalar attn_output, down and head, none with host (hybrid) rows */
+    int mq[PQ1_AL_MAX], co[PQ1_AL_MAX], mg[PQ1_AL_MAX], cd[PQ1_AL_MAX], ch = -1;
+    for (int il = 0; il < nl; il++) {
+      const unsigned char *const *w = wt + 7 * il;
+      mq[il] = co[il] = mg[il] = cd[il] = -1;
+      for (int i = 0; i < PQ1NM; i++) {
+        if (PQ1M[i].n == 3 && PQ1M[i].cols == hid && PQ1M[i].w[0] == w[0] && PQ1M[i].w[1] == w[1] &&
+            PQ1M[i].w[2] == w[2] && PQ1M[i].rows[0] == qr && PQ1M[i].rows[1] == kr &&
+            PQ1M[i].rows[2] == kr && !PQ1M[i].hrows && PQ1M[i].d_codes)
+          mq[il] = i;
+        if (PQ1M[i].n == 2 && PQ1M[i].cols == hid && PQ1M[i].w[0] == w[4] && PQ1M[i].w[1] == w[5] &&
+            PQ1M[i].rows[0] == inter && PQ1M[i].rows[1] == inter && !PQ1M[i].hrows && PQ1M[i].d_codes)
+          mg[il] = i;
+      }
+      for (int i = 0; i < PQ1N; i++) {
+        if (PQ1C[i].w == w[3] && PQ1C[i].rows == hid && PQ1C[i].cols == qr && !PQ1C[i].hrows &&
+            PQ1C[i].d_codes)
+          co[il] = i;
+        if (PQ1C[i].w == w[6] && PQ1C[i].rows == hid && PQ1C[i].cols == inter && !PQ1C[i].hrows &&
+            PQ1C[i].d_codes)
+          cd[il] = i;
+      }
+      if (mq[il] < 0 || co[il] < 0 || mg[il] < 0 || cd[il] < 0) return -1;
+    }
+    for (int i = 0; i < PQ1N; i++)
+      if (PQ1C[i].w == wt[7 * nl] && PQ1C[i].rows == vocab && PQ1C[i].cols == hid && !PQ1C[i].hrows &&
+          PQ1C[i].d_codes)
+        ch = i;
+    if (ch < 0) return -1;
+    if (!PQ1_CS && cudaStreamCreateWithFlags(&PQ1_CS, cudaStreamNonBlocking) != cudaSuccess) {
+      cudaGetLastError();
+      return -1;
+    }
+    if (!d_X) {   /* once: the residual stream and the 2 nl + 1 norm weight vectors */
+      const size_t need = ((size_t)(2 * nl + 2) * hid * 4 + 255) / 256 * 256;
+      if (!PQ1ARENA || PQ1ACUR + need > PQ1ALIM) { PQ1_TOK = 0; return -1; }
+      d_X = (float *)(PQ1ARENA + PQ1ACUR);
+      d_nw = d_X + hid;
+      PQ1ACUR += need;
+      if (PQ1ACUR > P2PEAK) P2PEAK = PQ1ACUR;
+    }
+    int up = 0;
+    for (int il = 0; il < nl && !up; il++)
+      up = cudaMemcpy(d_nw + (size_t)(2 * il) * hid, nw[4 * il], (size_t)hid * 4, cudaMemcpyHostToDevice) ||
+           cudaMemcpy(d_nw + (size_t)(2 * il + 1) * hid, nw[4 * il + 1], (size_t)hid * 4, cudaMemcpyHostToDevice) ||
+           cudaMemcpy(d_anw + (size_t)il * 256, nw[4 * il + 2], 512, cudaMemcpyHostToDevice) ||
+           cudaMemcpy(d_anw + (size_t)il * 256 + 128, nw[4 * il + 3], 512, cudaMemcpyHostToDevice);
+    if (up || cudaMemcpy(d_nw + (size_t)(2 * nl) * hid, nw[4 * nl], (size_t)hid * 4, cudaMemcpyHostToDevice)) {
+      cudaGetLastError();
+      PQ1_TOK = 0;
+      return -1;
+    }
+    float *qkv = (float *)MDY, *qo = (float *)(MDY + q0), *atto = (float *)(MDY + a0);
+    float *gu = (float *)MDY, *yh = (float *)(MDY + half);   /* yh: attn_output, then down */
+    cudaGraph_t g = NULL;
+    int rc = 0;
+    if (cudaStreamBeginCapture(PQ1_CS, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+      cudaGetLastError();
+      return -1;
+    }
+    cudaStream_t S = PQ1_CS;
+    rc |= cudaMemcpyAsync(d_ain, PQ1_AIN, PQ1_APAR_XQ, cudaMemcpyHostToDevice, S) != cudaSuccess;
+    rc |= cudaMemcpyAsync(d_X, x, (size_t)hid * 4, cudaMemcpyHostToDevice, S) != cudaSuccess;
+    for (int il = 0; il < nl && !rc; il++) {
+      rc |= pq1_rms_q8k_launch(d_X, il ? yh : NULL, d_nw + (size_t)(2 * il) * hid, d_xq, hid, 0, NULL, S);
+      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, hid, S);
+      rc |= pq1_tmx_launch(PQ1M[mq[il]].d_codes, PQ1M[mq[il]].d_scales, d_pl, d_au, qkv, hid,
+                           qr + 2 * kr, S);
+      rc |= pq1_attn_launch(qkv, d_anw + (size_t)il * 256, d_ain, qo, pq1_kv_layer(il, 0),
+                            pq1_kv_layer(il, 1), d_fas, d_fam, atto, nh, nkv, ctx, S);
+      rc |= pq1_q8k_launch(atto, qr, d_xq, S);
+      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, qr, S);
+      rc |= pq1_tmx_launch(PQ1C[co[il]].d_codes, PQ1C[co[il]].d_scales, d_pl, d_au, yh, qr, hid, S);
+      rc |= pq1_rms_q8k_launch(d_X, yh, d_nw + (size_t)(2 * il + 1) * hid, d_xq, hid, 0, NULL, S);
+      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, hid, S);
+      rc |= pq1_tmx_launch(PQ1M[mg[il]].d_codes, PQ1M[mg[il]].d_scales, d_pl, d_au, gu, hid,
+                           2 * inter, S);
+      rc |= pq1_silu_q8k_launch(gu, inter, d_xq, NULL, S);
+      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, inter, S);
+      rc |= pq1_tmx_launch(PQ1C[cd[il]].d_codes, PQ1C[cd[il]].d_scales, d_pl, d_au, yh, inter, hid, S);
+    }
+    if (!rc) {
+      rc |= pq1_rms_q8k_launch(d_X, yh, d_nw + (size_t)(2 * nl) * hid, d_xq, hid, 0, NULL, S);
+      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, hid, S);
+      rc |= pq1_tmx_launch(PQ1C[ch].d_codes, PQ1C[ch].d_scales, d_pl, d_au, d_y, hid, vocab, S);
+      rc |= cudaMemcpyAsync(head, d_y, (size_t)vocab * 4, cudaMemcpyDeviceToHost, S) != cudaSuccess;
+    }
+    if (cudaStreamEndCapture(S, &g) != cudaSuccess) { rc = 1; g = NULL; }
+    if (!rc && g && cudaGraphInstantiate(&PQ1_TOK_EX, g, NULL, NULL, 0) == cudaSuccess && PQ1_TOK_EX) {
+      PQ1_TOK_OK = 1;
+      PQ1_TOK_WT = wt; PQ1_TOK_XH = x; PQ1_TOK_HD = head;
+      PQ1_TOK_GRAPHS++;
+    }
+    if (g) cudaGraphDestroy(g);
+    cudaGetLastError();
+    if (!PQ1_TOK_OK) { PQ1_TOK = 0; return -1; }   /* never retry a failing capture */
+  }
+  memcpy(PQ1_AIN + PQ1_APAR_ROPE, rcc, 256);
+  memcpy(PQ1_AIN + PQ1_APAR_ROPE + 256, rcs, 256);
+  memcpy(PQ1_AIN + PQ1_APAR_NPOS, &npos, 4);
+  double kt0 = KTON > 0 ? pq1_now() : 0.0;
+  for (int il = 0; il < nl; il++) PQ1KV_LIVE[il] = 1;   /* the device owns every layer's cache */
+  if (cudaGraphLaunch(PQ1_TOK_EX, 0) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+    fprintf(stderr, "pq1: token graph failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+    exit(3);
+  }
+  for (int il = 0; il < nl; il++) PQ1KV_NEXT[il] = npos + 1;
+  if (KTON > 0) pq1_kt_add(-3, hid, pq1_now() - kt0);   /* rows -3: the whole-token graph */
+  PQ1_TOK_CALLS++;
+  return 0;
+#else
+  (void)nl; (void)wt; (void)nw; (void)nh; (void)nkv; (void)hid; (void)inter; (void)vocab;
+  (void)ctx; (void)npos; (void)rcc; (void)rcs; (void)x; (void)head;
+  return -1;
 #endif
 }
