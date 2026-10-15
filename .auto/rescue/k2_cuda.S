@@ -3210,7 +3210,7 @@ main:
     adrp x1, g_batch
     ldr w9, [x1, :lo12:g_batch]
     cmp w9, #1
-    b.gt .Lchunk                     /* batched prefill enabled */
+    b .Lloop                         /* Exp71: force single-token path (merge applies to prefill too) */
 .Lloop:
     /* --- choose id --- */
     cmp x25, x24

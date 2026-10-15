@@ -1030,6 +1030,7 @@ static void cuda_gemv_impl(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
     uint32_t nb32 = cols >> 5;
     uint64_t dev_w = 0;
     uint32_t rowsf = q4_classify(w, &dev_w);
+    uint32_t rows_cls = rowsf;   /* Exp70 */
     uint64_t d_sc = dev_sc, d_xq = dev_xq, d_y = dev_y, scb;
     size_t nrows, sc_bytes, xq_bytes;
     void *args[] = { &dev_w, &d_sc, &d_xq, &d_y, (void *)&r0, (void *)&r1,
@@ -1043,6 +1044,7 @@ static void cuda_gemv_impl(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
         k2q4_gemv_range(r0, r1, cols, w, x_act_unused, y, xq);
         return;
     }
+    rowsf = r1 - r0;   /* Exp70: merged groups ask for more rows than classify() matched */
     grid = (r1 > r0) ? (r1 - r0 + 31) / 32 : 0;
     if (!grid) return;
     nrows = (size_t)(r1 - r0);
@@ -1140,8 +1142,8 @@ static void cuda_gemv_impl(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
                     printf("GCALL n=%lu ms=%.3f rows=%u cols=%u\n", gcnt, ms, r1-r0, cols);
                 if (gcnt == hi) fflush(stdout);
             }
-            if ((gcnt % 197) == 0) {
-                printf("GTIME fwd=%lu call_us=%.1f fwd_ms=%.1f\n", gcnt/197, ms*1000.0, gtot - pgtot);
+            if ((gcnt % 113) == 0) {
+                printf("GTIME fwd=%lu call_us=%.1f fwd_ms=%.1f\n", gcnt/113, ms*1000.0, gtot - pgtot);
                 fflush(stdout); pgtot = gtot;
             }
         }
@@ -1158,8 +1160,8 @@ static void cuda_gemv_impl(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
     if (cuda_ok && selftest_remaining > 0) {
         static float s_gpu[65536], s_cpu[65536];
         static uint64_t dev_s = 0;
-        uint32_t t_r0 = 0, t_r1 = rowsf;
-        size_t full = (size_t)rowsf * 4;
+        uint32_t t_r0 = 0, t_r1 = rows_cls;
+        size_t full = (size_t)rows_cls * 4;
         void *targs[] = { &dev_w, &d_sc, &d_xq, &dev_s,
                           &t_r0, &t_r1, &nb32, &rowsf };
         CUresult r2 = 0;
@@ -1173,14 +1175,14 @@ static void cuda_gemv_impl(uint32_t r0, uint32_t r1, uint32_t cols, uint64_t w,
             }
         }
         if (pass) {
-            r2 = pLaunch(k_gemv, (rowsf + 15) / 16, 1, 1, 32, 8, 1,
+            r2 = pLaunch(k_gemv, (rows_cls + 15) / 16, 1, 1, 32, 8, 1,
                          0, NULL, targs, NULL);
             if (!r2) r2 = pCtxSync();
             if (!r2) r2 = pMemcpyDtoH(s_gpu, dev_s, full);
             if (r2) { ck(r2, "selftest-path"); pass = 0; }
         }
         if (pass) {
-            cuda_q4_ref(rowsf, cols, (const uint8_t *)(uintptr_t)w,
+            cuda_q4_ref(rows_cls, cols, (const uint8_t *)(uintptr_t)w,
                         scb, (const int8_t *)(uintptr_t)xq, s_cpu);
             if (memcmp(s_gpu, s_cpu, full)) {
                 size_t i, nf = full / 4;
