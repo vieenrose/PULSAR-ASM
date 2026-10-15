@@ -320,11 +320,30 @@ static int fpl_parity(void) {
   printf("FPL PARITY: %s\n", bad ? "FAIL" : "PASS");
   return bad ? 1 : 0;
 }
+/* exhaustive: every float through pq1_expf_ff vs pq1_expf_dev (glibc-2.27 expf) */
+extern int pq1_expf_chk_launch(unsigned base, unsigned long long *c_d);
+static int expf_parity(void) {
+  unsigned long long *d_c, c[4];
+  cudaMalloc((void **)&d_c, sizeof c);
+  cudaMemset(d_c, 0, sizeof c);
+  for (unsigned i = 0; i < 4096; i++) {
+    if (pq1_expf_chk_launch(i << 20, d_c)) { printf("expf launch failed\n"); return 1; }
+    if ((i & 63) == 63) cudaDeviceSynchronize();
+  }
+  int ce = (int)cudaMemcpy(c, d_c, sizeof c, cudaMemcpyDeviceToHost);
+  if (ce) { printf("expf: cuda error %d\n", ce); return 1; }
+  cudaFree(d_c);
+  printf("expf: 2^32 inputs, mismatches %llu, certified-wrong %llu, fallbacks %llu (%llu of them fast-correct) -> %s\n",
+         c[0], c[1], c[2], c[3], (c[0] || c[1]) ? "FAIL" : "PASS");
+  return (c[0] || c[1]) ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
 #if defined(PQ1_REAL_CUDA)
   if (argc > 1 && !strcmp(argv[1], "fa")) return fa_parity();
   if (argc > 1 && !strcmp(argv[1], "rms")) return rms_parity();
   if (argc > 1 && !strcmp(argv[1], "fpl")) return fpl_parity();
+  if (argc > 1 && !strcmp(argv[1], "expf")) return expf_parity();
 #endif
   int rows = argc > 1 ? atoi(argv[1]) : 256;
   int K = argc > 2 ? atoi(argv[2]) : 4096;
