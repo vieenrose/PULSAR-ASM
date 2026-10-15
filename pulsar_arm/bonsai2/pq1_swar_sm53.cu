@@ -742,10 +742,10 @@ extern "C" int pq1_gemv_tm_launch(const uint8_t* w_codes,
  * P[row][group] for a batch of RB rows; lanes 0..RB-1 then each add one
  * row's G products from 0.0f in ascending group order, the reference's order. */
 #ifndef HS_TPB1
-#define HS_TPB1 8
+#define HS_TPB1 4
 #endif
 #ifndef HS_MINB1
-#define HS_MINB1 4
+#define HS_MINB1 6
 #endif
 #ifndef HS_TPB3
 #define HS_TPB3 2
@@ -857,7 +857,7 @@ __device__ __forceinline__ int hs_group_s(const uint32_t (&p)[8][4], const uint3
 #define HS_RB1 6
 #endif
 #ifndef HS_PD1
-#define HS_PD1 3
+#define HS_PD1 6
 #endif
 #ifndef HS_RB3
 #define HS_RB3 4
@@ -899,6 +899,10 @@ __device__ __forceinline__ void hs_seg_step(float (*tiles)[RB * PS], float (*sac
 /* RB rows per batch, PD rows in flight per lane (a ring of PD load slots
  * that must restart aligned at every batch: RB % PD == 0). RB 6 / PD 3 at
  * K = 4096: deeper prefetch in the same 64 registers (offset form: 8 / 2).
+ * K = 4096: TPB 4 / MINB 6 / RB 6 / PD 6, the whole batch in flight at 80
+ * registers, 24 warps (TPB 8 / MINB 4 / PD 3 at 64 registers, 32 warps:
+ * PQ1_HS1O=1): 435 -> 379 us per call. With RB > PD (12/6, 10/5) it is slower
+ * than either.
  * K = 12288 (down, segmented): RB 4 / PD 4 / MINB 4, every row of a batch in
  * flight, 80 registers and a 12.9 KB tile ring, so 4 blocks (24 warps) are
  * resident instead of 2 (RB 8 / PD 2 / MINB 1 took 120 registers and 25.9 KB;
@@ -1090,7 +1094,10 @@ extern "C" int pq1_gemv_hs_launch(const uint8_t* w_codes,
   const __half* ws = reinterpret_cast<const __half*>(w_scales_h);
   cudaStream_t s = (cudaStream_t)stream;
   if (K == 4096) {
-    if (hv) hs_launch<1, HS_TPB1, HS_MINB1, HS_RB1, HS_PD1, true>(w_codes, ws, xpl, xau, y, N, s);
+    static int ho = -1;
+    if (ho < 0) { const char* e = getenv("PQ1_HS1O"); ho = e ? atoi(e) : 0; }
+    if (hv && ho) hs_launch<1, 8, 4, 6, 3, true>(w_codes, ws, xpl, xau, y, N, s);
+    else if (hv) hs_launch<1, HS_TPB1, HS_MINB1, HS_RB1, HS_PD1, true>(w_codes, ws, xpl, xau, y, N, s);
     else hs_launch<1, 8, 4, 8, 2, false>(w_codes, ws, xpl, xau, y, N, s);
   } else if (K == 12288) {
     static int ho = -1;
