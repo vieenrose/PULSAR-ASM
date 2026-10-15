@@ -1636,7 +1636,15 @@ __device__ __forceinline__ float pq1_expf_ffc(float x, bool* ok, const float* __
 __device__ __forceinline__ void pq1_expf_tab(float* tab, int t) {
   if (t < 64) tab[t] = __uint_as_float(PQ1_EXP2F_FF[2 * (t & 31) + (t >> 5)]);
 }
+__device__ __noinline__ float pq1_expf_dev_ni(float x) { return pq1_expf_dev(x); }
 __device__ __forceinline__ float pq1_expf_ff(float x, const float* __restrict__ tab) {
+  bool ok = false;
+  float e = 0.0f;
+  if (x > -86.5f && x < 88.0f) e = pq1_expf_ffc(x, &ok, tab);
+  return ok ? e : pq1_expf_dev_ni(x);
+}
+/* the same with the fallback inlined (PQ1_SNI=0 A/B arm) */
+__device__ __forceinline__ float pq1_expf_ff_il(float x, const float* __restrict__ tab) {
   bool ok = false;
   float e = 0.0f;
   if (x > -86.5f && x < 88.0f) e = pq1_expf_ffc(x, &ok, tab);
@@ -1766,15 +1774,25 @@ __global__ __launch_bounds__(256) void pq1_silu_q8k(const float* __restrict__ gu
  * |v| bits, first index by integer min, iscale/d/q as pq1_silu_q8k, planes by
  * pq1_plane_tr over the same 32-byte words (word j = elements 32j..32j+31),
  * group sums as integers. PQ1_QW=0 keeps the 256-thread kernel. */
+/* SiLU*u out of line (PQ1_SNI=1 default): q8k_w<2> runs right after the gate+up
+ * GEMV with a cold instruction cache; 1836 -> 762 SASS instructions cut it
+ * 31.8 -> 22.6 us/call in the engine (standalone hot: ~20 us). Same ops, same
+ * order, bit-identical. */
+__device__ __noinline__ float pq1_silu_ff_ni(float x, float u, const float* __restrict__ stab) {
+  const float mg = __uint_as_float(__float_as_uint(x) ^ 0x80000000u);
+  const float e = pq1_expf_ff(mg, stab);
+  const float sg = pq1_frcp(pq1_fadd(1.0f, e));
+  return pq1_fmul(pq1_fmul(x, sg), u);
+}
 template <int SILU>
 __global__ __launch_bounds__(256) void pq1_q8k_w(const float* __restrict__ gu, int n,
                                                  uint8_t* __restrict__ xq,
                                                  uint32_t* __restrict__ pl,
                                                  int* __restrict__ au) {
-  __shared__ float stab[SILU == 2 ? 64 : 1];
+  __shared__ float stab[SILU >= 2 ? 64 : 1];
   __shared__ __align__(16) uint8_t sqb[8][256];
   const int t = threadIdx.x, l = t & 31, w = t >> 5;
-  if (SILU == 2) {
+  if (SILU >= 2) {
     pq1_expf_tab(stab, t);
     __syncthreads();
   }
@@ -1788,10 +1806,14 @@ __global__ __launch_bounds__(256) void pq1_q8k_w(const float* __restrict__ gu, i
     const float x = src[32 * j];
     if (SILU) {
       const float u = src[n + 32 * j];
+      if (SILU == 2) {
+        v[j] = pq1_silu_ff_ni(x, u, stab);
+      } else {
       const float mg = __uint_as_float(__float_as_uint(x) ^ 0x80000000u);
-      const float e = SILU == 2 ? pq1_expf_ff(mg, stab) : pq1_expf_dev(mg);
+      const float e = SILU == 3 ? pq1_expf_ff_il(mg, stab) : pq1_expf_dev(mg);
       const float sg = pq1_frcp(pq1_fadd(1.0f, e));
       v[j] = pq1_fmul(pq1_fmul(x, sg), u);
+      }
     } else {
       v[j] = x;
     }
@@ -1906,7 +1928,11 @@ extern "C" int pq1_silu_q8k_pl_launch(int silu, const float* x_d, int n, uint8_t
   if (qw < 0) { const char* e = getenv("PQ1_QW"); qw = e ? atoi(e) : 1; }
   if (qw) {
     const int nb = (n / 256 + 7) / 8;
-    if (silu && pq1_exf())
+    static int sni = -1;
+    if (sni < 0) { const char* e = getenv("PQ1_SNI"); sni = e ? atoi(e) : 1; }
+    if (silu && pq1_exf() && !sni)
+      pq1_q8k_w<3><<<nb, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, pl_d, au_d);
+    else if (silu && pq1_exf())
       pq1_q8k_w<2><<<nb, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, pl_d, au_d);
     else if (silu)
       pq1_q8k_w<1><<<nb, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, pl_d, au_d);
