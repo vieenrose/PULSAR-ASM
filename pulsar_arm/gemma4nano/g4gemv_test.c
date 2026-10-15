@@ -63,7 +63,7 @@ static void repack_q4i(const tensor_t *t, uint8_t *nib, float *scl) {
 static void launch_q4i(const tensor_t *t, uint64_t out) {
     int rows = (int)t->dims[1], cols = (int)t->dims[0];
     void *a[] = {&dWi, &dSi, &dX, &out, &rows, &cols};
-    unsigned sm = getenv("Q4I") ? 0 : (unsigned)(cols * 2 + cols / 32 * 4 + cols / 256 * 4);
+    unsigned sm = (getenv("Q4I") && getenv("Q4I")[0] < '3') ? 0 : (unsigned)(cols * 2 + cols / 32 * 4 + cols / 256 * 4);
     CK(cuLaunchKernel_(fq4i, (rows + 255) / 256, 1, 1, 32, 8, 1, sm, NULL, a, NULL));
 }
 static int test_q4(const tensor_t *t) {
@@ -259,7 +259,7 @@ static double perf_q4(const char *name) {
     uint32_t r0 = 0, r1 = (uint32_t)t->dims[1], nb = (uint32_t)t->dims[0] / 32, rf = r1;
     double ms;
     if (use_q4i) { int rows = (int)r1, cols = (int)nb * 32; void *a[] = {&dWi, &dSi, &dX, &dY, &rows, &cols};
-                   smem_bytes = getenv("Q4I") ? 0 : (unsigned)(cols * 2 + cols / 32 * 4 + cols / 256 * 4);
+                   smem_bytes = (getenv("Q4I") && getenv("Q4I")[0] < '3') ? 0 : (unsigned)(cols * 2 + cols / 32 * 4 + cols / 256 * 4);
                    ms = time_launch(fq4i, (rows + 255) / 256, 32, 8, a); smem_bytes = 0; }
     else { void *args[] = {&dW, &dS, &dX, &dY, &r0, &r1, &nb, &rf}; ms = time_launch(fq4, (r1 + 31) / 32, 32, 8, args); }
     double gb = (double)r1 * nb * 20 / 1e9;   /* 16 B nibbles + 4 B f32 scale per block */
@@ -315,7 +315,7 @@ int main(int argc, char **argv) {
     { FILE *f = fopen(argv[2], "rb"); if (!f) { perror(argv[2]); return 2; }
       static char ptx[1 << 20]; size_t n = fread(ptx, 1, sizeof ptx - 1, f); fclose(f); ptx[n] = 0;
       CK(cuModuleLoadData_(&m6, ptx)); }
-    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : "q4i_gemv2") : "q4i_gemv3")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : getenv("Q4I")[0] == '2' ? "q4i_gemv2" : getenv("Q4I")[0] == '3' ? "q4i_gemv3" : "q4i_gemv4") : "q4i_gemv3")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
     CK(cuMemAlloc_(&dW, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dS, (size_t)2 * INTER * (H / 32) * 4));
     CK(cuMemAlloc_(&dX, sizeof XQ));
     CK(cuMemAlloc_(&dWi, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dSi, (size_t)2 * INTER * (H / 32) * 4)); CK(cuMemAlloc_(&dY, (size_t)VOCAB * 4));

@@ -498,3 +498,67 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv3(const uint4 *__restr
     }
     y[r] = acc;
 }
+
+// q4i v4: v3 with the weight/scale loads issued PF blocks ahead (a register ring),
+// for more memory-level parallelism when few rows (warps) exist, e.g. down
+// (1536 rows) at 12288 columns. Same arithmetic, same block order per row.
+#define Q4I_PF 4
+extern "C" __global__ void __launch_bounds__(256) q4i_gemv4(const uint4 *__restrict__ w,
+        const float *__restrict__ sc, const uint8_t *__restrict__ xq,
+        float *__restrict__ y, int rows, int cols) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int nb = cols >> 5, tid = threadIdx.y * 32 + threadIdx.x;
+    short *A = (short *)smem;
+    int *SA = (int *)(smem + cols * 2);
+    float *DA = (float *)(smem + cols * 2 + nb * 4);
+    for (int i = tid; i < cols; i += 256) A[i] = (short)(int8_t)xq[(i >> 8) * 292 + 4 + (i & 255)];
+    for (int i = tid; i < (cols >> 8); i += 256) DA[i] = *(const float *)(xq + i * 292);
+    __syncthreads();
+    for (int b = tid; b < nb; b += 256) {
+        int s = 0;
+        for (int j = 0; j < 32; j++) s += A[b * 32 + j];
+        SA[b] = s;
+    }
+    __syncthreads();
+    const int tile = blockIdx.x * 8 + threadIdx.y;
+    const int r = tile * 32 + threadIdx.x;
+    if (r >= rows) return;
+    const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
+    const float *st = sc + (size_t)tile * nb * 32 + threadIdx.x;
+    const uint4 *A4 = (const uint4 *)A;
+    uint4 qr[Q4I_PF];
+    float sr[Q4I_PF];
+    #pragma unroll
+    for (int p = 0; p < Q4I_PF; p++) if (p < nb) { qr[p] = wt[(size_t)p * 32]; sr[p] = st[(size_t)p * 32]; }
+    float acc = 0.0f;
+    for (int b0 = 0; b0 < nb; b0 += Q4I_PF) {
+        #pragma unroll
+        for (int p = 0; p < Q4I_PF; p++) {
+            const int b = b0 + p;
+            if (b < nb) {
+                const uint4 q = qr[p];
+                const float ws = sr[p];
+                if (b + Q4I_PF < nb) { qr[p] = wt[(size_t)(b + Q4I_PF) * 32]; sr[p] = st[(size_t)(b + Q4I_PF) * 32]; }
+                const uint4 a0 = A4[b * 4 + 0], a1 = A4[b * 4 + 1], a2 = A4[b * 4 + 2], a3 = A4[b * 4 + 3];
+                const unsigned lo[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+                const unsigned hi[8] = {a2.x, a2.y, a2.z, a2.w, a3.x, a3.y, a3.z, a3.w};
+                const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+                int s = -8 * SA[b];
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        const int e = 4 * k + j;
+                        const unsigned pl = lo[e >> 1], ph = hi[e >> 1];
+                        const int al = (e & 1) ? ((int)pl >> 16) : (int)(short)(pl & 0xffffu);
+                        const int ah = (e & 1) ? ((int)ph >> 16) : (int)(short)(ph & 0xffffu);
+                        s += (int)((qw[k] >> (8 * j)) & 15u) * al;
+                        s += (int)((qw[k] >> (8 * j + 4)) & 15u) * ah;
+                    }
+                }
+                acc = __fmaf_rn(__fmul_rn(ws, DA[b >> 3]), __int2float_rn(s), acc);
+            }
+        }
+    }
+    y[r] = acc;
+}
