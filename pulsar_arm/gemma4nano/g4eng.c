@@ -12,7 +12,7 @@
  *
  * Build (Nano, driver only):
  *   gcc -O2 -fopenmp -ffp-contract=off -o g4eng g4eng.c g4_host.S -ldl -lm
- * Run:   ./g4eng <gemma.gguf> <rope.bin> <ids...> [--gen N] [--sample temp topk topp seed]
+ * Run:   ./g4eng <gemma.gguf> <rope.bin> <ids...> [--gen N] [--batch B] [--sample temp topk topp seed]
  */
 #define G4REF_NO_MAIN
 #include "g4ref.c"
@@ -45,7 +45,8 @@ static CUresult (*cuMemHostGetDevicePointer_)(uint64_t *, void *, unsigned);
 static void *sym(void *h, const char *n) { void *p = dlsym(h, n); if (!p) { fprintf(stderr, "no %s\n", n); exit(3); } return p; }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
-static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i;
+static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i, *fq4ib, *fgeglub, *fargb;
+static uint64_t dYdevB, dHdevB, dX2B, dLogB;   /* batched prefill intermediates (BATCH_MAX tokens) */
 /* per tensor: 0 = K2 q4_gemv layout, 1 = q4i_gemv3 (q4i_gemv4: row-per-lane, tile-interleaved).
    Chosen per weight group at load: q4i where it measured faster (>= 1536 rows and
    <= 6144 columns), K2 elsewhere (k/v alone, inp_gate, down at 12288 columns). */
@@ -156,6 +157,99 @@ static void gpu_mlp(const layer_t *L, int inter, float *out) {
     double c_ = prof ? now_ms() : 0;
     copy_from_pinned(out, h_out, (size_t)H * 4);
     if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
+}
+
+/* ---------------------------------------------------- batched prefill hooks */
+static float YCATB[BATCH_MAX * NH * HD_F + BATCH_MAX * 2 * HD_F];
+/* q4i: one q4i_gemv_b launch for the whole group and all B tokens; K2-layout
+   tensors: one single-token launch per token on the stream; one wait either way */
+static void gpu_q4n_b(int n, const tensor_t **ts, const uint8_t *xq, int xs, int B, float **ys) {
+    int i0 = (int)(ts[0] - T);
+    uint32_t rows = 0, cols = (uint32_t)ts[0]->dims[0];
+    for (int k = 0; k < n; k++) {
+        if (KIND[ts[k] - T] != KIND[i0] || (KIND[i0] && DW[ts[k] - T] != DW[i0]) || (!KIND[i0] && n > 1)) { q4n_b_seq(n, ts, xq, xs, B, ys); return; }
+        rows += (uint32_t)ts[k]->dims[1];
+    }
+    if (!fast || (size_t)B * xs > 65536 || (size_t)B * rows > sizeof YCATB / 4) { q4n_b_seq(n, ts, xq, xs, B, ys); return; }
+    double a_ = prof ? now_ms() : 0;
+    stage_in(xq, (size_t)B * xs, dX);
+    double b_ = prof ? now_ms() : 0;
+    if (KIND[i0]) {
+        int irows = (int)rows, icols = (int)cols, ib = B, ixs = xs, iys = (int)rows;
+        void *a[] = {&DW[i0], &DS[i0], &dX, &h_out_dev, &irows, &icols, &ib, &ixs, &iys};
+        CK(cuLaunchKernel_(fq4ib, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, stream, a, NULL));
+    } else {
+        for (int t = 0; t < B; t++) {
+            uint64_t xt = dX + (uint64_t)t * xs, yt = h_out_dev + (uint64_t)t * rows * 4;
+            uint32_t r0 = 0, r1 = rows, nb = cols / 32, rf = rows;
+            void *a[] = {&DW[i0], &DS[i0], &xt, &yt, &r0, &r1, &nb, &rf};
+            CK(cuLaunchKernel_(fq4, (r1 + 31) / 32, 1, 1, 32, 8, 1, 0, stream, a, NULL));
+        }
+    }
+    wait_stream();
+    double c_ = prof ? now_ms() : 0;
+    copy_from_pinned(YCATB, h_out, (size_t)B * rows * 4);
+    for (int t = 0; t < B; t++)
+        for (int k = 0, off = 0; k < n; off += (int)ts[k]->dims[1], k++)
+            memcpy(ys[k] + (size_t)t * ts[k]->dims[1], YCATB + (size_t)t * rows + off, ts[k]->dims[1] * 4);
+    if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
+}
+/* MLP for B tokens on the GPU: gate+up (q4i_gemv_b), geglu_b, q8k_dev, down (q4i_gemv_b
+   or per-token K2 launches), one wait */
+static void gpu_mlp_b(const layer_t *L, int inter, const uint8_t *xq, int xs, int B, float *out) {
+    if (!fast || !KIND[L->gate - T]) { mlp_b_seq(L, inter, xq, xs, B, out); return; }
+    int ig = (int)(L->gate - T), id = (int)(L->down - T);
+    double a_ = prof ? now_ms() : 0;
+    stage_in(xq, (size_t)B * xs, dX);
+    int r2 = 2 * inter, cH = H, ib = B, ixs = xs, iys = 2 * inter;
+    void *a1[] = {&DW[ig], &DS[ig], &dX, &dYdevB, &r2, &cH, &ib, &ixs, &iys};
+    CK(cuLaunchKernel_(fq4ib, (r2 + 255) / 256, 1, 1, 32, 8, 1, 0, stream, a1, NULL));
+    int n = inter;
+    void *a2[] = {&dYdevB, &dHdevB, &n, &ib, &dTab};
+    CK(cuLaunchKernel_(fgeglub, (B * n + 255) / 256, 1, 1, 256, 1, 1, 0, stream, a2, NULL));
+    void *a3[] = {&dHdevB, &dX2B};
+    CK(cuLaunchKernel_(fq8k, B * n / 256, 1, 1, 256, 1, 1, 0, stream, a3, NULL));
+    int xs2 = (inter / 256) * Q8B;
+    if (KIND[id]) {
+        int rH = H, ci = inter, iyH = H;
+        void *a4[] = {&DW[id], &DS[id], &dX2B, &h_out_dev, &rH, &ci, &ib, &xs2, &iyH};
+        CK(cuLaunchKernel_(fq4ib, (H + 255) / 256, 1, 1, 32, 8, 1, 0, stream, a4, NULL));
+    } else {
+        for (int t = 0; t < B; t++) {
+            uint64_t xt = dX2B + (uint64_t)t * xs2, yt = h_out_dev + (uint64_t)t * H * 4;
+            uint32_t r0 = 0, r1 = H, nb = (uint32_t)inter / 32, rf = H;
+            void *a4[] = {&DW[id], &DS[id], &xt, &yt, &r0, &r1, &nb, &rf};
+            CK(cuLaunchKernel_(fq4, (r1 + 31) / 32, 1, 1, 32, 8, 1, 0, stream, a4, NULL));
+        }
+    }
+    double b_ = prof ? now_ms() : 0;
+    wait_stream();
+    double c_ = prof ? now_ms() : 0;
+    copy_from_pinned(out, h_out, (size_t)B * H * 4);
+    if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
+}
+/* head for B tokens: B q6i launches into device logits, argmax_b per token; only the
+   index and raw value come back, plus token `keep`'s full logits for the sampler */
+static void gpu_head_b(const tensor_t *emb, const uint8_t *xq, int xs, int B, int keep) {
+    if (!fast) { head_b_seq(emb, xq, xs, B, keep); return; }
+    int rows = (int)emb->dims[1];
+    double a_ = prof ? now_ms() : 0;
+    stage_in(xq, (size_t)B * xs, dX);
+    double b_ = prof ? now_ms() : 0;
+    for (int t = 0; t < B; t++) {
+        uint64_t xt = dX + (uint64_t)t * xs, yt = dLogB + (uint64_t)t * VOCAB * 4;
+        void *a[] = {&dHead, &xt, &yt, &rows};
+        CK(cuLaunchKernel_(fq6, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, stream, a, NULL));
+    }
+    void *aa[] = {&dLogB, &rows, &h_out_dev};
+    CK(cuLaunchKernel_(fargb, B, 1, 1, 1024, 1, 1, 0, stream, aa, NULL));
+    wait_stream();
+    double c_ = prof ? now_ms() : 0;
+    unsigned r[2 * BATCH_MAX];
+    memcpy(r, h_out, (size_t)8 * B);
+    for (int t = 0; t < B; t++) { memcpy(&TOPV[t], &r[2 * t], 4); TOPI[t] = (int)r[2 * t + 1]; }
+    if (keep >= 0) CK(cuMemcpyDtoH_(logits, dLogB + (uint64_t)keep * VOCAB * 4, (size_t)VOCAB * 4));
+    if (prof) { double d_ = now_ms(); P_h2d[1] += b_ - a_; P_k[1] += c_ - b_; P_d2h[1] += d_ - c_; P_n[1]++; }
 }
 
 /* ---------------------------------------------------------------- hooks */
@@ -298,7 +392,11 @@ static void gpu_init(void) {
     CK(cuModuleGetFunction_(&fgeglu, mk, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, mk, "q8k_dev"));
     CK(cuModuleGetFunction_(&fq4i, mk, "q4i_gemv4"));
     CK(cuModuleGetFunction_(&fq6, mk, "q6i_gemv"));
+    CK(cuModuleGetFunction_(&fq4ib, mk, "q4i_gemv_b")); CK(cuModuleGetFunction_(&fgeglub, mk, "geglu_b"));
+    CK(cuModuleGetFunction_(&fargb, mk, "argmax_b"));
     dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
+    dYdevB = dalloc((size_t)BATCH_MAX * 4 * INTER * 4); dHdevB = dalloc((size_t)BATCH_MAX * 2 * INTER * 4);
+    dX2B = dalloc((size_t)BATCH_MAX * sizeof XQ); dLogB = dalloc((size_t)BATCH_MAX * VOCAB * 4);
     {   /* exp/GELU constants for geglu_dev: g4ref.c's own definitions */
         double v[24] = {EXP_P0};
         for (int i = 0; i < 13; i++) v[1 + i] = EXP_C[i];
@@ -306,7 +404,7 @@ static void gpu_init(void) {
         v[18] = 709.0; v[19] = -745.0; v[20] = INFINITY; v[21] = GELU_C1; v[22] = GELU_C3; v[23] = 1.0;
         dTab = dalloc(sizeof v); CK(cuMemcpyHtoD_(dTab, v, sizeof v));
     }
-    dX = dalloc(sizeof XQ); dXf = dalloc((size_t)H * 4); dY = dalloc((size_t)VOCAB * 4);
+    dX = dalloc(65536); dXf = dalloc((size_t)H * 4); dY = dalloc((size_t)VOCAB * 4);   /* dX: up to BATCH_MAX inputs */
     /* Q4_0 layers: nibbles [rows][nb][16] + f32 scales [rows][nb] (K2 layout).
        q+k+v and gate+up of each layer get one allocation each, back to back, so
        gpu_q4n can cover them with a single launch. */
@@ -396,6 +494,7 @@ static void gpu_init(void) {
     fprintf(stderr, "GPU: %d Q4_0 tensors + Q6_K head + F16 proj, %.1f MB on device, %.0f MB free of %.0f; load %.0f ms\n",
             nq4, dev_bytes / 1048576.0, fr / 1048576.0, tot / 1048576.0, now_ms() - t0);
     G_Q4 = gpu_q4; G_Q4N = gpu_q4n; G_HEAD = gpu_head; G_F16 = gpu_f16;
+    G_Q4N_B = gpu_q4n_b; G_MLP_B = gpu_mlp_b; G_HEAD_B = gpu_head_b;
     if (!(getenv("G4GPUMLP") && getenv("G4GPUMLP")[0] == '0')) { G_MLP = gpu_mlp; fprintf(stderr, "MLP: on the GPU (gate+up, GeGLU, Q8_K, down)\n"); }
     /* G4ASM=0 keeps the C host loops (A/B and fallback) */
     if (!(getenv("G4ASM") && getenv("G4ASM")[0] == '0')) {
@@ -405,11 +504,12 @@ static void gpu_init(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: %s <gguf> <rope.bin> <ids...> [--gen N] [--sample temp topk topp seed]\n", argv[0]); return 2; }
-    int gen = 0, n = 0;
+    if (argc < 4) { fprintf(stderr, "usage: %s <gguf> <rope.bin> <ids...> [--gen N] [--batch B] [--sample temp topk topp seed]\n", argv[0]); return 2; }
+    int gen = 0, n = 0, batch = BATCH_MAX;   /* prefill in chunks of 8 by default; --batch 1 = token by token */
     static int ids[MAXSEQ];
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--batch") && i + 1 < argc) { batch = atoi(argv[++i]); if (batch > BATCH_MAX) batch = BATCH_MAX; if (batch < 1) batch = 1; continue; }
         if (parse_sample(argc, argv, &i)) continue;
         ids[n++] = atoi(argv[i]);
     }
@@ -423,26 +523,10 @@ int main(int argc, char **argv) {
       fclose(f); }
     prof = getenv("G4PROF") && getenv("G4PROF")[0] == '1';
     gpu_init();
-    int pos = 0, n_prompt = n;
+    int n_prompt = n;
     double tp = 0, tg = 0;
-    while (pos < MAXSEQ) {
-        int tok = ids[pos];
-        double t0 = now_ms();
-        forward(tok, pos);
-        int top = 0;
-        for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
-        int next = (SMP.on && pos + 1 >= n) ? sample_next(logits) : top;
-        double dt = now_ms() - t0;
-        if (pos < n_prompt) tp += dt; else tg += dt;
-        if (SMP.on) printf("step %d id_in=%d top=%d logit=%.4f pick=%d\n", pos, tok, top, capped(logits[top]), next);
-        else printf("step %d id_in=%d top=%d logit=%.4f\n", pos, tok, top, capped(logits[top]));
-        fflush(stdout);
-        pos++;
-        if (pos >= n) {
-            if (n - n_prompt >= gen || next == 1 || next == 106) break;
-            ids[n++] = next;
-        }
-    }
+    G_CLOCK = now_ms;
+    int pos = run_generation(ids, n, gen, batch, &tp, &tg);
     int ng = pos - n_prompt;
     if (prof) {
         const char *nm[3] = {"q4", "head", "f16"};

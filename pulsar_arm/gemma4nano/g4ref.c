@@ -17,7 +17,7 @@
  *    chains in ascending order.
  *  - Rope cos/sin come from a baked table (g4_rope.py), not computed here.
  *
- * Usage: g4ref <gemma.gguf> <rope.bin> <ids...> [--gen N] [--sample temp topk topp seed]
+ * Usage: g4ref <gemma.gguf> <rope.bin> <ids...> [--gen N] [--batch B] [--sample temp topk topp seed]
  * Prints: step <n> id_in=<id> top=<id> logit=<x.xxxx>   (logit after soft-cap)
  */
 #define _GNU_SOURCE
@@ -498,13 +498,221 @@ static int __attribute__((unused)) parse_sample(int argc, char **argv, int *i) {
     return 1;
 }
 
+/* ------------------------------------------------------------ batched prefill
+ * forward_batch() runs B prompt tokens at positions pos0..pos0+B-1 layer by layer.
+ * Every token goes through exactly forward()'s operations in forward()'s order;
+ * only the GEMVs are issued for all B tokens at once (hooks below, whose default
+ * here just loops over the tokens), so the engine can share one weight read
+ * between tokens. Attention stays per token, in order: token t stores its K/V at
+ * pos0+t, then attends to positions <= pos0+t, which already hold tokens < t of
+ * this batch (all of them stored by the time token t reaches them).
+ * Output: per token the argmax index and raw logit (TOPI/TOPV); if keep >= 0 the
+ * full logits of token `keep` are left in logits[] (the sampler needs them). */
+#define BATCH_MAX 8
+static int TOPI[BATCH_MAX];
+static float TOPV[BATCH_MAX];
+static float XSB[BATCH_MAX][H], PINB[BATCH_MAX][NL * PLE], QBB[BATCH_MAX][NH * HD_F], KBB[BATCH_MAX][HD_F],
+             VBB[BATCH_MAX][HD_F], ABB[BATCH_MAX][NH * HD_F], HBB[BATCH_MAX][H], PLEGB[BATCH_MAX][PLE],
+             PROJB[NL * PLE], ROWEB[NL * PLE];
+static uint8_t XQB[BATCH_MAX * (NH * HD_F / 256) * Q8B];
+/* n tensors sharing each token's quantized input; token t's input at xq + t*xs, its
+   output for tensor k at ys[k] + t * rows_k */
+static void q4n_b_seq(int n, const tensor_t **ts, const uint8_t *xq, int xs, int B, float **ys) {
+    for (int t = 0; t < B; t++) {
+        float *yt[3];
+        for (int k = 0; k < n; k++) yt[k] = ys[k] + (size_t)t * ts[k]->dims[1];
+        if (n == 1) G_Q4(ts[0], xq + (size_t)t * xs, yt[0]); else G_Q4N(n, ts, xq + (size_t)t * xs, yt);
+    }
+}
+static void (*G_Q4N_B)(int, const tensor_t **, const uint8_t *, int, int, float **) = q4n_b_seq;
+/* MLP for B tokens: inputs at xq + t*xs (H columns), outputs at out + t*H */
+static void mlp_b_seq(const layer_t *L, int inter, const uint8_t *xq, int xs, int B, float *out) {
+    for (int t = 0; t < B; t++) { memcpy(XQ, xq + (size_t)t * xs, xs); G_MLP(L, inter, out + (size_t)t * H); }
+}
+static void (*G_MLP_B)(const layer_t *, int, const uint8_t *, int, int, float *) = mlp_b_seq;
+/* head for B tokens: argmax and raw value per token; token `keep` (if >= 0) is done
+   last so its full logits stay in logits[] */
+static void head_b_seq(const tensor_t *emb, const uint8_t *xq, int xs, int B, int keep) {
+    for (int k = 0; k < B; k++) {
+        int t = (keep >= 0) ? (k < keep ? k : (k < B - 1 ? k + 1 : keep)) : k;
+        G_HEAD(emb, xq + (size_t)t * xs, logits);
+        int top = 0;
+        for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
+        TOPI[t] = top; TOPV[t] = logits[top];
+    }
+}
+static void (*G_HEAD_B)(const tensor_t *, const uint8_t *, int, int, int) = head_b_seq;
+
+static void __attribute__((unused)) forward_batch(const int *toks, int pos0, int B, int keep) {
+    const tensor_t *emb = tens("token_embd.weight");
+    const float *pnw = f32t(tens("per_layer_proj_norm.weight"));
+    for (int t = 0; t < B; t++) {             /* embedding and per-layer inputs, as forward() */
+        float *xt = XSB[t];
+        row_q6k(emb, toks[t], xt);
+        for (int i = 0; i < H; i++) xt[i] = (float)((double)xt[i] * sqrt(1536.0));
+        G_F16(tens("per_layer_model_proj.weight"), xt, PROJB);
+        row_q6k(tens("per_layer_token_embd.weight"), toks[t], ROWEB);
+        for (int l = 0; l < NL; l++) {
+            double sl[PLE], ss = 0;
+            for (int i = 0; i < PLE; i++) { sl[i] = (double)PROJB[l * PLE + i] * (1.0 / sqrt(1536.0)); ss += sl[i] * sl[i]; }
+            double r = sqrt(ss / PLE + EPS);
+            for (int i = 0; i < PLE; i++) {
+                double nrm = sl[i] / r * (double)pnw[i];
+                double tk = (double)ROWEB[l * PLE + i] * 16.0;
+                PINB[t][l * PLE + i] = (float)((nrm + tk) / sqrt(2.0));
+            }
+        }
+    }
+    int store_s = -1, store_f = -1;
+    for (int i = 0; i < FIRST_SHARED; i++) { if (SLIDING[i]) store_s = i; else store_f = i; }
+    const int xsH = (H / 256) * Q8B;
+    for (int il = 0; il < NL; il++) {
+        int full = !SLIDING[il], hd = full ? HD_F : HD_S, inter = il >= FIRST_SHARED ? 2 * INTER : INTER;
+        const layer_t *L = &LT[il];
+        /* attention: q (and k, v) for all tokens */
+        for (int t = 0; t < B; t++) { G_RMS(XSB[t], L->n_attn, HBB[t], H); G_Q8K(HBB[t], XQB + (size_t)t * xsH, H); }
+        if (il < FIRST_SHARED) {
+            const tensor_t *ts[3] = {L->q, L->k, L->v};
+            float *ys[3] = {QBB[0], KBB[0], VBB[0]};
+            /* outputs are written token-major with stride rows_k: q rows NH*hd, k/v rows hd */
+            static float qtmp[BATCH_MAX * NH * HD_F], ktmp[BATCH_MAX * HD_F], vtmp[BATCH_MAX * HD_F];
+            ys[0] = qtmp; ys[1] = ktmp; ys[2] = vtmp;
+            G_Q4N_B(3, ts, XQB, xsH, B, ys);
+            for (int t = 0; t < B; t++) {
+                memcpy(QBB[t], qtmp + (size_t)t * NH * hd, (size_t)NH * hd * 4);
+                memcpy(KBB[t], ktmp + (size_t)t * hd, (size_t)hd * 4);
+                memcpy(VBB[t], vtmp + (size_t)t * hd, (size_t)hd * 4);
+            }
+        } else {
+            static float qtmp[BATCH_MAX * NH * HD_F];
+            const tensor_t *ts[1] = {L->q};
+            float *ys[1] = {qtmp};
+            G_Q4N_B(1, ts, XQB, xsH, B, ys);
+            for (int t = 0; t < B; t++) memcpy(QBB[t], qtmp + (size_t)t * NH * hd, (size_t)NH * hd * 4);
+        }
+        int src = il < FIRST_SHARED ? il : (full ? store_f : store_s);
+        for (int t = 0; t < B; t++) {          /* per token, in order: norms, rope, KV store, attention */
+            int pos = pos0 + t;
+            const float *cs = rope_cs(full, 0, pos), *sn = rope_cs(full, 1, pos);
+            float *qb_ = QBB[t];
+            for (int j = 0; j < NH; j++) { float tq[HD_F]; G_RMS(qb_ + j * hd, L->n_q, tq, hd); memcpy(qb_ + j * hd, tq, hd * 4); rope(qb_ + j * hd, cs, sn, hd); }
+            if (il < FIRST_SHARED) {
+                float tk[HD_F];
+                G_RMS(KBB[t], L->n_k, tk, hd); rope(tk, cs, sn, hd);
+                memcpy(KC[il] + (size_t)pos * hd, tk, hd * 4);
+                G_RMSNS(VBB[t], hd);
+                memcpy(VC[il] + (size_t)pos * hd, VBB[t], hd * 4);
+            }
+            int lo = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
+            G_ATTNALL(qb_, KC[src], VC[src], lo, pos, hd, ABB[t]);
+        }
+        /* o projection */
+        const int xsO = (NH * hd / 256) * Q8B;
+        for (int t = 0; t < B; t++) G_Q8K(ABB[t], XQB + (size_t)t * xsO, NH * hd);
+        {
+            static float otmp[BATCH_MAX * H];
+            const tensor_t *ts[1] = {L->o};
+            float *ys[1] = {otmp};
+            G_Q4N_B(1, ts, XQB, xsO, B, ys);
+            for (int t = 0; t < B; t++) {
+                float tt[H]; G_RMS(otmp + (size_t)t * H, L->n_post_attn, tt, H);
+                for (int i = 0; i < H; i++) XSB[t][i] = XSB[t][i] + tt[i];
+            }
+        }
+        /* MLP */
+        for (int t = 0; t < B; t++) { G_RMS(XSB[t], L->n_ffn, HBB[t], H); G_Q8K(HBB[t], XQB + (size_t)t * xsH, H); }
+        {
+            static float mtmp[BATCH_MAX * H];
+            G_MLP_B(L, inter, XQB, xsH, B, mtmp);
+            for (int t = 0; t < B; t++) {
+                float tt[H]; G_RMS(mtmp + (size_t)t * H, L->n_post_ffw, tt, H);
+                for (int i = 0; i < H; i++) XSB[t][i] = XSB[t][i] + tt[i];
+            }
+        }
+        /* per-layer input */
+        for (int t = 0; t < B; t++) G_Q8K(XSB[t], XQB + (size_t)t * xsH, H);
+        {
+            static float gtmp[BATCH_MAX * PLE];
+            const tensor_t *ts[1] = {L->ig};
+            float *ys[1] = {gtmp};
+            G_Q4N_B(1, ts, XQB, xsH, B, ys);
+            const int xsP = (PLE / 256) * Q8B;
+            for (int t = 0; t < B; t++) {
+                memcpy(PLEGB[t], gtmp + (size_t)t * PLE, PLE * 4);
+                G_GEGLU(PLEGB[t], PINB[t] + il * PLE, PLE);
+                G_Q8K(PLEGB[t], XQB + (size_t)t * xsP, PLE);
+            }
+            static float ptmp[BATCH_MAX * H];
+            const tensor_t *tp[1] = {L->proj};
+            float *yp[1] = {ptmp};
+            G_Q4N_B(1, tp, XQB, xsP, B, yp);
+            for (int t = 0; t < B; t++) {
+                float tt[H]; G_RMS(ptmp + (size_t)t * H, L->n_post, tt, H);
+                for (int i = 0; i < H; i++) XSB[t][i] = XSB[t][i] + tt[i];
+                for (int i = 0; i < H; i++) XSB[t][i] = XSB[t][i] * L->scale;
+            }
+        }
+    }
+    for (int t = 0; t < B; t++) { G_RMS(XSB[t], f32t(tens("output_norm.weight")), HBB[t], H); G_Q8K(HBB[t], XQB + (size_t)t * xsH, H); }
+    G_HEAD_B(emb, XQB, xsH, B, keep);
+}
+
+/* The generation loop shared by the reference and the engine: prompt tokens go
+   through forward_batch() in chunks of `batch` (1 = forward() for every token),
+   generated tokens through forward(). Prints one step line per position. tp/tg
+   accumulate prefill and decode time (if a clock is given). */
+static double (*G_CLOCK)(void);
+static int __attribute__((unused)) run_generation(int *ids, int n, int gen, int batch, double *tp, double *tg) {
+    int pos = 0, n_prompt = n;
+    while (pos < MAXSEQ) {
+        double t0 = G_CLOCK ? G_CLOCK() : 0;
+        if (batch > 1 && pos + 1 < n_prompt) {
+            int nb = n_prompt - pos < batch ? n_prompt - pos : batch;
+            int keep = (SMP.on && pos + nb >= n) ? nb - 1 : -1;
+            forward_batch(ids + pos, pos, nb, keep);
+            for (int t = 0; t < nb; t++) {
+                int p = pos + t, top = TOPI[t];
+                int next = (SMP.on && p + 1 >= n) ? sample_next(logits) : top;
+                if (SMP.on) printf("step %d id_in=%d top=%d logit=%.4f pick=%d\n", p, ids[p], top, capped(TOPV[t]), next);
+                else printf("step %d id_in=%d top=%d logit=%.4f\n", p, ids[p], top, capped(TOPV[t]));
+                if (p + 1 >= n) {
+                    if (n - n_prompt >= gen || next == 1 || next == 106) { fflush(stdout); if (G_CLOCK) *tp += G_CLOCK() - t0; return p + 1; }
+                    ids[n++] = next;
+                }
+            }
+            fflush(stdout);
+            if (G_CLOCK) *tp += G_CLOCK() - t0;
+            pos += nb;
+            continue;
+        }
+        int tok = ids[pos];
+        forward(tok, pos);
+        int top = 0;
+        for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
+        /* greedy: argmax of the RAW logits (first max wins); the cap is monotone,
+           and applying it first could merge distinct values in float32 */
+        int next = (SMP.on && pos + 1 >= n) ? sample_next(logits) : top;
+        if (G_CLOCK) { double dt = G_CLOCK() - t0; if (pos < n_prompt) *tp += dt; else *tg += dt; }
+        if (SMP.on) printf("step %d id_in=%d top=%d logit=%.4f pick=%d\n", pos, tok, top, capped(logits[top]), next);
+        else printf("step %d id_in=%d top=%d logit=%.4f\n", pos, tok, top, capped(logits[top]));
+        fflush(stdout);
+        pos++;
+        if (pos >= n) {
+            if (n - n_prompt >= gen || next == 1 || next == 106) break;   /* gen = tokens generated */
+            ids[n++] = next;
+        }
+    }
+    return pos;
+}
+
 #ifndef G4REF_NO_MAIN   /* g4gemv_test.c includes this file for its numerics */
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: %s <gguf> <rope.bin> <ids...> [--gen N]\n", argv[0]); return 2; }
-    int gen = 0, n = 0;
+    int gen = 0, n = 0, batch = 1;
     static int ids[MAXSEQ];
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--batch") && i + 1 < argc) { batch = atoi(argv[++i]); if (batch > BATCH_MAX) batch = BATCH_MAX; continue; }
         if (parse_sample(argc, argv, &i)) continue;
         ids[n++] = atoi(argv[i]);
     }
@@ -516,24 +724,8 @@ int main(int argc, char **argv) {
       ROPE = malloc(want); FILE *f = fopen(argv[2], "rb");
       if (!f || fread(ROPE, 1, want, f) != want) { fprintf(stderr, "rope table %s: want %zu bytes\n", argv[2], want); return 2; }
       fclose(f); }
-    int pos = 0, n_prompt = n;
-    while (pos < MAXSEQ) {
-        int tok = ids[pos];
-        forward(tok, pos);
-        int top = 0;
-        for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
-        /* greedy: argmax of the RAW logits (first max wins); the cap is monotone,
-           and applying it first could merge distinct values in float32 */
-        int next = (SMP.on && pos + 1 >= n) ? sample_next(logits) : top;
-        if (SMP.on) printf("step %d id_in=%d top=%d logit=%.4f pick=%d\n", pos, tok, top, capped(logits[top]), next);
-        else printf("step %d id_in=%d top=%d logit=%.4f\n", pos, tok, top, capped(logits[top]));
-        fflush(stdout);
-        pos++;
-        if (pos >= n) {
-            if (n - n_prompt >= gen || next == 1 || next == 106) break;   /* gen = tokens generated */
-            ids[n++] = next;
-        }
-    }
+    double tp = 0, tg = 0;
+    run_generation(ids, n, gen, batch, &tp, &tg);
     return 0;
 }
 #endif

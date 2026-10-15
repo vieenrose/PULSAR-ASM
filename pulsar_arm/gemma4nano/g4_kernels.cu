@@ -636,3 +636,206 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv(const uint4 *__restri
     }
     y[r] = acc;
 }
+
+// ==============================================================================
+// Batched kernels for the prefill: B <= 8 tokens per weight pass. For each token
+// the arithmetic is exactly the single-token kernel's (same integer sums, same
+// fma chain over blocks in ascending order); only the weight reads are shared.
+#define BMAX 8
+
+// q4i_gemv_b: q4i layout. xq: token t at xq + t*xstride. y: token t at y + t*ystride.
+// Activations are staged in shared memory one 1024-column chunk at a time
+// (B x 1024 int16 + block sums), so any column count fits; the per-token float
+// chain simply continues across chunks. Nibbles are decoded once per block and
+// reused for all B tokens.
+#define Q4B_KC 1024
+extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b(const uint4 *__restrict__ w,
+        const float *__restrict__ sc, const uint8_t *__restrict__ xq, float *__restrict__ y,
+        int rows, int cols, int B, int xstride, int ystride) {
+    __shared__ __align__(16) short A[BMAX * Q4B_KC];
+    __shared__ int SA[BMAX * (Q4B_KC / 32)];
+    __shared__ float DA[BMAX * (Q4I_MAXCOLS / 256)];
+    const int nb = cols >> 5, nd = cols >> 8, tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = tid; i < B * nd; i += 256) DA[i] = *(const float *)(xq + (i / nd) * xstride + (i % nd) * 292);
+    const int tile = blockIdx.x * 8 + threadIdx.y;
+    const int r = tile * 32 + threadIdx.x;
+    const bool live = r < rows;
+    const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
+    const float *st = sc + (size_t)tile * nb * 32 + threadIdx.x;
+    float acc[BMAX];
+    #pragma unroll
+    for (int t = 0; t < BMAX; t++) acc[t] = 0.0f;
+    for (int c0 = 0; c0 < cols; c0 += Q4B_KC) {
+        const int kc = min(Q4B_KC, cols - c0), kb = kc >> 5;
+        __syncthreads();
+        for (int i = tid; i < B * kc; i += 256) {
+            const int t = i / kc, c = c0 + i % kc;
+            A[t * Q4B_KC + (i % kc)] = (short)(int8_t)xq[t * xstride + (c >> 8) * 292 + 4 + (c & 255)];
+        }
+        __syncthreads();
+        for (int i = tid; i < B * kb; i += 256) {
+            const int t = i / kb, bl = i % kb;
+            int s = 0;
+            for (int j = 0; j < 32; j++) s += A[t * Q4B_KC + bl * 32 + j];
+            SA[t * (Q4B_KC / 32) + bl] = s;
+        }
+        __syncthreads();
+        if (live) {
+            for (int bl = 0; bl < kb; bl++) {
+                const int b = (c0 >> 5) + bl;
+                const uint4 q = wt[(size_t)b * 32];
+                const float ws = st[(size_t)b * 32];
+                const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+                int nl[16], nh[16];
+                #pragma unroll
+                for (int e = 0; e < 16; e++) {
+                    nl[e] = (int)((qw[e >> 2] >> (8 * (e & 3))) & 15u);
+                    nh[e] = (int)((qw[e >> 2] >> (8 * (e & 3) + 4)) & 15u);
+                }
+                #pragma unroll
+                for (int t = 0; t < BMAX; t++) {
+                    if (t < B) {
+                        const uint4 *A4 = (const uint4 *)(A + t * Q4B_KC + bl * 32);
+                        const uint4 a0 = A4[0], a1 = A4[1], a2 = A4[2], a3 = A4[3];
+                        const unsigned lo[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+                        const unsigned hi[8] = {a2.x, a2.y, a2.z, a2.w, a3.x, a3.y, a3.z, a3.w};
+                        int s = -8 * SA[t * (Q4B_KC / 32) + bl];
+                        #pragma unroll
+                        for (int e = 0; e < 16; e++) {
+                            const unsigned pl = lo[e >> 1], ph = hi[e >> 1];
+                            const int al = (e & 1) ? ((int)pl >> 16) : (int)(short)(pl & 0xffffu);
+                            const int ah = (e & 1) ? ((int)ph >> 16) : (int)(short)(ph & 0xffffu);
+                            s += nl[e] * al + nh[e] * ah;
+                        }
+                        acc[t] = __fmaf_rn(__fmul_rn(ws, DA[t * nd + (b >> 3)]), __int2float_rn(s), acc[t]);
+                    }
+                }
+            }
+        }
+    }
+    if (live) {
+        #pragma unroll
+        for (int t = 0; t < BMAX; t++) if (t < B) y[(size_t)t * ystride + r] = acc[t];
+    }
+}
+
+// q6i_gemv_b: the q6i head for B tokens. Per block, each sub-block's 16 values are
+// decoded once (four words) and dotted with every token's activations; per token
+// isum = sum_j sc_j * (p_j - 32 * sum a_j), then acc = fma(dw * da, (float)isum, acc).
+extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__restrict__ w,
+        const uint8_t *__restrict__ xq, float *__restrict__ y, int rows, int B, int xstride, int ystride) {
+    __shared__ __align__(16) short A[BMAX * 1536];
+    __shared__ int SA[BMAX * 96];
+    __shared__ float DA[BMAX * 6];
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = tid; i < B * 1536; i += 256) {
+        const int t = i / 1536, c = i % 1536;
+        A[i] = (short)(int8_t)xq[t * xstride + (c >> 8) * 292 + 4 + (c & 255)];
+    }
+    for (int i = tid; i < B * 6; i += 256) DA[i] = *(const float *)(xq + (i / 6) * xstride + (i % 6) * 292);
+    __syncthreads();
+    for (int i = tid; i < B * 96; i += 256) {
+        const int t = i / 96, bj = i % 96, b = bj >> 4, j = bj & 15, n = j >> 3, k = (j >> 1) & 3, lh = j & 1;
+        int s = 0;
+        for (int l = 16 * lh; l < 16 * lh + 16; l++) s += A[t * 1536 + b * 256 + 128 * n + 32 * k + l];
+        SA[i] = s;
+    }
+    __syncthreads();
+    const int tile = blockIdx.x * 8 + threadIdx.y;
+    const int r = tile * 32 + threadIdx.x;
+    if (r >= rows) return;
+    const uint4 *wt = w + (size_t)tile * 6 * 14 * 32 + threadIdx.x;
+    float acc[BMAX];
+    #pragma unroll
+    for (int t = 0; t < BMAX; t++) acc[t] = 0.0f;
+    for (int b = 0; b < 6; b++) {
+        uint4 c[14];
+        #pragma unroll
+        for (int k = 0; k < 14; k++) c[k] = wt[((size_t)b * 14 + k) * 32];
+        const unsigned *u = (const unsigned *)c;
+        const int8_t *scb = (const int8_t *)(u + 48);
+        int s[BMAX];
+        #pragma unroll
+        for (int t = 0; t < BMAX; t++) s[t] = 0;
+        #pragma unroll
+        for (int n = 0; n < 2; n++) {
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                #pragma unroll
+                for (int lh = 0; lh < 2; lh++) {
+                    const int j = 8 * n + 2 * k + lh;
+                    unsigned q[4];
+                    #pragma unroll
+                    for (int g = 0; g < 4; g++) {
+                        const int lg = 4 * lh + g;
+                        const unsigned L0 = u[16 * n + lg], L1 = u[16 * n + 8 + lg], Hh = u[32 + 8 * n + lg];
+                        q[g] = k == 0 ? ((L0 & 0x0F0F0F0Fu) | ((Hh << 4) & 0x30303030u))
+                             : k == 1 ? ((L1 & 0x0F0F0F0Fu) | ((Hh << 2) & 0x30303030u))
+                             : k == 2 ? (((L0 >> 4) & 0x0F0F0F0Fu) | (Hh & 0x30303030u))
+                                      : (((L1 >> 4) & 0x0F0F0F0Fu) | ((Hh >> 2) & 0x30303030u));
+                    }
+                    #pragma unroll
+                    for (int t = 0; t < BMAX; t++) {
+                        if (t < B) {
+                            const uint2 *A2 = (const uint2 *)(A + t * 1536 + b * 256 + 128 * n + 32 * k + 16 * lh);
+                            int p = 0;
+                            #pragma unroll
+                            for (int g = 0; g < 4; g++) {
+                                const uint2 av = A2[g];
+                                p += (int)(q[g] & 0xffu) * (int)(short)(av.x & 0xffffu)
+                                   + (int)((q[g] >> 8) & 0xffu) * ((int)av.x >> 16)
+                                   + (int)((q[g] >> 16) & 0xffu) * (int)(short)(av.y & 0xffffu)
+                                   + (int)(q[g] >> 24) * ((int)av.y >> 16);
+                            }
+                            s[t] += (int)scb[j] * (p - 32 * SA[t * 96 + b * 16 + j]);
+                        }
+                    }
+                }
+            }
+        }
+        const float dw = __half2float(*(const __half *)(u + 52));
+        #pragma unroll
+        for (int t = 0; t < BMAX; t++) if (t < B) acc[t] = __fmaf_rn(__fmul_rn(dw, DA[t * 6 + b]), __int2float_rn(s[t]), acc[t]);
+    }
+    #pragma unroll
+    for (int t = 0; t < BMAX; t++) if (t < B) y[(size_t)t * ystride + r] = acc[t];
+}
+
+// GeGLU for B tokens: y is [token][gate (n) | up (n)], h is [token][n].
+extern "C" __global__ void geglu_b(const float *__restrict__ y, float *__restrict__ h,
+                                   int n, int B, const double *__restrict__ tab) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * B) return;
+    const int t = i / n, j = i % n;
+    const float g = y[(size_t)t * 2 * n + j], uu = y[(size_t)t * 2 * n + n + j];
+    const double x = (double)g;
+    const double x3 = __dmul_rn(__dmul_rn(x, x), x);
+    const double tt = -__dadd_rn(__dmul_rn(tab[21], x), __dmul_rn(tab[22], x3));
+    const double e = g4_exp_dev(tt, tab);
+    const float gl = __double2float_rn(__ddiv_rn(x, __dadd_rn(1.0, e)));
+    h[i] = __fmul_rn(gl, uu);
+}
+
+// Per-token argmax of the raw logits (block t handles y + t*n); same first-max rule
+// as the host loop. out[2t] = value bits, out[2t+1] = index.
+extern "C" __global__ void __launch_bounds__(1024) argmax_b(const float *__restrict__ y, int n,
+                                                            unsigned *__restrict__ out) {
+    __shared__ float sv[1024];
+    __shared__ int si[1024];
+    const int t = threadIdx.x;
+    const float *yy = y + (size_t)blockIdx.x * n;
+    float best = -__int_as_float(0x7f800000);
+    int bi = 0x7fffffff;
+    for (int i = t; i < n; i += 1024) { const float v = yy[i]; if (v > best) { best = v; bi = i; } }
+    sv[t] = best; si[t] = bi;
+    __syncthreads();
+    for (int s = 512; s; s >>= 1) {
+        if (t < s) {
+            const float a = sv[t], b = sv[t + s];
+            const int ia = si[t], ib = si[t + s];
+            if (b > a || (b == a && ib < ia)) { sv[t] = b; si[t] = ib; }
+        }
+        __syncthreads();
+    }
+    if (t == 0) { out[2 * blockIdx.x] = __float_as_uint(sv[0]); out[2 * blockIdx.x + 1] = (unsigned)si[0]; }
+}

@@ -46,7 +46,7 @@ static void make_x(float *x, int n, int kind) {
 }
 static int first_diff(const float *a, const float *b, int n) { for (int i = 0; i < n; i++) if (memcmp(a + i, b + i, 4)) return i; return -1; }
 
-static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k, *fq4i, *fq6i;
+static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k, *fq4i, *fq6i, *fq4ib, *fq6ib, *fgeglub, *fargb;
 static uint64_t dWi, dSi;
 static uint64_t dW, dS, dX, dY;
 
@@ -239,6 +239,99 @@ static int test_mlp_stages(void) {
     return bad;
 }
 
+/* batched kernels (prefill): every token of a B = 8 batch must equal the single-token
+   CPU reference, bit for bit */
+static int test_batch(void) {
+    enum { B = 8 };
+    int bad = 0;
+    static uint8_t xqb[B * (2 * INTER / 256) * Q8B];
+    static float x[2 * INTER], ycpu[2 * INTER], yb[B * 2 * INTER];
+    uint64_t dXb, dYb;
+    CK(cuMemAlloc_(&dXb, sizeof xqb)); CK(cuMemAlloc_(&dYb, (size_t)B * VOCAB * 4));
+    const char *names[] = {"blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_output.weight", "blk.4.attn_output.weight",
+                           "blk.0.ffn_gate.weight", "blk.0.ffn_down.weight", "blk.20.ffn_gate.weight", "blk.20.ffn_down.weight",
+                           "blk.0.inp_gate.weight", "blk.0.proj.weight"};
+    int ntest = 0;
+    for (unsigned k = 0; k < sizeof names / sizeof *names; k++) {
+        const tensor_t *t = tens(names[k]);
+        int cols = (int)t->dims[0], rows = (int)t->dims[1], nb = cols / 32, xs = (cols / 256) * Q8B;
+        uint8_t *nib = malloc((size_t)rows * nb * 16); float *scl = malloc((size_t)rows * nb * 4);
+        repack_q4i(t, nib, scl);
+        CK(cuMemcpyHtoD_(dWi, nib, (size_t)rows * nb * 16)); CK(cuMemcpyHtoD_(dSi, scl, (size_t)rows * nb * 4));
+        free(nib); free(scl);
+        for (int b = 0; b < B; b++) { make_x(x, cols, b % 3); q8k(x, xqb + (size_t)b * xs, cols); }
+        CK(cuMemcpyHtoD_(dXb, xqb, (size_t)B * xs));
+        int ib = B;
+        void *a[] = {&dWi, &dSi, &dXb, &dYb, &rows, &cols, &ib, &xs, &rows};
+        CK(cuLaunchKernel_(fq4ib, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, NULL, a, NULL));
+        CK(cuCtxSynchronize_());
+        CK(cuMemcpyDtoH_(yb, dYb, (size_t)B * rows * 4));
+        for (int b = 0; b < B; b++) {
+            gemv_q4(t, xqb + (size_t)b * xs, ycpu);
+            int d = first_diff(ycpu, yb + (size_t)b * rows, rows);
+            if (d >= 0) { bad++; printf("  q4i_b %s token %d row %d\n", names[k], b, d); }
+        }
+        ntest++;
+    }
+    printf("  q4i_gemv_b: %d shapes x 8 tokens, %d mismatches\n", ntest, bad);
+    int b1 = bad;
+    {
+        const tensor_t *t = tens("token_embd.weight");
+        int rows = (int)t->dims[1], xs = 6 * Q8B;
+        uint8_t *rp = repack_q6i(t);
+        uint64_t dHi; CK(cuMemAlloc_(&dHi, (size_t)rows * 6 * 224)); CK(cuMemcpyHtoD_(dHi, rp, (size_t)rows * 6 * 224)); free(rp);
+        for (int b = 0; b < B; b++) { make_x(x, H, b % 3); q8k(x, xqb + (size_t)b * xs, H); }
+        CK(cuMemcpyHtoD_(dXb, xqb, (size_t)B * xs));
+        int ib = B;
+        void *a[] = {&dHi, &dXb, &dYb, &rows, &ib, &xs, &rows};
+        CK(cuLaunchKernel_(fq6ib, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, NULL, a, NULL));
+        CK(cuCtxSynchronize_());
+        float *hb = malloc((size_t)B * rows * 4), *hc = malloc((size_t)rows * 4);
+        CK(cuMemcpyDtoH_(hb, dYb, (size_t)B * rows * 4));
+        uint64_t dOut; CK(cuMemAlloc_(&dOut, 64));
+        void *aa[] = {&dYb, &rows, &dOut};
+        CK(cuLaunchKernel_(fargb, B, 1, 1, 1024, 1, 1, 0, NULL, aa, NULL));
+        CK(cuCtxSynchronize_());
+        unsigned am[2 * B]; CK(cuMemcpyDtoH_(am, dOut, sizeof am));
+        for (int b = 0; b < B; b++) {
+            gemv_q6k_rows(t, xqb + (size_t)b * xs, hc, 0, rows);
+            int d = first_diff(hc, hb + (size_t)b * rows, rows);
+            if (d >= 0) { bad++; printf("  q6i_b token %d row %d\n", b, d); }
+            int top = 0; for (int v = 1; v < rows; v++) if (hc[v] > hc[top]) top = v;
+            float tv; memcpy(&tv, &am[2 * b], 4);
+            if ((int)am[2 * b + 1] != top || memcmp(&tv, &hc[top], 4)) { bad++; printf("  argmax_b token %d: gpu %u cpu %d\n", b, am[2 * b + 1], top); }
+        }
+        free(hb); free(hc);
+        printf("  q6i_gemv_b + argmax_b: 8 tokens x 262144 rows, %d mismatches\n", bad - b1);
+    }
+    int b2 = bad;
+    {
+        double v[24] = {EXP_P0};
+        for (int i = 0; i < 13; i++) v[1 + i] = EXP_C[i];
+        v[14] = EXP_LOG2E; v[15] = EXP_SH; v[16] = EXP_LN2HI; v[17] = EXP_LN2LO;
+        v[18] = 709.0; v[19] = -745.0; v[20] = INFINITY; v[21] = GELU_C1; v[22] = GELU_C3; v[23] = 1.0;
+        uint64_t dTab; CK(cuMemAlloc_(&dTab, sizeof v)); CK(cuMemcpyHtoD_(dTab, v, sizeof v));
+        const int n = INTER;
+        static float yy[B * 2 * INTER], g[INTER], hgo[B * INTER];
+        for (int i = 0; i < B * 2 * n; i++) yy[i] = (float)((urand() - 0.5) * 20.0);
+        uint64_t dG; CK(cuMemAlloc_(&dG, (size_t)B * 2 * n * 4));
+        CK(cuMemcpyHtoD_(dG, yy, (size_t)B * 2 * n * 4));
+        int in = n, ib = B;
+        void *a[] = {&dG, &dYb, &in, &ib, &dTab};
+        CK(cuLaunchKernel_(fgeglub, (B * n + 255) / 256, 1, 1, 256, 1, 1, 0, NULL, a, NULL));
+        CK(cuCtxSynchronize_());
+        CK(cuMemcpyDtoH_(hgo, dYb, (size_t)B * n * 4));
+        for (int b = 0; b < B; b++) {
+            memcpy(g, yy + (size_t)b * 2 * n, n * 4);
+            geglu_ref(g, yy + (size_t)b * 2 * n + n, n);
+            if (first_diff(g, hgo + (size_t)b * n, n) >= 0) { bad++; printf("  geglu_b token %d\n", b); }
+        }
+        printf("  geglu_b: 8 tokens x %d, %d mismatches\n", n, bad - b2);
+    }
+    return bad;
+}
+
+
 static int test_f16(void) {
     const tensor_t *t = tens("per_layer_model_proj.weight");
     int cols = (int)t->dims[0], rows = (int)t->dims[1];
@@ -328,6 +421,48 @@ static void perf(void) {
            tot, tot - head, head, 1000 / tot);
 }
 
+/* perfb: batched (B = 8) kernel time vs the single-token kernel, per token */
+static void perfb(void) {
+    enum { B = 8 };
+    static uint8_t xqb[B * (2 * INTER / 256) * Q8B];
+    static float x[2 * INTER];
+    uint64_t dXb, dYb; CK(cuMemAlloc_(&dXb, sizeof xqb)); CK(cuMemAlloc_(&dYb, (size_t)B * VOCAB * 4));
+    const char *names[] = {"blk.0.attn_q.weight", "blk.0.attn_output.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_down.weight",
+                           "blk.20.ffn_gate.weight", "blk.20.ffn_down.weight", "blk.0.proj.weight"};
+    double s1 = 0, sb = 0;
+    for (unsigned k = 0; k < sizeof names / sizeof *names; k++) {
+        const tensor_t *t = tens(names[k]);
+        int cols = (int)t->dims[0], rows = (int)t->dims[1], nb = cols / 32, xs = (cols / 256) * Q8B;
+        uint8_t *nib = malloc((size_t)rows * nb * 16); float *scl = malloc((size_t)rows * nb * 4);
+        repack_q4i(t, nib, scl);
+        CK(cuMemcpyHtoD_(dWi, nib, (size_t)rows * nb * 16)); CK(cuMemcpyHtoD_(dSi, scl, (size_t)rows * nb * 4));
+        free(nib); free(scl);
+        for (int b = 0; b < B; b++) { make_x(x, cols, 0); q8k(x, xqb + (size_t)b * xs, cols); }
+        CK(cuMemcpyHtoD_(dXb, xqb, (size_t)B * xs));
+        CK(cuMemcpyHtoD_(dX, xqb, (size_t)xs));
+        int ib = B;
+        void *a[] = {&dWi, &dSi, &dXb, &dYb, &rows, &cols, &ib, &xs, &rows};
+        double tb = time_launch(fq4ib, (rows + 255) / 256, 32, 8, a);
+        void *a1[] = {&dWi, &dSi, &dX, &dY, &rows, &cols};
+        smem_bytes = (unsigned)(cols * 2 + cols / 32 * 4 + cols / 256 * 4);
+        double t1 = time_launch(fq4i, (rows + 255) / 256, 32, 8, a1);
+        smem_bytes = 0;
+        printf("  %-26s single %.3f ms/token, batched %.3f ms/token (x%.2f)\n", names[k], t1, tb / B, t1 / (tb / B));
+        s1 += t1; sb += tb / B;
+    }
+    const tensor_t *t = tens("token_embd.weight");
+    int rows = (int)t->dims[1], xs = 6 * Q8B, ib = B;
+    uint8_t *rp = repack_q6i(t);
+    uint64_t dHi; CK(cuMemAlloc_(&dHi, (size_t)rows * 6 * 224)); CK(cuMemcpyHtoD_(dHi, rp, (size_t)rows * 6 * 224)); free(rp);
+    for (int b = 0; b < B; b++) { make_x(x, H, 0); q8k(x, xqb + (size_t)b * xs, H); }
+    CK(cuMemcpyHtoD_(dXb, xqb, (size_t)B * xs)); CK(cuMemcpyHtoD_(dX, xqb, (size_t)xs));
+    void *a[] = {&dHi, &dXb, &dYb, &rows, &ib, &xs, &rows};
+    double tb = time_launch(fq6ib, (rows + 255) / 256, 32, 8, a);
+    void *a1[] = {&dHi, &dX, &dY, &rows};
+    double t1 = time_launch(fq6i, (rows + 255) / 256, 32, 8, a1);
+    printf("  %-26s single %.3f ms/token, batched %.3f ms/token (x%.2f)\n", "head", t1, tb / B, t1 / (tb / B));
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s <gguf> <g4_kernels.ptx> [q4|head|f16|all|perf]\n", argv[0]); return 2; }
     const char *what = argc > 3 ? argv[3] : "all";
@@ -345,7 +480,7 @@ int main(int argc, char **argv) {
     { FILE *f = fopen(argv[2], "rb"); if (!f) { perror(argv[2]); return 2; }
       static char ptx[1 << 20]; size_t n = fread(ptx, 1, sizeof ptx - 1, f); fclose(f); ptx[n] = 0;
       CK(cuModuleLoadData_(&m6, ptx)); }
-    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq6i, m6, "q6i_gemv")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : getenv("Q4I")[0] == '2' ? "q4i_gemv2" : getenv("Q4I")[0] == '3' ? "q4i_gemv3" : "q4i_gemv4") : "q4i_gemv3")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq6i, m6, "q6i_gemv")); CK(cuModuleGetFunction_(&fq4ib, m6, "q4i_gemv_b")); CK(cuModuleGetFunction_(&fq6ib, m6, "q6i_gemv_b")); CK(cuModuleGetFunction_(&fgeglub, m6, "geglu_b")); CK(cuModuleGetFunction_(&fargb, m6, "argmax_b")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : getenv("Q4I")[0] == '2' ? "q4i_gemv2" : getenv("Q4I")[0] == '3' ? "q4i_gemv3" : "q4i_gemv4") : "q4i_gemv3")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
     CK(cuMemAlloc_(&dW, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dS, (size_t)2 * INTER * (H / 32) * 4));
     CK(cuMemAlloc_(&dX, sizeof XQ));
     CK(cuMemAlloc_(&dWi, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dSi, (size_t)2 * INTER * (H / 32) * 4)); CK(cuMemAlloc_(&dY, (size_t)VOCAB * 4));
@@ -359,8 +494,10 @@ int main(int argc, char **argv) {
     if (!strcmp(what, "head") || !strcmp(what, "all")) fails += test_head();
     if (!strcmp(what, "f16") || !strcmp(what, "all")) fails += test_f16();
     if (!strcmp(what, "mlp") || !strcmp(what, "all")) fails += test_mlp_stages();
+    if (!strcmp(what, "batch") || !strcmp(what, "all")) fails += test_batch();
     if (!strcmp(what, "perf")) { perf(); return 0; }
     if (!strcmp(what, "perfi")) { use_q4i = 1; perf(); return 0; }
+    if (!strcmp(what, "perfb")) { perfb(); perfb(); return 0; }
     printf(fails ? "M3 GATE: FAIL (%d)\n" : "M3 GATE: OK\n", fails);
     return fails ? 1 : 0;
 }
