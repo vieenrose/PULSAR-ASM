@@ -920,7 +920,7 @@ void cuda_init(void) {
           else { h_in = h_out = 0; printf("pinned staging unavailable (pageable)\n"); }
       }
       if (pStreamCreate && pEventCreate && pEventRecord && pEventQuery) {
-          if (pStreamCreate(&g_stream, 1) == 0 && pEventCreate(&g_event, 0) == 0)
+          if (pStreamCreate(&g_stream, 1) == 0 && pEventCreate(&g_event, 2 /* Exp94: CU_EVENT_DISABLE_TIMING: ~11 us cheaper per record+poll; the engine never reads event times */) == 0)
               printf("CUDA event-completion path\n");
           else { g_stream = 0; g_event = 0; }
       }
