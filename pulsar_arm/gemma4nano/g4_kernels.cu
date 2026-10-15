@@ -578,7 +578,7 @@ __device__ __forceinline__ int dot2_s16(unsigned m, unsigned a, int s) {
     return s;
 }
 extern "C" __global__ void __launch_bounds__(256) q4i_gemv5(const uint4 *__restrict__ w,
-        const float *__restrict__ sc, const uint8_t *__restrict__ xq,
+        const unsigned short *__restrict__ sc, const uint8_t *__restrict__ xq,
         float *__restrict__ y, int rows, int cols) {
     extern __shared__ __align__(16) unsigned char smem[];
     const int nb = cols >> 5, tid = threadIdx.y * 32 + threadIdx.x;
@@ -604,10 +604,10 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv5(const uint4 *__restr
     const int r = tile * 32 + threadIdx.x;
     if (r >= rows) return;
     const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
-    const float *st = sc + (size_t)tile * nb * 32 + threadIdx.x;
+    const unsigned short *st = sc + (size_t)tile * nb * 32 + threadIdx.x;   /* fp16 block scales */
     const uint4 *A4 = (const uint4 *)AW;
     uint4 qr[Q4I_PF];
-    float sr[Q4I_PF];
+    unsigned short sr[Q4I_PF];
     #pragma unroll
     for (int p = 0; p < Q4I_PF; p++) if (p < nb) { qr[p] = wt[(size_t)p * 32]; sr[p] = st[(size_t)p * 32]; }
     float acc = 0.0f;
@@ -617,7 +617,7 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv5(const uint4 *__restr
             const int b = b0 + p;
             if (b < nb) {
                 const uint4 q = qr[p];
-                const float ws = sr[p];
+                const float ws = __half2float(__ushort_as_half(sr[p]));   /* exact */
                 if (b + Q4I_PF < nb) { qr[p] = wt[(size_t)(b + Q4I_PF) * 32]; sr[p] = st[(size_t)(b + Q4I_PF) * 32]; }
                 const unsigned qw[4] = {q.x, q.y, q.z, q.w};
                 int s = -8 * SA[b];
@@ -802,7 +802,7 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b(const uint4 *__rest
 // permuted activation words (two XMADs per word); same integer products, exact int32
 // sums, same float chain per token, so y is bit-identical to q4i_gemv_b.
 extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b2(const uint4 *__restrict__ w,
-        const float *__restrict__ sc, const uint8_t *__restrict__ xq, float *__restrict__ y,
+        const unsigned short *__restrict__ sc, const uint8_t *__restrict__ xq, float *__restrict__ y,
         int rows, int cols, int B, int xstride, int ystride) {
     __shared__ __align__(16) unsigned AW[BMAX * Q4B_KC / 2];
     __shared__ int SA[BMAX * (Q4B_KC / 32)];
@@ -815,7 +815,7 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b2(const uint4 *__res
     const int r = tile * 32 + threadIdx.x;
     const bool live = r < rows;
     const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
-    const float *st = sc + (size_t)tile * nb * 32 + threadIdx.x;
+    const unsigned short *st = sc + (size_t)tile * nb * 32 + threadIdx.x;   /* fp16 block scales */
     float acc[BMAX];
     #pragma unroll
     for (int t = 0; t < BMAX; t++) acc[t] = 0.0f;
@@ -843,7 +843,7 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b2(const uint4 *__res
             for (int bl = 0; bl < kb; bl++) {
                 const int b = (c0 >> 5) + bl;
                 const uint4 q = wt[(size_t)b * 32];
-                const float ws = st[(size_t)b * 32];
+                const float ws = __half2float(__ushort_as_half(st[(size_t)b * 32]));   /* exact */
                 const unsigned qw[4] = {q.x, q.y, q.z, q.w};
                 unsigned m[16];
                 #pragma unroll

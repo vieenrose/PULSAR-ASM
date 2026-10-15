@@ -67,7 +67,7 @@ static int fast = 1;
 static void *stream, *event;
 static void *h_in, *h_out;
 static uint64_t h_in_dev, h_out_dev;
-static uint64_t DW[600], DS[600];          /* per tensor index: nibbles, f32 scales */
+static uint64_t DW[600], DS[600];          /* per tensor index: nibbles, block scales (q4i: fp16, K2: f32) */
 static uint64_t dX, dXf, dY, dHead, dF16;
 static size_t dev_bytes;
 /* G4PROF=1: per-hook wall time split (H2D, launch+sync, D2H), printed at exit */
@@ -454,9 +454,9 @@ static void gpu_init(void) {
     CK(cuModuleLoadData_(&mk, G4_PTX_K));
     CK(cuModuleGetFunction_(&ff16, mk, "f16_gemv_t"));
     CK(cuModuleGetFunction_(&fgeglu, mk, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, mk, "q8k_dev"));
-    CK(cuModuleGetFunction_(&fq4i, mk, getenv("G4Q4I4") ? "q4i_gemv4" : "q4i_gemv5"));   /* G4Q4I4=1: previous kernel (A/B) */
+    CK(cuModuleGetFunction_(&fq4i, mk, "q4i_gemv5"));
     CK(cuModuleGetFunction_(&fq6, mk, "q6i_gemv"));
-    CK(cuModuleGetFunction_(&fq4ib, mk, getenv("G4Q4I4") ? "q4i_gemv_b" : "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fgeglub, mk, "geglu_b"));
+    CK(cuModuleGetFunction_(&fq4ib, mk, "q4i_gemv_b2")); CK(cuModuleGetFunction_(&fgeglub, mk, "geglu_b"));
     CK(cuModuleGetFunction_(&fargb, mk, "argmax_b")); CK(cuModuleGetFunction_(&fq6ib, mk, "q6i_gemv_b"));
     CK(cuModuleGetFunction_(&fasc, mk, "attn_scores")); CK(cuModuleGetFunction_(&fapv, mk, "attn_softmax_pv"));
     dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
@@ -480,17 +480,19 @@ static void gpu_init(void) {
         for (int g = 0; g < 6; g++) {
             size_t tot = 0;
             for (int k = 0; k < 3 && grp[g][k]; k++) tot += (size_t)grp[g][k]->dims[1] * (grp[g][k]->dims[0] / 32);
-            uint64_t bw = dalloc(tot * 16), bs = dalloc(tot * 4);
-            size_t off = 0;
             size_t grows = 0;
             for (int k = 0; k < 3 && grp[g][k]; k++) grows += grp[g][k]->dims[1];
             int gcols = (int)grp[g][0]->dims[0];
             /* q4i for every group since the paired-nibble kernels (v5/b2): faster than
                K2 also for 256-row inp_gate and 12288-column down; 12288 = Q4I_MAXCOLS */
             int kind = use_q4i && gcols <= 12288 && grows % 32 == 0;
+            /* q4i keeps the fp16 block scales as stored (2 B, converted exactly in the
+               kernel): 18 B per 32 weights instead of 20 with f32 scales */
+            uint64_t bw = dalloc(tot * 16), bs = dalloc(tot * (kind ? 2 : 4));
+            size_t off = 0;
             if (kind) {   /* q4i: tile-interleave the whole group: [tile][block][32 rows] */
                 int nbq = gcols / 32;
-                uint8_t *nib = malloc(tot * 16); float *scl = malloc(tot * 4);
+                uint8_t *nib = malloc(tot * 16); uint16_t *scl = malloc(tot * 2);
                 size_t r = 0;
                 for (int k = 0; k < 3 && grp[g][k]; k++) {
                     const tensor_t *t = grp[g][k];
@@ -498,7 +500,7 @@ static void gpu_init(void) {
                         for (int b = 0; b < nbq; b++) {
                             const uint8_t *blk = t->data + (rr * nbq + b) * 18;
                             size_t o = ((r / 32) * nbq + b) * 32 + (r % 32);
-                            scl[o] = h2f((uint16_t)(blk[0] | blk[1] << 8));
+                            scl[o] = (uint16_t)(blk[0] | blk[1] << 8);
                             memcpy(nib + o * 16, blk + 2, 16);
                         }
                     int i = (int)(t - T);
@@ -506,7 +508,7 @@ static void gpu_init(void) {
                     drop_pages(t->data, (size_t)t->dims[1] * nbq * 18);
                     nq4++;
                 }
-                CK(cuMemcpyHtoD_(bw, nib, tot * 16)); CK(cuMemcpyHtoD_(bs, scl, tot * 4));
+                CK(cuMemcpyHtoD_(bw, nib, tot * 16)); CK(cuMemcpyHtoD_(bs, scl, tot * 2));
                 free(nib); free(scl);
                 continue;
             }
