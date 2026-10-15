@@ -33,12 +33,28 @@ static CUresult (*cuLaunchKernel_)(void *, unsigned, unsigned, unsigned, unsigne
                                    unsigned, unsigned, void *, void **, void **);
 static CUresult (*cuCtxSynchronize_)(void);
 static CUresult (*cuMemGetInfo_)(size_t *, size_t *);
+static CUresult (*cuStreamCreate_)(void **, unsigned);
+static CUresult (*cuEventCreate_)(void **, unsigned);
+static CUresult (*cuEventRecord_)(void *, void *);
+static CUresult (*cuEventQuery_)(void *);
+static CUresult (*cuMemHostAlloc_)(void **, size_t, unsigned);
+static CUresult (*cuMemHostGetDevicePointer_)(uint64_t *, void *, unsigned);
 
 #define CK(x) do { CUresult r_ = (x); if (r_) { fprintf(stderr, "%s:%d %s -> %d\n", __FILE__, __LINE__, #x, r_); exit(3); } } while (0)
 static void *sym(void *h, const char *n) { void *p = dlsym(h, n); if (!p) { fprintf(stderr, "no %s\n", n); exit(3); } return p; }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
-static void *fq4, *fq6, *ff16;
+static void *fq4, *fq6, *ff16, *fxc;
+/* fast driver path (G4FAST, default on), the K2 Exp93-96 recipe: one non-blocking
+   stream; inputs written to DEVICEMAP-pinned host memory and moved on the GPU by
+   K2's xq_copy kernel; GEMV results written by the kernel straight into pinned host
+   memory; completion = a timing-free event polled by the host; results read back
+   with four interleaved NEON streams (pinned memory is uncached for the CPU). Only
+   the transport changes; every kernel and its arithmetic are the same. */
+static int fast = 1;
+static void *stream, *event;
+static void *h_in, *h_out;
+static uint64_t h_in_dev, h_out_dev;
 static uint64_t DW[600], DS[600];          /* per tensor index: nibbles, f32 scales */
 static uint64_t dX, dXf, dY, dHead, dF16;
 static size_t dev_bytes;
@@ -53,9 +69,53 @@ static void drop_pages(const void *p, size_t n) {   /* the GGUF copy is on the G
 }
 static uint64_t dalloc(size_t n) { uint64_t d; CK(cuMemAlloc_(&d, n)); dev_bytes += n; return d; }
 
+
+static void wait_stream(void) {
+    CK(cuEventRecord_(event, stream));
+    CUresult r;
+    while ((r = cuEventQuery_(event)) == 600) { }
+    if (r) { fprintf(stderr, "event query %d\n", r); exit(3); }
+}
+static void copy_from_pinned(void *dst, const void *src, size_t n) {
+    size_t q = (n / 256) * 64;
+    char *d = (char *)dst; const char *s = (const char *)src;
+    if (q < 64) { memcpy(dst, src, n); return; }
+    for (size_t i = 0; i < q; i += 64) {
+        __asm__ volatile(
+            "ld1 {v0.16b-v3.16b}, [%4]\n\t" "ld1 {v4.16b-v7.16b}, [%5]\n\t"
+            "ld1 {v16.16b-v19.16b}, [%6]\n\t" "ld1 {v20.16b-v23.16b}, [%7]\n\t"
+            "st1 {v0.16b-v3.16b}, [%0]\n\t" "st1 {v4.16b-v7.16b}, [%1]\n\t"
+            "st1 {v16.16b-v19.16b}, [%2]\n\t" "st1 {v20.16b-v23.16b}, [%3]\n\t"
+            :: "r"(d + i), "r"(d + q + i), "r"(d + 2 * q + i), "r"(d + 3 * q + i),
+               "r"(s + i), "r"(s + q + i), "r"(s + 2 * q + i), "r"(s + 3 * q + i)
+            : "v0","v1","v2","v3","v4","v5","v6","v7","v16","v17","v18","v19","v20","v21","v22","v23","memory");
+    }
+    if (4 * q < n) memcpy(d + 4 * q, s + 4 * q, n - 4 * q);
+}
+/* stage n bytes (multiple of 4) of input into dX through the pinned buffer */
+static void stage_in(const void *src, size_t n, uint64_t dst) {
+    memcpy(h_in, src, n);
+    uint32_t nw = (uint32_t)(n / 4);
+    void *a[] = {&h_in_dev, &dst, &nw};
+    CK(cuLaunchKernel_(fxc, (nw + 255) / 256, 1, 1, 256, 1, 1, 0, stream, a, NULL));
+}
+/* one Q4_0 launch over rows [0, rows) of the weights at (w, s), y -> pinned host */
+static void q4_fast(uint64_t *w, uint64_t *s, uint32_t cols, uint32_t rows, const uint8_t *xq, float *y) {
+    double a_ = prof ? now_ms() : 0;
+    stage_in(xq, (size_t)(cols / 256) * Q8B, dX);
+    uint32_t r0 = 0, r1 = rows, nb = cols / 32, rf = rows;
+    void *args[] = {w, s, &dX, &h_out_dev, &r0, &r1, &nb, &rf};
+    double b_ = prof ? now_ms() : 0;
+    CK(cuLaunchKernel_(fq4, (r1 + 31) / 32, 1, 1, 32, 8, 1, 0, stream, args, NULL));
+    wait_stream();
+    double c_ = prof ? now_ms() : 0;
+    copy_from_pinned(y, h_out, (size_t)rows * 4);
+    if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
+}
 /* ---------------------------------------------------------------- hooks */
 static void gpu_q4(const tensor_t *t, const uint8_t *xq, float *y) {
     int i = (int)(t - T);
+    if (fast) { q4_fast(&DW[i], &DS[i], (uint32_t)t->dims[0], (uint32_t)t->dims[1], xq, y); return; }
     uint32_t cols = (uint32_t)t->dims[0], r0 = 0, r1 = (uint32_t)t->dims[1], nb = cols / 32, rf = r1;
     double a_ = prof ? now_ms() : 0;
     CK(cuMemcpyHtoD_(dX, xq, (size_t)(cols / 256) * Q8B));
@@ -83,6 +143,11 @@ static void gpu_q4n(int n, const tensor_t **ts, const uint8_t *xq, float **ys) {
         rows += (uint32_t)ts[k]->dims[1];
     }
     int i0 = (int)(ts[0] - T);
+    if (fast) {
+        q4_fast(&DW[i0], &DS[i0], (uint32_t)ts[0]->dims[0], rows, xq, YCAT);
+        for (int k = 0, off = 0; k < n; off += (int)ts[k]->dims[1], k++) memcpy(ys[k], YCAT + off, ts[k]->dims[1] * 4);
+        return;
+    }
     uint32_t cols = (uint32_t)ts[0]->dims[0], r0 = 0, r1 = rows, nb = cols / 32, rf = rows;
     double a_ = prof ? now_ms() : 0;
     CK(cuMemcpyHtoD_(dX, xq, (size_t)(cols / 256) * Q8B));
@@ -97,6 +162,18 @@ static void gpu_q4n(int n, const tensor_t **ts, const uint8_t *xq, float **ys) {
 }
 static void gpu_head(const tensor_t *t, const uint8_t *xq, float *y) {
     int rows = (int)t->dims[1];
+    if (fast) {
+        double a_ = prof ? now_ms() : 0;
+        stage_in(xq, (size_t)(t->dims[0] / 256) * Q8B, dX);
+        void *args[] = {&dHead, &dX, &h_out_dev, &rows};
+        double b_ = prof ? now_ms() : 0;
+        CK(cuLaunchKernel_(fq6, (rows + 31) / 32, 1, 1, 32, 8, 1, 0, stream, args, NULL));
+        wait_stream();
+        double c_ = prof ? now_ms() : 0;
+        copy_from_pinned(y, h_out, (size_t)rows * 4);
+        if (prof) { double d_ = now_ms(); P_h2d[1] += b_ - a_; P_k[1] += c_ - b_; P_d2h[1] += d_ - c_; P_n[1]++; }
+        return;
+    }
     double a_ = prof ? now_ms() : 0;
     CK(cuMemcpyHtoD_(dX, xq, (size_t)(t->dims[0] / 256) * Q8B));
     void *args[] = {&dHead, &dX, &dY, &rows};
@@ -109,6 +186,18 @@ static void gpu_head(const tensor_t *t, const uint8_t *xq, float *y) {
 }
 static void gpu_f16(const tensor_t *t, const float *x, float *y) {
     int rows = (int)t->dims[1], cols = (int)t->dims[0];
+    if (fast) {
+        double a_ = prof ? now_ms() : 0;
+        stage_in(x, (size_t)cols * 4, dXf);
+        void *args[] = {&dF16, &dXf, &h_out_dev, &rows, &cols};
+        double b_ = prof ? now_ms() : 0;
+        CK(cuLaunchKernel_(ff16, (rows + 127) / 128, 1, 1, 128, 1, 1, 0, stream, args, NULL));
+        wait_stream();
+        double c_ = prof ? now_ms() : 0;
+        copy_from_pinned(y, h_out, (size_t)rows * 4);
+        if (prof) { double d_ = now_ms(); P_h2d[2] += b_ - a_; P_k[2] += c_ - b_; P_d2h[2] += d_ - c_; P_n[2]++; }
+        return;
+    }
     double a_ = prof ? now_ms() : 0;
     CK(cuMemcpyHtoD_(dXf, x, (size_t)cols * 4));
     void *args[] = {&dF16, &dXf, &dY, &rows, &cols};
@@ -130,9 +219,22 @@ static void gpu_init(void) {
     cuMemAlloc_ = sym(h, "cuMemAlloc_v2"); cuMemcpyHtoD_ = sym(h, "cuMemcpyHtoD_v2"); cuMemcpyDtoH_ = sym(h, "cuMemcpyDtoH_v2");
     cuLaunchKernel_ = sym(h, "cuLaunchKernel"); cuCtxSynchronize_ = sym(h, "cuCtxSynchronize");
     cuMemGetInfo_ = sym(h, "cuMemGetInfo_v2");
+    cuStreamCreate_ = sym(h, "cuStreamCreate"); cuEventCreate_ = sym(h, "cuEventCreate");
+    cuEventRecord_ = sym(h, "cuEventRecord"); cuEventQuery_ = sym(h, "cuEventQuery");
+    cuMemHostAlloc_ = sym(h, "cuMemHostAlloc"); cuMemHostGetDevicePointer_ = sym(h, "cuMemHostGetDevicePointer_v2");
     int dev; void *ctx, *m4, *mk;
     CK(cuInit_(0)); CK(cuDeviceGet_(&dev, 0)); CK(cuCtxCreate_(&ctx, 0, dev));
     CK(cuModuleLoadData_(&m4, G4_PTX_Q4)); CK(cuModuleGetFunction_(&fq4, m4, "q4_gemv"));
+    CK(cuModuleGetFunction_(&fxc, m4, "xq_copy"));
+    fast = !(getenv("G4FAST") && getenv("G4FAST")[0] == '0');
+    if (fast) {
+        CK(cuStreamCreate_(&stream, 1));                       /* non-blocking */
+        CK(cuEventCreate_(&event, 2));                         /* CU_EVENT_DISABLE_TIMING */
+        CK(cuMemHostAlloc_(&h_in, 65536, 1 | 2));              /* PORTABLE | DEVICEMAP */
+        CK(cuMemHostAlloc_(&h_out, (size_t)VOCAB * 4, 1 | 2));
+        CK(cuMemHostGetDevicePointer_(&h_in_dev, h_in, 0));
+        CK(cuMemHostGetDevicePointer_(&h_out_dev, h_out, 0));
+    }
     CK(cuModuleLoadData_(&mk, G4_PTX_K));
     CK(cuModuleGetFunction_(&fq6, mk, "q6k_gemv4")); CK(cuModuleGetFunction_(&ff16, mk, "f16_gemv_t"));
     dX = dalloc(sizeof XQ); dXf = dalloc((size_t)H * 4); dY = dalloc((size_t)VOCAB * 4);
@@ -186,6 +288,7 @@ static void gpu_init(void) {
         drop_pages(t->data, (size_t)rows * cols * 2);
     }
     size_t fr = 0, tot = 0; cuMemGetInfo_(&fr, &tot);
+    if (fast) fprintf(stderr, "GPU driver path: fast (stream, timing-free event, mapped pinned I/O)\n");
     fprintf(stderr, "GPU: %d Q4_0 tensors + Q6_K head + F16 proj, %.1f MB on device, %.0f MB free of %.0f; load %.0f ms\n",
             nq4, dev_bytes / 1048576.0, fr / 1048576.0, tot / 1048576.0, now_ms() - t0);
     G_Q4 = gpu_q4; G_Q4N = gpu_q4n; G_HEAD = gpu_head; G_F16 = gpu_f16;
