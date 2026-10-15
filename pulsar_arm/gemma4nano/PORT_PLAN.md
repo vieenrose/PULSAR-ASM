@@ -189,3 +189,32 @@ Tried and dropped: q4i with an 8- or 16-block load ring (64 / 116 registers). Fe
 resident warps made most shapes slower (e.g. ffn_gate 12288x1536: 0.78 -> 0.94 / 1.11 ms);
 only down at 12288 columns improved (16-deep: 1.018 ms vs K2's 1.048), ~0.6 ms per token,
 not worth a third kernel.
+
+## Status at the end of the night (2026-10-16)
+
+Engine complete for single-sequence text generation, greedy and sampled, every stage
+bit-identical to g4ref.c (gates.sh: host asm test, GPU kernel test, three goldens).
+
+| step | en decode tok/s |
+|---|---|
+| first light (C host, synchronous GEMV round trips) | 3.23 |
+| merged launches | 3.49 |
+| K2 driver path | 3.97 |
+| NEON exp / GeGLU / attention | 4.44 |
+| MLP chain on the GPU | 4.98 |
+| 8-head attention pass, NEON RMS norm and Q8_K | 5.1-5.3 |
+| q4i row-per-lane Q4_0 kernel (220 of 275 tensors) | 5.7-5.9 |
+| q6i row-per-lane Q6_K head (41.7 -> 18.0 ms) | 6.8-6.9 |
+
+Final measurement (en gate prompt): load 4.05 s, 1,474 MB on the GPU, peak RSS 729 MB,
+prefill 6.54 tok/s, decode 6.83 tok/s. Demo prompts: 6.17 (291 steps) and 6.56 tok/s
+(117 steps); 5.5-5.7 tok/s over 500 steps. Per token ~146 ms: Q4_0 GEMVs + MLP chain ~103,
+head ~19, F16 projection ~4, CPU ~20.
+
+Open, measured or estimated:
+- down at 12288 columns stays on K2's kernel (~21 ms/token over 20 layers); a split-K
+  q4i needs the ordered float chain moved to an epilogue.
+- ~5 GPU synchronizations per layer (~14 ms/token of overhead); the per-layer-input chain
+  could join the GPU like the MLP (~2-4 ms, estimate). Moving norms to the GPU needs a
+  parallel-friendly sum order, i.e. a change of the reference arithmetic and new goldens.
+- Prefill is token by token.
