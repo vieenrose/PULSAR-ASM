@@ -45,7 +45,8 @@ static CUresult (*cuMemHostGetDevicePointer_)(uint64_t *, void *, unsigned);
 static void *sym(void *h, const char *n) { void *p = dlsym(h, n); if (!p) { fprintf(stderr, "no %s\n", n); exit(3); } return p; }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
-static void *fq4, *fq6, *ff16, *fxc;
+static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k;
+static uint64_t dYdev, dHdev, dX2, dTab;    /* device-only MLP intermediates */
 /* fast driver path (G4FAST, default on), the K2 Exp93-96 recipe: one non-blocking
    stream; inputs written to DEVICEMAP-pinned host memory and moved on the GPU by
    K2's xq_copy kernel; GEMV results written by the kernel straight into pinned host
@@ -148,6 +149,31 @@ static void attn_head_asm(const float *q, const float *K, const float *V, int lo
     for (int i = 0; i < n; i++) sum += e[i];
     for (int i = 0; i < n; i++) pp[i] = (float)(e[i] / sum);
     g4_attn_pv(pp, V + (size_t)lo * hd, n, hd, o);
+}
+
+/* MLP on the GPU: gate+up -> geglu_dev -> q8k_dev -> down, one wait at the end.
+   XQ already holds the quantized ffn_norm output. */
+static void gpu_mlp(const layer_t *L, int inter, float *out) {
+    if (!fast) { mlp_ref(L, inter, out); return; }
+    int ig = (int)(L->gate - T), id = (int)(L->down - T);
+    double a_ = prof ? now_ms() : 0;
+    stage_in(XQ, (size_t)(H / 256) * Q8B, dX);
+    uint32_t r0 = 0, r1 = 2 * inter, nb = H / 32, rf = r1;
+    void *a1[] = {&DW[ig], &DS[ig], &dX, &dYdev, &r0, &r1, &nb, &rf};
+    CK(cuLaunchKernel_(fq4, (r1 + 31) / 32, 1, 1, 32, 8, 1, 0, stream, a1, NULL));
+    int n = inter;
+    void *a2[] = {&dYdev, &dHdev, &n, &dTab};
+    CK(cuLaunchKernel_(fgeglu, (n + 255) / 256, 1, 1, 256, 1, 1, 0, stream, a2, NULL));
+    void *a3[] = {&dHdev, &dX2};
+    CK(cuLaunchKernel_(fq8k, n / 256, 1, 1, 256, 1, 1, 0, stream, a3, NULL));
+    uint32_t r1d = H, nbd = (uint32_t)inter / 32, rfd = H;
+    void *a4[] = {&DW[id], &DS[id], &dX2, &h_out_dev, &r0, &r1d, &nbd, &rfd};
+    CK(cuLaunchKernel_(fq4, (r1d + 31) / 32, 1, 1, 32, 8, 1, 0, stream, a4, NULL));
+    double b_ = prof ? now_ms() : 0;
+    wait_stream();
+    double c_ = prof ? now_ms() : 0;
+    copy_from_pinned(out, h_out, (size_t)H * 4);
+    if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
 }
 
 /* ---------------------------------------------------------------- hooks */
@@ -275,6 +301,15 @@ static void gpu_init(void) {
     }
     CK(cuModuleLoadData_(&mk, G4_PTX_K));
     CK(cuModuleGetFunction_(&fq6, mk, "q6k_gemv4")); CK(cuModuleGetFunction_(&ff16, mk, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&fgeglu, mk, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, mk, "q8k_dev"));
+    dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
+    {   /* exp/GELU constants for geglu_dev: g4ref.c's own definitions */
+        double v[24] = {EXP_P0};
+        for (int i = 0; i < 13; i++) v[1 + i] = EXP_C[i];
+        v[14] = EXP_LOG2E; v[15] = EXP_SH; v[16] = EXP_LN2HI; v[17] = EXP_LN2LO;
+        v[18] = 709.0; v[19] = -745.0; v[20] = INFINITY; v[21] = GELU_C1; v[22] = GELU_C3; v[23] = 1.0;
+        dTab = dalloc(sizeof v); CK(cuMemcpyHtoD_(dTab, v, sizeof v));
+    }
     dX = dalloc(sizeof XQ); dXf = dalloc((size_t)H * 4); dY = dalloc((size_t)VOCAB * 4);
     /* Q4_0 layers: nibbles [rows][nb][16] + f32 scales [rows][nb] (K2 layout).
        q+k+v and gate+up of each layer get one allocation each, back to back, so
@@ -330,6 +365,7 @@ static void gpu_init(void) {
     fprintf(stderr, "GPU: %d Q4_0 tensors + Q6_K head + F16 proj, %.1f MB on device, %.0f MB free of %.0f; load %.0f ms\n",
             nq4, dev_bytes / 1048576.0, fr / 1048576.0, tot / 1048576.0, now_ms() - t0);
     G_Q4 = gpu_q4; G_Q4N = gpu_q4n; G_HEAD = gpu_head; G_F16 = gpu_f16;
+    if (!(getenv("G4GPUMLP") && getenv("G4GPUMLP")[0] == '0')) { G_MLP = gpu_mlp; fprintf(stderr, "MLP: on the GPU (gate+up, GeGLU, Q8_K, down)\n"); }
     /* G4ASM=0 keeps the C host loops (A/B and fallback) */
     if (!(getenv("G4ASM") && getenv("G4ASM")[0] == '0')) {
         build_tab(); G_GEGLU = geglu_asm; G_ATTN = attn_head_asm;

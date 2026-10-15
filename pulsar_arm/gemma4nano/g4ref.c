@@ -356,6 +356,17 @@ static void attn_head_ref(const float *q, const float *K, const float *V, int lo
 static void geglu_ref(float *g, const float *u, int n) { for (int i = 0; i < n; i++) g[i] = gelu(g[i]) * u[i]; }
 static void (*G_ATTN)(const float *, const float *, const float *, int, int, int, float *) = attn_head_ref;
 static void (*G_GEGLU)(float *, const float *, int) = geglu_ref;
+/* MLP body on the quantized input in XQ: gate+up, GeGLU, Q8_K, down -> out. The
+   engine runs the whole chain on the GPU (one synchronization); same arithmetic. */
+static void mlp_ref(const layer_t *L, int inter, float *out) {
+    const tensor_t *ts[2] = {L->gate, L->up};
+    float *ys[2] = {gb, ub};
+    G_Q4N(2, ts, XQ, ys);
+    G_GEGLU(gb, ub, inter);
+    q8k(gb, XQ, inter);
+    G_Q4(L->down, XQ, out);
+}
+static void (*G_MLP)(const layer_t *, int, float *) = mlp_ref;
 
 static void __attribute__((unused)) forward(int tok, int pos) {
     /* embedding and per-layer inputs */
@@ -409,10 +420,7 @@ static void __attribute__((unused)) forward(int tok, int pos) {
         /* MLP */
         rmsnorm(xs, L->n_ffn, hb, H);
         q8k(hb, XQ, H);
-        { const tensor_t *ts[2] = {L->gate, L->up}; float *ys[2] = {gb, ub}; G_Q4N(2, ts, XQ, ys); }
-        G_GEGLU(gb, ub, inter);
-        q8k(gb, XQ, inter);
-        G_Q4(L->down, XQ, hb);
+        G_MLP(L, inter, hb);
         { float t[H]; rmsnorm(hb, L->n_post_ffw, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* per-layer input */
         q8k(xs, XQ, H);

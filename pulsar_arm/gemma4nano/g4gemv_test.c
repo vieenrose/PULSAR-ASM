@@ -46,7 +46,7 @@ static void make_x(float *x, int n, int kind) {
 }
 static int first_diff(const float *a, const float *b, int n) { for (int i = 0; i < n; i++) if (memcmp(a + i, b + i, 4)) return i; return -1; }
 
-static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16;
+static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k;
 static uint64_t dW, dS, dX, dY;
 
 static int test_q4(const tensor_t *t) {
@@ -135,6 +135,59 @@ static int test_head(void) {
         if (d2 >= 0) { bad++; printf("    v2 row %d cpu %.9g gpu %.9g\n", d2, ycpu[d2], ygpu2[d2]); }
     }
     CK(cuMemFree_(dH)); CK(cuMemFree_(dH2)); free(ycpu); free(ygpu); free(ygpu2);
+    return bad;
+}
+
+
+/* MLP stages: geglu_dev vs geglu_ref and q8k_dev vs q8k, bit for bit */
+static int test_mlp_stages(void) {
+    double v[24] = {EXP_P0};
+    for (int i = 0; i < 13; i++) v[1 + i] = EXP_C[i];
+    v[14] = EXP_LOG2E; v[15] = EXP_SH; v[16] = EXP_LN2HI; v[17] = EXP_LN2LO;
+    v[18] = 709.0; v[19] = -745.0; v[20] = INFINITY; v[21] = GELU_C1; v[22] = GELU_C3; v[23] = 1.0;
+    uint64_t dTab, dIn, dOut, dQ;
+    const int n = 2 * INTER;
+    CK(cuMemAlloc_(&dTab, sizeof v)); CK(cuMemcpyHtoD_(dTab, v, sizeof v));
+    CK(cuMemAlloc_(&dIn, (size_t)2 * n * 4)); CK(cuMemAlloc_(&dOut, (size_t)n * 4)); CK(cuMemAlloc_(&dQ, (size_t)(n / 256) * Q8B));
+    static float y[2 * 2 * INTER], g[2 * INTER], hg[2 * INTER];
+    static uint8_t qc[(2 * INTER / 256) * Q8B], qg[(2 * INTER / 256) * Q8B];
+    int bad = 0; long ng = 0, nq = 0;
+    for (int rep = 0; rep < 40; rep++) {
+        for (int i = 0; i < 2 * n; i++) {
+            double mag = pow(10.0, -5.0 + 9.0 * urand());
+            y[i] = (float)((urand() < 0.5 ? -1 : 1) * mag);
+        }
+        /* Edge values, all finite: GEMV outputs are always finite, and the contract
+           does not cover non-finite inputs (ARM and the GPU produce NaNs with
+           different payloads, e.g. gelu(-inf) = -inf/inf). Huge magnitudes still
+           drive the exp overflow and underflow branches. */
+        if (rep == 0) { float sp[] = {0.0f, -0.0f, 1e30f, -1e30f, 3e38f, -3e38f, 7.0f, -7.0f, 30.0f, -30.0f, 1e-30f, -1e-30f};
+                        for (unsigned i = 0; i < sizeof sp / sizeof *sp; i++) y[i] = sp[i]; }
+        /* GeGLU */
+        for (int i = 0; i < n; i++) g[i] = y[i];
+        geglu_ref(g, y + n, n);
+        CK(cuMemcpyHtoD_(dIn, y, (size_t)2 * n * 4));
+        int in = n;
+        void *a1[] = {&dIn, &dOut, &in, &dTab};
+        CK(cuLaunchKernel_(fgeglu, (n + 255) / 256, 1, 1, 256, 1, 1, 0, NULL, a1, NULL));
+        CK(cuCtxSynchronize_());
+        CK(cuMemcpyDtoH_(hg, dOut, (size_t)n * 4));
+        for (int i = 0; i < n; i++) if (memcmp(&g[i], &hg[i], 4)) { if (bad < 10) printf("  geglu i %d: gpu %.9g ref %.9g\n", i, hg[i], g[i]); bad++; }
+        ng += n;
+        /* Q8_K on the GeGLU output, with crafted blocks: all-zero, and +-ties of |x| */
+        if (rep == 1) for (int j = 0; j < 256; j++) g[j] = 0.0f;
+        if (rep == 2) { g[256 + 10] = -5.0f; g[256 + 40] = 5.0f; for (int j = 0; j < 256; j++) if (j != 10 && j != 40) g[256 + j] = 1.0f; }
+        if (rep == 3) { g[512 + 3] = 7.0f; g[512 + 200] = -7.0f; }
+        q8k(g, qc, n);
+        CK(cuMemcpyHtoD_(dOut, g, (size_t)n * 4));
+        void *a2[] = {&dOut, &dQ};
+        CK(cuLaunchKernel_(fq8k, n / 256, 1, 1, 256, 1, 1, 0, NULL, a2, NULL));
+        CK(cuCtxSynchronize_());
+        CK(cuMemcpyDtoH_(qg, dQ, (size_t)(n / 256) * Q8B));
+        for (int b = 0; b < n / 256; b++) if (memcmp(qc + b * Q8B, qg + b * Q8B, 260)) { if (bad < 20) printf("  q8k block %d differs\n", b); bad++; }
+        nq += n / 256;
+    }
+    printf("  GeGLU on GPU: %ld values; Q8_K on GPU: %ld blocks; %d mismatches\n", ng, nq, bad);
     return bad;
 }
 
@@ -233,7 +286,7 @@ int main(int argc, char **argv) {
     { FILE *f = fopen(argv[2], "rb"); if (!f) { perror(argv[2]); return 2; }
       static char ptx[1 << 20]; size_t n = fread(ptx, 1, sizeof ptx - 1, f); fclose(f); ptx[n] = 0;
       CK(cuModuleLoadData_(&m6, ptx)); }
-    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
     CK(cuMemAlloc_(&dW, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dS, (size_t)2 * INTER * (H / 32) * 4));
     CK(cuMemAlloc_(&dX, sizeof XQ)); CK(cuMemAlloc_(&dY, (size_t)VOCAB * 4));
     int fails = 0;
@@ -245,6 +298,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(what, "head") || !strcmp(what, "all")) fails += test_head();
     if (!strcmp(what, "f16") || !strcmp(what, "all")) fails += test_f16();
+    if (!strcmp(what, "mlp") || !strcmp(what, "all")) fails += test_mlp_stages();
     if (!strcmp(what, "perf")) { perf(); return 0; }
     printf(fails ? "M3 GATE: FAIL (%d)\n" : "M3 GATE: OK\n", fails);
     return fails ? 1 : 0;

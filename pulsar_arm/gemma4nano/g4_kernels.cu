@@ -268,3 +268,72 @@ extern "C" __global__ void __launch_bounds__(256) q6k_gemv4(const uint8_t *__res
         }
     }
 }
+
+// ------------------------------------------------------------------------------
+// MLP stages on the GPU, so gate+up -> GeGLU -> Q8_K -> down needs no CPU round
+// trip. Both reproduce g4ref.c bit for bit with explicit IEEE ops (no contraction).
+
+// g4ref.c g4_exp, operation by operation. tab: the same constant table the host
+// assembly uses (24 doubles: 1/13!, EXP_C[0..12], LOG2E, SH, LN2HI, LN2LO, ...).
+__device__ __forceinline__ double g4_exp_dev(double x, const double *__restrict__ tab) {
+    if (x != x) return x;
+    if (x > 709.0) return __longlong_as_double(0x7ff0000000000000ll);
+    if (x < -745.0) return 0.0;
+    const double kd = __dsub_rn(__dadd_rn(__dmul_rn(x, tab[14]), tab[15]), tab[15]);
+    const int k = (int)kd;
+    const double r = __dsub_rn(__dsub_rn(x, __dmul_rn(kd, tab[16])), __dmul_rn(kd, tab[17]));
+    double p = tab[0];
+    #pragma unroll
+    for (int i = 1; i <= 13; i++) p = __dadd_rn(__dmul_rn(p, r), tab[i]);
+    const int k1 = k / 2, k2 = k - k1;
+    const double s1 = __longlong_as_double((long long)(k1 + 1023) << 52);
+    const double s2 = __longlong_as_double((long long)(k2 + 1023) << 52);
+    return __dmul_rn(__dmul_rn(p, s1), s2);
+}
+
+// h[i] = (float)gelu(g[i]) * u[i]; g = y[0..n), u = y[n..2n) (the merged gate+up output)
+extern "C" __global__ void geglu_dev(const float *__restrict__ y, float *__restrict__ h,
+                                     int n, const double *__restrict__ tab) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double x = (double)y[i];
+    const double x3 = __dmul_rn(__dmul_rn(x, x), x);
+    const double t = -__dadd_rn(__dmul_rn(tab[21], x), __dmul_rn(tab[22], x3));
+    const double e = g4_exp_dev(t, tab);
+    const float gl = __double2float_rn(__ddiv_rn(x, __dadd_rn(1.0, e)));
+    h[i] = __fmul_rn(gl, y[n + i]);
+}
+
+// Q8_K quantization of n floats (n % 256 == 0), one 256-thread block per 256 values,
+// output 292-byte blocks (f32 d, 256 int8, 32 bytes unused) as g4ref.c q8k:
+// signed max = the FIRST element with the largest |x| (C: if (a > amax)), found as
+// max |x| then the smallest index holding it; iscale = -127/max;
+// q = nearest_int(fmaf(iscale, x, 0x1.8p23)) clamped below 127; d = 1/iscale.
+extern "C" __global__ void q8k_dev(const float *__restrict__ x, uint8_t *__restrict__ xq) {
+    __shared__ float sa[256];
+    __shared__ int si[256];
+    const int j = threadIdx.x, b = blockIdx.x;
+    const float v = x[b * 256 + j];
+    const float a = fabsf(v);
+    sa[j] = a;
+    __syncthreads();
+    for (int s = 128; s; s >>= 1) { if (j < s) sa[j] = fmaxf(sa[j], sa[j + s]); __syncthreads(); }
+    const float amax = sa[0];
+    si[j] = (a == amax) ? j : 256;
+    __syncthreads();
+    for (int s = 128; s; s >>= 1) { if (j < s) si[j] = min(si[j], si[j + s]); __syncthreads(); }
+    uint8_t *yb = xq + (size_t)b * 292;
+    if (j < 32) yb[260 + j] = 0;
+    if (!(amax > 0.0f)) {                       // all zero: d = 0, q = 0
+        if (j < 4) yb[j] = 0;
+        yb[4 + j] = 0;
+        return;
+    }
+    const float mx = x[b * 256 + si[0]];
+    const float iscale = __fdiv_rn(-127.f, mx);
+    const float f = __fmaf_rn(iscale, v, 12582912.f);
+    int q = (__float_as_int(f) & 0x007fffff) - 0x00400000;
+    q = q < 127 ? q : 127;
+    yb[4 + j] = (uint8_t)(int8_t)q;
+    if (j == 0) { const float d = __fdiv_rn(1.0f, iscale); *(float *)yb = d; }
+}
