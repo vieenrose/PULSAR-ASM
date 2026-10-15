@@ -238,10 +238,93 @@ static int rms_parity(void) {
 }
 #endif
 
+/* fpl: the quant kernels' fused plane emit against quant + pq1_tm_prep_launch,
+ * byte for byte (X written back, Q8_K bytes, planes, per-group sums), on rms
+ * (with and without residual), silu and plain q8k, with zero Q8_K blocks. */
+static int fpl_parity(void) {
+  const int NMAX = 12288, NV = 60;
+  const size_t qb = (size_t)(NMAX / 256) * 292, pb = (size_t)(NMAX / 256) * 73 * 4, ab = (NMAX / 128) * 4;
+  float *X = malloc(2 * NMAX * 4), *R = malloc(NMAX * 4), *W = malloc(NMAX * 4);
+  uint8_t *h1 = malloc(qb + pb + ab + NMAX * 4), *h2 = malloc(qb + pb + ab + NMAX * 4);
+  float *d_X, *d_R, *d_W;
+  uint8_t *d_q;
+  unsigned *d_pl;
+  int *d_au;
+  cudaMalloc((void **)&d_X, 2 * NMAX * 4); cudaMalloc((void **)&d_R, NMAX * 4);
+  cudaMalloc((void **)&d_W, NMAX * 4); cudaMalloc((void **)&d_q, qb);
+  cudaMalloc((void **)&d_pl, pb); cudaMalloc((void **)&d_au, ab);
+  srand(4242);
+  int bad = 0, ncase = 0;
+  for (int v = 0; v < NV; v++) {
+    const int kind = v % 4;   /* 0 rms+R, 1 rms, 2 silu, 3 q8k */
+    const int n = kind < 2 ? 4096 : (v & 4 ? 12288 : 4096);
+    const float sx = powf(2.0f, (float)(rand() % 24) - 12.0f);
+    for (int i = 0; i < 2 * n; i++) X[i] = frand() * sx * (i % 97 == 13 ? 60.0f : 1.0f);
+    for (int i = 0; i < n; i++) { R[i] = frand() * sx; W[i] = 0.25f + 2.0f * fabsf(frand()); }
+    if (v % 3 == 0) for (int i = 256; i < 512; i++) { X[i] = 0.0f; R[i] = 0.0f; X[n + i] = 0.0f; }
+    for (int arm = 0; arm < 2; arm++) {
+      uint8_t *h = arm ? h2 : h1;
+      cudaMemcpy(d_X, X, 2 * n * 4, cudaMemcpyHostToDevice);
+      cudaMemcpy(d_R, R, n * 4, cudaMemcpyHostToDevice);
+      cudaMemcpy(d_W, W, n * 4, cudaMemcpyHostToDevice);
+      cudaMemset(d_q, 0xA5, qb); cudaMemset(d_pl, 0x5A, pb); cudaMemset(d_au, 0x77, ab);
+      int rc;
+      if (!arm) {
+        rc = kind < 2 ? pq1_rms_q8k_launch(d_X, kind ? NULL : d_R, d_W, d_q, n, 0, NULL, 0)
+           : kind == 2 ? pq1_silu_q8k_launch(d_X, n, d_q, NULL, 0)
+                       : pq1_q8k_launch(d_X, n, d_q, 0);
+        rc |= pq1_tm_prep_launch(d_q, d_pl, d_au, n, 0);
+      } else {
+        rc = kind < 2 ? pq1_rms_q8k_pl_launch(d_X, kind ? NULL : d_R, d_W, d_q, d_pl, d_au, n, 0)
+                      : pq1_silu_q8k_pl_launch(kind == 2, d_X, n, d_q, d_pl, d_au, 0);
+      }
+      cudaDeviceSynchronize();
+      if (rc) bad++;
+      cudaMemcpy(h, d_q, (size_t)(n / 256) * 292, cudaMemcpyDeviceToHost);
+      cudaMemcpy(h + qb, d_pl, (size_t)(n / 256) * 73 * 4, cudaMemcpyDeviceToHost);
+      cudaMemcpy(h + qb + pb, d_au, (size_t)(n / 128) * 4, cudaMemcpyDeviceToHost);
+      cudaMemcpy(h + qb + pb + ab, d_X, (size_t)n * 4, cudaMemcpyDeviceToHost);
+    }
+    ncase++;
+    const char *what[4] = {"q8k", "planes", "sums", "X"};
+    const size_t off[4] = {0, qb, qb + pb, qb + pb + ab};
+    const size_t len[4] = {(size_t)(n / 256) * 292, (size_t)(n / 256) * 73 * 4, (size_t)(n / 128) * 4, (size_t)n * 4};
+    for (int k = 0; k < 4; k++)
+      if (memcmp(h1 + off[k], h2 + off[k], len[k])) {
+        if (bad < 8) printf("fpl case %d kind %d n %d: %s differ\n", v, kind, n, what[k]);
+        bad++;
+      }
+  }
+  {
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    float t[6];
+    for (int k = 0; k < 6; k++) {
+      cudaEventRecord(e0, 0);
+      for (int r = 0; r < 200; r++) {
+        if (k == 0) pq1_rms_q8k_launch(d_X, d_R, d_W, d_q, 4096, 0, NULL, 0);
+        if (k == 1) pq1_rms_q8k_pl_launch(d_X, d_R, d_W, d_q, d_pl, NULL, 4096, 0);
+        if (k == 2) pq1_silu_q8k_launch(d_X, 12288, d_q, NULL, 0);
+        if (k == 3) pq1_silu_q8k_pl_launch(1, d_X, 12288, d_q, d_pl, NULL, 0);
+        if (k == 4) pq1_tm_prep_launch(d_q, d_pl, d_au, 4096, 0);
+        if (k == 5) pq1_tm_prep_launch(d_q, d_pl, d_au, 12288, 0);
+      }
+      cudaEventRecord(e1, 0);
+      cudaEventSynchronize(e1);
+      cudaEventElapsedTime(&t[k], e0, e1);
+    }
+    printf("us/call: rms %.2f rms_pl %.2f | silu %.2f silu_pl %.2f | prep4096 %.2f prep12288 %.2f\n",
+           t[0] * 5, t[1] * 5, t[2] * 5, t[3] * 5, t[4] * 5, t[5] * 5);
+  }
+  printf("fpl: %d cases (rms+R, rms, silu, q8k; n 4096/12288; zero blocks), bad=%d\n", ncase, bad);
+  printf("FPL PARITY: %s\n", bad ? "FAIL" : "PASS");
+  return bad ? 1 : 0;
+}
 int main(int argc, char **argv) {
 #if defined(PQ1_REAL_CUDA)
   if (argc > 1 && !strcmp(argv[1], "fa")) return fa_parity();
   if (argc > 1 && !strcmp(argv[1], "rms")) return rms_parity();
+  if (argc > 1 && !strcmp(argv[1], "fpl")) return fpl_parity();
 #endif
   int rows = argc > 1 ? atoi(argv[1]) : 256;
   int K = argc > 2 ? atoi(argv[2]) : 4096;

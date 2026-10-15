@@ -1497,29 +1497,38 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
       return -1;
     }
     cudaStream_t S = PQ1_CS;
+    /* PQ1_FPL=0 is the A/B arm: separate quant + pq1_tm_prep launches (8fa3f38) */
+    static int fpl = -1;
+    if (fpl < 0) { const char *e = getenv("PQ1_FPL"); fpl = e ? atoi(e) : 1; }
+  /* the fused kernels skip the per-group sums when the consuming GEMV (rows N_) never reads them */
+#define PQ1_AU(n_, N_) (pq1_tmx_uses_au(n_, N_) ? d_au : NULL)
+#define PQ1_RMSQ(X_, R_, W_, n_, N_)                                                   \
+  (fpl ? pq1_rms_q8k_pl_launch(X_, R_, W_, d_xq, d_pl, PQ1_AU(n_, N_), n_, S)         \
+       : (pq1_rms_q8k_launch(X_, R_, W_, d_xq, n_, 0, NULL, S) |                        \
+          pq1_tm_prep_launch(d_xq, d_pl, d_au, n_, S)))
+#define PQ1_SQ(silu_, x_, n_, N_)                                                      \
+  (fpl ? pq1_silu_q8k_pl_launch(silu_, x_, n_, d_xq, d_pl, PQ1_AU(n_, N_), S)         \
+       : (((silu_) ? pq1_silu_q8k_launch(x_, n_, d_xq, NULL, S)                         \
+                   : pq1_q8k_launch(x_, n_, d_xq, S)) |                                 \
+          pq1_tm_prep_launch(d_xq, d_pl, d_au, n_, S)))
     rc |= cudaMemcpyAsync(d_ain, PQ1_AIN, PQ1_APAR_XQ, cudaMemcpyHostToDevice, S) != cudaSuccess;
     rc |= cudaMemcpyAsync(d_X, x, (size_t)hid * 4, cudaMemcpyHostToDevice, S) != cudaSuccess;
     for (int il = 0; il < nl && !rc; il++) {
-      rc |= pq1_rms_q8k_launch(d_X, il ? yh : NULL, d_nw + (size_t)(2 * il) * hid, d_xq, hid, 0, NULL, S);
-      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, hid, S);
+      rc |= PQ1_RMSQ(d_X, il ? yh : NULL, d_nw + (size_t)(2 * il) * hid, hid, qr + 2 * kr);
       rc |= pq1_tmx_launch(PQ1M[mq[il]].d_codes, PQ1M[mq[il]].d_scales, d_pl, d_au, qkv, hid,
                            qr + 2 * kr, S);
       rc |= pq1_attn_launch(qkv, d_anw + (size_t)il * 256, d_ain, qo, pq1_kv_layer(il, 0),
                             pq1_kv_layer(il, 1), d_fas, d_fam, atto, nh, nkv, ctx, S);
-      rc |= pq1_q8k_launch(atto, qr, d_xq, S);
-      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, qr, S);
+      rc |= PQ1_SQ(0, atto, qr, hid);
       rc |= pq1_tmx_launch(PQ1C[co[il]].d_codes, PQ1C[co[il]].d_scales, d_pl, d_au, yh, qr, hid, S);
-      rc |= pq1_rms_q8k_launch(d_X, yh, d_nw + (size_t)(2 * il + 1) * hid, d_xq, hid, 0, NULL, S);
-      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, hid, S);
+      rc |= PQ1_RMSQ(d_X, yh, d_nw + (size_t)(2 * il + 1) * hid, hid, 2 * inter);
       rc |= pq1_tmx_launch(PQ1M[mg[il]].d_codes, PQ1M[mg[il]].d_scales, d_pl, d_au, gu, hid,
                            2 * inter, S);
-      rc |= pq1_silu_q8k_launch(gu, inter, d_xq, NULL, S);
-      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, inter, S);
+      rc |= PQ1_SQ(1, gu, inter, hid);
       rc |= pq1_tmx_launch(PQ1C[cd[il]].d_codes, PQ1C[cd[il]].d_scales, d_pl, d_au, yh, inter, hid, S);
     }
     if (!rc) {
-      rc |= pq1_rms_q8k_launch(d_X, yh, d_nw + (size_t)(2 * nl) * hid, d_xq, hid, 0, NULL, S);
-      rc |= pq1_tm_prep_launch(d_xq, d_pl, d_au, hid, S);
+      rc |= PQ1_RMSQ(d_X, yh, d_nw + (size_t)(2 * nl) * hid, hid, vocab);
       rc |= pq1_tmx_launch(PQ1C[ch].d_codes, PQ1C[ch].d_scales, d_pl, d_au, d_y, hid, vocab, S);
       rc |= cudaMemcpyAsync(head, d_y, (size_t)vocab * 4, cudaMemcpyDeviceToHost, S) != cudaSuccess;
     }

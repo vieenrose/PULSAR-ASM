@@ -936,13 +936,25 @@ void pq1_gemv_hs(const uint8_t* __restrict__ w_codes,
   for (;;) {
     const int bnext = bi + stride;
     const int rn0 = bnext < nbatch ? min(bnext * RB, N - RB) : r0;
+#ifdef HS_EXP_HOT
+    const uint4* wn = wq + (size_t)(team & 3) * RB * G;
+    const __half* sn = sq + (size_t)(team & 3) * RB * G;
+#else
     const uint4* wn = wq + (size_t)rn0 * G;
     const __half* sn = sq + (size_t)rn0 * G;
+#endif
     float* P = sh_p[team][buf];
 #pragma unroll
     for (int rr = 0; rr < RB; rr++) {
       const uint4 cw = cwr[rr % PD];
       const __half wsh = wsr[rr % PD];
+#ifdef HS_EXP_NOSC
+      if (rr + PD < RB) {
+        cwr[rr % PD] = __ldg(wb + (rr + PD) * G);
+      } else {
+        cwr[rr % PD] = __ldg(wn + (rr + PD - RB) * G);
+      }
+#else
       if (rr + PD < RB) {
         cwr[rr % PD] = __ldg(wb + (rr + PD) * G);
         wsr[rr % PD] = __ldg(sb + (rr + PD) * G);
@@ -950,16 +962,29 @@ void pq1_gemv_hs(const uint8_t* __restrict__ w_codes,
         cwr[rr % PD] = __ldg(wn + (rr + PD - RB) * G);
         wsr[rr % PD] = __ldg(sn + (rr + PD - RB) * G);
       }
+#endif
+#ifdef HS_EXP_NOCOMP
+      const int isum = __popc(cw.x ^ cw.y ^ cw.z ^ cw.w) + cg;
+#else
       const int isum = 2 * (SM ? hs_group_s(p, n, cw) : hs_group(p, cw)) + cg;
+#endif
       P[rr * PS + g] = __fmul_rn(__fmul_rn(__half2float(wsh), db), (float)isum);
     }
     if (WR == 1) __syncwarp();
     else asm volatile("bar.sync %0, %1;" ::"r"(team + 1), "r"(WR * 32));
+#ifdef HS_ROT
+    if (wt == (WR > 1 ? (bi / stride) % WR : 0) && lane < RB) {
+#else
     if (wt == 0 && lane < RB) {
+#endif
       const float4* src = reinterpret_cast<const float4*>(P + lane * PS);
       float acc = 0.0f;
+#ifdef HS_EXP_NORED
+      for (int k = 0; k < 1; k++) {
+#else
 #pragma unroll
       for (int k = 0; k < G / 4; k++) {
+#endif
         float4 v = src[k];
         acc = __fadd_rn(acc, v.x);
         acc = __fadd_rn(acc, v.y);
@@ -1017,6 +1042,15 @@ extern "C" int pq1_gemv_hs_launch(const uint8_t* w_codes,
     return pq1_gemv_tm_launch(w_codes, w_scales_h, xpl, xau, y, K, N, stream);
   }
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+/* 1 when pq1_tmx_launch(K, N) reads the per-group sums xau: the sign-magnitude
+ * hs kernels rebuild them from the planes, tm and the offset-form arm do not. */
+extern "C" int pq1_tmx_uses_au(int K, int N) {
+  const char* e = getenv("PQ1_HS");
+  const char* v = getenv("PQ1_HSV");
+  if ((e && !atoi(e)) || (v && !atoi(v))) return 1;
+  return N < 16 || (K != 4096 && K != 12288);
 }
 
 /* Engine entry: every T-MAC GEMV goes to the hs kernel above (default since
@@ -1408,13 +1442,46 @@ __device__ __forceinline__ float pq1_expf_dev(float x) {
   return pq1_d2f(__dmul_rn(y, s));
 }
 
+/* Fused T-MAC plane emit (loop-261014-2216 row 17): the quant kernels write
+ * pq1_tm_prep_w's layout (planes of v = byte ^ 0x80, per-group sums) themselves,
+ * so its 145 launches/token go away. */
+/* Vote-free form (VOTE issues slowly here: 1024 ballots cost the rms block
+ * ~5 us): plane q of a 32-byte word from its 8 little-endian words, bit 4i+k =
+ * bit q of byte k of word i, of v = byte ^ 0x80 (the xor flips plane 7 only). */
+__device__ __forceinline__ uint32_t pq1_plane_tr(const uint4 a, const uint4 b, int q) {
+  const uint32_t u[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+  uint32_t o = 0u;
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    uint32_t x = (u[i] >> q) & 0x01010101u;   /* bits 0, 8, 16, 24 */
+    x |= x >> 7;                              /* bits 0,1 and 16,17 */
+    x |= x >> 14;                             /* bits 0..3 */
+    o |= (x & 0xfu) << (4 * i);
+  }
+  return q == 7 ? ~o : o;
+}
+/* sum over 32 bytes of (byte ^ 0x80) */
+__device__ __forceinline__ int pq1_bsum_x80(const uint4 a, const uint4 b) {
+  const uint32_t u[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+  uint32_t s2 = 0u;   /* two 16-bit lanes, each < 16 * 255 */
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const uint32_t v = u[i] ^ 0x80808080u;
+    s2 += (v & 0x00ff00ffu) + ((v >> 8) & 0x00ff00ffu);
+  }
+  return (int)((s2 & 0xffffu) + (s2 >> 16));
+}
+
 /* SILU=1: v = silu(gu[i]) * gu[n+i] (the FFN tail). SILU=0 (loop iter 4): v = gu[i],
  * i.e. plain q8_K_quant of a device vector (the attention output). */
 template <int SILU>
 __global__ __launch_bounds__(256) void pq1_silu_q8k(const float* __restrict__ gu, int n,
                                                     uint8_t* __restrict__ xq,
-                                                    float* __restrict__ vout) {
+                                                    float* __restrict__ vout,
+                                                    uint32_t* __restrict__ pl,
+                                                    int* __restrict__ au) {
   __shared__ float sv[256];
+  __shared__ __align__(16) uint8_t sqb[256];
   __shared__ unsigned sm[8];
   __shared__ int si[8];
   const int t = threadIdx.x, i = blockIdx.x * 256 + t;
@@ -1439,34 +1506,70 @@ __global__ __launch_bounds__(256) void pq1_silu_q8k(const float* __restrict__ gu
 #pragma unroll
   for (int k = 1; k < 8; k++) am = max(am, sm[k]);
   uint8_t* yb = xq + (size_t)blockIdx.x * 292;
-  if (am == 0u) {                                   /* fork: d = 0, qs = 0 */
+  unsigned qb = 0u, dbits = 0u;
+  if (am == 0u) {                                   /* fork: d = 0, qs = 0 (block-uniform) */
     if (t == 0) *reinterpret_cast<uint32_t*>(yb) = 0u;
     yb[4 + t] = 0;
-    return;
+  } else {
+    int idx = (a == am) ? t : 256;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) idx = min(idx, __shfl_xor_sync(0xffffffffu, idx, o));
+    if ((t & 31) == 0) si[t >> 5] = idx;
+    __syncthreads();
+    int first = si[0];
+#pragma unroll
+    for (int k = 1; k < 8; k++) first = min(first, si[k]);
+    const float iscale = pq1_fdiv(-127.0f, sv[first]);
+    qb = (uint8_t)(int8_t)pq1_q8n(v, iscale);
+    yb[4 + t] = (uint8_t)qb;
+    dbits = __float_as_uint(pq1_fdiv(1.0f, iscale));
+    if (t == 0) *reinterpret_cast<uint32_t*>(yb) = dbits;
   }
-  int idx = (a == am) ? t : 256;
-#pragma unroll
-  for (int o = 16; o; o >>= 1) idx = min(idx, __shfl_xor_sync(0xffffffffu, idx, o));
-  if ((t & 31) == 0) si[t >> 5] = idx;
-  __syncthreads();
-  int first = si[0];
-#pragma unroll
-  for (int k = 1; k < 8; k++) first = min(first, si[k]);
-  const float iscale = pq1_fdiv(-127.0f, sv[first]);
-  yb[4 + t] = (uint8_t)(int8_t)pq1_q8n(v, iscale);
-  if (t == 0) *reinterpret_cast<float*>(yb) = pq1_fdiv(1.0f, iscale);
+  if (pl) {                                         /* block b = Q8_K block, warp = word */
+    /* one plane word per lane of warps 0-1: t = 8 * word + plane (the 64 words
+     * of this Q8_K block in order; warp 0 = group 2b, warp 1 = group 2b+1) */
+    uint32_t* dst = pl + (size_t)blockIdx.x * 73;
+    sqb[t] = (uint8_t)qb;
+    __syncthreads();
+    if (t < 64) {                                   /* warp-uniform */
+      const uint4* src = reinterpret_cast<const uint4*>(sqb + (t >> 3) * 32);
+      const uint4 a0 = src[0], a1 = src[1];
+      dst[1 + t] = pq1_plane_tr(a0, a1, t & 7);
+      if (au) {
+        int sum = (t & 7) ? 0 : pq1_bsum_x80(a0, a1);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 8);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 16);
+        if ((t & 31) == 0) au[blockIdx.x * 2 + (t >> 5)] = sum;
+      }
+    } else if (t < 72) {
+      dst[65 + t - 64] = 0u;
+    } else if (t == 72) {
+      dst[0] = dbits;
+    }
+  }
 }
 
 extern "C" int pq1_silu_q8k_launch(const float* gu_d, int n, uint8_t* xq_d, float* vout_d,
                                    void* stream) {
   if (n <= 0 || (n & 255) != 0) return -2;
-  pq1_silu_q8k<1><<<n / 256, 256, 0, (cudaStream_t)stream>>>(gu_d, n, xq_d, vout_d);
+  pq1_silu_q8k<1><<<n / 256, 256, 0, (cudaStream_t)stream>>>(gu_d, n, xq_d, vout_d, NULL, NULL);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
 extern "C" int pq1_q8k_launch(const float* x_d, int n, uint8_t* xq_d, void* stream) {
   if (n <= 0 || (n & 255) != 0) return -2;
-  pq1_silu_q8k<0><<<n / 256, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, NULL);
+  pq1_silu_q8k<0><<<n / 256, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, NULL, NULL, NULL);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+/* the two launches above plus pq1_tm_prep_launch's planes/sums in one kernel */
+extern "C" int pq1_silu_q8k_pl_launch(int silu, const float* x_d, int n, uint8_t* xq_d,
+                                      uint32_t* pl_d, int* au_d, void* stream) {
+  if (n <= 0 || (n & 255) != 0 || n > PQ1_MAXK) return -2;
+  if (silu)
+    pq1_silu_q8k<1><<<n / 256, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, NULL, pl_d, au_d);
+  else
+    pq1_silu_q8k<0><<<n / 256, 256, 0, (cudaStream_t)stream>>>(x_d, n, xq_d, NULL, pl_d, au_d);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
@@ -2004,8 +2107,11 @@ __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
                                                     const float* __restrict__ R,
                                                     const float* __restrict__ w,
                                                     uint8_t* __restrict__ xq, int n, int serial,
-                                                    int* __restrict__ nfb) {
+                                                    int* __restrict__ nfb,
+                                                    uint32_t* __restrict__ pl,
+                                                    int* __restrict__ au) {
   __shared__ float sx[4096];
+  __shared__ uint32_t sq[1024];
   __shared__ double sw[32];
   __shared__ float ssc;
   __shared__ unsigned sam[32];
@@ -2074,24 +2180,49 @@ __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
   if (l == 0) sid[wp] = idx;
   __syncthreads();
   uint8_t* yb = xq + (size_t)b * 292;
-  if (am == 0u) {                                   /* fork: d = 0, qs = 0 */
-    if (lt == 0) *reinterpret_cast<uint32_t*>(yb) = 0u;
-    reinterpret_cast<uint32_t*>(yb + 4)[lt] = 0u;
-    return;
-  }
-  const int first = min(sid[2 * b], sid[2 * b + 1]);
-  const float iscale = pq1_fdiv(-127.0f, sx[b * 256 + first]);
-  uint32_t word = 0u;
+  uint32_t word = 0u, dbits = 0u;                   /* am == 0: fork's d = 0, qs = 0 */
+  if (am != 0u) {
+    const int first = min(sid[2 * b], sid[2 * b + 1]);
+    const float iscale = pq1_fdiv(-127.0f, sx[b * 256 + first]);
 #pragma unroll
-  for (int k = 0; k < 4; k++) word |= (uint32_t)(uint8_t)(int8_t)pq1_q8n(y[k], iscale) << (8 * k);
+    for (int k = 0; k < 4; k++) word |= (uint32_t)(uint8_t)(int8_t)pq1_q8n(y[k], iscale) << (8 * k);
+    dbits = __float_as_uint(pq1_fdiv(1.0f, iscale));
+  }
   reinterpret_cast<uint32_t*>(yb + 4)[lt] = word;
-  if (lt == 0) *reinterpret_cast<float*>(yb) = pq1_fdiv(1.0f, iscale);
+  if (lt == 0) *reinterpret_cast<uint32_t*>(yb) = dbits;
+  if (pl) {                                         /* warp wp = 128-group wp */
+    sq[t] = word;
+    if (lt == 0) pl[(size_t)b * 73] = dbits;
+    if (l < 8 && (wp & 1)) pl[(size_t)b * 73 + 65 + l] = 0u;
+    __syncthreads();
+    /* lane l: word w = l >> 3 of this warp's group, plane q = l & 7 */
+    const uint4* src = reinterpret_cast<const uint4*>(sq + wp * 32 + (l >> 3) * 8);
+    const uint4 a0 = src[0], a1 = src[1];
+    pl[(size_t)b * 73 + 1 + (wp & 1) * 32 + l] = pq1_plane_tr(a0, a1, l & 7);
+    if (au) {                                       /* block-uniform */
+      int sum = (l & 7) ? 0 : pq1_bsum_x80(a0, a1);
+      sum += __shfl_xor_sync(0xffffffffu, sum, 8);
+      sum += __shfl_xor_sync(0xffffffffu, sum, 16);
+      if (l == 0) au[wp] = sum;
+    }
+  }
 }
 
 extern "C" int pq1_rms_q8k_launch(float* X_d, const float* R_d, const float* w_d, uint8_t* xq_d,
                                   int n, int serial, int* nfb_d, void* stream) {
   if (n < 256 || n > 4096 || (n & 255) != 0) return -2;
-  pq1_rms_q8k<<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, serial, nfb_d);
+  pq1_rms_q8k<<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, serial, nfb_d,
+                                                     NULL, NULL);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+/* pq1_rms_q8k_launch plus pq1_tm_prep_launch's planes/sums in one kernel */
+extern "C" int pq1_rms_q8k_pl_launch(float* X_d, const float* R_d, const float* w_d,
+                                     uint8_t* xq_d, uint32_t* pl_d, int* au_d, int n,
+                                     void* stream) {
+  if (n < 256 || n > 4096 || (n & 255) != 0) return -2;
+  pq1_rms_q8k<<<1, n / 4, 0, (cudaStream_t)stream>>>(X_d, R_d, w_d, xq_d, n, 0, NULL, pl_d,
+                                                     au_d);
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 

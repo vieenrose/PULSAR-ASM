@@ -55,6 +55,9 @@ int pq1_silu_q8k_launch(const float *gu_d, int n, unsigned char *xq_d, float *vo
                         void *stream);
 /* loop iter 4: plain q8_K_quant of a device vector (same quant as above) */
 int pq1_q8k_launch(const float *x_d, int n, unsigned char *xq_d, void *stream);
+int pq1_tmx_uses_au(int K, int N);
+int pq1_silu_q8k_pl_launch(int silu, const float *x_d, int n, unsigned char *xq_d,
+                           unsigned int *pl_d, int *au_d, void *stream);
 /* loop iter 4: attention block (head rms + rope + K/V row store, then q.k, softmax,
  * p.v) for one layer. par_d holds, per token: cos[64] | sin[64] at PQ1_APAR_ROPE,
  * int npos at PQ1_APAR_NPOS, the Q8_K activation of attn_norm(x) at PQ1_APAR_XQ. */
@@ -85,6 +88,8 @@ void pq1_fa16_head(const float *q, const uint16_t *K, const uint16_t *V, int T, 
  * NULL) counts the calls that needed it. */
 int pq1_rms_q8k_launch(float *X_d, const float *R_d, const float *w_d, unsigned char *xq_d,
                        int n, int serial, int *nfb_d, void *stream);
+int pq1_rms_q8k_pl_launch(float *X_d, const float *R_d, const float *w_d, unsigned char *xq_d,
+                          unsigned int *pl_d, int *au_d, int n, void *stream);
 /* exhaustive pq1_r16 check; bad_d = 2 zeroed u64 on the device */
 int pq1_r16_test_launch(unsigned long long *bad_d);
 
