@@ -1048,3 +1048,11 @@ lanes, half the barriers), all bit-exact 4096/4096, nvprof parity: old 405-408 u
 NT=2 423-427, NT=2 with uniform per-team batch counts 506. NT=2 runs 3.7% fewer instructions but IPC
 falls 3.90 -> 3.65 as memory-dependency stalls rise 5 -> 18%: the per-batch reduction gap was also
 covering load latency. Patch kept as scratchpad row45_hs3n_private_ring.patch (not in the repo).
+
+Row 46 (discard): pq1_fa_sm fused into pq1_fa_qk4. The last y-block of each kv head (threadfence +
+atomic counter, re-armed by that block so graph replay stays valid) runs the softmax for its 4 query
+heads, one warp each, reading the scores through L2 (__ldcg). It is bit-exact: fa parity
+4096/4096 at T = 1..4096, r16 OK. ab_pair over 3 reps gave new/base 0.9971 (-0.29%). The serial
+tail (atomic, fence, L2 reread of sc, expf chain on 8 blocks) costs more than the ~1.5 us launch
+gap it removes. Conclusion: launch gaps between attention kernels are not worth fusing on this
+board, so the same goes for fusing pv or q8k_w<0>.
