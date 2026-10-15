@@ -1103,3 +1103,19 @@ harness gained K4/V3 support (it had one code width) and a correctly sized parti
 R = 1.0304 / 1.0261 / 1.0292 (bias 1.001 / 0.997 / 0.999); TQ4 vs f16 same rep 1.003 / 1.000 /
 1.003. Short-context TQ4 overhead is gone. Open: ctx > 256 runs still use the long chain while
 T is small (needs a host-side per-step graph choice).
+
+52. Context beyond 4096 positions (keep, capability; short-ctx decode untouched). Compile-time
+CTX 4096 -> 16384, run cap PQ1_CTX (default 4096, 64-aligned, <= 16384). The host f16 K16/V16
+arrays (BSS [36][8][CTX][128], 2.4 GB virtual at 16384) are now calloc'd at KVCTX stride on first
+use by the host attention only (CPU fallback, PQ1_ATT_CHECK); the fused GPU path never touched
+them. Arena: unchanged at ctx <= 4096 (f16-sized, the RSS lesson of row 50); above 4096 it takes
+max(f16 bytes at 4096, TQ bytes at ctx) so it stays monotone. The f16 cache above 4096 is refused
+(147 KB/position: 2.3 GB at 16k does not fit beside 1.19 GB of weights) instead of falling into
+the CPU path. pq1_parity tq 3|4|43 at PQ1_TQ_CTX=16384, T up to 16384: PASS (the harness had a
+4096-entry stack score array that segfaulted at 8192; heap now). Engine runs, TQ4, TF on repeated
+ids2k text: 6144 positions: arena 1717 MB, cache 231.9 MB, max RSS 224 MB, ms/token 110 (pos 1),
+92 (2048), 120 (4096), 145 (6144). 16384 positions: arena 1761 MB, cache 612 MB, PQ1GPU used
+1640 MB, free 301 MB, max RSS 230 MB, ms/token 172 (8192), 223 (12288), 275 (16383). Gates green
+on a fresh build, TQ4 goldens unchanged, prompt A 16.44 tps (single cold sample; the hot path is
+unchanged so no A/B). The per-token cost grows ~13 ms per 1k positions: the TQ qk/pv kernels are
+far from the cache-streaming floor (612 MB at 16k = ~24 ms), next lever.

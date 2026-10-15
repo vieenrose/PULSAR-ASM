@@ -228,7 +228,16 @@ static size_t pq1_kv_cache_bytes(int nl, int nkv, int ctx) {
   return ((size_t)nl * nkv * ctx * ((pq1_tq_cw(0) + pq1_tq_cw(1)) * 4 + 8) + (size_t)2 * nkv * 256 + 255) /
          256 * 256;
 }
-void pq1_kv_shape(int nl, int nkv, int ctx) { PQ1KVS_NL = nl; PQ1KVS_NKV = nkv; PQ1KVS_CTX = ctx; }
+void pq1_kv_shape(int nl, int nkv, int ctx) {
+  /* the exact f16 cache is 147 KB/position on the 8B: past 4096 positions it
+   * no longer fits next to the 1.19 GB of weights in 4 GB, so it is refused
+   * rather than left to fail into the CPU fallback (TQ4 is 39 KB/position) */
+  if (!pq1_kvtq() && ctx > 4096) {
+    fprintf(stderr, "pq1: %d positions need PQ1_KVTQ=3/4/43 (the f16 cache stops at 4096)\n", ctx);
+    exit(2);
+  }
+  PQ1KVS_NL = nl; PQ1KVS_NKV = nkv; PQ1KVS_CTX = ctx;
+}
 static uint8_t *d_xq = NULL;
 static float *d_y = NULL;
 static size_t P2XQMAX = 0, P2YMAX = 0;
@@ -498,9 +507,14 @@ static int pq1_arena_init(size_t need) {
   if (!e && PQ1KVS_CTX > 0) {
     /* sized for the f16 cache even under PQ1_KVTQ: the unused tail costs no
      * device memory (PQ1GPU used_mb unchanged), while a 1280 MB arena instead
-     * of 1426 raised max RSS by ~100 MB (TQ3, ctx 256: 795 vs 694 MB) */
-    const size_t kvb = (size_t)PQ1KVS_NL * 2 * PQ1KVS_NKV * PQ1KVS_CTX * 256 +
-                       (size_t)PQ1_FA_MAXH * PQ1KVS_CTX * 12;
+     * of 1426 raised max RSS by ~100 MB (TQ3, ctx 256: 795 vs 694 MB). Past
+     * 4096 positions (the old CTX) the TQ cache is sized as it is, or never
+     * below the f16 size at 4096, so the arena stays monotone in ctx. */
+    const int fc = !pq1_kvtq() || PQ1KVS_CTX <= 4096 ? PQ1KVS_CTX : 4096;
+    size_t kvb = (size_t)PQ1KVS_NL * 2 * PQ1KVS_NKV * fc * 256;
+    if (pq1_kvtq() && pq1_kv_cache_bytes(PQ1KVS_NL, PQ1KVS_NKV, PQ1KVS_CTX) > kvb)
+      kvb = pq1_kv_cache_bytes(PQ1KVS_NL, PQ1KVS_NKV, PQ1KVS_CTX);
+    kvb += (size_t)PQ1_FA_MAXH * PQ1KVS_CTX * 12;
     const size_t old = (size_t)36 * 2 * 8 * 512 * 128 * 4;   /* the ctx-512 f32 cache */
     if (kvb > old) mb += (kvb - old + (1u << 20) - 1) >> 20;
   }

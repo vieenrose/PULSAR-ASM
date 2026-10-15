@@ -36,7 +36,7 @@
 #ifdef PQ1_BUILD
 /* f16 K/V cache and the fork's flash-attention decode arithmetic (pq1_host.c
  * pq1_fa16_head); the device cache is sized per run (KVCTX) */
-#define CTX 4096
+#define CTX 16384   /* compile-time ceiling; runs default to 4096 (PQ1_CTX), cache KVCTX */
 #else
 #define CTX 512
 #endif
@@ -397,9 +397,13 @@ static float HEAD[VOCAB];
 #define KTB 16                       /* positions per contiguous K^T tile */
 #ifdef PQ1_BUILD
 /* f16 K/V rows, [layer][kv head][position][dim] (the fork's cache type and the
- * device layout). BSS: only the rows the host path writes become resident. */
-static uint16_t K16[36][NKV][CTX][HDIM], V16[36][NKV][CTX][HDIM];
+ * device layout), position stride KVCTX. Allocated on first use by the host
+ * attention (CPU fallback, PQ1_ATT_CHECK): the fused GPU path never touches
+ * them, and a static [CTX] array would reserve 2.4 GB of BSS at CTX 16384. */
+static uint16_t *K16b, *V16b;
 static int KVCTX = CTX;   /* device cache positions for this run */
+#define K16(il, kh, t) (K16b + (((size_t)(il) * NKV + (kh)) * KVCTX + (t)) * HDIM)
+#define V16(il, kh, t) (V16b + (((size_t)(il) * NKV + (kh)) * KVCTX + (t)) * HDIM)
 void pq1_f2h_row(const float *x, uint16_t *h, int n);
 void pq1_fa16_head(const float *q, const uint16_t *K, const uint16_t *V, int T, float scale,
                    float *out);
@@ -525,18 +529,23 @@ static void attn_cpu(int il, int put) {
 #ifdef PQ1_BUILD
     {
         static uint16_t kr[NKV * HDIM], vr[NKV * HDIM];
+        if (!K16b) {
+            K16b = calloc((size_t)36 * NKV * KVCTX * HDIM, 2);
+            V16b = calloc((size_t)36 * NKV * KVCTX * HDIM, 2);
+            if (!K16b || !V16b) { fprintf(stderr, "host K/V cache: out of memory\n"); exit(1); }
+        }
         pq1_f2h_row(KF, kr, NKV * HDIM);
         pq1_f2h_row(VF, vr, NKV * HDIM);
         for (int kh = 0; kh < NKV; kh++) {
-            memcpy(K16[il][kh][NPOS], kr + kh * HDIM, HDIM * 2);
-            memcpy(V16[il][kh][NPOS], vr + kh * HDIM, HDIM * 2);
+            memcpy(K16(il, kh, NPOS), kr + kh * HDIM, HDIM * 2);
+            memcpy(V16(il, kh, NPOS), vr + kh * HDIM, HDIM * 2);
         }
         /* loop iter 4: keep the device K/V cache complete for the fused path */
         if (put && pq1_attn_kv_put) pq1_attn_kv_put(il, NLAYER, NKV, KVCTX, NPOS, kr, vr);
     }
     ct_mark(CT_KVCPY);
     for (int h = 0; h < NHEAD; h++)
-        pq1_fa16_head(QF + h * 128, K16[il][h / 4][0], V16[il][h / 4][0], NPOS + 1, 0.0883883476f,
+        pq1_fa16_head(QF + h * 128, K16(il, h / 4, 0), V16(il, h / 4, 0), NPOS + 1, 0.0883883476f,
                       ATTO + h * 128);
 #else
     (void)put;
@@ -641,8 +650,8 @@ static void att_check(int il) {
     pq1_attn_dbg(il, NPOS, KD, VD, QD, OD, NHEAD);
     attn_cpu(il, 0);
     for (int i = 0; i < NKV * HDIM; i++) {
-        if (KD[i] != K16[il][i / HDIM][NPOS][i % HDIM]) ATTCHK_K++;
-        if (VD[i] != V16[il][i / HDIM][NPOS][i % HDIM]) ATTCHK_V++;
+        if (KD[i] != K16(il, i / HDIM, NPOS)[i % HDIM]) ATTCHK_K++;
+        if (VD[i] != V16(il, i / HDIM, NPOS)[i % HDIM]) ATTCHK_V++;
     }
     for (int i = 0; i < NHEAD * HDIM; i++) {
         if (memcmp(&QD[i], &QF[i], 4)) ATTCHK_Q++;
@@ -659,6 +668,15 @@ int main(int argc, char **argv) {
     XQ = malloc(((size_t)INTER / 256) * 292);
     static int ids[CTX + 8];
     int nids = 0, gen = 0;
+    /* run context: 4096 positions unless PQ1_CTX asks for more (up to the
+     * compile-time CTX; beyond 4096 the device cache must be TurboQuant) */
+    int ctxcap = CTX;
+#ifdef PQ1_BUILD
+    ctxcap = getenv("PQ1_CTX") ? atoi(getenv("PQ1_CTX")) : 4096;
+    if (ctxcap < 1) ctxcap = 4096;
+    ctxcap = (ctxcap + 63) / 64 * 64;   /* the device cache is 64-aligned */
+    if (ctxcap > CTX) ctxcap = CTX;
+#endif
     for (int a = 2; a < argc; a++) {
         if (!strcmp(argv[a], "--gen")) gen = atoi(argv[++a]);
         else if (!strcmp(argv[a], "--trace")) TRACE = 1;
@@ -667,19 +685,19 @@ int main(int argc, char **argv) {
             STopK = atoi(argv[++a]); RS = strtoull(argv[++a], 0, 10);
             if (a + 1 < argc && argv[a+1][0] != '-') SMINP = atof(argv[++a]);
         }
-        else if (nids < CTX) ids[nids++] = atoi(argv[a]);
-        else { fprintf(stderr, "prompt longer than the %d-position context\n", CTX); return 2; }
+        else if (nids < ctxcap) ids[nids++] = atoi(argv[a]);
+        else { fprintf(stderr, "prompt longer than the %d-position context\n", ctxcap); return 2; }
     }
     int n0 = nids;
-    if (n0 + gen > CTX) {
-        fprintf(stderr, "context %d: generation capped at %d tokens\n", CTX, CTX - n0);
-        gen = CTX - n0;
+    if (n0 + gen > ctxcap) {
+        fprintf(stderr, "context %d: generation capped at %d tokens\n", ctxcap, ctxcap - n0);
+        gen = ctxcap - n0;
     }
 #ifdef PQ1_BUILD
     /* the device K/V cache holds this run's positions only (64-aligned): the
      * arena grows by the excess over the old 75.5 MB f32 ctx-512 cache only */
     KVCTX = (n0 + gen + 63) / 64 * 64;
-    if (KVCTX > CTX) KVCTX = CTX;
+    if (KVCTX > ctxcap) KVCTX = ctxcap;
     if (pq1_kv_shape) pq1_kv_shape(NLAYER, NKV, KVCTX);
 #endif
     NPOS = 0;

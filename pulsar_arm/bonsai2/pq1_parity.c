@@ -519,12 +519,13 @@ static int tq_parity(int B) {
   const int nh = 32, nkv = 8, BK = B == 43 ? 4 : B, BV = B == 43 ? 3 : B,
             CWK = BK == 3 ? 12 : 16, CWV = BV == 3 ? 12 : 16;   /* B = 43: 4-bit K, 3-bit V */
   const int ctx = getenv("PQ1_TQ_CTX") ? atoi(getenv("PQ1_TQ_CTX")) : 2048;
-  const int Ts[] = {1, 2, 33, 44, 64, 128, 129, 255, 256, 257, 700, 2048};
+  const int Ts[] = {1, 2, 33, 44, 64, 128, 129, 255, 256, 257, 700, 2048, 4096, 4097, 8192, 12001, 16384};
   float *q = malloc((size_t)nh * 128 * 4), *od = malloc((size_t)nh * 128 * 4);
   uint16_t *K = malloc((size_t)nkv * ctx * 256), *V = malloc((size_t)nkv * ctx * 256);
   uint32_t *kc = malloc((size_t)nkv * ctx * CWK * 4), *vc = malloc((size_t)nkv * ctx * CWV * 4);
   float *ks = malloc((size_t)nkv * ctx * 4), *vs = malloc((size_t)nkv * ctx * 4);
   double *Kd = malloc((size_t)nkv * ctx * 128 * 8), *Vd = malloc((size_t)nkv * ctx * 128 * 8);
+  double *SD = malloc((size_t)2 * ctx * 8);   /* per-head fp64 scores, both references */
   unsigned char par[PQ1_APAR_BYTES];
   float *d_q, *d_sc, *d_part, *d_inv, *d_o, *d_ks, *d_vs;
   unsigned int *d_kc, *d_vc;
@@ -598,7 +599,7 @@ static int tq_parity(int B) {
     double emax = 0, qe2 = 0, qn2 = 0;
     for (int h = 0; h < nh; h++) {
       const int kh = h / 4;
-      double o1[128] = {0}, o2[128] = {0}, s1[4096], s2[4096], m1 = -1e300, m2 = -1e300, z1 = 0, z2 = 0;
+      double o1[128] = {0}, o2[128] = {0}, *s1 = SD, *s2 = SD + ctx, m1 = -1e300, m2 = -1e300, z1 = 0, z2 = 0;
       for (int t = 0; t < T; t++) {
         const double *kd = Kd + ((size_t)kh * ctx + t) * 128;
         const uint16_t *kf = K + ((size_t)kh * ctx + t) * 128;
