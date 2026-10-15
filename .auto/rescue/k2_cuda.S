@@ -1330,6 +1330,31 @@ attention_range:
     cmp x27, x20
     b.ls .LattnR_es_t
     fcvt s10, d10                    /* (f32)es */
+    /* Exp89: p[t] = e[t] / es for all t up front, 4 lanes per vector fdiv (IEEE per
+       lane, identical to the scalar fdiv), instead of one scalar fdiv inside the
+       p-loop. The scalar fdiv is poorly pipelined on the A57. */
+    dup v3.4s, v10.s[0]
+    add x1, x20, #1                  /* count = pos+1 */
+    bic x0, x1, #3
+    mov x27, xzr
+.LattnR_pv:
+    cmp x27, x0
+    b.hs .LattnR_pvt
+    add x10, x25, x27, lsl #2
+    ld1 {v0.4s}, [x10]
+    fdiv v0.4s, v0.4s, v3.4s
+    st1 {v0.4s}, [x10]
+    add x27, x27, #4
+    b .LattnR_pv
+.LattnR_pvt:
+    cmp x27, x1
+    b.hs .LattnR_pdone
+    ldr s0, [x25, x27, lsl #2]
+    fdiv s0, s0, s10
+    str s0, [x25, x27, lsl #2]
+    add x27, x27, #1
+    b .LattnR_pvt
+.LattnR_pdone:
     /* ---- p-loop: o += p * V ----
        Exp72: the 64 accumulators live in v16..v31 (4 lanes x 16 regs) for the
        whole t-sweep instead of being re-loaded and stored to ATTO once per t:
@@ -1357,8 +1382,8 @@ attention_range:
     mov x1, #393216
     mul x3, x3, x1                   /* kv-head plane offset (x2 dead across expf) */
 .LattnR_p_t:
-    ldr s2, [x25, x27, lsl #2]       /* e (stashed; bit-identical, no expf) */
-    fdiv s2, s2, s10                 /* p */
+    add x10, x25, x27, lsl #2
+    ld1r {v2.4s}, [x10]              /* p (precomputed above), replicated */
     add x9, x23, x27, lsl #8         /* VCA row */
     add x9, x9, x3
     /* Exp74: prefetch the V row 8 ahead (4 lines) */
@@ -1366,7 +1391,6 @@ attention_range:
     prfm pldl1keep, [x9, #2112]
     prfm pldl1keep, [x9, #2176]
     prfm pldl1keep, [x9, #2240]
-    dup v2.4s, v2.s[0]
     ld1 {v0.4s}, [x9], #16
     fmla v16.4s, v2.4s, v0.4s
     ld1 {v0.4s}, [x9], #16
