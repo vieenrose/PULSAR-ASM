@@ -1078,3 +1078,10 @@ table and applies the code's sign bit as fmaf(+-1, e, a) (exactly a +- e, output
 parity-timed tq4 per layer at T=1024 0.920 -> 0.437 ms, tq3 0.489 -> 0.472. Engine, TF-2048,
 ms/tok @~1970: f16 117.1, TQ3 91.0, K4V3 90.3, TQ4 88.8 (top-1 90.8 / 95.0 / 96.0%, unchanged).
 TQ4 is now the best arm: fastest at long context and most accurate.
+Row 50 (measured out): larger GPU arena to cut peak RSS. Prompt A, PQ1_ARENA_MB sweep: max RSS
+drops ~1 MB per arena MB (TQ4: 1280 -> 716-724 MB, 1426 -> 583, 1536 -> 469, 1792 -> 214; f16
+same slope), speed and PQ1GPU used_mb unchanged. Mid-run /proc: RssAnon 604 MB (1280) vs 85 MB
+(1792), RssFile 32 vs 34, but system MemAvailable 1426 vs 1421 MB and Cached 1.29 vs 1.26 GB:
+the board uses the same memory, the arena size only moves ~520 MB between the process's anon
+RSS and the nvmap/GPU-allocator accounting. Not a saving. Peak RSS on this board is therefore
+an accounting metric; compare memory claims with MemAvailable at the same arena size.

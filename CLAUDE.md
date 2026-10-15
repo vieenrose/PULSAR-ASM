@@ -51,7 +51,7 @@ The three gates, never overridable: (1) `pq1_parity` all four kernels bit-exact 
 - Prove the code path ran before believing a timing: check the `PQ1_KTIME=1` per-shape table or the `PQ1GPU` counter line. Two sessions lost results to a kernel silently running the old path (a missing `-DPQ1_REAL_CUDA`, and a branch that returned before the merged-output scatter).
 - `ab_kernel.sh` / `ab_kernel_pair.sh` must not be given `GITREF=HEAD`: they append `ab_delegates.inc`, the link fails, and the script measures a stale binary. Valid only for pre-#42 refs.
 - CUDA-graph staging buffers (256 KB activation, 1 MB output) are allocated once and must never be reallocated; a graph that baked in a freed pointer fails silently.
-- The 1280 MB GPU arena is not to be shrunk (raises RSS on Tegra unified memory). Zero-copy host outputs are catastrophic on Tegra (CPU-uncached).
+- The 1280 MB GPU arena is not to be shrunk (raises RSS on Tegra unified memory). Growing it lowers max RSS ~1 MB per MB (1792 MB: 214 MB RSS) without saving anything: MemAvailable is unchanged, anon pages just move to nvmap accounting. Compare memory only at equal arena size, or via MemAvailable. Zero-copy host outputs are catastrophic on Tegra (CPU-uncached).
 - T-MAC wins only on gate+up (24576 rows) and the head (151669 rows); it loses on everything smaller. The discriminator is wave fill, not K length.
 - Any NEON or reordering rewrite of the CPU passes (attention, rmsnorm, Q8_K quant) must preserve IEEE evaluation order and tie-breaks or the goldens break.
 
