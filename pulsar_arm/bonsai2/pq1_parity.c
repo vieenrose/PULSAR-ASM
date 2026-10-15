@@ -237,6 +237,29 @@ int main(int argc, char **argv) {
   printf("tm kernel vs host-ref: %d/%d bit-exact, maxrel %.2e %s\n", exact_tm, rows,
          mdm, exact_tm == rows ? "BIT-EXACT" : (mdm < 1e-5 ? "CLOSE" : "MISMATCH"));
 
+  /* ---- group-stationary Harley-Seal variant: same planes, same gate ------ */
+  float *yH = (float *)malloc((size_t)rows * 4);
+  float *d_y5 = NULL;
+  if (!yH) { printf("oom\n"); return 2; }
+  cudaMalloc((void **)&d_y5, (size_t)rows * 4);
+  cudaMemset(d_y5, 0xFF, (size_t)rows * 4);
+  int rc5 = pq1_gemv_hs_launch(d_wb, d_sc, d_pl, d_au, d_y5, K, rows, NULL);
+  if (rc5 != 0) { printf("hs launch failed rc=%d\n", rc5); return 1; }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    printf("hs sync: %s\n", cudaGetErrorString(cudaGetLastError()));
+    return 1;
+  }
+  cudaMemcpy(yH, d_y5, (size_t)rows * 4, cudaMemcpyDeviceToHost);
+  int exact_hs = 0;
+  double mdh = 0;
+  for (int r = 0; r < rows; r++) {
+    if (!memcmp(&yA[r], &yH[r], 4)) exact_hs++;
+    double d = fabs((double)yA[r] - (double)yH[r]) / fmax(fabs((double)yA[r]), 1e-6);
+    if (d > mdh) mdh = d;
+  }
+  printf("hs kernel vs host-ref: %d/%d bit-exact, maxrel %.2e %s\n", exact_hs, rows,
+         mdh, exact_hs == rows ? "BIT-EXACT" : (mdh < 1e-5 ? "CLOSE" : "MISMATCH"));
+
   /* ---- 128-rows/block variant (run #45): same reference, same gate -------- */
   float *yD = (float *)malloc((size_t)rows * 4);
   float *d_y3 = NULL;
@@ -295,9 +318,10 @@ int main(int argc, char **argv) {
       pq1_gemv_tm_launch(d_wb, d_sc, d_pl, d_au, d_y2, K, rows, NULL);
       pq1_gemv_r128_launch(d_wb, d_sc, d_xq, d_y3, K, rows, NULL);
       pq1_gemv_r256_launch(d_wb, d_sc, d_xq, d_y4, K, rows, NULL);
+      pq1_gemv_hs_launch(d_wb, d_sc, d_pl, d_au, d_y5, K, rows, NULL);
     }
     cudaDeviceSynchronize();
-    double ta = 0, tb = 0, tc = 0, td = 0;
+    double ta = 0, tb = 0, tc = 0, td = 0, te = 0;
     struct timespec s0, s1;
     for (int i = 0; i < nit; i++) {
       if (gap) usleep(gap);
@@ -324,13 +348,21 @@ int main(int argc, char **argv) {
       cudaDeviceSynchronize();
       clock_gettime(CLOCK_MONOTONIC, &s1);
       tb += (double)(s1.tv_sec - s0.tv_sec) * 1e3 + (double)(s1.tv_nsec - s0.tv_nsec) * 1e-6;
+      if (gap) usleep(gap);
+      clock_gettime(CLOCK_MONOTONIC, &s0);
+      pq1_gemv_hs_launch(d_wb, d_sc, d_pl, d_au, d_y5, K, rows, NULL);
+      cudaDeviceSynchronize();
+      clock_gettime(CLOCK_MONOTONIC, &s1);
+      te += (double)(s1.tv_sec - s0.tv_sec) * 1e3 + (double)(s1.tv_nsec - s0.tv_nsec) * 1e-6;
     }
-    printf("PQ1TIME iters=%d rows=%d K=%d gap=%ldus swar=%.4f ms  r128=%.4f ms (%.4fx)  r256=%.4f ms (%.4fx)  tm=%.4f ms\n",
-           nit, rows, K, gap, ta / nit, tc / nit, ta / tc, td / nit, ta / td, tb / nit);
+    printf("PQ1TIME iters=%d rows=%d K=%d gap=%ldus swar=%.4f ms  r128=%.4f ms (%.4fx)  r256=%.4f ms (%.4fx)  tm=%.4f ms  hs=%.4f ms (tm/hs %.4fx)\n",
+           nit, rows, K, gap, ta / nit, tc / nit, ta / tc, td / nit, ta / td, tb / nit, te / nit, tb / te);
   }
   if (argc > 3 && !strcmp(argv[3], "all"))
     return (exact == rows && exact_tm == rows && exact_r == rows &&
-            exact_e == rows && repack_ok) ? 0 : 1;
+            exact_e == rows && exact_hs == rows && repack_ok) ? 0 : 1;
+  if (argc > 3 && !strcmp(argv[3], "hs"))
+    return (exact == rows && exact_hs == rows && repack_ok) ? 0 : 1;
   if (argc > 3 && !strcmp(argv[3], "tm"))
     return (exact == rows && exact_tm == rows && repack_ok) ? 0 : 1;
   if (argc > 3 && !strcmp(argv[3], "r128"))

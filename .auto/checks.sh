@@ -32,7 +32,8 @@ bash "$REPO/.auto/build_q1.sh" || fail "build failed - refusing to gate unbuilt 
 
 # --- 1. kernel bit-exactness -------------------------------------------------
 # mode "all" checks EVERY device kernel in the TU against the host reference
-# (64-row SWAR, 128-row r128 = the engine default, T-MAC). Run #45 made r128 the
+# (64-row SWAR, 128-row r128, T-MAC tm, Harley-Seal hs = the engine default
+# since loop-261014-2216 row 12). Run #45 made r128 the
 # default, so the gate must cover it: a gate that only checks the kernel the
 # engine no longer runs is vacuous. Non-zero exit = any kernel not bit-exact.
 if ! ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 all >/dev/null 2>&1 && ./pq1_parity 512 12288 all >/dev/null 2>&1"; then
@@ -40,9 +41,9 @@ if ! ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 all >/dev/
   fail "pq1 parity (all kernels): $(echo "$P" | grep -E 'MISMATCH|failed' | head -n 2)"
 fi
 P=$(ssh -o ConnectTimeout=25 "$NANO" "cd $R && ./pq1_parity 256 4096 all 2>&1; ./pq1_parity 512 12288 all 2>&1" 2>/dev/null)
-[ "$(echo "$P" | grep -c '256/256 bit-exact')" -ge 4 ] || fail "K=4096: not all kernels bit-exact"
-[ "$(echo "$P" | grep -c '512/512 bit-exact')" -ge 4 ] || fail "K=12288: not all kernels bit-exact"
-echo "checks: pq1 kernels (swar, r128, r256, tm) BIT-EXACT at K=4096 (256/256) and K=12288 (512/512)"
+[ "$(echo "$P" | grep -c '256/256 bit-exact')" -ge 5 ] || fail "K=4096: not all kernels bit-exact"
+[ "$(echo "$P" | grep -c '512/512 bit-exact')" -ge 5 ] || fail "K=12288: not all kernels bit-exact"
+echo "checks: pq1 kernels (swar, r128, r256, tm, hs) BIT-EXACT at K=4096 (256/256) and K=12288 (512/512)"
 
 # --- 2. greedy stream goldens ------------------------------------------------
 ssh -o ConnectTimeout=25 "$NANO" \

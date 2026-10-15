@@ -34,6 +34,15 @@ void pq1_build_au(const uint8_t *xq, int K, int *au);
 int pq1_gemv_tm_launch(const unsigned char *w_bits,
                        const unsigned short *w_scales_h, const unsigned int *xpl,
                        const int *xau, float *y, int K, int N, void *stream);
+/* Group-stationary Harley-Seal kernel (same inputs and result as tm; K = 4096
+ * or 12288, other K fall back to tm). pq1_tmx_launch is the engine entry:
+ * hs is the default; PQ1_HS=0 selects tm. */
+int pq1_gemv_hs_launch(const unsigned char *w_bits,
+                       const unsigned short *w_scales_h, const unsigned int *xpl,
+                       const int *xau, float *y, int K, int N, void *stream);
+int pq1_tmx_launch(const unsigned char *w_bits,
+                   const unsigned short *w_scales_h, const unsigned int *xpl,
+                   const int *xau, float *y, int K, int N, void *stream);
 /* Device-side pq1_build_planes + pq1_build_au (run #72): xq_d holds the raw
  * Q8_K bytes (as uploaded for the SWAR kernels), pl_d/au_d receive the planes
  * (same byte size as xq) and the K/128 group sums. Graph-capturable. */

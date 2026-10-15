@@ -95,7 +95,7 @@ static int pq1_graph_run(pq1_graph *G, int use256 /* 0 r128, 1 r256, 2 tm */, co
          * the bit-sliced kernel - all inside the one graph */
         rc = pq1_tm_prep_launch((const uint8_t *)xq_d, d_pl, d_au, K, PQ1_CS);
         if (rc == 0)
-          rc = pq1_gemv_tm_launch((const uint8_t *)dc, (const unsigned short *)dsc,
+          rc = pq1_tmx_launch((const uint8_t *)dc, (const unsigned short *)dsc,
                                   d_pl, d_au, (float *)y_dev, K, N, PQ1_CS);
       } else
       rc = use256
@@ -701,7 +701,7 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
         } else {
           ok = cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
                pq1_tm_prep_launch(d_xq, d_pl, d_au, cols, NULL) == 0 &&
-               pq1_gemv_tm_launch(dc, dsc, d_pl, d_au, d_y, cols, ng_rows, NULL) == 0 &&
+               pq1_tmx_launch(dc, dsc, d_pl, d_au, d_y, cols, ng_rows, NULL) == 0 &&
                cudaDeviceSynchronize() == cudaSuccess &&
                cudaMemcpy(y, d_y, ygb, cudaMemcpyDeviceToHost) == cudaSuccess;
         }
@@ -1021,7 +1021,7 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
       } else {
         ok = cudaMemcpy(d_xq, xq, xqb, cudaMemcpyHostToDevice) == cudaSuccess &&
              pq1_tm_prep_launch(d_xq, d_pl, d_au, cols, NULL) == 0 &&
-             pq1_gemv_tm_launch(dc, dsc, d_pl, d_au, MDY, cols, ng_rows, NULL) == 0 &&
+             pq1_tmx_launch(dc, dsc, d_pl, d_au, MDY, cols, ng_rows, NULL) == 0 &&
              cudaDeviceSynchronize() == cudaSuccess &&
              cudaMemcpy(stage, MDY, ygb, cudaMemcpyDeviceToHost) == cudaSuccess;
       }
@@ -1155,11 +1155,11 @@ int pq1_ffn_fused(const unsigned char *wg, const unsigned char *wu, const unsign
     }
     if (cudaMemcpyAsync(d_xq, xq, xqb1, cudaMemcpyHostToDevice, PQ1_CS) == cudaSuccess &&
         pq1_tm_prep_launch(d_xq, d_pl, d_au, hid, PQ1_CS) == 0 &&
-        pq1_gemv_tm_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, gu, hid, 2 * inter,
+        pq1_tmx_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, gu, hid, 2 * inter,
                            PQ1_CS) == 0 &&
         pq1_silu_q8k_launch(gu, inter, d_xq, NULL, PQ1_CS) == 0 &&
         pq1_tm_prep_launch(d_xq, d_pl, d_au, inter, PQ1_CS) == 0 &&
-        pq1_gemv_tm_launch(PQ1C[ci].d_codes, PQ1C[ci].d_scales, d_pl, d_au, yd, inter, hid,
+        pq1_tmx_launch(PQ1C[ci].d_codes, PQ1C[ci].d_scales, d_pl, d_au, yd, inter, hid,
                            PQ1_CS) == 0 &&
         cudaMemcpyAsync(fo, yd, (size_t)hid * 4, cudaMemcpyDeviceToHost, PQ1_CS) == cudaSuccess)
       rc = 0;
@@ -1327,13 +1327,13 @@ int pq1_attn_fused(int il, const unsigned char *wq, const unsigned char *wk,
     }
     if (cudaMemcpyAsync(d_ain, PQ1_AIN, PQ1_APAR_XQ + xqb, cudaMemcpyHostToDevice, PQ1_CS) == cudaSuccess &&
         pq1_tm_prep_launch(d_ain + PQ1_APAR_XQ, d_pl, d_au, hid, PQ1_CS) == 0 &&
-        pq1_gemv_tm_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, qkv, hid,
+        pq1_tmx_launch(PQ1M[mi].d_codes, PQ1M[mi].d_scales, d_pl, d_au, qkv, hid,
                            qr + 2 * kr, PQ1_CS) == 0 &&
         pq1_attn_launch(qkv, d_anw + (size_t)il * 256, d_ain, qo, pq1_kv_layer(il, 0),
                         pq1_kv_layer(il, 1), d_fas, d_fam, atto, nh, nkv, ctx, PQ1_CS) == 0 &&
         pq1_q8k_launch(atto, qr, d_xq, PQ1_CS) == 0 &&
         pq1_tm_prep_launch(d_xq, d_pl, d_au, qr, PQ1_CS) == 0 &&
-        pq1_gemv_tm_launch(PQ1C[ci].d_codes, PQ1C[ci].d_scales, d_pl, d_au, yo, qr, hid,
+        pq1_tmx_launch(PQ1C[ci].d_codes, PQ1C[ci].d_scales, d_pl, d_au, yo, qr, hid,
                            PQ1_CS) == 0 &&
         cudaMemcpyAsync(ao, yo, (size_t)hid * 4, cudaMemcpyDeviceToHost, PQ1_CS) == cudaSuccess)
       rc = 0;
