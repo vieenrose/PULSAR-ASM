@@ -330,6 +330,11 @@ static const float *rope_cs(int full, int sin_, int pos) {
 }
 
 static float KC[FIRST_SHARED][MAXSEQ * HD_F], VC[FIRST_SHARED][MAXSEQ * HD_F];
+/* prefetch request: the K/V rows the next attention will read. forward() fills it
+   before the layer's q projection; the engine touches the lines into L2 while it
+   waits for that GEMV (no architectural effect). The reference ignores it. */
+static const char *PF_P[2];
+static size_t PF_N[2];
 static float xs[H], hb[H], qb[NH * HD_F], kb[HD_F], vb[HD_F], ab[NH * HD_F],
              gb[2 * INTER], ub[2 * INTER], pin[NL * PLE], projb[NL * PLE], pleg[PLE],
              rowe[NL * PLE], sc[MAXSEQ], logits[VOCAB];
@@ -405,6 +410,12 @@ static void __attribute__((unused)) forward(int tok, int pos) {
         /* attention */
         G_RMS(xs, L->n_attn, hb, H);
         G_Q8K(hb, XQ, H);
+        {
+            int srcp = il < FIRST_SHARED ? il : (full ? store_f : store_s);
+            int lop = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
+            PF_P[0] = (const char *)(KC[srcp] + (size_t)lop * hd); PF_N[0] = (size_t)(pos - lop) * hd * 4;
+            PF_P[1] = (const char *)(VC[srcp] + (size_t)lop * hd); PF_N[1] = (size_t)(pos - lop) * hd * 4;
+        }
         if (il < FIRST_SHARED) {               /* q, k, v share the quantized input */
             const tensor_t *ts[3] = {L->q, L->k, L->v};
             float *ys[3] = {qb, kb, vb};

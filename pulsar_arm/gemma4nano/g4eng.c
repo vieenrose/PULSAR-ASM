@@ -80,6 +80,11 @@ static uint64_t dalloc(size_t n) { uint64_t d; CK(cuMemAlloc_(&d, n)); dev_bytes
 
 static void wait_stream(void) {
     CK(cuEventRecord_(event, stream));
+    if (PF_N[0] | PF_N[1]) {   /* use the GPU wait: pull the next attention's K/V into L2 */
+        for (int k = 0; k < 2; k++)
+            for (size_t o = 0; o < PF_N[k]; o += 64) __builtin_prefetch(PF_P[k] + o, 0, 2);
+        PF_N[0] = PF_N[1] = 0;
+    }
     CUresult r;
     while ((r = cuEventQuery_(event)) == 600) { }
     if (r) { fprintf(stderr, "event query %d\n", r); exit(3); }
