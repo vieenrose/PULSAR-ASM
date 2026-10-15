@@ -45,7 +45,12 @@ static CUresult (*cuMemHostGetDevicePointer_)(uint64_t *, void *, unsigned);
 static void *sym(void *h, const char *n) { void *p = dlsym(h, n); if (!p) { fprintf(stderr, "no %s\n", n); exit(3); } return p; }
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
-static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k;
+static void *fq4, *fq6, *ff16, *fxc, *fgeglu, *fq8k, *fq4i;
+/* per tensor: 0 = K2 q4_gemv layout, 1 = q4i_gemv3 (row-per-lane, tile-interleaved).
+   Chosen per weight group at load: q4i where it measured faster (>= 1536 rows and
+   <= 6144 columns), K2 elsewhere (k/v alone, inp_gate, down at 12288 columns). */
+static unsigned char KIND[600];
+static int use_q4i = 1;
 static uint64_t dYdev, dHdev, dX2, dTab;    /* device-only MLP intermediates */
 /* fast driver path (G4FAST, default on), the K2 Exp93-96 recipe: one non-blocking
    stream; inputs written to DEVICEMAP-pinned host memory and moved on the GPU by
@@ -106,14 +111,25 @@ static void stage_in(const void *src, size_t n, uint64_t dst) {
     void *a[] = {&h_in_dev, &dst, &nw};
     CK(cuLaunchKernel_(fxc, (nw + 255) / 256, 1, 1, 256, 1, 1, 0, stream, a, NULL));
 }
+/* launch the Q4_0 GEMV of a weight group on the stream (K2 or q4i layout) */
+static void launch_q4(int kind, uint64_t *w, uint64_t *s, uint64_t xq_dev, uint64_t y_dev, uint32_t cols, uint32_t rows) {
+    if (kind) {
+        int irows = (int)rows, icols = (int)cols;
+        unsigned sm = cols * 2 + cols / 32 * 4 + cols / 256 * 4;
+        void *a[] = {w, s, &xq_dev, &y_dev, &irows, &icols};
+        CK(cuLaunchKernel_(fq4i, (rows + 255) / 256, 1, 1, 32, 8, 1, sm, stream, a, NULL));
+    } else {
+        uint32_t r0 = 0, r1 = rows, nb = cols / 32, rf = rows;
+        void *a[] = {w, s, &xq_dev, &y_dev, &r0, &r1, &nb, &rf};
+        CK(cuLaunchKernel_(fq4, (r1 + 31) / 32, 1, 1, 32, 8, 1, 0, stream, a, NULL));
+    }
+}
 /* one Q4_0 launch over rows [0, rows) of the weights at (w, s), y -> pinned host */
-static void q4_fast(uint64_t *w, uint64_t *s, uint32_t cols, uint32_t rows, const uint8_t *xq, float *y) {
+static void q4_fast(int kind, uint64_t *w, uint64_t *s, uint32_t cols, uint32_t rows, const uint8_t *xq, float *y) {
     double a_ = prof ? now_ms() : 0;
     stage_in(xq, (size_t)(cols / 256) * Q8B, dX);
-    uint32_t r0 = 0, r1 = rows, nb = cols / 32, rf = rows;
-    void *args[] = {w, s, &dX, &h_out_dev, &r0, &r1, &nb, &rf};
     double b_ = prof ? now_ms() : 0;
-    CK(cuLaunchKernel_(fq4, (r1 + 31) / 32, 1, 1, 32, 8, 1, 0, stream, args, NULL));
+    launch_q4(kind, w, s, dX, h_out_dev, cols, rows);
     wait_stream();
     double c_ = prof ? now_ms() : 0;
     copy_from_pinned(y, h_out, (size_t)rows * 4);
@@ -128,17 +144,13 @@ static void gpu_mlp(const layer_t *L, int inter, float *out) {
     int ig = (int)(L->gate - T), id = (int)(L->down - T);
     double a_ = prof ? now_ms() : 0;
     stage_in(XQ, (size_t)(H / 256) * Q8B, dX);
-    uint32_t r0 = 0, r1 = 2 * inter, nb = H / 32, rf = r1;
-    void *a1[] = {&DW[ig], &DS[ig], &dX, &dYdev, &r0, &r1, &nb, &rf};
-    CK(cuLaunchKernel_(fq4, (r1 + 31) / 32, 1, 1, 32, 8, 1, 0, stream, a1, NULL));
+    launch_q4(KIND[ig], &DW[ig], &DS[ig], dX, dYdev, H, 2 * inter);
     int n = inter;
     void *a2[] = {&dYdev, &dHdev, &n, &dTab};
     CK(cuLaunchKernel_(fgeglu, (n + 255) / 256, 1, 1, 256, 1, 1, 0, stream, a2, NULL));
     void *a3[] = {&dHdev, &dX2};
     CK(cuLaunchKernel_(fq8k, n / 256, 1, 1, 256, 1, 1, 0, stream, a3, NULL));
-    uint32_t r1d = H, nbd = (uint32_t)inter / 32, rfd = H;
-    void *a4[] = {&DW[id], &DS[id], &dX2, &h_out_dev, &r0, &r1d, &nbd, &rfd};
-    CK(cuLaunchKernel_(fq4, (r1d + 31) / 32, 1, 1, 32, 8, 1, 0, stream, a4, NULL));
+    launch_q4(KIND[id], &DW[id], &DS[id], dX2, h_out_dev, (uint32_t)inter, H);
     double b_ = prof ? now_ms() : 0;
     wait_stream();
     double c_ = prof ? now_ms() : 0;
@@ -149,7 +161,7 @@ static void gpu_mlp(const layer_t *L, int inter, float *out) {
 /* ---------------------------------------------------------------- hooks */
 static void gpu_q4(const tensor_t *t, const uint8_t *xq, float *y) {
     int i = (int)(t - T);
-    if (fast) { q4_fast(&DW[i], &DS[i], (uint32_t)t->dims[0], (uint32_t)t->dims[1], xq, y); return; }
+    if (fast) { q4_fast(KIND[i], &DW[i], &DS[i], (uint32_t)t->dims[0], (uint32_t)t->dims[1], xq, y); return; }
     uint32_t cols = (uint32_t)t->dims[0], r0 = 0, r1 = (uint32_t)t->dims[1], nb = cols / 32, rf = r1;
     double a_ = prof ? now_ms() : 0;
     CK(cuMemcpyHtoD_(dX, xq, (size_t)(cols / 256) * Q8B));
@@ -166,6 +178,16 @@ static void gpu_q4(const tensor_t *t, const uint8_t *xq, float *y) {
 static float YCAT[2 * 2 * INTER];
 static void gpu_q4n(int n, const tensor_t **ts, const uint8_t *xq, float **ys) {
     uint32_t rows = 0;
+    if (KIND[ts[0] - T]) {   /* q4i group: one interleaved image, launched as a whole */
+        for (int k = 0; k < n; k++) {
+            if (!KIND[ts[k] - T] || DW[ts[k] - T] != DW[ts[0] - T]) { fprintf(stderr, "q4i group mismatch\n"); exit(3); }
+            rows += (uint32_t)ts[k]->dims[1];
+        }
+        int i0 = (int)(ts[0] - T);
+        q4_fast(1, &DW[i0], &DS[i0], (uint32_t)ts[0]->dims[0], rows, xq, YCAT);
+        for (int k = 0, off = 0; k < n; off += (int)ts[k]->dims[1], k++) memcpy(ys[k], YCAT + off, ts[k]->dims[1] * 4);
+        return;
+    }
     for (int k = 0; k < n; k++) {
         int i = (int)(ts[k] - T);
         size_t nb_k = ts[k]->dims[0] / 32;
@@ -178,7 +200,7 @@ static void gpu_q4n(int n, const tensor_t **ts, const uint8_t *xq, float **ys) {
     }
     int i0 = (int)(ts[0] - T);
     if (fast) {
-        q4_fast(&DW[i0], &DS[i0], (uint32_t)ts[0]->dims[0], rows, xq, YCAT);
+        q4_fast(KIND[i0], &DW[i0], &DS[i0], (uint32_t)ts[0]->dims[0], rows, xq, YCAT);
         for (int k = 0, off = 0; k < n; off += (int)ts[k]->dims[1], k++) memcpy(ys[k], YCAT + off, ts[k]->dims[1] * 4);
         return;
     }
@@ -260,7 +282,9 @@ static void gpu_init(void) {
     CK(cuInit_(0)); CK(cuDeviceGet_(&dev, 0)); CK(cuCtxCreate_(&ctx, 0, dev));
     CK(cuModuleLoadData_(&m4, G4_PTX_Q4)); CK(cuModuleGetFunction_(&fq4, m4, "q4_gemv"));
     CK(cuModuleGetFunction_(&fxc, m4, "xq_copy"));
+
     fast = !(getenv("G4FAST") && getenv("G4FAST")[0] == '0');
+    use_q4i = fast && !(getenv("G4Q4I") && getenv("G4Q4I")[0] == '0');   /* q4i needs the fast path */
     if (fast) {
         CK(cuStreamCreate_(&stream, 1));                       /* non-blocking */
         CK(cuEventCreate_(&event, 2));                         /* CU_EVENT_DISABLE_TIMING */
@@ -272,6 +296,7 @@ static void gpu_init(void) {
     CK(cuModuleLoadData_(&mk, G4_PTX_K));
     CK(cuModuleGetFunction_(&fq6, mk, "q6k_gemv4")); CK(cuModuleGetFunction_(&ff16, mk, "f16_gemv_t"));
     CK(cuModuleGetFunction_(&fgeglu, mk, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, mk, "q8k_dev"));
+    CK(cuModuleGetFunction_(&fq4i, mk, "q4i_gemv3"));
     dYdev = dalloc((size_t)4 * INTER * 4); dHdev = dalloc((size_t)2 * INTER * 4); dX2 = dalloc(sizeof XQ);
     {   /* exp/GELU constants for geglu_dev: g4ref.c's own definitions */
         double v[24] = {EXP_P0};
@@ -293,6 +318,32 @@ static void gpu_init(void) {
             for (int k = 0; k < 3 && grp[g][k]; k++) tot += (size_t)grp[g][k]->dims[1] * (grp[g][k]->dims[0] / 32);
             uint64_t bw = dalloc(tot * 16), bs = dalloc(tot * 4);
             size_t off = 0;
+            size_t grows = 0;
+            for (int k = 0; k < 3 && grp[g][k]; k++) grows += grp[g][k]->dims[1];
+            int gcols = (int)grp[g][0]->dims[0];
+            int kind = use_q4i && grows >= 1536 && gcols <= 6144 && grows % 32 == 0;
+            if (kind) {   /* q4i: tile-interleave the whole group: [tile][block][32 rows] */
+                int nbq = gcols / 32;
+                uint8_t *nib = malloc(tot * 16); float *scl = malloc(tot * 4);
+                size_t r = 0;
+                for (int k = 0; k < 3 && grp[g][k]; k++) {
+                    const tensor_t *t = grp[g][k];
+                    for (size_t rr = 0; rr < t->dims[1]; rr++, r++)
+                        for (int b = 0; b < nbq; b++) {
+                            const uint8_t *blk = t->data + (rr * nbq + b) * 18;
+                            size_t o = ((r / 32) * nbq + b) * 32 + (r % 32);
+                            scl[o] = h2f((uint16_t)(blk[0] | blk[1] << 8));
+                            memcpy(nib + o * 16, blk + 2, 16);
+                        }
+                    int i = (int)(t - T);
+                    DW[i] = bw; DS[i] = bs; KIND[i] = 1;   /* only the group start is launched */
+                    drop_pages(t->data, (size_t)t->dims[1] * nbq * 18);
+                    nq4++;
+                }
+                CK(cuMemcpyHtoD_(bw, nib, tot * 16)); CK(cuMemcpyHtoD_(bs, scl, tot * 4));
+                free(nib); free(scl);
+                continue;
+            }
             for (int k = 0; k < 3 && grp[g][k]; k++) {
                 const tensor_t *t = grp[g][k];
                 int i = (int)(t - T);
@@ -332,6 +383,8 @@ static void gpu_init(void) {
     }
     size_t fr = 0, tot = 0; cuMemGetInfo_(&fr, &tot);
     if (fast) fprintf(stderr, "GPU driver path: fast (stream, timing-free event, mapped pinned I/O)\n");
+    { int nk = 0; for (int i = 0; i < NT; i++) nk += KIND[i];
+      fprintf(stderr, "Q4_0 kernels: %d tensors on q4i_gemv3, %d on K2 q4_gemv\n", nk, nq4 - nk); }
     fprintf(stderr, "GPU: %d Q4_0 tensors + Q6_K head + F16 proj, %.1f MB on device, %.0f MB free of %.0f; load %.0f ms\n",
             nq4, dev_bytes / 1048576.0, fr / 1048576.0, tot / 1048576.0, now_ms() - t0);
     G_Q4 = gpu_q4; G_Q4N = gpu_q4n; G_HEAD = gpu_head; G_F16 = gpu_f16;

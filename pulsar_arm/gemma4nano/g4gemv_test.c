@@ -46,9 +46,26 @@ static void make_x(float *x, int n, int kind) {
 }
 static int first_diff(const float *a, const float *b, int n) { for (int i = 0; i < n; i++) if (memcmp(a + i, b + i, 4)) return i; return -1; }
 
-static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k;
+static void *fq4, *fq6, *fq62, *fq63, *fq64, *ff16, *fgeglu, *fq8k, *fq4i;
+static uint64_t dWi, dSi;
 static uint64_t dW, dS, dX, dY;
 
+/* q4i layout: [tile of 32 rows][block][32 rows] x (16 B nibbles | f32 scale) */
+static void repack_q4i(const tensor_t *t, uint8_t *nib, float *scl) {
+    int nb = (int)t->dims[0] / 32, rows = (int)t->dims[1];
+    for (int r = 0; r < rows; r++) for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = t->data + ((size_t)r * nb + b) * 18;
+        size_t o = ((size_t)(r / 32) * nb + b) * 32 + (r % 32);
+        scl[o] = h2f((uint16_t)(blk[0] | blk[1] << 8));
+        memcpy(nib + o * 16, blk + 2, 16);
+    }
+}
+static void launch_q4i(const tensor_t *t, uint64_t out) {
+    int rows = (int)t->dims[1], cols = (int)t->dims[0];
+    void *a[] = {&dWi, &dSi, &dX, &out, &rows, &cols};
+    unsigned sm = getenv("Q4I") ? 0 : (unsigned)(cols * 2 + cols / 32 * 4 + cols / 256 * 4);
+    CK(cuLaunchKernel_(fq4i, (rows + 255) / 256, 1, 1, 32, 8, 1, sm, NULL, a, NULL));
+}
 static int test_q4(const tensor_t *t) {
     int cols = (int)t->dims[0], rows = (int)t->dims[1], nb = cols / 32;
     /* device layout: nibbles [rows][nb][16], scales f32 [rows][nb] */
@@ -60,6 +77,9 @@ static int test_q4(const tensor_t *t) {
     }
     CK(cuMemcpyHtoD_(dW, nib, (size_t)rows * nb * 16));
     CK(cuMemcpyHtoD_(dS, scl, (size_t)rows * nb * 4));
+    repack_q4i(t, nib, scl);
+    CK(cuMemcpyHtoD_(dWi, nib, (size_t)rows * nb * 16));
+    CK(cuMemcpyHtoD_(dSi, scl, (size_t)rows * nb * 4));
     static float x[2 * INTER], ycpu[2 * INTER], ygpu[2 * INTER];
     int bad = 0;
     for (int kind = 0; kind < 3; kind++) {
@@ -74,6 +94,10 @@ static int test_q4(const tensor_t *t) {
         CK(cuMemcpyDtoH_(ygpu, dY, (size_t)rows * 4));
         int d = first_diff(ycpu, ygpu, rows);
         if (d >= 0) { bad++; printf("  %s x%d: row %d cpu %.9g gpu %.9g\n", t->name, kind, d, ycpu[d], ygpu[d]); }
+        launch_q4i(t, dY); CK(cuCtxSynchronize_());
+        CK(cuMemcpyDtoH_(ygpu, dY, (size_t)rows * 4));
+        d = first_diff(ycpu, ygpu, rows);
+        if (d >= 0) { bad++; printf("  q4i %s x%d: row %d cpu %.9g gpu %.9g\n", t->name, kind, d, ycpu[d], ygpu[d]); }
     }
     free(nib); free(scl);
     return bad;
@@ -221,18 +245,23 @@ static int test_f16(void) {
 
 /* perf mode: kernel-only time per shape (20 launches after a warm-up), and the
    per-token GPU estimate from the layer schedule. Not a gate. */
+static unsigned smem_bytes;
 static double time_launch(void *f, unsigned gx, unsigned bx, unsigned by, void **args) {
-    CK(cuLaunchKernel_(f, gx, 1, 1, bx, by, 1, 0, NULL, args, NULL)); CK(cuCtxSynchronize_());
+    CK(cuLaunchKernel_(f, gx, 1, 1, bx, by, 1, smem_bytes, NULL, args, NULL)); CK(cuCtxSynchronize_());
     double t0 = now_ms();
-    for (int i = 0; i < 20; i++) CK(cuLaunchKernel_(f, gx, 1, 1, bx, by, 1, 0, NULL, args, NULL));
+    for (int i = 0; i < 20; i++) CK(cuLaunchKernel_(f, gx, 1, 1, bx, by, 1, smem_bytes, NULL, args, NULL));
     CK(cuCtxSynchronize_());
     return (now_ms() - t0) / 20;
 }
+static int use_q4i;
 static double perf_q4(const char *name) {
     const tensor_t *t = tens(name);
     uint32_t r0 = 0, r1 = (uint32_t)t->dims[1], nb = (uint32_t)t->dims[0] / 32, rf = r1;
-    void *args[] = {&dW, &dS, &dX, &dY, &r0, &r1, &nb, &rf};
-    double ms = time_launch(fq4, (r1 + 31) / 32, 32, 8, args);
+    double ms;
+    if (use_q4i) { int rows = (int)r1, cols = (int)nb * 32; void *a[] = {&dWi, &dSi, &dX, &dY, &rows, &cols};
+                   smem_bytes = getenv("Q4I") ? 0 : (unsigned)(cols * 2 + cols / 32 * 4 + cols / 256 * 4);
+                   ms = time_launch(fq4i, (rows + 255) / 256, 32, 8, a); smem_bytes = 0; }
+    else { void *args[] = {&dW, &dS, &dX, &dY, &r0, &r1, &nb, &rf}; ms = time_launch(fq4, (r1 + 31) / 32, 32, 8, args); }
     double gb = (double)r1 * nb * 20 / 1e9;   /* 16 B nibbles + 4 B f32 scale per block */
     printf("  %-28s %6u x %-6u %7.3f ms  %5.2f GB/s\n", name, r1, nb * 32, ms, gb / (ms / 1e3));
     return ms;
@@ -286,9 +315,10 @@ int main(int argc, char **argv) {
     { FILE *f = fopen(argv[2], "rb"); if (!f) { perror(argv[2]); return 2; }
       static char ptx[1 << 20]; size_t n = fread(ptx, 1, sizeof ptx - 1, f); fclose(f); ptx[n] = 0;
       CK(cuModuleLoadData_(&m6, ptx)); }
-    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
+    CK(cuModuleGetFunction_(&fq6, m6, "q6k_gemv")); CK(cuModuleGetFunction_(&fq62, m6, "q6k_gemv2")); CK(cuModuleGetFunction_(&fq63, m6, "q6k_gemv3")); CK(cuModuleGetFunction_(&fq64, m6, "q6k_gemv4")); CK(cuModuleGetFunction_(&fq4i, m6, getenv("Q4I") ? (getenv("Q4I")[0] == '1' ? "q4i_gemv" : "q4i_gemv2") : "q4i_gemv3")); CK(cuModuleGetFunction_(&fgeglu, m6, "geglu_dev")); CK(cuModuleGetFunction_(&fq8k, m6, "q8k_dev")); CK(cuModuleGetFunction_(&ff16, m6, "f16_gemv_t"));
     CK(cuMemAlloc_(&dW, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dS, (size_t)2 * INTER * (H / 32) * 4));
-    CK(cuMemAlloc_(&dX, sizeof XQ)); CK(cuMemAlloc_(&dY, (size_t)VOCAB * 4));
+    CK(cuMemAlloc_(&dX, sizeof XQ));
+    CK(cuMemAlloc_(&dWi, (size_t)2 * INTER * (H / 32) * 16)); CK(cuMemAlloc_(&dSi, (size_t)2 * INTER * (H / 32) * 4)); CK(cuMemAlloc_(&dY, (size_t)VOCAB * 4));
     int fails = 0;
     if (!strcmp(what, "q4") || !strcmp(what, "all")) {
         int n = 0, bad = 0; double t0 = now_ms();
@@ -300,6 +330,7 @@ int main(int argc, char **argv) {
     if (!strcmp(what, "f16") || !strcmp(what, "all")) fails += test_f16();
     if (!strcmp(what, "mlp") || !strcmp(what, "all")) fails += test_mlp_stages();
     if (!strcmp(what, "perf")) { perf(); return 0; }
+    if (!strcmp(what, "perfi")) { use_q4i = 1; perf(); return 0; }
     printf(fails ? "M3 GATE: FAIL (%d)\n" : "M3 GATE: OK\n", fails);
     return fails ? 1 : 0;
 }

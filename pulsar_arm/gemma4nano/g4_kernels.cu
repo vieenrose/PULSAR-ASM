@@ -337,3 +337,164 @@ extern "C" __global__ void q8k_dev(const float *__restrict__ x, uint8_t *__restr
     yb[4 + j] = (uint8_t)(int8_t)q;
     if (j == 0) { const float d = __fdiv_rn(1.0f, iscale); *(float *)yb = d; }
 }
+
+// ------------------------------------------------------------------------------
+// Q4_0 GEMV, row-per-lane ("q4i"): the K2 kernel's arithmetic with a different
+// data path. Per row: isum_b = sum over the 32 weights of block b of (n-8)*a,
+// exact int32; acc = fma(ws_b * d_a(b/8), (float)isum_b, acc) for b ascending.
+// That is gemv_q4 in g4ref.c, so the result is the same bits.
+// Layout (built once at load): rows in tiles of 32; for tile t and block b the
+// 32 rows' 16 nibble bytes are contiguous (512 B), scales f32 as [t][b][32].
+// A lane owns one row and walks its blocks in order, so the float chain stays in
+// one thread (no cross-lane reduction); a warp reads 512 contiguous bytes per
+// block. Activations go to shared memory once per CTA, sign-extended to int16,
+// with each 32-block's sum precomputed so (n-8)*a = n*a - 8*sum(a) per block.
+#define Q4I_MAXCOLS 12288
+extern "C" __global__ void __launch_bounds__(256) q4i_gemv(const uint4 *__restrict__ w,
+        const float *__restrict__ sc, const uint8_t *__restrict__ xq,
+        float *__restrict__ y, int rows, int cols) {
+    __shared__ short A[Q4I_MAXCOLS];
+    __shared__ int SA[Q4I_MAXCOLS / 32];
+    __shared__ float DA[Q4I_MAXCOLS / 256];
+    const int nb = cols >> 5, tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = tid; i < cols; i += 256) A[i] = (short)(int8_t)xq[(i >> 8) * 292 + 4 + (i & 255)];
+    for (int i = tid; i < (cols >> 8); i += 256) DA[i] = *(const float *)(xq + i * 292);
+    __syncthreads();
+    for (int b = tid; b < nb; b += 256) {
+        int s = 0;
+        for (int j = 0; j < 32; j++) s += A[b * 32 + j];
+        SA[b] = s;
+    }
+    __syncthreads();
+    const int tile = blockIdx.x * 8 + threadIdx.y;
+    const int r = tile * 32 + threadIdx.x;
+    if (r >= rows) return;
+    const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
+    const float *st = sc + (size_t)tile * nb * 32 + threadIdx.x;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const uint4 q = wt[(size_t)b * 32];
+        const float ws = st[(size_t)b * 32];
+        const short *a = A + b * 32;
+        int s = -8 * SA[b];
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                s += (int)((qw[k] >> (8 * j)) & 15u) * (int)a[4 * k + j];
+                s += (int)((qw[k] >> (8 * j + 4)) & 15u) * (int)a[16 + 4 * k + j];
+            }
+        }
+        acc = __fmaf_rn(__fmul_rn(ws, DA[b >> 3]), __int2float_rn(s), acc);
+    }
+    y[r] = acc;
+}
+
+// q4i v2: same layout and arithmetic as q4i_gemv; the 32 int16 activations of a
+// block are read as four 16-byte shared-memory vectors (instead of ~34 scalar
+// loads, which made v1 load-unit bound) and split into halves in registers.
+extern "C" __global__ void __launch_bounds__(256) q4i_gemv2(const uint4 *__restrict__ w,
+        const float *__restrict__ sc, const uint8_t *__restrict__ xq,
+        float *__restrict__ y, int rows, int cols) {
+    __shared__ __align__(16) short A[Q4I_MAXCOLS];
+    __shared__ int SA[Q4I_MAXCOLS / 32];
+    __shared__ float DA[Q4I_MAXCOLS / 256];
+    const int nb = cols >> 5, tid = threadIdx.y * 32 + threadIdx.x;
+    for (int i = tid; i < cols; i += 256) A[i] = (short)(int8_t)xq[(i >> 8) * 292 + 4 + (i & 255)];
+    for (int i = tid; i < (cols >> 8); i += 256) DA[i] = *(const float *)(xq + i * 292);
+    __syncthreads();
+    for (int b = tid; b < nb; b += 256) {
+        int s = 0;
+        for (int j = 0; j < 32; j++) s += A[b * 32 + j];
+        SA[b] = s;
+    }
+    __syncthreads();
+    const int tile = blockIdx.x * 8 + threadIdx.y;
+    const int r = tile * 32 + threadIdx.x;
+    if (r >= rows) return;
+    const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
+    const float *st = sc + (size_t)tile * nb * 32 + threadIdx.x;
+    const uint4 *A4 = (const uint4 *)A;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; b++) {
+        const uint4 q = wt[(size_t)b * 32];
+        const float ws = st[(size_t)b * 32];
+        const uint4 a0 = A4[b * 4 + 0], a1 = A4[b * 4 + 1], a2 = A4[b * 4 + 2], a3 = A4[b * 4 + 3];
+        // a0: x0..x7, a1: x8..x15 (low nibbles' partners); a2: x16..x23, a3: x24..x31
+        const unsigned lo[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+        const unsigned hi[8] = {a2.x, a2.y, a2.z, a2.w, a3.x, a3.y, a3.z, a3.w};
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+        int s = -8 * SA[b];
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int e = 4 * k + j;                       // weight byte index 0..15
+                const unsigned pl = lo[e >> 1], ph = hi[e >> 1];
+                const int al = (e & 1) ? ((int)pl >> 16) : (int)(short)(pl & 0xffffu);
+                const int ah = (e & 1) ? ((int)ph >> 16) : (int)(short)(ph & 0xffffu);
+                s += (int)((qw[k] >> (8 * j)) & 15u) * al;
+                s += (int)((qw[k] >> (8 * j + 4)) & 15u) * ah;
+            }
+        }
+        acc = __fmaf_rn(__fmul_rn(ws, DA[b >> 3]), __int2float_rn(s), acc);
+    }
+    y[r] = acc;
+}
+
+// q4i v3: v2 plus (a) dynamic shared memory sized to the real column count, so
+// more CTAs (warps) are resident to hide memory latency, and (b) the next block's
+// weights and scale are loaded before the current block is computed.
+// Shared memory bytes = cols*2 (int16 activations) + nb*4 (block sums) + (cols/256)*4.
+extern "C" __global__ void __launch_bounds__(256) q4i_gemv3(const uint4 *__restrict__ w,
+        const float *__restrict__ sc, const uint8_t *__restrict__ xq,
+        float *__restrict__ y, int rows, int cols) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int nb = cols >> 5, tid = threadIdx.y * 32 + threadIdx.x;
+    short *A = (short *)smem;
+    int *SA = (int *)(smem + cols * 2);
+    float *DA = (float *)(smem + cols * 2 + nb * 4);
+    for (int i = tid; i < cols; i += 256) A[i] = (short)(int8_t)xq[(i >> 8) * 292 + 4 + (i & 255)];
+    for (int i = tid; i < (cols >> 8); i += 256) DA[i] = *(const float *)(xq + i * 292);
+    __syncthreads();
+    for (int b = tid; b < nb; b += 256) {
+        int s = 0;
+        for (int j = 0; j < 32; j++) s += A[b * 32 + j];
+        SA[b] = s;
+    }
+    __syncthreads();
+    const int tile = blockIdx.x * 8 + threadIdx.y;
+    const int r = tile * 32 + threadIdx.x;
+    if (r >= rows) return;
+    const uint4 *wt = w + (size_t)tile * nb * 32 + threadIdx.x;
+    const float *st = sc + (size_t)tile * nb * 32 + threadIdx.x;
+    const uint4 *A4 = (const uint4 *)A;
+    float acc = 0.0f;
+    uint4 qn = wt[0];
+    float wsn = st[0];
+    for (int b = 0; b < nb; b++) {
+        const uint4 q = qn;
+        const float ws = wsn;
+        if (b + 1 < nb) { qn = wt[(size_t)(b + 1) * 32]; wsn = st[(size_t)(b + 1) * 32]; }
+        const uint4 a0 = A4[b * 4 + 0], a1 = A4[b * 4 + 1], a2 = A4[b * 4 + 2], a3 = A4[b * 4 + 3];
+        const unsigned lo[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+        const unsigned hi[8] = {a2.x, a2.y, a2.z, a2.w, a3.x, a3.y, a3.z, a3.w};
+        const unsigned qw[4] = {q.x, q.y, q.z, q.w};
+        int s = -8 * SA[b];
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int e = 4 * k + j;
+                const unsigned pl = lo[e >> 1], ph = hi[e >> 1];
+                const int al = (e & 1) ? ((int)pl >> 16) : (int)(short)(pl & 0xffffu);
+                const int ah = (e & 1) ? ((int)ph >> 16) : (int)(short)(ph & 0xffffu);
+                s += (int)((qw[k] >> (8 * j)) & 15u) * al;
+                s += (int)((qw[k] >> (8 * j + 4)) & 15u) * ah;
+            }
+        }
+        acc = __fmaf_rn(__fmul_rn(ws, DA[b >> 3]), __int2float_rn(s), acc);
+    }
+    y[r] = acc;
+}
