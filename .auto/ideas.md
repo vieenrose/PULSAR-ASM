@@ -997,3 +997,15 @@ Activation word bit widths (prompt A): K=4096 inputs avg 7.2 signed bits (55% ne
 
 ## Measured out (loop iter 9): silu in the gate+up T-MAC epilogue
 Thread row0=gate i, row1=up N+i, epilogue silu(g)*u then q8k<0>: bit-exact (FFNCHK 1548/0) but ab_pair PQ1_TMSILU=0 +2.04% (old path faster): the DP expf tail serializes on lane sub 0 at block end instead of overlapping. Patch iter9_tm_silu_epilogue.patch.
+
+## Loop 261014-2216 rows 11-35 (8.27 -> 16.11 decode tps): summary, details in HANDOFF §0
+Kept: flash-attn f16 KV (c8b2bff), Harley-Seal hs GEMV (1e1a1bb, +30.7%), sign-magnitude
+hs + load ring (2b1c440), whole token as one graph (8fa3f38, +11.9%), plane build fused
+into Q8_K (8a1bad7), SEG reduction at K=12288 (5d2dad4), fa_sm shuffle scan (f2cb48e),
+certified fp32 expf/RMS family (0c70c2d, d59c852, ba9f43b, 8a3e10c), warp-per-block Q8_K
+(1bf9aac), device argmax (9dd569f), occupancy x prefetch-depth hs configs (0eae2d3 +2.7%,
+11806d3 +9.8%). Rule: PD = RB (whole row batch in flight) AND >= 24 resident warps;
+either alone loses. Measured out: cache-policy loads, magic I2F, pinned staging,
+kernel-only token graph, NR=2 tile (504 us vs 435), block-wide reduction (592 vs 435),
+batched expf q8k_w<3> (35.2 vs 31.0 us in-engine), K=12288 re-sweep at PD=RB (all >= 437
+vs 406 us). Peak RSS drifts 596 -> 770 MB on identical binaries over one session.

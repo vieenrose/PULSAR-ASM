@@ -1,8 +1,105 @@
 # HANDOFF — Bonsai-8B Q1_0 (true 1-bit) on Jetson Nano, branch `bonsai-jetson-nano`
 
 Written 2026-10-14 at the end of an autoresearch session (68 logged runs); updated the same
-day after autoresearch loop `autoresearch/loop-261014-2216` (runs #76-#80, see §2.1).
+day after autoresearch loop `autoresearch/loop-261014-2216` (runs #76-#80, see §2.1), and on
+2026-10-15 with §0 (loop rows 11-35, 16.11 tps at 11806d3).
 **Read this first; `.auto/ideas.md` has the append-only history, `.auto/log.jsonl` the raw runs.**
+
+---
+
+## 0. Status at 11806d3 (2026-10-15): 16.11 decode tps, 15.85 prefill — READ THIS FIRST
+
+§1–§8 below describe the engine at 8.29 tps (T-MAC era). They are history now except the
+gates (§1), the measurement discipline (§7) and the file map (§8). Since then, loop
+`autoresearch/loop-261014-2216` rows 11–35 (TSV in that dir) took decode 8.27 → 16.11 tps.
+Cold harness at 11806d3: 62.08 ms/token. 1.06 GB/token against the measured 21.9 GB/s ceiling
+gives a bus floor of 48.4 ms, so the engine is at 17.1 GB/s, 78 % of that floor.
+
+### 0.1 The chain now (every item: ab_pair both orders, gates 3/3, parity bit-exact)
+
+| commit | change | effect |
+|---|---|---|
+| c8b2bff | 4k-context f16 KV + fork-faithful flash-attention decode (qk4/sm/pv) | RSS 342 → 304, decode neutral |
+| 1e1a1bb | `pq1_gemv_hs`: group-stationary Harley-Seal GEMV (LOP3 CSA tree, 10 POPC per 4 words × 8 planes), replaces T-MAC on every shape incl. head | 8.27 → 10.85 |
+| 2b1c440 | hs sign-magnitude planes (28 masked inputs, 18 POPC) + RB 6 / PD 3 load ring | → 11.67 |
+| 8fa3f38 | the whole token is ONE CUDA graph: device `pq1_rms_q8k` (certified parallel sum, serial fallback), X lives on the GPU | → 13.06 |
+| 8a1bad7 | T-MAC/hs plane build fused into the Q8_K kernels | → 13.22 |
+| 5d2dad4 | K=12288 hs reduction split by warp segment (`SEG`) | → 13.28 |
+| f2cb48e | fa_sm prefix max as a shuffle scan | → 13.49 |
+| 0c70c2d | silu expf in certified fp32 float-float (exhaustive 2^32 proof vs glibc) | → 13.62 |
+| 1bf9aac | warp-per-Q8_K-block quant + planes | → 13.70 |
+| 9dd569f | greedy argmax on the device, logits D2H skipped when greedy | → 14.07 |
+| 072d109 | sampler top-k early reject (sampled decode 81.4 → 73.7 ms) | greedy unaffected |
+| d59c852 / ba9f43b | attn_pre2 and rms_q8k with fp32 pair-tree certified RMS (fp64 only on fallback) | → 14.21 |
+| 8a3e10c | fa_sm in one 64-thread wave, certified fp32 expf | fa_sm 19.9 → 9.5 µs |
+| 0eae2d3 | hs K=12288: TPB 2 / MINB 4 / RB 4 / PD 4 (80 regs, 24 warps) | down 458 → 407 µs, → 14.66 |
+| 11806d3 | hs K=4096: TPB 4 / MINB 6 / RB 6 / PD 6 (80 regs, 24 warps) | hs<1> 435 → 379 µs, → 16.11 |
+
+"Certified" = a fast fp32 path that carries an error bound proving its rounded result equals
+the reference's double/glibc result, with a warp-uniform fallback to the exact serial path
+when the bound cannot certify. Parity modes `rms`, `fpl`, `apre`, `expf`, `fa` cover them.
+
+### 0.2 Where the 62 ms go (nvprof, prompt A, 11806d3)
+
+| GEMV | µs/call | MB/call | GB/s | ms/token |
+|---|---|---|---|---|
+| q+k+v 6144×4096 | 196 | 3.54 | 18.1 | 7.05 |
+| o 4096×4096 | 143 | 2.36 | 16.5 | 5.14 |
+| gate+up 24576×4096 | 691 | 14.16 | 20.5 | 24.9 |
+| down 4096×12288 | 406 | 7.08 | 17.4 | 14.6 |
+| head 151669×4096 | 4232 | 87.4 | 20.6 | 4.23 |
+
+GEMV ≈ 55.9 ms. The rest (~6 ms) is rms_q8k (~1.1 ms), Q8_K/silu (~1.1 ms), attn_pre2
+(~0.9 ms), flash attention, argmax and kernel-boundary drain/ramp. If every GEMV reached
+21.9 GB/s, the GEMVs would take ~48.4 ms. The gaps are down (~3 ms), o (~1.3), qkv (~1.2)
+and gate+up (~1.6).
+
+### 0.3 The rule that produced the last +13 % (occupancy × prefetch depth)
+
+On the single SM, an hs kernel only streams near the ceiling when **the whole row batch's
+loads are in flight (PD = RB)** AND ≥ 24 warps are resident. Either alone loses:
+- K=12288 at PD 2 with more warps loses; deep PD at 12 warps loses.
+- K=4096 rings with RB > PD (12/6, 10/5) run at 476–505 µs, against 379 µs at PD = RB.
+
+80 registers is the budget that fits PD = RB = 6 (K=4096) and 4 (K=12288) without spills.
+Re-sweeps at PD = RB (row 35) all lose to the current configs:
+- TPB1/RB4: 566 µs;
+- TPB2/MINB4/RB3: 437 µs;
+- TPB2/MINB2/RB6: 469 µs;
+- TPB1/RB3: 611 µs.
+
+The old configs remain as A/B arms: `PQ1_HS1O=1`, `PQ1_HS3O=1`, `PQ1_HSV=0`.
+
+### 0.4 Measured out in rows 11–35 (do not re-walk)
+
+- hs weight loads via `__ldg`/`__ldcg`/`__ldcs`: no effect (weights stream once; one SM).
+- hs I2F → magic-number int→float: flat (the quarter-rate pipe is not the bound).
+- Pinned staging for token-graph H2D/D2H: −0.03 %.
+- A kernel-only token graph with mapped inputs: +0.27 % for the OLD arm. The real
+  inter-token idle is ~0.2 ms; nvprof inflates it.
+- hs K=4096 two-batch tile (one 12-lane reduction per 12 rows): 434.7 → 503.9 µs, spills.
+- hs K=4096 block-wide row reduction (one `__syncthreads` per 48-row tile): 434.7 → 592 µs,
+  from block-barrier lockstep and 52 B of spills.
+- q8k_w<3> with 8 batched certified expf and one fallback branch: −12.6 % instructions and
+  faster warm micro, but slower in the engine (31.0 → 35.2 µs). The kernel is
+  latency-bound right after the hs sweep evicts its source.
+- RSS drift: identical binaries read 596 → 680 → 730 → 770 MB peak RSS over one session.
+  It is board page-cache state, so compare RSS only inside one ab_pair job.
+
+### 0.5 Open levers (ranked)
+
+1. **down (4096×12288) at 17.4 GB/s:** ~3 ms/token to the ceiling. WR=3 (3 warps per row
+   segment) + SEG reduction; untried: a different team structure, e.g. a 1-warp-per-row
+   walk over all 12288 with x planes from shared memory.
+2. **o and q+k+v at 16.5 / 18.1 GB/s:** short kernels, so ramp/drain dominates.
+   A per-shape hs config or a tail-aware batch split are possible. Fusing o into the
+   flash-attention tail cannot work, because o needs the full head output first.
+3. **Non-GEMV ~6 ms:** fuse fa_qk4/fa_sm/fa_pv, rms_q8k + plane build already fused. Each
+   item is < 1 % alone.
+4. **Prefill** runs token by token through the decode graph (15.85 tps). A batched-prompt
+   GEMV (weights streamed once per B tokens) is the only lever that can beat the 20.7 tps
+   bus bound for prefill; the `batch` kernel variant exists in pq1_swar_sm53.cu as a
+   starting point.
 
 ---
 
