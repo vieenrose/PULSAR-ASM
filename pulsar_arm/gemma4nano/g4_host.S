@@ -275,4 +275,163 @@ g4_attn_pv:
     ret
     .size g4_attn_pv, .-g4_attn_pv
 
+/* void g4_attn_scores8(const float *qT, const float *K, long n, long hd, float *S)
+ * All 8 query heads at once (Gemma 4 has one kv head). qT is the queries
+ * transposed, [hd][8]; S[t*8 + h] = fmaf chain over d ascending of K[t][d]*q_h[d].
+ * Vector lanes are heads: for each d, acc(h) = fma(acc(h), qT[d][h], K[t][d]).
+ * Four rows t per pass (8 accumulators), so each K row is read once for all heads.
+ * hd % 4 == 0. */
+    .global g4_attn_scores8
+    .type g4_attn_scores8, %function
+    .align 4
+g4_attn_scores8:
+    SAVE_D8_D15
+    lsl     x5, x3, #2                        /* K row bytes */
+4:  cmp     x2, #4
+    b.lt    5f
+    mov     x6, x1
+    add     x7, x6, x5
+    add     x8, x7, x5
+    add     x10, x8, x5
+    mov     x11, x0                           /* qT */
+    mov     x12, x3
+    movi    v16.4s, #0
+    movi    v17.4s, #0
+    movi    v18.4s, #0
+    movi    v19.4s, #0
+    movi    v20.4s, #0
+    movi    v21.4s, #0
+    movi    v22.4s, #0
+    movi    v23.4s, #0
+1:  ldr     q0, [x6], #16                     /* K[t0][d..d+3] */
+    ldr     q1, [x7], #16
+    ldr     q2, [x8], #16
+    ldr     q3, [x10], #16
+    ld1     {v4.4s-v7.4s}, [x11], #64         /* qT[d], qT[d+1] (lo, hi) */
+    ld1     {v8.4s-v11.4s}, [x11], #64        /* qT[d+2], qT[d+3] */
+    .irp j, 0,1,2,3
+    .if \j == 0
+    mov     v24.16b, v4.16b
+    mov     v25.16b, v5.16b
+    .elseif \j == 1
+    mov     v24.16b, v6.16b
+    mov     v25.16b, v7.16b
+    .elseif \j == 2
+    mov     v24.16b, v8.16b
+    mov     v25.16b, v9.16b
+    .else
+    mov     v24.16b, v10.16b
+    mov     v25.16b, v11.16b
+    .endif
+    fmla    v16.4s, v24.4s, v0.s[\j]
+    fmla    v17.4s, v25.4s, v0.s[\j]
+    fmla    v18.4s, v24.4s, v1.s[\j]
+    fmla    v19.4s, v25.4s, v1.s[\j]
+    fmla    v20.4s, v24.4s, v2.s[\j]
+    fmla    v21.4s, v25.4s, v2.s[\j]
+    fmla    v22.4s, v24.4s, v3.s[\j]
+    fmla    v23.4s, v25.4s, v3.s[\j]
+    .endr
+    subs    x12, x12, #4
+    b.gt    1b
+    st1     {v16.4s-v19.4s}, [x4], #64        /* S[t0][0..7], S[t1][0..7] */
+    st1     {v20.4s-v23.4s}, [x4], #64
+    add     x1, x1, x5, lsl #2
+    sub     x2, x2, #4
+    b       4b
+5:  cbz     x2, 9f                            /* one row at a time */
+    mov     x6, x1
+    mov     x11, x0
+    mov     x12, x3
+    movi    v16.4s, #0
+    movi    v17.4s, #0
+6:  ld1r    {v0.4s}, [x6], #4                 /* K[t][d] */
+    ld1     {v4.4s, v5.4s}, [x11], #32        /* qT[d] */
+    fmla    v16.4s, v4.4s, v0.4s
+    fmla    v17.4s, v5.4s, v0.4s
+    subs    x12, x12, #1
+    b.gt    6b
+    st1     {v16.4s, v17.4s}, [x4], #32
+    add     x1, x1, x5
+    subs    x2, x2, #1
+    b.gt    5b
+9:  RESTORE_D8_D15
+    ret
+    .size g4_attn_scores8, .-g4_attn_scores8
+
+/* void g4_attn_pv8(const float *P, const float *V, long n, long hd, float *O)
+ * All 8 heads at once: P is [t][8]; O[h*hd + d] = 0, then
+ * O[h][d] = fmaf(P[t][h], V[t][d], O[h][d]) for t ascending. Eight dims per pass
+ * (16 accumulators: 8 heads x 2 vectors), so each V row is read once for all
+ * heads. hd % 8 == 0. */
+    .global g4_attn_pv8
+    .type g4_attn_pv8, %function
+    .align 4
+g4_attn_pv8:
+    SAVE_D8_D15
+    lsl     x5, x3, #2                        /* V row bytes = O head stride */
+    mov     x9, #0                            /* byte offset of this 8-dim chunk */
+1:  movi    v16.4s, #0
+    movi    v17.4s, #0
+    movi    v18.4s, #0
+    movi    v19.4s, #0
+    movi    v20.4s, #0
+    movi    v21.4s, #0
+    movi    v22.4s, #0
+    movi    v23.4s, #0
+    movi    v24.4s, #0
+    movi    v25.4s, #0
+    movi    v26.4s, #0
+    movi    v27.4s, #0
+    movi    v28.4s, #0
+    movi    v29.4s, #0
+    movi    v30.4s, #0
+    movi    v31.4s, #0
+    add     x6, x1, x9                        /* V[0] + chunk */
+    mov     x7, x0                            /* P */
+    mov     x8, x2
+2:  ld1     {v0.4s, v1.4s}, [x6]              /* V[t][d..d+7] */
+    ld1     {v2.4s, v3.4s}, [x7], #32         /* P[t][0..7] */
+    fmla    v16.4s, v0.4s, v2.s[0]
+    fmla    v17.4s, v1.4s, v2.s[0]
+    fmla    v18.4s, v0.4s, v2.s[1]
+    fmla    v19.4s, v1.4s, v2.s[1]
+    fmla    v20.4s, v0.4s, v2.s[2]
+    fmla    v21.4s, v1.4s, v2.s[2]
+    fmla    v22.4s, v0.4s, v2.s[3]
+    fmla    v23.4s, v1.4s, v2.s[3]
+    fmla    v24.4s, v0.4s, v3.s[0]
+    fmla    v25.4s, v1.4s, v3.s[0]
+    fmla    v26.4s, v0.4s, v3.s[1]
+    fmla    v27.4s, v1.4s, v3.s[1]
+    fmla    v28.4s, v0.4s, v3.s[2]
+    fmla    v29.4s, v1.4s, v3.s[2]
+    fmla    v30.4s, v0.4s, v3.s[3]
+    fmla    v31.4s, v1.4s, v3.s[3]
+    add     x6, x6, x5
+    subs    x8, x8, #1
+    b.gt    2b
+    add     x10, x4, x9                       /* O[0][chunk] */
+    st1     {v16.4s, v17.4s}, [x10]
+    add     x10, x10, x5
+    st1     {v18.4s, v19.4s}, [x10]
+    add     x10, x10, x5
+    st1     {v20.4s, v21.4s}, [x10]
+    add     x10, x10, x5
+    st1     {v22.4s, v23.4s}, [x10]
+    add     x10, x10, x5
+    st1     {v24.4s, v25.4s}, [x10]
+    add     x10, x10, x5
+    st1     {v26.4s, v27.4s}, [x10]
+    add     x10, x10, x5
+    st1     {v28.4s, v29.4s}, [x10]
+    add     x10, x10, x5
+    st1     {v30.4s, v31.4s}, [x10]
+    add     x9, x9, #32
+    cmp     x9, x5
+    b.lt    1b
+    RESTORE_D8_D15
+    ret
+    .size g4_attn_pv8, .-g4_attn_pv8
+
     .section .note.GNU-stack,"",%progbits

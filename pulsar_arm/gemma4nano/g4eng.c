@@ -119,37 +119,7 @@ static void q4_fast(uint64_t *w, uint64_t *s, uint32_t cols, uint32_t rows, cons
     copy_from_pinned(y, h_out, (size_t)rows * 4);
     if (prof) { double d_ = now_ms(); P_h2d[0] += b_ - a_; P_k[0] += c_ - b_; P_d2h[0] += d_ - c_; P_n[0]++; }
 }
-/* ------------------------------------------------- host kernels (g4_host.S) */
-extern void g4_exp_vec(const double *x, double *y, long n, const double *tab);
-extern void g4_geglu(float *g, const float *u, long n, const double *tab);
-extern void g4_attn_scores(const float *q, const float *K, long n, long hd, float *s);
-extern void g4_attn_pv(const float *p, const float *V, long n, long hd, float *o);
-static double TAB2[48];   /* exp/GELU constants from g4ref.c's own definitions, duplicated pairs */
-static void build_tab(void) {
-    double v[24] = {EXP_P0};
-    for (int i = 0; i < 13; i++) v[1 + i] = EXP_C[i];
-    v[14] = EXP_LOG2E; v[15] = EXP_SH; v[16] = EXP_LN2HI; v[17] = EXP_LN2LO;
-    v[18] = 709.0; v[19] = -745.0; v[20] = INFINITY; v[21] = GELU_C1; v[22] = GELU_C3; v[23] = 1.0;
-    for (int i = 0; i < 24; i++) TAB2[2 * i] = TAB2[2 * i + 1] = v[i];
-}
-static void geglu_asm(float *g, const float *u, int n) { g4_geglu(g, u, n, TAB2); }
-/* attn_head_ref with the hot loops in assembly; same operations in the same order */
-static void attn_head_asm(const float *q, const float *K, const float *V, int lo, int pos, int hd, float *o) {
-    static double xin[MAXSEQ], e[MAXSEQ];
-    static float pp[MAXSEQ];
-    int n = pos - lo + 1;
-    g4_attn_scores(q, K + (size_t)lo * hd, n, hd, sc + lo);
-    float mx = -INFINITY;
-    for (int t = lo; t <= pos; t++) if (sc[t] > mx) mx = sc[t];
-    for (int i = 0; i < n; i++) xin[i] = (double)sc[lo + i] - (double)mx;
-    int ne = n & ~1;
-    if (ne) g4_exp_vec(xin, e, ne, TAB2);
-    if (n & 1) e[n - 1] = g4_exp(xin[n - 1]);
-    double sum = 0;
-    for (int i = 0; i < n; i++) sum += e[i];
-    for (int i = 0; i < n; i++) pp[i] = (float)(e[i] / sum);
-    g4_attn_pv(pp, V + (size_t)lo * hd, n, hd, o);
-}
+#include "g4_hostglue.h"
 
 /* MLP on the GPU: gate+up -> geglu_dev -> q8k_dev -> down, one wait at the end.
    XQ already holds the quantized ffn_norm output. */
@@ -368,7 +338,7 @@ static void gpu_init(void) {
     if (!(getenv("G4GPUMLP") && getenv("G4GPUMLP")[0] == '0')) { G_MLP = gpu_mlp; fprintf(stderr, "MLP: on the GPU (gate+up, GeGLU, Q8_K, down)\n"); }
     /* G4ASM=0 keeps the C host loops (A/B and fallback) */
     if (!(getenv("G4ASM") && getenv("G4ASM")[0] == '0')) {
-        build_tab(); G_GEGLU = geglu_asm; G_ATTN = attn_head_asm;
+        build_tab(); G_GEGLU = geglu_asm; G_ATTN = attn_head_asm; G_ATTNALL = attn_all_asm;
         fprintf(stderr, "host kernels: assembly (g4_host.S)\n");
     }
 }

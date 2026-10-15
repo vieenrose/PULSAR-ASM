@@ -356,6 +356,11 @@ static void attn_head_ref(const float *q, const float *K, const float *V, int lo
 static void geglu_ref(float *g, const float *u, int n) { for (int i = 0; i < n; i++) g[i] = gelu(g[i]) * u[i]; }
 static void (*G_ATTN)(const float *, const float *, const float *, int, int, int, float *) = attn_head_ref;
 static void (*G_GEGLU)(float *, const float *, int) = geglu_ref;
+/* all NH query heads against the single kv head; the engine does them in one pass */
+static void attn_all_ref(const float *q, const float *K, const float *V, int lo, int pos, int hd, float *o) {
+    for (int j = 0; j < NH; j++) G_ATTN(q + j * hd, K, V, lo, pos, hd, o + j * hd);
+}
+static void (*G_ATTNALL)(const float *, const float *, const float *, int, int, int, float *) = attn_all_ref;
 /* MLP body on the quantized input in XQ: gate+up, GeGLU, Q8_K, down -> out. The
    engine runs the whole chain on the GPU (one synchronization); same arithmetic. */
 static void mlp_ref(const layer_t *L, int inter, float *out) {
@@ -412,8 +417,7 @@ static void __attribute__((unused)) forward(int tok, int pos) {
             memcpy(VC[il] + (size_t)pos * hd, vb, hd * 4);
         }
         int lo = full ? 0 : (pos + 1 > WINDOW ? pos + 1 - WINDOW : 0);
-        for (int j = 0; j < NH; j++)
-            G_ATTN(qb + j * hd, KC[src], VC[src], lo, pos, hd, ab + j * hd);
+        G_ATTNALL(qb, KC[src], VC[src], lo, pos, hd, ab);
         q8k(ab, XQ, NH * hd);
         G_Q4(L->o, XQ, hb);
         { float t[H]; rmsnorm(hb, L->n_post_attn, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }

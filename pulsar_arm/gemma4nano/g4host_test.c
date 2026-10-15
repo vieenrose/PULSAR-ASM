@@ -4,19 +4,8 @@
 #define G4REF_NO_MAIN
 #include "g4ref.c"
 
-extern void g4_exp_vec(const double *x, double *y, long n, const double *tab);
-extern void g4_geglu(float *g, const float *u, long n, const double *tab);
-extern void g4_attn_scores(const float *q, const float *K, long n, long hd, float *s);
-extern void g4_attn_pv(const float *p, const float *V, long n, long hd, float *o);
+#include "g4_hostglue.h"
 
-static double TAB2[48];
-static void build_tab(void) {
-    double v[24] = {EXP_P0};
-    for (int i = 0; i < 13; i++) v[1 + i] = EXP_C[i];
-    v[14] = EXP_LOG2E; v[15] = EXP_SH; v[16] = EXP_LN2HI; v[17] = EXP_LN2LO;
-    v[18] = 709.0; v[19] = -745.0; v[20] = INFINITY; v[21] = GELU_C1; v[22] = GELU_C3; v[23] = 1.0;
-    for (int i = 0; i < 24; i++) TAB2[2 * i] = TAB2[2 * i + 1] = v[i];
-}
 static uint64_t rs = 88172645463325252ull;
 static uint64_t xr(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return rs; }
 static double ur(void) { return (double)(xr() >> 11) * 0x1p-53; }
@@ -95,6 +84,23 @@ int main(void) {
         }
     }
     printf("g4_attn_scores: %ld scores; g4_attn_pv: %ld outputs; %ld mismatches\n", nsc, npv, bad - b1);
+    long b2 = bad, nall = 0;
+    /* all-heads path against the per-head reference, positions [lo, pos] */
+    static float qa[NH * HD_F], oa1[NH * HD_F], oa2[NH * HD_F];
+    for (int hdi = 0; hdi < 2; hdi++) {
+        int hd = hdi ? HD_F : HD_S;
+        for (int i = 0; i < MAXSEQ * hd; i++) { K[i] = (float)((ur() - 0.5) * 2); V[i] = (float)((ur() - 0.5) * 3); }
+        int cases[][2] = {{0, 0}, {0, 1}, {0, 2}, {0, 4}, {0, 5}, {0, 7}, {0, 63}, {10, 600}, {0, 511}, {1, 512}, {300, 811}, {0, 2047}};
+        for (unsigned ci = 0; ci < sizeof cases / sizeof *cases; ci++) {
+            int lo = cases[ci][0], pos = cases[ci][1];
+            for (int i = 0; i < NH * hd; i++) qa[i] = (float)((ur() - 0.5) * 4);
+            attn_all_asm(qa, K, V, lo, pos, hd, oa1);
+            for (int j = 0; j < NH; j++) attn_head_ref(qa + j * hd, K, V, lo, pos, hd, oa2 + j * hd);
+            for (int i = 0; i < NH * hd; i++) if (memcmp(&oa1[i], &oa2[i], 4)) { if (bad < 40) printf("  attn_all hd %d lo %d pos %d i %d\n", hd, lo, pos, i); bad++; }
+            nall += NH * hd;
+        }
+    }
+    printf("attn_all_asm (8 heads, one pass): %ld outputs, %ld mismatches\n", nall, bad - b2);
     printf(bad ? "HOST ASM TEST: FAIL (%ld)\n" : "HOST ASM TEST: OK\n", bad);
     return bad != 0;
 }
