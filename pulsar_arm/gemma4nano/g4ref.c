@@ -296,7 +296,7 @@ static float xs[H], hb[H], qb[NH * HD_F], kb[HD_F], vb[HD_F], ab[NH * HD_F],
              rowe[NL * PLE], sc[MAXSEQ], logits[VOCAB];
 static uint8_t XQ[(2 * INTER / 256) * Q8B];
 
-static void forward(int tok, int pos) {
+static void __attribute__((unused)) forward(int tok, int pos) {
     /* embedding and per-layer inputs */
     const tensor_t *emb = tens("token_embd.weight");
     row_q6k(emb, tok, xs);
@@ -385,8 +385,9 @@ static void forward(int tok, int pos) {
     q8k(hb, XQ, H);
     gemv_q6k_rows(emb, XQ, logits, 0, VOCAB);   /* raw logits; soft-cap applied by the caller */
 }
-static float capped(float l) { return (float)(SOFTCAP * g4_tanh((double)l / SOFTCAP)); }
+static float __attribute__((unused)) capped(float l) { return (float)(SOFTCAP * g4_tanh((double)l / SOFTCAP)); }
 
+#ifndef G4REF_NO_MAIN   /* g4gemv_test.c includes this file for its numerics */
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: %s <gguf> <rope.bin> <ids...> [--gen N]\n", argv[0]); return 2; }
     int gen = 0, n = 0;
@@ -420,3 +421,4 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
+#endif
