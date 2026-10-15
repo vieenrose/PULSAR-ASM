@@ -11,6 +11,10 @@
 void pq2_pq2_compat_gemv(int rows, int cols, const unsigned char *w,
                          const float *x, float *y, const unsigned char *xq);
 #define pq2_gemv pq2_pq2_compat_gemv
+/* fwd8.c's multi-tensor entry is a weak reference; this path has none, so
+ * gemvP_multi takes its scalar loop */
+int pq2_gemv_batch(const uint8_t *const *W, const int *rows, int n, int K, float *const *Y,
+                   const uint8_t *xq) __attribute__((weak));
 
 #ifdef PQ2_USE_CUDA
 /* GPU-RAM report printed once at process exit (PQ2_STATS=1). Declared here

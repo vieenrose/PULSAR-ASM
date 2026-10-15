@@ -26,10 +26,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef BONSAI_4B
+/* Ternary-Bonsai-4B (Qwen3-4B dense, PQ2_0): HID 2560, INTER 9728, same
+ * heads/layers/vocab, YaRN orig 8192 base 5e6, head tied to token_embd */
+#define HID 2560
+#define INTER 9728
+#else
 #define HID 4096
 #define INTER 12288
+#endif
 #define NHEAD 32
 #define HDIM 128
+#define QDIM (NHEAD * HDIM)   /* attention width: HID on the 8B, not on the 4B */
 #define NKV 8
 #define NLAYER 36
 #define VOCAB 151669
@@ -41,8 +49,13 @@
 #define CTX 512
 #endif
 #define YARN_FACTOR 4.0f
+#ifdef BONSAI_4B
+#define YARN_ORIG 8192
+#define FREQ_BASE 5000000.0f
+#else
 #define YARN_ORIG 16384
 #define FREQ_BASE 1000000.0f
+#endif
 
 #ifndef STANDALONE
 void quantize_row_q8_K(const float * x, void * y, int64_t k);
@@ -242,6 +255,12 @@ static char *tn(int il, const char *kind, char *o) {
     return o;
 }
 #define TW(il, kind) tw(tn(il, kind, NB))
+/* LM head: output.weight, or the token embedding when tied (4B) */
+static uint8_t *tw_head(void) {
+    for (int i = 0; i < NT; i++)
+        if (!strcmp(TN[i], "output.weight")) return G + TO[i];
+    return tw("token_embd.weight");
+}
 
 static float h2f(uint16_t h) {
     uint32_t s = (uint32_t)(h & 0x8000u) << 16;
@@ -351,7 +370,7 @@ static void rope_yarn_apply(float *x, int heads, int pos) {
 
 static float X[HID], XN[HID], AO[HID], FO[HID];
 static float QF[32 * 128], KF[8 * 128], VF[8 * 128];
-static float ATTO[32 * 128], LG[INTER], LU[INTER];
+static float ATTO[QDIM], LG[INTER], LU[INTER];
 #ifdef PQ1_BUILD
 /* PQ1_FFN_CHECK=1: after every fused FFN graph, rerun the host-driven path
  * (gemvP_multi, pq1_silu_mul, gemvP) and compare, bit for bit, the device's
@@ -623,7 +642,7 @@ static void attn_cpu(int il, int put) {
     }
 #endif
     ct_mark(CT_ATTN);
-    gemvP(TW(il, "attn_output.weight"), HID, HID, ATTO, AO);
+    gemvP(TW(il, "attn_output.weight"), HID, QDIM, ATTO, AO);
     if (TRACE) { V8("attnout", AO); V8R("attnout", AO, 1000); }
 }
 
@@ -737,7 +756,7 @@ int main(int argc, char **argv) {
                     for (int j = 0; j < 7; j++) WT[7 * il + j] = TW(il, wk[j]);
                     for (int j = 0; j < 4; j++) NW[4 * il + j] = (const float *)TW(il, nk[j]);
                 }
-                WT[7 * NLAYER] = tw("output.weight");
+                WT[7 * NLAYER] = tw_head();
                 NW[4 * NLAYER] = (const float *)tw("output_norm.weight");
             }
             if (RC_POS != NPOS) rope_table(NPOS);
@@ -816,7 +835,7 @@ int main(int argc, char **argv) {
             float *onw = (float *)tw("output_norm.weight");
             rms(X, onw, HID, XN);
             ct_mark(CT_RMS);
-            gemvP(tw("output.weight"), VOCAB, HID, XN, HEAD);
+            gemvP(tw_head(), VOCAB, HID, XN, HEAD);
         }
         float topv;
         top = -1;

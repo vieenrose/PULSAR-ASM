@@ -120,12 +120,15 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
   int rrow = active ? row : 0;
 
   int K128 = K >> 7;
-  int nchunk = K128 / PQ2_CHUNK_GROUPS;
+  /* the last chunk may be partial (K = 2560 / 9728 on the 4B: 4 / 12 of its
+   * 16 groups); a full chunk runs exactly as before */
+  int nchunk = (K128 + PQ2_CHUNK_GROUPS - 1) / PQ2_CHUNK_GROUPS;
   if (nchunk > PQ2_MAXCHUNK || nchunk <= 0) return;
 
   float acc = 0.0f; /* lane 0 only; groups accumulated in order */
 
   for (int ch = 0; ch < nchunk; ch++) {
+    const int ng = min(PQ2_CHUNK_GROUPS, K128 - ch * PQ2_CHUNK_GROUPS);
     /* 1. Fused staging + Au: 16 threads per group (256 threads cover all
      * 16 groups), each copying its own 2 act words into the 272B-strided
      * tile and folding them locally, then a 4-step half-warp shuffle
@@ -143,12 +146,13 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
       int bb = gid >> 1;                 /* its Q8_K block */
       int wb = (gid & 1) * 32 + slot * 2;
       const uint32_t *src = x32 + bb * 73 + 1 + wb;
-      uint32_t v0 = __ldg(src);
-      uint32_t v1 = __ldg(src + 1);
+      const bool gin = gid < ng;   /* block-uniform per half-warp */
+      uint32_t v0 = gin ? __ldg(src) : 0u;
+      uint32_t v1 = gin ? __ldg(src + 1) : 0u;
       uint32_t m0 = v0 ^ 0x80808080u, m1 = v1 ^ 0x80808080u;
       t32[bb * 68 + wb] = m0;
       t32[bb * 68 + wb + 1] = m1;
-      if ((int)threadIdx.x < PQ2_CHUNK_BLOCKS) {
+      if ((int)threadIdx.x < (ng >> 1)) {
         uint32_t dv = __ldg(x32 + (int)threadIdx.x * 73);
         t32[(int)threadIdx.x * 68 + 64] = dv; /* fp32 d, verbatim */
       }
@@ -167,6 +171,7 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
 
     /* 3. one group per lane (128 weights per group, 32 code bytes) */
     int g = sub;
+    if (g < ng) {
     const uint8_t *c =
         w_codes + (size_t)rrow * (K >> 2) +
         (size_t)(ch * PQ2_CHUNK_GROUPS + g) * 32;
@@ -242,6 +247,7 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
                       : 0.0f;
     sh_prod[threadIdx.x >> 4][g] =
         __fmul_rn(__fmul_rn(ws, db), (float)isum);
+    }
     __syncwarp();
 
     /* 4. ordered reduce for this chunk: lane 0 of each row adds the 16
@@ -249,7 +255,8 @@ void pq2_gemv_sm53(const uint8_t* __restrict__ w_codes,
     if (sub == 0) {
       const float *p = sh_prod[threadIdx.x >> 4];
 #pragma unroll
-      for (int k = 0; k < PQ2_CHUNK_GROUPS; k++) acc = __fadd_rn(acc, p[k]);
+      for (int k = 0; k < PQ2_CHUNK_GROUPS; k++)
+        if (k < ng) acc = __fadd_rn(acc, p[k]);
     }
     __syncthreads(); /* the tile is reused by the next chunk */
   }
@@ -260,7 +267,7 @@ extern "C" int pq2_gemv_sm53_launch(const uint8_t *w_codes,
                                     const unsigned short *w_scales_h,
                                     const uint8_t *xq, float *y, int K, int N,
                                     void *stream) {
-  if ((K & 127) != 0) return -2;
+  if ((K & 255) != 0) return -2;   /* whole Q8_K blocks */
   if (K <= 0 || K > PQ2_MAXK || N <= 0) return -2;
   dim3 block(256, 1, 1);
   dim3 grid((N + PQ2_BLOCK_ROWS - 1) / PQ2_BLOCK_ROWS, 1, 1);
