@@ -256,6 +256,14 @@ static void gemv_f16(const tensor_t *w, const float *x, float *y) {
 }
 static const float *f32t(const tensor_t *t) { if (t->type != 0) { fprintf(stderr, "%s not F32\n", t->name); exit(2); } return (const float *)t->data; }
 
+/* GEMV hooks: the reference uses the CPU functions above; the Nano engine
+   (g4eng.c) points them at its GPU kernels, which M3 proved bit-identical, so the
+   rest of forward() is literally shared code. */
+static void head_cpu(const tensor_t *w, const uint8_t *xq, float *y) { gemv_q6k_rows(w, xq, y, 0, (int)w->dims[1]); }
+static void (*G_Q4)(const tensor_t *, const uint8_t *, float *) = gemv_q4;
+static void (*G_HEAD)(const tensor_t *, const uint8_t *, float *) = head_cpu;
+static void (*G_F16)(const tensor_t *, const float *, float *) = gemv_f16;
+
 /* --------------------------------------------------------------- stages */
 static double rms_r(const float *x, int n) {
     double ss = 0; for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
@@ -301,7 +309,7 @@ static void __attribute__((unused)) forward(int tok, int pos) {
     const tensor_t *emb = tens("token_embd.weight");
     row_q6k(emb, tok, xs);
     for (int i = 0; i < H; i++) xs[i] = (float)((double)xs[i] * sqrt(1536.0));
-    gemv_f16(tens("per_layer_model_proj.weight"), xs, projb);
+    G_F16(tens("per_layer_model_proj.weight"), xs, projb);
     row_q6k(tens("per_layer_token_embd.weight"), tok, rowe);
     const float *pnw = f32t(tens("per_layer_proj_norm.weight"));
     for (int l = 0; l < NL; l++) {
@@ -325,16 +333,16 @@ static void __attribute__((unused)) forward(int tok, int pos) {
         /* attention */
         rmsnorm(xs, F("attn_norm"), hb, H);
         q8k(hb, XQ, H);
-        gemv_q4(tl(il, "attn_q"), XQ, qb);
+        G_Q4(tl(il, "attn_q"), XQ, qb);
         const float *qn = F("attn_q_norm");
         for (int j = 0; j < NH; j++) { float t[HD_F]; rmsnorm(qb + j * hd, qn, t, hd); memcpy(qb + j * hd, t, hd * 4); rope(qb + j * hd, cs, sn, hd); }
         int src = il < FIRST_SHARED ? il : (full ? store_f : store_s);
         if (il < FIRST_SHARED) {
             float t[HD_F];
-            gemv_q4(tl(il, "attn_k"), XQ, kb);
+            G_Q4(tl(il, "attn_k"), XQ, kb);
             rmsnorm(kb, F("attn_k_norm"), t, hd); rope(t, cs, sn, hd);
             memcpy(KC[il] + (size_t)pos * hd, t, hd * 4);
-            gemv_q4(tl(il, "attn_v"), XQ, vb);
+            G_Q4(tl(il, "attn_v"), XQ, vb);
             rmsnorm_noscale(vb, hd);
             memcpy(VC[il] + (size_t)pos * hd, vb, hd * 4);
         }
@@ -359,23 +367,23 @@ static void __attribute__((unused)) forward(int tok, int pos) {
             }
         }
         q8k(ab, XQ, NH * hd);
-        gemv_q4(tl(il, "attn_output"), XQ, hb);
+        G_Q4(tl(il, "attn_output"), XQ, hb);
         { float t[H]; rmsnorm(hb, F("post_attention_norm"), t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* MLP */
         rmsnorm(xs, F("ffn_norm"), hb, H);
         q8k(hb, XQ, H);
-        gemv_q4(tl(il, "ffn_gate"), XQ, gb);
-        gemv_q4(tl(il, "ffn_up"), XQ, ub);
+        G_Q4(tl(il, "ffn_gate"), XQ, gb);
+        G_Q4(tl(il, "ffn_up"), XQ, ub);
         for (int i = 0; i < inter; i++) gb[i] = gelu(gb[i]) * ub[i];
         q8k(gb, XQ, inter);
-        gemv_q4(tl(il, "ffn_down"), XQ, hb);
+        G_Q4(tl(il, "ffn_down"), XQ, hb);
         { float t[H]; rmsnorm(hb, F("post_ffw_norm"), t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* per-layer input */
         q8k(xs, XQ, H);
-        gemv_q4(tl(il, "inp_gate"), XQ, pleg);
+        G_Q4(tl(il, "inp_gate"), XQ, pleg);
         for (int i = 0; i < PLE; i++) pleg[i] = gelu(pleg[i]) * pin[il * PLE + i];
         q8k(pleg, XQ, PLE);
-        gemv_q4(tl(il, "proj"), XQ, hb);
+        G_Q4(tl(il, "proj"), XQ, hb);
         { float t[H]; rmsnorm(hb, F("post_norm"), t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         const float ls = f32t(tens((snprintf(nb, sizeof nb, "blk.%d.layer_output_scale.weight", il), nb)))[0];
         for (int i = 0; i < H; i++) xs[i] = xs[i] * ls;
@@ -383,7 +391,7 @@ static void __attribute__((unused)) forward(int tok, int pos) {
     }
     rmsnorm(xs, f32t(tens("output_norm.weight")), hb, H);
     q8k(hb, XQ, H);
-    gemv_q6k_rows(emb, XQ, logits, 0, VOCAB);   /* raw logits; soft-cap applied by the caller */
+    G_HEAD(emb, XQ, logits);   /* raw logits; soft-cap applied by the caller */
 }
 static float __attribute__((unused)) capped(float l) { return (float)(SOFTCAP * g4_tanh((double)l / SOFTCAP)); }
 

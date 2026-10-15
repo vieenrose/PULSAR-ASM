@@ -169,3 +169,14 @@ The head was issue-bound, not memory-bound (one SM, ~100 instructions per block 
 v1-v3); v4 cut the decode work. Per-token GEMV estimate from the layer schedule: layers
 108.7 ms + head 41.4 ms = **150 ms, a 6.7 tok/s ceiling from GEMVs alone**, before the CPU
 stages and driver overhead. The engine will use `q6k_gemv4`; v1-v3 stay as parity records.
+
+## M4 first light (2026-10-15): engine output = goldens, bit for bit
+
+`g4eng.c` runs g4ref.c's own forward() (shared code) with its three GEMV hooks pointed
+at the M3 kernels. On the Nano: **golden_en.txt (97 steps) and golden_zh.txt (222 steps)
+reproduced byte for byte**, i.e. the aarch64 build and the GPU give exactly the x86
+reference's tokens and printed logits.
+
+First version (all CPU stages in C, one synchronous H2D + launch + sync + D2H per GEMV):
+load 4.6-6.4 s, 1,456 MB on the GPU, peak RSS 700 MB; decode 3.22 tok/s (en, 76 steps),
+2.96 tok/s (zh, 200 steps); prefill 2.76 tok/s. Next: profile and optimize.
