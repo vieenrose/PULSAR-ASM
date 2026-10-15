@@ -1004,7 +1004,135 @@ attention_range:
        s4/s5/s8/s9 + 4 K rows in flight) on top of the Exp69 16B LD1 + 4-lane
        FMUL + ordered scalar adds. Bit-identical by construction: every t keeps
        its own ascending 64-element fadd chain (lane 0 first, then DUP lanes). */
+    /* Exp87: transposed 16-row score block on the contiguous KV plane. trn1/trn2 turn
+       4 rows x 4 elements into vectors whose lanes are 4 different t's running dots; fmul by
+       element + vector fadd then advance four ascending-k chains per instruction. Same IEEE
+       ops per t in the same k order => bit-identical. */
     mov x27, xzr
+    bic x12, x20, #15
+.LattnR_score_t16:
+    cmp x27, x12
+    b.hs .LattnR_score_t16done
+    add x9, x22, x27, lsl #8
+    add x9, x9, x2
+    add x13, x9, #4096               /* running prefetch pointer: next block, +256 B per chunk */
+    mov x10, x24
+    movi v4.4s, #0
+    movi v5.4s, #0
+    movi v8.4s, #0
+    movi v9.4s, #0
+    mov x11, #16
+.LattnR_score_i16:
+    prfm pldl1keep, [x13]
+    prfm pldl1keep, [x13, #64]
+    prfm pldl1keep, [x13, #128]
+    prfm pldl1keep, [x13, #192]
+    add x13, x13, #256
+    ld1 {v0.4s}, [x10], #16
+    ldr q16, [x9, #0]
+    ldr q17, [x9, #256]
+    ldr q18, [x9, #512]
+    ldr q19, [x9, #768]
+    trn1 v20.4s, v16.4s, v17.4s
+    trn2 v21.4s, v16.4s, v17.4s
+    trn1 v22.4s, v18.4s, v19.4s
+    trn2 v23.4s, v18.4s, v19.4s
+    trn1 v24.2d, v20.2d, v22.2d
+    trn1 v25.2d, v21.2d, v23.2d
+    trn2 v26.2d, v20.2d, v22.2d
+    trn2 v27.2d, v21.2d, v23.2d
+    fmul v28.4s, v24.4s, v0.s[0]
+    fadd v4.4s, v4.4s, v28.4s
+    fmul v29.4s, v25.4s, v0.s[1]
+    fadd v4.4s, v4.4s, v29.4s
+    fmul v30.4s, v26.4s, v0.s[2]
+    fadd v4.4s, v4.4s, v30.4s
+    fmul v31.4s, v27.4s, v0.s[3]
+    fadd v4.4s, v4.4s, v31.4s
+    ldr q16, [x9, #1024]
+    ldr q17, [x9, #1280]
+    ldr q18, [x9, #1536]
+    ldr q19, [x9, #1792]
+    trn1 v20.4s, v16.4s, v17.4s
+    trn2 v21.4s, v16.4s, v17.4s
+    trn1 v22.4s, v18.4s, v19.4s
+    trn2 v23.4s, v18.4s, v19.4s
+    trn1 v24.2d, v20.2d, v22.2d
+    trn1 v25.2d, v21.2d, v23.2d
+    trn2 v26.2d, v20.2d, v22.2d
+    trn2 v27.2d, v21.2d, v23.2d
+    fmul v28.4s, v24.4s, v0.s[0]
+    fadd v5.4s, v5.4s, v28.4s
+    fmul v29.4s, v25.4s, v0.s[1]
+    fadd v5.4s, v5.4s, v29.4s
+    fmul v30.4s, v26.4s, v0.s[2]
+    fadd v5.4s, v5.4s, v30.4s
+    fmul v31.4s, v27.4s, v0.s[3]
+    fadd v5.4s, v5.4s, v31.4s
+    ldr q16, [x9, #2048]
+    ldr q17, [x9, #2304]
+    ldr q18, [x9, #2560]
+    ldr q19, [x9, #2816]
+    trn1 v20.4s, v16.4s, v17.4s
+    trn2 v21.4s, v16.4s, v17.4s
+    trn1 v22.4s, v18.4s, v19.4s
+    trn2 v23.4s, v18.4s, v19.4s
+    trn1 v24.2d, v20.2d, v22.2d
+    trn1 v25.2d, v21.2d, v23.2d
+    trn2 v26.2d, v20.2d, v22.2d
+    trn2 v27.2d, v21.2d, v23.2d
+    fmul v28.4s, v24.4s, v0.s[0]
+    fadd v8.4s, v8.4s, v28.4s
+    fmul v29.4s, v25.4s, v0.s[1]
+    fadd v8.4s, v8.4s, v29.4s
+    fmul v30.4s, v26.4s, v0.s[2]
+    fadd v8.4s, v8.4s, v30.4s
+    fmul v31.4s, v27.4s, v0.s[3]
+    fadd v8.4s, v8.4s, v31.4s
+    ldr q16, [x9, #3072]
+    ldr q17, [x9, #3328]
+    ldr q18, [x9, #3584]
+    ldr q19, [x9, #3840]
+    trn1 v20.4s, v16.4s, v17.4s
+    trn2 v21.4s, v16.4s, v17.4s
+    trn1 v22.4s, v18.4s, v19.4s
+    trn2 v23.4s, v18.4s, v19.4s
+    trn1 v24.2d, v20.2d, v22.2d
+    trn1 v25.2d, v21.2d, v23.2d
+    trn2 v26.2d, v20.2d, v22.2d
+    trn2 v27.2d, v21.2d, v23.2d
+    fmul v28.4s, v24.4s, v0.s[0]
+    fadd v9.4s, v9.4s, v28.4s
+    fmul v29.4s, v25.4s, v0.s[1]
+    fadd v9.4s, v9.4s, v29.4s
+    fmul v30.4s, v26.4s, v0.s[2]
+    fadd v9.4s, v9.4s, v30.4s
+    fmul v31.4s, v27.4s, v0.s[3]
+    fadd v9.4s, v9.4s, v31.4s
+    add x9, x9, #16
+    subs x11, x11, #1
+    b.ne .LattnR_score_i16
+    fmov v7.4s, #0.125
+    add x14, x25, x27, lsl #2
+    fmul v4.4s, v4.4s, v7.4s
+    str q4, [x14, #0]
+    fmul v5.4s, v5.4s, v7.4s
+    str q5, [x14, #16]
+    fmul v8.4s, v8.4s, v7.4s
+    str q8, [x14, #32]
+    fmul v9.4s, v9.4s, v7.4s
+    str q9, [x14, #48]
+    fmaxnm v0.4s, v4.4s, v5.4s
+    fmaxnm v1.4s, v8.4s, v9.4s
+    fmaxnm v0.4s, v0.4s, v1.4s
+    fmaxnmv s0, v0.4s
+    fcmp s0, s11
+    b.le .LattnR_t16nomax
+    fmov s11, s0
+.LattnR_t16nomax:
+    add x27, x27, #16
+    b .LattnR_score_t16
+.LattnR_score_t16done:
     bic x12, x20, #3
 .LattnR_score_t4:
     cmp x27, x12
