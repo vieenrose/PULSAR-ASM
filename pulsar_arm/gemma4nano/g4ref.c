@@ -78,9 +78,6 @@ static const tensor_t *tens(const char *name) {
     for (int i = 0; i < NT; i++) if (!strcmp(T[i].name, name)) return &T[i];
     fprintf(stderr, "missing tensor %s\n", name); exit(2);
 }
-static const tensor_t *tl(int il, const char *kind) {
-    char b[96]; snprintf(b, sizeof b, "blk.%d.%s.weight", il, kind); return tens(b);
-}
 static void gguf_open(const char *path) {
     int fd = open(path, O_RDONLY); struct stat s;
     if (fd < 0 || fstat(fd, &s)) { perror(path); exit(2); }
@@ -263,6 +260,33 @@ static void head_cpu(const tensor_t *w, const uint8_t *xq, float *y) { gemv_q6k_
 static void (*G_Q4)(const tensor_t *, const uint8_t *, float *) = gemv_q4;
 static void (*G_HEAD)(const tensor_t *, const uint8_t *, float *) = head_cpu;
 static void (*G_F16)(const tensor_t *, const float *, float *) = gemv_f16;
+/* n GEMVs sharing one quantized input (q+k+v, gate+up); the engine runs them as one launch */
+static void q4n_seq(int n, const tensor_t **ts, const uint8_t *xq, float **ys) { for (int i = 0; i < n; i++) G_Q4(ts[i], xq, ys[i]); }
+static void (*G_Q4N)(int, const tensor_t **, const uint8_t *, float **) = q4n_seq;
+
+/* per-layer tensor table, filled once (the names never change) */
+typedef struct {
+    const tensor_t *q, *k, *v, *o, *gate, *up, *down, *ig, *proj;
+    const float *n_attn, *n_q, *n_k, *n_post_attn, *n_ffn, *n_post_ffw, *n_post;
+    float scale;
+} layer_t;
+static layer_t LT[NL];
+static void layer_table(void) {
+    char b[96];
+#define W(kind) (snprintf(b, sizeof b, "blk.%d.%s.weight", il, kind), tens(b))
+    for (int il = 0; il < NL; il++) {
+        layer_t *L = &LT[il];
+        L->q = W("attn_q"); L->o = W("attn_output"); L->gate = W("ffn_gate"); L->up = W("ffn_up");
+        L->down = W("ffn_down"); L->ig = W("inp_gate"); L->proj = W("proj");
+        L->k = il < FIRST_SHARED ? W("attn_k") : NULL; L->v = il < FIRST_SHARED ? W("attn_v") : NULL;
+        L->n_attn = f32t(W("attn_norm")); L->n_q = f32t(W("attn_q_norm"));
+        L->n_k = il < FIRST_SHARED ? f32t(W("attn_k_norm")) : NULL;
+        L->n_post_attn = f32t(W("post_attention_norm")); L->n_ffn = f32t(W("ffn_norm"));
+        L->n_post_ffw = f32t(W("post_ffw_norm")); L->n_post = f32t(W("post_norm"));
+        L->scale = f32t(W("layer_output_scale"))[0];
+    }
+#undef W
+}
 
 /* --------------------------------------------------------------- stages */
 static double rms_r(const float *x, int n) {
@@ -327,22 +351,23 @@ static void __attribute__((unused)) forward(int tok, int pos) {
 
     for (int il = 0; il < NL; il++) {
         int full = !SLIDING[il], hd = full ? HD_F : HD_S, inter = il >= FIRST_SHARED ? 2 * INTER : INTER;
-        char nb[96];
-#define F(kind) (snprintf(nb, sizeof nb, "blk.%d.%s.weight", il, kind), f32t(tens(nb)))
+        const layer_t *L = &LT[il];
         const float *cs = rope_cs(full, 0, pos), *sn = rope_cs(full, 1, pos);
         /* attention */
-        rmsnorm(xs, F("attn_norm"), hb, H);
+        rmsnorm(xs, L->n_attn, hb, H);
         q8k(hb, XQ, H);
-        G_Q4(tl(il, "attn_q"), XQ, qb);
-        const float *qn = F("attn_q_norm");
+        if (il < FIRST_SHARED) {               /* q, k, v share the quantized input */
+            const tensor_t *ts[3] = {L->q, L->k, L->v};
+            float *ys[3] = {qb, kb, vb};
+            G_Q4N(3, ts, XQ, ys);
+        } else G_Q4(L->q, XQ, qb);
+        const float *qn = L->n_q;
         for (int j = 0; j < NH; j++) { float t[HD_F]; rmsnorm(qb + j * hd, qn, t, hd); memcpy(qb + j * hd, t, hd * 4); rope(qb + j * hd, cs, sn, hd); }
         int src = il < FIRST_SHARED ? il : (full ? store_f : store_s);
         if (il < FIRST_SHARED) {
             float t[HD_F];
-            G_Q4(tl(il, "attn_k"), XQ, kb);
-            rmsnorm(kb, F("attn_k_norm"), t, hd); rope(t, cs, sn, hd);
+            rmsnorm(kb, L->n_k, t, hd); rope(t, cs, sn, hd);
             memcpy(KC[il] + (size_t)pos * hd, t, hd * 4);
-            G_Q4(tl(il, "attn_v"), XQ, vb);
             rmsnorm_noscale(vb, hd);
             memcpy(VC[il] + (size_t)pos * hd, vb, hd * 4);
         }
@@ -367,27 +392,24 @@ static void __attribute__((unused)) forward(int tok, int pos) {
             }
         }
         q8k(ab, XQ, NH * hd);
-        G_Q4(tl(il, "attn_output"), XQ, hb);
-        { float t[H]; rmsnorm(hb, F("post_attention_norm"), t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
+        G_Q4(L->o, XQ, hb);
+        { float t[H]; rmsnorm(hb, L->n_post_attn, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* MLP */
-        rmsnorm(xs, F("ffn_norm"), hb, H);
+        rmsnorm(xs, L->n_ffn, hb, H);
         q8k(hb, XQ, H);
-        G_Q4(tl(il, "ffn_gate"), XQ, gb);
-        G_Q4(tl(il, "ffn_up"), XQ, ub);
+        { const tensor_t *ts[2] = {L->gate, L->up}; float *ys[2] = {gb, ub}; G_Q4N(2, ts, XQ, ys); }
         for (int i = 0; i < inter; i++) gb[i] = gelu(gb[i]) * ub[i];
         q8k(gb, XQ, inter);
-        G_Q4(tl(il, "ffn_down"), XQ, hb);
-        { float t[H]; rmsnorm(hb, F("post_ffw_norm"), t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
+        G_Q4(L->down, XQ, hb);
+        { float t[H]; rmsnorm(hb, L->n_post_ffw, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
         /* per-layer input */
         q8k(xs, XQ, H);
-        G_Q4(tl(il, "inp_gate"), XQ, pleg);
+        G_Q4(L->ig, XQ, pleg);
         for (int i = 0; i < PLE; i++) pleg[i] = gelu(pleg[i]) * pin[il * PLE + i];
         q8k(pleg, XQ, PLE);
-        G_Q4(tl(il, "proj"), XQ, hb);
-        { float t[H]; rmsnorm(hb, F("post_norm"), t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
-        const float ls = f32t(tens((snprintf(nb, sizeof nb, "blk.%d.layer_output_scale.weight", il), nb)))[0];
-        for (int i = 0; i < H; i++) xs[i] = xs[i] * ls;
-#undef F
+        G_Q4(L->proj, XQ, hb);
+        { float t[H]; rmsnorm(hb, L->n_post, t, H); for (int i = 0; i < H; i++) xs[i] = xs[i] + t[i]; }
+        for (int i = 0; i < H; i++) xs[i] = xs[i] * L->scale;
     }
     rmsnorm(xs, f32t(tens("output_norm.weight")), hb, H);
     q8k(hb, XQ, H);
@@ -407,6 +429,7 @@ int main(int argc, char **argv) {
     gguf_open(argv[1]);
     { int c = 0; for (int i = 0; i < NL; i++) c += !SLIDING[i];
       if (c != 7) { fprintf(stderr, "sliding pattern: %d full layers, want 7\n", c); return 2; } }
+    layer_table();
     { size_t want = (size_t)MAXSEQ * (128 + 256) * 2 * 4;
       ROPE = malloc(want); FILE *f = fopen(argv[2], "rb");
       if (!f || fread(ROPE, 1, want, f) != want) { fprintf(stderr, "rope table %s: want %zu bytes\n", argv[2], want); return 2; }
