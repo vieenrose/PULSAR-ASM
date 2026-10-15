@@ -561,3 +561,56 @@ double-buffering so the CPU runs ahead on non-deduped calls (WAR removal).
      wide-load question; measure in-engine with K2GTIME rather than end-to-end.
   6. Host submit/poll 22.7 ms/fwd: launch count is the only lever left; graphs/persistence/dedup
      all proved dead (runs #63/#75/#76/#77).
+
+## POST-EXP74 PROFILE FINDINGS (fresh, runs #88-#89; HEAD .S md5 669069df = Exp74 97 ms / 10.31 tok/s)
+Anchor copy: .auto/rescue/k2_cuda.exp74.S (untracked, = tracked .auto/rescue/k2_cuda.S at HEAD).
+Items 1-6 in the section above carry PRE-Exp68 numbers; item 6 in particular is superseded: the
+22.7 ms "host submit/poll" is really the GPU's own 61 ms of work seen from the CPU side (poll spin),
+not host overhead. Fresh decomposition per decoded token (216-step probe run, threads 1):
+  - wall 97 ms = GPU-busy ~61 ms (K2GTIME fwd_ms) + ~19 ms real CPU + ~25 ms poll spin/driver time.
+    SIGPROF: libcuda 52.7%, our binary 27.5%, libc 11.1%, libpthread 8.3%.
+  - 113 cuda_gemv calls/token = 28 layers x 4 merged calls + 1 LM head. The head is the biggest
+    single call (dt_us 6192, ~6-9 ms GPU-side).
+  - attention_range = 61.7% of our-binary samples = ~8.2 ms/token; expf ~2.2 ms; k2_q8_quant ~1.4 ms;
+    layer_forward 0.5 ms; cuda_gemv_impl/rms/argmax/rope ~0.4 ms each.
+  - Exp71 dead-path CONFIRMED by in-.S counters: k2q4_gemv_batch / layer_forward_batch / head_batch /
+    gemvW_batch entry counts are all 0 for every forward (prefill batch path is unreachable dead code).
+  - ~13 ms/token of libcuda work is non-spin driver time (~118 us/call: D2H + launch latency), fully
+    serialized because x_{k+1} depends on y_k.
+NEXT CANDIDATES (all bit-exact by construction, i.e. identical fadd sequence/value order):
+  A. [INVALID - retracted] attention_range `fadd s4, s4, v2.s[1]` (scalar-by-element FADD). The
+     assembler REJECTS it: `as -march=armv8-a` -> "operand 3 must be a floating-point register"
+     (checked on the Nano, run after the post-Exp76 notes). AArch64 has no scalar FADD-by-element,
+     so the `dup s7, v2.s[n]` extraction is required and the instruction count cannot be reduced
+     this way. Do not re-propose.
+  B. Prefetch distance is now BRACKETED: 8 KB = Exp74 (best), 16/24 KB = Exp76 (-5%, discarded).
+     Do not re-try deeper distances. If revisiting, keep the 8 KB *distance* and raise MLP instead
+     (issue the quad's prefetches two quad-iterations earlier).
+  C. Attack the ~13 ms/token driver cost: split a call's rows into 2 chunks and issue an async D2H for
+     chunk 1 while chunk 2's kernel runs, or fuse the activation quantize (k2_q8_quant, 1.4 ms) into the
+     GEMV kernel. No other CPU/GPU overlap is possible: every GEMV output feeds the next quantize.
+  D. expf (~2.2 ms/token, `bl expf` per element) — inline a bit-exact copy (identical table + order).
+  E. GPU kernel: 7.24 GB/s measured vs probe94's 8.45 GB/s ceiling -> gpu_v57/gen_v57.py (wide 32B/lane
+     v4 loads, generated but NEVER benched) is the remaining ~10 ms/fwd lever on the GPU side.
+  F. Hard constraint reminder: attention summation order is untouchable (Exp69: full reassociation
+     failed the gate, 221 steps, step1 logit 15.8644 vs golden 16.2669).
+
+## GPU KERNEL FINDINGS (Exp77 / run #90, after the Exp76 notes)
+- SASS of the unchanged v52 q4_gemv PTX (ptxas -arch=sm_53 on the Nano, cuobjdump -sass):
+  BFE 117, XMAD 91 (= the 96 mad.lo.s32, 1:1), LDG 33, LDS 30, STS 27, SEL 26, IADD/ISCADD/
+  ISETP ~60 total, I2F 12, FADD 9, FMUL 8. Register use 56, 16384 B smem, no spill.
+- Pipe-clock model (sm_53 rates: shift/BFE 64/clk, XMAD 32/clk, I2F 32/clk, int add 128/clk):
+  ~200 pipe-clk per warp-iteration. Total warp-iterations per token ~274k (rows/4 warps x nb/32
+  iterations, all GEMV calls) -> ~55 M clk -> ~60 ms at 921 MHz. This matches the measured
+  ~61 ms GPU-busy per token, so the kernel looks ISSUE/ALU-BOUND, not memory-bound.
+- Exp77 (ld.global -> ld.global.nc, read-only path): exactly zero gain (97 ms, 10.31 tok/s, run #90).
+  The load path is not the limiter. Cache-operator hints are closed.
+- SWAR "two products per XMAD" (pack X + Y<<16 against U = u_hi + u_lo<<16): BLOCKED. XMAD is a
+  16x16->32 multiply; the packed operands exceed 16 bits (the 2^16 field needs a 20-bit U), so
+  the trick would be emulated with 3 XMADs. Do not re-propose without a 16-bit-clean packing.
+- Remaining real GPU lever (needs a user decision): pre-expand the 4-bit weights to int8 at repack
+  time. This removes the 8 BFE per row-word (~4 of ~14 pipe-clk, est. -20..30% kernel ALU time,
+  ~-12 ms/token if ALU-bound). Cost: weight memory 2x (748 MB -> ~1.5 GB on the 4 GB board; GPU
+  peak RSS was 851 MB). Also doubles the weight-load count per row, a risk if LSU-bound.
+- v57 (gen_v57.py) changes the lane mapping and load width but NOT the ALU count per dot, so it is
+  unlikely to recover the ALU share. Its level-2 chain transfer is also unfinished in the generator.
