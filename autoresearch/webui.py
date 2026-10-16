@@ -8,8 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(ROOT)
-CSS = """:root{--bg:#fafafa;--fg:#1d1d1f;--mu:#6e6e73;--ln:#e3e3e6;--ac:#0a7d42;--bad:#b3261e;--card:#fff}
-@media (prefers-color-scheme:dark){:root{--bg:#141416;--fg:#e8e8ea;--mu:#9a9aa0;--ln:#2c2c30;--ac:#4cc38a;--bad:#ff7b72;--card:#1c1c1f}}
+CSS = """:root{--bg:#fafafa;--fg:#1d1d1f;--mu:#6e6e73;--ln:#e3e3e6;--ac:#0a7d42;--bad:#b3261e;--card:#fff;--c1:#1f6fd1;--c2:#d1661f}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--fg:#e8e8ea;--mu:#9a9aa0;--ln:#2c2c30;--ac:#4cc38a;--bad:#ff7b72;--card:#1c1c1f;--c1:#6aa8ff;--c2:#ffa25c}}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 ui-sans-serif,system-ui,sans-serif}
 main{max-width:1100px;margin:0 auto;padding:16px}h1{font-size:18px;margin:4px 0 12px}
 .card{background:var(--card);border:1px solid var(--ln);border-radius:8px;padding:12px;margin:12px 0;overflow-x:auto}
@@ -39,6 +39,46 @@ def fnum(x):
     try: return float(x)
     except (TypeError, ValueError): return None
 
+SPEEDS = (("prefill", "prefill tok/s", "var(--c1)"), ("decode", "generation tok/s", "var(--c2)"))
+
+def speeds(r):
+    """{'prefill': x, 'decode': y} parsed from guard-metric 'prefill=.. decode=.. rss=..'"""
+    out = {}
+    for kv in (r.get("guard-metric") or "").split():
+        k, _, v = kv.partition("=")
+        if k in ("prefill", "decode") and fnum(v) is not None: out[k] = fnum(v)
+    return out
+
+def speed_chart(rows):
+    """prefill and generation tok/s per iteration, one curve each (through kept rows), shared axis from 0"""
+    sp = [speeds(r) for r in rows]
+    vs = [v for d in sp for v in d.values()]
+    if not vs: return ""
+    W, H, P, L = 1000, 260, 30, 46
+    hi = max(vs) * 1.1
+    n = max(len(rows) - 1, 1)
+    X = lambda i: L + (W - L - P) * i / n
+    Y = lambda v: H - P - (H - 2 * P) * v / hi
+    out = [f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" aria-label="prefill and generation speed per iteration">']
+    for t in range(5):
+        v = hi * t / 4
+        out.append(f'<line x1="{L}" x2="{W-P}" y1="{Y(v):.1f}" y2="{Y(v):.1f}" stroke="var(--ln)"/>'
+                   f'<text x="{L-6}" y="{Y(v)+4:.1f}" text-anchor="end" fill="currentColor" font-size="12" opacity=".6">{v:.3g}</text>')
+    for k, lab, c in SPEEDS:
+        line = [f"{X(i):.1f},{Y(d[k]):.1f}" for i, (d, r) in enumerate(zip(sp, rows)) if k in d and r.get("status") in ("keep", "baseline")]
+        if line: out.append(f'<polyline points="{" ".join(line)}" fill="none" stroke="{c}" stroke-width="2.5"/>')
+        last = None
+        for i, (d, r) in enumerate(zip(sp, rows)):
+            if k not in d: continue
+            kept = r.get("status") in ("keep", "baseline")
+            out.append(f'<circle cx="{X(i):.1f}" cy="{Y(d[k]):.1f}" r="4" fill="{c if kept else "none"}" stroke="{c}" stroke-width="1.5">'
+                       f'<title>#{r.get("iteration")} {lab} {d[k]:g} ({html.escape(r.get("status",""))})</title></circle>')
+            if kept: last = (i, d[k])
+        if last: out.append(f'<text x="{X(last[0])-6:.1f}" y="{Y(last[1])-10:.1f}" text-anchor="end" fill="{c}" font-size="13" font-weight="600">{last[1]:g}</text>')
+    lg = "".join(f'<span style="display:inline-flex;align-items:center;gap:6px;margin-right:18px"><svg width="22" height="10"><line x1="0" x2="22" y1="5" y2="5" stroke="{c}" stroke-width="3"/></svg>{lab}</span>' for _, lab, c in SPEEDS)
+    out.append("</svg>")
+    return f'<div class="mu" style="margin-bottom:6px">speed per iteration (filled = kept, hollow = discarded) &nbsp; {lg}</div>' + "".join(out)
+
 def chart(rows):
     pts = [(i, fnum(r.get("metric")), r.get("status", "")) for i, r in enumerate(rows) if fnum(r.get("metric")) is not None]
     if len(pts) < 1: return ""
@@ -62,6 +102,10 @@ def chart(rows):
         out.append(f'<circle cx="{X(i):.1f}" cy="{Y(v):.1f}" r="4" fill="{c}"><title>#{rows[i].get("iteration")} {v} {html.escape(s)}</title></circle>')
     out.append("</svg>")
     return "".join(out)
+
+def fmt_sp(k, rows):
+    v = [speeds(r)[k] for r in rows if r.get("status") in ("keep", "baseline") and k in speeds(r)]
+    return f"{v[-1]:g} <span class=\"mu\" style=\"font-size:13px\">from {v[0]:g}</span>" if v else "-"
 
 def page(sel):
     ls = loops()
@@ -88,15 +132,22 @@ def page(sel):
         o.append(f'<div class="card kpi"><div><span class="mu">baseline</span><b class="num">{base:.4g}</b></div>'
                  f'<div><span class="mu">best</span><b class="num">{best[0]:.4g}</b></div>'
                  f'<div><span class="mu">improvement</span><b class="num">{imp:+.1f}%</b></div>'
+                 + "".join(f'<div><span class="mu">{lab}</span><b class="num" style="color:{c}">{fmt_sp(k, rows)}</b></div>' for k, lab, c in SPEEDS) +
                  f'<div><span class="mu">kept / other</span><b class="num">{kept} / {disc}</b></div>'
                  f'<div><span class="mu">iterations</span><b class="num">{len(rows)}</b></div></div>')
-    o.append(f'<div class="card">{chart(rows)}</div>')
+    o.append(f'<div class="card"><div class="mu" style="margin-bottom:6px">score per iteration</div>{chart(rows)}</div>')
+    sc = speed_chart(rows)
+    if sc: o.append(f'<div class="card">{sc}</div>')
     if rows:
         cols = [c for c in hdr]
+        if any(speeds(r) for r in rows) and "guard-metric" in cols:
+            gi = cols.index("guard-metric"); cols[gi:gi + 1] = ["prefill", "decode", "guard-metric"]
+            rows = [dict(r, prefill=f'{speeds(r)["prefill"]:g}' if "prefill" in speeds(r) else "",
+                         decode=f'{speeds(r)["decode"]:g}' if "decode" in speeds(r) else "") for r in rows]
         o.append('<div class="card"><table><tr>' + "".join(f"<th>{html.escape(c)}</th>" for c in cols) + "</tr>")
         for r in reversed(rows):
             o.append("<tr>" + "".join(
-                f'<td class="{"num " if c in ("iteration","metric","delta","commit","timestamp") else ""}{html.escape(r.get("status","")) if c=="status" else ""}">'
+                f'<td class="{"num " if c in ("iteration","metric","delta","commit","timestamp","prefill","decode") else ""}{html.escape(r.get("status","")) if c=="status" else ""}">'
                 f'{html.escape((r.get(c) or "")[:19].replace("T"," ") if c=="timestamp" else (r.get(c) or ""))}</td>' for c in cols) + "</tr>")
         o.append("</table></div>")
     if live: o.append(f'<div class="card"><div class="mu">running now (live.txt)</div><pre>{html.escape(live)}</pre></div>')
