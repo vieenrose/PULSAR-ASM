@@ -1479,3 +1479,25 @@ Measured out: (a) f16r on the FP32 pipe (C = 1.5 * 2^(e + 13), (y + C) - C, sign
 |y| < 2^15, checked exhaustively) to offload F2F pairs: longer dependent chain, more issues;
 4k ABBA E_FVF 1/3/5: score 14.26 / 13.41 / 12.94. (b) larger decode groups E_FVU 4/16/32 (with
 prefetch): decode 10.18 / 9.55 / 8.65 (register pressure, occupancy), not memory latency.
+75. k_fs register cap: k_fs<4, FK, MB> with FK = 2 K rows per warp pass and __launch_bounds__(256, 1)
+(keep, bit-identical; 4k decode +0.7%). nvprof, decode k_fs<4> at FAK: 97 registers, achieved
+occupancy 0.24, stall exec-dependency 58%, memory dependency 17%, IPC 3.17. E_FSK = 10 FK + MB
+picks the variant (0 = old FAK form). 4k sweep: 0 10.08, 24 9.98, 23 10.13, 21 10.15, 81 10.05, 43
+10.11, 0 10.09 decode. ABBA (21/0/0/21): decode 10.14 / 10.08 / 10.08 / 10.17, score 14.50 / 14.46
+/ 14.46 / 14.52, golden PASS. Same per-row chain and dotg_reduce order, only how many rows a pass
+holds. Measured out alongside: k_gdnf next-step prefetch (E_GPF) and 4 warps (E_GNW=4): ABBA
+decode 10.14 / 10.12 / 10.14 / 10.14 / 10.14 / 10.15, k_gdnf is at its memory rate. E_PROF=1 calls
+cudaProfilerStart after prefill, so `nvprof --profile-from-start off` profiles decode only.
+76. One-F2F exact f16 rounding in the k_fvh V chain (E_FVR, default 3; keep, bit-identical; 4k score
++0.7%). SASS of k_fvh: ~95 instructions per 4-position group, 40 of them F2F (f16r is two
+conversions), ~21 cycles per warp chain step per scheduler, consistent with conversions at 16/clk/SM.
+f16rr: h = F2F.F16.F32(|y|), f = float(h << 13) * 2^112 (the shift is one BFI), then y's sign OR'd
+back. Equal to __half2float(__float2half_rn(y)) for every |y| < 65520 including f16 denormals
+(build has no ftz), checked over all 2^32 inputs on the host and on the Nano's sm_53 (0
+mismatches). Overflow / NaN inputs give f >= 65536, so the chain keeps om = max(om, f) and a block
+whose om >= 65536 reruns its chain with exact f16r: no stream can differ. Microbench (1024 threads x
+4 chains x 4096 steps): 2xF2F 1.60 ms, shift+scale 1.58, +max 1.71; it helps in the kernel because
+the F2F pipe is the shared limit there, not the dependent latency. 4k ABBA (FVR 0/1/3/3/1/0):
+prefill 20.80 / 20.73 / 20.89 / 20.88 / 20.71 / 20.73, decode 10.12 / 10.20 / 10.22 / 10.22 / 10.22 /
+10.12, score 14.51 / 14.54 / 14.61 / 14.61 / 14.55 / 14.48, golden PASS. Locally (2B, 700 ids,
+chunks 8 / 5 / 1) streams and logits dumps equal with FVR 0 / 3 and with the fallback forced.

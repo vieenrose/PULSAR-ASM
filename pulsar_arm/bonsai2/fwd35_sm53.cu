@@ -29,6 +29,7 @@
 // and exact ties (whose rounding depends on the state) fall back to one real double add.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_profiler_api.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1257,8 +1258,9 @@ __global__ void k_fa(const float *q, const float *buf, const __half *kc, const _
    score with all blocks of the GPU (one block per KV group and 256-position tile, the GQ heads
    of the group share each K load), k_fw turns them into the in-place weights, k_fv runs the f16
    V chain. k_fa serialized the score phase inside one block per head. */
-template <int GQ>
-__global__ __launch_bounds__(256) void k_fs(const float *q, const __half *kc, const int *posp, float *scg,
+/* FK: K rows per warp pass; MB: minimum resident blocks per SM (register cap, occupancy). */
+template <int GQ, int FK, int MB>
+__global__ __launch_bounds__(256, MB) void k_fs(const float *q, const __half *kc, const int *posp, float *scg,
                                            int NH, int NKV, int ctx, float scale) {
     __shared__ float qs[GQ][256];
     const int g = blockIdx.x % NKV, base = blockIdx.x / NKV * 256, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -1273,16 +1275,16 @@ __global__ __launch_bounds__(256) void k_fs(const float *q, const __half *kc, co
 #pragma unroll
         for (int c = 0; c < 8; c++) qr[h][c] = qs[h][32 * c + lane];
     const int cnt = min(256, n - base);
-    for (int i0 = warp * FAK; i0 < cnt; i0 += 8 * FAK) {
-        __half kh[FAK][8];
+    for (int i0 = warp * FK; i0 < cnt; i0 += 8 * FK) {
+        __half kh[FK][8];
 #pragma unroll
-        for (int u = 0; u < FAK; u++) {
+        for (int u = 0; u < FK; u++) {
             const __half *kr = kc + (size_t)(base + min(i0 + u, cnt - 1)) * NKV * 256 + g * 256;
 #pragma unroll
             for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c + lane];
         }
 #pragma unroll
-        for (int u = 0; u < FAK; u++) {
+        for (int u = 0; u < FK; u++) {
             float a[GQ];
 #pragma unroll
             for (int h = 0; h < GQ; h++) a[h] = 0.0f;
@@ -1616,17 +1618,21 @@ __global__ void k_fvg(const float *buf, const __half *vc, const int *posp, const
    as float4 (U / 4 per head, ctx % 4 == 0) and V as one half2 word per position without
    predicates, and run the straight-line chain when no weight in the group is a rescale marker;
    other groups and the tail take k_fvg's per-position form. Arithmetic and order are k_fvg's. */
-template <int HG, int U>
-__global__ void k_fvh(const float *buf, const __half *vc, const int *posp, const float *scg,
-                      float *att, float *fao, int NH, int NKV, int ctx, int bs_) {
-    const int h0 = blockIdx.x * HG, tid = threadIdx.x;
-    const int n = *posp + (int)blockIdx.y + 1, g = h0 / (NH / NKV);
-    buf += (size_t)blockIdx.y * bs_; att += (size_t)blockIdx.y * NH * 256;
-    if (fao) fao += (size_t)blockIdx.y * NH * 256;
-    const float *wp = scg + ((size_t)blockIdx.y * NH + h0) * ctx;
-    const uint32_t *vp = (const uint32_t *)(vc + g * 256) + tid;
-    const int vs = NKV * 128;
-    float vk[HG][2], S[HG];
+/* f16r with one F2F (R): |y| to half, its bits back to f32 by a 13-bit shift and the exact 2^112
+   scale (denormal halves included), y's sign OR'd in. Equal to f16r for every |y| < 65520 (all 2^32
+   inputs checked); om keeps the largest scaled value, >= 65536 only where f16r gives inf or NaN. */
+template <bool R>
+__device__ __forceinline__ float f16rr(float y, float &om) {
+    if (!R) return f16r(y);
+    const uint32_t h = __half_as_ushort(__float2half_rn(fabsf(y)));
+    const float f = __uint_as_float(h << 13) * 0x1p112f;
+    om = fmaxf(om, f);
+    return __uint_as_float(__float_as_uint(f) | (__float_as_uint(y) & 0x80000000u));
+}
+template <int HG, int U, bool R>
+__device__ __forceinline__ float fvh_chain(const float *wp, const uint32_t *vp, int vs, int n, int ctx,
+                                           float (&vk)[HG][2], float (&S)[HG]) {
+    float om = 0.0f;
 #pragma unroll
     for (int j = 0; j < HG; j++) { S[j] = 0.0f; vk[j][0] = 0.0f; vk[j][1] = 0.0f; }
     int ic0 = 0;
@@ -1655,8 +1661,8 @@ __global__ void k_fvh(const float *buf, const __half *vc, const int *posp, const
 #pragma unroll
                 for (int j = 0; j < HG; j++) {
                     const float w = sw[u][j];
-                    vk[j][0] = f16r(fmaf(v0, w, vk[j][0]));
-                    vk[j][1] = f16r(fmaf(v1, w, vk[j][1]));
+                    vk[j][0] = f16rr<R>(fmaf(v0, w, vk[j][0]), om);
+                    vk[j][1] = f16rr<R>(fmaf(v1, w, vk[j][1]), om);
                     S[j] = fmaf(S[j], 1.0f, w);
                 }
             }
@@ -1670,11 +1676,11 @@ __global__ void k_fvh(const float *buf, const __half *vc, const int *posp, const
                     const float w = fabsf(sw[u][j]);
                     if (__float_as_uint(sw[u][j]) >> 31) {
 #pragma unroll
-                        for (int d = 0; d < 2; d++) { vk[j][d] = f16r(vk[j][d] * w); vk[j][d] = f16r(fmaf(vf[d], 1.0f, vk[j][d])); }
+                        for (int d = 0; d < 2; d++) { vk[j][d] = f16rr<R>(vk[j][d] * w, om); vk[j][d] = f16rr<R>(fmaf(vf[d], 1.0f, vk[j][d]), om); }
                         S[j] = fmaf(S[j], w, 1.0f);
                     } else {
 #pragma unroll
-                        for (int d = 0; d < 2; d++) vk[j][d] = f16r(fmaf(vf[d], w, vk[j][d]));
+                        for (int d = 0; d < 2; d++) vk[j][d] = f16rr<R>(fmaf(vf[d], w, vk[j][d]), om);
                         S[j] = fmaf(S[j], 1.0f, w);
                     }
                 }
@@ -1689,15 +1695,30 @@ __global__ void k_fvh(const float *buf, const __half *vc, const int *posp, const
             const float sw = __ldg(wp + (size_t)j * ctx + ic0), w = fabsf(sw);
             if (__float_as_uint(sw) >> 31) {
 #pragma unroll
-                for (int d = 0; d < 2; d++) { vk[j][d] = f16r(vk[j][d] * w); vk[j][d] = f16r(fmaf(vf[d], 1.0f, vk[j][d])); }
+                for (int d = 0; d < 2; d++) { vk[j][d] = f16rr<R>(vk[j][d] * w, om); vk[j][d] = f16rr<R>(fmaf(vf[d], 1.0f, vk[j][d]), om); }
                 S[j] = fmaf(S[j], w, 1.0f);
             } else {
 #pragma unroll
-                for (int d = 0; d < 2; d++) vk[j][d] = f16r(fmaf(vf[d], w, vk[j][d]));
+                for (int d = 0; d < 2; d++) vk[j][d] = f16rr<R>(fmaf(vf[d], w, vk[j][d]), om);
                 S[j] = fmaf(S[j], 1.0f, w);
             }
         }
     }
+    return om;
+}
+template <int HG, int U, bool RB>
+__global__ void k_fvh(const float *buf, const __half *vc, const int *posp, const float *scg,
+                      float *att, float *fao, int NH, int NKV, int ctx, int bs_) {
+    const int h0 = blockIdx.x * HG, tid = threadIdx.x;
+    const int n = *posp + (int)blockIdx.y + 1, g = h0 / (NH / NKV);
+    buf += (size_t)blockIdx.y * bs_; att += (size_t)blockIdx.y * NH * 256;
+    if (fao) fao += (size_t)blockIdx.y * NH * 256;
+    const float *wp = scg + ((size_t)blockIdx.y * NH + h0) * ctx;
+    const uint32_t *vp = (const uint32_t *)(vc + g * 256) + tid;
+    const int vs = NKV * 128;
+    float vk[HG][2], S[HG];
+    /* RB: the chain with f16rr<true>; a half overflow anywhere in this thread's chains reruns them with f16r */
+    if (!RB || fvh_chain<HG, U, true>(wp, vp, vs, n, ctx, vk, S) >= 65536.0f) fvh_chain<HG, U, false>(wp, vp, vs, n, ctx, vk, S);
 #pragma unroll
     for (int j = 0; j < HG; j++) {
         const float Si = S[j] == 0.0f ? 0.0f : 1.0f / S[j];
@@ -2193,6 +2214,8 @@ static int ssq_ready, ssq_on = -1;
 static double *d_ssq, *d_ssqn;
 static int ssqn_on = 1; /* E_SSQN: batch rms sums once per token in k_ssqn */
 static int fvgv = 0, fvgp = 2; /* E_FVGV / E_FVGP (one token / a token batch): 1 = k_fvg<1, 4>, 2 = k_fvg<2, 4> (4 heads share each V conversion), else k_fvg<2, 2> */
+static int fsk_d = 21; /* E_FSK: k_fs<4> variant, 10 * K rows per pass + min blocks per SM (0: FAK, 1; 21: 80 registers, 3 blocks per SM) */
+static int fvr_on = 3; /* E_FVR: k_fvh rounds with f16rr<true> (bit 0: one token, bit 1: a token batch) */
 static int fvh_on = 1; /* E_FVH: k_fvh lean-loop V chain (2: groups of 8 positions) */
 static int fvu_d = 4; /* E_FVU: k_fvg positions per load group at one token */
 static int fvp_on = 1; /* E_FVP: k_fvg issues the next position group's loads before the current chain */
@@ -2315,18 +2338,31 @@ static void enqueue(int nt, int tiny, int want) {
                 case 2: if (fsb_on == 2) k_fsb<2, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<2, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
                 default: if (fsb_on == 2) k_fsb<4, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<4, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
                 } else switch (NH / NKV) {
-                case 1: k_fs<1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
-                case 2: k_fs<2><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
-                default: k_fs<4><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                case 1: k_fs<1, FAK, 1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                case 2: k_fs<2, FAK, 1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                default:
+#define FS4(FK, MB) k_fs<4, FK, MB><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale)
+                    switch (fsk_d) {
+                    case 42: FS4(4, 2); break;
+                    case 43: FS4(4, 3); break;
+                    case 21: FS4(2, 1); break;
+                    case 23: FS4(2, 3); break;
+                    case 24: FS4(2, 4); break;
+                    case 81: FS4(8, 1); break;
+                    default: FS4(FAK, 1); break;
+                    }
+#undef FS4
+                    break;
                 }
                 if (fexp_on) k_fw<true><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
                 else k_fw<false><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
                 if (fvh_on && fvg && CTX % 4 == 0 && (nt > 1 ? fvgp : fvgv) != 1) {
                     const int hg4 = (nt > 1 ? fvgp : fvgv) == 2 && NH / NKV % 4 == 0;
-                    if (hg4) { if (fvh_on == 2) k_fvh<4, 8><<<dim3(NH / 4, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
-                               else k_fvh<4, 4><<<dim3(NH / 4, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG); }
-                    else { if (fvh_on == 2) k_fvh<2, 8><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
-                           else k_fvh<2, 4><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG); }
+#define FVH_L(HG, U, RB) k_fvh<HG, U, RB><<<dim3(NH / HG, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG)
+                    const bool rb = fvr_on & (nt > 1 ? 2 : 1);
+                    if (hg4) { if (fvh_on == 2) FVH_L(4, 8, false); else if (rb) FVH_L(4, 4, true); else FVH_L(4, 4, false); }
+                    else { if (fvh_on == 2) FVH_L(2, 8, false); else if (rb) FVH_L(2, 4, true); else FVH_L(2, 4, false); }
+#undef FVH_L
                 }
                 else if (nt == 1 && fvp_on) switch (fvu_d) {
                 case 8: FVG_L(true, 8) break;
@@ -2474,6 +2510,8 @@ int main(int argc, char **argv) {
     if (getenv("E_FVP")) fvp_on = atoi(getenv("E_FVP"));
     if (getenv("E_FVU")) fvu_d = atoi(getenv("E_FVU"));
     if (getenv("E_FVH")) fvh_on = atoi(getenv("E_FVH"));
+    if (getenv("E_FVR")) fvr_on = atoi(getenv("E_FVR"));
+    if (getenv("E_FSK")) fsk_d = atoi(getenv("E_FSK"));
     if (getenv("E_FSB")) fsb_on = atoi(getenv("E_FSB"));
     if (getenv("E_XQW")) xqw_on = atoi(getenv("E_XQW"));
     if (getenv("E_XQWD")) xqw_q1 = atoi(getenv("E_XQWD"));
@@ -2517,6 +2555,7 @@ int main(int argc, char **argv) {
     CK(cudaStreamSynchronize(st));
     const double t1 = now();
     double t2 = t1;
+    if (getenv("E_PROF")) CK(cudaProfilerStart()); /* nvprof --profile-from-start off: decode only */
     for (int s = 0; s < N; s++) {
         const int a = *hid;
         if (df) { CK(cudaMemcpy(hl, d_logits, 4 * (size_t)VOCAB, cudaMemcpyDeviceToHost)); fwrite(hl, 4, VOCAB, df); }
