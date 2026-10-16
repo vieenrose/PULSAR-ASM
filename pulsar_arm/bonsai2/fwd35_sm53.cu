@@ -966,7 +966,7 @@ __global__ void k_qk(const float *buf, const float *qn, const float *kn, const i
     if (lane < half) {
         float th = (float)pos;
         for (int t = 0; t < lane; t++) th *= ts;
-        const float c = gm_cosf(th), sn = gm_sinf(th);
+        const float c = gm_cosf(th), sn = gm_sincos_sinf(th);  // fork: GCC-fused sincosf
         const float x0 = y[lane], x1 = y[lane + half];
         y[lane] = fmaf(x0, c, -(x1 * sn));
         y[lane + half] = fmaf(x0, sn, x1 * c);

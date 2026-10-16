@@ -8,7 +8,7 @@
 set -u
 R=pesi@100.70.245.36; D=/home/pesi/b2
 cd "$(dirname "$0")/.."
-scp -q pulsar_arm/bonsai2/fwd35_sm53.cu .auto/golden_b2_*.txt $R:$D/ 2>&1 | grep -v locale
+scp -q pulsar_arm/bonsai2/fwd35_sm53.cu pulsar_arm/bonsai2/glibc_mathf.h .auto/golden_b2_*.txt $R:$D/ 2>&1 | grep -v locale
 ssh $R "cd $D && /usr/local/cuda/bin/nvcc -O3 -gencode arch=compute_53,code=sm_53 --fmad=false \
   -Xcompiler -fopenmp,-ffp-contract=off -o fwd35 fwd35_sm53.cu -lgomp 2>&1 | grep -i error" 2>&1 | grep -v locale
 A="248045 846 198 826 279 2943 15127 321 799 3065 421 4203 303 1754 13 248046 198 248045 74455 198 248068 271 248069 271"

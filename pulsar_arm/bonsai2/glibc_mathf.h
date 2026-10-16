@@ -221,6 +221,21 @@ GM_FN float gm_sinf(float x) {
     return x - x;
 }
 
+// sinf(x) as x86-64 glibc 2.27's __sincosf_fma returns it. GCC fuses a cosf/sinf pair of one
+// argument (the fork's rope_yarn) into sincosf, and that build differs from sinf only for
+// 2^-27 <= |x| < 2^-5: its vectorized code evaluates the inner term from x^3, not x^2
+// (fma(x^3, SS1, SS0)), then x + (x^2 cx) x. Exhaustively equal to libm sincosf over all
+// floats; its cos half is gm_cosf.
+GM_FN float gm_sincos_sinf(float x) {
+    const double theta = x, abstheta = fabs(theta);
+    if (abstheta < GM_PI_4 && abstheta >= 0x1p-27 && abstheta < 0x1p-5) {
+        const double theta2 = theta * theta, theta3 = theta * theta2;
+        const double cx = fma(theta3, 0x1.110f475cec8c5p-7, -0x1.555555543d49dp-3);
+        return (float)fma(theta2 * cx, theta, theta);
+    }
+    return gm_sinf(x);
+}
+
 GM_FN float gm_cosf(float x) {
     double theta = x;
     const double abstheta = fabs(theta);

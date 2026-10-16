@@ -467,7 +467,7 @@ static void rope(float *v, int pos) {
     float th = (float)pos;
     const int half = NROT / 2;
     for (int i = 0; i < half; i++) {
-        const float c = gm_cosf(th), s = gm_sinf(th);
+        const float c = gm_cosf(th), s = gm_sincos_sinf(th);  // fork: GCC-fused sincosf
         const float x0 = v[i], x1 = v[i + half];
         v[i] = fmaf(x0, c, -(x1 * s));
 #if ROPE_DST1_X0SIN

@@ -33,15 +33,12 @@ each attending over 3968 to 4031 positions.
   attention on, f16 cache).
   - **4B:** the 64-token stream equals the fork's. It is the harness gate
     (`.auto/golden_b2_4b_4k.txt`).
-  - **2B: known divergence.** The stream departs from the fork's at step
-    21 of 64, where the fork's top-2 margin is 0.04. The step-0 logits
-    already differ (max abs 0.14). They are bit-equal to the fork's for
-    256- and 512-token prefixes of the same prompt, so the cause is
-    length-dependent. Every engine path and switch, on the Nano and on a
-    desktop GPU, gives the same stream, and the fork gives the same stream
-    at ubatch 8, 16 and 32. The root cause is not yet found. The short-prompt
-    gates (`checks_b2.sh`) pass.
-  - **9B:** not yet checked against the fork at 4k.
+  - **2B and 9B:** the 64-token streams equal the fork's
+    (`.auto/golden_b2_2b_4k.txt`, `.auto/golden_b2_9b_4k.txt`). The 2B used to
+    leave the fork's stream at step 21. The cause was RoPE: the fork's
+    `cosf`/`sinf` pair is fused by GCC into x86 glibc's `sincosf`, whose sin
+    differs from `sinf` for 2^-27 <= |x| < 2^-5. The engine now transcribes
+    that path (`gm_sincos_sinf`, exhaustively equal over all floats).
 
 ### Why the short-prompt figures are higher
 
@@ -75,7 +72,7 @@ a near-empty cache.
 | | |
 |---|---|
 | Engine | `pulsar_arm/bonsai2/fwd35_sm53.cu`, one CUDA file written for this board. No llama.cpp, no cuBLAS, no Python at runtime |
-| Accuracy | **bit-exact against the PrismML llama.cpp fork**. Every demo stream below equals the fork's own greedy stream over its full length. `.auto/checks_b2.sh` gates 48 tokens on two prompts per model, at prefill chunk 1 and 8, against fork goldens. `.auto/measure_b2_4k.sh` gates the 4B's 64 tokens at 4k. Exception: the 2B's 4k stream diverges at step 21 (see the 4k notes above) |
+| Accuracy | **bit-exact against the PrismML llama.cpp fork**. Every demo stream below equals the fork's own greedy stream over its full length. `.auto/checks_b2.sh` gates 48 tokens on two prompts per model, at prefill chunk 1 and 8, against fork goldens. `.auto/measure_b2_4k.sh` gates the 4B's 64 tokens at 4k. The 2B and 9B 4k streams also equal the fork's |
 | Sources | [prism-ml/bonsai-2-small](https://huggingface.co/collections/prism-ml/bonsai-2-small) |
 
 sha256: 2B `36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa`,

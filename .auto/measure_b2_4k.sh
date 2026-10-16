@@ -9,7 +9,7 @@ set -u
 R=pesi@100.70.245.36; D=/home/pesi/b2
 cd "$(dirname "$0")/.."
 if [ -z "${NOBUILD:-}" ]; then
-  scp -q pulsar_arm/bonsai2/fwd35_sm53.cu .auto/prompt_b2_4k_ids.txt .auto/golden_b2_4b_4k.txt $R:$D/ 2>&1 | grep -v locale
+  scp -q pulsar_arm/bonsai2/fwd35_sm53.cu pulsar_arm/bonsai2/glibc_mathf.h .auto/prompt_b2_4k_ids.txt .auto/golden_b2_4b_4k.txt $R:$D/ 2>&1 | grep -v locale
   ssh $R "cd $D && /usr/local/cuda/bin/nvcc -O3 -gencode arch=compute_53,code=sm_53 --fmad=false \
     -Xcompiler -fopenmp,-ffp-contract=off -o fwd35 fwd35_sm53.cu -lgomp 2>&1 | grep -i error" 2>&1 | grep -v locale
 fi

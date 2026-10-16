@@ -1401,3 +1401,24 @@ decoder on every chunk: 0 chunks differ on the 2B and 4B. 4B cold ABBA after: PT
 / 5.1 s vs PQ2_0 5.2 / 5.2 s, wall 30.83 / 30.37 vs 30.55 / 30.50 s, stream identical. PTQ1_0
 keeps the smaller file (429 vs 517 MB, 950 vs 1146 MB) at the same speed. checks_b2 2B+4B ALL
 PASS. The 9B stays on PTQ1_0 (2.0 GB vs ~2.4 GB on a 14 GB card).
+69. 2B 4k divergence root-caused and fixed: RoPE sin from the fork's fused sincosf (keep; fixes the 2B,
+no speed change). The 2B's 4k stream left the fork's at step 21 of 64. Bisecting the prompt length
+on the desktop (fork_greedy, one thread, ubatch 32, vs the engine and fwd35_ref): step-0 logits
+bit-equal at 256-1664 tokens, different from 1728 on; at 1700 the engine equals the host
+reference (0 of 248320 differ) and both differ from the fork (max 0.138), so the reference
+missed a fork behaviour. Per-tensor dumps put the first difference at position 1699, layer 3,
+one Q element (head 0, index 54 = second half of RoPE pair i=22) and the K at the same position.
+Cause: ggml's rope_yarn calls cosf(theta) and sinf(theta) on one argument and GCC fuses the pair
+into sincosf. x86-64 glibc 2.27's __sincosf_fma differs from sinf only for sin at 2^-27 <= |x| <
+2^-5 (783266 floats, exhaustive; cos and every other range identical). Disassembly: the
+vectorised small-range code evaluates the inner term as fma(x^3, SS1, SS0) where sinf uses x^2,
+then sin = fma(x^2 cx, x, x). gm_sincos_sinf in glibc_mathf.h transcribes that; exhaustive check
+over all floats: 0 sin and 0 cos differences against libm sincosf. Before the change, sincosf plus
+the existing dst1 form reproduced all 61440 Q/K RoPE outputs of the fork's last ubatch in the
+six attention layers. 217 of 131072 (pos, i) angles below 4096 differ, and most of those round
+away, which is why only long prompts showed it. After: 2B step-0 logits bit-equal to the fork at
+1700, 1728, 1792 and 2048 tokens (engine and reference); 2B 4k 64-token stream equals the fork's
+on the desktop and on the Nano; 9B 4k stream equals the fork's (unchanged); 4B 4k golden PASS at
+18.77 / 9.82 (same as before); checks_b2 2B+4B ALL PASS. The fork streams are committed as
+golden_b2_2b_4k.txt / golden_b2_9b_4k.txt. checks_b2.sh and measure_b2_4k.sh now also copy
+glibc_mathf.h to the board (they copied only the .cu and built against a stale header).
