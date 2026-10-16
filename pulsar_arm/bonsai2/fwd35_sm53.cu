@@ -749,13 +749,8 @@ void k_gemvN(const uint4 *__restrict__ wc, const __half *__restrict__ ws, const 
 /* ---- GDN (gated delta net) layer pieces ---- */
 // ssm_beta / ssm_alpha F32 projections of xn: ggml_vec_dot_f32 order (tiny = 0, one token) or
 // tinyBLAS order (tiny = 1, the prompt batch)
-__global__ void k_ab(const float *wb, const float *wa, const float *xn, int E, int NV, int tiny, float *out) {
-    const int lane = threadIdx.x & 31;
-    xn += (size_t)blockIdx.y * E; out += (size_t)blockIdx.y * 2 * NV;
-    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    if (row >= 2 * NV) return;
-    const float *w = row < NV ? wb + (size_t)row * E : wa + (size_t)(row - NV) * E;
-    float r;
+// one k_ab row on one warp: the AVX2 ggml_vec_dot_f32 order, or tinyBLAS's (tiny)
+__device__ __forceinline__ float ab_row(const float *w, const float *xn, int E, int tiny, int lane) {
     if (!tiny) {
         float a = 0.0f;
         int i = 0;
@@ -767,12 +762,19 @@ __global__ void k_ab(const float *wb, const float *wa, const float *xn, int E, i
             for (int u = 0; u < 8; u++) a = fmaf(wv[u], xv[u], a);
         }
         for (; i < E; i += 32) a = fmaf(w[i + lane], xn[i + lane], a);
-        r = dotg_reduce(a, lane);
-    } else {
-        float c = 0.0f;
-        if (lane < 8) for (int l = 0; l < E; l += 8) c = fmaf(w[l + lane], xn[l + lane], c);
-        r = dott_reduce(c, lane);
+        return dotg_reduce(a, lane);
     }
+    float c = 0.0f;
+    if (lane < 8) for (int l = 0; l < E; l += 8) c = fmaf(w[l + lane], xn[l + lane], c);
+    return dott_reduce(c, lane);
+}
+__global__ void k_ab(const float *wb, const float *wa, const float *xn, int E, int NV, int tiny, float *out) {
+    const int lane = threadIdx.x & 31;
+    xn += (size_t)blockIdx.y * E; out += (size_t)blockIdx.y * 2 * NV;
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= 2 * NV) return;
+    const float *w = row < NV ? wb + (size_t)row * E : wa + (size_t)(row - NV) * E;
+    const float r = ab_row(w, xn, E, tiny, lane);
     if (lane == 0) out[row] = r;
 }
 /* k_ab's tiny order for a prompt batch, 4 tokens per warp: lanes 8 t' .. 8 t' + 7 run token
@@ -941,6 +943,99 @@ __global__ void k_gnorm(const float *o, const float *z, const float *w, int nh, 
     for (int i = lane; i < 128; i += 32) {
         const float nrm = (o[128 * h + i] * sc) * w[i];
         out[128 * h + i] = d_silu(z[128 * h + i]) * nrm;
+    }
+}
+
+/* Decode (one token) GDN fusions, E_GF. k_convl2 = k_conv + k_l2: one block of 128 threads per
+ * 128-channel head, q and k heads l2-normed from shared. k_gdnf = k_ab + k_gdn + k_gnorm: block h
+ * computes its own beta/alpha rows (k_ab's warp order), runs k_gdn's rows and gates its own 128
+ * outputs from shared. Every value keeps the unfused kernels' arithmetic. */
+__global__ __launch_bounds__(128) void k_convl2(const float *qkv, const float *cw, float *st, int CH, float *cv,
+                                                int nqk, float eps) {
+    __shared__ float y[128];
+    __shared__ float s_sc;
+    const int hd = blockIdx.x, c = hd * 128 + threadIdx.x;
+    const float *k = cw + 4 * c;
+    const float w0 = st[c], w1 = st[CH + c], w2 = st[2 * CH + c], w3 = qkv[c];
+    float s = 0.0f;
+    s += w0 * k[0]; s += w1 * k[1]; s += w2 * k[2]; s += w3 * k[3];
+    const float v = d_silu(s);
+    st[c] = w1; st[CH + c] = w2; st[2 * CH + c] = w3;
+    if (hd >= nqk) { cv[c] = v; return; }
+    y[threadIdx.x] = v;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const double q = wsum_sq(y, 128, threadIdx.x);
+        if (threadIdx.x == 0) s_sc = 1.0f / fmaxf(sqrtf((float)q), eps);
+    }
+    __syncthreads();
+    cv[c] = v * s_sc;
+}
+template <int RW>
+__global__ void k_gdnf(const float *cv, const float *wb, const float *wa, const float *xn, int E, int tiny,
+                       const float *ssm_a, const float *dtb, float *st, int NV, int NK, float scale,
+                       const float *z, const float *nw_, float eps, float *g) {
+    const int h = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    __shared__ float s_ab[2], s_be[2], so[128], s_sc;
+    if (warp < 2 || nw == 1) {
+        const int r0 = nw == 1 ? 0 : warp, r1 = nw == 1 ? 2 : warp + 1;
+        for (int r = r0; r < r1; r++) {
+            const float v = ab_row(r == 0 ? wb + (size_t)h * E : wa + (size_t)h * E, xn, E, tiny, lane);
+            if (lane == 0) s_ab[r] = v;
+        }
+    }
+    __syncthreads();
+    const float *q = cv + 128 * (h % NK), *k = cv + NK * 128 + 128 * (h % NK), *v = cv + 2 * NK * 128 + 128 * h;
+    if (threadIdx.x == 0) {
+        const float xg = s_ab[1] + dtb[h];
+        const float gg = ssm_a[h] * ((xg > 20.0f) ? xg : gm_logf(1.0f + gm_expf(xg)));
+        s_be[0] = 1.0f / (1.0f + gm_expf(-s_ab[0]));
+        s_be[1] = gm_expf(gg);
+    }
+    __syncthreads();
+    const float bt = s_be[0], eg = s_be[1];
+    float kr[4], qr[4];
+#pragma unroll
+    for (int c = 0; c < 4; c++) { kr[c] = k[32 * c + lane]; qr[c] = q[32 * c + lane]; }
+    float *M = st + (size_t)h * 128 * 128;
+    for (int j0 = warp; j0 < 128; j0 += RW * nw) {
+        float m[RW][4], a[RW], dt[RW], a2[RW];
+#pragma unroll
+        for (int u = 0; u < RW; u++) {
+            a[u] = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 4; c++) { m[u][c] = M[(j0 + u * nw) * 128 + 32 * c + lane] * eg; a[u] = fmaf(m[u][c], kr[c], a[u]); }
+        }
+#pragma unroll
+        for (int u = 0; u < RW; u++) dt[u] = dotg_reduce(a[u], lane);
+#pragma unroll
+        for (int u = 0; u < RW; u++) {
+            const int j = j0 + u * nw;
+            const float delta = (v[j] - dt[u]) * bt;
+            a2[u] = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                m[u][c] = fmaf(kr[c], delta, m[u][c]);
+                a2[u] = fmaf(m[u][c], qr[c], a2[u]);
+                M[j * 128 + 32 * c + lane] = m[u][c];
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < RW; u++) {
+            const float oo = dotg_reduce(a2[u], lane) * scale;
+            if (lane == 0) so[j0 + u * nw] = oo;
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const double ss = wsum_sq(so, 128, lane);
+        if (lane == 0) s_sc = rms_scale(ss, 128, eps);
+    }
+    __syncthreads();
+    const float sc = s_sc;
+    for (int i = threadIdx.x; i < 128; i += blockDim.x) {
+        const float nrm = (so[i] * sc) * nw_[i];
+        g[128 * h + i] = d_silu(z[128 * h + i]) * nrm;
     }
 }
 
@@ -1828,6 +1923,7 @@ static void tdump(const char *fmt, int il, const float *dv, int n) {
 /* nt consecutive tokens at positions *d_pos .. + nt - 1 (inputs d_x[t]). tiny: the prompt-batch
  * order of the F32 projections. want: 0 no head, 1 logits of the last token, 2 of every token. */
 static int gdn_rw = 2, gdn_nw = 2;
+static int gf_on = 1; /* E_GF: decode GDN fusions k_convl2 + k_gdnf */
 static int abt_on = 1; /* k_abt for prompt batches (E_ABT) */
 static int gdn_c = 1, gdn_crw = 4, gdn_cnw = 4; /* chunked k_gdnc for nt > 1 (E_GDNC, E_GCRW, E_GCNW) */ /* rows per warp chain, warps per block (128 % (rw * nw) == 0) */
 static void enqueue(int nt, int tiny, int want) {
@@ -1838,6 +1934,17 @@ static void enqueue(int nt, int tiny, int want) {
         norm_xq(d_x, L->attn_norm, d_xn, nt);
         gemvn(&L->in, d_buf, 0, nt, BIG);
         if (!L->full) {
+            if (nt == 1 && gf_on && !tdf) {
+                k_convl2<<<CH / 128, 128, 0, st>>>(d_buf, L->conv1d, d_conv[l], CH, d_cv, 2 * NK, EPS);
+                switch (gdn_rw) {
+                case 1: k_gdnf<1><<<NV, 32 * gdn_nw, 0, st>>>(d_cv, L->ssm_beta, L->ssm_alpha, d_xn, E, tiny, L->ssm_a, L->dt_bias, d_ssm[l], NV, NK, gscale, d_buf + CH, L->ssm_norm, EPS, d_g); break;
+                case 2: k_gdnf<2><<<NV, 32 * gdn_nw, 0, st>>>(d_cv, L->ssm_beta, L->ssm_alpha, d_xn, E, tiny, L->ssm_a, L->dt_bias, d_ssm[l], NV, NK, gscale, d_buf + CH, L->ssm_norm, EPS, d_g); break;
+                default: k_gdnf<4><<<NV, 32 * gdn_nw, 0, st>>>(d_cv, L->ssm_beta, L->ssm_alpha, d_xn, E, tiny, L->ssm_a, L->dt_bias, d_ssm[l], NV, NK, gscale, d_buf + CH, L->ssm_norm, EPS, d_g); break;
+                }
+                xq(d_g, NULL, GROUPED && NV > NK ? 1 : 0, INNER, INNER, nt);
+                gemv_res(&L->out, nt);
+                goto ffn;
+            }
             if (tiny && nt > 1 && abt_on)
                 k_abt<<<dim3((2 * NV + 3) / 4, (nt + 3) / 4), 128, 0, st>>>(L->ssm_beta, L->ssm_alpha, d_xn, E, NV, nt, d_ab);
             else
@@ -1886,6 +1993,7 @@ static void enqueue(int nt, int tiny, int want) {
             xq(d_att, NULL, 0, NH * HD, NH * HD, nt);
             gemv_res(&L->out, nt);
         }
+    ffn:
         tdump("attn_residual-%d", l, d_x, E);
         norm_xq(d_x, L->post_norm, d_xn, nt);
         gemvn(&L->ffu, d_buf, 0, nt, BIG);
@@ -2007,6 +2115,7 @@ int main(int argc, char **argv) {
     if (getenv("E_GNW")) gdn_nw = atoi(getenv("E_GNW"));
     if (getenv("E_GDNC")) gdn_c = atoi(getenv("E_GDNC"));
     if (getenv("E_ABT")) abt_on = atoi(getenv("E_ABT"));
+    if (getenv("E_GF")) gf_on = atoi(getenv("E_GF"));
     if (getenv("E_SSQN")) ssqn_on = atoi(getenv("E_SSQN"));
     if (getenv("E_FEXP")) fexp_on = atoi(getenv("E_FEXP"));
     k_feinit<<<1, 32>>>();

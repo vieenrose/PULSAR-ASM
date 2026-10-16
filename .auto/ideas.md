@@ -1422,3 +1422,14 @@ on the desktop and on the Nano; 9B 4k stream equals the fork's (unchanged); 4B 4
 18.77 / 9.82 (same as before); checks_b2 2B+4B ALL PASS. The fork streams are committed as
 golden_b2_2b_4k.txt / golden_b2_9b_4k.txt. checks_b2.sh and measure_b2_4k.sh now also copy
 glibc_mathf.h to the board (they copied only the .cu and built against a stale header).
+70. P8 decode GDN fusions k_convl2 + k_gdnf (keep, bit-identical; 4k decode +0.36%). Per GDN layer at one
+token, k_ab + k_conv + k_l2 + k_gdn + k_gnorm (5 launches) became 2: k_convl2 (conv + silu + state
+shift + the q/k l2 norm, one 128-thread block per 128-channel head, sum from shared) and k_gdnf
+(block h computes its own beta/alpha rows in k_ab's warp order, both the AVX2 and the tinyBLAS
+order, runs k_gdn's rows with outputs kept in shared, then k_gnorm's gated rms norm of its 128
+outputs). k_conv stays out of k_gdnf because the q/k channels are shared by NV/NK blocks and the
+conv state update would race. E_GF=0 restores the old chain. Local step-0 logits bit-equal (1-token
+prompt), streams identical (tiny and non-tiny order); checks_b2 2B+4B ALL PASS; 4B 4k ABBA
+(GF 1/0/0/1): decode 9.89 / 9.84 / 9.83 / 9.85, prefill 18.77-18.78 all four, golden PASS. The win
+is far below the ~2 ms the handoff estimated: in a CUDA graph on the Nano the small kernels cost
+little beyond their memory traffic, which the fusion keeps.
