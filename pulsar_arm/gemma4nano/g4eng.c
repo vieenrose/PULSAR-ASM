@@ -371,9 +371,10 @@ static void gpu_head_b(const tensor_t *emb, const uint8_t *xq, int xs, int B, in
     double b_ = prof ? now_ms() : 0;
     /* one q6i_gemv_b launch: each weight block read once for all B tokens (paired
        6-bit decode made it faster than B single launches); G4HEAD1=1: B launches */
-    if (!getenv("G4HEAD1")) {
-        int ib = B, ixs = xs, iys = VOCAB;
-        void *a[] = {&dHead, &dX, &dLogB, &rows, &ib, &ixs, &iys};
+    if (!getenv("G4HEAD1")) for (int t0 = 0; t0 < B; t0 += 4) {   /* q6i_gemv_b: <= 4 tokens per pass */
+        int ib = B - t0 < 4 ? B - t0 : 4, ixs = xs, iys = VOCAB;
+        uint64_t xt = dX + (uint64_t)t0 * xs, yt = dLogB + (uint64_t)t0 * VOCAB * 4;
+        void *a[] = {&dHead, &xt, &yt, &rows, &ib, &ixs, &iys};
         CK(cuLaunchKernel_(fq6ib, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, stream, a, NULL));
     } else for (int t = 0; t < B; t++) {
         uint64_t xt = dX + (uint64_t)t * xs, yt = dLogB + (uint64_t)t * VOCAB * 4;

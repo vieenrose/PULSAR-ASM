@@ -884,22 +884,24 @@ extern "C" __global__ void __launch_bounds__(256) q4i_gemv_b2(const uint4 *__res
 // q6i_gemv_b: the q6i head for B tokens. Per block, each sub-block's 16 values are
 // decoded once (four words) and dotted with every token's activations; per token
 // isum = sum_j sc_j * (p_j - 32 * sum a_j), then acc = fma(dw * da, (float)isum, acc).
+// q6i_gemv_b takes up to Q6BMAX tokens per weight pass (4: fewer live registers than 8)
+#define Q6BMAX 4
 extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__restrict__ w,
         const uint8_t *__restrict__ xq, float *__restrict__ y, int rows, int B, int xstride, int ystride) {
-    __shared__ __align__(16) short A[BMAX * 1536];
-    __shared__ int SA[BMAX * 96];
-    __shared__ float DA[BMAX * 6];
+    __shared__ __align__(16) short A[Q6BMAX * 1536];
+    __shared__ int SA[Q6BMAX * 96];
+    __shared__ float DA[Q6BMAX * 6];
     const int tid = threadIdx.y * 32 + threadIdx.x;
     // slots t >= B hold zeros and are never stored: no data-dependent branch in the
     // token loops, so the per-token chains interleave (as q4i_gemv_b2)
-    for (int i = tid; i < BMAX * 1536; i += 256) {
+    for (int i = tid; i < Q6BMAX * 1536; i += 256) {
         const int t = i / 1536, c = i % 1536;
         if (t >= B) { A[i] = 0; continue; }
         A[t * 1536 + Q6P(c)] = (short)(int8_t)xq[t * xstride + (c >> 8) * 292 + 4 + (c & 255)];   // as q6i_gemv
     }
-    for (int i = tid; i < BMAX * 6; i += 256) DA[i] = i < B * 6 ? *(const float *)(xq + (i / 6) * xstride + (i % 6) * 292) : 0.0f;
+    for (int i = tid; i < Q6BMAX * 6; i += 256) DA[i] = i < B * 6 ? *(const float *)(xq + (i / 6) * xstride + (i % 6) * 292) : 0.0f;
     __syncthreads();
-    for (int i = tid; i < BMAX * 96; i += 256) {
+    for (int i = tid; i < Q6BMAX * 96; i += 256) {
         const int t = i / 96, bj = i % 96, b = bj >> 4, j = bj & 15, n = j >> 3, k = (j >> 1) & 3, lh = j & 1;
         int s = 0;
         for (int l = 16 * lh; l < 16 * lh + 16; l++) s += A[t * 1536 + b * 256 + 128 * n + 32 * k + l];
@@ -910,18 +912,18 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__rest
     const int r = tile * 32 + threadIdx.x;
     if (r >= rows) return;
     const uint4 *wt = w + (size_t)tile * 6 * 14 * 32 + threadIdx.x;
-    float acc[BMAX];
+    float acc[Q6BMAX];
     #pragma unroll
-    for (int t = 0; t < BMAX; t++) acc[t] = 0.0f;
+    for (int t = 0; t < Q6BMAX; t++) acc[t] = 0.0f;
     for (int b = 0; b < 6; b++) {
         uint4 c[14];
         #pragma unroll
         for (int k = 0; k < 14; k++) c[k] = wt[((size_t)b * 14 + k) * 32];
         const unsigned *u = (const unsigned *)c;
         const int8_t *scb = (const int8_t *)(u + 48);
-        int s[BMAX];
+        int s[Q6BMAX];
         #pragma unroll
-        for (int t = 0; t < BMAX; t++) s[t] = 0;
+        for (int t = 0; t < Q6BMAX; t++) s[t] = 0;
         #pragma unroll
         for (int n = 0; n < 2; n++) {
             #pragma unroll
@@ -940,7 +942,7 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__rest
                                       : (((L1 >> 4) & 0x0F0F0F0Fu) | ((Hh >> 2) & 0x30303030u));
                     }
                     #pragma unroll
-                    for (int t = 0; t < BMAX; t++) {
+                    for (int t = 0; t < Q6BMAX; t++) {
                         const uint2 *A2 = (const uint2 *)(A + t * 1536 + b * 256 + 128 * n + 32 * k + 16 * lh);
                         int p = 0;
                         #pragma unroll
@@ -956,10 +958,10 @@ extern "C" __global__ void __launch_bounds__(256) q6i_gemv_b(const uint4 *__rest
         }
         const float dw = __half2float(*(const __half *)(u + 52));
         #pragma unroll
-        for (int t = 0; t < BMAX; t++) acc[t] = __fmaf_rn(__fmul_rn(dw, DA[t * 6 + b]), __int2float_rn(s[t]), acc[t]);
+        for (int t = 0; t < Q6BMAX; t++) acc[t] = __fmaf_rn(__fmul_rn(dw, DA[t * 6 + b]), __int2float_rn(s[t]), acc[t]);
     }
     #pragma unroll
-    for (int t = 0; t < BMAX; t++) if (t < B) y[(size_t)t * ystride + r] = acc[t];
+    for (int t = 0; t < Q6BMAX; t++) if (t < B) y[(size_t)t * ystride + r] = acc[t];
 }
 
 // f16_gemv_t2: f16_gemv_t with two adjacent rows per thread (one half2 load per k

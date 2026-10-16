@@ -294,9 +294,11 @@ static int test_batch(void) {
         uint64_t dHi; CK(cuMemAlloc_(&dHi, (size_t)rows * 6 * 224)); CK(cuMemcpyHtoD_(dHi, rp, (size_t)rows * 6 * 224)); free(rp);
         for (int b = 0; b < B; b++) { make_x(x, H, b % 3); q8k(x, xqb + (size_t)b * xs, H); }
         CK(cuMemcpyHtoD_(dXb, xqb, (size_t)B * xs));
-        int ib = B;
-        void *a[] = {&dHi, &dXb, &dYb, &rows, &ib, &xs, &rows};
-        CK(cuLaunchKernel_(fq6ib, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, NULL, a, NULL));
+        for (int t0 = 0; t0 < B; t0 += 4) {   /* q6i_gemv_b: 4 tokens per pass */
+            int ib = 4; uint64_t xt = dXb + (uint64_t)t0 * xs, yt = dYb + (uint64_t)t0 * rows * 4;
+            void *a[] = {&dHi, &xt, &yt, &rows, &ib, &xs, &rows};
+            CK(cuLaunchKernel_(fq6ib, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, NULL, a, NULL));
+        }
         CK(cuCtxSynchronize_());
         float *hb = malloc((size_t)B * rows * 4), *hc = malloc((size_t)rows * 4);
         CK(cuMemcpyDtoH_(hb, dYb, (size_t)B * rows * 4));
