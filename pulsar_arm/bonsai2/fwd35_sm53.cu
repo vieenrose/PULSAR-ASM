@@ -187,18 +187,21 @@ __device__ __forceinline__ float d_sigm(float x) { return 1.0f / (1.0f + gm_expf
 __device__ __forceinline__ double d_mk(int e, long long S) {
     return __longlong_as_double(((long long)(e + 1023) << 52) | (S & ((1ll << 52) - 1)));
 }
-/* flg != NULL: x is being written by a k_gemv that sets flg[b] once rows b*rbr.. are stored
-   (32 % rbr == 0); each chunk waits for its batches, reads x past L1 and clears the flags */
-__device__ double wsum_sq(const float *x, int n, int lane, int *flg = NULL, int rbr = 1) {
+/* zc != NULL: a running k_gemv copies each stored row into zc, which holds 0xffffffff (a NaN
+   payload arithmetic never produces) until then; the value is its own flag, so no fence is
+   needed. Each lane takes its element from zc and puts the sentinel back. */
+#define ZC_EMPTY 0xffffffffu
+__device__ double wsum_sq(const float *x, int n, int lane, uint32_t *zc = NULL) {
     double s = 0.0;
     for (int base = 0; base < n; base += 32) {
         const int i = base + lane;
         float xv = 0.0f;
-        if (flg) {
-            if (i < n) { while (((volatile int *)flg)[i / rbr] == 0) {} }
-            __threadfence();
-            __syncwarp();
-            if (i < n) { xv = ((volatile const float *)x)[i]; if (i % rbr == 0) flg[i / rbr] = 0; }
+        if (zc) {
+            if (i < n) {
+                uint32_t u;
+                while ((u = ((volatile uint32_t *)zc)[i]) == ZC_EMPTY) {}
+                xv = __uint_as_float(u); zc[i] = ZC_EMPTY;
+            }
         } else xv = i < n ? x[i] : 0.0f;
         const float t = xv * xv;
         const uint32_t tb = __float_as_uint(t);
@@ -341,8 +344,8 @@ __global__ void k_norm_xq(const float *x, const float *w, int n, float eps, floa
     fwht_q8(sv, bs, fsc, pl, b0);
 }
 // the rms sum of x while the residual k_gemv writing x is still running (one warp)
-__global__ void k_ssq(const float *x, int n, int *flg, int rbr, double *out) {
-    const double s = wsum_sq(x, n, threadIdx.x, flg, rbr);
+__global__ void k_ssq(int n, uint32_t *zc, double *out) {
+    const double s = wsum_sq(NULL, n, threadIdx.x, zc);
     if (threadIdx.x == 0) *out = s;
 }
 // xform + Q8_0 of a: mode 0 plain, 1 GDN head regroup (rep = NV/NK), 2 silu(a) * b
@@ -402,7 +405,7 @@ __device__ __forceinline__ int tw(const uint32_t (&nq)[8][4], int k, uint32_t m0
 template <int G, int WR, int TPB, int RB, int PD, int AD>
 __global__ __launch_bounds__(32 * WR * TPB)
 void k_gemv(const uint4 *__restrict__ wc, const __half *__restrict__ ws, const uint32_t *__restrict__ pl,
-            float *__restrict__ y, int N, int resid, int *flg) {
+            float *__restrict__ y, int N, int resid, uint32_t *zc) {
     constexpr int L = 32 * WR, R = L / G, RBR = RB * R, PS = G + 1;
     constexpr int NBUF = WR > 1 ? 2 : 1;
     static_assert(R >= 1 && RBR <= L && RB % PD == 0, "shape");
@@ -487,12 +490,11 @@ void k_gemv(const uint4 *__restrict__ wc, const __half *__restrict__ ws, const u
             float acc = 0.0f;
 #pragma unroll 8
             for (int k = 0; k < G; k++) { const float2 v = src[k]; acc = fmaf(v.y, v.x, acc); }
-            if (r < N) y[r] = resid ? acc + y[r] : acc;
-        }
-        if (RBR <= 32 && flg && wt == 0) { /* rows stored by lanes < RBR of this warp */
-            __threadfence();
-            __syncwarp();
-            if (lane == 0) ((volatile int *)flg)[bi] = 1;
+            if (r < N) {
+                const float v = resid ? acc + y[r] : acc;
+                y[r] = v;
+                if (zc) ((volatile float *)zc)[r] = v;
+            }
         }
         if (!more) break;
         if (WR == 1) __syncwarp();
@@ -1178,8 +1180,7 @@ static cudaStream_t st;
 #define NTM 8          /* most tokens per batched forward */
 static int BIG, PLS;   /* d_buf / d_pl per-token strides (floats / words) */
 
-static int grbr;    /* rows per flag of the last gemv_t launch, 0: it set no flags */
-static int *gflg;   /* k_gemv done flags for the next gemv launch (NULL: none) */
+static uint32_t *gzc; /* row copy buffer for the next gemv launch (NULL: none) */
 template <int G, int WR, int TPB, int RB, int PD, int AD = 1>
 static void gemv_t(const DT *d, float *y, int resid) {
     static int nres = 0;
@@ -1193,9 +1194,7 @@ static void gemv_t(const DT *d, float *y, int resid) {
     const int nbatch = (d->N + RBR - 1) / RBR;
     int nblk = (nbatch + TPB - 1) / TPB;
     if (nblk > nres) nblk = nres;
-    k_gemv<G, WR, TPB, RB, PD, AD><<<nblk, 32 * WR * TPB, 0, st>>>(d_codes + d->co, d_scales + d->so, d_pl, y, d->N, resid,
-                                                                  RBR <= 32 && 32 % RBR == 0 ? gflg : NULL);
-    grbr = RBR <= 32 && 32 % RBR == 0 && gflg ? RBR : 0;
+    k_gemv<G, WR, TPB, RB, PD, AD><<<nblk, 32 * WR * TPB, 0, st>>>(d_codes + d->co, d_scales + d->so, d_pl, y, d->N, resid, gzc);
 }
 template <int G, int WR, int TPB, int RB>
 static void gemvN_t(const DT *d, float *y, int resid, int nt, int ys) {
@@ -1292,16 +1291,17 @@ static void gemv(const DT *d, float *y, int resid) {
  * d_x reads the finished sum instead of paying the serial warp reduction */
 static cudaStream_t st2;
 static cudaEvent_t evf, evj;
-static int *d_flg, ssq_ready, ssq_on = -1;
+static uint32_t *d_zc;
+static int ssq_ready, ssq_on = -1;
 static double *d_ssq;
 static void gemv_res(const DT *d, int nt) {
     if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 1;
     if (nt != 1 || !ssq_on) { gemvn(d, d_x, 1, nt, E); return; }
     CK(cudaEventRecord(evf, st)); CK(cudaStreamWaitEvent(st2, evf, 0));
-    gflg = d_flg; gemv(d, d_x, 1); gflg = NULL;
-    if (grbr) k_ssq<<<1, 32, 0, st2>>>(d_x, E, d_flg, grbr, d_ssq);
+    gzc = d_zc; gemv(d, d_x, 1); gzc = NULL;
+    k_ssq<<<1, 32, 0, st2>>>(E, d_zc, d_ssq);
     CK(cudaEventRecord(evj, st2)); CK(cudaStreamWaitEvent(st, evj, 0));
-    ssq_ready = grbr != 0; grbr = 0;
+    ssq_ready = 1;
 }
 static void norm_xq(const float *x, const float *w, float *xn, int nt) {
     const double *sp = ssq_ready && nt == 1 && x == d_x ? d_ssq : NULL;
@@ -1460,7 +1460,7 @@ int main(int argc, char **argv) {
     CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
     CK(cudaStreamCreateWithFlags(&st2, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&evf, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&evj, cudaEventDisableTiming));
-    CK(cudaMalloc(&d_flg, 4 * 1024)); CK(cudaMemset(d_flg, 0, 4 * 1024)); CK(cudaMalloc(&d_ssq, 8));
+    CK(cudaMalloc(&d_zc, 4 * (size_t)E)); CK(cudaMemset(d_zc, 0xff, 4 * (size_t)E)); CK(cudaMalloc(&d_ssq, 8));
     float *hx; CK(cudaMallocHost(&hx, sizeof(float) * E * NTM));
     int *hpos; CK(cudaMallocHost(&hpos, sizeof(int) * (np + N + 1)));
     int *hid; CK(cudaMallocHost(&hid, sizeof(int) * NTM));
