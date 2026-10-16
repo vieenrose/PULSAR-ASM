@@ -1343,3 +1343,15 @@ and the same width-8 tree. Same-binary 400-token prefill, all streams md5 b15919
 19.20, k_gdnc only 20.60, both 21.46 / 21.44 (+11.7%). 4k harness: prefill 16.16 -> 17.76, decode
 9.77, score 12.5652 -> 13.1725, GOLDEN PASS, RSS 202552 KB; checks_b2 2B+4B ALL PASS (4B prompt A
 chunk 8 prefill 18.70 -> 21.15, 2B 46.1 -> 49.8).
+
+65. Batch rms sums once per token, k_ssqn (keep, bit-identical; 4k prefill +5.3%). A fresh 4k nvprof
+split (after rows 63-64) showed k_norm_xq at 4.40 ms/token in prefill vs 1.12 in decode: with
+nt > 1 every one of the E / BS Hadamard blocks of every token re-ran the exact serial warp sum
+wsum_sq (decode reads k_ssq's precomputed sum). Now one warp per token computes it once (k_ssqn,
+same wsum_sq) and k_norm_xq reads sp[blockIdx.y]. E_SSQN=0 restores the old path. Same binary
+400-token prefill ABBA, md5 b1591925: 23.11 / 21.45 / 21.42 / 22.84 tps (+7.2%). 4k harness:
+prefill 17.76 -> 18.70, decode 9.76, score 13.1725 -> 13.5097, GOLDEN PASS, RSS 200936 KB;
+checks_b2 2B+4B ALL PASS. Same split at 4k, decode ms/token: k_li K=2560 42.3, k_fvg 14.0,
+k_li K=9216 11.5, k_fs 7.2, k_gdn 6.4, k_li K=4096 5.4, k_xq 2.5, k_fw 2.1, k_ab 1.4, k_norm_xq 1.1
+(wall 103.7); prefill: k_hg K=2560 22.6, K=9216 7.6, K=4096 3.5, k_fvg 6.8, k_norm_xq 4.4 (now
+fixed), k_fs 3.4, k_gdnc 2.4, k_xq 2.3, k_fw 1.0, k_abt 0.9 (wall 59.6).

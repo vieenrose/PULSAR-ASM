@@ -334,7 +334,7 @@ __global__ void k_norm_xq(const float *x, const float *w, int n, float eps, floa
     __shared__ float s_sc;
     const int b0 = blockIdx.x * bs, tid = threadIdx.x;
     x += (size_t)blockIdx.y * n; if (xn) xn += (size_t)blockIdx.y * n; pl += (size_t)blockIdx.y * pls;
-    if (sp) { if (tid == 0) s_sc = rms_scale(*sp, n, eps); }
+    if (sp) { if (tid == 0) s_sc = rms_scale(sp[blockIdx.y], n, eps); }
     else if (tid < 32) {
         const double s = wsum_sq(x, n, tid);
         if (tid == 0) s_sc = rms_scale(s, n, eps);
@@ -347,6 +347,11 @@ __global__ void k_norm_xq(const float *x, const float *w, int n, float eps, floa
         sv[i] = y * sg[b0 + i];
     }
     fwht_q8(sv, bs, fsc, pl, b0);
+}
+// the rms sums of a token batch, once per token (one warp each), for k_norm_xq
+__global__ void k_ssqn(const float *x, int n, double *out) {
+    const double s = wsum_sq(x + (size_t)blockIdx.x * n, n, threadIdx.x);
+    if (threadIdx.x == 0) out[blockIdx.x] = s;
 }
 // the rms sum of x while the residual k_gemv writing x is still running (one warp)
 __global__ void k_ssq(int n, uint32_t *zc, double *out) {
@@ -1651,7 +1656,8 @@ static cudaStream_t st2;
 static cudaEvent_t evf, evj;
 static uint32_t *d_zc;
 static int ssq_ready, ssq_on = -1;
-static double *d_ssq;
+static double *d_ssq, *d_ssqn;
+static int ssqn_on = 1; /* E_SSQN: batch rms sums once per token in k_ssqn */
 static void gemv_res(const DT *d, int nt) {
     if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 1;
     if (nt != 1 || !ssq_on) { gemvn(d, d_x, 1, nt, E); return; }
@@ -1663,6 +1669,7 @@ static void gemv_res(const DT *d, int nt) {
 }
 static void norm_xq(const float *x, const float *w, float *xn, int nt) {
     const double *sp = ssq_ready && nt == 1 && x == d_x ? d_ssq : NULL;
+    if (!sp && nt > 1 && ssqn_on) { k_ssqn<<<nt, 32, 0, st>>>(x, E, d_ssqn); sp = d_ssqn; }
     ssq_ready = 0;
     static int nt1 = -1;
     if (nt1 < 0) nt1 = getenv("E_NT") ? atoi(getenv("E_NT")) : 0;
@@ -1839,7 +1846,7 @@ int main(int argc, char **argv) {
     CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
     CK(cudaStreamCreateWithFlags(&st2, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&evf, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&evj, cudaEventDisableTiming));
-    CK(cudaMalloc(&d_zc, 4 * (size_t)E)); CK(cudaMemset(d_zc, 0xff, 4 * (size_t)E)); CK(cudaMalloc(&d_ssq, 8));
+    CK(cudaMalloc(&d_zc, 4 * (size_t)E)); CK(cudaMemset(d_zc, 0xff, 4 * (size_t)E)); CK(cudaMalloc(&d_ssq, 8)); CK(cudaMalloc(&d_ssqn, 8 * NTM));
     float *hx; CK(cudaMallocHost(&hx, sizeof(float) * E * NTM * 2)); /* two prompt staging buffers */
     int *hpos; CK(cudaMallocHost(&hpos, sizeof(int) * (np + N + 1)));
     int *hid; CK(cudaMallocHost(&hid, sizeof(int) * NTM));
@@ -1867,6 +1874,7 @@ int main(int argc, char **argv) {
     if (getenv("E_GNW")) gdn_nw = atoi(getenv("E_GNW"));
     if (getenv("E_GDNC")) gdn_c = atoi(getenv("E_GDNC"));
     if (getenv("E_ABT")) abt_on = atoi(getenv("E_ABT"));
+    if (getenv("E_SSQN")) ssqn_on = atoi(getenv("E_SSQN"));
     if (getenv("E_GCRW")) gdn_crw = atoi(getenv("E_GCRW"));
     if (getenv("E_GCNW")) gdn_cnw = atoi(getenv("E_GCNW"));
     /* capture outside the timed region */
