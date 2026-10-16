@@ -1,7 +1,7 @@
 # PULSAR-ASM: Gemma 4 E2B on a Jetson Nano
 
-Google's **Gemma 4 E2B** (text only, the QAT Q4_0 release) running at **9.5 tokens/s decode
-and 15-17 tokens/s prefill on a Jetson Nano Gen1**, the 2019 4 GB board, with its 128-core
+Google's **Gemma 4 E2B** (text only, the QAT Q4_0 release) running at **9.9 tokens/s decode
+and 17.5 tokens/s prefill on a Jetson Nano Gen1**, the 2019 4 GB board, with its 128-core
 Maxwell GPU. The host side is C with the hot loops in hand-written AArch64 assembly; the
 GEMVs, attention, the MLP and the per-layer-input chains run on the GPU through kernels driven
 directly by the CUDA driver API. Every output bit is the same as the engine's scalar reference.
@@ -34,9 +34,9 @@ How the clip was made: the committed engine on the Nano; both runs rerun byte-id
 (`pulsar_arm/gemma4nano/probes/*_steps.txt`); the text is the detokenized output up to the
 end-of-turn token, unedited (the English answer's LaTeX is shown raw, as generated). The status
 line shows the engine's own decode rate (generated steps over their wall time, median of three
-runs: 9.54 and 9.55 tok/s). Reshot after the second optimization round: the faster engine
-reproduces both step files byte for byte (3 runs each), only the rates changed (6.2 and
-6.6 tok/s at the first shoot). Frames are rendered at a fixed cadence, not in real time.
+runs: 9.54 and 9.55 tok/s, measured before the last three optimization steps). Reshot after the
+second optimization round: the faster engine reproduces both step files byte for byte (3 runs
+each), only the rates changed (6.2 and 6.6 tok/s at the first shoot). Frames are rendered at a fixed cadence, not in real time.
 Re-render with `python3 -I pulsar_arm/tools/make_chat_gif.py g4-nano` (Pillow and ffmpeg).
 
 ## At a glance
@@ -44,10 +44,10 @@ Re-render with `python3 -I pulsar_arm/tools/make_chat_gif.py g4-nano` (Pillow an
 | | |
 |---|---|
 | Board | Jetson Nano Gen1: Tegra X1, 4x Cortex-A57, one Maxwell SM (sm_53), 4 GB LPDDR4 shared by CPU and GPU. L4T R32.5.1, CUDA 10.2 driver |
-| Decode | **9.5 tok/s** on the English gate prompt (76 steps, 9.5-10.2); 9.5 tok/s on both demo prompts (291 and 117 steps); 9.5-9.7 tok/s over 500 steps (attention runs on the GPU, context length barely shows) |
-| Prefill | **16.7 tok/s** on a 225-token prompt, 14-16.5 tok/s on short prompts: prompt tokens go through in batches of 8, each weight read once per batch |
-| End to end | 225-token prompt + 128 generated tokens in 26.7 s = **13.2 tok/s** (57.1 s / 6.2 tok/s before the second optimization round) |
-| Load | 3.6-3.9 s (weights repacked and uploaded) |
+| Decode | **9.9 tok/s** on the English gate prompt (76 steps); about 9.9 tok/s on the demo prompts and over 500 steps (attention runs on the GPU, context length barely shows) |
+| Prefill | **17.5 tok/s** on a 225-token prompt, 14-17.5 tok/s on short prompts: prompt tokens go through in batches of 8, each weight read once per batch |
+| End to end | 225-token prompt + 128 generated tokens in 25.8 s = **13.7 tok/s** (57.1 s / 6.2 tok/s before the second optimization round) |
+| Load | 3.6-4.5 s (weights repacked and uploaded) |
 | Memory | 1,385-1,391 MB on the GPU (the GPU KV cache is sized to the run's positions), peak RSS 707-722 MB; the 1.93 GB per-layer-input table stays memory-mapped, one 7.4 KB row read per token |
 | Context | 2048 positions; KV cache only on the 15 layers that own one (the other 20 share) |
 | Clocks | not pinned (no root for `jetson_clocks`): the GPU sits at 921.6 MHz under load, the CPU governor is `schedutil`, so CPU-side timings vary by a few ms between runs |
@@ -129,6 +129,9 @@ Each step kept only if the full gate set stayed bit-identical; median of three r
 | Q4 activations staged in 4,096-column chunks (the 12,288-column down projection had 2 blocks per SM) | 12.86 | 16.00 | 9.56 |
 | prefill attention on the GPU | 12.98 | 16.61 | 9.35 |
 | per-layer-input chain on the GPU, GeGLU fused with Q8_K | 13.21 | 16.74 | 9.62 |
+| thread pinning: OpenMP threads kept off CPU 0, which takes every device interrupt | 13.40 | 17.21 | 9.64 |
+| greedy argmax on the GPU (8 bytes back instead of 1 MB of logits) | 13.54 | 17.34 | 9.78 |
+| prefill head at 4 tokens per weight pass (no register spills) | 13.70 | 17.55 | 9.88 |
 
 Tried and dropped (both rounds in `pulsar_arm/gemma4nano/PORT_PLAN.md`): a head kernel built on 16-bit multiplies in plain C (slower: the compiler
 kept the byte extracts; inline PTX on register halves was what worked), deeper load rings and
@@ -136,8 +139,15 @@ register caps for the Q4 and head kernels (spills and lost overlap cost more tha
 occupancy gained), prompt batches of 16 (the batched kernels are bound by per-token integer
 work, not by weight reads), parallel RMS norms (waking OpenMP workers after each GPU wait costs
 more than the divides), fewer kernel launches by fusing tiny kernels (a launch costs ~50 µs of
-CPU, but it is hidden behind GPU work), GPU argmax for greedy decode and Markstein softmax
-divides on the GPU (real but under 1%).
+CPU, but it is hidden behind GPU work), Markstein softmax divides on the GPU (real but under
+1%), the attention p·V shared across heads (V read once; the kernel had too few warps and was
+5% slower), 4 tokens per block for the batched Q4 kernel (slower than 8), an unpadded Q6 head
+layout (the separate scale stream costs more than the 6% of bytes saved), and the q/k norms and
+RoPE on the GPU (the serial double sum per head cost what the saved round trip gained).
+
+The decode rate used to be bimodal (~9.15 or ~9.65 tok/s for the same binary). Every device
+interrupt on this board lands on CPU 0 and the main thread busy-polls the GPU; the engine now
+pins each OpenMP thread once at startup (`G4PIN=0` disables it), which made the rate stable.
 
 ## Accuracy
 
