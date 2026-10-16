@@ -187,11 +187,19 @@ __device__ __forceinline__ float d_sigm(float x) { return 1.0f / (1.0f + gm_expf
 __device__ __forceinline__ double d_mk(int e, long long S) {
     return __longlong_as_double(((long long)(e + 1023) << 52) | (S & ((1ll << 52) - 1)));
 }
-__device__ double wsum_sq(const float *x, int n, int lane) {
+/* flg != NULL: x is being written by a k_gemv that sets flg[b] once rows b*rbr.. are stored
+   (32 % rbr == 0); each chunk waits for its batches, reads x past L1 and clears the flags */
+__device__ double wsum_sq(const float *x, int n, int lane, int *flg = NULL, int rbr = 1) {
     double s = 0.0;
     for (int base = 0; base < n; base += 32) {
         const int i = base + lane;
-        const float xv = i < n ? x[i] : 0.0f;
+        float xv = 0.0f;
+        if (flg) {
+            if (i < n) { while (((volatile int *)flg)[i / rbr] == 0) {} }
+            __threadfence();
+            __syncwarp();
+            if (i < n) { xv = ((volatile const float *)x)[i]; if (i % rbr == 0) flg[i / rbr] = 0; }
+        } else xv = i < n ? x[i] : 0.0f;
         const float t = xv * xv;
         const uint32_t tb = __float_as_uint(t);
         const int tex = (int)(tb >> 23);
@@ -313,12 +321,13 @@ __device__ void fwht_q8(float *v, int bs, float fsc, uint32_t *pl, int b0) {
 // rms_norm(x) * w -> xn (optional), then signs, FWHT, Q8_0. One block per Hadamard block;
 // warp 0 of every block computes the (exact, cheap) full-width sum.
 __global__ void k_norm_xq(const float *x, const float *w, int n, float eps, float *xn,
-                          const float *sg, int bs, float fsc, uint32_t *pl, int pls) {
+                          const float *sg, int bs, float fsc, uint32_t *pl, int pls, const double *sp) {
     extern __shared__ float sv[];
     __shared__ float s_sc;
     const int b0 = blockIdx.x * bs, tid = threadIdx.x;
     x += (size_t)blockIdx.y * n; if (xn) xn += (size_t)blockIdx.y * n; pl += (size_t)blockIdx.y * pls;
-    if (tid < 32) {
+    if (sp) { if (tid == 0) s_sc = rms_scale(*sp, n, eps); }
+    else if (tid < 32) {
         const double s = wsum_sq(x, n, tid);
         if (tid == 0) s_sc = rms_scale(s, n, eps);
     }
@@ -330,6 +339,11 @@ __global__ void k_norm_xq(const float *x, const float *w, int n, float eps, floa
         sv[i] = y * sg[b0 + i];
     }
     fwht_q8(sv, bs, fsc, pl, b0);
+}
+// the rms sum of x while the residual k_gemv writing x is still running (one warp)
+__global__ void k_ssq(const float *x, int n, int *flg, int rbr, double *out) {
+    const double s = wsum_sq(x, n, threadIdx.x, flg, rbr);
+    if (threadIdx.x == 0) *out = s;
 }
 // xform + Q8_0 of a: mode 0 plain, 1 GDN head regroup (rep = NV/NK), 2 silu(a) * b
 __global__ void k_xq(const float *a, const float *b, int mode, const float *sg, int bs, float fsc,
@@ -388,7 +402,7 @@ __device__ __forceinline__ int tw(const uint32_t (&nq)[8][4], int k, uint32_t m0
 template <int G, int WR, int TPB, int RB, int PD, int AD>
 __global__ __launch_bounds__(32 * WR * TPB)
 void k_gemv(const uint4 *__restrict__ wc, const __half *__restrict__ ws, const uint32_t *__restrict__ pl,
-            float *__restrict__ y, int N, int resid) {
+            float *__restrict__ y, int N, int resid, int *flg) {
     constexpr int L = 32 * WR, R = L / G, RBR = RB * R, PS = G + 1;
     constexpr int NBUF = WR > 1 ? 2 : 1;
     static_assert(R >= 1 && RBR <= L && RB % PD == 0, "shape");
@@ -474,6 +488,11 @@ void k_gemv(const uint4 *__restrict__ wc, const __half *__restrict__ ws, const u
 #pragma unroll 8
             for (int k = 0; k < G; k++) { const float2 v = src[k]; acc = fmaf(v.y, v.x, acc); }
             if (r < N) y[r] = resid ? acc + y[r] : acc;
+        }
+        if (RBR <= 32 && flg && wt == 0) { /* rows stored by lanes < RBR of this warp */
+            __threadfence();
+            __syncwarp();
+            if (lane == 0) ((volatile int *)flg)[bi] = 1;
         }
         if (!more) break;
         if (WR == 1) __syncwarp();
@@ -1159,6 +1178,8 @@ static cudaStream_t st;
 #define NTM 8          /* most tokens per batched forward */
 static int BIG, PLS;   /* d_buf / d_pl per-token strides (floats / words) */
 
+static int grbr;    /* rows per flag of the last gemv_t launch, 0: it set no flags */
+static int *gflg;   /* k_gemv done flags for the next gemv launch (NULL: none) */
 template <int G, int WR, int TPB, int RB, int PD, int AD = 1>
 static void gemv_t(const DT *d, float *y, int resid) {
     static int nres = 0;
@@ -1172,7 +1193,9 @@ static void gemv_t(const DT *d, float *y, int resid) {
     const int nbatch = (d->N + RBR - 1) / RBR;
     int nblk = (nbatch + TPB - 1) / TPB;
     if (nblk > nres) nblk = nres;
-    k_gemv<G, WR, TPB, RB, PD, AD><<<nblk, 32 * WR * TPB, 0, st>>>(d_codes + d->co, d_scales + d->so, d_pl, y, d->N, resid);
+    k_gemv<G, WR, TPB, RB, PD, AD><<<nblk, 32 * WR * TPB, 0, st>>>(d_codes + d->co, d_scales + d->so, d_pl, y, d->N, resid,
+                                                                  RBR <= 32 && 32 % RBR == 0 ? gflg : NULL);
+    grbr = RBR <= 32 && 32 % RBR == 0 && gflg ? RBR : 0;
 }
 template <int G, int WR, int TPB, int RB>
 static void gemvN_t(const DT *d, float *y, int resid, int nt, int ys) {
@@ -1264,11 +1287,29 @@ static void gemv(const DT *d, float *y, int resid) {
     default: fprintf(stderr, "gemv: K %d unsupported\n", d->K); exit(1);
     }
 }
+/* E_SSQ (default 1): a residual nt = 1 GEMV into d_x forks a one-warp k_ssq on st2 that sums
+ * x^2 as the GEMV's row batches land (same chunked order as wsum_sq), so the next norm_xq of
+ * d_x reads the finished sum instead of paying the serial warp reduction */
+static cudaStream_t st2;
+static cudaEvent_t evf, evj;
+static int *d_flg, ssq_ready, ssq_on = -1;
+static double *d_ssq;
+static void gemv_res(const DT *d, int nt) {
+    if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 1;
+    if (nt != 1 || !ssq_on) { gemvn(d, d_x, 1, nt, E); return; }
+    CK(cudaEventRecord(evf, st)); CK(cudaStreamWaitEvent(st2, evf, 0));
+    gflg = d_flg; gemv(d, d_x, 1); gflg = NULL;
+    if (grbr) k_ssq<<<1, 32, 0, st2>>>(d_x, E, d_flg, grbr, d_ssq);
+    CK(cudaEventRecord(evj, st2)); CK(cudaStreamWaitEvent(st, evj, 0));
+    ssq_ready = grbr != 0; grbr = 0;
+}
 static void norm_xq(const float *x, const float *w, float *xn, int nt) {
+    const double *sp = ssq_ready && nt == 1 && x == d_x ? d_ssq : NULL;
+    ssq_ready = 0;
     static int nt1 = -1;
     if (nt1 < 0) nt1 = getenv("E_NT") ? atoi(getenv("E_NT")) : 0;
     const int T = nt1 ? (BS < 1024 ? BS : 1024) : (BS / 2 < 1024 ? BS / 2 : 1024); /* E/BS blocks of BS threads overflow 2048/SM at E 2560 */
-    k_norm_xq<<<dim3(E / BS, nt), T, BS * 4, st>>>(x, w, E, EPS, xn, sign_d[sign_ix(E)], BS, FSC, d_pl, PLS);
+    k_norm_xq<<<dim3(E / BS, nt), T, BS * 4, st>>>(x, w, E, EPS, xn, sign_d[sign_ix(E)], BS, FSC, d_pl, PLS, sp);
 }
 static void xq(const float *a, const float *b, int mode, int n, int as, int nt) {
     const int T = BS < 1024 ? BS : 1024;
@@ -1292,6 +1333,7 @@ static void tdump(const char *fmt, int il, const float *dv, int n) {
  * order of the F32 projections. want: 0 no head, 1 logits of the last token, 2 of every token. */
 static int gdn_rw = 1, gdn_nw = 4; /* rows per warp chain, warps per block (128 % (rw * nw) == 0) */
 static void enqueue(int nt, int tiny, int want) {
+    ssq_ready = 0;
     const float gscale = 1.0f / sqrtf((float)DS), ascale = 1.0f / sqrtf((float)HD);
     for (int l = 0; l < NL; l++) {
         Layer *L = &Ls[l];
@@ -1312,7 +1354,7 @@ static void enqueue(int nt, int tiny, int want) {
             k_gnorm<<<dim3((NV + 3) / 4, nt), 128, 0, st>>>(d_o, d_buf + CH, L->ssm_norm, NV, EPS, d_g, BIG);
             tdump("final_output-%d", l, d_g, INNER);
             xq(d_g, NULL, GROUPED && NV > NK ? 1 : 0, INNER, INNER, nt);
-            gemvn(&L->out, d_x, 1, nt, E);
+            gemv_res(&L->out, nt);
         } else {
             const int fi = l / 4;
             k_qk<<<dim3((NH + NKV + 3) / 4, nt), 128, 0, st>>>(d_buf, L->q_norm, L->k_norm, d_pos, d_q, d_kc[fi], d_vc[fi],
@@ -1333,13 +1375,13 @@ static void enqueue(int nt, int tiny, int want) {
             tdump("fa_out-%d", l, d_fao, NH * HD);
             tdump("attn_gated-%d", l, d_att, NH * HD);
             xq(d_att, NULL, 0, NH * HD, NH * HD, nt);
-            gemvn(&L->out, d_x, 1, nt, E);
+            gemv_res(&L->out, nt);
         }
         tdump("attn_residual-%d", l, d_x, E);
         norm_xq(d_x, L->post_norm, d_xn, nt);
         gemvn(&L->ffu, d_buf, 0, nt, BIG);
         xq(d_buf, d_buf + FF, 2, FF, BIG, nt);
-        gemvn(&L->ffd, d_x, 1, nt, E);
+        gemv_res(&L->ffd, nt);
         tdump("l_out-%d", l, d_x, E);
     }
     if (!want) return;
@@ -1416,6 +1458,9 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "fwd35: state %.1f MB (K/V f16 at ctx %d, GDN, conv)\n", stbytes / 1048576.0, CTX);
     CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+    CK(cudaStreamCreateWithFlags(&st2, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&evf, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&evj, cudaEventDisableTiming));
+    CK(cudaMalloc(&d_flg, 4 * 1024)); CK(cudaMemset(d_flg, 0, 4 * 1024)); CK(cudaMalloc(&d_ssq, 8));
     float *hx; CK(cudaMallocHost(&hx, sizeof(float) * E * NTM));
     int *hpos; CK(cudaMallocHost(&hpos, sizeof(int) * (np + N + 1)));
     int *hid; CK(cudaMallocHost(&hid, sizeof(int) * NTM));
