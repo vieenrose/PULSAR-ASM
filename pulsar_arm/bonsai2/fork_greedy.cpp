@@ -36,7 +36,9 @@ int main(int argc, char **argv) {
     llama_model *m = llama_model_load_from_file(path, mp);
     if (!m) return 2;
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 4096; cp.n_batch = 512; cp.n_ubatch = 512;
+    // FG_BATCH: n_batch = n_ubatch (default 512); a longer prompt is decoded in chunks of it
+    const int nb = getenv("FG_BATCH") ? atoi(getenv("FG_BATCH")) : 512;
+    cp.n_ctx = 4096; cp.n_batch = nb; cp.n_ubatch = nb;
     cp.n_threads = nth; cp.n_threads_batch = nth;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cp.type_k = GGML_TYPE_F16; cp.type_v = GGML_TYPE_F16;
@@ -45,7 +47,14 @@ int main(int argc, char **argv) {
     if (!c) return 3;
     const int nv = llama_vocab_n_tokens(llama_model_get_vocab(m));
     FILE *df = dump ? fopen(dump, "wb") : nullptr;
-    llama_batch b = llama_batch_get_one(ids.data(), ids.size());
+    // the last prompt chunk is step 0
+    size_t off = 0;
+    while (ids.size() - off > (size_t)nb) {
+        llama_batch pb = llama_batch_get_one(ids.data() + off, nb);
+        if (llama_decode(c, pb)) { fprintf(stderr, "decode fail\n"); return 4; }
+        off += nb;
+    }
+    llama_batch b = llama_batch_get_one(ids.data() + off, ids.size() - off);
     for (int s = 0; s < N; s++) {
         tcur = s;
         if (llama_decode(c, b)) { fprintf(stderr, "decode fail\n"); return 4; }
