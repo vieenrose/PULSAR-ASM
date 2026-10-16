@@ -472,6 +472,16 @@ static void gpu_head(const tensor_t *t, const uint8_t *xq, float *y) {
     if (fast) {
         double a_ = prof ? now_ms() : 0;
         stage_in(xq, (size_t)(t->dims[0] / 256) * Q8B, dX);
+        if (!SMP.on && y == logits) {   /* greedy decode: argmax on the GPU, 8 bytes back instead of 1 MB */
+            void *args[] = {&dHead, &dX, &dY, &rows};
+            CK(cuLaunchKernel_(fq6, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, stream, args, NULL));
+            void *aa[] = {&dY, &rows, &h_out_dev};
+            CK(cuLaunchKernel_(fargb, 1, 1, 1, 1024, 1, 1, 0, stream, aa, NULL));
+            wait_stream();
+            unsigned r[2]; memcpy(r, h_out, 8);
+            memcpy(&y[r[1]], &r[0], 4); HEAD_TOP = (int)r[1];
+            return;
+        }
         void *args[] = {&dHead, &dX, &h_out_dev, &rows};
         double b_ = prof ? now_ms() : 0;
         CK(cuLaunchKernel_(fq6, (rows + 255) / 256, 1, 1, 32, 8, 1, 0, stream, args, NULL));   /* q6i_gemv */

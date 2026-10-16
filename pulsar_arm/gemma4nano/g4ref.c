@@ -339,6 +339,9 @@ static float xs[H], hb[H], qb[NH * HD_F], kb[HD_F], vb[HD_F], ab[NH * HD_F],
              gb[2 * INTER], ub[2 * INTER], pin[NL * PLE], projb[NL * PLE], pleg[PLE],
              rowe[NL * PLE], sc[MAXSEQ], logits[VOCAB];
 static uint8_t XQ[(2 * INTER / 256) * Q8B];
+/* set by a head hook that already found the greedy argmax (first max of the raw
+   logits; only logits[HEAD_TOP] is then valid); -1 = scan logits[] */
+static int HEAD_TOP = -1;
 
 /* One query head over cached positions [lo, pos]: scores as float fmaf chains over
    d ascending, max, exp in float64 (g4_exp) with a sequential float64 sum,
@@ -754,7 +757,8 @@ static int __attribute__((unused)) run_generation(int *ids, int n, int gen, int 
         int tok = ids[pos];
         forward(tok, pos);
         int top = 0;
-        for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
+        if (HEAD_TOP >= 0) { top = HEAD_TOP; HEAD_TOP = -1; }
+        else for (int v = 1; v < VOCAB; v++) if (logits[v] > logits[top]) top = v;
         /* greedy: argmax of the RAW logits (first max wins); the cap is monotone,
            and applying it first could merge distinct values in float32 */
         int next = (SMP.on && pos + 1 >= n) ? sample_next(logits) : top;
