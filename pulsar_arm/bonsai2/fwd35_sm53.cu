@@ -797,6 +797,106 @@ __global__ void k_fa(const float *q, const float *buf, const __half *kc, const _
     att[h * 256 + tid] = acc * d_sigm(buf[h * 512 + 256 + tid]);
 }
 
+/* Split form of k_fa, same arithmetic in the same order, three kernels: k_fs computes every
+   score with all blocks of the GPU (one block per KV group and 256-position tile, the GQ heads
+   of the group share each K load), k_fw turns them into the in-place weights, k_fv runs the f16
+   V chain. k_fa serialized the score phase inside one block per head. */
+template <int GQ>
+__global__ __launch_bounds__(256) void k_fs(const float *q, const __half *kc, const int *posp, float *scg,
+                                           int NH, int NKV, int ctx, float scale) {
+    __shared__ float qs[GQ][256];
+    const int g = blockIdx.x % NKV, base = blockIdx.x / NKV * 256, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int n = *posp + (int)blockIdx.y + 1, h0 = g * GQ;
+    if (base >= n) return;
+    q += (size_t)blockIdx.y * NH * 256; scg += (size_t)blockIdx.y * NH * ctx;
+    for (int i = tid; i < GQ * 256; i += 256) qs[i >> 8][i & 255] = f16r(q[(h0 + (i >> 8)) * 256 + (i & 255)]);
+    __syncthreads();
+    float qr[GQ][8];
+#pragma unroll
+    for (int h = 0; h < GQ; h++)
+#pragma unroll
+        for (int c = 0; c < 8; c++) qr[h][c] = qs[h][32 * c + lane];
+    const int cnt = min(256, n - base);
+    for (int i0 = warp * FAK; i0 < cnt; i0 += 8 * FAK) {
+        __half kh[FAK][8];
+#pragma unroll
+        for (int u = 0; u < FAK; u++) {
+            const __half *kr = kc + (size_t)(base + min(i0 + u, cnt - 1)) * NKV * 256 + g * 256;
+#pragma unroll
+            for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c + lane];
+        }
+#pragma unroll
+        for (int u = 0; u < FAK; u++) {
+            float a[GQ];
+#pragma unroll
+            for (int h = 0; h < GQ; h++) a[h] = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 8; c++) {
+                const float kv = __half2float(kh[u][c]);
+#pragma unroll
+                for (int h = 0; h < GQ; h++) a[h] = fmaf(kv, qr[h][c], a[h]);
+            }
+#pragma unroll
+            for (int h = 0; h < GQ; h++) {
+                const float sv = dotg_reduce(a[h], lane) * scale;
+                if (lane == 0 && i0 + u < cnt) scg[(size_t)(h0 + h) * ctx + base + i0 + u] = sv;
+            }
+        }
+    }
+}
+__global__ __launch_bounds__(256) void k_fw(const int *posp, float *scg, int NH, int ctx) {
+    __shared__ float cm[256];
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const int n = *posp + (int)blockIdx.y + 1;
+    float *sc = scg + ((size_t)blockIdx.y * NH + h) * ctx;
+    const int chunk = (n + 255) / 256, lo = min(tid * chunk, n), hi = min(lo + chunk, n);
+    float m = -INFINITY;
+    for (int i = lo; i < hi; i++) m = fmaxf(m, sc[i]);
+    cm[tid] = m;
+    __syncthreads();
+    if (tid == 0) {
+        float run = -INFINITY;
+        for (int t = 0; t < 256; t++) { const float v = cm[t]; cm[t] = run; run = fmaxf(run, v); }
+    }
+    __syncthreads();
+    float run = cm[tid];
+    for (int i = lo; i < hi; i++) {
+        const float s = sc[i];
+        if (s > run) { sc[i] = -gm_expf(run - s); run = s; }
+        else sc[i] = gm_expf(s - run);
+    }
+}
+#ifndef FVU
+#define FVU 4
+#endif
+__global__ __launch_bounds__(256, 8) void k_fv(const float *buf, const __half *vc, const int *posp, const float *scg,
+                                               float *att, float *fao, int NH, int NKV, int ctx, int bs_) {
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const int n = *posp + (int)blockIdx.y + 1, g = h / (NH / NKV);
+    buf += (size_t)blockIdx.y * bs_; att += (size_t)blockIdx.y * NH * 256;
+    if (fao) fao += (size_t)blockIdx.y * NH * 256;
+    const float *wp = scg + ((size_t)blockIdx.y * NH + h) * ctx;
+    const __half *vp = vc + g * 256 + tid;
+    float vk = 0.0f, S = 0.0f;
+    for (int ic0 = 0; ic0 < n; ic0 += FVU) {
+        __half vh[FVU]; float sw[FVU];
+#pragma unroll
+        for (int u = 0; u < FVU; u++)
+            if (ic0 + u < n) { vh[u] = vp[(size_t)(ic0 + u) * NKV * 256]; sw[u] = __ldg(wp + ic0 + u); }
+#pragma unroll
+        for (int u = 0; u < FVU; u++) {
+            if (ic0 + u >= n) break;
+            const float w = fabsf(sw[u]), vv = __half2float(vh[u]);
+            if (__float_as_uint(sw[u]) >> 31) { vk = f16r(vk * w); vk = f16r(fmaf(vv, 1.0f, vk)); S = fmaf(S, w, 1.0f); }
+            else { vk = f16r(fmaf(vv, w, vk)); S = fmaf(S, 1.0f, w); }
+        }
+    }
+    const float Si = S == 0.0f ? 0.0f : 1.0f / S;
+    const float acc = vk * Si;
+    if (fao) fao[h * 256 + tid] = acc;
+    att[h * 256 + tid] = acc * d_sigm(buf[h * 512 + 256 + tid]);
+}
+
 /* ---- argmax: first index of the maximum ---- */
 __device__ __forceinline__ void amx(float &v, int &i, float v2, int i2) {
     if (v2 > v || (v2 == v && i2 < i)) { v = v2; i = i2; }
@@ -1030,6 +1130,8 @@ static void embed(int id, float *x) {
 }
 
 /* ======================= host: forward ======================= */
+static float *d_sc;   /* split attention scores / weights: NTM x NH x CTX */
+static int fa_split;
 static float *d_x, *d_xn, *d_buf, *d_cv, *d_ab, *d_o, *d_g, *d_q, *d_att, *d_fao, *d_logits, *d_pv;
 static uint32_t *d_pl;
 static int *d_pos, *d_pi, *d_out;
@@ -1198,8 +1300,18 @@ static void enqueue(int nt, int tiny, int want) {
             k_qk<<<dim3((NH + NKV + 3) / 4, nt), 128, 0, st>>>(d_buf, L->q_norm, L->k_norm, d_pos, d_q, d_kc[fi], d_vc[fi],
                                                              NH, NKV, NROT, ROPE_TS, EPS, BIG);
             tdump("Qcur-%d", l, d_q, NH * HD);
-            k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 4, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
-                                                             tdf ? d_fao : NULL, NH, NKV, CTX, ascale, BIG);
+            if (fa_split) {
+                const dim3 gs(NKV * ((CTX + 255) / 256), nt);
+                switch (NH / NKV) {
+                case 1: k_fs<1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                case 2: k_fs<2><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                default: k_fs<4><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                }
+                k_fw<<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
+                k_fv<<<dim3(NH, nt), 256, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
+            } else
+                k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 4, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
+                                                                 tdf ? d_fao : NULL, NH, NKV, CTX, ascale, BIG);
             tdump("fa_out-%d", l, d_fao, NH * HD);
             tdump("attn_gated-%d", l, d_att, NH * HD);
             xq(d_att, NULL, 0, NH * HD, NH * HD, nt);
@@ -1264,6 +1376,8 @@ int main(int argc, char **argv) {
     CK(cudaMalloc(&d_cv, 4 * (size_t)NTM * CH)); CK(cudaMalloc(&d_ab, 4 * (size_t)NTM * 2 * NV));
     CK(cudaMalloc(&d_o, 4 * (size_t)NTM * INNER)); CK(cudaMalloc(&d_g, 4 * (size_t)NTM * INNER));
     CK(cudaMalloc(&d_q, 4 * (size_t)NTM * NH * HD)); CK(cudaMalloc(&d_att, 4 * (size_t)NTM * NH * HD));
+    fa_split = NH % NKV == 0 && (NH / NKV == 1 || NH / NKV == 2 || NH / NKV == 4) && (!getenv("E_FASPLIT") || atoi(getenv("E_FASPLIT")));
+    if (fa_split) CK(cudaMalloc(&d_sc, 4 * (size_t)NTM * NH * CTX));
     CK(cudaMalloc(&d_fao, 4 * (size_t)NTM * NH * HD)); CK(cudaMalloc(&d_logits, 4 * (size_t)NTM * VOCAB));
     CK(cudaMalloc(&d_pv, 4 * 64 * NTM)); CK(cudaMalloc(&d_pi, 4 * 64 * NTM)); CK(cudaMalloc(&d_out, 4 * NTM));
     CK(cudaMalloc(&d_pos, 4));
