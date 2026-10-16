@@ -1247,3 +1247,29 @@ sample and on the 4B's G32 too: defaults kept, variants stay behind E_V96 / E_V3
 Demos (doc/bonsai2-{2b,4b,9b}-nano-chat-{en,zh-tw}.gif): greedy to <|im_end|> with E_STOP=1 and
 E_STEPMS=1; every stream equals fork_greedy over its full length (2B 101/351, 4B 83/405, 9B
 100/93 ids). Decode 2B 22.11 / 21.06, 4B 9.90 / 9.25, 9B 5.72 / 5.74 tps (en / zh-tw).
+
+60. Bonsai-2 4B long-context loop (autoresearch loop-261016-1216, 15 iterations, Nano pesi):
+score = sqrt(prefill_tps x decode_tps) on the 3968-token zh-TW prompt + 64 greedy tokens, f16
+K/V at ctx 4096, every kept change bit-identical to the fork golden (checks_b2.sh 4B ALL PASS).
+4.4182 -> 9.6182 (+117.7%); prefill 5.53 -> 10.67, decode 3.53 -> 8.67 tps; peak RSS 201800 ->
+198328 KB (noise band 198-203 MB). Kept: k_fa smem flag packing, 16-row V prefetch, 4-position
+score passes (it 1-3); split attention k_fs/k_fw/k_fv (it 5, the big one at 4k ctx); k_fv FVD=4
+(it 6); exact rms sum overlapped with the residual GEMV via k_ssq on a second stream, then
+fence-free sentinel hand-off (it 7-8); k_gdn 2 rows x 2 warps (it 10); k_fvg 2 heads x 2 dims per
+thread (it 11); ping-pong prompt staging buffers (it 12).
+Measured out (all bit-identical unless noted): k_fag grouped attention (it 4, slower); fused
+k_gnorm->k_xq (neutral); Veltkamp f16 rounding in k_fv with exact fallback (2.29 -> 2.64 ms) and
+unchecked (2.08 -> 1.95, not exact); conversion-free V via the h2f bit trick in k_fvg (2.083 ->
+2.025 ms, NOT taken: inexact if a V cache entry is inf/NaN; a sticky nonfinite flag from k_qk
+would make it safe); k_fvg shapes (2x2 best at FVU 4; 4x2 2.097, 2x4 2.269, 1x4 2.825, FVU 2/8
+2.205/2.118 ms); smem-tree k_fs reduction (0.82 -> 0.98 ms); conversion-free K in k_fs (0.89);
+parallel prefix-max k_fw (0.286 -> 0.283; k_fw is bound by the FP64 glibc-exact expf); on-GPU
+embed / pipelined decode (removing every per-step host sync gains 0.2-0.5%, not built); k_ab with
+2-10 chunks of loads in flight (no change: nvprof's 133 us/call is not exposed latency); k_gdn
+software-pipelined state loads (-0.6%). Batched prefill (E_PCHUNK 2/4/8) on sm_53 is 5.2/6.2/7.0
+vs 11.9 tps at chunk 1: the single-token GEMV is popc-pipe and issue bound (~10 popc + ~35 ALU per
+32 weights per token, both ~0.33 clk/word on the one SM), so sharing weight loads buys nothing; an
+HFMA2/FFMA decode path costs ~1.7 issue per weight-token. nvprof at 2000 tokens: GEMVs 59% of GPU
+time (k_ssq's 22% runs concurrently), k_gdn 5.6%, k_fvg 3.2%, k_ab 2.9%, k_xq 2.2%, k_fs 1.7%.
+Open: a cheaper exact ternary x int8 inner product (fewer popc per word), the sticky-flag
+conversion-free V, k_gdn closer to the streaming ceiling (16 GB/s now).
