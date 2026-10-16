@@ -98,7 +98,7 @@ The issue floor (~42 instructions per word) now coincides with the byte floor. W
 Every step keeps the fork's integer sums and float chain order, passes `checks_b2.sh 2B 4B` and
 the 4k golden, keeps RSS at or below ~200 MB, and is decided by a same-job ABBA.
 
-1. **P1, decode GEMV latency (61.5 -> ~48 ms; decode ~+14%, chunk-1 prefill ~+18%).**
+1. **P1, decode GEMV latency (61.5 -> ~48 ms; decode ~+14%, chunk-1 prefill ~+18%).** DONE as k_li (ideas row 63): bit-exact, needed the 32-row tiled layout (row-major lane = row was 2x slower); GEMVs 19-20 GB/s, 4B decode +7%, 4k score 11.98 -> 12.57.
    - Design: lane = row. Repack each plane so that word k of the 32 rows of a warp is contiguous,
      giving coalesced LDG.128.
    - Keep the activation planes in shared memory, read as broadcast LDS.128 (2 per word).

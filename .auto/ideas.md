@@ -1310,3 +1310,23 @@ forces it (8.91 tps on the 400-token prefill vs 18.27, same stream md5). Nano pe
 prefill 11.37 -> 15.54 tps, decode 9.23 (unchanged), score 10.2554 -> 11.9764, GOLDEN PASS, RSS
 197576 KB; checks_b2 2B+4B ALL PASS (chunk 1 and 8); 4B prompt A prefill 12.57 (chunk 1) / 17.68
 (chunk 8), 2B 29.6 / 43.7.
+
+63. P1 lane = row decode GEMV on a 32-row tiled weight layout, k_li (keep, bit-identical; decode
++7%, 4k score +4.9%). First prototype (lane = row on the row-major planes, activation planes of the
+whole K in shared memory as broadcast LDS.128, each lane running its row's chain s_k = tw + cg,
+si = fma(d8, s, si), sumf = fma(sc, si, sumf)) was bit-exact but 2.0-2.5x SLOWER than k_gemv
+(7-8 GB/s): a warp's 32 loads hit 32 row-strided sectors, half of each used. The fix is the layout,
+not the arithmetic: weights repacked at load into tiles of 32 rows, per group the 32 rows' c0
+uint4s then their c1 uint4s (64 G uint4 per tile) and the 32 scales, so each warp load is one
+contiguous 512 B line. Standalone bench vs a verbatim k_gemv, 0 mismatches: K=2560 N=18432 19.0 ->
+20.4 GB/s (x1.07, W 4 PD 2), K=9216 N=2560 14.7 -> 20.0 GB/s (x1.36, W 4 PD 4), K=4096 N=2560
+16.7 -> 19.1 GB/s (x1.14); W 1 loses (too few warps at N = 2560), W 8 neutral. k_hg (prefill) reads
+the same tiles (group stride 64, c1 offset 32, scale stride 32). Tensors are padded to 32 rows; a
+merged tensor that is not tile aligned is refused at load. E_LI=0 restores row-major + k_gemv;
+default off on sm_61 (k_gemvN, row-major only). Nano pesi, same binary ABBA prompt A: 4B decode
+12.40/12.39 vs 11.60/11.57 (+7.0%), prefill chunk 8 18.65 vs 17.76 (+5%); 2B decode 25.16 vs
+24.78 (+1.5%), prefill 45.5 vs 43.9. 4k harness: prefill 15.54 -> 16.16, decode 9.23 -> 9.77,
+score 11.9764 -> 12.5652, GOLDEN PASS, RSS 200832 KB (198-203 MB run spread); checks_b2 2B+4B ALL
+PASS. Note on storage: PTQ1_0 in the GGUF is already base-3 (1.75 bpw); the GPU planes are 2.125 bpw
+because the POPC identity needs bit planes, and the decode GEMVs now run at 19-20 GB/s of a ~22 GB/s
+ceiling, so a denser on-GPU encoding only pays if its unpack is nearly free.

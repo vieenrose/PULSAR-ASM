@@ -498,6 +498,60 @@ void k_gemv(const uint4 *__restrict__ wc, const __half *__restrict__ ws, const u
     }
 }
 
+/* Lane = row GEMV on the 32-row tiled layout (li_on): tile t of rows 32t..32t+31 holds, per
+ * group g, the 32 rows' c0 uint4s then their c1 uint4s (64 G uint4 per tile) and the 32 scales
+ * (32 G halves), so every weight load of a warp is one contiguous 512 B line. The activation
+ * planes of the whole K sit in shared memory (broadcast reads); each lane runs its own row's
+ * chain in group order: s_k = tw + cg, si = fma(d8, s, si) over k, sumf = fma(sc, si, sumf)
+ * over groups, k_gemv's arithmetic with no tile, barrier or serial chain. PD groups in flight. */
+template <int G, int W, int PD>
+__global__ __launch_bounds__(32 * W) void k_li(const uint4 *__restrict__ wc, const __half *__restrict__ ws,
+        const uint32_t *__restrict__ pl, float *__restrict__ y, int N, int resid, uint32_t *zc) {
+    __shared__ uint4 sp[G * 10];
+    for (int i = threadIdx.x; i < G * 10; i += 32 * W) sp[i] = __ldg((const uint4 *)pl + i);
+    const int r = blockIdx.x * 32 * W + threadIdx.x, lane = threadIdx.x & 31;
+    const uint4 *wr = wc + (size_t)(r >> 5) * 64 * G + lane;
+    const __half *sr = ws + (size_t)(r >> 5) * 32 * G + lane;
+    uint4 b0[PD], b1[PD];
+    __half bs[PD];
+#pragma unroll
+    for (int i = 0; i < PD; i++) { b0[i] = __ldg(wr + i * 64); b1[i] = __ldg(wr + i * 64 + 32); bs[i] = __ldg(sr + i * 32); }
+    __syncthreads();
+    float sumf = 0.0f;
+#pragma unroll 1
+    for (int g0 = 0; g0 < G; g0 += PD) {
+#pragma unroll
+        for (int i = 0; i < PD; i++) {
+            const int g = g0 + i;
+            if (PD > 1 && g >= G) break;
+            const uint4 c0 = b0[i], c1 = b1[i];
+            const float sc = __half2float(bs[i]);
+            const int gn = min(g + PD, G - 1);
+            b0[i] = __ldg(wr + gn * 64); b1[i] = __ldg(wr + gn * 64 + 32); bs[i] = __ldg(sr + gn * 32);
+            const uint4 *a = sp + g * 10;
+            uint32_t nq[8][4];
+            const uint4 dv = a[0];
+#pragma unroll
+            for (int q = 0; q < 8; q++) { const uint4 v = a[1 + q]; nq[q][0] = v.x; nq[q][1] = v.y; nq[q][2] = v.z; nq[q][3] = v.w; }
+            const uint4 cv = a[9];
+            const int s0 = tw(nq, 0, c0.x, c1.x) + (int)cv.x;
+            const int s1 = tw(nq, 1, c0.y, c1.y) + (int)cv.y;
+            const int s2 = tw(nq, 2, c0.z, c1.z) + (int)cv.z;
+            const int s3 = tw(nq, 3, c0.w, c1.w) + (int)cv.w;
+            float si = fmaf(__uint_as_float(dv.x), (float)s0, 0.0f);
+            si = fmaf(__uint_as_float(dv.y), (float)s1, si);
+            si = fmaf(__uint_as_float(dv.z), (float)s2, si);
+            si = fmaf(__uint_as_float(dv.w), (float)s3, si);
+            sumf = fmaf(sc, si, sumf);
+        }
+    }
+    if (r < N) {
+        const float v = resid ? sumf + y[r] : sumf;
+        y[r] = v;
+        if (zc) ((volatile float *)zc)[r] = v;
+    }
+}
+
 __device__ __forceinline__ __half2 u2h(uint32_t u) { __half2 h; memcpy(&h, &u, 4); return h; }
 /* Batched GEMV for nt <= NT tokens (prefill chunks), on the fp16 pipe: lane = row (RB rows per
  * lane, 32 W apart). Each 32-weight word pair is decoded once to 16 half2 of +-2 / 0 (nz = ~b0,
@@ -507,7 +561,7 @@ __device__ __forceinline__ __half2 u2h(uint32_t u) { __half2 h; memcpy(&h, &u, 4
  * = w q, integers of at most 2032, which fp16 holds exactly, so lo + hi in fp32 is exactly the
  * single-token kernel's integer s and the float chain after it (si = fma(d8, s, si) over the 4
  * words, sumf = fma(scale, si, sumf) over the groups) is k_gemv's: the bits are equal. */
-template <int G, int W, int NT, int GC, int RB, int MB>
+template <int G, int W, int NT, int GC, int RB, int MB, int LI>
 __global__ __launch_bounds__(32 * W, MB) void k_hg(const uint4 *__restrict__ wc, const __half *__restrict__ ws,
         const uint32_t *__restrict__ pl, int pls, const __half *__restrict__ hq, int hqs,
         float *__restrict__ y, int ys, int N, int resid, int nt) {
@@ -519,8 +573,10 @@ __global__ __launch_bounds__(32 * W, MB) void k_hg(const uint4 *__restrict__ wc,
 #pragma unroll
     for (int b = 0; b < RB; b++) {
         const int rr = min(r0 + b * 32 * W, N - 1);
-        wr[b] = wc + (size_t)rr * 2 * G; sr[b] = ws + (size_t)rr * G;
+        if (LI) { wr[b] = wc + (size_t)(rr >> 5) * 64 * G + (rr & 31); sr[b] = ws + (size_t)(rr >> 5) * 32 * G + (rr & 31); }
+        else { wr[b] = wc + (size_t)rr * 2 * G; sr[b] = ws + (size_t)rr * G; }
     }
+    constexpr int HGS = LI ? 64 : 1, HC1 = LI ? 32 : G, HSS = LI ? 32 : 1; /* group / c1 / scale strides */
     float sumf[RB][NT];
 #pragma unroll
     for (int b = 0; b < RB; b++)
@@ -529,7 +585,7 @@ __global__ __launch_bounds__(32 * W, MB) void k_hg(const uint4 *__restrict__ wc,
     uint4 nm0[RB], nm1[RB];
     float nsc[RB];
 #pragma unroll
-    for (int b = 0; b < RB; b++) { nm0[b] = __ldg(wr[b]); nm1[b] = __ldg(wr[b] + G); nsc[b] = __half2float(sr[b][0]); }
+    for (int b = 0; b < RB; b++) { nm0[b] = __ldg(wr[b]); nm1[b] = __ldg(wr[b] + HC1); nsc[b] = __half2float(sr[b][0]); }
     for (int g0 = 0; g0 < G; g0 += GC) {
         __syncthreads();
         for (int i = threadIdx.x; i < NT * GC * 16; i += 32 * W) {
@@ -549,7 +605,7 @@ __global__ __launch_bounds__(32 * W, MB) void k_hg(const uint4 *__restrict__ wc,
             for (int b = 0; b < RB; b++) { m0[b] = nm0[b]; m1[b] = nm1[b]; sc[b] = nsc[b]; }
             const int gn = g0 + gg + 1 < G ? g0 + gg + 1 : g0 + gg;
 #pragma unroll
-            for (int b = 0; b < RB; b++) { nm0[b] = __ldg(wr[b] + gn); nm1[b] = __ldg(wr[b] + G + gn); nsc[b] = __half2float(sr[b][gn]); }
+            for (int b = 0; b < RB; b++) { nm0[b] = __ldg(wr[b] + gn * HGS); nm1[b] = __ldg(wr[b] + HC1 + gn * HGS); nsc[b] = __half2float(sr[b][gn * HSS]); }
             float si[RB][NT];
 #pragma unroll
             for (int b = 0; b < RB; b++)
@@ -1153,6 +1209,7 @@ static float *d_out_norm_w;
 static int nsign; static int sign_w[8]; static float *sign_h[8], *sign_d[8];
 static int8_t LUT[256][5];
 static uint4 *d_codes; static __half *d_scales;
+static int li_on = 1; /* 32-row tiled weight layout + k_li decode GEMV (E_LI, default on except sm_61) */
 static size_t n_codes, n_scales;
 
 static const TI *ptq(const char *n) {
@@ -1179,7 +1236,8 @@ static DT dt_alloc(const TI **ts, int nt) {
         d.N += (int)ts[i]->ne[1];
     }
     const size_t G = d.K / 128;
-    n_codes += (size_t)d.N * 2 * G; n_scales += (size_t)d.N * G;
+    const size_t NA = li_on ? ((size_t)d.N + 31) & ~(size_t)31 : (size_t)d.N;
+    n_codes += NA * 2 * G; n_scales += NA * G;
     n_scales = (n_scales + 127) & ~(size_t)127;
     return d;
 }
@@ -1212,6 +1270,8 @@ static void dt_fill(const DT *d, const TI **ts, int nt) {
     const int G = d->K / 128, CHUNK = 8192;
     uint32_t *hc = (uint32_t *)malloc((size_t)CHUNK * 8 * G * 4);
     uint16_t *hs = (uint16_t *)malloc((size_t)CHUNK * G * 2);
+    uint32_t *tc = li_on ? (uint32_t *)malloc((size_t)CHUNK * 8 * G * 4) : NULL;
+    uint16_t *tsb = li_on ? (uint16_t *)malloc((size_t)CHUNK * G * 2) : NULL;
     size_t row = 0;
     for (int i = 0; i < nt; i++) {
         const int N = (int)ts[i]->ne[1];
@@ -1219,15 +1279,30 @@ static void dt_fill(const DT *d, const TI **ts, int nt) {
             const int nr = N - r0 < CHUNK ? N - r0 : CHUNK;
             const uint8_t *src = ts[i]->d + (size_t)r0 * G * PTQ_BYTES;
             repack_rows(src, d->K, nr, hc, hs);
-            CK(cudaMemcpy(d_codes + d->co + (row + r0) * 2 * G, hc, (size_t)nr * 8 * G * 4, cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(d_scales + d->so + (row + r0) * G, hs, (size_t)nr * G * 2, cudaMemcpyHostToDevice));
+            if (li_on) { /* rows -> 32-row tiles (a tensor that is not the last must end on a tile) */
+                if ((row & 31) || ((nr & 31) && i + 1 < nt)) { fprintf(stderr, "li: rows not tile aligned\n"); exit(1); }
+                const int nra = (nr + 31) & ~31;
+                memset(tc, 0, (size_t)nra * 8 * G * 4); memset(tsb, 0, (size_t)nra * G * 2);
+                for (int r = 0; r < nr; r++)
+                    for (int g = 0; g < G; g++) {
+                        const size_t t = r >> 5, l = r & 31;
+                        memcpy(tc + (t * 64 * G + g * 64 + l) * 4, hc + (size_t)r * 8 * G + 4 * g, 16);
+                        memcpy(tc + (t * 64 * G + g * 64 + 32 + l) * 4, hc + (size_t)r * 8 * G + 4 * G + 4 * g, 16);
+                        tsb[t * 32 * G + g * 32 + l] = hs[(size_t)r * G + g];
+                    }
+                CK(cudaMemcpy(d_codes + d->co + (row + r0) * 2 * G, tc, (size_t)nra * 8 * G * 4, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(d_scales + d->so + (row + r0) * G, tsb, (size_t)nra * G * 2, cudaMemcpyHostToDevice));
+            } else {
+                CK(cudaMemcpy(d_codes + d->co + (row + r0) * 2 * G, hc, (size_t)nr * 8 * G * 4, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(d_scales + d->so + (row + r0) * G, hs, (size_t)nr * G * 2, cudaMemcpyHostToDevice));
+            }
             /* the source pages are not needed again (embedding rows aside) */
             uintptr_t a = (uintptr_t)src & ~(uintptr_t)4095, e = (uintptr_t)(src + (size_t)nr * G * PTQ_BYTES) & ~(uintptr_t)4095;
             if (ts[i] != tok_t && e > a) madvise((void *)a, e - a, MADV_DONTNEED);
         }
         row += N;
     }
-    free(hc); free(hs);
+    free(hc); free(hs); free(tc); free(tsb);
 }
 
 static void load(void) {
@@ -1369,7 +1444,10 @@ static void gemv_t(const DT *d, float *y, int resid) {
 template <int G>
 static void gemvN_t(const DT *d, float *y, int resid, int nt, int ys) {
     constexpr int W = 4, RB = 2;
-    k_hg<G, W, NTM, 4, RB, 1><<<(d->N + 32 * W * RB - 1) / (32 * W * RB), 32 * W, 0, st>>>(
+    const dim3 gr((d->N + 32 * W * RB - 1) / (32 * W * RB));
+    if (li_on) k_hg<G, W, NTM, 4, RB, 1, 1><<<gr, 32 * W, 0, st>>>(
+        d_codes + d->co, d_scales + d->so, d_pl, PLS, (const __half *)(d_pl + PLS - HQW), 2 * PLS, y, ys, d->N, resid, nt);
+    else k_hg<G, W, NTM, 4, RB, 1, 0><<<gr, 32 * W, 0, st>>>(
         d_codes + d->co, d_scales + d->so, d_pl, PLS, (const __half *)(d_pl + PLS - HQW), 2 * PLS, y, ys, d->N, resid, nt);
 }
 template <int G, int WR, int TPB, int RB>
@@ -1412,7 +1490,23 @@ static void gemvn(const DT *d, float *y, int resid, int nt, int ys) {
     default: fprintf(stderr, "gemv: K %d unsupported\n", d->K); exit(1);
     }
 }
+template <int G, int PD>
+static void li_t(const DT *d, float *y, int resid) {
+    constexpr int W = 4;
+    k_li<G, W, PD><<<(d->N + 32 * W - 1) / (32 * W), 32 * W, 0, st>>>(d_codes + d->co, d_scales + d->so, d_pl, y, d->N, resid, gzc);
+}
 static void gemv(const DT *d, float *y, int resid) {
+    if (li_on) {
+        switch (d->K / 128) {
+        case 16: li_t<16, 2>(d, y, resid); return;
+        case 20: li_t<20, 2>(d, y, resid); return;
+        case 32: li_t<32, 2>(d, y, resid); return;
+        case 48: li_t<48, 4>(d, y, resid); return;
+        case 72: li_t<72, 4>(d, y, resid); return;
+        case 96: li_t<96, 4>(d, y, resid); return;
+        default: fprintf(stderr, "gemv: K %d unsupported\n", d->K); exit(1);
+        }
+    }
     static int v20 = -1, v72 = -1, v32 = -1, v16 = -1, v48 = -1, v96 = -1;
     if (v20 < 0) {
         const char *e16 = getenv("E_V16"), *e48 = getenv("E_V48");
@@ -1604,6 +1698,13 @@ int main(int argc, char **argv) {
     if (getenv("E_CTX")) CTX = atoi(getenv("E_CTX"));
     if (getenv("E_GRAPH")) use_graph = atoi(getenv("E_GRAPH"));
     CK(cudaFree(0));
+    {
+        int mj = 0, mn = 0, dv = 0;
+        cudaGetDevice(&dv);
+        cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dv);
+        cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dv);
+        li_on = getenv("E_LI") ? atoi(getenv("E_LI")) : mj * 10 + mn != 61;
+    }
     gguf_open(argv[1]);
     load();
     int N = atoi(argv[2]); const int np = argc - 3;
@@ -1668,6 +1769,7 @@ int main(int argc, char **argv) {
     cudaDeviceGetAttribute(&ccmaj, cudaDevAttrComputeCapabilityMajor, dev);
     cudaDeviceGetAttribute(&ccmin, cudaDevAttrComputeCapabilityMinor, dev);
     hg_on = getenv("E_HG") ? atoi(getenv("E_HG")) : ccmaj * 10 + ccmin != 61;
+    if (li_on) hg_on = 1; /* k_gemvN reads the row-major layout only */
     int pch = getenv("E_PCHUNK") ? atoi(getenv("E_PCHUNK")) : NTM;
     if (pch < 1) pch = 1;
     if (pch > NTM) pch = NTM;
