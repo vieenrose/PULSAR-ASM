@@ -1058,12 +1058,22 @@ static void gemvn(const DT *d, float *y, int resid, int nt, int ys) {
     }
 }
 static void gemv(const DT *d, float *y, int resid) {
-    static int v20 = -1, v72 = -1, v32 = -1, v16 = -1, v48 = -1;
+    static int v20 = -1, v72 = -1, v32 = -1, v16 = -1, v48 = -1, v96 = -1;
     if (v20 < 0) {
         const char *e16 = getenv("E_V16"), *e48 = getenv("E_V48");
         v16 = e16 ? atoi(e16) : 0; v48 = e48 ? atoi(e48) : 0;
         const char *e = getenv("E_V20"); v20 = e ? atoi(e) : 0;
         e = getenv("E_V72"); v72 = e ? atoi(e) : 0; e = getenv("E_V32"); v32 = e ? atoi(e) : 0;
+        e = getenv("E_V96"); v96 = e ? atoi(e) : 0;
+    }
+    if (d->K == 12288 && v96) {
+        switch (v96) {
+        case 1: gemv_t<96, 3, 2, 4, 2>(d, y, resid); return;
+        case 2: gemv_t<96, 3, 2, 3, 3, 0>(d, y, resid); return;
+        case 3: gemv_t<96, 6, 1, 2, 2, 0>(d, y, resid); return;
+        case 4: gemv_t<96, 3, 1, 4, 2, 0>(d, y, resid); return;
+        case 5: gemv_t<96, 3, 4, 2, 2, 0>(d, y, resid); return;
+        }
     }
     if (d->K == 2048 && v16) {
         switch (v16) {
@@ -1092,6 +1102,10 @@ static void gemv(const DT *d, float *y, int resid) {
     if (d->K == 4096 && v32) {
         switch (v32) {
         case 1: gemv_t<32, 1, 8, 4, 2, 0>(d, y, resid); return;
+        case 2: gemv_t<32, 1, 8, 3, 3>(d, y, resid); return;
+        case 3: gemv_t<32, 1, 4, 4, 2>(d, y, resid); return;
+        case 4: gemv_t<32, 2, 4, 4, 2>(d, y, resid); return;
+        case 5: gemv_t<32, 1, 8, 6, 3>(d, y, resid); return;
         }
     }
     switch (d->K / 128) {
@@ -1183,6 +1197,7 @@ static void enqueue(int nt, int tiny, int want) {
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static cudaGraphExec_t gx[NTM + 1][2][3];
 static int use_graph = 1;
+static int EOS_ID;
 static void run(int nt, int tiny, int want) {
     if (!use_graph || tdf) { enqueue(nt, tiny, want); return; }
     cudaGraphExec_t *e = &gx[nt][tiny][want];
@@ -1198,13 +1213,15 @@ static void run(int nt, int tiny, int want) {
 }
 
 int main(int argc, char **argv) {
+    const double tstart = now();
     if (argc < 4) { fprintf(stderr, "usage: %s model.gguf N id id ...\n", argv[0]); return 1; }
     if (getenv("E_CTX")) CTX = atoi(getenv("E_CTX"));
     if (getenv("E_GRAPH")) use_graph = atoi(getenv("E_GRAPH"));
     CK(cudaFree(0));
     gguf_open(argv[1]);
     load();
-    const int N = atoi(argv[2]), np = argc - 3;
+    int N = atoi(argv[2]); const int np = argc - 3;
+    EOS_ID = (int)kv_int("tokenizer.ggml.eos_token_id", 248046);
     ROPE_TS = powf(ROPE_BASE, -2.0f / NROT);
     FSC = 1.0f / sqrtf((float)BS);
     fprintf(stderr, "fwd35: rope theta_scale %a\n", ROPE_TS);
@@ -1269,7 +1286,12 @@ int main(int argc, char **argv) {
     }
     int pos = 0;
     tcur = 0;
+    /* demo switches, stream unchanged: E_STEPMS=1 prints each token's step time, E_STOP=1 ends
+       after the end-of-turn id (it is printed; later steps are not run) */
+    const int stepms = getenv("E_STEPMS") ? atoi(getenv("E_STEPMS")) : 0;
+    const int stop = getenv("E_STOP") ? atoi(getenv("E_STOP")) : 0;
     const double t0 = now();
+    if (stepms) fprintf(stderr, "fwd35: load %.3f s\n", t0 - tstart);
     for (int i = 0; i < np;) {
         const int nt = np - i < pch ? np - i : pch;
         for (int t = 0; t < nt; t++) embed(atoi(argv[3 + i + t]), hx + (size_t)E * t);
@@ -1289,7 +1311,9 @@ int main(int argc, char **argv) {
         if (df) { CK(cudaMemcpy(hl, d_logits, 4 * (size_t)VOCAB, cudaMemcpyDeviceToHost)); fwrite(hl, 4, VOCAB, df); }
         printf("%d\n", a); fflush(stdout);
         tcur = s + 1;
+        if (stop && a == EOS_ID) { N = s + 1; break; }
         if (s + 1 < N) {
+            const double ts = now();
             embed(a, hx);
             hpos[pos] = pos;
             CK(cudaMemcpyAsync(d_x, hx, 4 * E, cudaMemcpyHostToDevice, st));
@@ -1298,6 +1322,7 @@ int main(int argc, char **argv) {
             run(1, 0, 1);
             CK(cudaMemcpyAsync(hid, d_out, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
+            if (stepms) fprintf(stderr, "STEP %d ms=%.2f\n", s + 1, 1000 * (now() - ts));
         }
         t2 = now();
     }

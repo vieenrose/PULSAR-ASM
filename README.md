@@ -1,10 +1,143 @@
-# PULSAR-ASM: Bonsai-8B 1-bit on a Jetson Nano
+# PULSAR-ASM: Ternary-Bonsai-2 on a Jetson Nano
 
-An 8-billion-parameter language model running at **16.5 tokens/s on a
-Jetson Nano Gen1**, the 2019 4 GB board, using its 128-core Maxwell GPU.
-The model is PrismML's **Bonsai-8B** (Qwen3-8B architecture) in the
-`Q1_0` format: true 1-bit weights, one sign bit per weight plus one f16
-scale per 128-weight block.
+PrismML's **Ternary-Bonsai-2** family (2B, 4B, 9B) running on a **Jetson
+Nano Gen1**, the 2019 4 GB board, on its 128-core Maxwell GPU. The
+models are the `PTQ1_0` GGUFs: ternary weights packed 128 to a 28-byte
+block with one f16 scale, 1.75 bits per weight. The architecture is `qwen35`,
+a hybrid that puts one full-attention layer after every three Gated
+DeltaNet (linear attention) layers.
+
+| model | GGUF bytes | on the GPU | prefill | decode |
+|---|---|---|---|---|
+| Ternary-Bonsai-2-2B | 429,183,456 | 476 MB | **25.4 tok/s** | **22.1 tok/s** |
+| Ternary-Bonsai-2-4B | 949,549,920 | 1064 MB | **10.8 tok/s** | **9.9 tok/s** |
+| Ternary-Bonsai-2-9B | 1,997,486,976 | 2009 MB | **6.2 tok/s** | **5.7 tok/s** |
+
+Prefill and decode are measured on English prompt A (24 prompt tokens),
+running to the model's own end of turn: 100, 82 and 99 decode steps.
+Conditions are `jetson_clocks` (GPU 921.6 MHz, CPU 1.479 GHz), L4T
+R32.5.1, CUDA 10.2, greedy decoding, f16 K/V cache. Decode streams
+10.5, 10.5 and 11.5 GB/s of weights. The GEMV is issue-bound at about
+13 GB/s on this GPU, below the 21.9 GB/s bus ceiling, because ternary
+dot products cost more ALU work per byte than the 1-bit ones below.
+
+| | |
+|---|---|
+| Engine | `pulsar_arm/bonsai2/fwd35_sm53.cu`, one CUDA file, written for this board. No llama.cpp, no cuBLAS, no Python at runtime |
+| Accuracy | **bit-exact against the PrismML llama.cpp fork**: every demo stream below equals the fork's own greedy stream over its full length, and `.auto/checks_b2.sh` gates 48 tokens on two prompts per model against fork goldens |
+| Sources | [prism-ml/bonsai-2-small](https://huggingface.co/collections/prism-ml/bonsai-2-small) |
+
+sha256: 2B `36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa`,
+4B `56711263ec9a9ffeaa74a3a0e58dece8127cf9268404746c721113ca76994d60`,
+9B `3561df7ac7d26a71ffa991ac2db740b10841c3a350aa2676ccd3ff5d428b4e8b`.
+
+## Demo
+
+The same two prompts on each model, one English and one Traditional
+Chinese. The clips play in real time: each token appears at the moment
+the engine produced it, using the per-step times from the run's own log.
+Loading (weight repack + upload) and prompt processing are shown at their
+measured durations too.
+
+### Ternary-Bonsai-2-2B
+
+**English** (100 tokens, decode 22.1 tok/s)
+
+![Ternary-Bonsai-2-2B on a Jetson Nano, English prompt](doc/bonsai2-2b-nano-chat-en.gif)
+
+**Traditional Chinese** (350 tokens, decode 21.1 tok/s)
+
+![Ternary-Bonsai-2-2B on a Jetson Nano, Traditional Chinese prompt](doc/bonsai2-2b-nano-chat-zh-tw.gif)
+
+### Ternary-Bonsai-2-4B
+
+**English** (82 tokens, decode 9.9 tok/s)
+
+![Ternary-Bonsai-2-4B on a Jetson Nano, English prompt](doc/bonsai2-4b-nano-chat-en.gif)
+
+**Traditional Chinese** (404 tokens, decode 9.25 tok/s)
+
+![Ternary-Bonsai-2-4B on a Jetson Nano, Traditional Chinese prompt](doc/bonsai2-4b-nano-chat-zh-tw.gif)
+
+### Ternary-Bonsai-2-9B
+
+**English** (99 tokens, decode 5.7 tok/s)
+
+![Ternary-Bonsai-2-9B on a Jetson Nano, English prompt](doc/bonsai2-9b-nano-chat-en.gif)
+
+**Traditional Chinese** (92 tokens, decode 5.7 tok/s)
+
+![Ternary-Bonsai-2-9B on a Jetson Nano, Traditional Chinese prompt](doc/bonsai2-9b-nano-chat-zh-tw.gif)
+
+How the clips were made:
+
+- The engine is `fwd35_sm53.cu` at the commit that adds these clips,
+  built on the Nano with
+  `nvcc -O3 -gencode arch=compute_53,code=sm_53 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off`.
+- The prompts are "List the four seasons and one thing that changes in
+  each." and "請列出四季，以及每一季會改變的一件事。", wrapped in the
+  model's chat template with an empty think block. Prompt ids came from
+  the fork's `llama-tokenize` on the same GGUF.
+- Decoding is greedy. `E_STOP=1` ends the run at `<|im_end|>`, which
+  every run reached on its own. `E_STEPMS=1` logs the step times the
+  clips replay.
+- **Every stream equals the fork's.** `fork_greedy.cpp` (the fork's
+  own CPU graph, f16 K/V cache, flash attention) was run for each clip's
+  full length: 2B 101 / 351, 4B 83 / 405 and 9B 100 / 93 ids are
+  identical. The text is decoded with each GGUF's own vocabulary and is
+  not edited.
+- Decode steps: 2B 44–68 ms, 4B 99–125 ms, 9B 171–210 ms. Steps grow
+  with depth only through the full-attention layers (one in four), so
+  the long Chinese answers lose 5–7 %. Loading is 5.1 s, 11.1 s and
+  23.5 s: the ternary planes are repacked on the CPU before upload.
+- The 2B's Chinese answer has slips, kept as generated, for example
+  "花朵開墜" and summer "植物葉片變黃". The 4B writes "收获" (simplified
+  获) once.
+- The board's 14 GB card holds the 2B plus one of the 4B and 9B at a
+  time, so the 4B clips were recorded before the 9B was copied in.
+- Re-render with `python3 pulsar_arm/tools/make_chat_gif.py
+  bonsai2-2b-nano-en bonsai2-2b-nano-zh-tw bonsai2-4b-nano-en
+  bonsai2-4b-nano-zh-tw bonsai2-9b-nano-en bonsai2-9b-nano-zh-tw` (needs
+  Pillow ≥ 8.2 and ffmpeg). Transcripts and step times are literals.
+
+### Speculative decoding: measured out on this board
+
+The Bonsai-2 releases come with MTP heads and DFlash draft models. On the
+Nano neither can help. The ternary GEMV is bound by instruction issue per
+(row, token): ~286 SASS instructions per 128-weight row group, ~180 of
+them the POPC/LOP3 core. Checking k drafted tokens in one batched pass
+therefore costs nearly k single-token steps. Measured with the engine's
+own batched forward on the 4B (`E_PCHUNK`), the per-token cost of a
+k-token pass against single tokens is 1.81× at k = 2, 1.62× at 3 and
+1.36× at 8. A draft would need near-perfect acceptance just to break
+even. The same batched pass is 3–3.7× faster per token on a GTX 1070
+(sm_61), so `E_PCHUNK` defaults to 8 there and to 1 on sm_53. The DFlash
+drafts (~1.57 GB) would not fit next to the 4B or 9B anyway.
+
+### Build, run and gates
+
+```sh
+nvcc -O3 -gencode arch=compute_53,code=sm_53 --fmad=false \
+     -Xcompiler -fopenmp,-ffp-contract=off -o fwd35 fwd35_sm53.cu -lgomp
+sudo jetson_clocks
+./fwd35 Ternary-Bonsai-2-4B-PTQ1_0.gguf 400 <prompt ids...>   # prints greedy ids; tok/s on stderr
+bash .auto/checks_b2.sh 2B 4B 9B    # from the host: sync, build on the Nano, fork-golden gates
+```
+
+Switches: `E_STOP=1`, `E_STEPMS=1`, `E_PCHUNK=n` (prefill tokens per
+batched pass), `E_GRAPH=0` (no CUDA graphs), `E_CTX` (default 4096).
+The host reference `fwd35_ref.c` (plain C, same bits on x86 and the
+Nano's A57) and the per-kernel record are in `.auto/ideas.md` row 59.
+
+## Bonsai-8B Q1_0 engine (previous generation)
+
+The pages below document the engine this repository was built around:
+PrismML's **Bonsai-8B** (Qwen3-8B architecture) in the `Q1_0` format,
+true 1-bit weights (one sign bit per weight plus one f16 scale per
+128-weight block), at **16.5 tokens/s** on the same board. It also runs
+the first-generation Ternary-Bonsai-4B (`-DPQ1_TERN -DBONSAI_4B`,
+14.5 tok/s). Its demo clips were replaced by the Bonsai-2 ones above and
+remain in git history (commit d2b7ed9).
 
 | | |
 |---|---|
@@ -13,104 +146,7 @@ scale per 128-weight block.
 | Engine | C + CUDA (sm_53), written for this board. No llama.cpp, no cuBLAS, no Python at runtime; the binary links only `libcudart`, `libgomp`, libc/libm/libpthread and libstdc++ |
 | Accuracy | every GEMV kernel bit-exact against a host reference of the PrismML llama.cpp fork's Q1_0 arithmetic; greedy streams frozen as goldens and enforced by a gate on every change |
 
-## Demo
-
-Both clips play in real time: each token appears at the moment the engine
-produced it, using the per-step times from the run's own log. Loading
-(weight repack + upload) and prompt processing are shown at their measured
-durations too.
-
-**English** (seed 7, 106 tokens, decode 15.8 tok/s)
-
-![Bonsai-8B Q1_0 on a Jetson Nano, English prompt](doc/bonsai8b-q1-nano-chat-en.gif)
-
-**Traditional Chinese** (seed 123, 251 tokens, decode 15.3 tok/s)
-
-![Bonsai-8B Q1_0 on a Jetson Nano, Traditional Chinese prompt](doc/bonsai8b-q1-nano-chat-zh-tw.gif)
-
-How the clips were made:
-
-- Engine code is the committed `bonsai-jetson-nano` HEAD (bfabc8a),
-  built with `.auto/build_q1.sh`, on a Nano with `jetson_clocks`
-  (GPU 921.6 MHz, CPU 1.479 GHz), L4T R32.5.1, CUDA 10.2.
-- The prompts are "List the four seasons and one thing that changes in
-  each." and "請列出四季，以及每一季會改變的一件事。", wrapped in the
-  model's chat template with an empty think block. Prompt ids came from
-  `llama-tokenize` against the same GGUF.
-- Sampling uses the GGUF's own recommended settings: temperature 0.5,
-  top-p 0.85, top-k 20.
-- Both runs stopped on their own at end-of-sequence.
-- The commands, as shown in the clips:
-
-  ```sh
-  OMP_NUM_THREADS=4 ./fwd8_q1 b8q1.gguf 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.5 0.85 20 7
-  OMP_NUM_THREADS=4 ./fwd8_q1 b8q1.gguf 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.5 0.85 20 123
-  ```
-
-- The text is the model's output, detokenized and not edited. The
-  Chinese answer has 1-bit-model slips, kept as generated: "溫度
-  gradually 上升", "蜂群越winter", and winter given "長日" (long days).
-- 15.8 and 15.3 tok/s are lower than the 16.51 headline below because
-  these runs go deeper into the context (up to position 275, against 44 in
-  the harness; attention grows with it, steps go from ~61 to ~76 ms),
-  sample on the host from the full logits (0.4 ms/token), and ran in a
-  different hour on the same board, which drifts 2–6 %. The headline is
-  the greedy harness number.
-- The transcripts and per-token times are literals in
-  `pulsar_arm/tools/make_chat_gif.py`, so re-rendering can only reproduce
-  these frames: `python3 pulsar_arm/tools/make_chat_gif.py
-  bonsai8b-q1-nano-en bonsai8b-q1-nano-zh-tw` (needs Pillow ≥ 8.2 and
-  ffmpeg).
-
-### Ternary-Bonsai-4B
-
-The same two prompts, seeds and sampling on the 4B ternary checkpoint
-(1.58-bit weights, `-DPQ1_TERN -DBONSAI_4B` build), with the engine's
-default TurboQuant 4-bit KV cache.
-
-**English** (seed 7, 92 tokens, decode 14.6 tok/s)
-
-![Ternary-Bonsai-4B on a Jetson Nano, English prompt](doc/bonsai4b-ternary-nano-chat-en.gif)
-
-**Traditional Chinese** (seed 123, 386 tokens, decode 14.2 tok/s)
-
-![Ternary-Bonsai-4B on a Jetson Nano, Traditional Chinese prompt](doc/bonsai4b-ternary-nano-chat-zh-tw.gif)
-
-How the clips were made:
-
-- Engine code is the committed `bonsai-jetson-nano` HEAD (8fd086d),
-  built with `.auto/build_t4.sh`, same board and clocks as above
-  (`jetson_clocks`, GPU 921.6 MHz, CPU 1.479 GHz).
-- The commands, as shown in the clips (the trailing `0` is min-p):
-
-  ```sh
-  OMP_NUM_THREADS=4 ./fwd8_t4 t4b.gguf 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.5 0.85 20 7 0
-  OMP_NUM_THREADS=4 ./fwd8_t4 t4b.gguf 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.5 0.85 20 123 0
-  ```
-
-- Token ids were decoded with the 4B GGUF's own vocabulary. The text
-  is not edited.
-- Loading takes 9.5 s, against 2.4 s for the 8B, because the ternary
-  weights are repacked on the CPU before upload. The clips show the
-  measured time.
-- Decode steps run 68–70 ms in the English run. In the Chinese run they
-  grow to 74 ms by position 410, as attention grows with the context,
-  plus one 108 ms step. Prompt processing runs at 14.3 tok/s.
-- Both runs ended on a sampled end-of-sequence. The Chinese one ends
-  partway through the autumn list, on an empty `-` bullet, and never
-  reaches winter. That is the model's own stop and is kept as is.
-- The Chinese answer has other slips, kept as generated:
-  - Japanese 気 instead of 氣, twice, and the simplified 树.
-  - "花朵開開".
-  - For summer, "影子最長" (shadows longest) and "水資源干涸".
-- The TurboQuant cache is lossy. With the exact f16 cache
-  (`PQ1_KVTQ=0`), seed 123 samples a different token at step 5 and
-  writes a different answer. The f16 path is the one gated bit-exact
-  against the fork.
-- Re-render with `python3 pulsar_arm/tools/make_chat_gif.py
-  bonsai4b-ternary-nano-en bonsai4b-ternary-nano-zh-tw`.
-
-## At a glance
+### At a glance
 
 | | |
 |---|---|
@@ -123,7 +159,7 @@ How the clips were made:
 | Bandwidth | ~17.1 GB/s of 21.9 (78 %); the GEMV kernels alone run at 16.5–20.6 GB/s, up to 94 % of the ceiling |
 | Conditions | cold harness run, prompt A (20 prompt ids + 24 greedy tokens), `jetson_clocks`, cpuidle c7 off |
 
-## How it works
+### How it works
 
 At load, the 1-bit weights are repacked into a 1280 MB GPU arena. After
 the first token, a whole decode step is **one CUDA graph**: per layer,
@@ -173,7 +209,7 @@ build. Each has a switch to turn it off (`PQ1_FFN=0`, `PQ1_ATT=0`,
 `PQ1_GRAPH=0`, ...). The full record, including every idea
 that was measured and rejected, is `.auto/HANDOFF_NANO_Q1_0.md`.
 
-## Accuracy
+### Accuracy
 
 `.auto/checks.sh` rebuilds from the working tree and runs three gates.
 They are never overridden:
@@ -200,7 +236,7 @@ engine's own exact path. Note that the fork's own greedy stream is not
 unique either: on a long Traditional Chinese prompt, flash attention on vs
 off first differs at token 36, and 20 threads vs 1 thread at token 32.
 
-## Build and run
+### Build and run
 
 Everything builds on the Nano (CUDA 10.2, gcc 7.5). The exact recipe is
 `.auto/build_q1.sh`; in short:
@@ -232,7 +268,7 @@ that knows Q1_0 (the PrismML fork), or with
 `pulsar_arm/bonsai2/tokdetok.cpp` built against it, which also turns the
 printed ids back into text.
 
-## Measurement harness
+### Measurement harness
 
 Run from a host with ssh access to the board (the scripts default to
 `pesi@100.70.245.36`; set `NANO=` to change it). They copy the sources,
@@ -253,7 +289,7 @@ and graph counters at exit, the proof that a code path actually ran),
 The board drifts 2–6 % from hour to hour, so a number is only compared
 with another from the same A/B job, never with one from another run.
 
-## Limitations and work in progress
+### Limitations and work in progress
 
 - Context is capped at 512 tokens, and the prompt is processed one token
   at a time through the decode path (no batched prefill).
@@ -267,6 +303,9 @@ with another from the same A/B job, never with one from another run.
 ## Layout
 
 ```
+pulsar_arm/bonsai2/fwd35_sm53.cu      Bonsai-2 (qwen35, PTQ1_0) GPU engine: GEMV, GDN, attention, graphs
+pulsar_arm/bonsai2/fwd35_ref.c        Bonsai-2 host reference, bit-exact vs the fork; glibc_mathf.h
+pulsar_arm/bonsai2/fork_greedy.cpp    the fork's own greedy stream (goldens, full-length demo checks)
 pulsar_arm/bonsai2/pq1_swar_sm53.cu   GPU kernels: hs, T-MAC + SWAR GEMVs, attention, FFN, rms/quant
 pulsar_arm/bonsai2/pq1_fwd8_glue.c    repack, GPU arena, merged tensors, CUDA graphs, dispatch, timers
 pulsar_arm/bonsai2/fwd8.c             engine: layer loop, CPU passes, sampler (compiled with pq1_fwd8_shim.h)

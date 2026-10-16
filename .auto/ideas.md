@@ -1237,3 +1237,13 @@ Measured out, do not re-walk:
 - GEMV shape sweeps (E_V16 0-7, E_V48 0-6, E_V20/72/32): the table above is the sweep winner.
 Remaining 4B per-token GPU profile: G20 (in + ffu + head) ~44 ms, G72 16.7, G32 7.2, norm_xq 7,
 gdn 6.8, xq 2.4, fa 1.9 ms.
+9B on the Nano (fits: 1890.5 MB planes + 118.2 MB scales + 178 MB state; repack 21 s): checks_b2 9B
+4/4 PASS, prefill 6.2 tps, decode 5.78 tps (48 tok), 5.72 over 99 steps (~11.5 GB/s of weights).
+Shape sweep at K=12288 (G96, down) and K=4096 (G32: qkv/gate/up/head/o), 2 reps, tps (default
+5.71/5.68): V96 <96,3,2,4,2,AD1> 5.58, <96,3,2,3,3> 5.50/5.57, <96,6,1,2,2> 5.52/5.50, <96,3,1,4,2>
+5.12, <96,3,4,2,2> 5.62/5.61; V32 <32,1,8,4,2,AD0> 5.41/5.43, <32,1,8,3,3> 5.75/5.73, <32,1,4,4,2>
+5.75/5.74, <32,2,4,4,2> 5.40/5.37, <32,1,8,6,3> 4.89/4.92. Best is +0.8%, inside the +-1% of one
+sample and on the 4B's G32 too: defaults kept, variants stay behind E_V96 / E_V32.
+Demos (doc/bonsai2-{2b,4b,9b}-nano-chat-{en,zh-tw}.gif): greedy to <|im_end|> with E_STOP=1 and
+E_STEPMS=1; every stream equals fork_greedy over its full length (2B 101/351, 4B 83/405, 9B
+100/93 ids). Decode 2B 22.11 / 21.06, 4B 9.90 / 9.25, 9B 5.72 / 5.74 tps (en / zh-tw).
