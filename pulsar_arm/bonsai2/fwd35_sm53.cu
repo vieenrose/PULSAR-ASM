@@ -720,8 +720,9 @@ __global__ void k_fa(const float *q, const float *buf, const __half *kc, const _
                      float *att, float *fao, int NH, int NKV, int ctx, float scale, int bs_) {
     extern __shared__ float fsh[];
     __shared__ float qs[256], cm[256];
-    float *sc = fsh, *wv = fsh + ctx;
-    unsigned char *up = (unsigned char *)(fsh + 2 * ctx);
+    /* one float per position: the score, then in place the weight (ms | vs, >= +0) with the
+       sign bit set where the running max moved (ms); 4 B instead of 9 B per position */
+    float *sc = fsh;
     const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int n = *posp + (int)blockIdx.y + 1, g = h / (NH / NKV);
     q += (size_t)blockIdx.y * NH * 256; buf += (size_t)blockIdx.y * bs_; att += (size_t)blockIdx.y * NH * 256;
@@ -753,16 +754,16 @@ __global__ void k_fa(const float *q, const float *buf, const __half *kc, const _
     float run = cm[tid];
     for (int i = lo; i < hi; i++) {
         const float s = sc[i];
-        if (s > run) { wv[i] = gm_expf(run - s); up[i] = 1; run = s; }
-        else { wv[i] = gm_expf(s - run); up[i] = 0; }
+        if (s > run) { sc[i] = -gm_expf(run - s); run = s; }
+        else sc[i] = gm_expf(s - run);
     }
     __syncthreads();
     float vk = 0.0f, S = 0.0f;
     const __half *vp = vc + g * 256 + tid;
     for (int ic = 0; ic < n; ic++) {
-        const float w = wv[ic];
+        const float sw = sc[ic], w = fabsf(sw);
         const float vv = __half2float(vp[(size_t)ic * NKV * 256]);
-        if (up[ic]) { vk = f16r(vk * w); vk = f16r(fmaf(vv, 1.0f, vk)); S = fmaf(S, w, 1.0f); }
+        if (__float_as_uint(sw) >> 31) { vk = f16r(vk * w); vk = f16r(fmaf(vv, 1.0f, vk)); S = fmaf(S, w, 1.0f); }
         else { vk = f16r(fmaf(vv, w, vk)); S = fmaf(S, 1.0f, w); }
     }
     const float Si = S == 0.0f ? 0.0f : 1.0f / S;
@@ -1172,7 +1173,7 @@ static void enqueue(int nt, int tiny, int want) {
             k_qk<<<dim3((NH + NKV + 3) / 4, nt), 128, 0, st>>>(d_buf, L->q_norm, L->k_norm, d_pos, d_q, d_kc[fi], d_vc[fi],
                                                              NH, NKV, NROT, ROPE_TS, EPS, BIG);
             tdump("Qcur-%d", l, d_q, NH * HD);
-            k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 9, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
+            k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 4, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
                                                              tdf ? d_fao : NULL, NH, NKV, CTX, ascale, BIG);
             tdump("fa_out-%d", l, d_fao, NH * HD);
             tdump("attn_gated-%d", l, d_att, NH * HD);
@@ -1228,8 +1229,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "fwd35: L=%d E=%d FF=%d H=%d/%d NV=%d NK=%d BS=%d grouped=%d tied=%d vocab=%d ctx=%d\n",
             NL, E, FF, NH, NKV, NV, NK, BS, GROUPED, TIED, VOCAB, CTX);
     if (np + N > CTX) { fprintf(stderr, "prompt + generation exceeds ctx %d\n", CTX); return 1; }
-    if ((size_t)CTX * 9 > 48 * 1024 - 2048) { fprintf(stderr, "ctx too large for the attention kernel\n"); return 1; }
-    CK(cudaFuncSetAttribute(k_fa, cudaFuncAttributeMaxDynamicSharedMemorySize, CTX * 9));
+    if ((size_t)CTX * 4 > 48 * 1024 - 2048) { fprintf(stderr, "ctx too large for the attention kernel\n"); return 1; }
+    CK(cudaFuncSetAttribute(k_fa, cudaFuncAttributeMaxDynamicSharedMemorySize, CTX * 4));
     int big = FF * 2; if (CH + INNER > big) big = CH + INNER; if (2 * NH * HD + 2 * NKV * HD > big) big = 2 * NH * HD + 2 * NKV * HD;
     int kmax = E; if (FF > kmax) kmax = FF; if (INNER > kmax) kmax = INNER; if (NH * HD > kmax) kmax = NH * HD;
     BIG = big; PLS = kmax / 32 * 10;
