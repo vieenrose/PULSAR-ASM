@@ -1109,6 +1109,63 @@ __global__ __launch_bounds__(256) void k_fs(const float *q, const __half *kc, co
         }
     }
 }
+/* fw_expf(x), x <= 0: gm_expf's bits on the FP32 pipe. Float-float evaluation of glibc's own
+   formula (same k = rne(x * 32 / ln2), same table, same degree-3 polynomial) to ~2^-45 relative;
+   the FP64 gm_expf runs instead when k is near a tie, when the value lies within 2^-38 (relative)
+   of a float rounding midpoint, or when the result would be subnormal (x < -87). Certified
+   against gm_expf over every float x <= 0 on the Nano (0 mismatches; ideas row 67). */
+__device__ float fe_tab[64]; /* 2^(i/32) as glibc's table holds it, hi and lo floats (k_feinit) */
+__global__ void k_feinit() {
+    const int i = threadIdx.x;
+    const double d = gm_asd(gm_exp2f_tab[i] + ((uint64_t)i << 47));
+    fe_tab[2 * i] = (float)d; fe_tab[2 * i + 1] = (float)(d - (double)fe_tab[2 * i]);
+}
+__device__ __forceinline__ void fe_2s(float a, float b, float &s, float &e) {
+    s = __fadd_rn(a, b); const float bb = __fsub_rn(s, a);
+    e = __fadd_rn(__fsub_rn(a, __fsub_rn(s, bb)), __fsub_rn(b, bb));
+}
+__device__ __noinline__ float fe_slow(float x) { return gm_expf(x); }
+__device__ __forceinline__ float fw_expf(float x) {
+    if (!(x >= -87.0f)) return fe_slow(x);
+    const float A1 = 0x1.715476p+5f, A2 = 0x1.4ae0cp-21f, A3 = -0x1p-46f;
+    const float ph = __fmul_rn(x, A1), pe = __fmaf_rn(x, A1, -ph);
+    const float m1 = __fmul_rn(x, A2), e1 = __fmaf_rn(x, A2, -m1);
+    float k = rintf(ph);
+    float a, ae, rh, be;
+    fe_2s(__fsub_rn(ph, k), pe, a, ae);
+    fe_2s(a, m1, rh, be);
+    float rl = __fadd_rn(__fadd_rn(__fadd_rn(ae, be), e1), __fmul_rn(x, A3));
+    { const float s = __fadd_rn(rh, rl); rl = __fsub_rn(rl, __fsub_rn(s, rh)); rh = s; }
+    if (rh > 0.5f) { rh = __fsub_rn(rh, 1.0f); k = __fadd_rn(k, 1.0f); }
+    else if (rh < -0.5f) { rh = __fadd_rn(rh, 1.0f); k = __fsub_rn(k, 1.0f); }
+    if (fabsf(fabsf(rh) - 0.5f) < 0x1p-20f) return fe_slow(x);
+    const float C0 = 0x1.c6af84p-20f, C1H = 0x1.ebfce6p-13f, C1L = -0x1.e0a762p-38f,
+                C2H = 0x1.62e43p-6f, C2L = -0x1.e75a54p-35f;
+    /* q = C2 r + (C1 + C0 r) r^2 */
+    const float t1h = __fmul_rn(C2H, rh), t1e = __fmaf_rn(C2H, rh, -t1h);
+    const float t1l = __fadd_rn(__fadd_rn(t1e, __fmul_rn(C2H, rl)), __fmul_rn(C2L, rh));
+    float ch, ce; fe_2s(C1H, __fmul_rn(C0, rh), ch, ce);
+    const float cl = __fadd_rn(ce, C1L);
+    const float r2h = __fmul_rn(rh, rh), r2e = __fadd_rn(__fmaf_rn(rh, rh, -r2h), __fmul_rn(__fmul_rn(2.0f, rh), rl));
+    const float t2h = __fmul_rn(ch, r2h), t2e = __fmaf_rn(ch, r2h, -t2h);
+    const float t2l = __fadd_rn(__fadd_rn(t2e, __fmul_rn(ch, r2e)), __fmul_rn(cl, r2h));
+    float qh, qe; fe_2s(t1h, t2h, qh, qe);
+    const float ql = __fadd_rn(__fadd_rn(qe, t1l), t2l);
+    /* y = T (1 + q) */
+    const int ki = (int)k, ti = ki & 31;
+    const float Th = fe_tab[2 * ti], Tl = fe_tab[2 * ti + 1];
+    const float m = __fmul_rn(Th, qh), me = __fmaf_rn(Th, qh, -m);
+    float yh, ye; fe_2s(Th, m, yh, ye);
+    const float rest = __fadd_rn(__fadd_rn(__fadd_rn(ye, me), __fadd_rn(__fmul_rn(Th, ql), Tl)), __fmul_rn(Tl, qh));
+    const float f = __fadd_rn(yh, rest);
+    const float d = __fadd_rn(__fsub_rn(yh, f), rest);
+    const uint32_t fu = __float_as_uint(f);
+    const float ulp = __int_as_float((int)(fu & 0x7F800000u) - (23 << 23));
+    const float hg = (d < 0.0f && (fu & 0x7FFFFFu) == 0) ? __fmul_rn(ulp, 0.25f) : __fmul_rn(ulp, 0.5f);
+    if (fabsf(__fsub_rn(fabsf(d), hg)) < __fmul_rn(f, 0x1p-38f)) return fe_slow(x);
+    return __fmul_rn(f, __int_as_float(((ki >> 5) + 127) << 23));
+}
+template <bool FE>
 __global__ __launch_bounds__(256) void k_fw(const int *posp, float *scg, int NH, int ctx) {
     __shared__ float cm[256];
     const int h = blockIdx.x, tid = threadIdx.x;
@@ -1127,8 +1184,8 @@ __global__ __launch_bounds__(256) void k_fw(const int *posp, float *scg, int NH,
     float run = cm[tid];
     for (int i = lo; i < hi; i++) {
         const float s = sc[i];
-        if (s > run) { sc[i] = -gm_expf(run - s); run = s; }
-        else sc[i] = gm_expf(s - run);
+        if (s > run) { sc[i] = -(FE ? fw_expf(run - s) : gm_expf(run - s)); run = s; }
+        else sc[i] = FE ? fw_expf(s - run) : gm_expf(s - run);
     }
 }
 #ifndef FVU
@@ -1658,6 +1715,7 @@ static uint32_t *d_zc;
 static int ssq_ready, ssq_on = -1;
 static double *d_ssq, *d_ssqn;
 static int ssqn_on = 1; /* E_SSQN: batch rms sums once per token in k_ssqn */
+static int fexp_on = 1; /* E_FEXP: k_fw weights with the certified FP32 fw_expf */
 static void gemv_res(const DT *d, int nt) {
     if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 1;
     if (nt != 1 || !ssq_on) { gemvn(d, d_x, 1, nt, E); return; }
@@ -1743,7 +1801,8 @@ static void enqueue(int nt, int tiny, int want) {
                 case 2: k_fs<2><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 default: k_fs<4><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 }
-                k_fw<<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
+                if (fexp_on) k_fw<true><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
+                else k_fw<false><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
                 if (fvg) k_fvg<2, 2><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
                 else k_fv<<<dim3(NH, nt), 256 / FVD, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
             } else
@@ -1875,6 +1934,8 @@ int main(int argc, char **argv) {
     if (getenv("E_GDNC")) gdn_c = atoi(getenv("E_GDNC"));
     if (getenv("E_ABT")) abt_on = atoi(getenv("E_ABT"));
     if (getenv("E_SSQN")) ssqn_on = atoi(getenv("E_SSQN"));
+    if (getenv("E_FEXP")) fexp_on = atoi(getenv("E_FEXP"));
+    k_feinit<<<1, 32>>>();
     if (getenv("E_GCRW")) gdn_crw = atoi(getenv("E_GCRW"));
     if (getenv("E_GCNW")) gdn_cnw = atoi(getenv("E_GCNW"));
     /* capture outside the timed region */

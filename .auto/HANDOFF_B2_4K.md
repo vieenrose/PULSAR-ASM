@@ -122,16 +122,16 @@ the 4k golden, keeps RSS at or below ~200 MB, and is decided by a same-job ABBA.
    - Share the K/V loads and the K/V f16 -> f32 conversions across the chunk.
    - The per-token V-chain rounding cannot be shared, so the gain is bounded at about 1/3 of the
      conversion work.
-5. **P5, k_fs score reduction (7.1 -> ~4 ms at 4k).**
+5. **P5, k_fs score reduction (7.1 -> ~4 ms at 4k).** MEASURED OUT (loop row 9: 0.82 -> 0.88 ms).
    - Use a shuffle transpose-reduce (31 SHFL per 32 scores instead of 5 per score) that yields
      the same xor-butterfly tree bits.
    - The smem-tree variant was measured out in row 60; this one is different and untested.
-6. **P6, k_fvg pipe balance (14.0 -> ~11-12 ms, uncertain).**
+6. **P6, k_fvg pipe balance (14.0 -> ~11-12 ms, uncertain).** MEASURED OUT (ideas row 66): the mixed ALU/F2F split is 0.90x at 1 of 4 chains, 0.46x at 3-4; k_fvg is issue bound.
    - Round part of the V chains on the FP32 pipe (Veltkamp split plus a magic-add for the
      subnormal range, certified by an exhaustive 2^32 check, no fallback) and the rest with F2F.
    - Row 60 measured the all-ALU unchecked rounding at only -6%, so only the balanced split is
      worth trying.
-7. **P7, certified fp32 expf in k_fw (2.1 -> ~0.5 ms at 4k).** The FP64 glibc-exact expf binds it
+7. **P7, certified fp32 expf in k_fw (2.1 -> ~0.5 ms at 4k).** DONE as fw_expf (ideas row 67): exhaustively certified for x <= 0, score 13.52 -> 13.58. The FP64 glibc-exact expf binds it
    (row 60). It needs a proof or an exhaustive check over the input range that occurs.
 8. **P8, small-kernel fusion (~2-3 ms).** Candidates: k_xq / k_norm_xq into the producing kernels,
    and the GDN side kernels (k_conv, k_gnorm, k_l2).

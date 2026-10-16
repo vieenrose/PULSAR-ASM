@@ -1355,3 +1355,24 @@ checks_b2 2B+4B ALL PASS. Same split at 4k, decode ms/token: k_li K=2560 42.3, k
 k_li K=9216 11.5, k_fs 7.2, k_gdn 6.4, k_li K=4096 5.4, k_xq 2.5, k_fw 2.1, k_ab 1.4, k_norm_xq 1.1
 (wall 103.7); prefill: k_hg K=2560 22.6, K=9216 7.6, K=4096 3.5, k_fvg 6.8, k_norm_xq 4.4 (now
 fixed), k_fs 3.4, k_gdnc 2.4, k_xq 2.3, k_fw 1.0, k_abt 0.9 (wall 59.6).
+
+66. k_fvg mixed ALU / F2F f16 rounding (measured out, not shipped). The exhaustively certified ALU
+rounding (add/sub of an exponent-derived constant, 0 mismatches over all 2^32 floats bar the sign
+of zero) was put on NA of the 4 chains per thread, with the per-step overflow check replaced by a
+running FMNMX max and an exact f16r recompute pass if it ever exceeds 65504. Standalone bench
+($SP/p6/fv.cu: n=4000, 16 heads, 4 KV, k_fvg<2,2> shape, random V and online-softmax weights with
+rescales), bits identical to base in every arm: NA=1 0.90x, NA=2 0.85x, NA=3 0.46x, NA=4 0.45x of
+the all-F2F kernel (1.68 ms). The kernel is issue bound, not F2F bound: the 3-4 extra ALU ops per
+update cost more than the quarter-rate conversion they replace. With the earlier all-ALU (row 60)
+and Veltkamp variants (loop rows 9, 11), the k_fvg rounding lever is closed.
+
+67. Certified FP32 expf in k_fw, fw_expf (keep, bit-identical; 4k score +0.45%). The softmax
+weights only take x <= 0. fw_expf evaluates glibc's own formula in float-float on the FP32 pipe:
+k = rne(x * 32/ln2) with 32/ln2 split exactly into three floats, r with two-products, the same
+degree-3 polynomial and the same 2^(i/32) table as hi/lo floats, ~2^-45 relative. The FP64
+gm_expf runs instead when |r| is within 2^-20 of 0.5 (k tie), when the value is within 2^-38 of
+a float rounding midpoint, or when x < -87 (subnormal results). Exhaustive check on the Nano
+against gm_expf over every negative float and +0: 0 mismatches; throughput loop 70 vs 205 ms.
+E_FEXP=0 restores gm_expf. 400-token prefill md5 b1591925 unchanged. 4k harness ABBA (E_FEXP
+1/0/0/1): score 13.5765 / 13.5272 / 13.5202 / 13.5837, decode 9.82 / 9.78 / 9.77 / 9.82, prefill
+18.77 / 18.71 / 18.71 / 18.79, GOLDEN PASS all four; checks_b2 2B+4B ALL PASS.
