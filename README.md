@@ -62,6 +62,54 @@ How the clips were made:
   bonsai8b-q1-nano-en bonsai8b-q1-nano-zh-tw` (needs Pillow ≥ 8.2 and
   ffmpeg).
 
+### Ternary-Bonsai-4B
+
+The same two prompts, seeds and sampling on the 4B ternary checkpoint
+(1.58-bit weights, `-DPQ1_TERN -DBONSAI_4B` build), with the engine's
+default TurboQuant 4-bit KV cache.
+
+**English** (seed 7, 92 tokens, decode 14.6 tok/s)
+
+![Ternary-Bonsai-4B on a Jetson Nano, English prompt](doc/bonsai4b-ternary-nano-chat-en.gif)
+
+**Traditional Chinese** (seed 123, 386 tokens, decode 14.2 tok/s)
+
+![Ternary-Bonsai-4B on a Jetson Nano, Traditional Chinese prompt](doc/bonsai4b-ternary-nano-chat-zh-tw.gif)
+
+How the clips were made:
+
+- Engine code is the committed `bonsai-jetson-nano` HEAD (8fd086d),
+  built with `.auto/build_t4.sh`, same board and clocks as above
+  (`jetson_clocks`, GPU 921.6 MHz, CPU 1.479 GHz).
+- The commands, as shown in the clips (the trailing `0` is min-p):
+
+  ```sh
+  OMP_NUM_THREADS=4 ./fwd8_t4 t4b.gguf 151644 872 198 852 279 3040 15584 323 825 3166 429 4344 304 1817 13 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.5 0.85 20 7 0
+  OMP_NUM_THREADS=4 ./fwd8_t4 t4b.gguf 151644 872 198 100792 114116 109080 3837 101034 104588 99377 99496 110946 99774 108008 1773 151645 198 151644 77091 198 151667 271 151668 271 --gen 400 --sample 0.5 0.85 20 123 0
+  ```
+
+- Token ids were decoded with the 4B GGUF's own vocabulary. The text
+  is not edited.
+- Loading takes 9.5 s, against 2.4 s for the 8B, because the ternary
+  weights are repacked on the CPU before upload. The clips show the
+  measured time.
+- Decode steps run 68–70 ms in the English run. In the Chinese run they
+  grow to 74 ms by position 410, as attention grows with the context,
+  plus one 108 ms step. Prompt processing runs at 14.3 tok/s.
+- Both runs ended on a sampled end-of-sequence. The Chinese one ends
+  partway through the autumn list, on an empty `-` bullet, and never
+  reaches winter. That is the model's own stop and is kept as is.
+- The Chinese answer has other slips, kept as generated:
+  - Japanese 気 instead of 氣, twice, and the simplified 树.
+  - "花朵開開".
+  - For summer, "影子最長" (shadows longest) and "水資源干涸".
+- The TurboQuant cache is lossy. With the exact f16 cache
+  (`PQ1_KVTQ=0`), seed 123 samples a different token at step 5 and
+  writes a different answer. The f16 path is the one gated bit-exact
+  against the fork.
+- Re-render with `python3 pulsar_arm/tools/make_chat_gif.py
+  bonsai4b-ternary-nano-en bonsai4b-ternary-nano-zh-tw`.
+
 ## At a glance
 
 | | |
