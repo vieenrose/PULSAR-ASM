@@ -716,6 +716,9 @@ __global__ void k_qk(const float *buf, const float *qn, const float *kn, const i
  * (ms | vs) of every position only depend on the running max, a prefix max, so they are
  * computed in parallel; the f16 VKQ chain stays sequential per output dim. Then
  * out = VKQ / S * sigmoid(gate). One block of 256 threads per q head. */
+#ifndef FAU
+#define FAU 16
+#endif
 __global__ void k_fa(const float *q, const float *buf, const __half *kc, const __half *vc, const int *posp,
                      float *att, float *fao, int NH, int NKV, int ctx, float scale, int bs_) {
     extern __shared__ float fsh[];
@@ -760,11 +763,20 @@ __global__ void k_fa(const float *q, const float *buf, const __half *kc, const _
     __syncthreads();
     float vk = 0.0f, S = 0.0f;
     const __half *vp = vc + g * 256 + tid;
-    for (int ic = 0; ic < n; ic++) {
-        const float sw = sc[ic], w = fabsf(sw);
-        const float vv = __half2float(vp[(size_t)ic * NKV * 256]);
-        if (__float_as_uint(sw) >> 31) { vk = f16r(vk * w); vk = f16r(fmaf(vv, 1.0f, vk)); S = fmaf(S, w, 1.0f); }
-        else { vk = f16r(fmaf(vv, w, vk)); S = fmaf(S, 1.0f, w); }
+    /* the V rows are independent of the f16 chain: issue FAU loads at once so one memory
+       latency covers FAU positions instead of one */
+    for (int ic0 = 0; ic0 < n; ic0 += FAU) {
+        __half vh[FAU];
+#pragma unroll
+        for (int u = 0; u < FAU; u++) if (ic0 + u < n) vh[u] = vp[(size_t)(ic0 + u) * NKV * 256];
+#pragma unroll
+        for (int u = 0; u < FAU; u++) {
+            if (ic0 + u >= n) break;
+            const float sw = sc[ic0 + u], w = fabsf(sw);
+            const float vv = __half2float(vh[u]);
+            if (__float_as_uint(sw) >> 31) { vk = f16r(vk * w); vk = f16r(fmaf(vv, 1.0f, vk)); S = fmaf(S, w, 1.0f); }
+            else { vk = f16r(fmaf(vv, w, vk)); S = fmaf(S, 1.0f, w); }
+        }
     }
     const float Si = S == 0.0f ? 0.0f : 1.0f / S;
     const float acc = vk * Si;
