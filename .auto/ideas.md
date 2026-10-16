@@ -1330,3 +1330,16 @@ score 11.9764 -> 12.5652, GOLDEN PASS, RSS 200832 KB (198-203 MB run spread); ch
 PASS. Note on storage: PTQ1_0 in the GGUF is already base-3 (1.75 bpw); the GPU planes are 2.125 bpw
 because the POPC identity needs bit planes, and the decode GEMVs now run at 19-20 GB/s of a ~22 GB/s
 ceiling, so a denser on-GPU encoding only pays if its unpack is nearly free.
+
+64. P3 chunked GDN prefill k_gdnc + batched tiny-order k_abt (keep, bit-identical; 4k prefill +9.9%).
+k_gdnc: for nt > 1 each warp loads its state rows of M once, runs them through the chunk's tokens in
+order (m = m * eg_t, the k / q dot chains, delta, update; k_gdn's per-row per-token arithmetic) and
+stores them once; q / k of the chunk staged in shared memory, the double-precision exp/log of the
+gates one thread per token. Rows 4 per warp chain x 4 warps (E_GCRW / E_GCNW; 1x2 18.77, 1x4 19.86,
+2x4 20.22, 2x8 20.34, 1x16 20.12, 4x8 20.52, 4x4 20.53 tps on the 400-token prefill vs 19.19 with
+E_GDNC=0). k_abt: the prompt batch's tiny-order F32 alpha / beta projections (8 lanes, dott_reduce)
+ran 4x underfilled warps per token; now 4 tokens per warp, lanes 8t'..8t'+7 with the same chains
+and the same width-8 tree. Same-binary 400-token prefill, all streams md5 b1591925: both off 19.22 /
+19.20, k_gdnc only 20.60, both 21.46 / 21.44 (+11.7%). 4k harness: prefill 16.16 -> 17.76, decode
+9.77, score 12.5652 -> 13.1725, GOLDEN PASS, RSS 202552 KB; checks_b2 2B+4B ALL PASS (4B prompt A
+chunk 8 prefill 18.70 -> 21.15, 2B 46.1 -> 49.8).

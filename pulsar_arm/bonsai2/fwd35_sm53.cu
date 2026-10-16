@@ -764,6 +764,21 @@ __global__ void k_ab(const float *wb, const float *wa, const float *xn, int E, i
     }
     if (lane == 0) out[row] = r;
 }
+/* k_ab's tiny order for a prompt batch, 4 tokens per warp: lanes 8 t' .. 8 t' + 7 run token
+ * t = 4 blockIdx.y + t' with dott_reduce's chains and tree inside their group of 8. */
+__global__ void k_abt(const float *wb, const float *wa, const float *xn, int E, int NV, int nt, float *out) {
+    const int lane = threadIdx.x & 31, s = lane & 7, t = blockIdx.y * 4 + (lane >> 3);
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= 2 * NV) return;
+    const float *w = row < NV ? wb + (size_t)row * E : wa + (size_t)(row - NV) * E;
+    const float *x = xn + (size_t)min(t, nt - 1) * E;
+    float c = 0.0f;
+    for (int l = 0; l < E; l += 8) c = fmaf(w[l + s], x[l + s], c);
+    float o = __shfl_down_sync(FULL, c, 4, 8); if (s < 4) c = o + c;
+    o = __shfl_down_sync(FULL, c, 2, 8); if (s < 2) c = c + o;
+    o = __shfl_down_sync(FULL, c, 1, 8); if (s == 0) c = c + o;
+    if (s == 0 && t < nt) out[(size_t)t * 2 * NV + row] = c;
+}
 // causal conv over [s0 s1 s2 x] (products rounded, summed in order), silu; state shifts
 __global__ void k_conv(const float *qkv, const float *cw, float *st, int CH, float *cv, int nt, int qs) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -842,6 +857,68 @@ __global__ void k_gdn(const float *cv0, const float *ab0, const float *ssm_a, co
     }
     __syncthreads(); /* s_be is rewritten for the next token */
   }
+}
+/* Chunked k_gdn for nt <= NT tokens (prefill): rows of M are independent, so each warp loads its
+ * state rows once, runs them through the nt tokens in order and stores them once (k_gdn reads
+ * and writes all of M per token). The per-row, per-token arithmetic is k_gdn's. */
+template <int RW, int NT>
+__global__ void k_gdnc(const float *cv0, const float *ab0, const float *ssm_a, const float *dtb, float *st,
+                       float *o0, int NV, int NK, float scale, int nt, int CH, int INNER) {
+    const int h = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    __shared__ float s_be[NT][2], sq[NT][128], sk[NT][128];
+    if (threadIdx.x < nt) { /* the glibc-exact exp/log in double: one thread per token */
+        const int t = threadIdx.x;
+        const float *ab = ab0 + (size_t)t * 2 * NV;
+        const float xg = ab[NV + h] + dtb[h];
+        const float g = ssm_a[h] * ((xg > 20.0f) ? xg : gm_logf(1.0f + gm_expf(xg)));
+        s_be[t][0] = 1.0f / (1.0f + gm_expf(-ab[h]));
+        s_be[t][1] = gm_expf(g);
+    }
+    for (int i = threadIdx.x; i < nt * 128; i += blockDim.x) {
+        const int t = i >> 7, e = i & 127;
+        const float *cv = cv0 + (size_t)t * CH;
+        sq[t][e] = cv[128 * (h % NK) + e]; sk[t][e] = cv[NK * 128 + 128 * (h % NK) + e];
+    }
+    __syncthreads();
+    float *M = st + (size_t)h * 128 * 128;
+    for (int j0 = warp; j0 < 128; j0 += RW * nw) {
+        float m[RW][4];
+#pragma unroll
+        for (int u = 0; u < RW; u++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) m[u][c] = M[(j0 + u * nw) * 128 + 32 * c + lane];
+        for (int t = 0; t < nt; t++) {
+            const float bt = s_be[t][0], eg = s_be[t][1];
+            const float *v = cv0 + (size_t)t * CH + 2 * NK * 128 + 128 * h;
+            float kr[4], qr[4], a[RW], dt[RW], a2[RW];
+#pragma unroll
+            for (int c = 0; c < 4; c++) { kr[c] = sk[t][32 * c + lane]; qr[c] = sq[t][32 * c + lane]; }
+#pragma unroll
+            for (int u = 0; u < RW; u++) {
+                a[u] = 0.0f;
+#pragma unroll
+                for (int c = 0; c < 4; c++) { m[u][c] = m[u][c] * eg; a[u] = fmaf(m[u][c], kr[c], a[u]); }
+            }
+#pragma unroll
+            for (int u = 0; u < RW; u++) dt[u] = dotg_reduce(a[u], lane);
+#pragma unroll
+            for (int u = 0; u < RW; u++) {
+                const float delta = (v[j0 + u * nw] - dt[u]) * bt;
+                a2[u] = 0.0f;
+#pragma unroll
+                for (int c = 0; c < 4; c++) { m[u][c] = fmaf(kr[c], delta, m[u][c]); a2[u] = fmaf(m[u][c], qr[c], a2[u]); }
+            }
+#pragma unroll
+            for (int u = 0; u < RW; u++) {
+                const float oo = dotg_reduce(a2[u], lane) * scale;
+                if (lane == 0) o0[(size_t)t * INNER + h * 128 + j0 + u * nw] = oo;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < RW; u++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) M[(j0 + u * nw) * 128 + 32 * c + lane] = m[u][c];
+    }
 }
 // gated norm: silu(z) * rms_norm(o_head) * ssm_norm, warp per head
 __global__ void k_gnorm(const float *o, const float *z, const float *w, int nh, float eps, float *out, int zs) {
@@ -1612,7 +1689,9 @@ static void tdump(const char *fmt, int il, const float *dv, int n) {
 
 /* nt consecutive tokens at positions *d_pos .. + nt - 1 (inputs d_x[t]). tiny: the prompt-batch
  * order of the F32 projections. want: 0 no head, 1 logits of the last token, 2 of every token. */
-static int gdn_rw = 2, gdn_nw = 2; /* rows per warp chain, warps per block (128 % (rw * nw) == 0) */
+static int gdn_rw = 2, gdn_nw = 2;
+static int abt_on = 1; /* k_abt for prompt batches (E_ABT) */
+static int gdn_c = 1, gdn_crw = 4, gdn_cnw = 4; /* chunked k_gdnc for nt > 1 (E_GDNC, E_GCRW, E_GCNW) */ /* rows per warp chain, warps per block (128 % (rw * nw) == 0) */
 static void enqueue(int nt, int tiny, int want) {
     ssq_ready = 0;
     const float gscale = 1.0f / sqrtf((float)DS), ascale = 1.0f / sqrtf((float)HD);
@@ -1621,12 +1700,21 @@ static void enqueue(int nt, int tiny, int want) {
         norm_xq(d_x, L->attn_norm, d_xn, nt);
         gemvn(&L->in, d_buf, 0, nt, BIG);
         if (!L->full) {
-            k_ab<<<dim3((2 * NV + 3) / 4, nt), 128, 0, st>>>(L->ssm_beta, L->ssm_alpha, d_xn, E, NV, tiny, d_ab);
+            if (tiny && nt > 1 && abt_on)
+                k_abt<<<dim3((2 * NV + 3) / 4, (nt + 3) / 4), 128, 0, st>>>(L->ssm_beta, L->ssm_alpha, d_xn, E, NV, nt, d_ab);
+            else
+                k_ab<<<dim3((2 * NV + 3) / 4, nt), 128, 0, st>>>(L->ssm_beta, L->ssm_alpha, d_xn, E, NV, tiny, d_ab);
             k_conv<<<(CH + 255) / 256, 256, 0, st>>>(d_buf, L->conv1d, d_conv[l], CH, d_cv, nt, BIG);
             tdump("conv_output_silu-%d", l, d_cv, CH);
             tdump("alpha-%d", l, d_ab + NV, NV); tdump("beta-%d", l, d_ab, NV);
             k_l2<<<dim3((2 * NK + 3) / 4, nt), 128, 0, st>>>(d_cv, 2 * NK, EPS, CH);
-            switch (gdn_rw) {
+            if (nt > 1 && gdn_c) {
+                switch (gdn_crw) {
+                case 1: k_gdnc<1, NTM><<<NV, 32 * gdn_cnw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
+                case 2: k_gdnc<2, NTM><<<NV, 32 * gdn_cnw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
+                default: k_gdnc<4, NTM><<<NV, 32 * gdn_cnw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
+                }
+            } else switch (gdn_rw) {
             case 1: k_gdn<1><<<NV, 32 * gdn_nw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
             case 2: k_gdn<2><<<NV, 32 * gdn_nw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
             default: k_gdn<4><<<NV, 32 * gdn_nw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
@@ -1777,6 +1865,10 @@ int main(int argc, char **argv) {
     const int tiny = np >= 2;
     if (getenv("E_GRW")) gdn_rw = atoi(getenv("E_GRW"));
     if (getenv("E_GNW")) gdn_nw = atoi(getenv("E_GNW"));
+    if (getenv("E_GDNC")) gdn_c = atoi(getenv("E_GDNC"));
+    if (getenv("E_ABT")) abt_on = atoi(getenv("E_ABT"));
+    if (getenv("E_GCRW")) gdn_crw = atoi(getenv("E_GCRW"));
+    if (getenv("E_GCNW")) gdn_cnw = atoi(getenv("E_GCNW"));
     /* capture outside the timed region */
     if (use_graph && !tdf) {
         CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal)); /* warm the occupancy queries */

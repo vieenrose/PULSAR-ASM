@@ -114,7 +114,7 @@ the 4k golden, keeps RSS at or below ~200 MB, and is decided by a same-job ABBA.
    - The existing `k_gemvN` loses at chunk > 1 (row 60: 5.2 / 6.2 / 7.0 vs 11.9 tps) because it
      re-reads the activation planes from global per token (~20 B per word-token), keeps RB = 2,
      and keeps the serial tile chain. Fixing those three is the point.
-3. **P3, chunked GDN prefill (k_gdn 6.5 -> ~1.5 ms).**
+3. **P3, chunked GDN prefill (k_gdn 6.5 -> ~1.5 ms).** DONE as k_gdnc + k_abt (ideas row 64): 4k prefill 16.16 -> 17.76, score 13.17.
    - Each state row stays in registers across the chunk's tokens. Rows are independent and the
      per-row arithmetic is unchanged.
    - Also batch k_ab: it costs 3.4 ms in prefill vs 1.4 in decode.
