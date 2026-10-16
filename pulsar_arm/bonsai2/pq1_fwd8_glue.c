@@ -1266,6 +1266,11 @@ static float *d_anw = NULL, *d_fas = NULL, *d_fam = NULL;
 static uint8_t *d_ain = NULL;
 static int PQ1KV_NL = 0, PQ1KV_NKV = 0, PQ1KV_CTX = 0, PQ1KV_DEAD = 0;
 static int PQ1KV_NEXT[PQ1_AL_MAX], PQ1KV_LIVE[PQ1_AL_MAX];
+/* time-sliced sessions (pq1_sess_init): PQ1_NSESS caches of PQ1KV_SB bytes
+ * back to back from d_kv0, d_kv = the selected session's */
+static int PQ1_NSESS = 1, PQ1_SCUR = 0;
+static size_t PQ1KV_SB = 0;
+static uint8_t *d_kv0 = NULL;
 static uint8_t PQ1_AIN[PQ1_APAR_BYTES] __attribute__((aligned(64)));
 
 static int pq1_kv_alloc(int nl, int nkv, int ctx) {
@@ -1273,10 +1278,18 @@ static int pq1_kv_alloc(int nl, int nkv, int ctx) {
   if (PQ1KV_DEAD || nl <= 0 || nl > PQ1_AL_MAX || nkv <= 0 || ctx <= 0) return -1;
   size_t kvb = pq1_kv_cache_bytes(nl, nkv, ctx), nwb = (size_t)nl * 256 * 4;
   size_t fab = (size_t)PQ1_FA_MAXH * ctx * 4;   /* scores; (ms, vs) pairs take 2x */
-  size_t need = (kvb + 3 * fab + nwb + PQ1_APAR_BYTES + 255) / 256 * 256;
-  if (!PQ1ARENA || PQ1ACUR + need > PQ1ALIM || pq1_arena_init(need) != 0) { PQ1KV_DEAD = 1; return -1; }
-  d_kv = (uint16_t *)(PQ1ARENA + PQ1ACUR);
-  d_fas = (float *)((uint8_t *)d_kv + kvb);
+  size_t need = ((size_t)PQ1_NSESS * kvb + 3 * fab + nwb + PQ1_APAR_BYTES + 255) / 256 * 256;
+  if (!PQ1ARENA || PQ1ACUR + need > PQ1ALIM || pq1_arena_init(need) != 0) {
+    if (PQ1_NSESS > 1)
+      fprintf(stderr, "pq1: %d sessions x %.1f MB of K/V cache do not fit the arena\n", PQ1_NSESS,
+              kvb / 1048576.0);
+    PQ1KV_DEAD = 1;
+    return -1;
+  }
+  d_kv0 = PQ1ARENA + PQ1ACUR;   /* kvb is a multiple of 256: every cache stays aligned */
+  PQ1KV_SB = kvb;
+  d_kv = (uint16_t *)(d_kv0 + (size_t)PQ1_SCUR * kvb);
+  d_fas = (float *)(d_kv0 + (size_t)PQ1_NSESS * kvb);
   d_fam = d_fas + (size_t)PQ1_FA_MAXH * ctx;
   d_anw = d_fam + (size_t)2 * PQ1_FA_MAXH * ctx;
   d_ain = (uint8_t *)d_anw + nwb;
@@ -1287,6 +1300,9 @@ static int pq1_kv_alloc(int nl, int nkv, int ctx) {
     fprintf(stderr, "pq1: TurboQuant K%d/V%d-bit cache, %.1f MB (f16 would be %.1f MB)\n",
             pq1_tq_cw(0) == 12 ? 3 : 4, pq1_tq_cw(1) == 12 ? 3 : 4,
             kvb / 1048576.0, (double)nl * 2 * nkv * ctx * 256 / 1048576.0);
+  if (PQ1_NSESS > 1)
+    fprintf(stderr, "pq1: %d sessions, %d positions each, %.1f MB of K/V cache in all\n", PQ1_NSESS,
+            ctx, (double)PQ1_NSESS * kvb / 1048576.0);
   return 0;
 }
 static uint16_t *pq1_kv_layer(int il, int v) {
@@ -1690,5 +1706,62 @@ int pq1_token_fused(int nl, const unsigned char *const *wt, const float *const *
   (void)nl; (void)wt; (void)nw; (void)nh; (void)nkv; (void)hid; (void)inter; (void)vocab;
   (void)ctx; (void)npos; (void)rcc; (void)rcs; (void)x; (void)head;
   return -1;
+#endif
+}
+
+/* ---- time-sliced concurrent sessions ----------------------------------------
+ * N > 1 users without batching (a batched GEMV is slower on this GPU, loop row
+ * 56): each session owns a K/V cache and runs whole token steps in turn on the
+ * single N=1 engine. pq1_sess_init(n) before the first device call makes the
+ * cache region n caches long. pq1_sess_select(s) points d_kv at cache s and
+ * swaps in that session's cache cursors (PQ1KV_NEXT/LIVE) and its own captured
+ * attention and token graphs: every one of them bakes its cache pointers in, so
+ * each session captures its set once and keeps it. Everything else (weights,
+ * activation staging, score scratch, the residual stream, which a token graph
+ * rewrites from the host embedding) is shared, because steps never overlap.
+ * Same kernels, same inputs per step: each stream is the solo run's stream. */
+#ifdef PQ1_USE_CUDA
+typedef struct {
+  int next[PQ1_AL_MAX], live[PQ1_AL_MAX];
+  pq1_attg ag[PQ1_AL_MAX];
+  int tok_ok[2], tok_hn;
+  cudaGraphExec_t tok_ex[2];
+  const void *tok_wt, *tok_xh, *tok_hd;
+} pq1_sess_t;
+static pq1_sess_t *PQ1SS = NULL;
+#endif
+int pq1_sess_init(int n) {
+#ifdef PQ1_USE_CUDA
+  if (n < 1 || n > 64 || d_kv || PQ1SS) return -1;   /* before the cache exists, once */
+  PQ1SS = calloc((size_t)n, sizeof *PQ1SS);
+  if (!PQ1SS) return -1;
+  PQ1_NSESS = n;
+  PQ1_SCUR = 0;
+  return 0;
+#else
+  return n == 1 ? 0 : -1;
+#endif
+}
+void pq1_sess_select(int s) {
+#ifdef PQ1_USE_CUDA
+  if (!PQ1SS || s == PQ1_SCUR || s < 0 || s >= PQ1_NSESS) return;
+  pq1_sess_t *o = &PQ1SS[PQ1_SCUR], *n = &PQ1SS[s];
+  memcpy(o->next, PQ1KV_NEXT, sizeof PQ1KV_NEXT);
+  memcpy(o->live, PQ1KV_LIVE, sizeof PQ1KV_LIVE);
+  memcpy(o->ag, PQ1AG, sizeof PQ1AG);
+  memcpy(o->tok_ok, PQ1_TOK_OKV, sizeof PQ1_TOK_OKV);
+  memcpy(o->tok_ex, PQ1_TOK_EXV, sizeof PQ1_TOK_EXV);
+  o->tok_wt = PQ1_TOK_WT; o->tok_xh = PQ1_TOK_XH; o->tok_hd = PQ1_TOK_HD; o->tok_hn = PQ1_TOK_HN;
+  memcpy(PQ1KV_NEXT, n->next, sizeof PQ1KV_NEXT);
+  memcpy(PQ1KV_LIVE, n->live, sizeof PQ1KV_LIVE);
+  memcpy(PQ1AG, n->ag, sizeof PQ1AG);
+  memcpy(PQ1_TOK_OKV, n->tok_ok, sizeof PQ1_TOK_OKV);
+  memcpy(PQ1_TOK_EXV, n->tok_ex, sizeof PQ1_TOK_EXV);
+  PQ1_TOK_WT = n->tok_wt; PQ1_TOK_XH = n->tok_xh; PQ1_TOK_HD = n->tok_hd;
+  PQ1_TOK_HN = n->tok_hd ? n->tok_hn : -1;
+  PQ1_SCUR = s;
+  if (d_kv0) d_kv = (uint16_t *)(d_kv0 + (size_t)s * PQ1KV_SB);
+#else
+  (void)s;
 #endif
 }

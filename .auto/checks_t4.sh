@@ -45,4 +45,14 @@ for P in A B; do
   fi
   echo "checks_t4: prompt $P greedy stream equals the fork ($(wc -l < "$GF")/$(wc -l < "$GF"))"
 done
+
+# time-sliced sessions A B A B (f16 cache): each stream equals the fork's
+OUT=$(ssh -o ConnectTimeout=25 "$NANO" \
+  "cd $R && PQ1_KVTQ=0 OMP_NUM_THREADS=4 timeout 900 ./fwd8_t4 $MODEL --gen 24 $A_IDS --next $B_IDS --next $A_IDS --next $B_IDS 2>/dev/null | grep '^step'" 2>/dev/null)
+for k in 0 1 2 3; do
+  if [ $((k % 2)) = 0 ]; then GS="$REPO/.auto/golden_t4_A.txt"; else GS="$REPO/.auto/golden_t4_B.txt"; fi
+  T=$(echo "$OUT" | grep " sess=$k\$" | sed 's/.*top=//;s/ .*//' | head -n "$(wc -l < "$GS")")
+  diff <(echo "$T") "$GS" > /dev/null || fail "session $k of 4 differs from the fork golden"
+done
+echo "checks_t4: 4 time-sliced sessions each equal the fork goldens"
 exit 0

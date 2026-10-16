@@ -1196,3 +1196,20 @@ qkv 296 -> 235, gate+up 900 -> 726, head 6979 -> 5556; K=4096 <32,1,4,6,4,2> -> 
 RB 5/PD 5, RB 6/PD 3, TPB 8/MINB 3, WR 4. Engine, order HST 1 0 0 1: 83.76 / 68.71 / 69.15 /
 83.75 ms per token (-17.7%), streams identical. TQ4 default: 68.4 ms (14.6 tps), 5/44 tokens
 differ from the f16 stream (lossy cache, no 4B TQ goldens frozen). Q1 gates green, 16.72 tps.
+
+58. N>1 users as time-sliced sessions (keep; feature, solo speed unchanged).
+fwd8.c: prompts separated by --next become sessions (ids, npos, step, last top, sampler RNG copy),
+stepped round-robin; the next id is drawn right after a step while HEAD still holds that
+session's logits. Glue: pq1_sess_init(n) makes the K/V region n caches long; pq1_sess_select(s)
+repoints d_kv and swaps PQ1KV_NEXT/LIVE, the 36 attention graphs and the two token graphs per
+session (each bakes its cache pointer; captured once per session, kept). First run: under the
+f16 cache all 4 streams equal their goldens, under TQ4 sessions 1-3 diverged from step 0 (logit
+8.8495 vs 8.9102): a solo run's first token is always the host attention on exact f16 K/V
+(merged tensors do not exist yet), while a later session's went to the device graph, which reads
+position 0 back from the TurboQuant cache. Fix: NPOS == 0 always takes the host attention.
+Results (8B): A B A B, each stream == solo golden under PQ1_KVTQ=0 and 4; greedy B full 40
+steps == solo B --gen 24; --sample 0.7 0.9 40 1234 0, A B B: sessions == their solo runs.
+Throughput, TQ4, 4 sessions, steps 9-128: 59.54 ms/step = 16.79 tok/s aggregate, 4.20 per user
+(solo 16.73). Capacity (TQ4): 4 sessions x 4032 positions = 602 MB of cache allocates (arena
+grows). 4B: 4 sessions == fork goldens (f16), TQ4 68.24 ms/step, 14.65 aggregate, 3.66 per user.
+Gates: checks.sh sections 1-4 green, measure 16.73 tps; checks_t4 green.

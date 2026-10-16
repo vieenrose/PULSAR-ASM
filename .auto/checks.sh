@@ -87,4 +87,21 @@ for P in A B; do
   fi
   echo "checks: default TQ4 prompt $P stream matches its golden ($(wc -l < "$GT")/$(wc -l < "$GT"))"
 done
+
+# --- 4. time-sliced sessions ---------------------------------------------------
+# Four sequences (A B A B, prompts separated by --next) stepped round-robin
+# through one engine, each with its own K/V cache and graphs: every stream must
+# equal its solo golden, under the exact f16 cache and the TQ4 default (B runs
+# 24 tokens here, its golden covers the first 26 steps).
+for KV in 0 4; do
+  OUT=$(ssh -o ConnectTimeout=25 "$NANO" \
+    "cd $R && PQ1_KVTQ=$KV OMP_NUM_THREADS=4 timeout 900 ./fwd8_q1 $MODEL --gen 24 $A_IDS --next $B_IDS --next $A_IDS --next $B_IDS 2>/dev/null | grep '^step'" 2>/dev/null)
+  SUF=""; [ $KV = 4 ] && SUF="_tq4"
+  for k in 0 1 2 3; do
+    if [ $((k % 2)) = 0 ]; then GS="$REPO/.auto/golden_q1_A$SUF.txt"; else GS="$REPO/.auto/golden_q1_B$SUF.txt"; fi
+    T=$(echo "$OUT" | grep " sess=$k\$" | sed 's/.*top=//;s/ .*//' | head -n "$(wc -l < "$GS")")
+    diff <(echo "$T") "$GS" > /dev/null || fail "session $k of 4 (PQ1_KVTQ=$KV) differs from its solo golden"
+  done
+  echo "checks: 4 time-sliced sessions (PQ1_KVTQ=$KV) each equal their solo goldens"
+done
 exit 0

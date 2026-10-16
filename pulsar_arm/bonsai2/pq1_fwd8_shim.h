@@ -54,6 +54,10 @@ __attribute__((weak)) int pq1_token_fused(int nl, const unsigned char *const *wt
 /* loop iter 22: need = 0 lets the token graph skip the logits D2H (greedy, no
  * TOP40); pq1_head_top: the device argmax of the last fused token, or -1 */
 __attribute__((weak)) void pq1_head_need(int need);
+/* time-sliced sessions: n K/V caches (before the first device call), then
+ * select the session whose token step runs next */
+__attribute__((weak)) int pq1_sess_init(int n);
+__attribute__((weak)) void pq1_sess_select(int s);
 __attribute__((weak)) int pq1_head_top(float *val);
 
 #ifdef PQ1_USE_CUDA

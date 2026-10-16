@@ -56,6 +56,10 @@ bash .auto/checks_t4.sh    # pq1t_parity (7 shapes, both PQ1_HST arms), rms n=25
 
 `golden_t4_*` come from the fork itself (llama-cli `-fa on`, f16 cache), not from the engine. `PQ1_HST=1` selects the first bring-up team shapes for A/B; `./pq1t_parity [rows K ...]` times and bit-checks any shape. There are no frozen TQ4 goldens for the 4B yet.
 
+### Concurrent users (time-sliced sessions)
+
+`./fwd8_q1 <gguf> --gen G <ids A> --next <ids B> --next ...` (up to 16; same for `fwd8_t4`) runs one sequence per prompt, stepped round-robin one token each; step lines get a ` sess=k` suffix (none with one prompt). Each session owns a K/V cache and its own captured attention/token graphs (`pq1_sess_init` / `pq1_sess_select` in the glue: graphs bake the cache pointer); weights and scratch are shared. Every stream is bit-identical to its solo run (greedy and `--sample`, f16 and TQ4), gated by section 4 of `checks.sh` and the end of `checks_t4.sh`. A session's first token always takes the host attention path, as a solo run's must (the device path would read position 0 back from the TQ cache). Batched N>1 GEMV is measured out (ideas row 56): aggregate tok/s equals the single-stream rate, split across users. Note `--sample` takes an optional 5th value (min_p) that will swallow a following prompt id; pass it explicitly.
+
 ## Measurement discipline (the expensive lessons)
 
 - The board drifts 2-6% between hours; never compare against a number from another run. Use `ab_pair.sh` (one pair in each order). A single cold harness sample is worth about ±1%.

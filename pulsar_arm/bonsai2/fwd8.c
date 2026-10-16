@@ -682,11 +682,21 @@ static void att_check(int il) {
 }
 #endif
 
+/* time-sliced concurrent sessions: prompts separated by --next on the command
+ * line, each its own sequence (ids, position, K/V cache on the device, sampler
+ * RNG), stepped round-robin one token each through the single N=1 engine. With
+ * one prompt the run is exactly the old single-sequence loop. */
+#define SESS_MAX 16
+typedef struct {
+    int *ids, nids, n0, gen, npos, step, top, next, done;
+    uint64_t rs;
+} sess_t;
+
 int main(int argc, char **argv) {
     gguf_table(argv[1]);
     XQ = malloc(((size_t)INTER / 256) * 292);
-    static int ids[CTX + 8];
-    int nids = 0, gen = 0;
+    static sess_t SS[SESS_MAX];
+    int nsess = 1, gen = 0;
     /* run context: 4096 positions unless PQ1_CTX asks for more (up to the
      * compile-time CTX; beyond 4096 the device cache must be TurboQuant) */
     int ctxcap = CTX;
@@ -696,6 +706,7 @@ int main(int argc, char **argv) {
     ctxcap = (ctxcap + 63) / 64 * 64;   /* the device cache is 64-aligned */
     if (ctxcap > CTX) ctxcap = CTX;
 #endif
+    SS[0].ids = malloc(((size_t)ctxcap + 8) * sizeof(int));
     for (int a = 2; a < argc; a++) {
         if (!strcmp(argv[a], "--gen")) gen = atoi(argv[++a]);
         else if (!strcmp(argv[a], "--trace")) TRACE = 1;
@@ -704,33 +715,61 @@ int main(int argc, char **argv) {
             STopK = atoi(argv[++a]); RS = strtoull(argv[++a], 0, 10);
             if (a + 1 < argc && argv[a+1][0] != '-') SMINP = atof(argv[++a]);
         }
-        else if (nids < ctxcap) ids[nids++] = atoi(argv[a]);
+        else if (!strcmp(argv[a], "--next")) {
+            if (nsess == SESS_MAX) { fprintf(stderr, "at most %d sessions\n", SESS_MAX); return 2; }
+            SS[nsess++].ids = malloc(((size_t)ctxcap + 8) * sizeof(int));
+        }
+        else if (SS[nsess - 1].nids < ctxcap) SS[nsess - 1].ids[SS[nsess - 1].nids++] = atoi(argv[a]);
         else { fprintf(stderr, "prompt longer than the %d-position context\n", ctxcap); return 2; }
     }
-    int n0 = nids;
-    if (n0 + gen > ctxcap) {
-        fprintf(stderr, "context %d: generation capped at %d tokens\n", ctxcap, ctxcap - n0);
-        gen = ctxcap - n0;
+    int kvneed = 0;
+    for (int si = 0; si < nsess; si++) {
+        sess_t *S = &SS[si];
+        if (S->nids < 1) { fprintf(stderr, "session %d: empty prompt\n", si); return 2; }
+        S->n0 = S->nids;
+        S->gen = gen;
+        if (S->n0 + S->gen > ctxcap) {
+            fprintf(stderr, "context %d: generation capped at %d tokens\n", ctxcap, ctxcap - S->n0);
+            S->gen = ctxcap - S->n0;
+        }
+        S->top = -1;
+        S->rs = RS;   /* every session draws from its own copy of the seeded stream */
+        if (S->n0 + S->gen > kvneed) kvneed = S->n0 + S->gen;
     }
 #ifdef PQ1_BUILD
+    if (nsess > 1 && (TRACE || att_check_on() || ffn_check_on() || !pq1_sess_init ||
+                      pq1_sess_init(nsess) != 0)) {
+        fprintf(stderr, "sessions need the device engine (no --trace, no per-layer checks)\n");
+        return 2;
+    }
     /* the device K/V cache holds this run's positions only (64-aligned): the
      * arena grows by the excess over the old 75.5 MB f32 ctx-512 cache only */
-    KVCTX = (n0 + gen + 63) / 64 * 64;
+    KVCTX = (kvneed + 63) / 64 * 64;
     if (KVCTX > ctxcap) KVCTX = ctxcap;
     if (pq1_kv_shape) pq1_kv_shape(NLAYER, NKV, KVCTX);
+#else
+    if (nsess > 1) { fprintf(stderr, "sessions need the device engine\n"); return 2; }
 #endif
     NPOS = 0;
 #ifdef PQ1_BUILD
     if (pq1_head_need) pq1_head_need(STEMP > 0 || getenv("TOP40") != NULL);
 #endif
-    int top = -1;   /* the previous step's greedy argmax of HEAD */
-    for (int step = 0; step < n0 + gen; step++) {
+    for (int live = nsess; live > 0;)
+      for (int si = 0; si < nsess; si++) {
+        sess_t *S = &SS[si];
+        if (S->done) continue;
+#ifdef PQ1_BUILD
+        if (nsess > 1) pq1_sess_select(si);
+#endif
+        int *ids = S->ids, n0 = S->n0, step = S->step, top = S->top;
+        NPOS = S->npos;
+        RS = S->rs;
         BQ1_T0();
         ct_begin(step, n0);
-        int id = step < n0 ? ids[step]
-               : (STEMP > 0 ? sample_topkpp(HEAD, VOCAB, STEMP, STOPP, STopK, SMINP)
-                            : top >= 0 ? top : argmax(HEAD, VOCAB));
-        if (step >= n0) ids[nids++] = id;
+        /* the next id was drawn right after the previous step (S->next), while
+         * HEAD still held this session's logits: other sessions overwrite it */
+        int id = step < n0 ? ids[step] : S->next;
+        if (step >= n0) ids[S->nids++] = id;
         ct_mark(CT_SAMPLE);
         embed(id);
         ct_mark(CT_EMBED);
@@ -741,7 +780,12 @@ int main(int argc, char **argv) {
          * graph (residual adds, rms norms and Q8_K included, X kept on the
          * device); declines on the first token (merged tensors and the device
          * K/V cache are built by it), under TRACE and the per-layer checks */
-        if (!TRACE && pq1_token_fused && !att_check_on() && !ffn_check_on()) {
+        /* a sequence's first token always runs the host attention (exact f16
+         * K/V of position 0), as it must in a solo run, where the merged
+         * tensors do not exist yet: the device path would read position 0
+         * back from a TurboQuant cache, so a later session would diverge */
+        const int pos0 = NPOS == 0;
+        if (!TRACE && !pos0 && pq1_token_fused && !att_check_on() && !ffn_check_on()) {
             static const unsigned char **WT;
             static const float **NW;
             if (!WT) {
@@ -774,7 +818,7 @@ int main(int argc, char **argv) {
             /* loop iter 4: q+k+v, head norms, rope, K/V store, attention, Q8_K
              * and attn_output as one device graph; declines on the first token
              * (merged q+k+v not built yet) and under TRACE */
-            if (!TRACE && pq1_attn_fused) {
+            if (!TRACE && !pos0 && pq1_attn_fused) {
                 if (RC_POS != NPOS) rope_table(NPOS);
                 q8_K_quant(XN, XQ, HID);
                 ct_mark(CT_QUANT);
@@ -844,7 +888,8 @@ int main(int argc, char **argv) {
 #endif
         if (top < 0) { top = argmax(HEAD, VOCAB); topv = HEAD[top]; }
         ct_mark(CT_ARGMAX);
-        printf("step %d id_in=%d top=%d logit=%.4f\n", step, id, top, topv);
+        if (nsess > 1) printf("step %d id_in=%d top=%d logit=%.4f sess=%d\n", step, id, top, topv, si);
+        else printf("step %d id_in=%d top=%d logit=%.4f\n", step, id, top, topv);
         BQ1_T1(step);
         if (getenv("TOP40") && step == 22) {
             /* print top-40 (id:prob) under the configured sampler for comparison
@@ -868,10 +913,13 @@ int main(int argc, char **argv) {
             for (int k = 0; k < 40 && k < m2; k++)
                 printf("  P %d %.6f\n", ix[k], expf(s2[k] - s2[0]) / e2);
         }
+        if (step + 1 >= n0 && step + 1 < n0 + S->gen)
+            S->next = STEMP > 0 ? sample_topkpp(HEAD, VOCAB, STEMP, STOPP, STopK, SMINP) : top;
         fflush(stdout);
-        if (step >= n0 && id == 151645) break; /* EOS */
         NPOS++;
-    }
+        S->npos = NPOS; S->step = step + 1; S->top = top; S->rs = RS;
+        if ((step >= n0 && id == 151645) /* EOS */ || S->step >= n0 + S->gen) { S->done = 1; live--; }
+      }
     ct_dump();
     return 0;
 }
