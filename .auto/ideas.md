@@ -1273,3 +1273,20 @@ HFMA2/FFMA decode path costs ~1.7 issue per weight-token. nvprof at 2000 tokens:
 time (k_ssq's 22% runs concurrently), k_gdn 5.6%, k_fvg 3.2%, k_ab 2.9%, k_xq 2.2%, k_fs 1.7%.
 Open: a cheaper exact ternary x int8 inner product (fewer popc per word), the sticky-flag
 conversion-free V, k_gdn closer to the streaming ceiling (16 GB/s now).
+
+61. 8-POPC ternary x Q8_0 identity in k_gemv / k_gemvN (keep, bit-identical). With c0 = b0 (w = 0)
+and c1 = lop3(b0, b1, N, 0x46) = (w = +1, x >= 0) | (w = -1, x < 0) (exclusive masks), each lane's
+v = (c0 + 2 c1)|x| = w x + |x| < 256 has carry-free bit planes D_0 = c0 Q_0, D_q = c0 Q_q | c1 Q_{q-1}
+(one LOP3 0xEA each), D_7 = c1 Q_6, so sum w x = sum_q 2^q popc(D_q) - S and the activation
+correction word becomes cg = -S (was -(S + S_N)). Same integer as the 9-POPC carry-save ripple, so
+the float chain is untouched; per-lane identity checked exhaustively (3 codes x 255 q). SASS: POPC
+2916 -> 2592 in the binary, GEMV body 900 -> 720 instructions at the same 96 registers. Nano pesi,
+same job: 4k harness prefill 11.37 / decode 9.25 tps, score 10.2554 (HEAD 9.51-9.56 the same day),
+GOLDEN PASS, RSS 200368 KB (noise band 198-203 MB); ABBA x2 4B 47-token decode 11.58/11.61/11.61/
+11.62 vs 10.75/10.69/10.75/10.76 (+8.1%), 400-token prefill 12.81/12.85/12.87/12.87 vs 11.92/11.92/
+12.01/12.02 (+7.4%). checks_b2 2B+4B ALL PASS (chunk 1 and 8); 2B decode 24.9 tps (was 22.1).
+Instructions -20% but time -9%: nvprof (E_GRAPH=0; graphs hide kernels from --metrics) on the
+GEMVs: K=2560 occupancy 31% / issue 57% / stalls mem 36% exec 28% sync 22%; K=9216 42% / 52% /
+mem 23% exec 19% sync 42%; K=4096 37% / 50% / mem 51% exec 28% sync 0%. The body's issue floor
+(~42 instr per word at ~125/clk on the one SM, ~48 ms/token) now meets the 50 ms weight-streaming
+floor; what is left is latency hiding (the tile barrier, too few bytes in flight).

@@ -12,8 +12,8 @@
 //
 // Weights: PTQ1_0 (base-3 packed trits, 28 bytes per 128) is re-encoded at load into two bit
 // planes per 128-weight group, b0 and b1 with code = b0 + 2 b1 = trit + 1, so a 32-weight
-// integer sum is a handful of LOP3 + POPC against the bit-sliced Q8_0 activation (the 2 SMs
-// cannot afford a base-3 decode per weight). The integer sums are encoding-independent, the
+// integer sum is a handful of LOP3 + POPC against the bit-sliced Q8_0 activation (the one
+// 128-lane SM cannot afford a base-3 decode per weight). The integer sums are encoding-independent, the
 // float chain after them is the fork's: sumi = fma(d8_k, s_k, sumi) over the 4 sub-blocks,
 // sumf = fma(d, sumi, sumf) over the blocks in order. 34 bytes per 128 weights (+21 %).
 //
@@ -280,7 +280,7 @@ __device__ __forceinline__ float dott_reduce(float c, int lane) {
 
 /* ---- Q8_0 activation, bit-sliced: per 128-group 40 words [d8 x4][N x4][Q0 x4]..[Q6 x4][cg x4],
  * word k of a plane = elements 32k..32k+31 of the group (bit = element), N = sign, Q_b =
- * bit b of |q|, cg = -(S + S_N) of the GEMV identity below (S = sum |q|, S_N = sum over q < 0).
+ * bit b of |q|, cg = -S of the GEMV identity below (S = sum |q|).
  * quantize_row_q8_0: d = amax/127 stored fp16, q = rint(x * 127/amax). */
 __device__ __forceinline__ void q8word(float xv, int lane, uint32_t *pl, int word) {
     float amax = fabsf(xv);
@@ -300,7 +300,7 @@ __device__ __forceinline__ void q8word(float xv, int lane, uint32_t *pl, int wor
         const uint32_t Q = __ballot_sync(FULL, (a >> b) & 1);
         if (lane == 2 + b) g[8 + 4 * b + k] = Q;
     }
-    int c = q < 0 ? 2 * a : a;
+    int c = a;
 #pragma unroll
     for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(FULL, c, o);
     if (lane == 9) g[36 + k] = (uint32_t)(-c);
@@ -368,35 +368,25 @@ __global__ void k_xq(const float *a, const float *b, int mode, const float *sg, 
 }
 
 /* ---- ternary GEMV. Weight row r: G uint4 of plane b0, then G uint4 of plane b1 (word k of
- * group g = weights 128g + 32k ..), scale half per group. With the sign-magnitude activation
- * (N, |q| planes Q_b) and T(m) = sum_b 2^b popc((m ^ N) & Q_b) = sum m.x + S_N,
- *   sum (b0 + 2 b1 - 1) x = T(b0) + 2 T(b1) - S - S_N,  S = sum |x|, S_N = sum_N |x|.
- * T(b0) + 2 T(b1) is one ripple of carry-save adders over the 8 weight levels (b1 plane b
- * sits at level b+1): 9 POPC per 32 weights for both planes together. */
-__device__ __forceinline__ uint32_t lop_mk(uint32_t m, uint32_t n, uint32_t q) {
-    uint32_t r; asm("lop3.b32 %0, %1, %2, %3, 0x28;" : "=r"(r) : "r"(m), "r"(n), "r"(q)); return r;
+ * group g = weights 128g + 32k ..), scale half per group. Weight w = b0 + 2 b1 - 1. Against the
+ * sign-magnitude activation (N = sign, Q_b = bit b of |x|) take the exclusive masks
+ *   c0 = b0 (w = 0),  c1 = (w = +1, x >= 0) | (w = -1, x < 0),
+ * so each lane's v = (c0 + 2 c1) |x| = w x + |x| is below 256 and its bit q is
+ * D_q = c0 Q_q | c1 Q_{q-1} (no carries): sum w x = sum_q 2^q popc(D_q) - S, S = sum |x|.
+ * 8 POPC per 32 weights for both planes together; the integer equals the old 9-POPC
+ * carry-save form's, so the float chain after it is untouched. */
+__device__ __forceinline__ uint32_t lop_c1(uint32_t m0, uint32_t m1, uint32_t n) {
+    uint32_t r; asm("lop3.b32 %0, %1, %2, %3, 0x46;" : "=r"(r) : "r"(m0), "r"(m1), "r"(n)); return r;
 }
-__device__ __forceinline__ uint32_t lop_x3(uint32_t a, uint32_t b, uint32_t c) {
-    uint32_t r; asm("lop3.b32 %0, %1, %2, %3, 0x96;" : "=r"(r) : "r"(a), "r"(b), "r"(c)); return r;
-}
-__device__ __forceinline__ uint32_t lop_mj(uint32_t a, uint32_t b, uint32_t c) {
-    uint32_t r; asm("lop3.b32 %0, %1, %2, %3, 0xE8;" : "=r"(r) : "r"(a), "r"(b), "r"(c)); return r;
+__device__ __forceinline__ uint32_t lop_ao(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t r; asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(r) : "r"(a), "r"(b), "r"(c)); return r;
 }
 __device__ __forceinline__ int tw(const uint32_t (&nq)[8][4], int k, uint32_t m0, uint32_t m1) {
-    const uint32_t N = nq[0][k];
-    int acc = __popc(lop_mk(m0, N, nq[1][k]));
-    uint32_t a = lop_mk(m0, N, nq[2][k]), b = lop_mk(m1, N, nq[1][k]);
-    uint32_t s = a ^ b, c = a & b;
-    acc += __popc(s) << 1;
+    const uint32_t c1 = lop_c1(m0, m1, nq[0][k]);
+    int acc = __popc(m0 & nq[1][k]);
 #pragma unroll
-    for (int q = 2; q < 7; q++) {
-        a = lop_mk(m0, N, nq[1 + q][k]); b = lop_mk(m1, N, nq[q][k]);
-        s = lop_x3(a, b, c); c = lop_mj(a, b, c);
-        acc += __popc(s) << q;
-    }
-    b = lop_mk(m1, N, nq[7][k]);
-    s = b ^ c; c = b & c;
-    return acc + (__popc(s) << 7) + (__popc(c) << 8);
+    for (int q = 1; q < 7; q++) acc += __popc(lop_ao(m0, nq[1 + q][k], c1 & nq[q][k])) << q;
+    return acc + (__popc(c1 & nq[7][k]) << 7);
 }
 /* A team of WR warps holds R = 32 WR / G rows per pass (lane = slot * G + group); a batch is
  * RB passes = RB * R rows. Each lane leaves (sumi, d) of its group in a shared tile, lane i of
