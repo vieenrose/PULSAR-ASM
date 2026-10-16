@@ -719,6 +719,9 @@ __global__ void k_qk(const float *buf, const float *qn, const float *kn, const i
 #ifndef FAU
 #define FAU 16
 #endif
+#ifndef FAK
+#define FAK 4
+#endif
 __global__ void k_fa(const float *q, const float *buf, const __half *kc, const __half *vc, const int *posp,
                      float *att, float *fao, int NH, int NKV, int ctx, float scale, int bs_) {
     extern __shared__ float fsh[];
@@ -735,13 +738,23 @@ __global__ void k_fa(const float *q, const float *buf, const __half *kc, const _
     float qr[8];
 #pragma unroll
     for (int c = 0; c < 8; c++) qr[c] = qs[32 * c + lane];
-    for (int ic = warp; ic < n; ic += 8) {
-        const __half *kr = kc + (size_t)ic * NKV * 256 + g * 256;
-        float a = 0.0f;
+    /* FAK positions per warp pass, their K loads issued together */
+    for (int ic0 = warp * FAK; ic0 < n; ic0 += 8 * FAK) {
+        __half kh[FAK][8];
 #pragma unroll
-        for (int c = 0; c < 8; c++) a = fmaf(__half2float(kr[32 * c + lane]), qr[c], a);
-        const float s = dotg_reduce(a, lane) * scale;
-        if (lane == 0) sc[ic] = s;
+        for (int u = 0; u < FAK; u++) {
+            const __half *kr = kc + (size_t)min(ic0 + u, n - 1) * NKV * 256 + g * 256;
+#pragma unroll
+            for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c + lane];
+        }
+#pragma unroll
+        for (int u = 0; u < FAK; u++) {
+            float a = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 8; c++) a = fmaf(__half2float(kh[u][c]), qr[c], a);
+            const float s = dotg_reduce(a, lane) * scale;
+            if (lane == 0 && ic0 + u < n) sc[ic0 + u] = s;
+        }
     }
     __syncthreads();
     const int chunk = (n + 255) / 256, lo = min(tid * chunk, n), hi = min(lo + chunk, n);
