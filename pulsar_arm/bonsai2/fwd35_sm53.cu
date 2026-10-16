@@ -278,6 +278,7 @@ __device__ __forceinline__ float dott_reduce(float c, int lane) {
     return __shfl_sync(FULL, c, 0);
 }
 
+__constant__ int c_hqo; /* word offset of the fp16 q/2 activations inside a token's d_pl stride */
 /* ---- Q8_0 activation, bit-sliced: per 128-group 40 words [d8 x4][N x4][Q0 x4]..[Q6 x4][cg x4],
  * word k of a plane = elements 32k..32k+31 of the group (bit = element), N = sign, Q_b =
  * bit b of |q|, cg = -S of the GEMV identity below (S = sum |q|).
@@ -304,6 +305,10 @@ __device__ __forceinline__ void q8word(float xv, int lane, uint32_t *pl, int wor
 #pragma unroll
     for (int o = 16; o; o >>= 1) c += __shfl_xor_sync(FULL, c, o);
     if (lane == 9) g[36 + k] = (uint32_t)(-c);
+    if (gridDim.y > 1) { /* a token batch: also q/2 as fp16 in k_hg's pair order */
+        const int e = lane & 15, h = (e & 1) ? 8 + (e >> 1) : (e >> 1);
+        ((__half *)(pl + c_hqo))[word * 32 + h * 2 + (lane >> 4)] = __float2half_rn(0.5f * (float)q);
+    }
 }
 // v[0..bs) in shared: scale, Sylvester butterflies, then Q8_0 planes of words b0/32 + ...
 __device__ void fwht_q8(float *v, int bs, float fsc, uint32_t *pl, int b0) {
@@ -493,7 +498,118 @@ void k_gemv(const uint4 *__restrict__ wc, const __half *__restrict__ ws, const u
     }
 }
 
-/* Batched form for nt <= NTM tokens (prefill chunks, speculative verify): the RB rows of a batch
+__device__ __forceinline__ __half2 u2h(uint32_t u) { __half2 h; memcpy(&h, &u, 4); return h; }
+/* Batched GEMV for nt <= NT tokens (prefill chunks), on the fp16 pipe: lane = row (RB rows per
+ * lane, 32 W apart). Each 32-weight word pair is decoded once to 16 half2 of +-2 / 0 (nz = ~b0,
+ * neg = ~(b0 | b1), even and odd elements interleaved so one shift + mask yields a half2 of
+ * elements (i, i + 16)), and multiplied against the token's activations q/2 (exact in fp16, from
+ * q8word, staged GC groups at a time in shared memory). Each half lane sums 16 products 2 w q / 2
+ * = w q, integers of at most 2032, which fp16 holds exactly, so lo + hi in fp32 is exactly the
+ * single-token kernel's integer s and the float chain after it (si = fma(d8, s, si) over the 4
+ * words, sumf = fma(scale, si, sumf) over the groups) is k_gemv's: the bits are equal. */
+template <int G, int W, int NT, int GC, int RB, int MB>
+__global__ __launch_bounds__(32 * W, MB) void k_hg(const uint4 *__restrict__ wc, const __half *__restrict__ ws,
+        const uint32_t *__restrict__ pl, int pls, const __half *__restrict__ hq, int hqs,
+        float *__restrict__ y, int ys, int N, int resid, int nt) {
+    __shared__ uint4 sa[NT][GC][4][4];
+    __shared__ float sd[NT][GC][4];
+    const int r0 = blockIdx.x * 32 * W * RB + threadIdx.x;
+    const uint4 *wr[RB];
+    const __half *sr[RB];
+#pragma unroll
+    for (int b = 0; b < RB; b++) {
+        const int rr = min(r0 + b * 32 * W, N - 1);
+        wr[b] = wc + (size_t)rr * 2 * G; sr[b] = ws + (size_t)rr * G;
+    }
+    float sumf[RB][NT];
+#pragma unroll
+    for (int b = 0; b < RB; b++)
+#pragma unroll
+        for (int t = 0; t < NT; t++) sumf[b][t] = 0.0f;
+    uint4 nm0[RB], nm1[RB];
+    float nsc[RB];
+#pragma unroll
+    for (int b = 0; b < RB; b++) { nm0[b] = __ldg(wr[b]); nm1[b] = __ldg(wr[b] + G); nsc[b] = __half2float(sr[b][0]); }
+    for (int g0 = 0; g0 < G; g0 += GC) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < NT * GC * 16; i += 32 * W) {
+            const int t = i / (GC * 16), rem = i - t * GC * 16, gg = rem >> 4, j = rem & 15;
+            sa[t][gg][j >> 2][j & 3] = t < nt ? __ldg((const uint4 *)(hq + (size_t)t * hqs) + (g0 + gg) * 16 + j) : make_uint4(0, 0, 0, 0);
+        }
+        for (int i = threadIdx.x; i < NT * GC * 4; i += 32 * W) {
+            const int t = i / (GC * 4), rem = i - t * GC * 4, gg = rem >> 2, k = rem & 3;
+            sd[t][gg][k] = t < nt ? __uint_as_float(__ldg(pl + (size_t)t * pls + (g0 + gg) * 40 + k)) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll 1
+        for (int gg = 0; gg < GC; gg++) {
+            uint4 m0[RB], m1[RB];
+            float sc[RB];
+#pragma unroll
+            for (int b = 0; b < RB; b++) { m0[b] = nm0[b]; m1[b] = nm1[b]; sc[b] = nsc[b]; }
+            const int gn = g0 + gg + 1 < G ? g0 + gg + 1 : g0 + gg;
+#pragma unroll
+            for (int b = 0; b < RB; b++) { nm0[b] = __ldg(wr[b] + gn); nm1[b] = __ldg(wr[b] + G + gn); nsc[b] = __half2float(sr[b][gn]); }
+            float si[RB][NT];
+#pragma unroll
+            for (int b = 0; b < RB; b++)
+#pragma unroll
+                for (int t = 0; t < NT; t++) si[b][t] = 0.0f;
+            const uint4 *sak = &sa[0][gg][0][0];
+            const float *sdk = &sd[0][gg][0];
+#pragma unroll 1
+            for (int k = 0; k < 4; k++) {
+                __half2 w[RB][16];
+#pragma unroll
+                for (int b = 0; b < RB; b++) {
+                    const uint32_t a0 = m0[b].x, a1 = m1[b].x;
+                    m0[b].x = m0[b].y; m0[b].y = m0[b].z; m0[b].z = m0[b].w;
+                    m1[b].x = m1[b].y; m1[b].y = m1[b].z; m1[b].z = m1[b].w;
+                    const uint32_t nz = ~a0, ng = ~(a0 | a1);
+                    const uint32_t xe = (nz & 0x55555555u) | ((ng << 1) & 0xAAAAAAAAu);
+                    const uint32_t xo = ((nz >> 1) & 0x55555555u) | (ng & 0xAAAAAAAAu);
+#pragma unroll
+                    for (int j = 0; j < 8; j++) { w[b][j] = u2h((xe << (14 - 2 * j)) & 0xC000C000u); w[b][8 + j] = u2h((xo << (14 - 2 * j)) & 0xC000C000u); }
+                }
+#pragma unroll
+                for (int t = 0; t < NT; t++) {
+                    __half2 acc[RB];
+#pragma unroll
+                    for (int b = 0; b < RB; b++) acc[b] = u2h(0);
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        const uint4 v = sak[t * GC * 16 + q];
+#pragma unroll
+                        for (int b = 0; b < RB; b++) {
+                            acc[b] = __hfma2(w[b][4 * q], u2h(v.x), acc[b]); acc[b] = __hfma2(w[b][4 * q + 1], u2h(v.y), acc[b]);
+                            acc[b] = __hfma2(w[b][4 * q + 2], u2h(v.z), acc[b]); acc[b] = __hfma2(w[b][4 * q + 3], u2h(v.w), acc[b]);
+                        }
+                    }
+                    const float d = sdk[t * GC * 4];
+#pragma unroll
+                    for (int b = 0; b < RB; b++) {
+                        const float s = __low2float(acc[b]) + __high2float(acc[b]);
+                        si[b][t] = fmaf(d, s, si[b][t]);
+                    }
+                }
+                sak += 4; sdk += 1;
+            }
+#pragma unroll
+            for (int b = 0; b < RB; b++)
+#pragma unroll
+                for (int t = 0; t < NT; t++) sumf[b][t] = fmaf(sc[b], si[b][t], sumf[b][t]);
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < RB; b++) {
+        const int r = r0 + b * 32 * W;
+        if (r < N)
+#pragma unroll
+            for (int t = 0; t < NT; t++) if (t < nt) { float *yy = y + (size_t)t * ys + r; *yy = resid ? sumf[b][t] + *yy : sumf[b][t]; }
+    }
+}
+
+/* Batched POPC form (sm_61, whose fp16 pipe is 1/64 rate) for nt <= NTM tokens: the RB rows of a batch
  * stay in registers while the lane walks the tokens, so a weight row is read once for all of
  * them. Per (row, token) the arithmetic is the single-token kernel's, so the bits are equal. */
 template <int G, int WR, int TPB, int RB, int NTM>
@@ -1232,7 +1348,7 @@ static float **d_conv, **d_ssm;
 static __half **d_kc, **d_vc;
 static cudaStream_t st;
 #define NTM 8          /* most tokens per batched forward */
-static int BIG, PLS;   /* d_buf / d_pl per-token strides (floats / words) */
+static int BIG, PLS, HQW; /* d_buf / d_pl per-token strides (floats / words), fp16 q/2 tail words */
 
 static uint32_t *gzc; /* row copy buffer for the next gemv launch (NULL: none) */
 template <int G, int WR, int TPB, int RB, int PD, int AD = 1>
@@ -1250,8 +1366,14 @@ static void gemv_t(const DT *d, float *y, int resid) {
     if (nblk > nres) nblk = nres;
     k_gemv<G, WR, TPB, RB, PD, AD><<<nblk, 32 * WR * TPB, 0, st>>>(d_codes + d->co, d_scales + d->so, d_pl, y, d->N, resid, gzc);
 }
-template <int G, int WR, int TPB, int RB>
+template <int G>
 static void gemvN_t(const DT *d, float *y, int resid, int nt, int ys) {
+    constexpr int W = 4, RB = 2;
+    k_hg<G, W, NTM, 4, RB, 1><<<(d->N + 32 * W * RB - 1) / (32 * W * RB), 32 * W, 0, st>>>(
+        d_codes + d->co, d_scales + d->so, d_pl, PLS, (const __half *)(d_pl + PLS - HQW), 2 * PLS, y, ys, d->N, resid, nt);
+}
+template <int G, int WR, int TPB, int RB>
+static void gemvP_t(const DT *d, float *y, int resid, int nt, int ys) {
     static int nres = 0;
     if (!nres) {
         int per = 0, dev = 0, nsm = 1;
@@ -1266,16 +1388,27 @@ static void gemvN_t(const DT *d, float *y, int resid, int nt, int ys) {
     k_gemvN<G, WR, TPB, RB, NTM><<<nblk, 32 * WR * TPB, 0, st>>>(d_codes + d->co, d_scales + d->so, d_pl, PLS, y, ys,
                                                                   d->N, resid, nt);
 }
+static int hg_on = 1; /* k_hg (fp16 pipe) for batches, else k_gemvN */
 static void gemv(const DT *d, float *y, int resid);
 static void gemvn(const DT *d, float *y, int resid, int nt, int ys) {
     if (nt == 1) { gemv(d, y, resid); return; }
+    if (!hg_on) {
+        switch (d->K / 128) {
+        case 16: gemvP_t<16, 1, 8, 2>(d, y, resid, nt, ys); return;
+        case 20: gemvP_t<20, 5, 2, 2>(d, y, resid, nt, ys); return;
+        case 32: gemvP_t<32, 1, 8, 2>(d, y, resid, nt, ys); return;
+        case 48: gemvP_t<48, 3, 2, 2>(d, y, resid, nt, ys); return;
+        case 72: gemvP_t<72, 9, 1, 2>(d, y, resid, nt, ys); return;
+        case 96: gemvP_t<96, 3, 2, 2>(d, y, resid, nt, ys); return;
+        }
+    }
     switch (d->K / 128) {
-    case 16: gemvN_t<16, 1, 8, 2>(d, y, resid, nt, ys); break;
-    case 20: gemvN_t<20, 5, 2, 2>(d, y, resid, nt, ys); break;
-    case 32: gemvN_t<32, 1, 8, 2>(d, y, resid, nt, ys); break;
-    case 48: gemvN_t<48, 3, 2, 2>(d, y, resid, nt, ys); break;
-    case 72: gemvN_t<72, 9, 1, 2>(d, y, resid, nt, ys); break;
-    case 96: gemvN_t<96, 3, 2, 2>(d, y, resid, nt, ys); break;
+    case 16: gemvN_t<16>(d, y, resid, nt, ys); break;
+    case 20: gemvN_t<20>(d, y, resid, nt, ys); break;
+    case 32: gemvN_t<32>(d, y, resid, nt, ys); break;
+    case 48: gemvN_t<48>(d, y, resid, nt, ys); break;
+    case 72: gemvN_t<72>(d, y, resid, nt, ys); break;
+    case 96: gemvN_t<96>(d, y, resid, nt, ys); break;
     default: fprintf(stderr, "gemv: K %d unsupported\n", d->K); exit(1);
     }
 }
@@ -1485,7 +1618,8 @@ int main(int argc, char **argv) {
     CK(cudaFuncSetAttribute(k_fa, cudaFuncAttributeMaxDynamicSharedMemorySize, CTX * 4));
     int big = FF * 2; if (CH + INNER > big) big = CH + INNER; if (2 * NH * HD + 2 * NKV * HD > big) big = 2 * NH * HD + 2 * NKV * HD;
     int kmax = E; if (FF > kmax) kmax = FF; if (INNER > kmax) kmax = INNER; if (NH * HD > kmax) kmax = NH * HD;
-    BIG = big; PLS = kmax / 32 * 10;
+    BIG = big; HQW = kmax / 2; PLS = kmax / 32 * 10 + HQW;
+    { const int o = PLS - HQW; CK(cudaMemcpyToSymbol(c_hqo, &o, sizeof o)); }
     CK(cudaMalloc(&d_x, 4 * (size_t)NTM * E)); CK(cudaMalloc(&d_xn, 4 * (size_t)NTM * E));
     CK(cudaMalloc(&d_buf, 4 * (size_t)NTM * big));
     CK(cudaMalloc(&d_cv, 4 * (size_t)NTM * CH)); CK(cudaMalloc(&d_ab, 4 * (size_t)NTM * 2 * NV));
@@ -1525,13 +1659,16 @@ int main(int argc, char **argv) {
     FILE *df = dump ? fopen(dump, "wb") : NULL;
     if (df) hl = (float *)malloc(4 * (size_t)VOCAB);
     if (getenv("E_TDUMP")) { tdf = fopen(getenv("E_TDUMP"), "wb"); tstep = atoi(getenv("E_TSTEP")); }
-    /* batched prefill: the ternary GEMV is ALU-bound per (row, token) on sm_53, where nt = 2..8
-     * runs 1.36-1.81x slower per token than nt = 1 (Nano, 4B); on sm_61 nt = 8 is 3.3x faster */
+    /* batched prefill: on sm_53 the POPC batch k_gemvN ran 1.36-1.81x slower per token than
+     * nt = 1 (ALU-bound per (row, token)); the fp16 k_hg runs nt = 8 1.5-1.67x faster per token
+     * (Nano, 4B). sm_61 keeps k_gemvN (3.3x faster at nt = 8 there; its fp16 pipe is 1/64 rate).
+     * E_HG=0 forces k_gemvN. */
     int ccmaj = 0, ccmin = 0, dev = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&ccmaj, cudaDevAttrComputeCapabilityMajor, dev);
     cudaDeviceGetAttribute(&ccmin, cudaDevAttrComputeCapabilityMinor, dev);
-    int pch = getenv("E_PCHUNK") ? atoi(getenv("E_PCHUNK")) : (ccmaj * 10 + ccmin >= 61 ? NTM : 1);
+    hg_on = getenv("E_HG") ? atoi(getenv("E_HG")) : ccmaj * 10 + ccmin != 61;
+    int pch = getenv("E_PCHUNK") ? atoi(getenv("E_PCHUNK")) : NTM;
     if (pch < 1) pch = 1;
     if (pch > NTM) pch = NTM;
     if (tdf) pch = 1;

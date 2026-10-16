@@ -1290,3 +1290,23 @@ GEMVs: K=2560 occupancy 31% / issue 57% / stalls mem 36% exec 28% sync 22%; K=92
 mem 23% exec 19% sync 42%; K=4096 37% / 50% / mem 51% exec 28% sync 0%. The body's issue floor
 (~42 instr per word at ~125/clk on the one SM, ~48 ms/token) now meets the 50 ms weight-streaming
 floor; what is left is latency hiding (the tile barrier, too few bytes in flight).
+
+62. P2 batched prefill GEMV on the fp16 pipe, k_hg (keep, bit-identical; prefill +37%). Lane = row,
+RB = 2 rows per lane, W = 4 warps, NT = 8 tokens. Each 32-weight word pair is decoded once per chunk
+to 16 half2 of +-2 / 0 (nz = ~b0, neg = ~(b0 | b1); even/odd elements interleaved with 2 LOP3 so one
+shift + mask yields the half2 of elements (i, i + 16)). Activations are q/2 in fp16, written by
+q8word when gridDim.y > 1 into a tail of each token's d_pl stride (PLS += kmax / 2 words), staged 4
+groups at a time in shared memory. Each half lane sums 16 products 2 w q / 2 = w q, integers <= 2032
+(fp16 exact to 2048), so lo + hi through 2 F2F + FADD is exactly the integer s and the fork chain
+(si = fma(d8, s, si), sumf = fma(scale, si, sumf)) is k_gemv's. Standalone bench vs a verbatim copy
+of k_gemv x 8 tokens, 0 mismatches on every shape: v1 (RB 1, all loops unrolled) 1.05-1.33x;
+nvprof showed 34% inst-fetch and 31% memory-dependency stalls -> RB 2, the 4-word loop rolled
+(registers rotated), next-group weight prefetch: 1.49x K=2560 / 1.67x K=9216 / 1.55x K=4096, issue
+75%, 155 registers, occupancy 18%; capping registers (launch bounds 4-12 blocks) or W 2/8, GC 2/8
+all lose. Floor of this form ~0.8 issue per weight-token (16 HFMA2 + 4 LDS.128 + 2 F2F + FADD +
+FFMA per word-row-token at RB 2, decode amortized over 8 tokens), so not the ~0.5 hoped. Engine:
+default chunk is now NTM = 8 on every arch; k_gemvN is kept for sm_61 (fp16 1/64 rate), E_HG=0
+forces it (8.91 tps on the 400-token prefill vs 18.27, same stream md5). Nano pesi: 4k harness
+prefill 11.37 -> 15.54 tps, decode 9.23 (unchanged), score 10.2554 -> 11.9764, GOLDEN PASS, RSS
+197576 KB; checks_b2 2B+4B ALL PASS (chunk 1 and 8); 4B prompt A prefill 12.57 (chunk 1) / 17.68
+(chunk 8), 2B 29.6 / 43.7.

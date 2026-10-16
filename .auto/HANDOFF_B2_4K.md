@@ -106,7 +106,7 @@ the 4k golden, keeps RSS at or below ~200 MB, and is decided by a same-job ABBA.
      tile, the barrier and the serial warp-0 chain, and frees the `nq[8][4]` registers for more
      warps and deeper prefetch.
    - Prototype at K=2560 standalone first; kill the idea if it cannot beat `<20,5,1,3,3,1>` there.
-2. **P2, batched prefill GEMM (61.8 -> 25-35 ms; prefill ~+50-60%).**
+2. **P2, batched prefill GEMM (61.8 -> 25-35 ms; prefill ~+50-60%).** DONE as k_hg (ideas row 62): GEMVs 1.5-1.67x at chunk 8, 4k prefill 11.37 -> 15.54 tps. The fp16 form's floor is ~0.8 issue per weight-token, not 0.5; what follows is the original plan.
    - Weights are decoded to half2 once per chunk (PRMT / shift unpack).
    - Activations are int8 values as fp16, broadcast from shared memory.
    - Per word-token: 16 HFMA2, then lo + hi through 2 F2F + FADD, then the fork chain.
