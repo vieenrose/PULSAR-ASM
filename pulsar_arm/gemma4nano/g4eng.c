@@ -16,6 +16,7 @@
  */
 #define G4REF_NO_MAIN
 #include "g4ref.c"
+#include <sched.h>   /* sched_setaffinity, CPU_SET (_GNU_SOURCE is set at the top of g4ref.c) */
 #include "g4_ptx_q4.h"
 #include "g4_ptx_k.h"
 #include <dlfcn.h>
@@ -730,6 +731,30 @@ int main(int argc, char **argv) {
     prof = getenv("G4PROF") && getenv("G4PROF")[0] == '1';
     G_CAP = n + gen + 1 < MAXSEQ ? n + gen + 1 : MAXSEQ;   /* positions this run can reach */
     gpu_init();
+    /* All device interrupts on this board (GPU syncpoints, gk20a, ethernet, i2c) are
+       taken by CPU 0. The main thread busy-polls the GPU between kernels; when the
+       scheduler puts it on CPU 0 a whole run decodes ~5% slower (measured: 9.1 vs
+       9.6 tok/s, bimodal across runs). So each OpenMP thread pins itself once: the
+       main thread (thread 0) to the highest allowed CPU, worker t to the t-th allowed
+       CPU from the bottom - one thread per core, the main thread away from CPU 0
+       (pinning the main thread alone made a worker share its core: prefill -8%).
+       Only when there are at least as many allowed CPUs as threads; G4PIN=0 disables. */
+    if (!(getenv("G4PIN") && getenv("G4PIN")[0] == '0')) {
+        cpu_set_t s;
+        int cpus[CPU_SETSIZE], nc = 0;
+        if (!sched_getaffinity(0, sizeof s, &s))
+            for (int c = 0; c < CPU_SETSIZE; c++) if (CPU_ISSET(c, &s)) cpus[nc++] = c;
+        int ok = 1;
+        #pragma omp parallel
+        {
+            const int t = omp_get_thread_num(), nt = omp_get_num_threads();
+            if (nc > 1 && nt <= nc) {
+                cpu_set_t one; CPU_ZERO(&one); CPU_SET(t == 0 ? cpus[nc - 1] : cpus[t - 1], &one);
+                if (sched_setaffinity(0, sizeof one, &one)) ok = 0;
+            } else ok = 0;
+        }
+        if (ok) fprintf(stderr, "threads pinned: main on CPU %d, OpenMP workers on the others (device interrupts are on CPU 0)\n", cpus[nc - 1]);
+    }
     if (prof) {
         o_rms = G_RMS; G_RMS = w_rms; o_rmsns = G_RMSNS; G_RMSNS = w_rmsns; o_q8k = G_Q8K; G_Q8K = w_q8k;
         o_attn = G_ATTNALL; G_ATTNALL = w_attn; o_geglu = G_GEGLU; G_GEGLU = w_geglu;
