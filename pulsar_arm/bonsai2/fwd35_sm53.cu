@@ -1527,7 +1527,7 @@ int main(int argc, char **argv) {
     CK(cudaStreamCreateWithFlags(&st2, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&evf, cudaEventDisableTiming)); CK(cudaEventCreateWithFlags(&evj, cudaEventDisableTiming));
     CK(cudaMalloc(&d_zc, 4 * (size_t)E)); CK(cudaMemset(d_zc, 0xff, 4 * (size_t)E)); CK(cudaMalloc(&d_ssq, 8));
-    float *hx; CK(cudaMallocHost(&hx, sizeof(float) * E * NTM));
+    float *hx; CK(cudaMallocHost(&hx, sizeof(float) * E * NTM * 2)); /* two prompt staging buffers */
     int *hpos; CK(cudaMallocHost(&hpos, sizeof(int) * (np + N + 1)));
     int *hid; CK(cudaMallocHost(&hid, sizeof(int) * NTM));
     float *hl = NULL;
@@ -1561,15 +1561,22 @@ int main(int argc, char **argv) {
     const int stop = getenv("E_STOP") ? atoi(getenv("E_STOP")) : 0;
     const double t0 = now();
     if (stepms) fprintf(stderr, "fwd35: load %.3f s\n", t0 - tstart);
+    cudaEvent_t evx[2];
+    for (int k = 0; k < 2; k++) CK(cudaEventCreateWithFlags(&evx[k], cudaEventDisableTiming));
+    int chunk = 0;
     for (int i = 0; i < np;) {
         const int nt = np - i < pch ? np - i : pch;
-        for (int t = 0; t < nt; t++) embed(atoi(argv[3 + i + t]), hx + (size_t)E * t);
+        /* ping-pong staging: the host embeds chunk k + 1 while the GPU runs chunk k; a buffer is
+           rewritten only after the copy that read it two chunks ago has completed */
+        float *hb = hx + (size_t)E * NTM * (chunk & 1);
+        if (chunk >= 2) CK(cudaEventSynchronize(evx[chunk & 1]));
+        for (int t = 0; t < nt; t++) embed(atoi(argv[3 + i + t]), hb + (size_t)E * t);
         hpos[pos] = pos;
-        CK(cudaMemcpyAsync(d_x, hx, 4 * (size_t)E * nt, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_x, hb, 4 * (size_t)E * nt, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_pos, hpos + pos, 4, cudaMemcpyHostToDevice, st));
-        i += nt; pos += nt;
+        CK(cudaEventRecord(evx[chunk & 1], st));
+        i += nt; pos += nt; chunk++;
         run(nt, tiny, i == np ? 1 : 0);
-        if (i < np) CK(cudaStreamSynchronize(st)); /* hx is reused */
     }
     CK(cudaMemcpyAsync(hid, d_out, 4, cudaMemcpyDeviceToHost, st));
     CK(cudaStreamSynchronize(st));
