@@ -1,4 +1,4 @@
-// fwd35_sm53.cu: Ternary-Bonsai-2 (arch qwen35, PTQ1_0 weights) on the Jetson Nano GPU (sm_53).
+// fwd35_sm53.cu: Ternary-Bonsai-2 (arch qwen35, PTQ1_0 or PQ2_0 weights) on the Jetson Nano GPU (sm_53).
 //
 // Bit-exact port of fwd35_ref.c (itself bit-exact vs the PrismML fork's x86 CPU build): every
 // op keeps the fork's evaluation order, so the greedy stream and every logit equal the fork's.
@@ -9,6 +9,12 @@
 //   env:   E_DUMP=f     raw f32 logits of every step appended to f (same format as R_DUMP)
 //          E_TDUMP=f E_TSTEP=s   named intermediates of the forward that yields step s (no graph)
 //          E_CTX=n      K/V cache positions (default 4096)   E_GRAPH=0  no CUDA graph
+//          E_RPCHK=1    re-run the per-weight PTQ1_0 decode on every load chunk and compare
+//
+// PQ2_0 GGUFs of the same checkpoints carry the same codes and scales (checked tensor by tensor
+// for the 2B and 4B: identical, code 3 never used), so they load to the same planes and give the
+// same stream bit for bit. This engine keeps the PTQ1_0 activation path (Q8_0) for both; the fork
+// itself runs PQ2_0 against Q8_K, which is a different stream.
 //
 // Weights: PTQ1_0 (base-3 packed trits, 28 bytes per 128) is re-encoded at load into two bit
 // planes per 128-weight group, b0 and b1 with code = b0 + 2 b1 = trit + 1, so a 32-weight
@@ -1332,6 +1338,9 @@ __global__ void k_argmax2(const float *pv, const int *pi, int n, int *out) {
 #define T_F32 0
 #define T_PTQ1 143
 #define PTQ_BYTES 28   /* qs[24] qh[2] d(fp16) per 128 weights */
+#define T_PQ2 142
+#define PQ2_BYTES 34   /* d(fp16) qs[32] per 128 weights, 2-bit code q, weight q - 1 */
+static int wpq2 = -1, wbytes = PTQ_BYTES; /* weight format of the GGUF (all ternary tensors alike) */
 typedef struct { const TI *t; int K, N; size_t co, so; } DT;   /* device tensor: uint4 / half offsets */
 typedef struct {
     int full;
@@ -1347,13 +1356,19 @@ static DT head;
 static float *d_out_norm_w;
 static int nsign; static int sign_w[8]; static float *sign_h[8], *sign_d[8];
 static int8_t LUT[256][5];
+static uint8_t EV[256]; /* even bits 0,2,4,6 of a byte -> nibble */
+static uint64_t TPL[2][256], TPH[2][256], TP2[2][256], TP3[2][256]; /* PTQ1 byte -> plane bit patterns */
+static int rp_ref = 0, rp_chk = 0; /* E_RPCHK=1: the per-weight PTQ1 decode re-run on every chunk, compared */
+static size_t rp_bad = 0;
 static uint4 *d_codes; static __half *d_scales;
 static int li_on = 1; /* 32-row tiled weight layout + k_li decode GEMV (E_LI, default on except sm_61) */
 static size_t n_codes, n_scales;
 
 static const TI *ptq(const char *n) {
     const TI *t = tget(n, 1);
-    if (t->type != T_PTQ1) { fprintf(stderr, "%s: type %u, want PTQ1_0\n", n, t->type); exit(1); }
+    if (t->type != T_PTQ1 && t->type != T_PQ2) { fprintf(stderr, "%s: type %u, want PTQ1_0 or PQ2_0\n", n, t->type); exit(1); }
+    if (wpq2 < 0) { wpq2 = t->type == T_PQ2; wbytes = wpq2 ? PQ2_BYTES : PTQ_BYTES; }
+    else if (wpq2 != (t->type == T_PQ2)) { fprintf(stderr, "%s: mixed PTQ1_0 / PQ2_0 tensors\n", n); exit(1); }
     return t;
 }
 static float *f32d(const char *n) {
@@ -1386,8 +1401,42 @@ static void repack_rows(const uint8_t *src, int K, int nrows, uint32_t *codes, u
     const int G = K / 128;
 #pragma omp parallel for schedule(static)
     for (int r = 0; r < nrows; r++) {
-        const uint8_t *row = src + (size_t)r * G * PTQ_BYTES;
+        const uint8_t *row = src + (size_t)r * G * wbytes;
         uint32_t *c = codes + (size_t)r * 8 * G;
+        if (wpq2) { /* PQ2_0: byte m holds weights 4m..4m+3, code = b0 + 2 b1 already */
+            for (int g = 0; g < G; g++) {
+                const uint8_t *b = row + PQ2_BYTES * g;
+                for (int k = 0; k < 4; k++) {
+                    uint32_t p0 = 0, p1 = 0;
+                    for (int m = 0; m < 8; m++) {
+                        const uint8_t v = b[2 + 8 * k + m];
+                        p0 |= (uint32_t)EV[v] << (4 * m);
+                        p1 |= (uint32_t)EV[v >> 1] << (4 * m);
+                    }
+                    c[4 * g + k] = p0; c[4 * G + 4 * g + k] = p1;
+                }
+                memcpy(scales + (size_t)r * G + g, b, 2);
+            }
+            continue;
+        }
+        if (!rp_ref) { /* PTQ1_0 via per-byte plane patterns (TP*): bit 16n / 16 + 8n / 56 + 2n of
+                        * byte m's (resp. 16 + m's, 24 + h's) trit n, shifted by m (h) */
+            for (int g = 0; g < G; g++) {
+                const uint8_t *b = row + PTQ_BYTES * g;
+                uint64_t lo0 = 0, hi0 = 0, lo1 = 0, hi1 = 0;
+                for (int m = 0; m < 16; m++) {
+                    lo0 |= TPL[0][b[m]] << m; hi0 |= TPH[0][b[m]] << m;
+                    lo1 |= TPL[1][b[m]] << m; hi1 |= TPH[1][b[m]] << m;
+                }
+                for (int m = 0; m < 8; m++) { hi0 |= TP2[0][b[16 + m]] << m; hi1 |= TP2[1][b[16 + m]] << m; }
+                for (int h = 0; h < 2; h++) { hi0 |= TP3[0][b[24 + h]] << h; hi1 |= TP3[1][b[24 + h]] << h; }
+                uint32_t *c0 = c + 4 * g, *c1 = c + 4 * G + 4 * g;
+                c0[0] = (uint32_t)lo0; c0[1] = (uint32_t)(lo0 >> 32); c0[2] = (uint32_t)hi0; c0[3] = (uint32_t)(hi0 >> 32);
+                c1[0] = (uint32_t)lo1; c1[1] = (uint32_t)(lo1 >> 32); c1[2] = (uint32_t)hi1; c1[3] = (uint32_t)(hi1 >> 32);
+                memcpy(scales + (size_t)r * G + g, b + 26, 2);
+            }
+            continue;
+        }
         for (int g = 0; g < G; g++) {
             const uint8_t *b = row + PTQ_BYTES * g;
             uint32_t p0[4] = {0, 0, 0, 0}, p1[4] = {0, 0, 0, 0};
@@ -1416,8 +1465,14 @@ static void dt_fill(const DT *d, const TI **ts, int nt) {
         const int N = (int)ts[i]->ne[1];
         for (int r0 = 0; r0 < N; r0 += CHUNK) {
             const int nr = N - r0 < CHUNK ? N - r0 : CHUNK;
-            const uint8_t *src = ts[i]->d + (size_t)r0 * G * PTQ_BYTES;
+            const uint8_t *src = ts[i]->d + (size_t)r0 * G * wbytes;
             repack_rows(src, d->K, nr, hc, hs);
+            if (rp_chk && !wpq2) {
+                uint32_t *hc2 = (uint32_t *)malloc((size_t)nr * 8 * G * 4); uint16_t *hs2 = (uint16_t *)malloc((size_t)nr * G * 2);
+                rp_ref = 1; repack_rows(src, d->K, nr, hc2, hs2); rp_ref = 0;
+                if (memcmp(hc, hc2, (size_t)nr * 8 * G * 4) || memcmp(hs, hs2, (size_t)nr * G * 2)) rp_bad++;
+                free(hc2); free(hs2);
+            }
             if (li_on) { /* rows -> 32-row tiles (a tensor that is not the last must end on a tile) */
                 if ((row & 31) || ((nr & 31) && i + 1 < nt)) { fprintf(stderr, "li: rows not tile aligned\n"); exit(1); }
                 const int nra = (nr + 31) & ~31;
@@ -1436,7 +1491,7 @@ static void dt_fill(const DT *d, const TI **ts, int nt) {
                 CK(cudaMemcpy(d_scales + d->so + (row + r0) * G, hs, (size_t)nr * G * 2, cudaMemcpyHostToDevice));
             }
             /* the source pages are not needed again (embedding rows aside) */
-            uintptr_t a = (uintptr_t)src & ~(uintptr_t)4095, e = (uintptr_t)(src + (size_t)nr * G * PTQ_BYTES) & ~(uintptr_t)4095;
+            uintptr_t a = (uintptr_t)src & ~(uintptr_t)4095, e = (uintptr_t)(src + (size_t)nr * G * wbytes) & ~(uintptr_t)4095;
             if (ts[i] != tok_t && e > a) madvise((void *)a, e - a, MADV_DONTNEED);
         }
         row += N;
@@ -1476,6 +1531,17 @@ static void load(void) {
     }
     if (o != nv) { fprintf(stderr, "sign_values length\n"); exit(1); }
     static const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+    for (int v = 0; v < 256; v++)
+        for (int n = 0; n < 5; n++) {
+            const int code = (int)(((uint16_t)(uint8_t)(v * pow3[n]) * 3) >> 8); /* trit + 1 */
+            for (int p = 0; p < 2; p++) {
+                const uint64_t bit = (uint64_t)((code >> p) & 1);
+                if (n < 4) TPL[p][v] |= bit << (16 * n); else TPH[p][v] |= bit;
+                TP2[p][v] |= bit << (16 + 8 * n);
+                if (n < 4) TP3[p][v] |= bit << (56 + 2 * n);
+            }
+        }
+    for (int v = 0; v < 256; v++) { uint8_t e = 0; for (int j = 0; j < 4; j++) e |= ((v >> (2 * j)) & 1) << j; EV[v] = (uint8_t)e; }
     for (int b = 0; b < 256; b++)
         for (int n = 0; n < 5; n++) {
             uint8_t v = (uint8_t)(b * pow3[n]);
@@ -1523,13 +1589,20 @@ static void load(void) {
     }
     dt_fill(&head, &ht, 1);
     fprintf(stderr, "fwd35: repack %.1f s\n", omp_get_wtime() - t0);
+    if (rp_chk) fprintf(stderr, "fwd35: E_RPCHK %s (%zu chunks differ)\n", rp_bad ? "FAIL" : "ok", rp_bad);
 }
 
 /* host embedding: dequantized row, FWHT, signs (fwd35_ref embed) */
 static void embed(int id, float *x) {
     const int nb = E / 128;
-    const uint8_t *row = tok_t->d + (size_t)id * nb * PTQ_BYTES;
-    for (int i = 0; i < nb; i++) {
+    const uint8_t *row = tok_t->d + (size_t)id * nb * wbytes;
+    for (int i = 0; i < nb && wpq2; i++) {
+        const uint8_t *b = row + PQ2_BYTES * i;
+        uint16_t dh; memcpy(&dh, b, 2);
+        const float d = f16f(dh);
+        for (int j = 0; j < 128; j++) x[128 * i + j] = (float)(((b[2 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * d;
+    }
+    for (int i = 0; i < nb && !wpq2; i++) {
         const uint8_t *b = row + PTQ_BYTES * i;
         uint16_t dh; memcpy(&dh, b + 26, 2);
         const float d = f16f(dh);
@@ -1860,6 +1933,7 @@ int main(int argc, char **argv) {
         li_on = getenv("E_LI") ? atoi(getenv("E_LI")) : mj * 10 + mn != 61;
     }
     gguf_open(argv[1]);
+    if (getenv("E_RPCHK")) rp_chk = atoi(getenv("E_RPCHK"));
     load();
     int N = atoi(argv[2]); const int np = argc - 3;
     EOS_ID = (int)kv_int("tokenizer.ggml.eos_token_id", 248046);

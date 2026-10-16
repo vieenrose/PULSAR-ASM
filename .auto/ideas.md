@@ -1376,3 +1376,28 @@ against gm_expf over every negative float and +0: 0 mismatches; throughput loop 
 E_FEXP=0 restores gm_expf. 400-token prefill md5 b1591925 unchanged. 4k harness ABBA (E_FEXP
 1/0/0/1): score 13.5765 / 13.5272 / 13.5202 / 13.5837, decode 9.82 / 9.78 / 9.77 / 9.82, prefill
 18.77 / 18.71 / 18.71 / 18.79, GOLDEN PASS all four; checks_b2 2B+4B ALL PASS.
+
+68. PQ2_0 instead of PTQ1_0 for the 2B and 4B (measured out for speed; kept as an input format)
+and a table-driven PTQ1_0 repack (keep: load -6 s on the 4B, bit-identical planes). The question
+was whether the 2.125 bpw PQ2_0 GGUFs run faster on the Nano than the 1.75 bpw PTQ1_0 ones.
+(1) Same weights: every ternary tensor of the PrismML PQ2_0 files has exactly the PTQ1_0 file's
+codes and fp16 scales (2B 151 tensors, 4B 201; code 3 never used; all F32 tensors byte-equal).
+(2) Same GPU bytes: the engine already re-encodes PTQ1_0 into two bit planes, 34 bytes per 128,
+the size of a PQ2_0 block. (3) The only compute difference would be the fork's PQ2_0 numerics,
+Q8_K activations (one scale per 256) and one integer sum per 128-weight group. Standalone k_li
+bench with that epilogue against today's 4-FMA Q8_0 epilogue, Nano, jetson_clocks, 4B and 2B
+shapes, two runs: 0.997x to 1.016x (gate+up 19456x2560 0.642 vs 0.642 ms, down 2560x9728 0.365
+vs 0.360, head 248320x2560 7.920 vs 7.875): k_li runs at 18-21.4 GB/s against the 21.9 GB/s
+ceiling, so the epilogue no longer matters; not worth a second activation path and new goldens.
+(4) Load. The engine now also reads PQ2_0 tensors (type 142; same planes, same stream: 351- and
+405-token zh prompts, 64 ids identical). Cold ABBA on the Nano, before the repack change: 2B
+repack 5.2 s PTQ1_0 vs 2.3 s PQ2_0 (wall 15.14 / 15.13 vs 12.23 / 12.25 s), 4B 11.9 vs 5.3 s
+(wall 37.20 / 37.26 vs 30.61 / 30.65 s); prefill and decode equal within 0.3 % (4B 22.71 /
+12.15-12.24 vs 22.70 / 12.14). Cold `cat` of the 2B files: 1.36 s vs 1.65 s, so the gap was
+the CPU base-3 decode (per-weight LUT into t[128], then a 128-step bit loop), not the card.
+Fix: per-byte plane patterns (TPL/TPH for qs[0..15], TP2 for qs[16..23], TP3 for qh) OR-ed in
+shifted by the byte's position, 26 lookups per plane per group. E_RPCHK=1 re-runs the old
+decoder on every chunk: 0 chunks differ on the 2B and 4B. 4B cold ABBA after: PTQ1_0 repack 5.6
+/ 5.1 s vs PQ2_0 5.2 / 5.2 s, wall 30.83 / 30.37 vs 30.55 / 30.50 s, stream identical. PTQ1_0
+keeps the smaller file (429 vs 517 MB, 950 vs 1146 MB) at the same speed. checks_b2 2B+4B ALL
+PASS. The 9B stays on PTQ1_0 (2.0 GB vs ~2.4 GB on a 14 GB card).
