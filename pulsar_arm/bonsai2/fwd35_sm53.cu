@@ -797,6 +797,105 @@ __global__ void k_fa(const float *q, const float *buf, const __half *kc, const _
     att[h * 256 + tid] = acc * d_sigm(buf[h * 512 + 256 + tid]);
 }
 
+/* grouped variant of k_fa for 4 q heads per KV head: one block of 512 threads per KV head, so
+ * each K/V row is read once for the 4 heads instead of 4 times (the cache does not fit the L2
+ * at long context). Positions go in tiles of FT; the running max, vk and S carry across tiles,
+ * so every score, weight and f16 chain step is the k_fa one in the same order (the prefix max
+ * is order-free). Thread t: q head hh = t >> 7 of the group, output dims d and d + 128. */
+#define FT 256
+__device__ __forceinline__ float ldh(const __half *p) {
+    return __half2float(__ushort_as_half(__ldg((const unsigned short *)p)));
+}
+__global__ __launch_bounds__(512) void k_fag(const float *q, const float *buf, const __half *kc, const __half *vc,
+                                             const int *posp, float *att, float *fao, int NH, int NKV, float scale, int bs_) {
+    __shared__ float qs[4][256], sc[4][FT], wm[16];
+    const int g = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int n = *posp + (int)blockIdx.y + 1, h0 = g * 4;
+    q += (size_t)blockIdx.y * NH * 256; buf += (size_t)blockIdx.y * bs_; att += (size_t)blockIdx.y * NH * 256;
+    if (fao) fao += (size_t)blockIdx.y * NH * 256;
+    for (int i = tid; i < 1024; i += 512) qs[i >> 8][i & 255] = f16r(q[(h0 + (i >> 8)) * 256 + (i & 255)]);
+    __syncthreads();
+    float qr[4][8];
+#pragma unroll
+    for (int h = 0; h < 4; h++)
+#pragma unroll
+        for (int c = 0; c < 8; c++) qr[h][c] = qs[h][32 * c + lane];
+    const int hh = tid >> 7, d = tid & 127;
+    const __half *vp = vc + g * 256 + d;
+    float carry = -INFINITY, vk0 = 0.0f, vk1 = 0.0f, S = 0.0f;
+    for (int base = 0; base < n; base += FT) {
+        const int cnt = min(FT, n - base);
+        for (int i0 = warp * FAK; i0 < cnt; i0 += 16 * FAK) {
+            __half kh[FAK][8];
+#pragma unroll
+            for (int u = 0; u < FAK; u++) {
+                const __half *kr = kc + (size_t)(base + min(i0 + u, cnt - 1)) * NKV * 256 + g * 256;
+#pragma unroll
+                for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c + lane];
+            }
+#pragma unroll
+            for (int u = 0; u < FAK; u++) {
+                float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                for (int c = 0; c < 8; c++) {
+                    const float kv = __half2float(kh[u][c]);
+#pragma unroll
+                    for (int h = 0; h < 4; h++) a[h] = fmaf(kv, qr[h][c], a[h]);
+                }
+#pragma unroll
+                for (int h = 0; h < 4; h++) {
+                    const float sv = dotg_reduce(a[h], lane) * scale;
+                    if (lane == 0 && i0 + u < cnt) sc[h][i0 + u] = sv;
+                }
+            }
+        }
+        __syncthreads();
+        {   /* weights: thread d of head hh owns tile positions 2d, 2d + 1 */
+            const int p0 = 2 * d, p1 = p0 + 1;
+            const float s0 = p0 < cnt ? sc[hh][p0] : -INFINITY, s1 = p1 < cnt ? sc[hh][p1] : -INFINITY;
+            float m = fmaxf(s0, s1);
+            for (int o = 1; o < 32; o <<= 1) { const float t = __shfl_up_sync(FULL, m, o); if (lane >= o) m = fmaxf(m, t); }
+            float ex = __shfl_up_sync(FULL, m, 1);
+            if (lane == 0) ex = -INFINITY;
+            if (lane == 31) wm[warp] = m;
+            __syncthreads();
+            float run = carry;
+            for (int w = 4 * hh; w < warp; w++) run = fmaxf(run, wm[w]);
+            run = fmaxf(run, ex);
+            if (p0 < cnt) { if (s0 > run) { sc[hh][p0] = -gm_expf(run - s0); run = s0; } else sc[hh][p0] = gm_expf(s0 - run); }
+            if (p1 < cnt) { if (s1 > run) { sc[hh][p1] = -gm_expf(run - s1); run = s1; } else sc[hh][p1] = gm_expf(s1 - run); }
+            carry = fmaxf(carry, fmaxf(fmaxf(wm[4 * hh], wm[4 * hh + 1]), fmaxf(wm[4 * hh + 2], wm[4 * hh + 3])));
+        }
+        __syncthreads();
+        for (int i0 = 0; i0 < cnt; i0 += FAU) {
+            float va[FAU], vb[FAU];
+#pragma unroll
+            for (int u = 0; u < FAU; u++)
+                if (i0 + u < cnt) { const __half *r = vp + (size_t)(base + i0 + u) * NKV * 256; va[u] = ldh(r); vb[u] = ldh(r + 128); }
+#pragma unroll
+            for (int u = 0; u < FAU; u++) {
+                if (i0 + u >= cnt) break;
+                const float sw = sc[hh][i0 + u], w = fabsf(sw);
+                if (__float_as_uint(sw) >> 31) {
+                    vk0 = f16r(vk0 * w); vk0 = f16r(fmaf(va[u], 1.0f, vk0));
+                    vk1 = f16r(vk1 * w); vk1 = f16r(fmaf(vb[u], 1.0f, vk1));
+                    S = fmaf(S, w, 1.0f);
+                } else {
+                    vk0 = f16r(fmaf(va[u], w, vk0)); vk1 = f16r(fmaf(vb[u], w, vk1));
+                    S = fmaf(S, 1.0f, w);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    const float Si = S == 0.0f ? 0.0f : 1.0f / S;
+    const int h = h0 + hh;
+    const float a0 = vk0 * Si, a1 = vk1 * Si;
+    if (fao) { fao[h * 256 + d] = a0; fao[h * 256 + d + 128] = a1; }
+    att[h * 256 + d] = a0 * d_sigm(buf[h * 512 + 256 + d]);
+    att[h * 256 + d + 128] = a1 * d_sigm(buf[h * 512 + 256 + d + 128]);
+}
+
 /* ---- argmax: first index of the maximum ---- */
 __device__ __forceinline__ void amx(float &v, int &i, float v2, int i2) {
     if (v2 > v || (v2 == v && i2 < i)) { v = v2; i = i2; }
@@ -1198,8 +1297,12 @@ static void enqueue(int nt, int tiny, int want) {
             k_qk<<<dim3((NH + NKV + 3) / 4, nt), 128, 0, st>>>(d_buf, L->q_norm, L->k_norm, d_pos, d_q, d_kc[fi], d_vc[fi],
                                                              NH, NKV, NROT, ROPE_TS, EPS, BIG);
             tdump("Qcur-%d", l, d_q, NH * HD);
-            k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 4, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
-                                                             tdf ? d_fao : NULL, NH, NKV, CTX, ascale, BIG);
+            if (NH == 4 * NKV)
+                k_fag<<<dim3(NKV, nt), 512, 0, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
+                                                     tdf ? d_fao : NULL, NH, NKV, ascale, BIG);
+            else
+                k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 4, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
+                                                                 tdf ? d_fao : NULL, NH, NKV, CTX, ascale, BIG);
             tdump("fa_out-%d", l, d_fao, NH * HD);
             tdump("attn_gated-%d", l, d_att, NH * HD);
             xq(d_att, NULL, 0, NH * HD, NH * HD, nt);
