@@ -9,17 +9,22 @@ DeltaNet (linear attention) layers.
 
 | model | GGUF bytes | on the GPU | prefill | decode |
 |---|---|---|---|---|
-| Ternary-Bonsai-2-2B | 429,183,456 | 476 MB | **25.4 tok/s** | **22.1 tok/s** |
-| Ternary-Bonsai-2-4B | 949,549,920 | 1064 MB | **10.8 tok/s** | **9.9 tok/s** |
-| Ternary-Bonsai-2-9B | 1,997,486,976 | 2009 MB | **6.2 tok/s** | **5.7 tok/s** |
+| Ternary-Bonsai-2-2B | 429,183,456 | 476 MB | **44.1 tok/s** | **25.1 tok/s** |
+| Ternary-Bonsai-2-4B | 949,549,920 | 1064 MB | **17.9 tok/s** | **11.6 tok/s** |
+| Ternary-Bonsai-2-9B | 1,997,486,976 | 2009 MB | 6.2 tok/s | 5.7 tok/s |
 
 Prefill and decode are measured on English prompt A (24 prompt tokens),
-running to the model's own end of turn: 100, 82 and 99 decode steps.
-Conditions are `jetson_clocks` (GPU 921.6 MHz, CPU 1.479 GHz), L4T
-R32.5.1, CUDA 10.2, greedy decoding, f16 K/V cache. Decode streams
-10.5, 10.5 and 11.5 GB/s of weights. The GEMV is issue-bound at about
-13 GB/s on this GPU, below the 21.9 GB/s bus ceiling, because ternary
-dot products cost more ALU work per byte than the 1-bit ones below.
+running to the model's own end of turn: 100 and 82 decode steps for the
+2B and 4B, from one run each at commit 1767589 (batched prefill, 8-token
+chunks). The 9B row is from the earlier build (before the 8-POPC change
+and the batched prefill) and is not re-measured: the board's SD card
+holds only one of the 4B and 9B at a time. Conditions are `jetson_clocks`
+(GPU 921.6 MHz, CPU 1.479 GHz), L4T R32.5.1, CUDA 10.2, greedy decoding,
+f16 K/V cache. The 2B and 4B decode streams 10.8 and 11.0 GB/s of weights
+(GGUF bytes times tok/s); the 9B streams 11.5 GB/s. The GEMV is
+issue-bound at about 13 GB/s on this GPU, below the 21.9 GB/s bus ceiling,
+because ternary dot products cost more ALU work per byte than the 1-bit
+ones below.
 
 | | |
 |---|---|
@@ -34,7 +39,9 @@ sha256: 2B `36061ad406df8a4903a6db005be350c50fabfaf717f9ef0acf4b76adcd9929fa`,
 ## Demo
 
 The same two prompts on each model, one English and one Traditional
-Chinese. The clips play in real time: each token appears at the moment
+Chinese. The clips were recorded before the 8-POPC and batched-prefill
+changes; their status lines show that build's numbers (the table above has
+the current 2B and 4B figures). Re-shooting them is still to do. The clips play in real time: each token appears at the moment
 the engine produced it, using the per-step times from the run's own log.
 Loading (weight repack + upload) and prompt processing are shown at their
 measured durations too.
@@ -110,9 +117,12 @@ therefore costs nearly k single-token steps. Measured with the engine's
 own batched forward on the 4B (`E_PCHUNK`), the per-token cost of a
 k-token pass against single tokens is 1.81× at k = 2, 1.62× at 3 and
 1.36× at 8. A draft would need near-perfect acceptance just to break
-even. The same batched pass is 3–3.7× faster per token on a GTX 1070
-(sm_61), so `E_PCHUNK` defaults to 8 there and to 1 on sm_53. The DFlash
-drafts (~1.57 GB) would not fit next to the 4B or 9B anyway.
+even. Those figures are for the POPC batch kernel. The fp16 batch kernel that
+prefill now uses (`k_hg`, ideas row 62) runs 8 tokens 1.5–1.7× faster per
+token than single tokens on the 4B's GEMV shapes, so the k-token verify
+cost is not re-measured with it. The DFlash drafts (~1.57 GB) would not
+fit next to the 4B or 9B anyway. `E_PCHUNK` defaults to 8 on sm_53 and
+sm_61; `E_HG=0` falls back to the POPC batch kernel.
 
 ### Build, run and gates
 
@@ -125,7 +135,7 @@ bash .auto/checks_b2.sh 2B 4B 9B    # from the host: sync, build on the Nano, fo
 ```
 
 Switches: `E_STOP=1`, `E_STEPMS=1`, `E_PCHUNK=n` (prefill tokens per
-batched pass), `E_GRAPH=0` (no CUDA graphs), `E_CTX` (default 4096).
+batched pass, default 8), `E_HG=0` (POPC batch kernel instead of the fp16 one), `E_GRAPH=0` (no CUDA graphs), `E_CTX` (default 4096).
 The host reference `fwd35_ref.c` (plain C, same bits on x86 and the
 Nano's A57) and the per-kernel record are in `.auto/ideas.md` row 59.
 
