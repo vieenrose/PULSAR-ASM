@@ -1520,7 +1520,7 @@ __global__ void k_fv(const float *buf, const __half *vc, const int *posp, const 
 
 /* k_fv with HG heads of one KV group per thread (FD dims each): the V element is loaded and
    converted once for the HG chains that read it. Per chain the arithmetic and order are k_fv's. */
-template <int FD, int HG>
+template <int FD, int HG, bool PF, int U>
 __global__ void k_fvg(const float *buf, const __half *vc, const int *posp, const float *scg,
                       float *att, float *fao, int NH, int NKV, int ctx, int bs_, int fvf) {
     const int h0 = blockIdx.x * HG, tid = threadIdx.x;
@@ -1536,27 +1536,34 @@ __global__ void k_fvg(const float *buf, const __half *vc, const int *posp, const
 #pragma unroll
         for (int d = 0; d < FD; d++) vk[j][d] = 0.0f;
     }
-    for (int ic0 = 0; ic0 < n; ic0 += FVU) {
-        __half vh[FVU][FD]; float sw[FVU][HG];
+    __half nvh[U][FD]; float nsw[U][HG];
+    auto ld = [&](int i0) {
 #pragma unroll
-        for (int u = 0; u < FVU; u++)
-            if (ic0 + u < n) {
-                const __half *vr = vp + (size_t)(ic0 + u) * NKV * 256;
-                if (FD == 4) { const uint2 x = *(const uint2 *)vr; memcpy(vh[u], &x, 8); }
-                else if (FD == 2) { const uint32_t x = *(const uint32_t *)vr; memcpy(vh[u], &x, 4); }
-                else vh[u][0] = *vr;
+        for (int u = 0; u < U; u++)
+            if (i0 + u < n) {
+                const __half *vr = vp + (size_t)(i0 + u) * NKV * 256;
+                if (FD == 4) { const uint2 x = *(const uint2 *)vr; memcpy(nvh[u], &x, 8); }
+                else if (FD == 2) { const uint32_t x = *(const uint32_t *)vr; memcpy(nvh[u], &x, 4); }
+                else nvh[u][0] = *vr;
 #pragma unroll
-                for (int j = 0; j < HG; j++) sw[u][j] = __ldg(wp + (size_t)j * ctx + ic0 + u);
+                for (int j = 0; j < HG; j++) nsw[u][j] = __ldg(wp + (size_t)j * ctx + i0 + u);
             }
-        if (fvf && ic0 + FVU <= n) { /* no rescale weight in the group: the straight-line form */
+    };
+    if (PF) ld(0);
+    for (int ic0 = 0; ic0 < n; ic0 += U) {
+        if (!PF) ld(ic0);
+        __half vh[U][FD]; float sw[U][HG];
+        memcpy(vh, nvh, sizeof(vh)); memcpy(sw, nsw, sizeof(sw));
+        if (PF && ic0 + U < n) ld(ic0 + U); /* the next group's loads fly under this group's chain */
+        if (fvf && ic0 + U <= n) { /* no rescale weight in the group: the straight-line form */
             uint32_t sg = 0;
 #pragma unroll
-            for (int u = 0; u < FVU; u++)
+            for (int u = 0; u < U; u++)
 #pragma unroll
                 for (int j = 0; j < HG; j++) sg |= __float_as_uint(sw[u][j]);
             if (!(sg >> 31)) {
 #pragma unroll
-                for (int u = 0; u < FVU; u++) {
+                for (int u = 0; u < U; u++) {
                     float vf[FD];
 #pragma unroll
                     for (int d = 0; d < FD; d++) vf[d] = __half2float(vh[u][d]);
@@ -1572,7 +1579,7 @@ __global__ void k_fvg(const float *buf, const __half *vc, const int *posp, const
             }
         }
 #pragma unroll
-        for (int u = 0; u < FVU; u++) {
+        for (int u = 0; u < U; u++) {
             if (ic0 + u >= n) break;
             float vf[FD];
 #pragma unroll
@@ -1601,6 +1608,105 @@ __global__ void k_fvg(const float *buf, const __half *vc, const int *posp, const
             const float acc = vk[j][d] * Si;
             if (fao) fao[jj] = acc;
             att[jj] = acc * d_sigm(buf[(h0 + j) * 512 + 256 + tid * FD + d]);
+        }
+    }
+}
+
+/* k_fvg<2, HG> with a lean loop (E_FVH): full groups of U positions load the weights of each head
+   as float4 (U / 4 per head, ctx % 4 == 0) and V as one half2 word per position without
+   predicates, and run the straight-line chain when no weight in the group is a rescale marker;
+   other groups and the tail take k_fvg's per-position form. Arithmetic and order are k_fvg's. */
+template <int HG, int U>
+__global__ void k_fvh(const float *buf, const __half *vc, const int *posp, const float *scg,
+                      float *att, float *fao, int NH, int NKV, int ctx, int bs_) {
+    const int h0 = blockIdx.x * HG, tid = threadIdx.x;
+    const int n = *posp + (int)blockIdx.y + 1, g = h0 / (NH / NKV);
+    buf += (size_t)blockIdx.y * bs_; att += (size_t)blockIdx.y * NH * 256;
+    if (fao) fao += (size_t)blockIdx.y * NH * 256;
+    const float *wp = scg + ((size_t)blockIdx.y * NH + h0) * ctx;
+    const uint32_t *vp = (const uint32_t *)(vc + g * 256) + tid;
+    const int vs = NKV * 128;
+    float vk[HG][2], S[HG];
+#pragma unroll
+    for (int j = 0; j < HG; j++) { S[j] = 0.0f; vk[j][0] = 0.0f; vk[j][1] = 0.0f; }
+    int ic0 = 0;
+    for (; ic0 + U <= n; ic0 += U) {
+        uint32_t vw[U]; float sw[U][HG];
+        const uint32_t *vr = vp + (size_t)ic0 * vs;
+#pragma unroll
+        for (int u = 0; u < U; u++) vw[u] = vr[u * vs];
+#pragma unroll
+        for (int j = 0; j < HG; j++)
+#pragma unroll
+            for (int q = 0; q < U / 4; q++) {
+                const float4 w4 = __ldg((const float4 *)(wp + (size_t)j * ctx + ic0) + q);
+                sw[4 * q][j] = w4.x; sw[4 * q + 1][j] = w4.y; sw[4 * q + 2][j] = w4.z; sw[4 * q + 3][j] = w4.w;
+            }
+        uint32_t sg = 0;
+#pragma unroll
+        for (int u = 0; u < U; u++)
+#pragma unroll
+            for (int j = 0; j < HG; j++) sg |= __float_as_uint(sw[u][j]);
+        if (!(sg >> 31)) {
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                __half2 h2; memcpy(&h2, &vw[u], 4);
+                const float v0 = __low2float(h2), v1 = __high2float(h2);
+#pragma unroll
+                for (int j = 0; j < HG; j++) {
+                    const float w = sw[u][j];
+                    vk[j][0] = f16r(fmaf(v0, w, vk[j][0]));
+                    vk[j][1] = f16r(fmaf(v1, w, vk[j][1]));
+                    S[j] = fmaf(S[j], 1.0f, w);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                __half2 h2; memcpy(&h2, &vw[u], 4);
+                const float vf[2] = {__low2float(h2), __high2float(h2)};
+#pragma unroll
+                for (int j = 0; j < HG; j++) {
+                    const float w = fabsf(sw[u][j]);
+                    if (__float_as_uint(sw[u][j]) >> 31) {
+#pragma unroll
+                        for (int d = 0; d < 2; d++) { vk[j][d] = f16r(vk[j][d] * w); vk[j][d] = f16r(fmaf(vf[d], 1.0f, vk[j][d])); }
+                        S[j] = fmaf(S[j], w, 1.0f);
+                    } else {
+#pragma unroll
+                        for (int d = 0; d < 2; d++) vk[j][d] = f16r(fmaf(vf[d], w, vk[j][d]));
+                        S[j] = fmaf(S[j], 1.0f, w);
+                    }
+                }
+            }
+        }
+    }
+    for (; ic0 < n; ic0++) {
+        __half2 h2; const uint32_t x = vp[(size_t)ic0 * vs]; memcpy(&h2, &x, 4);
+        const float vf[2] = {__low2float(h2), __high2float(h2)};
+#pragma unroll
+        for (int j = 0; j < HG; j++) {
+            const float sw = __ldg(wp + (size_t)j * ctx + ic0), w = fabsf(sw);
+            if (__float_as_uint(sw) >> 31) {
+#pragma unroll
+                for (int d = 0; d < 2; d++) { vk[j][d] = f16r(vk[j][d] * w); vk[j][d] = f16r(fmaf(vf[d], 1.0f, vk[j][d])); }
+                S[j] = fmaf(S[j], w, 1.0f);
+            } else {
+#pragma unroll
+                for (int d = 0; d < 2; d++) vk[j][d] = f16r(fmaf(vf[d], w, vk[j][d]));
+                S[j] = fmaf(S[j], 1.0f, w);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < HG; j++) {
+        const float Si = S[j] == 0.0f ? 0.0f : 1.0f / S[j];
+#pragma unroll
+        for (int d = 0; d < 2; d++) {
+            const int jj = (h0 + j) * 256 + tid * 2 + d;
+            const float acc = vk[j][d] * Si;
+            if (fao) fao[jj] = acc;
+            att[jj] = acc * d_sigm(buf[(h0 + j) * 512 + 256 + tid * 2 + d]);
         }
     }
 }
@@ -2087,6 +2193,10 @@ static int ssq_ready, ssq_on = -1;
 static double *d_ssq, *d_ssqn;
 static int ssqn_on = 1; /* E_SSQN: batch rms sums once per token in k_ssqn */
 static int fvgv = 0, fvgp = 2; /* E_FVGV / E_FVGP (one token / a token batch): 1 = k_fvg<1, 4>, 2 = k_fvg<2, 4> (4 heads share each V conversion), else k_fvg<2, 2> */
+static int fvh_on = 1; /* E_FVH: k_fvh lean-loop V chain (2: groups of 8 positions) */
+static int fvu_d = 4; /* E_FVU: k_fvg positions per load group at one token */
+static int fvp_on = 1; /* E_FVP: k_fvg issues the next position group's loads before the current chain */
+#define FVG_L(PFV, U) if (fvg && (nt > 1 ? fvgp : fvgv) == 1 && NH / NKV % 4 == 0) k_fvg<1, 4, PFV, U><<<dim3(NH / 4, nt), 256, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG, fvf_on); else if (fvg && (nt > 1 ? fvgp : fvgv) == 2 && NH / NKV % 4 == 0) k_fvg<2, 4, PFV, U><<<dim3(NH / 4, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG, fvf_on); else if (fvg) k_fvg<2, 2, PFV, U><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG, fvf_on);
 static int fvf_on = 1; /* E_FVF: k_fvg straight-line groups without a rescale weight */
 static int fsb_on = 2; /* E_FSB: k_fsb, chunk tokens share each K load (2: transposed reduce, 1: dotg_reduce per score) */
 static int fexp_on = 1; /* E_FEXP: k_fw weights with the certified FP32 fw_expf */
@@ -2211,10 +2321,22 @@ static void enqueue(int nt, int tiny, int want) {
                 }
                 if (fexp_on) k_fw<true><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
                 else k_fw<false><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
-                if (fvg && (nt > 1 ? fvgp : fvgv) == 1 && NH / NKV % 4 == 0) k_fvg<1, 4><<<dim3(NH / 4, nt), 256, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG, fvf_on);
-                else if (fvg && (nt > 1 ? fvgp : fvgv) == 2 && NH / NKV % 4 == 0) k_fvg<2, 4><<<dim3(NH / 4, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG, fvf_on);
-                else if (fvg) k_fvg<2, 2><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG, fvf_on);
-                else k_fv<<<dim3(NH, nt), 256 / FVD, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
+                if (fvh_on && fvg && CTX % 4 == 0 && (nt > 1 ? fvgp : fvgv) != 1) {
+                    const int hg4 = (nt > 1 ? fvgp : fvgv) == 2 && NH / NKV % 4 == 0;
+                    if (hg4) { if (fvh_on == 2) k_fvh<4, 8><<<dim3(NH / 4, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
+                               else k_fvh<4, 4><<<dim3(NH / 4, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG); }
+                    else { if (fvh_on == 2) k_fvh<2, 8><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
+                           else k_fvh<2, 4><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG); }
+                }
+                else if (nt == 1 && fvp_on) switch (fvu_d) {
+                case 8: FVG_L(true, 8) break;
+                case 16: FVG_L(true, 16) break;
+                case 32: FVG_L(true, 32) break;
+                default: FVG_L(true, 4) break;
+                }
+                else if (fvp_on) { FVG_L(true, 4) }
+                else { FVG_L(false, 4) }
+                if (!fvg) k_fv<<<dim3(NH, nt), 256 / FVD, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
             } else
                 k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 4, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
                                                                  tdf ? d_fao : NULL, NH, NKV, CTX, ascale, BIG);
@@ -2349,6 +2471,9 @@ int main(int argc, char **argv) {
     if (getenv("E_FVGV")) fvgv = atoi(getenv("E_FVGV"));
     if (getenv("E_FVGP")) fvgp = atoi(getenv("E_FVGP"));
     if (getenv("E_FVF")) fvf_on = atoi(getenv("E_FVF"));
+    if (getenv("E_FVP")) fvp_on = atoi(getenv("E_FVP"));
+    if (getenv("E_FVU")) fvu_d = atoi(getenv("E_FVU"));
+    if (getenv("E_FVH")) fvh_on = atoi(getenv("E_FVH"));
     if (getenv("E_FSB")) fsb_on = atoi(getenv("E_FSB"));
     if (getenv("E_XQW")) xqw_on = atoi(getenv("E_XQW"));
     if (getenv("E_XQWD")) xqw_q1 = atoi(getenv("E_XQWD"));

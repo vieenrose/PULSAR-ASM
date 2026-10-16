@@ -1462,3 +1462,20 @@ each V conversion (k_fvg<2, 4>, E_FVGP, default 2); at one token it has only NH 
 nvprof 1500 tokens: k_fvg 2.76 s (FVF=0) -> 2.40 (FVF) -> 2.13 (FVF + <2, 4>). 4k ABBA
 (old/new/new/old): prefill 19.88 / 20.63 / 20.61 / 19.88, decode 9.89 / 10.12 / 10.11 / 9.89, golden
 PASS; checks ALL PASS. Score 13.60 (row 70) -> 14.44.
+74. k_fvg load prefetch (E_FVP) + lean FD=2 loop k_fvh (E_FVH) (keep, bit-identical; 4k score
++0.4%), with two measured-out k_fvg ideas. nvprof, decode k_fvg<2, 2>: IPC 3.15, issue slots 65%,
+stall exec-dependency 71%, memory dependency 0.4%: the kernel is issue-bound, and the loop
+around a group (predicated loads, 64-bit addresses, __half array shuffles) costs about as much
+as the ~60-instruction chain body. E_FVP=1 issues the next group's loads before the current
+chain: 4k ABBA (0/1/1/0) decode 10.11 / 10.17 / 10.18 / 10.11, score 14.45 -> 14.48. k_fvh
+(FD 2, HG 4 or 2) runs full groups unpredicated, weights as one float4 per head (ctx % 4 == 0,
+group start % 4 == 0), V as one half2 word per position (__low2float / __high2float); groups
+with a rescale weight and the tail keep k_fvg's per-position form, same arithmetic and order.
+4k ABBA (FVH 0/1/2/2/1/0): prefill 20.60 / 20.74 / 20.61 / 20.62 / 20.75 / 20.62, decode 10.16 /
+10.13 / 10.17 / 10.17 / 10.19 / 10.17, score 14.47 / 14.49 / 14.48 / 14.48 / 14.54 / 14.48; groups
+of 8 (E_FVH=2) give nothing. Local 2B logits + streams equal for FVH 0/1/2 x chunk 8/5/1;
+checks_b2 2B+4B ALL PASS.
+Measured out: (a) f16r on the FP32 pipe (C = 1.5 * 2^(e + 13), (y + C) - C, sign OR; exact for
+|y| < 2^15, checked exhaustively) to offload F2F pairs: longer dependent chain, more issues;
+4k ABBA E_FVF 1/3/5: score 14.26 / 13.41 / 12.94. (b) larger decode groups E_FVU 4/16/32 (with
+prefetch): decode 10.18 / 9.55 / 8.65 (register pressure, occupancy), not memory latency.
