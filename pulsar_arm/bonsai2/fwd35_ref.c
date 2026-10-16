@@ -209,9 +209,9 @@ static void load(void) {
     const int32_t *sv = kv_i32arr("prism.hadamard.sign_values", &nv);
     uint64_t o = 0;
     for (uint64_t i = 0; i < nw; i++) {
-        sign_w[nsign] = sw[i]; sign_v[nsign] = malloc(sizeof(float) * sw[i]);
-        for (int j = 0; j < sw[i]; j++) sign_v[nsign][j] = (float)sv[o + j];
-        o += sw[i]; nsign++;
+        int32_t swi; memcpy(&swi, sw + i, 4); sign_w[nsign] = swi; sign_v[nsign] = malloc(sizeof(float) * swi);
+        for (int j = 0; j < swi; j++) { int32_t t; memcpy(&t, sv + o + j, 4); sign_v[nsign][j] = (float)t; }
+        o += swi; nsign++;
     }
     if (o != nv) { fprintf(stderr, "sign_values length\n"); exit(1); }
     tok_embd = pt("token_embd.weight"); VOCAB = tok_embd.N;

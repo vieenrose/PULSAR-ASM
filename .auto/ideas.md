@@ -1213,3 +1213,27 @@ Throughput, TQ4, 4 sessions, steps 9-128: 59.54 ms/step = 16.79 tok/s aggregate,
 (solo 16.73). Capacity (TQ4): 4 sessions x 4032 positions = 602 MB of cache allocates (arena
 grows). 4B: 4 sessions == fork goldens (f16), TQ4 68.24 ms/step, 14.65 aggregate, 3.66 per user.
 Gates: checks.sh sections 1-4 green, measure 16.73 tps; checks_t4 green.
+
+59. Bonsai-2 (qwen35 hybrid: Gated DeltaNet + full attention, PTQ1_0 ternary) GPU engine on the
+Nano (keep; new model family, fwd35_sm53.cu, gates .auto/checks_b2.sh, fork goldens golden_b2_*).
+Bit-exact vs the PrismML fork: greedy 48 tokens, prompts A and B, 2B and 4B, on the Nano (sm_53)
+and a GTX 1070 (sm_61), batched prefill on and off. Decode (jetson_clocks, prompt A, 48 tok):
+2B 21.6 -> 21.97 tps, 4B 8.16 -> 9.94 tps from the tuning below; prefill 25.4 / 10.8 tps.
+Kept: (a) GEMV k_gemv<G,WR,TPB,RB,PD,AD> per-K shape table (G16 <16,1,8,2,2>, G20 <20,5,1,3,3>
+AD1, G32 <32,1,8,4,2> AD1, G48/G96 <..,3,2,4,2>, G72 <72,9,1,2,1>); AD=1 = immediate-offset
+addressing over a tail-padded arena (+2 MB codes, +1 MB scales), helps G20/G32, hurts G48/G72.
+(b) norm_xq with BS/2 threads: 512-thread x5 blocks exceeded 2048 threads/SM on the 4B, 190 ->
+110 us. (c) k_gdn: glibc-exact expf/logf gate scalars once per block into shared memory (fp64
+runs at 1/32 rate), 330 -> 282 us. (d) k_ab: 8-wide loads ahead of the in-order fma chain.
+Measured out, do not re-walk:
+- MTP / DFlash speculative decoding: the ternary GEMV is issue-bound per (row, token) (~286 SASS
+  per 128-weight group, ~180 of them the POPC/LOP3 core; ~13 GB/s ceiling vs 12.4 achieved), so
+  verifying k tokens costs about k decode steps. Batched prefill on sm_53, per-token cost vs
+  chunk 1: chunk 2 1.81x, 3 1.62x, 8 1.36x (4B 8.9 -> 6.56 tps); 2B chunk 8 19.4 vs 25.1 tps.
+  The same batching is 3.0-3.7x faster on the GTX 1070 (2B 151 -> 560, 4B 83 -> 252 tps), hence
+  E_PCHUNK defaults to 8 on cc >= 6.1 and 1 on sm_53. DFlash drafts (~1.57 GB) do not fit anyway.
+- The old pq1t_gemv_hs 4-word tree needs Q8_K (one scale per 256); Q8_0 per-32 scales block it.
+- Multi-element exact rms sum (wsum_sqv): slower on the Nano. RW interleave in k_gdn: no gain.
+- GEMV shape sweeps (E_V16 0-7, E_V48 0-6, E_V20/72/32): the table above is the sweep winner.
+Remaining 4B per-token GPU profile: G20 (in + ffu + head) ~44 ms, G72 16.7, G32 7.2, norm_xq 7,
+gdn 6.8, xq 2.4, fa 1.9 ms.
