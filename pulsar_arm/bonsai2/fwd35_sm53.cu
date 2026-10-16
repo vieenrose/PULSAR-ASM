@@ -869,32 +869,50 @@ __global__ __launch_bounds__(256) void k_fw(const int *posp, float *scg, int NH,
 #ifndef FVU
 #define FVU 4
 #endif
-__global__ __launch_bounds__(256, 8) void k_fv(const float *buf, const __half *vc, const int *posp, const float *scg,
-                                               float *att, float *fao, int NH, int NKV, int ctx, int bs_) {
+/* FVD dims per thread: the weight load, the ms branch and the S chain (equal for every dim)
+   are paid once per FVD chains instead of once per chain; FVD independent chains per thread
+   still hide the conversion latency */
+#define FVD 4
+__global__ void k_fv(const float *buf, const __half *vc, const int *posp, const float *scg,
+                     float *att, float *fao, int NH, int NKV, int ctx, int bs_) {
     const int h = blockIdx.x, tid = threadIdx.x;
     const int n = *posp + (int)blockIdx.y + 1, g = h / (NH / NKV);
     buf += (size_t)blockIdx.y * bs_; att += (size_t)blockIdx.y * NH * 256;
     if (fao) fao += (size_t)blockIdx.y * NH * 256;
     const float *wp = scg + ((size_t)blockIdx.y * NH + h) * ctx;
-    const __half *vp = vc + g * 256 + tid;
-    float vk = 0.0f, S = 0.0f;
+    const __half *vp = vc + g * 256 + tid * FVD;
+    float vk[FVD], S = 0.0f;
+#pragma unroll
+    for (int d = 0; d < FVD; d++) vk[d] = 0.0f;
     for (int ic0 = 0; ic0 < n; ic0 += FVU) {
-        __half vh[FVU]; float sw[FVU];
+        uint2 vh[FVU]; float sw[FVU];
 #pragma unroll
         for (int u = 0; u < FVU; u++)
-            if (ic0 + u < n) { vh[u] = vp[(size_t)(ic0 + u) * NKV * 256]; sw[u] = __ldg(wp + ic0 + u); }
+            if (ic0 + u < n) { vh[u] = *(const uint2 *)(vp + (size_t)(ic0 + u) * NKV * 256); sw[u] = __ldg(wp + ic0 + u); }
 #pragma unroll
         for (int u = 0; u < FVU; u++) {
             if (ic0 + u >= n) break;
-            const float w = fabsf(sw[u]), vv = __half2float(vh[u]);
-            if (__float_as_uint(sw[u]) >> 31) { vk = f16r(vk * w); vk = f16r(fmaf(vv, 1.0f, vk)); S = fmaf(S, w, 1.0f); }
-            else { vk = f16r(fmaf(vv, w, vk)); S = fmaf(S, 1.0f, w); }
+            const float w = fabsf(sw[u]);
+            __half hh[FVD]; memcpy(hh, &vh[u], sizeof(hh));
+            if (__float_as_uint(sw[u]) >> 31) {
+#pragma unroll
+                for (int d = 0; d < FVD; d++) { vk[d] = f16r(vk[d] * w); vk[d] = f16r(fmaf(__half2float(hh[d]), 1.0f, vk[d])); }
+                S = fmaf(S, w, 1.0f);
+            } else {
+#pragma unroll
+                for (int d = 0; d < FVD; d++) vk[d] = f16r(fmaf(__half2float(hh[d]), w, vk[d]));
+                S = fmaf(S, 1.0f, w);
+            }
         }
     }
     const float Si = S == 0.0f ? 0.0f : 1.0f / S;
-    const float acc = vk * Si;
-    if (fao) fao[h * 256 + tid] = acc;
-    att[h * 256 + tid] = acc * d_sigm(buf[h * 512 + 256 + tid]);
+#pragma unroll
+    for (int d = 0; d < FVD; d++) {
+        const int j = h * 256 + tid * FVD + d;
+        const float acc = vk[d] * Si;
+        if (fao) fao[j] = acc;
+        att[j] = acc * d_sigm(buf[h * 512 + 256 + tid * FVD + d]);
+    }
 }
 
 /* ---- argmax: first index of the maximum ---- */
@@ -1308,7 +1326,7 @@ static void enqueue(int nt, int tiny, int want) {
                 default: k_fs<4><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 }
                 k_fw<<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
-                k_fv<<<dim3(NH, nt), 256, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
+                k_fv<<<dim3(NH, nt), 256 / FVD, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
             } else
                 k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 4, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
                                                                  tdf ? d_fao : NULL, NH, NKV, CTX, ascale, BIG);
