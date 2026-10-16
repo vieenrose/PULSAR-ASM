@@ -1177,3 +1177,22 @@ at that occupancy warp 0 no longer straggles. Engine A/B PQ1_HSG=0, ab_pair 1 pa
 vs 16.45/16.44 tps (+1.83% both orders). nvprof in the engine: hs<3> 411.7 -> 384.9 us per call
 (576 calls, SEG=1 -> SEG=0 instance). Same chain, same order: default PQ1_HSG 1 -> 0. Gates green
 on a fresh build, 16.72 tps.
+
+57. Ternary-Bonsai-4B phase 2: the pq1 GPU engine under -DPQ1_TERN (keep; 4B 10.1 -> 14.5 tps).
+PQ2_0 rows repack to two 1-bit planes (b0 | b1, K/32 words each); pq1t_gemv_hs<G,WR,TPB,MINB,RB,PD>
+runs one Harley-Seal sign count per plane against the Q8_K sign-magnitude planes, isum =
+2*S(b1) + S(b0) - S - S_N, then (ws*db)*isum per group, summed in group order with __fadd_rn: the
+fork's pq2 vec_dot order. pq1t_parity: BIT-EXACT at qkv 6144x2560, o 2560x4096, gate+up
+19456x2560, down 2560x9728, head 151669x2560, 1001x2560, 37x9728. Engine A/B (PQ1_KVTQ=0) equal
+the fork goldens 44/44 and 26/26.
+(a) rms_q8k at n=2560: lane-0 tail fell to the serial fp64 chain on every call for n not a power
+of two (230 us x 73 calls = 17 ms/token). Bracket S = H + L in fp64 with directed rounding
+(S(1 -/+ 2^-40)/n), accept when both ends round to the same float, else serial. pq1_parity rms
+2560/4096/1280 bit-exact (fallback on ~20% of the steered-to-midpoint vectors only); nvprof
+230 -> 13.9 us/call; decode 99 -> 83.7 ms. Q1 n=4096 path unchanged (gates green).
+(b) Team shapes per K (pq1t_parity, 50-launch mean, us): K=2560 <20,5,1,4,2,2> -> <20,2,2,4,4,2>
+qkv 296 -> 235, gate+up 900 -> 726, head 6979 -> 5556; K=4096 <32,1,4,6,4,2> -> <..,3,3> 187 ->
+149; K=9728 <76,5,1,4,4,2> -> <..,3,3> 525 -> 429. Tried and slower: RB 1/PD 1, RB 3/PD 1,
+RB 5/PD 5, RB 6/PD 3, TPB 8/MINB 3, WR 4. Engine, order HST 1 0 0 1: 83.76 / 68.71 / 69.15 /
+83.75 ms per token (-17.7%), streams identical. TQ4 default: 68.4 ms (14.6 tps), 5/44 tokens
+differ from the f16 stream (lossy cache, no 4B TQ goldens frozen). Q1 gates green, 16.72 tps.

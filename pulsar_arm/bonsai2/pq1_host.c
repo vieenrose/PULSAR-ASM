@@ -23,6 +23,58 @@ float pq1_h2f(uint16_t h) {
   float r; memcpy(&r, &o, 4); return r;
 }
 
+#ifdef PQ1_TERN
+void pq1_split_repack(const uint8_t *q2, int rows, int K, uint32_t *w_bits,
+                      uint16_t *w_scales_h) {
+  int nb = K / 128;                 /* 34B blocks per row */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (int r = 0; r < rows; r++) {
+    const uint8_t *row = q2 + (size_t)r * nb * 34;
+    uint32_t *p0 = w_bits + (size_t)r * PQ1_RW(K), *p1 = p0 + K / 32;
+    uint16_t *sc = w_scales_h + (size_t)r * nb;
+    for (int b = 0; b < nb; b++) {
+      const uint8_t *c = row + b * 34 + 2;
+      for (int j = 0; j < 4; j++) {
+        uint32_t w0 = 0, w1 = 0;
+        for (int a = 0; a < 32; a++) {
+          const int i = 32 * j + a, code = (c[i >> 2] >> ((i & 3) * 2)) & 3;
+          w0 |= (uint32_t)(code & 1) << a;
+          w1 |= (uint32_t)(code >> 1) << a;
+        }
+        p0[b * 4 + j] = w0;
+        p1[b * 4 + j] = w1;
+      }
+      memcpy(sc + b, row + b * 34, 2);          /* fp16 scale, verbatim */
+    }
+  }
+}
+
+/* the fork's PQ2_0 x Q8_K dot (pq2_host.c pq2_gemv_cpu) on the plane layout */
+void pq1_gemv_cpu(int rows, int K, const uint32_t *w_bits,
+                  const uint16_t *w_scales_h, const uint8_t *xq, float *y) {
+  int nb = K / 128;
+  for (int r = 0; r < rows; r++) {
+    const uint32_t *p0 = w_bits + (size_t)r * PQ1_RW(K), *p1 = p0 + K / 32;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; b++) {
+      const uint8_t *qb = xq + (size_t)(b >> 1) * 292;
+      float db; memcpy(&db, qb, 4);
+      const int8_t *qs = (const int8_t *)(qb + 4 + (b & 1) * 128);
+      float ws = pq1_h2f(w_scales_h[(size_t)r * nb + b]);
+      int isum = 0;
+      for (int i = 0; i < 128; i++) {
+        const int b0 = (p0[b * 4 + (i >> 5)] >> (i & 31)) & 1;
+        const int b1 = (p1[b * 4 + (i >> 5)] >> (i & 31)) & 1;
+        isum += (2 * b1 + b0 - 1) * (int)qs[i];
+      }
+      acc += (ws * db) * (float)isum;
+    }
+    y[r] = acc;
+  }
+}
+#else
 void pq1_split_repack(const uint8_t *q1, int rows, int K, uint32_t *w_bits,
                       uint16_t *w_scales_h) {
   int nb = K / 128;                 /* 18B blocks per row */
@@ -66,6 +118,8 @@ void pq1_gemv_cpu(int rows, int K, const uint32_t *w_bits,
     y[r] = acc;
   }
 }
+
+#endif
 
 /* T-MAC bit-plane repack of the Q8_K activations (run #41 experiment).
  *

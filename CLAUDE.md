@@ -45,6 +45,17 @@ Engine env vars reach the remote **only** through `PQ1_EXTRA="VAR=1 VAR2=0" bash
 
 The three gates, never overridable: (1) `pq1_parity` all four kernels bit-exact at K=4096 (256/256) and K=12288 (512/512); (2) greedy stream on prompt A equals `.auto/golden_q1_A.txt` (44 tokens); (3) held-out prompt B equals `.auto/golden_q1_B.txt` (26 tokens). Gates 2-3 run with the exact f16 cache (`PQ1_KVTQ=0`). `checks.sh` also checks the lossy TQ4 default against `.auto/golden_q1_{A,B}_tq4.txt`; regenerate those only with a recorded reason. A gate failure is information, not something to work around; the tooling auto-reverts it.
 
+### Ternary-Bonsai-4B on the Nano (`-DPQ1_TERN -DBONSAI_4B`)
+
+The same pq1 sources build a PQ2_0 ternary engine: `PQ1_TERN` switches the repack to two bit planes per row (b0, b1; code = b0 + 2*b1, weight = code - 1), the host reference to the fork's `ggml_vec_dot_pq2_0_q8_K` order, and every GEMV to `pq1t_gemv_hs` (r128/r256/swar/T-MAC are Q1-only and return -1). `BONSAI_4B` sets the 4B shape in `fwd8.c` (HID 2560, INTER 9728, QDIM 4096, 36 layers, tied head). Model `/home/pesi/t4b.gguf`, build dir `/home/pesi/t4`.
+
+```bash
+bash .auto/build_t4.sh     # fwd8_t4 + pq1t_parity in /home/pesi/t4
+bash .auto/checks_t4.sh    # pq1t_parity (7 shapes, both PQ1_HST arms), rms n=2560, A/B vs fork goldens golden_t4_{A,B}.txt (PQ1_KVTQ=0)
+```
+
+`golden_t4_*` come from the fork itself (llama-cli `-fa on`, f16 cache), not from the engine. `PQ1_HST=1` selects the first bring-up team shapes for A/B; `./pq1t_parity [rows K ...]` times and bit-checks any shape. There are no frozen TQ4 goldens for the 4B yet.
+
 ## Measurement discipline (the expensive lessons)
 
 - The board drifts 2-6% between hours; never compare against a number from another run. Use `ab_pair.sh` (one pair in each order). A single cold harness sample is worth about ±1%.

@@ -168,8 +168,8 @@ static int steer(float *x, int n, double delta) {
   }
   return 0;
 }
-static int rms_parity(void) {
-  const int n = 4096, NV = 600;
+static int rms_parity(int n) {   /* n: 4096 (8B), 2560 (4B) */
+  const int NV = 600;
   float *X = malloc(n * 4), *R = malloc(n * 4), *W = malloc(n * 4), *Xh = malloc(n * 4), *Xd = malloc(n * 4);
   const size_t qb = (size_t)(n / 256) * 292;
   uint8_t *qh = malloc(qb), *qd = malloc(qb);
@@ -736,7 +736,7 @@ int main(int argc, char **argv) {
 #if defined(PQ1_REAL_CUDA)
   if (argc > 1 && !strcmp(argv[1], "fa")) return fa_parity();
   if (argc > 1 && !strcmp(argv[1], "apre")) return apre_parity();
-  if (argc > 1 && !strcmp(argv[1], "rms")) return rms_parity();
+  if (argc > 1 && !strcmp(argv[1], "rms")) return rms_parity(argc > 2 ? atoi(argv[2]) : 4096);
   if (argc > 1 && !strcmp(argv[1], "fpl")) return fpl_parity();
   if (argc > 1 && !strcmp(argv[1], "expf")) return expf_parity();
   if (argc > 1 && !strcmp(argv[1], "argmax")) return argmax_parity();

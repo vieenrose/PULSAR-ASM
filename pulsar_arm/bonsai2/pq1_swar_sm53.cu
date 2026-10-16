@@ -403,6 +403,9 @@ extern "C" int pq1_gemv_r128_launch(const uint8_t* w_codes,
                                     const unsigned short* w_scales_h,
                                     const uint8_t* xq, float* y, int K, int N,
                                     void* stream) {
+#ifdef PQ1_TERN
+  return -1;   /* Q1_0 layout only */
+#endif
   if ((K & 127) != 0) return -2;
   if (K <= 0 || K > PQ1_MAXK || N <= 0) return -2;
   dim3 block(256, 1, 1);
@@ -532,6 +535,9 @@ extern "C" int pq1_gemv_r256_launch(const uint8_t* w_codes,
                                     const unsigned short* w_scales_h,
                                     const uint8_t* xq, float* y, int K, int N,
                                     void* stream) {
+#ifdef PQ1_TERN
+  return -1;   /* Q1_0 layout only */
+#endif
   if ((K & 127) != 0) return -2;
   if (K <= 0 || K > PQ1_MAXK || N <= 0) return -2;
   dim3 block(256, 1, 1);
@@ -1153,6 +1159,178 @@ extern "C" int pq1_gemv_hs_launch(const uint8_t* w_codes,
   return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
 }
 
+#ifdef PQ1_TERN
+/* Ternary hs (PQ1_TERN: Ternary-Bonsai-4B, PQ2_0). A row is two bit planes,
+ * b0 and b1 (pq1_split_repack), code c = b0 + 2 b1, weight c - 1. With the
+ * sign-magnitude activation of hs_group_s (N = sign plane, S = sum |x|,
+ * T(m) = sum_q 2^q popc((m ^ N) & Q_q) = sum over m != N of |x|) a 1-bit
+ * mask m gives sum_i x_i (2 m_i - 1) = 2 T(m) - S, hence
+ *   isum = sum (2 b1 + b0 - 1) x = 2 T(b1) + T(b0) - S - S_N,
+ * S_N = sum over N of |x| (S and A = sum x share parity, so the halves cancel
+ * exactly). The same integer as the reference, then the same fp chain:
+ * prod = (ws * db) * (float)isum, row sum from 0.0f in group order.
+ *
+ * Any K with G = K/128 groups: a team of WR warps holds R = 32 WR / G rows
+ * per pass (lane = slot * G + group, lanes past R * G idle), RB passes per
+ * batch, so a batch is RB * R rows and lanes 0..RB*R-1 each sum one row. */
+template <int G, int WR, int TPB, int MINB, int RB, int PD>
+__global__ __launch_bounds__(32 * WR * TPB, MINB)
+void pq1t_gemv_hs(const uint8_t* __restrict__ w_codes, const __half* __restrict__ w_scales,
+                  const uint32_t* __restrict__ xpl, float* __restrict__ y, int N) {
+  constexpr int L = 32 * WR;
+  constexpr int R = L / G;
+  constexpr int RBR = RB * R;
+  constexpr int PS = G + 4;
+  constexpr int NBUF = WR > 1 ? 2 : 1;
+  static_assert(R >= 1 && RBR <= L && G % 4 == 0, "shape");
+  static_assert(RB % PD == 0, "load ring must realign at each batch");
+  __shared__ __align__(16) float sh_p[TPB][NBUF][RBR * PS];
+  const int warp = (int)threadIdx.x >> 5, lane = (int)threadIdx.x & 31;
+  const int team = warp / WR, wt = warp - team * WR;
+  const int lid = wt * 32 + lane;
+  const int slot = lid / G, g = lid - slot * G;
+  const bool act = slot < R;
+
+  uint32_t p[8][4];
+  uint32_t n[4] = {0u, 0u, 0u, 0u};
+  float db = 0.0f;
+  int cg = 0;
+  if (act) {
+    const uint32_t* pb = xpl + (g >> 1) * 73 + 1 + (g & 1) * 32;
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+#pragma unroll
+      for (int q = 0; q < 8; q++) p[q][j] = __ldg(pb + j * 8 + q);
+    db = __int_as_float((int)__ldg(xpl + (g >> 1) * 73));
+    int asum = 0, an = 0;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      n[j] = ~p[7][j];
+      uint32_t c = n[j];
+#pragma unroll
+      for (int q = 0; q < 7; q++) {
+        const uint32_t t = p[q][j] ^ n[j];
+        p[q][j] = t ^ c;
+        c &= t;
+        asum += __popc(p[q][j]) << q;
+        an += __popc(p[q][j] & n[j]) << q;
+      }
+    }
+    cg = -asum - an;
+  }
+
+  const int nbatch = (N + RBR - 1) / RBR;
+  const int stride = (int)gridDim.x * TPB;
+  int bi = (int)blockIdx.x * TPB + team;
+  if (bi >= nbatch) return; /* team-uniform */
+  const uint4* wq = reinterpret_cast<const uint4*>(w_codes) + slot * 2 * G + g;
+  const __half* sq = w_scales + slot * G + g;
+  int r0 = min(bi * RBR, N - RBR);
+  const uint4* wb = wq + (size_t)r0 * 2 * G;
+  const __half* sb = sq + (size_t)r0 * G;
+  uint4 c0r[PD], c1r[PD];
+  __half wsr[PD];
+  if (act) {
+#pragma unroll
+    for (int i = 0; i < PD; i++) {
+      c0r[i] = __ldg(wb + i * R * 2 * G);
+      c1r[i] = __ldg(wb + i * R * 2 * G + G);
+      wsr[i] = __ldg(sb + i * R * G);
+    }
+  }
+  int buf = 0;
+  for (;;) {
+    const int bnext = bi + stride;
+    const int rn0 = bnext < nbatch ? min(bnext * RBR, N - RBR) : r0;
+    const uint4* wn = wq + (size_t)rn0 * 2 * G;
+    const __half* sn = sq + (size_t)rn0 * G;
+    float* P = sh_p[team][buf];
+    if (act) {
+#pragma unroll
+      for (int rr = 0; rr < RB; rr++) {
+        const uint4 c0 = c0r[rr % PD], c1 = c1r[rr % PD];
+        const __half wsh = wsr[rr % PD];
+        const uint4* wl = rr + PD < RB ? wb + (rr + PD) * R * 2 * G : wn + (rr + PD - RB) * R * 2 * G;
+        const __half* sl = rr + PD < RB ? sb + (rr + PD) * R * G : sn + (rr + PD - RB) * R * G;
+        c0r[rr % PD] = __ldg(wl);
+        c1r[rr % PD] = __ldg(wl + G);
+        wsr[rr % PD] = __ldg(sl);
+        const int isum = 2 * hs_group_s(p, n, c1) + hs_group_s(p, n, c0) + cg;
+        P[(rr * R + slot) * PS + g] = __fmul_rn(__fmul_rn(__half2float(wsh), db), (float)isum);
+      }
+    }
+    if (WR == 1) __syncwarp();
+    else asm volatile("bar.sync %0, %1;" ::"r"(team + 1), "r"(L));
+    if (lid < RBR) {
+      const float4* src = reinterpret_cast<const float4*>(P + lid * PS);
+      float acc = 0.0f;
+#pragma unroll
+      for (int k = 0; k < G / 4; k++) {
+        const float4 v = src[k];
+        acc = __fadd_rn(acc, v.x);
+        acc = __fadd_rn(acc, v.y);
+        acc = __fadd_rn(acc, v.z);
+        acc = __fadd_rn(acc, v.w);
+      }
+      y[r0 + lid] = acc;
+    }
+    if (bnext >= nbatch) break;
+    if (WR == 1) __syncwarp(); /* single tile: read before the next batch writes */
+    else buf ^= 1;              /* two tiles: the next barrier orders the reuse */
+    bi = bnext; r0 = rn0; wb = wn; sb = sn;
+  }
+}
+
+template <int G, int WR, int TPB, int MINB, int RB, int PD>
+static int hst_launch(const uint8_t* w_codes, const __half* w_scales, const uint32_t* xpl,
+                      float* y, int N, cudaStream_t s) {
+  constexpr int RBR = RB * (32 * WR / G);
+  if (N < RBR) return -2;
+  static int nres = 0;
+  if (nres == 0) {
+    int per = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, pq1t_gemv_hs<G, WR, TPB, MINB, RB, PD>,
+                                                  32 * WR * TPB, 0);
+    int dev = 0, nsm = 1;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+    nres = (per > 0 ? per : 1) * nsm;
+  }
+  int nbatch = (N + RBR - 1) / RBR;
+  int nblk = (nbatch + TPB - 1) / TPB;
+  if (nblk > nres) nblk = nres;
+  pq1t_gemv_hs<G, WR, TPB, MINB, RB, PD><<<nblk, 32 * WR * TPB, 0, s>>>(w_codes, w_scales, xpl, y, N);
+  return (cudaGetLastError() == cudaSuccess) ? 0 : -1;
+}
+
+extern "C" int pq1_tmx_uses_au(int K, int N) { (void)K; (void)N; return 0; }
+
+/* Team shape per K, tuned with pq1t_parity (Nano, 50-launch mean): 6144x2560 235 us,
+   2560x4096 149, 2560x9728 429, head 151669x2560 5556. PQ1_HST=1 restores the
+   first bring-up shapes (296 / 187 / 525 / 6979 us) for same-job A/B. */
+extern "C" int pq1_tmx_launch(const uint8_t* w_codes, const unsigned short* w_scales_h,
+                              const uint32_t* xpl, const int* xau, float* y, int K, int N,
+                              void* stream) {
+  (void)xau;
+  static int v = -1;
+  if (v < 0) { const char* e = getenv("PQ1_HST"); v = e ? atoi(e) : 0; }
+  const __half* ws = reinterpret_cast<const __half*>(w_scales_h);
+  cudaStream_t s = (cudaStream_t)stream;
+  switch (K) {
+    case 2560:
+      if (v == 1) return hst_launch<20, 5, 1, 4, 2, 2>(w_codes, ws, xpl, y, N, s);
+      return hst_launch<20, 2, 2, 4, 4, 2>(w_codes, ws, xpl, y, N, s);
+    case 4096:
+      if (v == 1) return hst_launch<32, 1, 4, 6, 4, 2>(w_codes, ws, xpl, y, N, s);
+      return hst_launch<32, 1, 4, 6, 3, 3>(w_codes, ws, xpl, y, N, s);
+    case 9728:
+      if (v == 1) return hst_launch<76, 5, 1, 4, 4, 2>(w_codes, ws, xpl, y, N, s);
+      return hst_launch<76, 5, 1, 4, 3, 3>(w_codes, ws, xpl, y, N, s);
+    default:
+      return -2;
+  }
+}
+#else
 /* 1 when pq1_tmx_launch(K, N) reads the per-group sums xau: the sign-magnitude
  * hs kernels rebuild them from the planes, tm and the offset-form arm do not. */
 extern "C" int pq1_tmx_uses_au(int K, int N) {
@@ -1174,6 +1352,8 @@ extern "C" int pq1_tmx_launch(const uint8_t* w_codes, const unsigned short* w_sc
             : pq1_gemv_tm_launch(w_codes, w_scales_h, xpl, xau, y, K, N, stream);
 }
 
+
+#endif
 
 /* Device-side T-MAC activation prep (run #72). The engine used to build the
  * bit planes and the per-group sums on the host (pq1_build_planes/_au: 0.21 ms
@@ -1284,6 +1464,9 @@ extern "C" int pq1_gemv_sm53_launch(const uint8_t *w_codes,
                                     const unsigned short *w_scales_h,
                                     const uint8_t *xq, float *y, int K, int N,
                                     void *stream) {
+#ifdef PQ1_TERN
+  return -1;   /* Q1_0 layout only */
+#endif
   if ((K & 127) != 0) return -2;
   if (K <= 0 || K > PQ1_MAXK || N <= 0) return -2;
   dim3 block(256, 1, 1);
@@ -1460,6 +1643,9 @@ extern "C" int pq1_gemv_batch_launch(int use256, const uint8_t* const* codes,
                                      float* const* ys, const int* rows, int n,
                                      int K, int N, const uint8_t* xq,
                                      void* stream) {
+#ifdef PQ1_TERN
+  return -1;   /* Q1_0 layout only */
+#endif
   if ((K & 127) != 0) return -2;
   if (K <= 0 || K > PQ1_MAXK || N <= 0 || n < 1 || n > PQ1_BN) return -2;
   const uint8_t* c[PQ1_BN] = {codes[0], n > 1 ? codes[1] : codes[0],
@@ -2869,6 +3055,16 @@ __global__ __launch_bounds__(1024) void pq1_rms_q8k(float* __restrict__ X,
                pq1_fgt(pq1_fmul(hdn, 0.99999904632568359375f), pq1_fsub(eh, L));
         }
         float f = pq1_fmul(H, pq1_fdiv(1.0f, (float)n));   /* exact reciprocal when ok */
+        if (!ok && !serial && (n & (n - 1)) && hb >= 0x0d800000u && hb < 0x7f800000u) {
+          /* n not a power of two (the 4B's 2560): H + L is exact in double and
+           * s lies within 2^-40 of it (bound above), so as in V = 1 both ends
+           * of that interval, rounded outward and divided, must give one
+           * float; division and the conversion are monotone in s */
+          const double S = __dadd_rn((double)H, (double)L);
+          const float flo = pq1_d2f(__ddiv_rn(__dmul_rd(S, 1.0 - 1.0 / 1099511627776.0), (double)n));
+          const float fhi = pq1_d2f(__ddiv_rn(__dmul_ru(S, 1.0 + 1.0 / 1099511627776.0), (double)n));
+          if (__float_as_uint(flo) == __float_as_uint(fhi)) { f = flo; ok = 1; }
+        }
         if (!ok) {
           double q = 0.0;
           for (int j = 0; j < n; j++) { const double e = pq1_f2d(sx[j]); q = __fma_rn(e, e, q); }

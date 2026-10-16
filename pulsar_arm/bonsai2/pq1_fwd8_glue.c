@@ -167,6 +167,10 @@ static int pq1_hyb_rows_of(int rows, int cap) {
     const char *t = getenv("PQ1_HYB_THREADS");
     if (t) pq1_hyb_threads(atoi(t));
   }
+#ifdef PQ1_TERN
+  (void)cap;
+  return 0;   /* the host tail kernels (pq1_hyb_rows) read the Q1_0 layout */
+#endif
   if (!PQ1_HYB || rows < 1024) return 0;
   int h = (int)((long)rows * PQ1_HYB / 100) & ~127;
   if (h > cap) h = cap & ~127;
@@ -176,7 +180,7 @@ static int pq1_hyb_rows_of(int rows, int cap) {
 /* take the tail of a split (codes, scales) block: hrows rows starting at row0 */
 static int pq1_hyb_take(const uint32_t *codes, const uint16_t *scales, int row0, int hrows,
                         int cols, uint32_t **hc, float **hs) {
-  size_t cw = (size_t)cols / 32, nb = (size_t)cols / 128;
+  size_t cw = PQ1_RW(cols), nb = (size_t)cols / 128;
   *hc = NULL; *hs = NULL;
   if (!hrows) return 0;
   *hc = (uint32_t *)malloc((size_t)hrows * cw * 4);
@@ -587,7 +591,7 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
 #ifdef PQ1_USE_CUDA
   if (ci >= 0) {
     if (!PQ1C[ci].d_codes && codes) {
-      size_t ncb = (size_t)rows * (cols / 32) * 4, nsb = (size_t)rows * ng * 2;
+      size_t ncb = (size_t)rows * PQ1_RW(cols) * 4, nsb = (size_t)rows * ng * 2;
       size_t a = (ncb + 63) / 64 * 64, b = (nsb + 63) / 64 * 64;
       if (pq1_arena_init(a + b) == 0) {
         uint8_t *pb = PQ1ARENA + PQ1ACUR;
@@ -613,7 +617,7 @@ void pq1_pq1_compat_gemv(int rows, int cols, const unsigned char *w,
            * memory -- a fallback re-repack would re-read them from the
            * file. This is the resident mass on a 4GB board. */
           {
-            size_t tbytes = (size_t)rows * ng * 18;
+            size_t tbytes = (size_t)rows * ng * PQ1_GGUF_BB;
             uintptr_t p0 = (uintptr_t)w & ~(uintptr_t)4095;
             uintptr_t p1 = ((uintptr_t)w + tbytes + 4095) & ~(uintptr_t)4095;
             if (p1 > p0) madvise((void *)p0, (size_t)(p1 - p0), MADV_DONTNEED);
@@ -943,7 +947,7 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
       if (same) { mi = i; break; }
     }
   }
-  size_t rowcb = (size_t)(cols / 32) * 4, rowsc = (size_t)(cols / 128) * 2;
+  size_t rowcb = PQ1_RW(cols) * 4, rowsc = (size_t)(cols / 128) * 2;
   size_t ncb = (size_t)total * rowcb, nsb = (size_t)total * rowsc;
   size_t a = (ncb + 63) / 64 * 64, b = (nsb + 63) / 64 * 64;
   if (mi < 0) {
@@ -986,7 +990,7 @@ int pq1_pq1_compat_gemv_batch(const unsigned char *const *w, const int *rows, in
       oc += cb;
       os += sb;
       /* the GGUF pages of a tensor consumed by a merged tensor are single-use */
-      size_t tbytes = (size_t)rows[i] * (cols / 128) * 18;
+      size_t tbytes = (size_t)rows[i] * (cols / 128) * PQ1_GGUF_BB;
       uintptr_t p0 = (uintptr_t)w[i] & ~(uintptr_t)4095;
       uintptr_t p1 = ((uintptr_t)w[i] + tbytes + 4095) & ~(uintptr_t)4095;
       if (p1 > p0) madvise((void *)p0, (size_t)(p1 - p0), MADV_DONTNEED);

@@ -438,7 +438,7 @@ static int NPOS;
 static void embed(int id) {
     uint8_t *W = tw("token_embd.weight");
     int ng = HID / 128;
-#ifdef PQ1_BUILD
+#if defined(PQ1_BUILD) && !defined(PQ1_TERN)
     /* Real Q1_0 (1-bit) checkpoint: 18-byte blocks = fp16 scale + 128
      * packed bits, bit=1 -> +1. Selected by the shim for the 1-bit build;
      * the 2-bit path below is unchanged. */

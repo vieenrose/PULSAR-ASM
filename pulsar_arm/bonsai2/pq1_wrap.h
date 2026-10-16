@@ -6,6 +6,21 @@
 extern "C" {
 #endif
 
+/* PQ1_TERN (compile-time, every TU): the same engine on a PQ2_0 checkpoint
+ * (Ternary-Bonsai-4B; 34B blocks = fp16 scale + 128 2-bit codes, value =
+ * code - 1). pq1_split_repack then writes each row as two bit planes of
+ * K/32 words each, [b0 plane | b1 plane] (group g's 128 bits at words
+ * 4g..4g+3 of each plane, bit a of word j = weight 32j + a), so a row is
+ * K/16 words; pq1_gemv_cpu is the fork's PQ2_0 x Q8_K dot. PQ1_GGUF_BB is the
+ * GGUF block size, PQ1_RW(K) the repacked u32 words per row. */
+#ifdef PQ1_TERN
+#define PQ1_GGUF_BB 34
+#define PQ1_RW(K) ((size_t)(K) / 16)
+#else
+#define PQ1_GGUF_BB 18
+#define PQ1_RW(K) ((size_t)(K) / 32)
+#endif
+
 /* Q1_0 block (18B): fp16 scale + 16B of 128 packed bits, LSB-first.
  * Split into w_bits [rows*K/32] u32 (bit=1 -> +1) and w_scales [rows*K/128]
  * fp16 verbatim. */
