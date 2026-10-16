@@ -1433,3 +1433,32 @@ prompt), streams identical (tiny and non-tiny order); checks_b2 2B+4B ALL PASS; 
 (GF 1/0/0/1): decode 9.89 / 9.84 / 9.83 / 9.85, prefill 18.77-18.78 all four, golden PASS. The win
 is far below the ~2 ms the handoff estimated: in a CUDA graph on the Nano the small kernels cost
 little beyond their memory traffic, which the fusion keeps.
+71. Warp-form FWHT + Q8_0, k_xqw / k_norm_xqw (keep, bit-identical; 4k prefill +2.7%, decode +1.1%).
+A Hadamard block of 512 runs on 16 / Q warps with Q elements per lane: stages len < 32 by shuffle
+(lane ^ len), the next log2 Q in registers, the rest through shared (2 barriers each); every
+butterfly is the shared-memory form's (u + w low, u - w high, same operands, increasing len), then
+q8word per word. E_XQW=0 restores k_xq / k_norm_xq; E_XQWD (one token, default 2 = 8 warps per
+Hadamard block) and E_XQWP (token batch, default 4) pick Q. Only BS == 512 uses it. Nano 4B,
+96-token decode: Q 16 / 8 / 4 / 2 / 1 = 11.86 / 12.36 / 12.58 / 12.67 / 12.58 vs 12.49 for k_xq
+(ABBA); 390-token chunk-8 prefill: 23.19 / 23.47 / 23.57 / 23.47 vs 22.81. Local logits and
+streams bit-equal for every Q. 4k ABBA (XQW 0/1/1/0): prefill 18.80 / 19.30 / 19.30 / 18.78,
+decode 9.86 / 9.95 / 9.97 / 9.85, golden PASS; checks_b2 2B+4B ALL PASS.
+72. P4 k_fs part, k_fsb: chunk-batched scores with a transposed reduce (keep, bit-identical; 4k prefill
++3.9%). One block per KV group and 256-position tile scores all chunk tokens (<= 8), each K row
+loaded and converted once per chunk. With 32 / GQ positions per warp pass, the pass's 32
+dotg_reduce trees run transposed (stages 16, 8, 4, 1, 2: a lane keeps half its sets and swaps
+the other half, 31 shuffles per 32 scores instead of 160; every add is lower + upper, which
+commutes bitwise). nvprof, 1500-token prompt: k_fs 2.12 s, k_fsb with plain dotg_reduce 1.73 s,
+transposed 0.875 s. The transposed reduce alone (k_fst, one token per block) was 2.20 s, slower,
+which matches loop row 9 (P5 measured out): it pays only once the K loads are shared. E_FSB=0
+restores k_fs, 1 = k_fsb with dotg_reduce. 4k ABBA (FSB 0/2/2/0): prefill 19.27 / 20.04 / 20.04 /
+19.29, decode 9.95 / 9.95 / 9.94 / 9.94, golden PASS; checks ALL PASS.
+73. k_fvg straight-line groups + k_fvg<2, 4> for chunks (keep, bit-identical; 4k prefill +3.7%, decode
++2.3%). When none of a group's FVU x HG weights carries the rescale sign (warp-uniform, one OR of
+the sign bits), the group runs without the per-weight branch; SASS showed the branch/SYNC
+skeleton beside the F2F chains. E_FVF=0 restores the old loop. For token batches, 4 heads share
+each V conversion (k_fvg<2, 4>, E_FVGP, default 2); at one token it has only NH / 4 blocks and is
+0.4% slower at 4k decode (10.09 / 10.05 / 10.04 / 10.08), so decode keeps k_fvg<2, 2> (E_FVGV).
+nvprof 1500 tokens: k_fvg 2.76 s (FVF=0) -> 2.40 (FVF) -> 2.13 (FVF + <2, 4>). 4k ABBA
+(old/new/new/old): prefill 19.88 / 20.63 / 20.61 / 19.88, decode 9.89 / 10.12 / 10.11 / 9.89, golden
+PASS; checks ALL PASS. Score 13.60 (row 70) -> 14.44.

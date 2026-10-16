@@ -118,11 +118,11 @@ the 4k golden, keeps RSS at or below ~200 MB, and is decided by a same-job ABBA.
    - Each state row stays in registers across the chunk's tokens. Rows are independent and the
      per-row arithmetic is unchanged.
    - Also batch k_ab: it costs 3.4 ms in prefill vs 1.4 in decode.
-4. **P4, batched prefill attention (12.3 -> ~8 ms).**
+4. **P4, batched prefill attention (12.3 -> ~8 ms).** PARTLY DONE (ideas rows 72-73): k_fsb shares K across the chunk with a transposed reduce (k_fs 2.4x), k_fvg straight-line groups + 4 heads per V conversion for chunks; V still re-read per token.
    - Share the K/V loads and the K/V f16 -> f32 conversions across the chunk.
    - The per-token V-chain rounding cannot be shared, so the gain is bounded at about 1/3 of the
      conversion work.
-5. **P5, k_fs score reduction (7.1 -> ~4 ms at 4k).** MEASURED OUT (loop row 9: 0.82 -> 0.88 ms).
+5. **P5, k_fs score reduction (7.1 -> ~4 ms at 4k).** MEASURED OUT (loop row 9: 0.82 -> 0.88 ms). Alone it loses; inside the chunk-batched k_fsb it is the main win (row 72).
    - Use a shuffle transpose-reduce (31 SHFL per 32 scores instead of 5 per score) that yields
      the same xor-butterfly tree bits.
    - The smem-tree variant was measured out in row 60; this one is different and untested.

@@ -332,6 +332,96 @@ __device__ void fwht_q8(float *v, int bs, float fsc, uint32_t *pl, int b0) {
     const int lane = tid & 31, wid = tid >> 5, nw = T >> 5;
     for (int wd = wid; wd < bs / 32; wd += nw) q8word(v[wd * 32 + lane], lane, pl, (b0 >> 5) + wd);
 }
+/* FWHT + Q8_0 of a Hadamard block of 32 P elements on P / Q warps, Q elements per lane: lane of
+ * warp wq holds element 32 (Q wq + r) + lane in v[r]. Stages len < 32 pair lanes (lane ^ len) by
+ * shuffle, len < 32 Q pair registers, longer ones go through shared xs (two barriers each; with
+ * Q = P there are none). Every butterfly is the shared-memory form's (u + w at the lower index,
+ * u - w at the upper, same operands), and word Q wq + r ends in v[r] as q8word wants. */
+template <int P, int Q>
+__device__ __forceinline__ void fwht_q8w(float (&v)[Q], int lane, int wq, float *xs, float fsc, uint32_t *pl, int b0) {
+#pragma unroll
+    for (int r = 0; r < Q; r++) v[r] = v[r] * fsc;
+#pragma unroll
+    for (int len = 1; len < 32; len <<= 1) {
+        const bool up = lane & len;
+#pragma unroll
+        for (int r = 0; r < Q; r++) {
+            const float o = __shfl_xor_sync(FULL, v[r], len);
+            v[r] = up ? o - v[r] : v[r] + o;
+        }
+    }
+#pragma unroll
+    for (int rl = 1; rl < Q; rl <<= 1)
+#pragma unroll
+        for (int r = 0; r < Q; r++)
+            if (!(r & rl)) { const float u = v[r], w = v[r + rl]; v[r] = u + w; v[r + rl] = u - w; }
+#pragma unroll
+    for (int wl = 1; wl < P / Q; wl <<= 1) {
+        const bool up = wq & wl;
+#pragma unroll
+        for (int r = 0; r < Q; r++) xs[32 * (Q * wq + r) + lane] = v[r];
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < Q; r++) {
+            const float o = xs[32 * (Q * (wq ^ wl) + r) + lane];
+            v[r] = up ? o - v[r] : v[r] + o;
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < Q; r++) q8word(v[r], lane, pl, (b0 >> 5) + Q * wq + r);
+}
+// k_xq on P / Q warps per Hadamard block (E_XQW); a block runs HB Hadamard blocks
+template <int P, int Q>
+__global__ void k_xqw(const float *a, const float *b, int mode, const float *sg, float fsc,
+                      uint32_t *pl, int nk, int rep, int as, int pls, int nb) {
+    __shared__ float xs[P / Q > 1 ? 32 * P * (P / Q < 4 ? 4 / (P / Q) : 1) : 1]; /* max(128, 32 P / Q) threads */
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wq = warp % (P / Q), hb = warp / (P / Q);
+    const int blk = blockIdx.x * (blockDim.x / (32 * (P / Q))) + hb;
+    const int b0 = min(blk, nb - 1) * 32 * P;
+    a += (size_t)blockIdx.y * as; if (b) b += (size_t)blockIdx.y * as; pl += (size_t)blockIdx.y * pls;
+    float v[Q];
+#pragma unroll
+    for (int r = 0; r < Q; r++) {
+        const int ix = b0 + 32 * (Q * wq + r) + lane;
+        float x;
+        if (mode == 0) x = a[ix];
+        else if (mode == 1) {
+            const int hd = ix >> 7, j = ix & 127, rr = hd % rep, k = hd / rep;
+            x = a[128 * (k + nk * rr) + j];
+        } else x = d_silu(a[ix]) * b[ix];
+        v[r] = x * sg[ix];
+    }
+    /* out-of-range Hadamard blocks recompute the last one (barriers stay uniform), same bits */
+    fwht_q8w<P, Q>(v, lane, wq, xs + (P / Q > 1 ? hb * 32 * P : 0), fsc, pl, b0);
+}
+// k_norm_xq likewise; the rms sum comes from sp (k_ssq / k_ssqn) or warp 0 computes it
+template <int P, int Q>
+__global__ void k_norm_xqw(const float *x, const float *w, int n, float eps, float *xn,
+                           const float *sg, float fsc, uint32_t *pl, int pls, const double *sp, int nb) {
+    __shared__ float s_sc;
+    __shared__ float xs[P / Q > 1 ? 32 * P : 1];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wq = warp % (P / Q);
+    const int blk = blockIdx.x;
+    x += (size_t)blockIdx.y * n; if (xn) xn += (size_t)blockIdx.y * n; pl += (size_t)blockIdx.y * pls;
+    if (sp) { if (threadIdx.x == 0) s_sc = rms_scale(sp[blockIdx.y], n, eps); }
+    else if (warp == 0) {
+        const double s = wsum_sq(x, n, lane);
+        if (lane == 0) s_sc = rms_scale(s, n, eps);
+    }
+    __syncthreads();
+    const float sc = s_sc;
+    const int b0 = blk * 32 * P;
+    float v[Q];
+#pragma unroll
+    for (int r = 0; r < Q; r++) {
+        const int ix = b0 + 32 * (Q * wq + r) + lane;
+        const float y = (x[ix] * sc) * w[ix];
+        if (xn) xn[ix] = y;
+        v[r] = y * sg[ix];
+    }
+    fwht_q8w<P, Q>(v, lane, wq, xs, fsc, pl, b0);
+}
 // rms_norm(x) * w -> xn (optional), then signs, FWHT, Q8_0. One block per Hadamard block;
 // warp 0 of every block computes the (exact, cheap) full-width sum.
 __global__ void k_norm_xq(const float *x, const float *w, int n, float eps, float *xn,
@@ -1210,6 +1300,96 @@ __global__ __launch_bounds__(256) void k_fs(const float *q, const __half *kc, co
         }
     }
 }
+/* k_fs for a token batch (E_FSB): one block per KV group and 256-position tile scores all nt
+   (<= 8) tokens of the chunk, so each K row is loaded and converted once per chunk instead of
+   once per token. Per token and head the arithmetic is k_fs's: same 8-element lane chains, same
+   dotg_reduce tree, same scale. TR: 32 / GQ positions per warp pass and the pass's 32 trees run
+   transposed: at each stage (offsets 16, 8, 4, 1, 2) a lane keeps half its sets and swaps the
+   other half with its partner, 31 shuffles for 32 scores instead of 160; every add is
+   dotg_reduce's (lower lane + upper lane, addition commutes bitwise). Lane L ends holding set
+   (L & 28) | (L & 1) << 1 | (L >> 1 & 1). */
+template <int GQ, bool TR>
+__global__ __launch_bounds__(256) void k_fsb(const float *q, const __half *kc, const int *posp, float *scg,
+                                            int NH, int NKV, int ctx, float scale, int nt) {
+    __shared__ float qs[8][GQ][256];
+    const int g = blockIdx.x % NKV, base = blockIdx.x / NKV * 256, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int p0 = *posp, h0 = g * GQ, nmax = p0 + nt;
+    if (base >= nmax) return;
+    for (int i = tid; i < nt * GQ * 256; i += 256) {
+        const int t = i / (GQ * 256), h = i / 256 % GQ, e = i & 255;
+        qs[t][h][e] = f16r(q[(size_t)t * NH * 256 + (h0 + h) * 256 + e]);
+    }
+    __syncthreads();
+    constexpr int U = TR ? 32 / GQ : FAK;
+    const int cnt = min(256, nmax - base);
+    const int ms = (lane & 28) | (lane & 1) << 1 | (lane >> 1 & 1), mu = ms / GQ, mh = ms % GQ;
+    for (int i0 = warp * U; i0 < cnt; i0 += 8 * U) {
+        float kf[U][8];
+        {
+            __half kh[U][8];
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                const __half *kr = kc + (size_t)(base + min(i0 + u, cnt - 1)) * NKV * 256 + g * 256;
+#pragma unroll
+                for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c + lane];
+            }
+#pragma unroll
+            for (int u = 0; u < U; u++)
+#pragma unroll
+                for (int c = 0; c < 8; c++) kf[u][c] = __half2float(kh[u][c]);
+        }
+        for (int t = 0; t < nt; t++) {
+            const int n = p0 + t + 1;
+            if (base + i0 >= n) continue;
+            float qr[GQ][8];
+#pragma unroll
+            for (int h = 0; h < GQ; h++)
+#pragma unroll
+                for (int c = 0; c < 8; c++) qr[h][c] = qs[t][h][32 * c + lane];
+            float *sc = scg + (size_t)t * NH * ctx;
+            if (TR) {
+                float a[32];
+#pragma unroll
+                for (int u = 0; u < U; u++) {
+#pragma unroll
+                    for (int h = 0; h < GQ; h++) a[u * GQ + h] = 0.0f;
+#pragma unroll
+                    for (int c = 0; c < 8; c++)
+#pragma unroll
+                        for (int h = 0; h < GQ; h++) a[u * GQ + h] = fmaf(kf[u][c], qr[h][c], a[u * GQ + h]);
+                }
+#pragma unroll
+                for (int st = 0; st < 5; st++) {
+                    const int d = st < 3 ? 16 >> st : (st == 3 ? 1 : 2), m = 16 >> st;
+                    const bool up = lane & d;
+#pragma unroll
+                    for (int k = 0; k < m; k++) {
+                        const float x = a[k], y = a[k + m];
+                        const float o = __shfl_xor_sync(FULL, up ? x : y, d);
+                        a[k] = (up ? y : x) + o;
+                    }
+                }
+                if (base + i0 + mu < n) sc[(size_t)(h0 + mh) * ctx + base + i0 + mu] = a[0] * scale;
+                continue;
+            }
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                float a[GQ];
+#pragma unroll
+                for (int h = 0; h < GQ; h++) a[h] = 0.0f;
+#pragma unroll
+                for (int c = 0; c < 8; c++)
+#pragma unroll
+                    for (int h = 0; h < GQ; h++) a[h] = fmaf(kf[u][c], qr[h][c], a[h]);
+#pragma unroll
+                for (int h = 0; h < GQ; h++) {
+                    const float sv = dotg_reduce(a[h], lane) * scale;
+                    if (lane == 0 && base + i0 + u < n) sc[(size_t)(h0 + h) * ctx + base + i0 + u] = sv;
+                }
+            }
+        }
+    }
+}
 /* fw_expf(x), x <= 0: gm_expf's bits on the FP32 pipe. Float-float evaluation of glibc's own
    formula (same k = rne(x * 32 / ln2), same table, same degree-3 polynomial) to ~2^-45 relative;
    the FP64 gm_expf runs instead when k is near a tie, when the value lies within 2^-38 (relative)
@@ -1342,7 +1522,7 @@ __global__ void k_fv(const float *buf, const __half *vc, const int *posp, const 
    converted once for the HG chains that read it. Per chain the arithmetic and order are k_fv's. */
 template <int FD, int HG>
 __global__ void k_fvg(const float *buf, const __half *vc, const int *posp, const float *scg,
-                      float *att, float *fao, int NH, int NKV, int ctx, int bs_) {
+                      float *att, float *fao, int NH, int NKV, int ctx, int bs_, int fvf) {
     const int h0 = blockIdx.x * HG, tid = threadIdx.x;
     const int n = *posp + (int)blockIdx.y + 1, g = h0 / (NH / NKV);
     buf += (size_t)blockIdx.y * bs_; att += (size_t)blockIdx.y * NH * 256;
@@ -1368,6 +1548,29 @@ __global__ void k_fvg(const float *buf, const __half *vc, const int *posp, const
 #pragma unroll
                 for (int j = 0; j < HG; j++) sw[u][j] = __ldg(wp + (size_t)j * ctx + ic0 + u);
             }
+        if (fvf && ic0 + FVU <= n) { /* no rescale weight in the group: the straight-line form */
+            uint32_t sg = 0;
+#pragma unroll
+            for (int u = 0; u < FVU; u++)
+#pragma unroll
+                for (int j = 0; j < HG; j++) sg |= __float_as_uint(sw[u][j]);
+            if (!(sg >> 31)) {
+#pragma unroll
+                for (int u = 0; u < FVU; u++) {
+                    float vf[FD];
+#pragma unroll
+                    for (int d = 0; d < FD; d++) vf[d] = __half2float(vh[u][d]);
+#pragma unroll
+                    for (int j = 0; j < HG; j++) {
+                        const float w = sw[u][j];
+#pragma unroll
+                        for (int d = 0; d < FD; d++) vk[j][d] = f16r(fmaf(vf[d], w, vk[j][d]));
+                        S[j] = fmaf(S[j], 1.0f, w);
+                    }
+                }
+                continue;
+            }
+        }
 #pragma unroll
         for (int u = 0; u < FVU; u++) {
             if (ic0 + u >= n) break;
@@ -1883,6 +2086,9 @@ static uint32_t *d_zc;
 static int ssq_ready, ssq_on = -1;
 static double *d_ssq, *d_ssqn;
 static int ssqn_on = 1; /* E_SSQN: batch rms sums once per token in k_ssqn */
+static int fvgv = 0, fvgp = 2; /* E_FVGV / E_FVGP (one token / a token batch): 1 = k_fvg<1, 4>, 2 = k_fvg<2, 4> (4 heads share each V conversion), else k_fvg<2, 2> */
+static int fvf_on = 1; /* E_FVF: k_fvg straight-line groups without a rescale weight */
+static int fsb_on = 2; /* E_FSB: k_fsb, chunk tokens share each K load (2: transposed reduce, 1: dotg_reduce per score) */
 static int fexp_on = 1; /* E_FEXP: k_fw weights with the certified FP32 fw_expf */
 static void gemv_res(const DT *d, int nt) {
     if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 1;
@@ -1893,6 +2099,9 @@ static void gemv_res(const DT *d, int nt) {
     CK(cudaEventRecord(evj, st2)); CK(cudaStreamWaitEvent(st, evj, 0));
     ssq_ready = 1;
 }
+static int xqw_on = 1; /* E_XQW: warp-form FWHT + Q8_0 (k_xqw, k_norm_xqw) */
+static int xqw_q1 = 2, xqw_qn = 4; /* E_XQWD / E_XQWP: elements per lane at one token / a token batch (16 / Q warps per Hadamard block) */
+#define XQW_SW(Q, CALL) switch (Q) { case 1: CALL(1); break; case 2: CALL(2); break; case 4: CALL(4); break; case 8: CALL(8); break; default: CALL(16); }
 static void norm_xq(const float *x, const float *w, float *xn, int nt) {
     const double *sp = ssq_ready && nt == 1 && x == d_x ? d_ssq : NULL;
     if (!sp && nt > 1 && ssqn_on) { k_ssqn<<<nt, 32, 0, st>>>(x, E, d_ssqn); sp = d_ssqn; }
@@ -1900,9 +2109,24 @@ static void norm_xq(const float *x, const float *w, float *xn, int nt) {
     static int nt1 = -1;
     if (nt1 < 0) nt1 = getenv("E_NT") ? atoi(getenv("E_NT")) : 0;
     const int T = nt1 ? (BS < 1024 ? BS : 1024) : (BS / 2 < 1024 ? BS / 2 : 1024); /* E/BS blocks of BS threads overflow 2048/SM at E 2560 */
+    if (xqw_on && BS == 512) {
+        const int nb = E / BS;
+        const int q = nt == 1 ? xqw_q1 : xqw_qn;
+#define NXQ(Q) k_norm_xqw<16, Q><<<dim3(nb, nt), 32 * (16 / Q), 0, st>>>(x, w, E, EPS, xn, sign_d[sign_ix(E)], FSC, d_pl, PLS, sp, nb)
+        XQW_SW(q, NXQ)
+#undef NXQ
+        return;
+    }
     k_norm_xq<<<dim3(E / BS, nt), T, BS * 4, st>>>(x, w, E, EPS, xn, sign_d[sign_ix(E)], BS, FSC, d_pl, PLS, sp);
 }
 static void xq(const float *a, const float *b, int mode, int n, int as, int nt) {
+    if (xqw_on && BS == 512) {
+        const int nb = n / BS, q = nt == 1 ? xqw_q1 : xqw_qn, hb = q >= 4 ? q / 4 : 1;
+#define XQ(Q) k_xqw<16, Q><<<dim3((nb + hb - 1) / hb, nt), 32 * (16 / Q) * hb, 0, st>>>(a, b, mode, sign_d[sign_ix(n)], FSC, d_pl, NK, NV / NK, as, PLS, nb)
+        XQW_SW(q, XQ)
+#undef XQ
+        return;
+    }
     const int T = BS < 1024 ? BS : 1024;
     k_xq<<<dim3(n / BS, nt), T, BS * 4, st>>>(a, b, mode, sign_d[sign_ix(n)], BS, FSC, d_pl, NK, NV / NK, as, PLS);
 }
@@ -1976,14 +2200,20 @@ static void enqueue(int nt, int tiny, int want) {
             tdump("Qcur-%d", l, d_q, NH * HD);
             if (fa_split) {
                 const dim3 gs(NKV * ((CTX + 255) / 256), nt);
-                switch (NH / NKV) {
+                if (fsb_on && nt > 1 && nt <= 8) switch (NH / NKV) {
+                case 1: if (fsb_on == 2) k_fsb<1, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<1, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
+                case 2: if (fsb_on == 2) k_fsb<2, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<2, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
+                default: if (fsb_on == 2) k_fsb<4, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<4, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
+                } else switch (NH / NKV) {
                 case 1: k_fs<1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 case 2: k_fs<2><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 default: k_fs<4><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 }
                 if (fexp_on) k_fw<true><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
                 else k_fw<false><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
-                if (fvg) k_fvg<2, 2><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
+                if (fvg && (nt > 1 ? fvgp : fvgv) == 1 && NH / NKV % 4 == 0) k_fvg<1, 4><<<dim3(NH / 4, nt), 256, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG, fvf_on);
+                else if (fvg && (nt > 1 ? fvgp : fvgv) == 2 && NH / NKV % 4 == 0) k_fvg<2, 4><<<dim3(NH / 4, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG, fvf_on);
+                else if (fvg) k_fvg<2, 2><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG, fvf_on);
                 else k_fv<<<dim3(NH, nt), 256 / FVD, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
             } else
                 k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 4, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
@@ -2116,6 +2346,13 @@ int main(int argc, char **argv) {
     if (getenv("E_GDNC")) gdn_c = atoi(getenv("E_GDNC"));
     if (getenv("E_ABT")) abt_on = atoi(getenv("E_ABT"));
     if (getenv("E_GF")) gf_on = atoi(getenv("E_GF"));
+    if (getenv("E_FVGV")) fvgv = atoi(getenv("E_FVGV"));
+    if (getenv("E_FVGP")) fvgp = atoi(getenv("E_FVGP"));
+    if (getenv("E_FVF")) fvf_on = atoi(getenv("E_FVF"));
+    if (getenv("E_FSB")) fsb_on = atoi(getenv("E_FSB"));
+    if (getenv("E_XQW")) xqw_on = atoi(getenv("E_XQW"));
+    if (getenv("E_XQWD")) xqw_q1 = atoi(getenv("E_XQWD"));
+    if (getenv("E_XQWP")) xqw_qn = atoi(getenv("E_XQWP"));
     if (getenv("E_SSQN")) ssqn_on = atoi(getenv("E_SSQN"));
     if (getenv("E_FEXP")) fexp_on = atoi(getenv("E_FEXP"));
     k_feinit<<<1, 32>>>();
