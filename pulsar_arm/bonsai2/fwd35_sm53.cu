@@ -1331,7 +1331,7 @@ static void tdump(const char *fmt, int il, const float *dv, int n) {
 
 /* nt consecutive tokens at positions *d_pos .. + nt - 1 (inputs d_x[t]). tiny: the prompt-batch
  * order of the F32 projections. want: 0 no head, 1 logits of the last token, 2 of every token. */
-static int gdn_rw = 1, gdn_nw = 4; /* rows per warp chain, warps per block (128 % (rw * nw) == 0) */
+static int gdn_rw = 2, gdn_nw = 2; /* rows per warp chain, warps per block (128 % (rw * nw) == 0) */
 static void enqueue(int nt, int tiny, int want) {
     ssq_ready = 0;
     const float gscale = 1.0f / sqrtf((float)DS), ascale = 1.0f / sqrtf((float)HD);
