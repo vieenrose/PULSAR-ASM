@@ -936,6 +936,70 @@ __global__ void k_fv(const float *buf, const __half *vc, const int *posp, const 
     }
 }
 
+/* k_fv with HG heads of one KV group per thread (FD dims each): the V element is loaded and
+   converted once for the HG chains that read it. Per chain the arithmetic and order are k_fv's. */
+template <int FD, int HG>
+__global__ void k_fvg(const float *buf, const __half *vc, const int *posp, const float *scg,
+                      float *att, float *fao, int NH, int NKV, int ctx, int bs_) {
+    const int h0 = blockIdx.x * HG, tid = threadIdx.x;
+    const int n = *posp + (int)blockIdx.y + 1, g = h0 / (NH / NKV);
+    buf += (size_t)blockIdx.y * bs_; att += (size_t)blockIdx.y * NH * 256;
+    if (fao) fao += (size_t)blockIdx.y * NH * 256;
+    const float *wp = scg + ((size_t)blockIdx.y * NH + h0) * ctx;
+    const __half *vp = vc + g * 256 + tid * FD;
+    float vk[HG][FD], S[HG];
+#pragma unroll
+    for (int j = 0; j < HG; j++) {
+        S[j] = 0.0f;
+#pragma unroll
+        for (int d = 0; d < FD; d++) vk[j][d] = 0.0f;
+    }
+    for (int ic0 = 0; ic0 < n; ic0 += FVU) {
+        __half vh[FVU][FD]; float sw[FVU][HG];
+#pragma unroll
+        for (int u = 0; u < FVU; u++)
+            if (ic0 + u < n) {
+                const __half *vr = vp + (size_t)(ic0 + u) * NKV * 256;
+                if (FD == 4) { const uint2 x = *(const uint2 *)vr; memcpy(vh[u], &x, 8); }
+                else if (FD == 2) { const uint32_t x = *(const uint32_t *)vr; memcpy(vh[u], &x, 4); }
+                else vh[u][0] = *vr;
+#pragma unroll
+                for (int j = 0; j < HG; j++) sw[u][j] = __ldg(wp + (size_t)j * ctx + ic0 + u);
+            }
+#pragma unroll
+        for (int u = 0; u < FVU; u++) {
+            if (ic0 + u >= n) break;
+            float vf[FD];
+#pragma unroll
+            for (int d = 0; d < FD; d++) vf[d] = __half2float(vh[u][d]);
+#pragma unroll
+            for (int j = 0; j < HG; j++) {
+                const float w = fabsf(sw[u][j]);
+                if (__float_as_uint(sw[u][j]) >> 31) {
+#pragma unroll
+                    for (int d = 0; d < FD; d++) { vk[j][d] = f16r(vk[j][d] * w); vk[j][d] = f16r(fmaf(vf[d], 1.0f, vk[j][d])); }
+                    S[j] = fmaf(S[j], w, 1.0f);
+                } else {
+#pragma unroll
+                    for (int d = 0; d < FD; d++) vk[j][d] = f16r(fmaf(vf[d], w, vk[j][d]));
+                    S[j] = fmaf(S[j], 1.0f, w);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < HG; j++) {
+        const float Si = S[j] == 0.0f ? 0.0f : 1.0f / S[j];
+#pragma unroll
+        for (int d = 0; d < FD; d++) {
+            const int jj = (h0 + j) * 256 + tid * FD + d;
+            const float acc = vk[j][d] * Si;
+            if (fao) fao[jj] = acc;
+            att[jj] = acc * d_sigm(buf[(h0 + j) * 512 + 256 + tid * FD + d]);
+        }
+    }
+}
+
 /* ---- argmax: first index of the maximum ---- */
 __device__ __forceinline__ void amx(float &v, int &i, float v2, int i2) {
     if (v2 > v || (v2 == v && i2 < i)) { v = v2; i = i2; }
@@ -1170,7 +1234,7 @@ static void embed(int id, float *x) {
 
 /* ======================= host: forward ======================= */
 static float *d_sc;   /* split attention scores / weights: NTM x NH x CTX */
-static int fa_split;
+static int fa_split, fvg;
 static float *d_x, *d_xn, *d_buf, *d_cv, *d_ab, *d_o, *d_g, *d_q, *d_att, *d_fao, *d_logits, *d_pv;
 static uint32_t *d_pl;
 static int *d_pos, *d_pi, *d_out;
@@ -1368,7 +1432,8 @@ static void enqueue(int nt, int tiny, int want) {
                 default: k_fs<4><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 }
                 k_fw<<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
-                k_fv<<<dim3(NH, nt), 256 / FVD, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
+                if (fvg) k_fvg<2, 2><<<dim3(NH / 2, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
+                else k_fv<<<dim3(NH, nt), 256 / FVD, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG);
             } else
                 k_fa<<<dim3(NH, nt), 256, (size_t)CTX * 4, st>>>(d_q, d_buf, d_kc[fi], d_vc[fi], d_pos, d_att,
                                                                  tdf ? d_fao : NULL, NH, NKV, CTX, ascale, BIG);
@@ -1438,6 +1503,7 @@ int main(int argc, char **argv) {
     CK(cudaMalloc(&d_q, 4 * (size_t)NTM * NH * HD)); CK(cudaMalloc(&d_att, 4 * (size_t)NTM * NH * HD));
     fa_split = NH % NKV == 0 && (NH / NKV == 1 || NH / NKV == 2 || NH / NKV == 4) && (!getenv("E_FASPLIT") || atoi(getenv("E_FASPLIT")));
     if (fa_split) CK(cudaMalloc(&d_sc, 4 * (size_t)NTM * NH * CTX));
+    fvg = NH / NKV % 2 == 0 && (!getenv("E_FVG") || atoi(getenv("E_FVG"))); /* 2 heads x 2 dims per k_fvg thread */
     CK(cudaMalloc(&d_fao, 4 * (size_t)NTM * NH * HD)); CK(cudaMalloc(&d_logits, 4 * (size_t)NTM * VOCAB));
     CK(cudaMalloc(&d_pv, 4 * 64 * NTM)); CK(cudaMalloc(&d_pi, 4 * 64 * NTM)); CK(cudaMalloc(&d_out, 4 * NTM));
     CK(cudaMalloc(&d_pos, 4));
