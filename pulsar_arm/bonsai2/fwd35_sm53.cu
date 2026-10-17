@@ -466,7 +466,10 @@ __global__ void k_ssq(int n, uint32_t *zc, double *out) {
    a segment is accepted only if s really lies in the predicted binade and the segment sum
    keeps it there, and each event term is a real double add. r < 2^52 and n < 4096 keep the
    unsigned prefix from wrapping. Any rejection (or more than BS_EVM events, or a non-finite
-   float prefix) resumes the old block iteration from the last accepted point. */
+   float prefix) resumes the old block iteration from the last accepted point.
+   It runs once per norm between big GEMVs, so it starts with a cold instruction cache: the
+   fast path is short rolled loops over the row staged in smem (TM >= T terms per thread),
+   not unrolled register arrays (3x the code: 35.7 us per call in the engine vs 16.7). */
 #define BS_EZ (-100000) /* predicted s == 0 */
 #define BS_EVM 64
 __device__ __forceinline__ int bs_fbin(float a) {
@@ -476,43 +479,38 @@ __device__ __forceinline__ int bs_fbin(float a) {
     return b ? (31 - __clz((int)b)) - 149 : BS_EZ;
 }
 __device__ __forceinline__ void bs_round(uint32_t tm, int te, int e, unsigned long long &rr, bool &ee) {
-    rr = 0; ee = false;
-    if (!tm) return;
-    if (e == BS_EZ) { ee = true; return; }
+    /* branch-free: sh >= 0 shifts left (event past 28), sh < 0 rounds half-even away k = -sh bits
+       (k >= 25 always rounds to 0 without a tie: tm < 2^24, so clamping k to 31 is exact) */
     const int sh = te - (e - 52);
-    if (sh >= 0) { if (sh > 28) ee = true; else rr = (unsigned long long)tm << sh; }
-    else {
-        const int k = -sh;
-        if (k <= 25) {
-            const uint32_t half = 1u << (k - 1), rem = tm & ((half << 1) - 1u);
-            if (rem == half) ee = true;
-            rr = (unsigned long long)(tm >> k) + (rem > half ? 1 : 0);
-        }
-    }
+    const int kk = min(-sh, 31), sl = min(max(sh, 0), 28);
+    const uint32_t half = 1u << (max(kk, 1) - 1), rem = tm & ((half << 1) - 1u);
+    const unsigned long long up = (unsigned long long)tm << sl;
+    const unsigned long long dn = (unsigned long long)((tm >> max(kk, 0)) + (rem > half ? 1u : 0u));
+    const bool ez = e == BS_EZ;
+    rr = ez || sh > 28 ? 0ull : (sh >= 0 ? up : dn);
+    ee = tm && (ez || (sh >= 0 ? sh > 28 : rem == half));
 }
-template <int TM>
+template <int TM, int NT>
 __device__ double bsum_sq(const float *x, int n) {
     __shared__ float b_ft[32];
     __shared__ unsigned long long b_tot[32], e_pb[BS_EVM];
     __shared__ int b_cnt[32], e_f[BS_EVM], e_e[BS_EVM], b_fin_e, b_pos;
     __shared__ float e_t[BS_EVM];
     __shared__ double b_s;
-    const int NT = blockDim.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, NW = NT >> 5;
+    __shared__ float b_x[TM * NT];
+    constexpr int NW = NT / 32;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const int T = (n + NT - 1) / NT, i0 = tid * T;
-    float t[TM];
-    uint32_t tm[TM];
-    int te[TM];
-    float ts = 0.0f;
+    /* coalesced staging, then each thread reads its contiguous T */
 #pragma unroll
-    for (int j = 0; j < TM; j++) {
-        const float xv = j < T && i0 + j < n ? x[i0 + j] : 0.0f;
-        t[j] = xv * xv;
-        const uint32_t tb = __float_as_uint(t[j]);
-        const int tex = (int)(tb >> 23);
-        tm[j] = tex ? ((tb & 0x7fffffu) | 0x800000u) : (tb & 0x7fffffu);
-        te[j] = tex ? tex - 150 : -149;
-        ts += t[j];
-    }
+    for (int k = 0; k < TM; k++) { const int i = tid + NT * k; if (i < n) b_x[i] = x[i]; }
+    __syncthreads();
+    /* compact code: the terms are re-read from smem in three short loops (P0 float sum,
+       P1 rounded sum + event count, P2 event records) instead of unrolled register arrays */
+    const int jn = max(0, min(T, n - i0)); /* valid terms of this thread */
+    float ts = 0.0f;
+#pragma unroll 1
+    for (int j = 0; j < jn; j++) { const float xv = b_x[i0 + j]; ts += xv * xv; }
     /* float exclusive prefix: warp scan of thread totals, then warp bases in fixed order */
     float fi = ts;
 #pragma unroll
@@ -522,29 +520,41 @@ __device__ double bsum_sq(const float *x, int n) {
     if (lane == 31) b_ft[w] = fi;
     __syncthreads();
     float wb = 0.0f, wbn = 0.0f;
+#pragma unroll
     for (int k = 0; k < NW; k++) { if (k < w) wb += b_ft[k]; if (k <= w) wbn += b_ft[k]; }
     const float base = wb + fl;
     float nbase = __shfl_down_sync(FULL, base, 1);
     if (lane == 31) nbase = wbn + 0.0f;
     bool bad = false;
-    int eh[TM];
-    unsigned long long r[TM], R = 0;
-    bool ev[TM];
-    int C = 0;
+    unsigned long long R = 0;
+    int C = 0, elast = BS_EZ;
+    /* the first two events of this thread are kept in registers for P2 */
+    unsigned long long q0 = 0, q1 = 0;
+    float t0 = 0.0f, t1 = 0.0f;
+    int f0 = 0, f1 = 0, h0 = 0, h1 = 0;
     {
         float a = base;
-#pragma unroll
-        for (int j = 0; j < TM; j++) {
-            eh[j] = bs_fbin(a);
-            const float an = j + 1 < T ? a + t[j] : nbase;
+#pragma unroll 1
+        for (int j = 0; j < jn; j++) {
+            const float xv = b_x[i0 + j], t = xv * xv;
+            const uint32_t tb = __float_as_uint(t);
+            const int tex = (int)(tb >> 23);
+            const uint32_t tm = tex ? ((tb & 0x7fffffu) | 0x800000u) : (tb & 0x7fffffu);
+            const int te = tex ? tex - 150 : -149;
+            const int eh = bs_fbin(a);
+            const float an = j + 1 < T ? a + t : nbase;
             const int en = bs_fbin(an);
-            if (j < T && i0 + j < n) {
-                if (eh[j] >= 128 || en >= 128) bad = true;
-                bs_round(tm[j], te[j], eh[j], r[j], ev[j]);
-                if (i0 + j + 1 < n && en != eh[j]) ev[j] = true;
-            } else { r[j] = 0; ev[j] = false; }
-            if (ev[j]) { r[j] = 0; C++; }
-            R += r[j];
+            unsigned long long rr;
+            bool ee;
+            bs_round(tm, te, eh, rr, ee);
+            ee = ee || (i0 + j + 1 < n && en != eh);
+            bad |= eh >= 128 || en >= 128;
+            if (ee) {
+                if (C == 0) { q0 = R; t0 = t; f0 = i0 + j; h0 = eh; }
+                else if (C == 1) { q1 = R; t1 = t; f1 = i0 + j; h1 = eh; }
+            }
+            R += ee ? 0ull : rr; C += ee;
+            elast = eh;
             a = an;
         }
     }
@@ -557,24 +567,38 @@ __device__ double bsum_sq(const float *x, int n) {
         if (lane >= o) { P += v; Cs += c; }
     }
     if (lane == 31) { b_tot[w] = P; b_cnt[w] = Cs; }
-    if (i0 <= n - 1 && n - 1 < i0 + T) {
-        const int jl = n - 1 - i0;
-        int e = eh[0];
-#pragma unroll
-        for (int j = 1; j < TM; j++) if (j == jl) e = eh[j];
-        b_fin_e = e;
-    }
+    if (jn > 0 && i0 + jn == n) b_fin_e = elast;
     bad = __syncthreads_or(bad);
     unsigned long long off = 0, tot = 0;
     int coff = 0, nev = 0;
+#pragma unroll
     for (int k = 0; k < NW; k++) { const unsigned long long v = b_tot[k]; const int c = b_cnt[k]; if (k < w) { off += v; coff += c; } tot += v; nev += c; }
-    {
+    if (C && C <= 2) {
+        const unsigned long long Q = off + P - R;
+        const int c = coff + Cs - C;
+        if (c < BS_EVM) { e_f[c] = f0; e_pb[c] = Q + q0; e_t[c] = t0; e_e[c] = h0; }
+        if (C == 2 && c + 1 < BS_EVM) { e_f[c + 1] = f1; e_pb[c + 1] = Q + q1; e_t[c + 1] = t1; e_e[c + 1] = h1; }
+    } else if (C) { /* P2: more than two events, re-walk this thread's terms and record them */
         unsigned long long Q = off + P - R;
         int c = coff + Cs - C;
-#pragma unroll
-        for (int j = 0; j < TM; j++) {
-            if (ev[j]) { if (c < BS_EVM) { e_f[c] = i0 + j; e_pb[c] = Q; e_t[c] = t[j]; e_e[c] = eh[j]; } c++; }
-            Q += r[j];
+        float a = base;
+#pragma unroll 1
+        for (int j = 0; j < jn; j++) {
+            const float xv = b_x[i0 + j], t = xv * xv;
+            const uint32_t tb = __float_as_uint(t);
+            const int tex = (int)(tb >> 23);
+            const uint32_t tm = tex ? ((tb & 0x7fffffu) | 0x800000u) : (tb & 0x7fffffu);
+            const int te = tex ? tex - 150 : -149;
+            const int eh = bs_fbin(a);
+            const float an = j + 1 < T ? a + t : nbase;
+            const int en = bs_fbin(an);
+            unsigned long long rr;
+            bool ee;
+            bs_round(tm, te, eh, rr, ee);
+            ee = ee || (i0 + j + 1 < n && en != eh);
+            if (ee) { if (c < BS_EVM) { e_f[c] = i0 + j; e_pb[c] = Q; e_t[c] = t; e_e[c] = eh; } c++; }
+            else Q += rr;
+            a = an;
         }
     }
     __syncthreads();
@@ -622,6 +646,19 @@ __device__ double bsum_sq(const float *x, int n) {
     __shared__ long long f_pb[32];
     __shared__ float f_tf[32];
     __shared__ int f_f[32], f_fl[32];
+    if (pos >= n) return s;
+    float t[TM];
+    uint32_t tm[TM];
+    int te[TM];
+#pragma unroll
+    for (int j = 0; j < TM; j++) {
+        const float xv = j < T && i0 + j < n ? b_x[i0 + j] : 0.0f;
+        t[j] = xv * xv;
+        const uint32_t tb = __float_as_uint(t[j]);
+        const int tex = (int)(tb >> 23);
+        tm[j] = tex ? ((tb & 0x7fffffu) | 0x800000u) : (tb & 0x7fffffu);
+        te[j] = tex ? tex - 150 : -149;
+    }
     while (pos < n) {
         if (s == 0.0) {
             int fj = TM;
@@ -702,10 +739,10 @@ __device__ double bsum_sq(const float *x, int n) {
     }
     return s;
 }
-// E_SSQ = 2: the rms sum of a token row by one 256-thread block (bsum_sq, same bits as wsum_sq)
+// E_SSQ = 2: the rms sum of a token row by one 512-thread block (bsum_sq, same bits as wsum_sq)
 template <int TM>
-__global__ void __launch_bounds__(256) k_ssqb(const float *x, int n, double *out) {
-    const double s = bsum_sq<TM>(x + (size_t)blockIdx.x * n, n);
+__global__ void __launch_bounds__(512) k_ssqb(const float *x, int n, double *out) {
+    const double s = bsum_sq<TM, 512>(x + (size_t)blockIdx.x * n, n);
     if (threadIdx.x == 0) out[blockIdx.x] = s;
 }
 // xform + Q8_0 of a: mode 0 plain, 1 GDN head regroup (rep = NV/NK), 2 silu(a) * b
@@ -2494,7 +2531,7 @@ static void norm_xq(const float *x, const float *w, float *xn, int nt) {
     if (!sp && nt > 1 && ssqn_on) { k_ssqn<<<nt, 32, 0, st>>>(x, E, d_ssqn); sp = d_ssqn; }
     if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 2;
     if (!sp && nt == 1 && ssq_on == 2 && E <= 4096) {
-        if (E <= 2560) k_ssqb<10><<<1, 256, 0, st>>>(x, E, d_ssq); else k_ssqb<16><<<1, 256, 0, st>>>(x, E, d_ssq);
+        if (E <= 2560) k_ssqb<5><<<1, 512, 0, st>>>(x, E, d_ssq); else k_ssqb<8><<<1, 512, 0, st>>>(x, E, d_ssq);
         sp = d_ssq;
     }
     ssq_ready = 0;

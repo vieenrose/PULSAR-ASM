@@ -1521,3 +1521,17 @@ first (also the embedding norm, which did the warp sum in every block). 4k ABBA 
 10.22 / 10.54 / 10.58 / 10.20, score 14.60 / 14.83 / 14.87 / 14.59, golden PASS. Measured out: the
 same speculation in one warp per chunk (wsum_sq2, exact): 51-60 us alone, 206 vs 270 us per
 64-token gaussian grid, ~0.4% of prefill for k_ssqn; not taken.
+78. Compact-code k_ssqb (keep, bit-identical; 4k decode +1.4%). k_ssqb cost 15 us warm in the bench but
+35.7 us per call in the engine (nvprof, E_GRAPH=0, 4B decode): it runs once per norm between big
+GEMVs, so every call starts with a cold instruction cache, and the fully unrolled TM-term register
+arrays made ~4800 SASS instructions (thread-0 phase clocks on the 64 real attn_residual / l_out rows
+of a 4k dump: 4.5 events per row, fast path always, but ~4900 cycles to round 10 terms). Steps,
+engine us per call: branch-free bs_round + smem-staged coalesced loads (warm 8.8 us) 28.3; rolled
+loops re-reading the row from smem in three passes (P0 float sum, P1 rounded sum + event count, P2
+event records; 1614 SASS, warm 13.8) 21.6; the first two events of a thread kept in registers in P1
+so P2 is a few stores (re-walk only for > 2 events; warm 10.7) 19.3; 512 threads x TM 5 (TM 8 for
+E 4096) 16.7. 1024 x 3 is slower (warm 19-24 us: the NW = 32 cross-warp loops); #pragma unroll 2 in
+P1 gains nothing. Bench: 0 mismatches of 32768 rows (8 distributions) at 256/512/1024 threads, also
+with the event chain forced to break (BS_TESTFB), and 0 of 64 real rows. 4k ABBA (1/2/2/1, prebuilt
+binaries): decode 10.57 / 10.72 / 10.72 / 10.58, score 14.85 / 14.96 / 14.96 / 14.86, golden PASS.
+Cold: 20.86 / 10.71 / 14.95. Short decode 2B 27.3 -> 28.1, 4B 13.2 -> 13.4 tok/s.
