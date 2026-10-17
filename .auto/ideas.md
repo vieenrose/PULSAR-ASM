@@ -1557,3 +1557,20 @@ Measured out:
   ~90 decode / MOV, 40 LDS, 32 F2F, 16 FADD, 16 FFMA); issue ~78%, not_selected 27%. Larger tiles
   lose registers and occupancy.
 NTM is now #ifndef-overridable (k_gemvN's template parameter is renamed NTN to avoid the clash).
+80. Transposed warp reduce in prefill k_gdnc + 8 rows per warp + v staged in smem (keep, bit-identical;
+4k prefill +2.2%). k_gdnc's per-row dt and output sums ran RW independent dotg_reduce trees (5 shuffles
+each). dotg_reduceT reduces RW rows together: at stage k with offset st (16, 8, 4, 1, 2: dotg_reduce's own
+order) each lane keeps half its values and adds the partner's other half, so RW rows cost RW-1 + the
+remaining stages of shuffles, and every row's sum has exactly dotg_reduce's association (IEEE add is
+commutative, only the tree shape matters). The row sum lands on lane gtr_base(u); dt is broadcast from it,
+outputs are stored by the lanes with !(lane & gtr_rest). k_gdnc is now <RW, NT, TR>; E_GTR=0 restores the
+old reduce, E_GCRW the rows per warp (default 8, 4 warps). nvprof per call (480-token 4B prefill): old
+RW4 NW4 806 us; TR RW4 NW4 665; RW2 NW4 675; RW8 NW4 544-555; RW4 NW8 777; RW8 NW2 614; RW2 NW8 653; RW16
+NW2 563; RW16 NW4 580; RW8 NW4 + the token's v row staged in smem 463 (-42%; issue 69%, IPC 3.15, occ
+0.29, 93 regs). RW16 x NW8 and RW8 x NW16 fail to launch. All variants md5-identical on the 480-token
+32-gen run. Measured out: k_gdnq, a row per lane quad (E_GDNC=2 while it existed), bit-identical but 960 us
+(IPC 1.46, occ 0.24, 113 regs); __launch_bounds__ caps worse (6 blocks 971, 8 blocks 1441 us with spills).
+4k ABBA A = E_GTR=0 E_GCRW=4 vs B = default (1/2/2/1, one build): prefill 21.32 / 21.80 / 21.80 / 21.33,
+decode 10.72 / 10.71 / 10.71 / 10.76, score 15.12 / 15.28 / 15.28 / 15.15, golden PASS. Cold: 21.88 /
+10.73 / 15.32. checks_b2 2B 4B ALL PASS. Decode k_gdnf has the same shape but is memory-bound (row 75): not
+applied there.

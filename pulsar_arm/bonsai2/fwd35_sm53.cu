@@ -1287,14 +1287,55 @@ __global__ void k_gdn(const float *cv0, const float *ab0, const float *ssm_a, co
     __syncthreads(); /* s_be is rewritten for the next token */
   }
 }
+/* dotg_reduce of R rows at once (lane holds a[r] of row r): the same tree per row (lane pairs
+ * +16, +8, +4, then +1 on even lanes, then +2), but the first log2 R stages are transposed: a lane
+ * keeps one row of a pair and sends the other, so one shuffle serves two rows (IEEE add is
+ * commutative, so only the association matters). Row r ends in lane gtr_base(r); lane l's row is
+ * gtr_row(l). */
+__device__ __forceinline__ constexpr int gtr_off(int k) { return k < 3 ? 16 >> k : k == 3 ? 1 : 2; } /* dotg_reduce's stages */
+template <int R> __device__ __forceinline__ int gtr_base(int r) {
+    int b = 0;
+#pragma unroll
+    for (int k = 0; (1 << k) < R; k++) b |= ((r >> k) & 1) * gtr_off(k);
+    return b;
+}
+template <int R> __device__ __forceinline__ int gtr_row(int lane) {
+    int r = 0;
+#pragma unroll
+    for (int k = 0; (1 << k) < R; k++) r |= ((lane & gtr_off(k)) ? 1 : 0) << k;
+    return r;
+}
+template <int R> __device__ __forceinline__ constexpr int gtr_rest() { /* lane bits of the untransposed stages */
+    int m = 0;
+    for (int k = 0; k < 5; k++) if ((1 << k) >= R) m |= gtr_off(k);
+    return m;
+}
+template <int R>
+__device__ __forceinline__ float dotg_reduceT(const float (&a)[R], int lane) {
+    float v[R];
+#pragma unroll
+    for (int i = 0; i < R; i++) v[i] = a[i];
+    int k = 0;
+#pragma unroll
+    for (int n = R; n > 1; n >>= 1, k++) {
+        const int st = gtr_off(k);
+        const bool up = lane & st;
+#pragma unroll
+        for (int i = 0; i < n / 2; i++) v[i] = (up ? v[2 * i + 1] : v[2 * i]) + __shfl_xor_sync(FULL, up ? v[2 * i] : v[2 * i + 1], st);
+    }
+    float z = v[0];
+#pragma unroll
+    for (; k < 5; k++) z = z + __shfl_down_sync(FULL, z, gtr_off(k));
+    return z;
+}
 /* Chunked k_gdn for nt <= NT tokens (prefill): rows of M are independent, so each warp loads its
  * state rows once, runs them through the nt tokens in order and stores them once (k_gdn reads
  * and writes all of M per token). The per-row, per-token arithmetic is k_gdn's. */
-template <int RW, int NT>
+template <int RW, int NT, bool TR>
 __global__ void k_gdnc(const float *cv0, const float *ab0, const float *ssm_a, const float *dtb, float *st,
                        float *o0, int NV, int NK, float scale, int nt, int CH, int INNER) {
     const int h = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    __shared__ float s_be[NT][2], sq[NT][128], sk[NT][128];
+    __shared__ float s_be[NT][2], sq[NT][128], sk[NT][128], sv[TR ? NT : 1][128];
     if (threadIdx.x < nt) { /* the glibc-exact exp/log in double: one thread per token */
         const int t = threadIdx.x;
         const float *ab = ab0 + (size_t)t * 2 * NV;
@@ -1307,6 +1348,7 @@ __global__ void k_gdnc(const float *cv0, const float *ab0, const float *ssm_a, c
         const int t = i >> 7, e = i & 127;
         const float *cv = cv0 + (size_t)t * CH;
         sq[t][e] = cv[128 * (h % NK) + e]; sk[t][e] = cv[NK * 128 + 128 * (h % NK) + e];
+        if (TR) sv[t][e] = cv[2 * NK * 128 + 128 * h + e];
     }
     __syncthreads();
     float *M = st + (size_t)h * 128 * 128;
@@ -1318,7 +1360,7 @@ __global__ void k_gdnc(const float *cv0, const float *ab0, const float *ssm_a, c
             for (int c = 0; c < 4; c++) m[u][c] = M[(j0 + u * nw) * 128 + 32 * c + lane];
         for (int t = 0; t < nt; t++) {
             const float bt = s_be[t][0], eg = s_be[t][1];
-            const float *v = cv0 + (size_t)t * CH + 2 * NK * 128 + 128 * h;
+            const float *v = TR ? sv[t] : cv0 + (size_t)t * CH + 2 * NK * 128 + 128 * h;
             float kr[4], qr[4], a[RW], dt[RW], a2[RW];
 #pragma unroll
             for (int c = 0; c < 4; c++) { kr[c] = sk[t][32 * c + lane]; qr[c] = sq[t][32 * c + lane]; }
@@ -1328,8 +1370,14 @@ __global__ void k_gdnc(const float *cv0, const float *ab0, const float *ssm_a, c
 #pragma unroll
                 for (int c = 0; c < 4; c++) { m[u][c] = m[u][c] * eg; a[u] = fmaf(m[u][c], kr[c], a[u]); }
             }
+            if (TR) {
+                const float z = dotg_reduceT<RW>(a, lane);
 #pragma unroll
-            for (int u = 0; u < RW; u++) dt[u] = dotg_reduce(a[u], lane);
+                for (int u = 0; u < RW; u++) dt[u] = __shfl_sync(FULL, z, gtr_base<RW>(u));
+            } else {
+#pragma unroll
+                for (int u = 0; u < RW; u++) dt[u] = dotg_reduce(a[u], lane);
+            }
 #pragma unroll
             for (int u = 0; u < RW; u++) {
                 const float delta = (v[j0 + u * nw] - dt[u]) * bt;
@@ -1337,10 +1385,16 @@ __global__ void k_gdnc(const float *cv0, const float *ab0, const float *ssm_a, c
 #pragma unroll
                 for (int c = 0; c < 4; c++) { m[u][c] = fmaf(kr[c], delta, m[u][c]); a2[u] = fmaf(m[u][c], qr[c], a2[u]); }
             }
+            if (TR) {
+                const float oo = dotg_reduceT<RW>(a2, lane) * scale;
+                const int u = gtr_row<RW>(lane);
+                if (!(lane & gtr_rest<RW>())) o0[(size_t)t * INNER + h * 128 + j0 + u * nw] = oo;
+            } else {
 #pragma unroll
-            for (int u = 0; u < RW; u++) {
-                const float oo = dotg_reduce(a2[u], lane) * scale;
-                if (lane == 0) o0[(size_t)t * INNER + h * 128 + j0 + u * nw] = oo;
+                for (int u = 0; u < RW; u++) {
+                    const float oo = dotg_reduce(a2[u], lane) * scale;
+                    if (lane == 0) o0[(size_t)t * INNER + h * 128 + j0 + u * nw] = oo;
+                }
             }
         }
 #pragma unroll
@@ -2619,7 +2673,8 @@ static void tdump(const char *fmt, int il, const float *dv, int n) {
 static int gdn_rw = 2, gdn_nw = 2;
 static int gf_on = 1; /* E_GF: decode GDN fusions k_convl2 + k_gdnf */
 static int abt_on = 2; /* prompt batches (E_ABT): 2 = k_abt2 (float4, tokens staged in smem), 1 = k_abt */
-static int gdn_c = 1, gdn_crw = 4, gdn_cnw = 4; /* chunked k_gdnc for nt > 1 (E_GDNC, E_GCRW, E_GCNW) */ /* rows per warp chain, warps per block (128 % (rw * nw) == 0) */
+static int gtr_on = 1; /* E_GTR: k_gdnc's row sums of a warp with the transposed dotg_reduceT, v staged in smem */
+static int gdn_c = 1, gdn_crw = 8, gdn_cnw = 4; /* chunked k_gdnc for nt > 1 (E_GDNC, E_GCRW, E_GCNW) */ /* rows per warp chain, warps per block (128 % (rw * nw) == 0) */
 static void enqueue(int nt, int tiny, int want) {
     ssq_ready = 0;
     const float gscale = 1.0f / sqrtf((float)DS), ascale = 1.0f / sqrtf((float)HD);
@@ -2650,11 +2705,17 @@ static void enqueue(int nt, int tiny, int want) {
             tdump("alpha-%d", l, d_ab + NV, NV); tdump("beta-%d", l, d_ab, NV);
             k_l2<<<dim3((2 * NK + 3) / 4, nt), 128, 0, st>>>(d_cv, 2 * NK, EPS, CH);
             if (nt > 1 && gdn_c) {
+#define GDNC(RW) do { if (gtr_on) k_gdnc<RW, NTM, true><<<NV, 32 * gdn_cnw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); \
+                           else k_gdnc<RW, NTM, false><<<NV, 32 * gdn_cnw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); } while (0)
                 switch (gdn_crw) {
-                case 1: k_gdnc<1, NTM><<<NV, 32 * gdn_cnw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
-                case 2: k_gdnc<2, NTM><<<NV, 32 * gdn_cnw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
-                default: k_gdnc<4, NTM><<<NV, 32 * gdn_cnw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
+                case 1: GDNC(1); break;
+                case 2: GDNC(2); break;
+                case 8: GDNC(8); break;
+                case 16: GDNC(16); break;
+                default: GDNC(4); break;
                 }
+#undef GDNC
+
             } else switch (gdn_rw) {
             case 1: k_gdn<1><<<NV, 32 * gdn_nw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
             case 2: k_gdn<2><<<NV, 32 * gdn_nw, 0, st>>>(d_cv, d_ab, L->ssm_a, L->dt_bias, d_ssm[l], d_o, NV, NK, gscale, nt, CH, INNER); break;
@@ -2859,6 +2920,7 @@ int main(int argc, char **argv) {
     if (getenv("E_FEXP")) fexp_on = atoi(getenv("E_FEXP"));
     k_feinit<<<1, 32>>>();
     if (getenv("E_GCRW")) gdn_crw = atoi(getenv("E_GCRW"));
+    if (getenv("E_GTR")) gtr_on = atoi(getenv("E_GTR"));
     if (getenv("E_GCNW")) gdn_cnw = atoi(getenv("E_GCNW"));
     /* capture outside the timed region */
     if (use_graph && !tdf) {
