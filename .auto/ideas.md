@@ -1602,3 +1602,20 @@ token) reading its window (157 us vs 105 per call: 4x the loads, no L1 for globa
 l2 fused into k_conv2 for the q/k heads (155 ms vs 86 + 83: -14 ms, below ABBA resolution; removed).
 4k ABBA E_CONV=0 vs 1: prefill 22.07 / 22.14 / 22.13 / 22.06, decode 10.80 / 10.82 / 10.82 /
 10.77, golden PASS. Cold: 22.13 / 10.81 / 15.47. checks_b2 2B 4B ALL PASS (both changes).
+84. Mixed-pipe V chain rounding in k_fvh (E_FVX / E_FVXP, defaults 1 / 2; keep, bit-identical; 4k
+prefill +0.8%, decode +0.8%). Since row 76 every V chain of a k_fvh thread rounds with f16rr (one F2F +
+shift, scale, max, sign OR); the exact f16r is two F2F and nothing else. With all chains on f16rr the
+kernel is issue bound (the converse test, E_FVA: V halves converted on the ALU by the same bit form,
+exhaustively exact for finite halves with a nonfinite flag forcing the exact rerun, md5-identical but
+4k decode 10.46 vs 10.81 and prefill 21.75 vs 22.13). So the first NX chains of a thread now round with
+f16r and the rest with f16rr: f16r chains are the reference op itself (inf / NaN propagate natively and
+need no om check), the f16rr chains keep the om >= 65536 rerun of the whole thread with f16r. Sweep
+(4k prompt + 64 gen, all md5 0b84b6abb1e2): decode HG 2 (4 chains) NX 0 / 1 / 2 / 3 = 10.82 / 10.88 /
+10.77 / 10.44; prefill HG 4 (8 chains) NX 0 / 1 / 2 / 3 / 4 / 6 = 22.14 / 22.20 / 22.29-22.31 / 22.23 /
+22.16 / 22.02. 4k ABBA A = E_FVX=0 E_FVXP=0 vs B = default (1/2/2/1, one build): prefill 22.14 / 22.30 /
+22.31 / 22.12, decode 10.81 / 10.87 / 10.88 / 10.77, golden PASS. Cold: 22.32 / 10.86 / 15.57.
+Measured out this round (all md5-identical):
+- Decode k_fvh with one dim per thread (E_FVD1, HG 1): 4k decode 10.62 vs 10.81.
+- Decode k_gdnf: E_GRW=4 10.81-10.83 vs 10.81 (noise); the k_gdnc transposed reduce in k_gdnf (RW 2 /
+  4 / 8): 10.74 / 10.75 / 10.68 vs 10.81. k_gdnf is memory-latency bound (row 75), and the transposed
+  form's selects only add issue.

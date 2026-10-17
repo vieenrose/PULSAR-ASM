@@ -2132,7 +2132,7 @@ __device__ __forceinline__ float f16rr(float y, float &om) {
     om = fmaxf(om, f);
     return __uint_as_float(__float_as_uint(f) | (__float_as_uint(y) & 0x80000000u));
 }
-template <int HG, int U, bool R>
+template <int HG, int U, bool R, int NX = 0> /* NX: the first NX chains (j, d order) round with f16r, two F2F */
 __device__ __forceinline__ float fvh_chain(const float *wp, const uint32_t *vp, int vs, int n, int ctx,
                                            float (&vk)[HG][2], float (&S)[HG]) {
     float om = 0.0f;
@@ -2164,8 +2164,8 @@ __device__ __forceinline__ float fvh_chain(const float *wp, const uint32_t *vp, 
 #pragma unroll
                 for (int j = 0; j < HG; j++) {
                     const float w = sw[u][j];
-                    vk[j][0] = f16rr<R>(fmaf(v0, w, vk[j][0]), om);
-                    vk[j][1] = f16rr<R>(fmaf(v1, w, vk[j][1]), om);
+                    vk[j][0] = 2 * j < NX ? f16r(fmaf(v0, w, vk[j][0])) : f16rr<R>(fmaf(v0, w, vk[j][0]), om);
+                    vk[j][1] = 2 * j + 1 < NX ? f16r(fmaf(v1, w, vk[j][1])) : f16rr<R>(fmaf(v1, w, vk[j][1]), om);
                     S[j] = fmaf(S[j], 1.0f, w);
                 }
             }
@@ -2209,7 +2209,7 @@ __device__ __forceinline__ float fvh_chain(const float *wp, const uint32_t *vp, 
     }
     return om;
 }
-template <int HG, int U, bool RB>
+template <int HG, int U, bool RB, int NX = 0>
 __global__ void k_fvh(const float *buf, const __half *vc, const int *posp, const float *scg,
                       float *att, float *fao, int NH, int NKV, int ctx, int bs_) {
     const int h0 = blockIdx.x * HG, tid = threadIdx.x;
@@ -2221,7 +2221,7 @@ __global__ void k_fvh(const float *buf, const __half *vc, const int *posp, const
     const int vs = NKV * 128;
     float vk[HG][2], S[HG];
     /* RB: the chain with f16rr<true>; a half overflow anywhere in this thread's chains reruns them with f16r */
-    if (!RB || fvh_chain<HG, U, true>(wp, vp, vs, n, ctx, vk, S) >= 65536.0f) fvh_chain<HG, U, false>(wp, vp, vs, n, ctx, vk, S);
+    if (!RB || fvh_chain<HG, U, true, NX>(wp, vp, vs, n, ctx, vk, S) >= 65536.0f) fvh_chain<HG, U, false>(wp, vp, vs, n, ctx, vk, S);
 #pragma unroll
     for (int j = 0; j < HG; j++) {
         const float Si = S[j] == 0.0f ? 0.0f : 1.0f / S[j];
@@ -2722,6 +2722,7 @@ static int ssqn_on = 2; /* E_SSQN: batch rms sums once per token, 2 = one k_ssqb
 static int fvgv = 0, fvgp = 2; /* E_FVGV / E_FVGP (one token / a token batch): 1 = k_fvg<1, 4>, 2 = k_fvg<2, 4> (4 heads share each V conversion), else k_fvg<2, 2> */
 static int fsk_d = 21; /* E_FSK: k_fs<4> variant, 10 * K rows per pass + min blocks per SM (0: FAK, 1; 21: 80 registers, 3 blocks per SM) */
 static int fvr_on = 3; /* E_FVR: k_fvh rounds with f16rr<true> (bit 0: one token, bit 1: a token batch) */
+static int fvx = 1, fvxp = 2; /* E_FVX / E_FVXP (one token / a token batch): the first N V chains of a k_fvh thread round with the two-F2F f16r */
 static int fvh_on = 1; /* E_FVH: k_fvh lean-loop V chain (2: groups of 8 positions) */
 static int fvu_d = 4; /* E_FVU: k_fvg positions per load group at one token */
 static int fvp_on = 1; /* E_FVP: k_fvg issues the next position group's loads before the current chain */
@@ -2884,7 +2885,8 @@ static void enqueue(int nt, int tiny, int want) {
                 else k_fw<false><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
                 if (fvh_on && fvg && CTX % 4 == 0 && (nt > 1 ? fvgp : fvgv) != 1) {
                     const int hg4 = (nt > 1 ? fvgp : fvgv) == 2 && NH / NKV % 4 == 0;
-#define FVH_L(HG, U, RB) k_fvh<HG, U, RB><<<dim3(NH / HG, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG)
+#define FVH_X(HG, NX) k_fvh<HG, 4, true, NX><<<dim3(NH / HG, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG)
+#define FVH_L(HG, U, RB) if (RB && U == 4 && (nt > 1 ? fvxp : fvx)) switch (nt > 1 ? fvxp : fvx) { case 1: FVH_X(HG, 1); break; case 2: FVH_X(HG, 2); break; case 3: FVH_X(HG, 3); break; case 4: FVH_X(HG, 4); break; default: FVH_X(HG, 6); break; } else k_fvh<HG, U, RB><<<dim3(NH / HG, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG)
                     const bool rb = fvr_on & (nt > 1 ? 2 : 1);
                     if (hg4) { if (fvh_on == 2) FVH_L(4, 8, false); else if (rb) FVH_L(4, 4, true); else FVH_L(4, 4, false); }
                     else { if (fvh_on == 2) FVH_L(2, 8, false); else if (rb) FVH_L(2, 4, true); else FVH_L(2, 4, false); }
@@ -3032,6 +3034,8 @@ int main(int argc, char **argv) {
     if (getenv("E_GF")) gf_on = atoi(getenv("E_GF"));
     if (getenv("E_FVGV")) fvgv = atoi(getenv("E_FVGV"));
     if (getenv("E_FVGP")) fvgp = atoi(getenv("E_FVGP"));
+    if (getenv("E_FVX")) fvx = atoi(getenv("E_FVX"));
+    if (getenv("E_FVXP")) fvxp = atoi(getenv("E_FVXP"));
     if (getenv("E_FVF")) fvf_on = atoi(getenv("E_FVF"));
     if (getenv("E_FVP")) fvp_on = atoi(getenv("E_FVP"));
     if (getenv("E_FVU")) fvu_d = atoi(getenv("E_FVU"));
