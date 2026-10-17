@@ -445,7 +445,7 @@ __global__ void k_norm_xq(const float *x, const float *w, int n, float eps, floa
     }
     fwht_q8(sv, bs, fsc, pl, b0);
 }
-// the rms sums of a token batch, once per token (one warp each), for k_norm_xq
+// the rms sums of a token batch, once per token (one warp each), for k_norm_xq (E_SSQN=1)
 __global__ void k_ssqn(const float *x, int n, double *out) {
     const double s = wsum_sq(x + (size_t)blockIdx.x * n, n, threadIdx.x);
     if (threadIdx.x == 0) out[blockIdx.x] = s;
@@ -1060,13 +1060,13 @@ __global__ __launch_bounds__(32 * W, MB) void k_hg(const uint4 *__restrict__ wc,
 /* Batched POPC form (sm_61, whose fp16 pipe is 1/64 rate) for nt <= NTM tokens: the RB rows of a batch
  * stay in registers while the lane walks the tokens, so a weight row is read once for all of
  * them. Per (row, token) the arithmetic is the single-token kernel's, so the bits are equal. */
-template <int G, int WR, int TPB, int RB, int NTM>
+template <int G, int WR, int TPB, int RB, int NTN>
 __global__ __launch_bounds__(32 * WR * TPB)
 void k_gemvN(const uint4 *__restrict__ wc, const __half *__restrict__ ws, const uint32_t *__restrict__ pl, int pls,
              float *__restrict__ y, int ys, int N, int resid, int nt) {
     constexpr int L = 32 * WR, R = L / G, RBR = RB * R, PS = G + 1;
     static_assert(R >= 1 && RBR <= L, "shape");
-    __shared__ float2 tile[TPB][NTM][RBR * PS];
+    __shared__ float2 tile[TPB][NTN][RBR * PS];
     const int warp = (int)threadIdx.x >> 5, lane = (int)threadIdx.x & 31;
     const int team = warp / WR, wt = warp - team * WR, lid = wt * 32 + lane;
     const int slot = lid / G, g = lid - slot * G;
@@ -1172,6 +1172,41 @@ __global__ void k_abt(const float *wb, const float *wa, const float *xn, int E, 
     o = __shfl_down_sync(FULL, c, 2, 8); if (s < 2) c = c + o;
     o = __shfl_down_sync(FULL, c, 1, 8); if (s == 0) c = c + o;
     if (s == 0 && t < nt) out[(size_t)t * 2 * NV + row] = c;
+}
+/* k_abt with float4 loads (E_ABT=2): k_abt's 8 chains of a (row, token) on 2 lanes, lane h holding
+ * chains 4h .. 4h + 3, so one LDG.128 of w and one LDS.128 of x (8 tokens staged in smem, ABT_KC
+ * columns at a time) feed 4 chains. Lanes 2 t + h of each half warp run token t; a warp covers 2
+ * rows, a block 16. The tree is k_abt's (c[s] = c[s + 4] + c[s], then c[s] + c[s + 2], then
+ * c[0] + c[1]). Latency bound: the fully unrolled 256-column chunk keeps 16 LDG.128 in flight. */
+#define ABT_KC 256
+__global__ void __launch_bounds__(256) k_abt2(const float *wb, const float *wa, const float *xn, int E, int NV, int nt, float *out) {
+    __shared__ float4 xs[8][ABT_KC / 4 + 2];
+    const int lane = threadIdx.x & 31, h = lane & 1, t = (lane >> 1) & 7;
+    const int row = blockIdx.x * 16 + (threadIdx.x >> 5) * 2 + (lane >> 4), rr = min(row, 2 * NV - 1);
+    const float *w = rr < NV ? wb + (size_t)rr * E : wa + (size_t)(rr - NV) * E;
+    float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+    for (int k0 = 0; k0 < E; k0 += ABT_KC) {
+        const int kn = min(ABT_KC, E - k0) >> 2;
+        __syncthreads();
+        for (int i = threadIdx.x; i < 8 * kn; i += blockDim.x) {
+            const int tt = i / kn, j = i - tt * kn;
+            xs[tt][j] = ((const float4 *)(xn + (size_t)min(blockIdx.y * 8 + tt, nt - 1) * E + k0))[j];
+        }
+        __syncthreads();
+        const float4 *wk = (const float4 *)(w + k0) + h, *xk = &xs[t][h];
+#pragma unroll 16
+        for (int l = 0; l < kn; l += 2) {
+            const float4 a = __ldg(wk + l), b = xk[l];
+            c0 = fmaf(a.x, b.x, c0); c1 = fmaf(a.y, b.y, c1); c2 = fmaf(a.z, b.z, c2); c3 = fmaf(a.w, b.w, c3);
+        }
+    }
+    const float o0 = __shfl_xor_sync(FULL, c0, 1), o1 = __shfl_xor_sync(FULL, c1, 1);
+    const float o2 = __shfl_xor_sync(FULL, c2, 1), o3 = __shfl_xor_sync(FULL, c3, 1);
+    c0 = o0 + c0; c1 = o1 + c1; c2 = o2 + c2; c3 = o3 + c3;
+    c0 = c0 + c2; c1 = c1 + c3;
+    c0 = c0 + c1;
+    const int tg = blockIdx.y * 8 + t;
+    if (h == 0 && tg < nt && row < 2 * NV) out[(size_t)tg * 2 * NV + row] = c0;
 }
 // causal conv over [s0 s1 s2 x] (products rounded, summed in order), silu; state shifts
 __global__ void k_conv(const float *qkv, const float *cw, float *st, int CH, float *cv, int nt, int qs) {
@@ -2349,7 +2384,9 @@ static int *d_pos, *d_pi, *d_out;
 static float **d_conv, **d_ssm;
 static __half **d_kc, **d_vc;
 static cudaStream_t st;
+#ifndef NTM
 #define NTM 8          /* most tokens per batched forward */
+#endif
 static int BIG, PLS, HQW; /* d_buf / d_pl per-token strides (floats / words), fp16 q/2 tail words */
 
 static uint32_t *gzc; /* row copy buffer for the next gemv launch (NULL: none) */
@@ -2503,7 +2540,7 @@ static cudaEvent_t evf, evj;
 static uint32_t *d_zc;
 static int ssq_ready, ssq_on = -1;
 static double *d_ssq, *d_ssqn;
-static int ssqn_on = 1; /* E_SSQN: batch rms sums once per token in k_ssqn */
+static int ssqn_on = 2; /* E_SSQN: batch rms sums once per token, 2 = one k_ssqb block each, 1 = one k_ssqn warp each */
 static int fvgv = 0, fvgp = 2; /* E_FVGV / E_FVGP (one token / a token batch): 1 = k_fvg<1, 4>, 2 = k_fvg<2, 4> (4 heads share each V conversion), else k_fvg<2, 2> */
 static int fsk_d = 21; /* E_FSK: k_fs<4> variant, 10 * K rows per pass + min blocks per SM (0: FAK, 1; 21: 80 registers, 3 blocks per SM) */
 static int fvr_on = 3; /* E_FVR: k_fvh rounds with f16rr<true> (bit 0: one token, bit 1: a token batch) */
@@ -2528,6 +2565,10 @@ static int xqw_q1 = 2, xqw_qn = 4; /* E_XQWD / E_XQWP: elements per lane at one 
 #define XQW_SW(Q, CALL) switch (Q) { case 1: CALL(1); break; case 2: CALL(2); break; case 4: CALL(4); break; case 8: CALL(8); break; default: CALL(16); }
 static void norm_xq(const float *x, const float *w, float *xn, int nt) {
     const double *sp = ssq_ready && nt == 1 && x == d_x ? d_ssq : NULL;
+    if (!sp && nt > 1 && ssqn_on == 2 && E <= 4096) {
+        if (E <= 2560) k_ssqb<5><<<nt, 512, 0, st>>>(x, E, d_ssqn); else k_ssqb<8><<<nt, 512, 0, st>>>(x, E, d_ssqn);
+        sp = d_ssqn;
+    }
     if (!sp && nt > 1 && ssqn_on) { k_ssqn<<<nt, 32, 0, st>>>(x, E, d_ssqn); sp = d_ssqn; }
     if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 2;
     if (!sp && nt == 1 && ssq_on == 2 && E <= 4096) {
@@ -2577,7 +2618,7 @@ static void tdump(const char *fmt, int il, const float *dv, int n) {
  * order of the F32 projections. want: 0 no head, 1 logits of the last token, 2 of every token. */
 static int gdn_rw = 2, gdn_nw = 2;
 static int gf_on = 1; /* E_GF: decode GDN fusions k_convl2 + k_gdnf */
-static int abt_on = 1; /* k_abt for prompt batches (E_ABT) */
+static int abt_on = 2; /* prompt batches (E_ABT): 2 = k_abt2 (float4, tokens staged in smem), 1 = k_abt */
 static int gdn_c = 1, gdn_crw = 4, gdn_cnw = 4; /* chunked k_gdnc for nt > 1 (E_GDNC, E_GCRW, E_GCNW) */ /* rows per warp chain, warps per block (128 % (rw * nw) == 0) */
 static void enqueue(int nt, int tiny, int want) {
     ssq_ready = 0;
@@ -2598,7 +2639,9 @@ static void enqueue(int nt, int tiny, int want) {
                 gemv_res(&L->out, nt);
                 goto ffn;
             }
-            if (tiny && nt > 1 && abt_on)
+            if (tiny && nt > 1 && abt_on == 2)
+                k_abt2<<<dim3((2 * NV + 15) / 16, (nt + 7) / 8), 256, 0, st>>>(L->ssm_beta, L->ssm_alpha, d_xn, E, NV, nt, d_ab);
+            else if (tiny && nt > 1 && abt_on)
                 k_abt<<<dim3((2 * NV + 3) / 4, (nt + 3) / 4), 128, 0, st>>>(L->ssm_beta, L->ssm_alpha, d_xn, E, NV, nt, d_ab);
             else
                 k_ab<<<dim3((2 * NV + 3) / 4, nt), 128, 0, st>>>(L->ssm_beta, L->ssm_alpha, d_xn, E, NV, tiny, d_ab);

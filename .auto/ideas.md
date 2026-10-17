@@ -1535,3 +1535,25 @@ P1 gains nothing. Bench: 0 mismatches of 32768 rows (8 distributions) at 256/512
 with the event chain forced to break (BS_TESTFB), and 0 of 64 real rows. 4k ABBA (1/2/2/1, prebuilt
 binaries): decode 10.57 / 10.72 / 10.72 / 10.58, score 14.85 / 14.96 / 14.96 / 14.86, golden PASS.
 Cold: 20.86 / 10.71 / 14.95. Short decode 2B 27.3 -> 28.1, 4B 13.2 -> 13.4 tok/s.
+79. Prompt-batch rms sums on k_ssqb + float4 alpha/beta GEMV k_abt2 (keep, bit-identical; 4k prefill
++2.0%). (a) E_SSQN=2: the per-token rms sums of a prompt batch (norm_xq, nt > 1) run as one 512-thread
+k_ssqb block per token (TM 5, TM 8 for E 4096) instead of one k_ssqn warp per token: 102 -> 58 us per
+call (nvprof, 480-token 4B prefill). ABBA vs E_SSQN=1 (1/2/2/1, one build): prefill 20.89 / 21.05 /
+21.03 / 20.86, decode equal. (b) E_ABT=2: k_abt (tinyBLAS-order fp32 alpha/beta GEMV, 2 NV = 64 rows x
+E 2560 per chunk, 0.93 ms per prefill token) keeps its 8 chains per (row, token) and its tree. The 8
+chains now sit on 2 lanes (4 each), so one LDG.128 of w and one LDS.128 of x feed 4 FMAs. The 8
+tokens of a block are staged in smem 256 columns at a time (stride 66 float4: conflict-free) with a
+fully unrolled 16-load chunk loop. Per call (nvprof): k_abt 312 us; smem-staged scalar form 232;
+float4 with 512-column chunks, unroll 4: 156 (memory-dependency stall 79%, occupancy 0.27);
+256 / unroll 8: 125; 256 / 16: 115; 128 / 16: 116; 256 / 32: 115; 512 / 64: 135 (registers). The
+480-token md5 is unchanged in every variant. ABBA vs E_ABT=1 (1/2/2/1, one build): prefill 21.06 /
+21.31 / 21.30 / 21.05, decode 10.71 / 10.70 / 10.72 / 10.72, score 15.02 / 15.10 / 15.11 / 15.02,
+golden PASS. Cold: 21.39 / 10.71 / 15.14.
+Measured out:
+- 16-token prefill chunks (NTM 16, k_hg NT 16): bit-exact but prefill 18.52 / 18.52 vs 20.86 / 20.88
+  (ABBA of prebuilt binaries).
+- k_hg RB 1 / 3 / 4 at NT 8 and 16: all slower than RB 2 / NT 8.
+- k_hg sits near the issue floor of its form. Per k-iteration SASS is 455 instructions (256 HFMA2,
+  ~90 decode / MOV, 40 LDS, 32 F2F, 16 FADD, 16 FFMA); issue ~78%, not_selected 27%. Larger tiles
+  lose registers and occupancy.
+NTM is now #ifndef-overridable (k_gemvN's template parameter is renamed NTN to avoid the clash).
