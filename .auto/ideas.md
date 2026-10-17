@@ -1633,3 +1633,17 @@ the predicated form also updates, read before that stage's add). Same chains, tr
 10.94 / 10.91-10.97, so FK 2 MB 1 stays. 4k ABBA A = E_FSL=0 vs B = default (1/2/2/1, one build):
 prefill 22.31 / 22.31 / 22.31 / 22.30, decode 10.88 / 10.92 / 10.93 / 10.89, golden PASS. Cold:
 22.33 / 10.89 / 15.59. checks_b2 2B 4B ALL PASS.
+
+86. Lane-major K cache rows (E_KPERM, default 1; keep, bit-identical; 4k decode +0.6%, prefill +0.6%).
+k_qk now stores logical K element 32 * c + lane of a row at lane * 8 + c, so the 8 elements of a
+lane's score chain (c = 0..7, the same chain as before) are one 16-byte LDG.128 instead of 8 LDG.U16.
+The warp's row read is 512 contiguous bytes either way; what drops is the load instruction count. The
+decode score kernel k_fsl and the prefill batch score kernel k_fsb (TR form) take a KP template arm.
+k_fs, k_fa and k_fsb's non-TR form index through kix() on a __constant__ c_kperm, so every reader
+stays correct under either layout. Chains, trees and scale are unchanged. Decode profile before
+(E_GRAPH=0 nvprof, 4k prompt + 64 gen): per token k_li 58 ms, k_fvh 11.0 ms, k_gdnf 8.1 ms,
+k_fsl 6.1 ms (8 calls of 764 us for ~8 MB of K each, ~10.5 GB/s). Sweep (all md5 0b84b6abb1e2):
+E_KPERM 0 / 1 / 1 / 0 decode 10.93 / 11.03 / 11.01 / 10.91, prefill 22.28 / 22.33 / 22.33 / 22.19;
+with KP, FSK 21 / 41 / 42 / 22 / 81 = 11.01 / 11.00 / 10.98 / 11.04 / 10.92, so FK 2 MB 1 stays.
+4k ABBA A = E_KPERM=0 vs B = default (1/2/2/1, one build): prefill 22.20 / 22.33 / 22.33 / 22.20,
+decode 10.98 / 11.02 / 11.01 / 10.93, golden PASS. Cold: 22.34 / 11.02 / 15.69. checks_b2 2B 4B ALL PASS.

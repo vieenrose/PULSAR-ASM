@@ -1634,6 +1634,10 @@ __global__ void k_gdnf(const float *cv, const float *wb, const float *wa, const 
 }
 
 /* ---- full attention layer pieces (HD 256) ---- */
+/* E_KPERM: K cache rows stored lane-major, logical element 32 * c + lane at lane * 8 + c, so the
+   8 elements of a lane's score chain are one 16-byte load. Values and chains are unchanged. */
+__constant__ int c_kperm;
+__device__ __forceinline__ int kix(int d) { return c_kperm ? (d & 31) * 8 + (d >> 5) : d; }
 // q/k rms_norm + imrope on the first nrot dims; k and v go to the f16 cache at pos
 __global__ void k_qk(const float *buf, const float *qn, const float *kn, const int *posp, float *qo,
                      __half *kc, __half *vc, int NH, int NKV, int nrot, float ts, float eps, int bs_) {
@@ -1667,7 +1671,7 @@ __global__ void k_qk(const float *buf, const float *qn, const float *kn, const i
         const int kh = hh - NH;
         const float *vv = buf + NH * 512 + NKV * 256 + kh * 256;
         __half *kd = kc + (size_t)pos * NKV * 256 + kh * 256, *vd = vc + (size_t)pos * NKV * 256 + kh * 256;
-        for (int i = lane; i < 256; i += 32) { kd[i] = __float2half_rn(y[i]); vd[i] = __float2half_rn(vv[i]); }
+        for (int i = lane; i < 256; i += 32) { kd[kix(i)] = __float2half_rn(y[i]); vd[i] = __float2half_rn(vv[i]); }
     }
 }
 /* flash attention, f16 K/V, the fork's one_chunk online softmax: per position
@@ -1705,7 +1709,7 @@ __global__ void k_fa(const float *q, const float *buf, const __half *kc, const _
         for (int u = 0; u < FAK; u++) {
             const __half *kr = kc + (size_t)min(ic0 + u, n - 1) * NKV * 256 + g * 256;
 #pragma unroll
-            for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c + lane];
+            for (int c = 0; c < 8; c++) kh[u][c] = kr[kix(32 * c + lane)];
         }
 #pragma unroll
         for (int u = 0; u < FAK; u++) {
@@ -1784,7 +1788,7 @@ __global__ __launch_bounds__(256, MB) void k_fs(const float *q, const __half *kc
         for (int u = 0; u < FK; u++) {
             const __half *kr = kc + (size_t)(base + min(i0 + u, cnt - 1)) * NKV * 256 + g * 256;
 #pragma unroll
-            for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c + lane];
+            for (int c = 0; c < 8; c++) kh[u][c] = kr[kix(32 * c + lane)];
         }
 #pragma unroll
         for (int u = 0; u < FK; u++) {
@@ -1816,7 +1820,7 @@ __device__ __forceinline__ float dotg_reduce0(float a) {
 }
 /* Lean k_fs (E_FSL): row offsets stepped by a pass instead of recomputed per row, per-head store
    pointers, dotg_reduce0. Same chains, tree and scale as k_fs. */
-template <int GQ, int FK, int MB>
+template <int GQ, int FK, int MB, bool KP = false>
 __global__ __launch_bounds__(256, MB) void k_fsl(const float *q, const __half *kc, const int *posp, float *scg,
                                             int NH, int NKV, int ctx, float scale) {
     __shared__ float qs[GQ][256];
@@ -1832,7 +1836,7 @@ __global__ __launch_bounds__(256, MB) void k_fsl(const float *q, const __half *k
 #pragma unroll
         for (int c = 0; c < 8; c++) qr[h][c] = qs[h][32 * c + lane];
     const int cnt = min(256, n - base), rs = NKV * 256;
-    const __half *k0 = kc + (size_t)base * rs + g * 256 + lane, *kl = k0 + (size_t)(cnt - 1) * rs;
+    const __half *k0 = kc + (size_t)base * rs + g * 256 + (KP ? lane * 8 : lane), *kl = k0 + (size_t)(cnt - 1) * rs;
     float *sp = scg + (size_t)h0 * ctx + base;
     const __half *kp = k0 + (size_t)warp * FK * rs;
     for (int i0 = warp * FK; i0 < cnt; i0 += 8 * FK, kp += (size_t)8 * FK * rs) {
@@ -1840,6 +1844,12 @@ __global__ __launch_bounds__(256, MB) void k_fsl(const float *q, const __half *k
 #pragma unroll
         for (int u = 0; u < FK; u++) {
             const __half *kr = i0 + u < cnt ? kp + u * rs : kl;
+            if (KP) {
+                const uint4 w = *(const uint4 *)kr;
+                const __half *wh = (const __half *)&w;
+#pragma unroll
+                for (int c = 0; c < 8; c++) kh[u][c] = wh[c];
+            } else
 #pragma unroll
             for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c];
         }
@@ -1871,7 +1881,7 @@ __global__ __launch_bounds__(256, MB) void k_fsl(const float *q, const __half *k
    other half with its partner, 31 shuffles for 32 scores instead of 160; every add is
    dotg_reduce's (lower lane + upper lane, addition commutes bitwise). Lane L ends holding set
    (L & 28) | (L & 1) << 1 | (L >> 1 & 1). */
-template <int GQ, bool TR>
+template <int GQ, bool TR, bool KP = false>
 __global__ __launch_bounds__(256) void k_fsb(const float *q, const __half *kc, const int *posp, float *scg,
                                             int NH, int NKV, int ctx, float scale, int nt) {
     __shared__ float qs[8][GQ][256];
@@ -1893,8 +1903,14 @@ __global__ __launch_bounds__(256) void k_fsb(const float *q, const __half *kc, c
 #pragma unroll
             for (int u = 0; u < U; u++) {
                 const __half *kr = kc + (size_t)(base + min(i0 + u, cnt - 1)) * NKV * 256 + g * 256;
+                if (KP) {
+                    const uint4 w = *(const uint4 *)(kr + lane * 8);
+                    const __half *wh = (const __half *)&w;
 #pragma unroll
-                for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c + lane];
+                    for (int c = 0; c < 8; c++) kh[u][c] = wh[c];
+                } else
+#pragma unroll
+                for (int c = 0; c < 8; c++) kh[u][c] = kr[kix(32 * c + lane)];
             }
 #pragma unroll
             for (int u = 0; u < U; u++)
@@ -2778,6 +2794,7 @@ static int ssq_ready, ssq_on = -1;
 static double *d_ssq, *d_ssqn;
 static int ssqn_on = 2; /* E_SSQN: batch rms sums once per token, 2 = one k_ssqb block each, 1 = one k_ssqn warp each */
 static int fvgv = 0, fvgp = 2; /* E_FVGV / E_FVGP (one token / a token batch): 1 = k_fvg<1, 4>, 2 = k_fvg<2, 4> (4 heads share each V conversion), else k_fvg<2, 2> */
+static int kperm = 1; /* E_KPERM: lane-major K cache rows (c_kperm), 16-byte K loads in k_fsl / k_fsb */
 static int fsl_on = 1; /* E_FSL: lean k_fsl for the one-token score pass (GQ 4) */
 static int fsk_d = 21; /* E_FSK: k_fs<4> variant, 10 * K rows per pass + min blocks per SM (0: FAK, 1; 21: 80 registers, 3 blocks per SM) */
 static int fvr_on = 3; /* E_FVR: k_fvh rounds with f16rr<true> (bit 0: one token, bit 1: a token batch) */
@@ -2920,19 +2937,23 @@ static void enqueue(int nt, int tiny, int want) {
             if (fa_split) {
                 const dim3 gs(NKV * ((CTX + 255) / 256), nt);
                 if (fsb_on && nt > 1 && nt <= 8) switch (NH / NKV) {
-                case 1: if (fsb_on == 2) k_fsb<1, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<1, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
-                case 2: if (fsb_on == 2) k_fsb<2, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<2, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
-                default: if (fsb_on == 2) k_fsb<4, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<4, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
+                case 1: if (fsb_on == 2 && kperm) k_fsb<1, true, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else if (fsb_on == 2) k_fsb<1, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<1, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
+                case 2: if (fsb_on == 2 && kperm) k_fsb<2, true, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else if (fsb_on == 2) k_fsb<2, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<2, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
+                default: if (fsb_on == 2 && kperm) k_fsb<4, true, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else if (fsb_on == 2) k_fsb<4, true><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); else k_fsb<4, false><<<gs.x, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale, nt); break;
                 } else switch (NH / NKV) {
                 case 1: k_fs<1, FAK, 1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 case 2: k_fs<2, FAK, 1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 default:
 #define FS4(FK, MB) k_fs<4, FK, MB><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale)
                     if (fsl_on) switch (fsk_d) {
-                    case 41: k_fsl<4, 4, 1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
-                    case 22: k_fsl<4, 2, 2><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
-                    case 23: k_fsl<4, 2, 3><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
-                    default: k_fsl<4, 2, 1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+#define FSL(FK, MB) if (kperm) k_fsl<4, FK, MB, true><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); else k_fsl<4, FK, MB><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale)
+                    case 41: FSL(4, 1); break;
+                    case 42: FSL(4, 2); break;
+                    case 22: FSL(2, 2); break;
+                    case 23: FSL(2, 3); break;
+                    case 81: FSL(8, 1); break;
+                    default: FSL(2, 1); break;
+#undef FSL
                     } else switch (fsk_d) {
                     case 42: FS4(4, 2); break;
                     case 43: FS4(4, 3); break;
@@ -3107,6 +3128,8 @@ int main(int argc, char **argv) {
     if (getenv("E_FVR")) fvr_on = atoi(getenv("E_FVR"));
     if (getenv("E_FSK")) fsk_d = atoi(getenv("E_FSK"));
     if (getenv("E_FSL")) fsl_on = atoi(getenv("E_FSL"));
+    if (getenv("E_KPERM")) kperm = atoi(getenv("E_KPERM"));
+    CK(cudaMemcpyToSymbol(c_kperm, &kperm, sizeof(int)));
     if (getenv("E_FSB")) fsb_on = atoi(getenv("E_FSB"));
     if (getenv("E_XQW")) xqw_on = atoi(getenv("E_XQW"));
     if (getenv("E_XQWD")) xqw_q1 = atoi(getenv("E_XQWD"));
