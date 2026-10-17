@@ -2855,6 +2855,7 @@ static double *d_ssq, *d_ssqn;
 static int ssqn_on = 2; /* E_SSQN: batch rms sums once per token, 2 = one k_ssqb block each, 1 = one k_ssqn warp each */
 static int fvgv = 0, fvgp = 2; /* E_FVGV / E_FVGP (one token / a token batch): 1 = k_fvg<1, 4>, 2 = k_fvg<2, 4> (4 heads share each V conversion), else k_fvg<2, 2> */
 static int fwv_on = 1; /* E_FWV: k_fwv, coalesced float4 groups + shuffle prefix max for the weight pass */
+static int fvu8 = 8, fvup = 8; /* E_FVU8 / E_FVUP: positions per group (4, 8, 16) of the mixed-rounding k_fvh, decode / prefill */
 static int kperm = 1; /* E_KPERM: lane-major K cache rows (c_kperm), 16-byte K loads in k_fsl / k_fsb */
 static int fsl_on = 1; /* E_FSL: lean k_fsl for the one-token score pass (GQ 4) */
 static int fsk_d = 21; /* E_FSK: k_fs<4> variant, 10 * K rows per pass + min blocks per SM (0: FAK, 1; 21: 80 registers, 3 blocks per SM) */
@@ -3013,6 +3014,9 @@ static void enqueue(int nt, int tiny, int want) {
                     case 22: FSL(2, 2); break;
                     case 23: FSL(2, 3); break;
                     case 81: FSL(8, 1); break;
+                    case 24: FSL(2, 4); break;
+                    case 25: FSL(2, 5); break;
+                    case 14: FSL(1, 4); break;
                     default: FSL(2, 1); break;
 #undef FSL
                     } else switch (fsk_d) {
@@ -3034,7 +3038,7 @@ static void enqueue(int nt, int tiny, int want) {
                 else k_fw<false><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
                 if (fvh_on && fvg && CTX % 4 == 0 && (nt > 1 ? fvgp : fvgv) != 1) {
                     const int hg4 = (nt > 1 ? fvgp : fvgv) == 2 && NH / NKV % 4 == 0;
-#define FVH_X(HG, NX) k_fvh<HG, 4, true, NX><<<dim3(NH / HG, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG)
+#define FVH_X(HG, NX) if ((nt > 1 ? fvup : fvu8) == 16) k_fvh<HG, 16, true, NX><<<dim3(NH / HG, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG); else if ((nt > 1 ? fvup : fvu8) == 8) k_fvh<HG, 8, true, NX><<<dim3(NH / HG, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG); else k_fvh<HG, 4, true, NX><<<dim3(NH / HG, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG)
 #define FVH_L(HG, U, RB) if (RB && U == 4 && (nt > 1 ? fvxp : fvx)) switch (nt > 1 ? fvxp : fvx) { case 1: FVH_X(HG, 1); break; case 2: FVH_X(HG, 2); break; case 3: FVH_X(HG, 3); break; case 4: FVH_X(HG, 4); break; default: FVH_X(HG, 6); break; } else k_fvh<HG, U, RB><<<dim3(NH / HG, nt), 128, 0, st>>>(d_buf, d_vc[fi], d_pos, d_sc, d_att, tdf ? d_fao : NULL, NH, NKV, CTX, BIG)
                     const bool rb = fvr_on & (nt > 1 ? 2 : 1);
                     if (hg4) { if (fvh_on == 2) FVH_L(4, 8, false); else if (rb) FVH_L(4, 4, true); else FVH_L(4, 4, false); }
@@ -3194,6 +3198,8 @@ int main(int argc, char **argv) {
     if (getenv("E_FSL")) fsl_on = atoi(getenv("E_FSL"));
     if (getenv("E_KPERM")) kperm = atoi(getenv("E_KPERM"));
     if (getenv("E_FWV")) fwv_on = atoi(getenv("E_FWV"));
+    if (getenv("E_FVU8")) fvu8 = atoi(getenv("E_FVU8"));
+    if (getenv("E_FVUP")) fvup = atoi(getenv("E_FVUP"));
     CK(cudaMemcpyToSymbol(c_kperm, &kperm, sizeof(int)));
     if (getenv("E_FSB")) fsb_on = atoi(getenv("E_FSB"));
     if (getenv("E_XQW")) xqw_on = atoi(getenv("E_XQW"));

@@ -1664,3 +1664,9 @@ same comparisons and exp arguments up to a zero's sign, exp(+-0) = 1. Sweep (4k 
 22.39 / 22.33, decode 11.02 / 11.06 / 11.06 / 11.04, golden PASS. Cold: 22.41 / 11.06 / 15.74.
 checks_b2 2B 4B ALL PASS. Prefill profile at this point (nvprof, E_GRAPH=0, 4k): k_hg 75.2%,
 k_fvh 10.0%, k_gdnc 3.1%, k_fsb 3.1%, k_xqw 2.3%, k_fw 1.6% (before k_fwv).
+
+88. k_fvh 8 positions per group (E_FVU8 decode / E_FVUP prefill, default 8, was 4; keep, bit-identical,
+md5 0b84b6abb1e2). Same-job ABBA (A = 4/4, B = 8/8): decode 11.07 / 11.07 vs 11.30 / 11.27 (+2.0%),
+prefill 22.40 / 22.40 vs 22.48 / 22.50 (+0.4%); fresh score 15.95 (15.74 before). Sweep: decode U=16
+11.05 (no gain), prefill U=16 21.63 (slower). Measured out on k_fsl with KP: FSK 24 (MB 4) noise
+(11.07 / 11.10 vs 11.07 / 11.06), 25 spills, 14 slower (10.99). checks_b2 2B 4B ALL PASS.
