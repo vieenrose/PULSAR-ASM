@@ -11,9 +11,9 @@ DeltaNet (linear attention) layers.
 
 | model | GGUF bytes | on the GPU | prefill, 3968 tokens | decode at 4k |
 |---|---|---|---|---|
-| Ternary-Bonsai-2-2B | 429,183,456 | 476 MB | **47.1 tok/s** | **20.1 tok/s** |
-| Ternary-Bonsai-2-4B | 949,549,920 | 1064 MB | **18.8 tok/s** | **9.8 tok/s** |
-| Ternary-Bonsai-2-9B | 1,997,486,976 | 2009 MB | **11.8 tok/s** | **6.4 tok/s** |
+| Ternary-Bonsai-2-2B | 429,183,456 | 476 MB | **57.4 tok/s** | **24.0 tok/s** |
+| Ternary-Bonsai-2-4B | 949,549,920 | 1064 MB | **22.5 tok/s** | **11.3 tok/s** |
+| Ternary-Bonsai-2-9B | 1,997,486,976 | 2009 MB | **13.0 tok/s** | **7.1 tok/s** |
 
 All three rows run the same 3968-token prompt
 (`.auto/prompt_b2_4k_ids.txt`): a Traditional Chinese article with an
@@ -22,12 +22,13 @@ then decodes 64 greedy tokens. Prefill speed is 3968 tokens divided by the
 prefill wall time. Decode speed covers the 63 steps after the first token,
 each attending over 3968 to 4031 positions.
 
-- **Build and conditions:** commit b056001, the default settings (8-token
+- **Build and conditions:** commit 1ab76d2, the default settings (8-token
   prefill chunks, exact f16 K/V cache), `jetson_clocks` (GPU 921.6 MHz,
   CPU 1.479 GHz), page cache dropped before each run, L4T R32.5.1, CUDA 10.2.
-- **Runs:** each figure is one cold run. The 4B figures are the mean of two
-  runs in the order-balanced A/B of b056001 (18.77 / 18.79 and
-  9.82 / 9.82). The board drifts 2 to 6 % between hours.
+- **Runs:** each figure is one cold run. The 4B figures are the mean of the two
+  default-setting runs of the same-job E_FVXP sweep at 1ab76d2
+  (22.52 / 22.50 and 11.29 / 11.30). All three 4k streams equal their
+  goldens at 1ab76d2. The board drifts 2 to 6 % between hours.
 - **Exactness at 4k:** the reference is the PrismML fork's greedy stream on
   the same prompt (`fork_greedy`, one thread, 32-token ubatches, flash
   attention on, f16 cache).
@@ -47,9 +48,9 @@ own end of turn) gives:
 
 | model | prefill, 24 tokens | decode, ≤ 125 positions |
 |---|---|---|
-| 2B | 52.9 tok/s | 25.3 tok/s |
-| 4B | 22.4 tok/s | 12.5 tok/s |
-| 9B | 12.8 tok/s | 7.3 tok/s |
+| 2B | 58.2 tok/s | 28.5 tok/s |
+| 4B | 24.7 tok/s | 13.6 tok/s |
+| 9B | 13.5 tok/s | 7.8 tok/s |
 
 Decode is slower at 4k because every full-attention layer reads the whole
 K/V cache at every step. For the 4B at 4k (nvprof, ms per decoded token),
@@ -118,7 +119,7 @@ are in `.auto/HANDOFF_B2_4K.md`.
 ## Demo
 
 The same two prompts on each model, one English and one Traditional
-Chinese, recorded at commit b056001 with the default settings. The clips
+Chinese, recorded at commit 1ab76d2 with the default settings. The clips
 play in real time. Each token appears at the moment the engine produced
 it, using the per-step times from the run's own log. Loading (weight
 repack + upload) and prompt processing are shown at their measured
@@ -126,37 +127,37 @@ durations too.
 
 ### Ternary-Bonsai-2-2B
 
-**English** (100 tokens, decode 25.3 tok/s)
+**English** (100 tokens, decode 28.5 tok/s)
 
 ![Ternary-Bonsai-2-2B on a Jetson Nano, English prompt](doc/bonsai2-2b-nano-chat-en.gif)
 
-**Traditional Chinese** (350 tokens, decode 25.3 tok/s)
+**Traditional Chinese** (350 tokens, decode 28.6 tok/s)
 
 ![Ternary-Bonsai-2-2B on a Jetson Nano, Traditional Chinese prompt](doc/bonsai2-2b-nano-chat-zh-tw.gif)
 
 ### Ternary-Bonsai-2-4B
 
-**English** (82 tokens, decode 12.5 tok/s)
+**English** (82 tokens, decode 13.6 tok/s)
 
 ![Ternary-Bonsai-2-4B on a Jetson Nano, English prompt](doc/bonsai2-4b-nano-chat-en.gif)
 
-**Traditional Chinese** (404 tokens, decode 12.4 tok/s)
+**Traditional Chinese** (404 tokens, decode 13.5 tok/s)
 
 ![Ternary-Bonsai-2-4B on a Jetson Nano, Traditional Chinese prompt](doc/bonsai2-4b-nano-chat-zh-tw.gif)
 
 ### Ternary-Bonsai-2-9B
 
-**English** (99 tokens, decode 7.3 tok/s)
+**English** (99 tokens, decode 7.8 tok/s)
 
 ![Ternary-Bonsai-2-9B on a Jetson Nano, English prompt](doc/bonsai2-9b-nano-chat-en.gif)
 
-**Traditional Chinese** (92 tokens, decode 7.3 tok/s)
+**Traditional Chinese** (92 tokens, decode 7.8 tok/s)
 
 ![Ternary-Bonsai-2-9B on a Jetson Nano, Traditional Chinese prompt](doc/bonsai2-9b-nano-chat-zh-tw.gif)
 
 How the clips were made:
 
-- The engine is `fwd35_sm53.cu` at b056001, built on the Nano with
+- The engine is `fwd35_sm53.cu` at 1ab76d2, built on the Nano with
   `nvcc -O3 -gencode arch=compute_53,code=sm_53 --fmad=false -Xcompiler -fopenmp,-ffp-contract=off`,
   under `jetson_clocks`, with the page cache dropped before each run.
 - The prompts are "List the four seasons and one thing that changes in
@@ -169,15 +170,16 @@ How the clips were made:
 - **Every stream equals the fork's.** `fork_greedy.cpp` (the fork's
   own CPU graph, f16 K/V cache, flash attention) was run for each clip's
   full length: 2B 101 / 351, 4B 83 / 405 and 9B 100 / 93 ids are
-  identical. The re-shoot at b056001 produced the same ids as the first
-  recording. The text is decoded with each GGUF's own vocabulary and is
+  identical. The re-shoots at b056001 and 1ab76d2 produced the same ids as the
+  first recording. The text is decoded with each GGUF's own vocabulary and is
   not edited.
 - **Timings.**
-  - Decode steps: 2B 39–78 ms, 4B 79–129 ms, 9B 134–206 ms. The first
+  - Decode steps: 2B 34–58 ms, 4B 73–105 ms, 9B 126–170 ms. The first
     step after the prefill is the slowest.
   - These answers stay short of 4k, so the 350- and 404-token Chinese
-    answers decode within 0.3 % of the English ones.
-  - Loading took 6.5 s, 14.3 s and 25.9 s at b056001. Most of it was the
+    answers decode within 1 % of the English ones.
+  - Loading took 3.3–3.4 s, 7.4–9.5 s and 12.7–13.1 s at 1ab76d2
+    (6.5 s, 14.3 s and 25.9 s at b056001). Most of it was the
     CPU repack of the base-3 trits into bit planes. Since 9c9bb94 the repack
     is table driven, with bit-identical planes. The 4B's repack dropped from
     11.9 s to 5.1–5.6 s (cold, on the Nano).

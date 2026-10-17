@@ -1670,3 +1670,9 @@ md5 0b84b6abb1e2). Same-job ABBA (A = 4/4, B = 8/8): decode 11.07 / 11.07 vs 11.
 prefill 22.40 / 22.40 vs 22.48 / 22.50 (+0.4%); fresh score 15.95 (15.74 before). Sweep: decode U=16
 11.05 (no gain), prefill U=16 21.63 (slower). Measured out on k_fsl with KP: FSK 24 (MB 4) noise
 (11.07 / 11.10 vs 11.07 / 11.06), 25 spills, 14 slower (10.99). checks_b2 2B 4B ALL PASS.
+
+89. Re-sweep of the k_fvh mixed-rounding split under U=8 (measured out; defaults stay). Decode E_FVX
+0/1/2/3/4: 11.00 / 11.30 / 11.20 / 11.07 / 10.96 (1 twice: 11.29, 11.31). Prefill E_FVXP 1/2/3/4/6:
+22.43 / 22.51 / 22.47 / 22.37 / 22.16. All md5 0b84b6abb1e2. Also measured: RMW of the GDN state
+(2 MB per layer, in place) peaks at 18.8 GB/s on the Nano (read only 21.3), so k_gdnf's floor is
+~5.4 ms per token against ~8.1 ms; k_li runs at 18-21 GB/s of the 21.9 ceiling.
