@@ -198,8 +198,51 @@ __device__ __forceinline__ double d_mk(int e, long long S) {
    payload arithmetic never produces) until then; the value is its own flag, so no fence is
    needed. Each lane takes its element from zc and puts the sentinel back. */
 #define ZC_EMPTY 0xffffffffu
+/* E_WSF fast path of wsum_sq: if every float term t = x^2 has its top bit within 53 bits of the
+   lowest set bit lo over all terms, and the integer total in units of 2^lo stays below 2^53, then
+   every prefix of the sequential double sum is exactly representable (the terms are >= 0, so a
+   prefix never exceeds the total): no add rounds, and the tree sum of the integers is the same
+   double. Otherwise (or for inf / NaN terms) the caller runs the sequential walk. */
+__constant__ int c_wsf = 1;
+__device__ __forceinline__ bool wsum_sq_fast(const float *x, int n, int lane, double *out) {
+    int lo = 0x7fffffff, hi = -0x7fffffff;
+    bool bad = false;
+    for (int i = lane; i < n; i += 32) {
+        const float xv = x[i], t = xv * xv;
+        const uint32_t tb = __float_as_uint(t);
+        const int tex = (int)(tb >> 23);
+        const uint32_t tm = tex ? ((tb & 0x7fffffu) | 0x800000u) : (tb & 0x7fffffu);
+        const int te = tex ? tex - 150 : -149;
+        if (tex == 255) bad = true;
+        if (tm) { lo = min(lo, te + __ffs(tm) - 1); hi = max(hi, te + 31 - __clz(tm)); }
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+        lo = min(lo, __shfl_xor_sync(FULL, lo, o));
+        hi = max(hi, __shfl_xor_sync(FULL, hi, o));
+    }
+    if (__any_sync(FULL, bad)) return false;
+    if (hi == -0x7fffffff) { *out = 0.0; return true; }
+    if (hi - lo > 52) return false;
+    unsigned long long S = 0;
+    for (int i = lane; i < n; i += 32) {
+        const float xv = x[i], t = xv * xv;
+        const uint32_t tb = __float_as_uint(t);
+        const int tex = (int)(tb >> 23);
+        const uint32_t tm = tex ? ((tb & 0x7fffffu) | 0x800000u) : (tb & 0x7fffffu);
+        const int sh = (tex ? tex - 150 : -149) - lo;
+        S += sh >= 0 ? (unsigned long long)tm << sh : (unsigned long long)(tm >> -sh);
+    }
+    if (S >= (1ull << 53)) S = 1ull << 53; /* n <= 4096: a lane adds < 2^60 before this */
+#pragma unroll
+    for (int o = 16; o; o >>= 1) S += __shfl_xor_sync(FULL, S, o);
+    if (S >= (1ull << 53)) return false;
+    *out = ldexp((double)S, lo);
+    return true;
+}
 __device__ double wsum_sq(const float *x, int n, int lane, uint32_t *zc = NULL) {
     double s = 0.0;
+    if (!zc && c_wsf) { double f; if (wsum_sq_fast(x, n, lane, &f)) return f; }
     for (int base = 0; base < n; base += 32) {
         const int i = base + lane;
         float xv = 0.0f;
@@ -1277,6 +1320,30 @@ __global__ void k_conv(const float *qkv, const float *cw, float *st, int CH, flo
         s += w0 * k[0]; s += w1 * k[1]; s += w2 * k[2]; s += w3 * k[3];
         cv[(size_t)t * CH + c] = d_silu(s);
         w0 = w1; w1 = w2; w2 = w3;
+    }
+    st[c] = w0; st[CH + c] = w1; st[2 * CH + c] = w2;
+}
+/* k_conv for a token batch: the nt <= NT inputs of a channel are loaded up front (restrict:
+   no store can alias them), then the same chain as k_conv. E_CONV=0 keeps k_conv. */
+template <int NT>
+__global__ void k_conv2(const float *__restrict__ qkv, const float *__restrict__ cw, float *__restrict__ st, int CH,
+                        float *__restrict__ cv, int nt, int qs) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= CH) return;
+    float x[NT];
+#pragma unroll
+    for (int t = 0; t < NT; t++) x[t] = t < nt ? qkv[(size_t)t * qs + c] : 0.0f;
+    const float k0 = cw[4 * c], k1 = cw[4 * c + 1], k2 = cw[4 * c + 2], k3 = cw[4 * c + 3];
+    float w0 = st[c], w1 = st[CH + c], w2 = st[2 * CH + c];
+#pragma unroll
+    for (int t = 0; t < NT; t++) {
+        if (t < nt) {
+            const float w3 = x[t];
+            float s = 0.0f;
+            s += w0 * k0; s += w1 * k1; s += w2 * k2; s += w3 * k3;
+            cv[(size_t)t * CH + c] = d_silu(s);
+            w0 = w1; w1 = w2; w2 = w3;
+        }
     }
     st[c] = w0; st[CH + c] = w1; st[2 * CH + c] = w2;
 }
@@ -2671,6 +2738,7 @@ static void gemv_res(const DT *d, int nt) {
     CK(cudaEventRecord(evj, st2)); CK(cudaStreamWaitEvent(st, evj, 0));
     ssq_ready = 1;
 }
+static int conv_on = 1; /* E_CONV: prefill causal conv with preloaded inputs (k_conv2) */
 static int xqw_on = 1; /* E_XQW: warp-form FWHT + Q8_0 (k_xqw, k_norm_xqw) */
 static int xqw_q1 = 2, xqw_qn = 4; /* E_XQWD / E_XQWP: elements per lane at one token / a token batch (16 / Q warps per Hadamard block) */
 #define XQW_SW(Q, CALL) switch (Q) { case 1: CALL(1); break; case 2: CALL(2); break; case 4: CALL(4); break; case 8: CALL(8); break; default: CALL(16); }
@@ -2757,7 +2825,8 @@ static void enqueue(int nt, int tiny, int want) {
                 k_abt<<<dim3((2 * NV + 3) / 4, (nt + 3) / 4), 128, 0, st>>>(L->ssm_beta, L->ssm_alpha, d_xn, E, NV, nt, d_ab);
             else
                 k_ab<<<dim3((2 * NV + 3) / 4, nt), 128, 0, st>>>(L->ssm_beta, L->ssm_alpha, d_xn, E, NV, tiny, d_ab);
-            k_conv<<<(CH + 255) / 256, 256, 0, st>>>(d_buf, L->conv1d, d_conv[l], CH, d_cv, nt, BIG);
+            if (conv_on && nt > 1) k_conv2<NTM><<<(CH + 127) / 128, 128, 0, st>>>(d_buf, L->conv1d, d_conv[l], CH, d_cv, nt, BIG);
+            else k_conv<<<(CH + 255) / 256, 256, 0, st>>>(d_buf, L->conv1d, d_conv[l], CH, d_cv, nt, BIG);
             tdump("conv_output_silu-%d", l, d_cv, CH);
             tdump("alpha-%d", l, d_ab + NV, NV); tdump("beta-%d", l, d_ab, NV);
             k_l2<<<dim3((2 * NK + 3) / 4, nt), 128, 0, st>>>(d_cv, 2 * NK, EPS, CH);
@@ -2978,6 +3047,8 @@ int main(int argc, char **argv) {
     k_feinit<<<1, 32>>>();
     if (getenv("E_GCRW")) gdn_crw = atoi(getenv("E_GCRW"));
     if (getenv("E_GTR")) gtr_on = atoi(getenv("E_GTR"));
+    if (getenv("E_WSF")) { const int v = atoi(getenv("E_WSF")); CK(cudaMemcpyToSymbol(c_wsf, &v, sizeof v)); }
+    if (getenv("E_CONV")) conv_on = atoi(getenv("E_CONV"));
     if (getenv("E_Q8T")) { const int q8t = atoi(getenv("E_Q8T")); CK(cudaMemcpyToSymbol(c_q8t, &q8t, sizeof q8t)); }
     if (getenv("E_GCNW")) gdn_cnw = atoi(getenv("E_GCNW"));
     /* capture outside the timed region */

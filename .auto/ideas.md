@@ -1583,3 +1583,22 @@ k_norm_xqw (E_Q8T=0 keeps q8word). k_xqw was issue-bound (issue 70%, IPC 3.35, ~
 nvprof 480-token 4B prefill totals: k_xqw 525 -> 502 ms, k_norm_xqw 195 -> 175 ms. md5-identical.
 4k ABBA E_Q8T=0 vs 1 (1/2/2/1, one build): prefill 21.75 / 21.86 / 21.85 / 21.74, decode 10.75 / 10.74 /
 10.75 / 10.75, golden PASS. Cold: 21.85 / 10.76 / 15.33. checks_b2 2B 4B ALL PASS.
+82. Exact integer fast path for wsum_sq (keep, bit-identical; 4k prefill +1.0%, decode +0.6%). wsum_sq
+(the sequential double sum of float squares x^2 on one warp) walked 32-term chunks with a 64-bit
+prefix scan and event handling: k_qk was exec-dependency bound (72% stalls, ~1900 inst per warp).
+wsum_sq_fast: warp min of every nonzero term's lowest set bit lo, max of its top bit hi; if hi - lo
+<= 52 and the integer total in units of 2^lo is < 2^53 (lane sums saturate at 2^53 before the warp
+add), no prefix of the sequential sum can round (terms >= 0, prefix <= total), so ldexp(total, lo)
+is the same double; inf/NaN or a wider range falls back to the walk. E_WSF=0 restores. Used by
+k_qk, k_l2, k_gnorm and the decode q/k/gated norms. nvprof 480-token 4B prefill totals: k_gnorm 200
+-> 110 ms, k_l2 175 -> 82, k_qk 134 -> 107. md5-identical. 4k ABBA E_WSF=0 vs 1 (1/2/2/1, one
+build): prefill 21.85 / 22.08 / 22.05 / 21.85, decode 10.76 / 10.82 / 10.83 / 10.75, golden PASS.
+(The residual-stream rms sums of k_ssqb, n 2560 with outliers, would mostly fail the range test.)
+83. k_conv2: prefill causal conv with the nt inputs of a channel loaded up front (keep, bit-identical;
+4k prefill +0.3%). k_conv's per-token chain re-issued each qkv load after the cv store (possible
+alias); k_conv2<NTM> (restrict pointers, x[NT] preloaded, 128 threads) runs the same chain.
+k_conv 151 -> k_conv2 87 ms (480-token 4B prefill total). Measured out: a thread per (channel,
+token) reading its window (157 us vs 105 per call: 4x the loads, no L1 for global on sm_53), and
+l2 fused into k_conv2 for the q/k heads (155 ms vs 86 + 83: -14 ms, below ABBA resolution; removed).
+4k ABBA E_CONV=0 vs 1: prefill 22.07 / 22.14 / 22.13 / 22.06, decode 10.80 / 10.82 / 10.82 /
+10.77, golden PASS. Cold: 22.13 / 10.81 / 15.47. checks_b2 2B 4B ALL PASS (both changes).
