@@ -455,6 +455,259 @@ __global__ void k_ssq(int n, uint32_t *zc, double *out) {
     const double s = wsum_sq(NULL, n, threadIdx.x, zc);
     if (threadIdx.x == 0) *out = s;
 }
+/* bsum_sq: the sequential double sum of x[i]^2 (float squares) by all threads of a block.
+   Terms are squares, so s never shrinks, and inside the binade of s RN(s + t) = s + RN_u(t)
+   with t rounded to the ulp of s: an exact integer prefix sum. Thread k owns the contiguous
+   positions [k T, k T + T).
+   Fast path: a float prefix scan predicts the binade of s before every term; each term is
+   rounded to its predicted ulp, and an event is any term that ties, is too large (r would
+   reach 2^52), or after which the predicted binade changes. One unsigned 64-bit scan (the
+   events contribute 0) gives every segment's sum; one lane then walks the events in order:
+   a segment is accepted only if s really lies in the predicted binade and the segment sum
+   keeps it there, and each event term is a real double add. r < 2^52 and n < 4096 keep the
+   unsigned prefix from wrapping. Any rejection (or more than BS_EVM events, or a non-finite
+   float prefix) resumes the old block iteration from the last accepted point. */
+#define BS_EZ (-100000) /* predicted s == 0 */
+#define BS_EVM 64
+__device__ __forceinline__ int bs_fbin(float a) {
+    const uint32_t b = __float_as_uint(a);
+    const int ex = (int)(b >> 23);
+    if (ex) return ex - 127;
+    return b ? (31 - __clz((int)b)) - 149 : BS_EZ;
+}
+__device__ __forceinline__ void bs_round(uint32_t tm, int te, int e, unsigned long long &rr, bool &ee) {
+    rr = 0; ee = false;
+    if (!tm) return;
+    if (e == BS_EZ) { ee = true; return; }
+    const int sh = te - (e - 52);
+    if (sh >= 0) { if (sh > 28) ee = true; else rr = (unsigned long long)tm << sh; }
+    else {
+        const int k = -sh;
+        if (k <= 25) {
+            const uint32_t half = 1u << (k - 1), rem = tm & ((half << 1) - 1u);
+            if (rem == half) ee = true;
+            rr = (unsigned long long)(tm >> k) + (rem > half ? 1 : 0);
+        }
+    }
+}
+template <int TM>
+__device__ double bsum_sq(const float *x, int n) {
+    __shared__ float b_ft[32];
+    __shared__ unsigned long long b_tot[32], e_pb[BS_EVM];
+    __shared__ int b_cnt[32], e_f[BS_EVM], e_e[BS_EVM], b_fin_e, b_pos;
+    __shared__ float e_t[BS_EVM];
+    __shared__ double b_s;
+    const int NT = blockDim.x, tid = threadIdx.x, lane = tid & 31, w = tid >> 5, NW = NT >> 5;
+    const int T = (n + NT - 1) / NT, i0 = tid * T;
+    float t[TM];
+    uint32_t tm[TM];
+    int te[TM];
+    float ts = 0.0f;
+#pragma unroll
+    for (int j = 0; j < TM; j++) {
+        const float xv = j < T && i0 + j < n ? x[i0 + j] : 0.0f;
+        t[j] = xv * xv;
+        const uint32_t tb = __float_as_uint(t[j]);
+        const int tex = (int)(tb >> 23);
+        tm[j] = tex ? ((tb & 0x7fffffu) | 0x800000u) : (tb & 0x7fffffu);
+        te[j] = tex ? tex - 150 : -149;
+        ts += t[j];
+    }
+    /* float exclusive prefix: warp scan of thread totals, then warp bases in fixed order */
+    float fi = ts;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) { const float v = __shfl_up_sync(FULL, fi, o); if (lane >= o) fi += v; }
+    float fl = __shfl_up_sync(FULL, fi, 1);
+    if (lane == 0) fl = 0.0f;
+    if (lane == 31) b_ft[w] = fi;
+    __syncthreads();
+    float wb = 0.0f, wbn = 0.0f;
+    for (int k = 0; k < NW; k++) { if (k < w) wb += b_ft[k]; if (k <= w) wbn += b_ft[k]; }
+    const float base = wb + fl;
+    float nbase = __shfl_down_sync(FULL, base, 1);
+    if (lane == 31) nbase = wbn + 0.0f;
+    bool bad = false;
+    int eh[TM];
+    unsigned long long r[TM], R = 0;
+    bool ev[TM];
+    int C = 0;
+    {
+        float a = base;
+#pragma unroll
+        for (int j = 0; j < TM; j++) {
+            eh[j] = bs_fbin(a);
+            const float an = j + 1 < T ? a + t[j] : nbase;
+            const int en = bs_fbin(an);
+            if (j < T && i0 + j < n) {
+                if (eh[j] >= 128 || en >= 128) bad = true;
+                bs_round(tm[j], te[j], eh[j], r[j], ev[j]);
+                if (i0 + j + 1 < n && en != eh[j]) ev[j] = true;
+            } else { r[j] = 0; ev[j] = false; }
+            if (ev[j]) { r[j] = 0; C++; }
+            R += r[j];
+            a = an;
+        }
+    }
+    unsigned long long P = R;
+    int Cs = C;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const unsigned long long v = __shfl_up_sync(FULL, P, o);
+        const int c = __shfl_up_sync(FULL, Cs, o);
+        if (lane >= o) { P += v; Cs += c; }
+    }
+    if (lane == 31) { b_tot[w] = P; b_cnt[w] = Cs; }
+    if (i0 <= n - 1 && n - 1 < i0 + T) {
+        const int jl = n - 1 - i0;
+        int e = eh[0];
+#pragma unroll
+        for (int j = 1; j < TM; j++) if (j == jl) e = eh[j];
+        b_fin_e = e;
+    }
+    bad = __syncthreads_or(bad);
+    unsigned long long off = 0, tot = 0;
+    int coff = 0, nev = 0;
+    for (int k = 0; k < NW; k++) { const unsigned long long v = b_tot[k]; const int c = b_cnt[k]; if (k < w) { off += v; coff += c; } tot += v; nev += c; }
+    {
+        unsigned long long Q = off + P - R;
+        int c = coff + Cs - C;
+#pragma unroll
+        for (int j = 0; j < TM; j++) {
+            if (ev[j]) { if (c < BS_EVM) { e_f[c] = i0 + j; e_pb[c] = Q; e_t[c] = t[j]; e_e[c] = eh[j]; } c++; }
+            Q += r[j];
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        double s = 0.0;
+        int pos = 0;
+        if (!bad) {
+            const int ne = nev < BS_EVM ? nev : BS_EVM;
+            unsigned long long Pp = 0;
+            int k = 0;
+            for (; k < ne; k++) {
+                const int e = e_e[k];
+                const unsigned long long seg = e_pb[k] - Pp;
+                if (s == 0.0) { if (e != BS_EZ || seg) break; }
+                else {
+                    const unsigned long long sb = (unsigned long long)__double_as_longlong(s);
+                    const unsigned long long S = (sb & ((1ull << 52) - 1)) | (1ull << 52);
+                    if (e != (int)(sb >> 52) - 1023 || S + seg >= (1ull << 53)) break;
+                    s = d_mk(e, (long long)(S + seg));
+                }
+                s = s + (double)e_t[k];
+                pos = e_f[k] + 1;
+                Pp = e_pb[k];
+            }
+            if (k == nev) {
+                if (pos < n) { /* the final segment (no events) */
+                    const int e = b_fin_e;
+                    const unsigned long long seg = tot - Pp;
+                    if (s == 0.0) { if (e == BS_EZ && !seg) pos = n; }
+                    else {
+                        const unsigned long long sb = (unsigned long long)__double_as_longlong(s);
+                        const unsigned long long S = (sb & ((1ull << 52) - 1)) | (1ull << 52);
+                        if (e == (int)(sb >> 52) - 1023 && S + seg < (1ull << 53)) { s = d_mk(e, (long long)(S + seg)); pos = n; }
+                    }
+                }
+            }
+        }
+        b_s = s; b_pos = pos;
+    }
+    __syncthreads();
+    double s = b_s;
+    int pos = b_pos;
+    /* fallback: one block iteration per event, from the last accepted point */
+    __shared__ long long f_tot[32];
+    __shared__ long long f_pb[32];
+    __shared__ float f_tf[32];
+    __shared__ int f_f[32], f_fl[32];
+    while (pos < n) {
+        if (s == 0.0) {
+            int fj = TM;
+#pragma unroll
+            for (int j = TM - 1; j >= 0; j--) if (tm[j] && i0 + j >= pos) fj = j;
+            const unsigned m = __ballot_sync(FULL, fj < TM);
+            if (m && lane == __ffs(m) - 1) {
+                float tv = t[0];
+#pragma unroll
+                for (int j = 1; j < TM; j++) if (j == fj) tv = t[j];
+                f_tf[w] = tv; f_f[w] = i0 + fj;
+            }
+            if (lane == 0) f_fl[w] = m != 0;
+            __syncthreads();
+            int fw = NW;
+            for (int k = NW - 1; k >= 0; k--) if (f_fl[k]) fw = k;
+            if (fw == NW) break;
+            s = (double)f_tf[fw]; pos = f_f[fw] + 1;
+            __syncthreads();
+            continue;
+        }
+        const unsigned long long sb = (unsigned long long)__double_as_longlong(s);
+        const int e = (int)(sb >> 52) - 1023;
+        const long long S0 = (long long)((sb & ((1ull << 52) - 1)) | (1ull << 52));
+        long long rr[TM], RR = 0;
+        bool ee[TM];
+#pragma unroll
+        for (int j = 0; j < TM; j++) {
+            const int sh = te[j] - (e - 52);
+            long long q = 0;
+            bool g = false;
+            if (tm[j]) {
+                if (sh >= 0) { if (sh > 29) g = true; else q = (long long)tm[j] << sh; }
+                else {
+                    const int k = -sh;
+                    if (k <= 25) {
+                        const uint32_t half = 1u << (k - 1), rem = tm[j] & ((half << 1) - 1u);
+                        if (rem == half) g = true;
+                        q = (long long)(tm[j] >> k) + (rem > half ? 1 : 0);
+                    }
+                }
+            }
+            if (i0 + j < pos) { q = 0; g = false; }
+            rr[j] = q; ee[j] = g; RR += q;
+        }
+        long long PP = RR;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const long long v = __shfl_up_sync(FULL, PP, o);
+            if (lane >= o) PP += v;
+        }
+        if (lane == 31) f_tot[w] = PP;
+        __syncthreads();
+        long long fo = 0, ft = 0;
+        for (int k = 0; k < NW; k++) { const long long v = f_tot[k]; if (k < w) fo += v; ft += v; }
+        long long Q = fo + PP - RR, Qb = 0;
+        int fj = TM;
+#pragma unroll
+        for (int j = 0; j < TM; j++) {
+            const long long Qp = Q;
+            Q += rr[j];
+            if (fj == TM && (ee[j] || (rr[j] && S0 + Q >= (1ll << 53)))) { fj = j; Qb = Qp; }
+        }
+        const unsigned m = __ballot_sync(FULL, fj < TM);
+        if (m && lane == __ffs(m) - 1) {
+            float tv = t[0];
+#pragma unroll
+            for (int j = 1; j < TM; j++) if (j == fj) tv = t[j];
+            f_pb[w] = Qb; f_tf[w] = tv; f_f[w] = i0 + fj;
+        }
+        if (lane == 0) f_fl[w] = m != 0;
+        __syncthreads();
+        int fw = NW;
+        for (int k = NW - 1; k >= 0; k--) if (f_fl[k]) fw = k;
+        if (fw == NW) { s = d_mk(e, S0 + ft); break; }
+        s = d_mk(e, S0 + f_pb[fw]) + (double)f_tf[fw];
+        pos = f_f[fw] + 1;
+    }
+    return s;
+}
+// E_SSQ = 2: the rms sum of a token row by one 256-thread block (bsum_sq, same bits as wsum_sq)
+template <int TM>
+__global__ void __launch_bounds__(256) k_ssqb(const float *x, int n, double *out) {
+    const double s = bsum_sq<TM>(x + (size_t)blockIdx.x * n, n);
+    if (threadIdx.x == 0) out[blockIdx.x] = s;
+}
 // xform + Q8_0 of a: mode 0 plain, 1 GDN head regroup (rep = NV/NK), 2 silu(a) * b
 __global__ void k_xq(const float *a, const float *b, int mode, const float *sg, int bs, float fsc,
                      uint32_t *pl, int nk, int rep, int as, int pls) {
@@ -2204,9 +2457,10 @@ static void gemv(const DT *d, float *y, int resid) {
     default: fprintf(stderr, "gemv: K %d unsupported\n", d->K); exit(1);
     }
 }
-/* E_SSQ (default 1): a residual nt = 1 GEMV into d_x forks a one-warp k_ssq on st2 that sums
+/* E_SSQ = 1: a residual nt = 1 GEMV into d_x forks a one-warp k_ssq on st2 that sums
  * x^2 as the GEMV's row batches land (same chunked order as wsum_sq), so the next norm_xq of
- * d_x reads the finished sum instead of paying the serial warp reduction */
+ * d_x reads the finished sum instead of paying the serial warp reduction. 2 (default): no fork; every
+ * one-token norm_xq first runs the one-block k_ssqb on the main stream (E <= 4096) */
 static cudaStream_t st2;
 static cudaEvent_t evf, evj;
 static uint32_t *d_zc;
@@ -2224,8 +2478,8 @@ static int fvf_on = 1; /* E_FVF: k_fvg straight-line groups without a rescale we
 static int fsb_on = 2; /* E_FSB: k_fsb, chunk tokens share each K load (2: transposed reduce, 1: dotg_reduce per score) */
 static int fexp_on = 1; /* E_FEXP: k_fw weights with the certified FP32 fw_expf */
 static void gemv_res(const DT *d, int nt) {
-    if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 1;
-    if (nt != 1 || !ssq_on) { gemvn(d, d_x, 1, nt, E); return; }
+    if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 2;
+    if (nt != 1 || ssq_on != 1) { gemvn(d, d_x, 1, nt, E); return; }
     CK(cudaEventRecord(evf, st)); CK(cudaStreamWaitEvent(st2, evf, 0));
     gzc = d_zc; gemv(d, d_x, 1); gzc = NULL;
     k_ssq<<<1, 32, 0, st2>>>(E, d_zc, d_ssq);
@@ -2238,6 +2492,11 @@ static int xqw_q1 = 2, xqw_qn = 4; /* E_XQWD / E_XQWP: elements per lane at one 
 static void norm_xq(const float *x, const float *w, float *xn, int nt) {
     const double *sp = ssq_ready && nt == 1 && x == d_x ? d_ssq : NULL;
     if (!sp && nt > 1 && ssqn_on) { k_ssqn<<<nt, 32, 0, st>>>(x, E, d_ssqn); sp = d_ssqn; }
+    if (ssq_on < 0) ssq_on = getenv("E_SSQ") ? atoi(getenv("E_SSQ")) : 2;
+    if (!sp && nt == 1 && ssq_on == 2 && E <= 4096) {
+        if (E <= 2560) k_ssqb<10><<<1, 256, 0, st>>>(x, E, d_ssq); else k_ssqb<16><<<1, 256, 0, st>>>(x, E, d_ssq);
+        sp = d_ssq;
+    }
     ssq_ready = 0;
     static int nt1 = -1;
     if (nt1 < 0) nt1 = getenv("E_NT") ? atoi(getenv("E_NT")) : 0;

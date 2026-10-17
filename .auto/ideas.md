@@ -1501,3 +1501,23 @@ the F2F pipe is the shared limit there, not the dependent latency. 4k ABBA (FVR 
 prefill 20.80 / 20.73 / 20.89 / 20.88 / 20.71 / 20.73, decode 10.12 / 10.20 / 10.22 / 10.22 / 10.22 /
 10.12, score 14.51 / 14.54 / 14.61 / 14.61 / 14.55 / 14.48, golden PASS. Locally (2B, 700 ids,
 chunks 8 / 5 / 1) streams and logits dumps equal with FVR 0 / 3 and with the fallback forced.
+77. Block-parallel exact rms sum k_ssqb (E_SSQ, default 2; keep, bit-identical; 4k decode +3.4%).
+The one-warp wsum_sq of a 2560 row took 83 us on its own and sat on the critical path after the o-proj
+and down GEMVs (the st2 k_ssq fork could not overlap: the rows land at the GEMV's end). Counted per
+sum (gaussian): ~92 warp passes, ~10 binade exits (s doubles from ~1 to 2560) and ~2 ties. A
+one-warp V-terms-per-lane scan (wsum_sqv) cut passes to 22 but each costs ~2.6 us: 52-57 us. A block
+iteration per event (256 threads) was 12.8 iterations x ~5000 cycles: 60-68 us. Kept form, bsum_sq:
+the terms are squares, so s is monotone; a float prefix scan predicts the binade of s before every
+term, each term is rounded to its predicted ulp (events: ties, r >= 2^52, a predicted binade change
+after the term), one unsigned 64-bit block scan gives the segment sums (event terms contribute 0; r
+< 2^52 and n < 4096 rule out wrap), and thread 0 walks the events with real double adds, accepting a
+segment only if s lies in the predicted binade and the segment sum keeps it below 2^53. Any
+rejection, a non-finite float prefix or more than 64 events resumes the per-event block iteration
+from the last accepted point. Bench (Nano): 0 mismatches of 32768 rows over 8 distributions (n
+100 / 2304 / 2560 / 4096, ties, huge range, leading zeros) against the host sequential sum, also with
+the chain forced to break at events 0-7 and before the final segment; 15.1 us per 2560 sum (256
+threads, 106 registers). E_SSQ=2 drops the fork: every one-token norm_xq runs the one-block k_ssqb
+first (also the embedding norm, which did the warp sum in every block). 4k ABBA (1/2/2/1): decode
+10.22 / 10.54 / 10.58 / 10.20, score 14.60 / 14.83 / 14.87 / 14.59, golden PASS. Measured out: the
+same speculation in one warp per chunk (wsum_sq2, exact): 51-60 us alone, 206 vs 270 us per
+64-token gaussian grid, ~0.4% of prefill for k_ssqn; not taken.
