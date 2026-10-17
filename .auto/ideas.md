@@ -1574,3 +1574,12 @@ NW2 563; RW16 NW4 580; RW8 NW4 + the token's v row staged in smem 463 (-42%; iss
 decode 10.72 / 10.71 / 10.71 / 10.76, score 15.12 / 15.28 / 15.28 / 15.15, golden PASS. Cold: 21.88 /
 10.73 / 15.32. checks_b2 2B 4B ALL PASS. Decode k_gdnf has the same shape but is memory-bound (row 75): not
 applied there.
+81. Transposed amax / |q|-sum reduce in the Q8_0 activation quantizer (keep, bit-identical; 4k prefill
++0.5%). q8word ran two 5-shuffle all-reduces (fmaxf amax, integer |q| sum) per 32-element word; a lane of
+fwht_q8w holds Q words. q8words<Q> reduces the Q words together (offsets 1..Q/2 transposed, lane r ends
+with word r, then the remaining xor stages): Q-1 + 5-log2 Q shuffles per reduce instead of 5 Q, plus Q
+broadcasts for amax. fmaxf of non-negative floats and int adds are exact in any order. Used by k_xqw and
+k_norm_xqw (E_Q8T=0 keeps q8word). k_xqw was issue-bound (issue 70%, IPC 3.35, ~690 inst per warp at Q 4).
+nvprof 480-token 4B prefill totals: k_xqw 525 -> 502 ms, k_norm_xqw 195 -> 175 ms. md5-identical.
+4k ABBA E_Q8T=0 vs 1 (1/2/2/1, one build): prefill 21.75 / 21.86 / 21.85 / 21.74, decode 10.75 / 10.74 /
+10.75 / 10.75, golden PASS. Cold: 21.85 / 10.76 / 15.33. checks_b2 2B 4B ALL PASS.

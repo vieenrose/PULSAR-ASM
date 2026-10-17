@@ -317,6 +317,62 @@ __device__ __forceinline__ void q8word(float xv, int lane, uint32_t *pl, int wor
         ((__half *)(pl + c_hqo))[word * 32 + h * 2 + (lane >> 4)] = __float2half_rn(0.5f * (float)q);
     }
 }
+/* q8word on Q consecutive words of a lane (Q a power of two <= 32): the amax and |q| sums of
+ * the Q words reduce together (transposed: at offset 1 << k < Q a lane keeps the half of its
+ * values its bit k selects and adds / maxes in the partner's other half, then the remaining
+ * xor stages), so lane r ends with word r's value. max and integer sums are exact in any
+ * order, so every word is q8word's. E_Q8T=0 keeps q8word. */
+template <int Q, typename T, typename F>
+__device__ __forceinline__ T q8t_red(T (&a)[Q], int lane, F op) {
+#pragma unroll
+    for (int st = 1; st < Q; st <<= 1) {
+        const bool up = lane & st;
+#pragma unroll
+        for (int i = 0; i < Q / (2 * st); i++) {
+            const T keep = up ? a[2 * i + 1] : a[2 * i], send = up ? a[2 * i] : a[2 * i + 1];
+            a[i] = op(keep, __shfl_xor_sync(FULL, send, st));
+        }
+    }
+    T z = a[0];
+#pragma unroll
+    for (int st = Q; st < 32; st <<= 1) z = op(z, __shfl_xor_sync(FULL, z, st));
+    return z;
+}
+template <int Q>
+__device__ __forceinline__ void q8words(const float (&xv)[Q], int lane, uint32_t *pl, int word0) {
+    float am[Q];
+#pragma unroll
+    for (int r = 0; r < Q; r++) am[r] = fabsf(xv[r]);
+    const float za = q8t_red<Q>(am, lane, [](float x, float y) { return fmaxf(x, y); });
+    int ca[Q];
+#pragma unroll
+    for (int r = 0; r < Q; r++) {
+        const float amax = __shfl_sync(FULL, za, r);
+        const int word = word0 + r;
+        const float d = amax / 127.0f;
+        const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+        const int q = (int)rintf(xv[r] * id);
+        const uint32_t N = __ballot_sync(FULL, q < 0);
+        const int a = q < 0 ? -q : q;
+        uint32_t *g = pl + (word >> 2) * 40;
+        const int k = word & 3;
+        if (lane == 0) g[k] = __float_as_uint(f16r(d));
+        if (lane == 1) g[4 + k] = N;
+#pragma unroll
+        for (int b = 0; b < 7; b++) {
+            const uint32_t Qb = __ballot_sync(FULL, (a >> b) & 1);
+            if (lane == 2 + b) g[8 + 4 * b + k] = Qb;
+        }
+        ca[r] = a;
+        if (gridDim.y > 1) {
+            const int e = lane & 15, h = (e & 1) ? 8 + (e >> 1) : (e >> 1);
+            ((__half *)(pl + c_hqo))[word * 32 + h * 2 + (lane >> 4)] = __float2half_rn(0.5f * (float)q);
+        }
+    }
+    const int zc = q8t_red<Q>(ca, lane, [](int x, int y) { return x + y; });
+    if (lane < Q) { const int word = word0 + lane; pl[(word >> 2) * 40 + 36 + (word & 3)] = (uint32_t)(-zc); }
+}
+__constant__ int c_q8t = 1;
 // v[0..bs) in shared: scale, Sylvester butterflies, then Q8_0 planes of words b0/32 + ...
 __device__ void fwht_q8(float *v, int bs, float fsc, uint32_t *pl, int b0) {
     const int T = blockDim.x, tid = threadIdx.x;
@@ -369,6 +425,7 @@ __device__ __forceinline__ void fwht_q8w(float (&v)[Q], int lane, int wq, float 
         }
         __syncthreads();
     }
+    if (c_q8t) { q8words<Q>(v, lane, pl, (b0 >> 5) + Q * wq); return; }
 #pragma unroll
     for (int r = 0; r < Q; r++) q8word(v[r], lane, pl, (b0 >> 5) + Q * wq + r);
 }
@@ -2921,6 +2978,7 @@ int main(int argc, char **argv) {
     k_feinit<<<1, 32>>>();
     if (getenv("E_GCRW")) gdn_crw = atoi(getenv("E_GCRW"));
     if (getenv("E_GTR")) gtr_on = atoi(getenv("E_GTR"));
+    if (getenv("E_Q8T")) { const int q8t = atoi(getenv("E_Q8T")); CK(cudaMemcpyToSymbol(c_q8t, &q8t, sizeof q8t)); }
     if (getenv("E_GCNW")) gdn_cnw = atoi(getenv("E_GCNW"));
     /* capture outside the timed region */
     if (use_graph && !tdf) {
