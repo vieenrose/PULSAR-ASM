@@ -1619,3 +1619,17 @@ Measured out this round (all md5-identical):
 - Decode k_gdnf: E_GRW=4 10.81-10.83 vs 10.81 (noise); the k_gdnc transposed reduce in k_gdnf (RW 2 /
   4 / 8): 10.74 / 10.75 / 10.68 vs 10.81. k_gdnf is memory-latency bound (row 75), and the transposed
   form's selects only add issue.
+
+85. Lean decode score kernel k_fsl (E_FSL, default 1; keep, bit-identical; 4k decode +0.4%). k_fs
+recomputed each K row address per row (base + min(i0+u, cnt-1)) * NKV * 256 + g * 256 with 64-bit
+multiplies, stored each score with its own (h0+h)*ctx+base+i0+u address under a per-head lane==0
+predicate, and ran the full predicated dotg_reduce (with broadcast) though only lane 0 uses the sum.
+k_fsl steps one row pointer by 8*FK rows per pass (lane folded in), clamps the tail row to a
+precomputed last-row pointer, keeps one per-head store pointer and reduces with dotg_reduce0: the
+same 5 shuffle-adds without predicates or broadcast, exact for lane 0 (a lane read at a stage is one
+the predicated form also updates, read before that stage's add). Same chains, tree, scale: SASS loop
+240 vs 301 instructions per 2 positions. Sweep (4k prompt + 64 gen, all md5 0b84b6abb1e2): E_FSL 0 /
+1 / 1 / 0 decode 10.86 / 10.91 / 10.97 / 10.87; FK/MB 41 / 22 / 23 / 21 (default) = 10.85 / 10.93 /
+10.94 / 10.91-10.97, so FK 2 MB 1 stays. 4k ABBA A = E_FSL=0 vs B = default (1/2/2/1, one build):
+prefill 22.31 / 22.31 / 22.31 / 22.30, decode 10.88 / 10.92 / 10.93 / 10.89, golden PASS. Cold:
+22.33 / 10.89 / 15.59. checks_b2 2B 4B ALL PASS.

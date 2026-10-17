@@ -1805,6 +1805,64 @@ __global__ __launch_bounds__(256, MB) void k_fs(const float *q, const __half *kc
         }
     }
 }
+/* dotg_reduce's sum for lane 0 only: the predicates go (a lane whose value is read at a stage is one
+   the predicated form also updates, and it is read before the stage's add) and so does the broadcast. */
+__device__ __forceinline__ float dotg_reduce0(float a) {
+    a = a + __shfl_down_sync(FULL, a, 16);
+    a = a + __shfl_down_sync(FULL, a, 8);
+    a = a + __shfl_down_sync(FULL, a, 4);
+    a = a + __shfl_down_sync(FULL, a, 1);
+    return a + __shfl_down_sync(FULL, a, 2);
+}
+/* Lean k_fs (E_FSL): row offsets stepped by a pass instead of recomputed per row, per-head store
+   pointers, dotg_reduce0. Same chains, tree and scale as k_fs. */
+template <int GQ, int FK, int MB>
+__global__ __launch_bounds__(256, MB) void k_fsl(const float *q, const __half *kc, const int *posp, float *scg,
+                                            int NH, int NKV, int ctx, float scale) {
+    __shared__ float qs[GQ][256];
+    const int g = blockIdx.x % NKV, base = blockIdx.x / NKV * 256, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int n = *posp + (int)blockIdx.y + 1, h0 = g * GQ;
+    if (base >= n) return;
+    q += (size_t)blockIdx.y * NH * 256; scg += (size_t)blockIdx.y * NH * ctx;
+    for (int i = tid; i < GQ * 256; i += 256) qs[i >> 8][i & 255] = f16r(q[(h0 + (i >> 8)) * 256 + (i & 255)]);
+    __syncthreads();
+    float qr[GQ][8];
+#pragma unroll
+    for (int h = 0; h < GQ; h++)
+#pragma unroll
+        for (int c = 0; c < 8; c++) qr[h][c] = qs[h][32 * c + lane];
+    const int cnt = min(256, n - base), rs = NKV * 256;
+    const __half *k0 = kc + (size_t)base * rs + g * 256 + lane, *kl = k0 + (size_t)(cnt - 1) * rs;
+    float *sp = scg + (size_t)h0 * ctx + base;
+    const __half *kp = k0 + (size_t)warp * FK * rs;
+    for (int i0 = warp * FK; i0 < cnt; i0 += 8 * FK, kp += (size_t)8 * FK * rs) {
+        __half kh[FK][8];
+#pragma unroll
+        for (int u = 0; u < FK; u++) {
+            const __half *kr = i0 + u < cnt ? kp + u * rs : kl;
+#pragma unroll
+            for (int c = 0; c < 8; c++) kh[u][c] = kr[32 * c];
+        }
+#pragma unroll
+        for (int u = 0; u < FK; u++) {
+            float a[GQ];
+#pragma unroll
+            for (int h = 0; h < GQ; h++) a[h] = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 8; c++) {
+                const float kv = __half2float(kh[u][c]);
+#pragma unroll
+                for (int h = 0; h < GQ; h++) a[h] = fmaf(kv, qr[h][c], a[h]);
+            }
+            float sv[GQ];
+#pragma unroll
+            for (int h = 0; h < GQ; h++) sv[h] = dotg_reduce0(a[h]) * scale;
+            if (lane == 0 && i0 + u < cnt)
+#pragma unroll
+                for (int h = 0; h < GQ; h++) sp[(size_t)h * ctx + i0 + u] = sv[h];
+        }
+    }
+}
 /* k_fs for a token batch (E_FSB): one block per KV group and 256-position tile scores all nt
    (<= 8) tokens of the chunk, so each K row is loaded and converted once per chunk instead of
    once per token. Per token and head the arithmetic is k_fs's: same 8-element lane chains, same
@@ -2720,6 +2778,7 @@ static int ssq_ready, ssq_on = -1;
 static double *d_ssq, *d_ssqn;
 static int ssqn_on = 2; /* E_SSQN: batch rms sums once per token, 2 = one k_ssqb block each, 1 = one k_ssqn warp each */
 static int fvgv = 0, fvgp = 2; /* E_FVGV / E_FVGP (one token / a token batch): 1 = k_fvg<1, 4>, 2 = k_fvg<2, 4> (4 heads share each V conversion), else k_fvg<2, 2> */
+static int fsl_on = 1; /* E_FSL: lean k_fsl for the one-token score pass (GQ 4) */
 static int fsk_d = 21; /* E_FSK: k_fs<4> variant, 10 * K rows per pass + min blocks per SM (0: FAK, 1; 21: 80 registers, 3 blocks per SM) */
 static int fvr_on = 3; /* E_FVR: k_fvh rounds with f16rr<true> (bit 0: one token, bit 1: a token batch) */
 static int fvx = 1, fvxp = 2; /* E_FVX / E_FVXP (one token / a token batch): the first N V chains of a k_fvh thread round with the two-F2F f16r */
@@ -2869,7 +2928,12 @@ static void enqueue(int nt, int tiny, int want) {
                 case 2: k_fs<2, FAK, 1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
                 default:
 #define FS4(FK, MB) k_fs<4, FK, MB><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale)
-                    switch (fsk_d) {
+                    if (fsl_on) switch (fsk_d) {
+                    case 41: k_fsl<4, 4, 1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                    case 22: k_fsl<4, 2, 2><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                    case 23: k_fsl<4, 2, 3><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                    default: k_fsl<4, 2, 1><<<gs, 256, 0, st>>>(d_q, d_kc[fi], d_pos, d_sc, NH, NKV, CTX, ascale); break;
+                    } else switch (fsk_d) {
                     case 42: FS4(4, 2); break;
                     case 43: FS4(4, 3); break;
                     case 21: FS4(2, 1); break;
@@ -3042,6 +3106,7 @@ int main(int argc, char **argv) {
     if (getenv("E_FVH")) fvh_on = atoi(getenv("E_FVH"));
     if (getenv("E_FVR")) fvr_on = atoi(getenv("E_FVR"));
     if (getenv("E_FSK")) fsk_d = atoi(getenv("E_FSK"));
+    if (getenv("E_FSL")) fsl_on = atoi(getenv("E_FSL"));
     if (getenv("E_FSB")) fsb_on = atoi(getenv("E_FSB"));
     if (getenv("E_XQW")) xqw_on = atoi(getenv("E_XQW"));
     if (getenv("E_XQWD")) xqw_q1 = atoi(getenv("E_XQWD"));
