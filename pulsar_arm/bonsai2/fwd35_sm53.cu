@@ -2048,6 +2048,66 @@ __global__ __launch_bounds__(256) void k_fw(const int *posp, float *scg, int NH,
         else sc[i] = FE ? fw_expf(s - run) : gm_expf(s - run);
     }
 }
+/* k_fw with coalesced float4 groups (E_FWV): thread t takes groups t, t + 256, ... of 4 positions,
+   keeps them in registers, and a shuffle scan of the group maxima (tile by tile, carried across
+   tiles) gives every group its exclusive prefix max. Each output only depends on its score and the
+   max of all earlier scores, so the result is k_fw's for any partition (fmaxf is order-free here;
+   a -0 / +0 prefix gives the same s > run tests and the same exp arguments up to a zero's sign). */
+template <bool FE>
+__global__ __launch_bounds__(256) void k_fwv(const int *posp, float *scg, int NH, int ctx) {
+    __shared__ float wm[8];
+    const int h = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int n = *posp + (int)blockIdx.y + 1, T = (n + 1023) >> 10;
+    float *sc = scg + ((size_t)blockIdx.y * NH + h) * ctx;
+    float4 x[8]; float rn[8];
+    float carry = -INFINITY;
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+        if (k >= T) break;
+        const int i = 4 * (k * 256 + tid);
+        float gm = -INFINITY;
+        if (i < n) {
+            x[k] = *(const float4 *)(sc + i);
+            gm = x[k].x;
+            if (i + 1 < n) gm = fmaxf(gm, x[k].y);
+            if (i + 2 < n) gm = fmaxf(gm, x[k].z);
+            if (i + 3 < n) gm = fmaxf(gm, x[k].w);
+        }
+        float in = gm;
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            const float o = __shfl_up_sync(FULL, in, off);
+            if (lane >= off) in = fmaxf(in, o);
+        }
+        if (lane == 31) wm[warp] = in;
+        float ex = __shfl_up_sync(FULL, in, 1);
+        if (lane == 0) ex = -INFINITY;
+        __syncthreads();
+        float pre = carry, all = carry;
+#pragma unroll
+        for (int w = 0; w < 8; w++) { const float v = wm[w]; if (w < warp) pre = fmaxf(pre, v); all = fmaxf(all, v); }
+        rn[k] = fmaxf(pre, ex);
+        carry = all;
+        __syncthreads();
+    }
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+        if (k >= T) break;
+        const int i = 4 * (k * 256 + tid);
+        if (i >= n) continue;
+        float run = rn[k], v[4] = {x[k].x, x[k].y, x[k].z, x[k].w};
+        const int m = min(4, n - i);
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            if (e >= m) break;
+            const float s = v[e];
+            if (s > run) { v[e] = -(FE ? fw_expf(run - s) : gm_expf(run - s)); run = s; }
+            else v[e] = FE ? fw_expf(s - run) : gm_expf(s - run);
+        }
+        if (m == 4) *(float4 *)(sc + i) = make_float4(v[0], v[1], v[2], v[3]);
+        else for (int e = 0; e < m; e++) sc[i + e] = v[e];
+    }
+}
 #ifndef FVU
 #define FVU 4
 #endif
@@ -2794,6 +2854,7 @@ static int ssq_ready, ssq_on = -1;
 static double *d_ssq, *d_ssqn;
 static int ssqn_on = 2; /* E_SSQN: batch rms sums once per token, 2 = one k_ssqb block each, 1 = one k_ssqn warp each */
 static int fvgv = 0, fvgp = 2; /* E_FVGV / E_FVGP (one token / a token batch): 1 = k_fvg<1, 4>, 2 = k_fvg<2, 4> (4 heads share each V conversion), else k_fvg<2, 2> */
+static int fwv_on = 1; /* E_FWV: k_fwv, coalesced float4 groups + shuffle prefix max for the weight pass */
 static int kperm = 1; /* E_KPERM: lane-major K cache rows (c_kperm), 16-byte K loads in k_fsl / k_fsb */
 static int fsl_on = 1; /* E_FSL: lean k_fsl for the one-token score pass (GQ 4) */
 static int fsk_d = 21; /* E_FSK: k_fs<4> variant, 10 * K rows per pass + min blocks per SM (0: FAK, 1; 21: 80 registers, 3 blocks per SM) */
@@ -2966,7 +3027,10 @@ static void enqueue(int nt, int tiny, int want) {
 #undef FS4
                     break;
                 }
-                if (fexp_on) k_fw<true><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
+                if (fwv_on && CTX % 4 == 0 && CTX <= 8192) {
+                    if (fexp_on) k_fwv<true><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
+                    else k_fwv<false><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
+                } else if (fexp_on) k_fw<true><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
                 else k_fw<false><<<dim3(NH, nt), 256, 0, st>>>(d_pos, d_sc, NH, CTX);
                 if (fvh_on && fvg && CTX % 4 == 0 && (nt > 1 ? fvgp : fvgv) != 1) {
                     const int hg4 = (nt > 1 ? fvgp : fvgv) == 2 && NH / NKV % 4 == 0;
@@ -3129,6 +3193,7 @@ int main(int argc, char **argv) {
     if (getenv("E_FSK")) fsk_d = atoi(getenv("E_FSK"));
     if (getenv("E_FSL")) fsl_on = atoi(getenv("E_FSL"));
     if (getenv("E_KPERM")) kperm = atoi(getenv("E_KPERM"));
+    if (getenv("E_FWV")) fwv_on = atoi(getenv("E_FWV"));
     CK(cudaMemcpyToSymbol(c_kperm, &kperm, sizeof(int)));
     if (getenv("E_FSB")) fsb_on = atoi(getenv("E_FSB"));
     if (getenv("E_XQW")) xqw_on = atoi(getenv("E_XQW"));

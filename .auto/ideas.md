@@ -1647,3 +1647,20 @@ E_KPERM 0 / 1 / 1 / 0 decode 10.93 / 11.03 / 11.01 / 10.91, prefill 22.28 / 22.3
 with KP, FSK 21 / 41 / 42 / 22 / 81 = 11.01 / 11.00 / 10.98 / 11.04 / 10.92, so FK 2 MB 1 stays.
 4k ABBA A = E_KPERM=0 vs B = default (1/2/2/1, one build): prefill 22.20 / 22.33 / 22.33 / 22.20,
 decode 10.98 / 11.02 / 11.01 / 10.93, golden PASS. Cold: 22.34 / 11.02 / 15.69. checks_b2 2B 4B ALL PASS.
+
+87. Coalesced weight pass k_fwv (E_FWV, default 1; keep, bit-identical; 4k prefill +0.2%, decode
++0.3%). k_fw gave each thread a contiguous chunk of (n + 255) / 256 positions (16 at 4k): every
+warp load touched 32 cache lines with no L1 for global loads, every score was read twice (max pass,
+exp pass), and thread 0 ran the 256-step chunk-max prefix serially. Each output only depends on its
+own score and the max of all earlier scores (prefix max), so any partition gives the same values:
+k_fwv gives thread t the float4 groups t, t + 256, ... (one coalesced LDG.128 per group, kept in
+registers, at most 8 tiles of 1024 so CTX <= 8192, CTX % 4 == 0), a shuffle scan per tile plus an
+8-entry warp table gives each group its exclusive prefix max (carried across tiles), then the same
+per-position branch (s > run: -(exp(run - s)), run = s; else exp(s - run)) writes float4 groups
+back. fmaxf is order-free on these values; a prefix that differs only in a zero's sign gives the
+same comparisons and exp arguments up to a zero's sign, exp(+-0) = 1. Sweep (4k + 64 gen, all md5
+0b84b6abb1e2): E_FWV 0 / 1 / 1 / 0 prefill 22.34 / 22.38 / 22.39 / 22.34, decode 11.04 / 11.06 /
+11.10 / 11.04. 4k ABBA A = E_FWV=0 vs B = default (1/2/2/1, one build): prefill 22.35 / 22.39 /
+22.39 / 22.33, decode 11.02 / 11.06 / 11.06 / 11.04, golden PASS. Cold: 22.41 / 11.06 / 15.74.
+checks_b2 2B 4B ALL PASS. Prefill profile at this point (nvprof, E_GRAPH=0, 4k): k_hg 75.2%,
+k_fvh 10.0%, k_gdnc 3.1%, k_fsb 3.1%, k_xqw 2.3%, k_fw 1.6% (before k_fwv).
