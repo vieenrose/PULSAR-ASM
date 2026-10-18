@@ -1739,3 +1739,15 @@ runs the captured graphs): prefill is compute bound (weights at ~3 GB/s), so a r
 GEMVs onto NEON adds compute without contending for the bus; decode is near the bus ceiling, so a
 CPU share there is capped by the shared 25.6 GB/s. Lossy levers (f16 GDN state: 192 MB of the
 ~1.26 GB per decode token; TurboQuant K/V; MTP) are excluded by the 2026-10-16 decision.
+
+96. CPU co-processed prefill (E_CPUF, per mille of each prefill GEMV's rows on the A57s) measured
+out. The NEON kernel (MUL.16B + SADALP word sums, 2 rows sharing q loads, lanes = tokens, k_hg's
+fma chain) runs 16.4 GMAC/s on 4 A57s and is bit-exact (prompt A md5 af77ae304be1 at every share).
+Wiring is in the captured graph: st forks st2, which runs a D2H of the chunk's d8 words and q/2,
+a cudaLaunchHostFunc node, an H2D of the rows, then a join and a store kernel. Prompt A prefill
+(83 tokens): 24.37 (off) vs 20.95 / 20.20 / 13.01 tok/s at 30 / 60 / 120 per mille. The fixed cost
+is ~0.4 ms per split GEMV (host-node wake-up plus 4 copies on Tegra), against a ~2.6 ms GEMV per
+8-token chunk whose ideal CPU saving is ~0.26 ms. Below break-even at NTM=8, so the code was
+reverted (kernel kept at .auto/attic/fwd35_cpu.c). It would need chunks of more than 64 tokens or a
+persistent CPU worker polling a device flag; the latter cannot be expressed in a CUDA graph
+without a spin kernel holding the single SM.
