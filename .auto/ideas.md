@@ -1751,3 +1751,16 @@ is ~0.4 ms per split GEMV (host-node wake-up plus 4 copies on Tegra), against a 
 reverted (kernel kept at .auto/attic/fwd35_cpu.c). It would need chunks of more than 64 tokens or a
 persistent CPU worker polling a device flag; the latter cannot be expressed in a CUDA graph
 without a spin kernel holding the single SM.
+
+97. Larger prefill chunks (NTM 8 -> 16, the prerequisite for amortizing row 96's CPU split, or for
+any 64-token tile) measured out. At NTM=64, k_hg needs 68 KB of smem (> 48 KB) and does not
+build. At NTM=16 it builds without spills (182 vs 158 registers, 17 KB smem; the sm_61 k_gemvN tile
+had to be capped at 8) and is bit-exact: prompt A md5 af77ae304be1, 4k stream 0b84b6abb1e2 =
+golden. But it is slower: prompt A prefill 20.30 vs 24.36 tok/s; 4k prefill 20.22 vs 22.68 tok/s
+(same job, decode 11.31 both). nvprof (E_GRAPH=0, 3k-token prefill), per token:
+- k_hg<20> 0.400 vs 0.350 ms;
+- k_hg<72> 0.248 vs 0.235 ms;
+- k_gdnc 0.086 vs 0.057 ms.
+k_hg is issue-bound per token-MAC (row 79), not per weight expansion, so sharing each expanded
+weight word across 16 tokens buys nothing, and the larger register file and smem tile cost ILP.
+Bigger chunks are out on the GPU side, and with them the amortized CPU split of row 96.
