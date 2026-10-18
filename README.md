@@ -11,9 +11,9 @@ DeltaNet (linear attention) layers.
 
 | model | GGUF bytes | on the GPU | prefill, 3968 tokens | decode at 4k |
 |---|---|---|---|---|
-| Ternary-Bonsai-2-2B | 429,183,456 | 476 MB | **57.4 tok/s** | **24.0 tok/s** |
+| Ternary-Bonsai-2-2B | 429,183,456 | 476 MB | **57.3 tok/s** | **24.2 tok/s** |
 | Ternary-Bonsai-2-4B | 949,549,920 | 1064 MB | **22.5 tok/s** | **11.3 tok/s** |
-| Ternary-Bonsai-2-9B | 1,997,486,976 | 2009 MB | **13.0 tok/s** | **7.1 tok/s** |
+| Ternary-Bonsai-2-9B | 1,997,486,976 | 2009 MB | **13.1 tok/s** | **7.0 tok/s** |
 
 All three rows run the same 3968-token prompt
 (`.auto/prompt_b2_4k_ids.txt`): a Traditional Chinese article with an
@@ -22,13 +22,17 @@ then decodes 64 greedy tokens. Prefill speed is 3968 tokens divided by the
 prefill wall time. Decode speed covers the 63 steps after the first token,
 each attending over 3968 to 4031 positions.
 
-- **Build and conditions:** commit 1ab76d2, the default settings (8-token
+- **Build and conditions:** the 4B row is from commit 1ab76d2. The 2B and 9B
+  rows were re-measured at 6fd0775, which adds k_li pipeline depth 2 for
+  the 2B's K=6144 down GEMV (+0.8 % 2B decode). Default settings (8-token
   prefill chunks, exact f16 K/V cache), `jetson_clocks` (GPU 921.6 MHz,
   CPU 1.479 GHz), page cache dropped before each run, L4T R32.5.1, CUDA 10.2.
 - **Runs:** each figure is one cold run. The 4B figures are the mean of the two
   default-setting runs of the same-job E_FVXP sweep at 1ab76d2
   (22.52 / 22.50 and 11.29 / 11.30). All three 4k streams equal their
-  goldens at 1ab76d2. The board drifts 2 to 6 % between hours.
+  goldens at 1ab76d2, and the 2B and 9B streams again at 6fd0775. The board
+  drifts 2 to 6 % between hours, so the 9B's 7.0 against an earlier 7.1 is
+  drift (no 9B code path changed).
 - **Exactness at 4k:** the reference is the PrismML fork's greedy stream on
   the same prompt (`fork_greedy`, one thread, 32-token ubatches, flash
   attention on, f16 cache).
