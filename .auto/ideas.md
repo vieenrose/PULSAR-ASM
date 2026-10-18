@@ -1679,6 +1679,26 @@ prefill 22.40 / 22.40 vs 22.48 / 22.50 (+0.4%); fresh score 15.95 (15.74 before)
 
 90. k_li pipeline depth PD 8 for the K=9728 down GEMV (E_LIPD76; measured out, code reverted). Same-job
 ABBA (A = PD 4, B = PD 8, 1/2/2/1): decode 11.27 / 11.29 vs 11.28 / 11.27, prefill 22.49 / 22.48 vs
-22.49 / 22.48, all golden PASS. The down GEMV is not limited by loads in flight; with row 63's W/PD
-sweeps and row 68's bench, k_li's remaining gap to the 21.9 GB/s read ceiling is not reachable by
-depth or warp count.
+22.49 / 22.48, all golden PASS. CORRECTION: this A/B tested nothing. The 4B has FF=9216, so its down
+GEMV is K=9216, G=72 (k_li<72,4,4>); G=76 (K=9728) never runs on the 4B. PD 8 on G=72 is untested.
+
+91. Investigation: decode and prefill are largely clock (compute) bound, not DRAM bound (research,
+no code change). GPU clock sweep, 4B prompt A, 64 gen, EMC unchanged: decode 921.6 / 768 / 614.4 /
+460.8 MHz = 13.52 / 12.36 / 10.37 / 8.04 tok/s, while the streaming read bench (rmw.cu) gives 21.34 /
+20.92 / 20.84 / 19.83 GB/s and the in-place RMW 18.41 / 18.30 / 17.85 / 16.61. A 33% clock cut
+costs the bus 2.3% but decode 23%. Per kernel (nvprof summary, E_GRAPH=0, 921.6 vs 614.4 MHz):
+k_li<20> 641 -> 866 us (+35%), k_li<72> 342 -> 446 (+30%), k_li<32> 166 -> 210 (+26%), k_gdnf 338 ->
+374 (+10%, memory), prefill k_hg<20> 2.80 -> 4.09 ms (+46% of a possible +50%, compute bound),
+k_hg<72> 1.88 -> 2.71 ms. Budget per 4B token at 921.6 MHz: 31.3M groups x 4 words x 8 POPC =
+1.0e9 POPC at 32/clk/SM (sm_5x quarter rate) = 34 ms of POPC pipe; ~30 issued instructions per
+word = ~37-40 ms of issue; 1064 MB at 21.3 GB/s = 50 ms of DRAM; measured k_li ~57 ms. So k_li
+sits on a joint compute + memory floor with partial overlap; row 68's "18-21 of 21.9 GB/s, at the
+ceiling" was right about bandwidth but not about why the gap stays. Consequences: (1) a denser
+base-3 GPU encoding (34 -> 28 B per 128) would add unpack ALU to a POPC/issue-bound kernel: not
+worth building. (2) A T-MAC nibble LUT costs ~5 instructions per 4 weights per plane (~80 per 32
+weights vs ~30 + 8 POPC now) and the fp16 HFMA2 path costs ~48 per word for one token: both worse
+for decode; a POPC / HFMA2 split balances at ~4% HFMA (issue then binds). (3) The levers left are
+fewer issued instructions per word in k_li (activation LDS amortized over 2 rows per lane, ~5% of
+issue) and better compute/memory overlap; prefill k_hg is fp16-pipe bound (NT 16 measured out,
+line 1553). nvprof --metrics profiled no engine kernel after k_feinit (also with --kernels on the
+mangled name); the clock sweep was the substitute. GPU devfreq: set max then min, restore 921600000.
