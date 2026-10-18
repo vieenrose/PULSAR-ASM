@@ -1764,3 +1764,21 @@ golden. But it is slower: prompt A prefill 20.30 vs 24.36 tok/s; 4k prefill 20.2
 k_hg is issue-bound per token-MAC (row 79), not per weight expansion, so sharing each expanded
 weight word across 16 tokens buys nothing, and the larger register file and smem tile cost ILP.
 Bigger chunks are out on the GPU side, and with them the amortized CPU split of row 96.
+
+98. 2B decode: k_li pipeline depth PD 2 for K=6144 (the 2B down GEMV; E_LI48, default 2, was 4;
+keep, bit-identical). The new knob E_LI16 sweeps PD for K=2048, and its default of 2 stays (1 / 4 /
+8 give 27.06 / 27.57 / 22.46 vs 28.37 tok/s). Same-job ABBA, 2B prompt A decode: PD2 28.64 / 28.71
+/ 28.65 vs PD4 28.44 / 28.43 / 28.40 tok/s (+0.8%), prefill equal. 2B 4k golden PASS: decode 24.19
+vs 23.98, prefill 57.27 vs 57.46 (one sample each). checks_b2 2B 4B ALL PASS. K=6144 occurs only in
+the 2B, so the 4B and 9B are unchanged.
+
+2B decode nvprof per token (~35 ms):
+- head k_li: 6.68 ms at 20.2 GB/s;
+- 12288-row K=2048 k_li: 0.35 ms each at 19.3 GB/s;
+- 8192-row: 18.5 GB/s;
+- down: 17.4 GB/s;
+- 2048 x 2048: 14.3 GB/s;
+- k_gdnf: 18 x 0.16 ms.
+
+Smaller k_li blocks for tensors of at most 2048 rows were measured out (1 or 2 warps: 26.33 /
+27.95 vs 28.75 tok/s), because every block refills the shared activation planes.

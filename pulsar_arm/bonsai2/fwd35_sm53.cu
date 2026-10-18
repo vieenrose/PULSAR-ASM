@@ -2774,10 +2774,12 @@ static void li_t(const DT *d, float *y, int resid) {
 static void gemv(const DT *d, float *y, int resid) {
     if (li_on) {
         switch (d->K / 128) {
-        case 16: li_t<16, 2>(d, y, resid); return;
+        case 16: { static int pd = -1; if (pd < 0) pd = getenv("E_LI16") ? atoi(getenv("E_LI16")) : 2;
+            if (pd == 1) li_t<16, 1>(d, y, resid); else if (pd == 4) li_t<16, 4>(d, y, resid); else if (pd == 8) li_t<16, 8>(d, y, resid); else li_t<16, 2>(d, y, resid); return; }
         case 20: li_t<20, 2>(d, y, resid); return;
         case 32: li_t<32, 2>(d, y, resid); return;
-        case 48: li_t<48, 4>(d, y, resid); return;
+        case 48: { static int pd = -1; if (pd < 0) pd = getenv("E_LI48") ? atoi(getenv("E_LI48")) : 2;
+            if (pd == 2) li_t<48, 2>(d, y, resid); else if (pd == 8) li_t<48, 8>(d, y, resid); else if (pd == 6) li_t<48, 6>(d, y, resid); else li_t<48, 4>(d, y, resid); return; }
         case 72: li_t<72, 4>(d, y, resid); return;
         case 96: li_t<96, 4>(d, y, resid); return;
         default: fprintf(stderr, "gemv: K %d unsupported\n", d->K); exit(1);
