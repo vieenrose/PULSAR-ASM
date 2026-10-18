@@ -1720,3 +1720,11 @@ wave tail nor load latency; what is left is the read-to-write turnaround of a 4 
 nvprof GPU summary at 921.6 MHz (E_GRAPH=0, 4B prompt A, 64 gen) for reference: k_li<20> 638 us,
 k_li<72> 340, k_gdnf 338, k_li<32> 166; the small decode kernels (k_ssqb 13-23 us, k_xqw 12-24,
 k_norm_xqw 12, k_convl2 33, k_argmax1 164 per token) together are ~4% of a decode token.
+
+94. One-token decode scores on k_fsb (transposed reduce, 31 shuffles per 32 scores) instead of k_fsl
+(E_FSB1; measured out, golden PASS, code reverted). 4k harness: decode 11.25 / 11.27 (FSB1) vs
+11.31 / 11.32 (k_fsl). At 4k, per decode token, attention is 8 x (k_fsl 0.66 ms + k_fvh<2,8> 1.15 ms)
+= 14.5 ms; k_fsl moves 8 MB of K per layer at 12.4 GB/s but is not shuffle-bound (this row, and
+row 72's k_fst), and k_fvh is the fork-ordered sequential f16 chain, issue-bound at ~10
+instructions per position step (4096 chains x ~4000 steps). Prefill k_hg is at its issue floor
+(row 79: 455 instructions per 256 HFMA2; HFMA2 alone is ~50% of its time).
