@@ -1,6 +1,6 @@
 # Bonsai-2 4B at 4k context on the Jetson Nano: limits and plan
 
-State at 9ce1479 (2026-10-16, branch `bonsai-jetson-nano`). Engine `pulsar_arm/bonsai2/fwd35_sm53.cu`
+Started at 9ce1479 (2026-10-16), final state at 1233a80 (2026-10-18), branch `bonsai-jetson-nano`; see "Final state" below. Engine `pulsar_arm/bonsai2/fwd35_sm53.cu`
 (Ternary-Bonsai-2-4B-PTQ1_0, bit-exact vs the PrismML fork). Harness `.auto/measure_b2_4k.sh`:
 3968-token zh-TW prompt + 64 greedy tokens, exact f16 K/V at ctx 4096, fork golden
 `golden_b2_4b_4k.txt`, score = sqrt(prefill_tps x decode_tps). Gates `.auto/checks_b2.sh 2B 4B`.
@@ -9,9 +9,49 @@ the user's decision; do not re-propose them.
 
 | | prefill tps | decode tps | score | peak RSS |
 |---|---|---|---|---|
-| now (9ce1479) | 11.37 | 9.25 | 10.26 | 200 MB |
+| start (9ce1479) | 11.37 | 9.25 | 10.26 | 200 MB |
+| **final (1233a80)** | **22.53** | **11.29** | **15.95** (15.92 on later cold runs) | ~200 MB |
 | realistic exact target | 21-26 | 12-12.5 | ~16-18 | <= 200 MB |
 | bandwidth / roofline ideal | ~40-50 (non-exact fp16 GEMM at peak) | 16.6 (19.0 at the 25.6 GB/s spec) | ~26 | |
+
+## Final state (2026-10-18, 1233a80): optimization loop stopped
+
+The exact-arithmetic levers are exhausted. Ideas rows 62-97 hold the full record. Every
+kept change is bit-identical: the 4k golden passes, and `checks_b2.sh 2B 4B` passes ALL. At short
+context the 4B runs prompt A at 24.4 tok/s prefill and 13.5 tok/s decode.
+
+Where the time goes now (rows 79, 91, 93, 95):
+- **decode, short context:** ~74 ms per token.
+  - k_li takes ~57 ms. Its weight-stream floor is ~50 ms and its issue floor 37-40 ms; it is
+    clock-bound, not DRAM-bound.
+  - k_gdnf takes 24 x 0.34 ms.
+  - The small kernels take ~4%.
+- **decode at 4k:** attention adds 14.5 ms per token, 8 x (k_fsl 0.66 + k_fvh 1.15 ms). k_fvh is
+  the fork-ordered f16 V chain and is issue-bound.
+- **prefill:** k_hg is at its issue floor (~118 GMAC/s; HFMA2 alone is ~50% of its time). Its cost
+  is per token-MAC, so larger token tiles do not help (row 97).
+
+Measured out in the final sessions. Do not re-walk these:
+- **row 89:** re-sweep of the k_fvh mixed-rounding split;
+- **row 90:** k_li PD8;
+- **row 92:** k_li geometry and the 32-register k_gdnf;
+- **row 93:** k_gdnf state prefetch;
+- **row 94:** k_fsb for one-token decode;
+- **row 95:** prompt-lookup speculative decoding, 1.14-1.23 tokens per step against a ~1.4
+  break-even;
+- **row 96:** CPU co-processed prefill (E_CPUF). It is bit-exact; the NEON twin of k_hg is kept
+  at `.auto/attic/fwd35_cpu.c`. But each split GEMV adds ~0.4 ms of graph host-node and copy
+  cost, against a ~0.26 ms ideal gain;
+- **row 97:** NTM 16 and 64 prefill chunks. 64 does not fit in shared memory. 16 is bit-exact but
+  11% slower on 4k prefill.
+
+The open levers are all lossy, and the user excluded them on 2026-10-16:
+- f16 GDN state, 192 MB of the ~1.26 GB per decode token;
+- a TurboQuant K/V cache;
+- MTP / DFlash.
+
+Reopen them only on an explicit user request. Any further exact work needs a new idea that is
+not in rows 59-97.
 
 ## Hardware ceilings (measured, `pulsar_arm/bonsai2/bench_sm53*.cu`, jetson_clocks, 921.6 MHz)
 
@@ -153,7 +193,7 @@ score ~16-18.
 - k_ab with more loads in flight.
 - Software-pipelined k_gdn loads (-0.6%).
 - Batched N > 1 decode, MTP/DFlash, TurboQuant (out of scope).
-- CPU co-execution: Tegra's pinned memory is CPU-uncached and RSS would grow.
+- CPU co-execution: Tegra's pinned memory is CPU-uncached and RSS would grow; the prefill row split was measured directly in row 96 (host-node overhead > gain).
 
 ## Recipes
 
