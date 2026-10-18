@@ -1702,3 +1702,13 @@ fewer issued instructions per word in k_li (activation LDS amortized over 2 rows
 issue) and better compute/memory overlap; prefill k_hg is fp16-pipe bound (NT 16 measured out,
 line 1553). nvprof --metrics profiled no engine kernel after k_feinit (also with --kernels on the
 mangled name); the clock sweep was the substitute. GPU devfreq: set max then min, restore 921600000.
+
+92. k_li / k_gdnf geometry levers after row 91 (all measured out, bit-exact, code reverted). 4B prompt A
+64-gen screens at 921.6 MHz, ids md5 af77ae304be1 on every arm. (a) k_li2, two row tiles per warp
+sharing one activation LDS (E_LIRR=2): decode 12.52 vs 13.53; with PD halved 13.06 vs 13.51 (the
+amortized LDS is lost to register pressure / fewer loads in flight). (b) word-major activation
+layout in smem with a 1-word tw1 (E_LITR): 13.33 vs 13.51. (c) 8-warp k_li blocks (E_LIW8): 13.46
+(K >= 6144 only) / 13.37 (all shapes) vs 13.52. (d) k_gdnf<2> capped at 32 registers
+(__launch_bounds__(64,32), 0 spills) so all 32 head blocks are resident in one wave instead of ~25
++ 7: 13.64/13.66 vs 13.65/13.66, i.e. the k_gdnf gap to the RMW bench is not a wave tail. The k_li
+launch geometry is exhausted.
