@@ -1782,3 +1782,26 @@ the 2B, so the 4B and 9B are unchanged.
 
 Smaller k_li blocks for tensors of at most 2048 rows were measured out (1 or 2 warps: 26.33 /
 27.95 vs 28.75 tok/s), because every block refills the shared activation planes.
+
+99. 9B shape tuning (measured out; no code change). The 9B is back on the Nano and the 4B is off
+it (SD card space). Prompt A today: prefill 13.3 tok/s, decode 7.8 tok/s (the port started at 6.2
+/ 5.7). Decode nvprof per shape:
+- 24576 x 4096 k_li: 19.9 GB/s;
+- head: 20.7 GB/s;
+- 12288 x 4096: 19.5 GB/s;
+- 10240 x 4096: 19.4 GB/s;
+- down 4096 x 12288: 18.1 GB/s;
+- 4096 x 4096: 18.0 GB/s;
+- k_gdnf: 0.38 ms per layer;
+- the quantizers (k_xq / k_norm_xq) and k_ssqb: ~3%.
+
+Results, all bit-identical (md5 6a03581e518b):
+- **k_li PD for K=12288 (E_LI96):** 2 / 3 / 6 / 8 give 7.61 / 7.79 / 7.63 / 7.53 vs 7.74 tok/s at
+  4 in the 32-token screen. The 64-token ABBA reverses PD3: 7.72 / 7.77 / 7.74 vs 7.82 / 7.76 /
+  7.82 at PD4.
+- **k_li PD for K=4096 (E_LI32):** 1 / 3 / 4 give 7.66 / 7.69 / 7.72 vs 7.74 at 2.
+- **Warp-form quantizer k_xqw / k_norm_xqw at BS 4096 (P=128):** the 9B is the only model with a
+  4096-wide Hadamard block and runs the old k_xq. Q 8 / 16 are bit-identical but give decode 7.67
+  / 7.51 vs 7.71 / 7.76 and prefill +1%. Q 4 (1024 threads) fails to launch.
+
+The 4B-tuned defaults stand for the 9B.
