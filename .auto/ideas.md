@@ -1728,3 +1728,14 @@ k_norm_xqw 12, k_convl2 33, k_argmax1 164 per token) together are ~4% of a decod
 row 72's k_fst), and k_fvh is the fork-ordered sequential f16 chain, issue-bound at ~10
 instructions per position step (4096 chains x ~4000 steps). Prefill k_hg is at its issue floor
 (row 79: 455 instructions per 256 HFMA2; HFMA2 alone is ~50% of its time).
+
+95. Structural review (research). Prompt-lookup speculative decoding (no draft model; n-gram 3/2/1
+suffix match over prompt + output, exact greedy verify) simulated offline on the frozen streams:
+4B 4k golden 1.14 / 1.21 / 1.23 tokens per step for draft length 1 / 2 / 3; prompt A (output-only
+lookup) 1.07, prompt B 1.00. A 2-token POPC verify costs ~1.35-1.4 decode steps (k_li issue ~37-40
+ms per token doubles against a shared 50 ms weight stream), so the break-even is ~1.4 tokens per
+step: measured out on paper. Exact levers left are CPU co-processing (the 4 A57s idle while the GPU
+runs the captured graphs): prefill is compute bound (weights at ~3 GB/s), so a row split of the k_hg
+GEMVs onto NEON adds compute without contending for the bus; decode is near the bus ceiling, so a
+CPU share there is capped by the shared 25.6 GB/s. Lossy levers (f16 GDN state: 192 MB of the
+~1.26 GB per decode token; TurboQuant K/V; MTP) are excluded by the 2026-10-16 decision.
