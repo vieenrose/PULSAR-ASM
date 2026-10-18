@@ -1805,3 +1805,22 @@ Results, all bit-identical (md5 6a03581e518b):
   / 7.51 vs 7.71 / 7.76 and prefill +1%. Q 4 (1024 threads) fails to launch.
 
 The 4B-tuned defaults stand for the 9B.
+
+## 100. MTP / DFlash speculative decoding for Bonsai-2: estimated at most +4..23% (2B), -4..+14% (9B), not built
+
+PrismML ships MTP (one Q8_0 layer) and DFlash drafts. Fork acceptance (4B MTP, CPU, greedy, 300
+tokens, 4 prompts) at draft n=1 is 65-95% (zh-TW 65%, EN 83%, code/list 95-97%); n=2/3 add little
+(per-draft acceptance falls to 50-75%).
+
+Verify cost on fwd35: the batched k_hg path costs ~4-4.7 decode steps for any 2-8 token chunk
+(E_PCHUNK: 2B 107.6 ms at c2 vs 26.7 ms/token), so a dedicated multi-token decode GEMV was probed:
+k_liv (k_li with NV per-token chains from the same weight planes, token 0 exact, md5 unchanged).
+Decode with every GEMV at NV tokens, prompt A 64 tokens, same job:
+- 2B: 28.61 (NV1) / 20.02 (NV2, 1.43x) / 13.62 (NV3, 2.10x).
+- 9B: 7.79 / 4.82 (NV2, 1.61x) / 2.45 (NV3, 3.18x; per-token MAC issue bound, not bandwidth).
+
+With n=1 (pass = 1.43-1.61 steps + ~0.1-0.15 for the MTP layer and a pruned head; GDN state
+rollback and nt=2 attention not counted): 2B 1.04-1.23x, 9B 0.96-1.14x, prompt dependent. DFlash
+verifies ~16-token blocks (>= 4.7 steps here) and needs ~1.6 GB drafts on a 4 GB board: out.
+The sm_53 GEMV is MAC-issue bound once a second token is added, so speculation buys little. The
+probe source is in `.auto/attic/fwd35_liv_probe.cu`.
