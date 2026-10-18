@@ -1676,3 +1676,9 @@ prefill 22.40 / 22.40 vs 22.48 / 22.50 (+0.4%); fresh score 15.95 (15.74 before)
 22.43 / 22.51 / 22.47 / 22.37 / 22.16. All md5 0b84b6abb1e2. Also measured: RMW of the GDN state
 (2 MB per layer, in place) peaks at 18.8 GB/s on the Nano (read only 21.3), so k_gdnf's floor is
 ~5.4 ms per token against ~8.1 ms; k_li runs at 18-21 GB/s of the 21.9 ceiling.
+
+90. k_li pipeline depth PD 8 for the K=9728 down GEMV (E_LIPD76; measured out, code reverted). Same-job
+ABBA (A = PD 4, B = PD 8, 1/2/2/1): decode 11.27 / 11.29 vs 11.28 / 11.27, prefill 22.49 / 22.48 vs
+22.49 / 22.48, all golden PASS. The down GEMV is not limited by loads in flight; with row 63's W/PD
+sweeps and row 68's bench, k_li's remaining gap to the 21.9 GB/s read ceiling is not reachable by
+depth or warp count.
