@@ -1712,3 +1712,11 @@ layout in smem with a 1-word tw1 (E_LITR): 13.33 vs 13.51. (c) 8-warp k_li block
 (__launch_bounds__(64,32), 0 spills) so all 32 head blocks are resident in one wave instead of ~25
 + 7: 13.64/13.66 vs 13.65/13.66, i.e. the k_gdnf gap to the RMW bench is not a wave tail. The k_li
 launch geometry is exhausted.
+
+93. k_gdnf software prefetch of the next RW rows' state ahead of the two dotg reductions (E_GPF; measured
+out, bit-exact, code reverted): decode 13.52 / 13.50 vs 13.52 / 13.51 (also with 4 warps per head:
+13.53). With rows 92(d) and 93 the k_gdnf 0.338 ms per layer vs 0.253 ms RMW bench gap is neither a
+wave tail nor load latency; what is left is the read-to-write turnaround of a 4 MB in-place RMW.
+nvprof GPU summary at 921.6 MHz (E_GRAPH=0, 4B prompt A, 64 gen) for reference: k_li<20> 638 us,
+k_li<72> 340, k_gdnf 338, k_li<32> 166; the small decode kernels (k_ssqb 13-23 us, k_xqw 12-24,
+k_norm_xqw 12, k_convl2 33, k_argmax1 164 per token) together are ~4% of a decode token.
