@@ -122,6 +122,54 @@ static void q8_ref(const int8_t* q, const __half* s, const float* x, float* y,
   }
 }
 
+// The bit-exactness reference: mirrors the KERNEL's arithmetic operation for
+// operation, which is the repo's own technique (pq1_swar_sm53.cu:19-22, "the
+// fp accumulation is made bit-exact too by reducing per-group products in
+// GROUP ORDER in fp32 (__fmul_rn/__fadd_rn, no contraction)").
+//
+// Two things must match, and both were visible as maxrel ~3e-4 against the
+// sequential reference above:
+//   1. no FMA contraction of the 32-term sums -- compile with -fmad=false, and
+//      use __fmul_rn/__fadd_rn here so the host side cannot contract either;
+//   2. the inter-block reduction, which in the kernel is a warp-shuffle
+//      butterfly (o = 16,8,4,2,1) over the 32 partials of each half-row, then
+//      part[0] + part[1]. fp addition is not associative, so a sequential
+//      acc += p[b] differs in the last bits.
+// int8 -> float is exact, so the products are the same values on both sides.
+static __device__ float butterfly32(const float* p) {
+  float v[32];
+  for (int i = 0; i < 32; i++) v[i] = p[i];
+  for (int o = 16; o > 0; o >>= 1) {
+    float t[32];
+    for (int i = 0; i < 32; i++) t[i] = __fadd_rn(v[i], v[i + o < 32 ? i + o : i]);
+    for (int i = 0; i < 32; i++) v[i] = t[i];
+  }
+  return v[0];
+}
+
+static __device__ void q8_ref_tree_one(const int8_t* q, const __half* s, const float* x,
+                                       float* y, int r, int K) {
+  const int nb = K / Q8_BLK;                     // 64 at K=2048
+  float p[64];
+  for (int b = 0; b < nb; b++) {
+    float sum = 0.f;
+    for (int j = 0; j < Q8_BLK; j++)
+      sum = __fadd_rn(sum, __fmul_rn((float)q[(size_t)r * K + b * Q8_BLK + j],
+                                     x[b * Q8_BLK + j]));
+    p[b] = __fmul_rn(__half2float(s[(size_t)r * nb + b]), sum);
+  }
+  y[r] = __fadd_rn(butterfly32(p), butterfly32(p + 32));
+}
+
+// Runs the reference on the device: __fadd_rn/__fmul_rn are __device__
+// intrinsics, so a host-side reference cannot use them (nvcc rejects the call
+// outright). One thread per row; only used by the correctness check.
+__global__ void q8_ref_tree_kernel(const int8_t* q, const __half* s, const float* x,
+                                   float* y, int N, int K) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r < N) q8_ref_tree_one(q, s, x, y, r, K);
+}
+
 static double ms_since(const struct timespec* a) {
   struct timespec b; clock_gettime(CLOCK_MONOTONIC, &b);
   return (b.tv_sec - a->tv_sec) * 1e3 + (b.tv_nsec - a->tv_nsec) * 1e-6;
@@ -148,11 +196,12 @@ int main() {
     sh[i] = __float2half((float)(rnd() % 64) / 64.f + 0.01f);
   for (int i = 0; i < MAXK; i++) xh[i] = (float)(rnd() % 255) / 128.f;
 
-  int8_t *dq; __half *ds; float *dx, *dy;
+  int8_t *dq; __half *ds; float *dx, *dy, *dref;
   cudaMalloc(&dq, (size_t)MAXN * MAXK);
   cudaMalloc(&ds, (size_t)MAXN * (MAXK / Q8_BLK) * 2);
   cudaMalloc(&dx, (size_t)MAXK * 4);
   cudaMalloc(&dy, (size_t)MAXN * 4);
+  cudaMalloc(&dref, (size_t)MAXN * 4);
   cudaMemcpy(dq, qh, (size_t)MAXN * MAXK, cudaMemcpyHostToDevice);
   cudaMemcpy(ds, sh, (size_t)MAXN * (MAXK / Q8_BLK) * 2, cudaMemcpyHostToDevice);
   cudaMemcpy(dx, xh, (size_t)MAXK * 4, cudaMemcpyHostToDevice);
@@ -182,16 +231,23 @@ int main() {
       cudaError_t e2 = cudaDeviceSynchronize();
       if (e2) { printf("  LAUNCH(R=%d): %s\n", R, cudaGetErrorString(e2)); return 1; }
       cudaMemcpy(yh, dy, (size_t)N * 4, cudaMemcpyDeviceToHost);
+      q8_ref_tree_kernel<<<(N + 255) / 256, 256>>>(dq, ds, dx, dref, N, k);
+      float* yt = (float*)malloc((size_t)N * 4);
+      cudaMemcpy(yt, dref, (size_t)N * 4, cudaMemcpyDeviceToHost);
       float* yr = (float*)malloc((size_t)N * 4);
       q8_ref(qh, sh, xh, yr, N, k);
-      int bad = 0; double maxabs = 0, maxrel = 0;
+      int bad = 0, badt = 0; double maxabs = 0, maxrel = 0, maxrelt = 0;
       for (int i = 0; i < N; i++) {
         double a = fabs((double)yh[i] - yr[i]), r = a / (fabs((double)yr[i]) + 1e-9);
+        double at = fabs((double)yh[i] - yt[i]);
+        double rt = at / (fabs((double)yt[i]) + 1e-9);
         if (a > maxabs) maxabs = a;
         if (r > maxrel) maxrel = r;
+        if (rt > maxrelt) maxrelt = rt;
         if (yh[i] != yr[i]) bad++;
+        if (yh[i] != yt[i]) badt++;
       }
-      free(yr);
+      free(yr); free(yt);
       for (int i = 0; i < 20; i++) launch();
       cudaDeviceSynchronize();
       struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -202,14 +258,15 @@ int main() {
       // f16 scale per 32-code block, so x1.0625. Codes-only flatters the
       // number by 6%.
       double bytes = (double)N * k * (1.0 + 2.0 / Q8_BLK);
-      printf("%-3d %-8d %6d %8.1f %9.3f %9.2f  %s (maxabs %.3g maxrel %.3g)\n",
+      printf("%-4d %-8d %6d %8.1f %9.3f %9.2f  tree %-9s seq maxrel %.2g  tree maxrel %.2g\n",
              R, N, N, bytes / 1e6, ms, bytes / (ms * 1e6),
-             bad ? "differs" : "BIT-EXACT", maxabs, maxrel);
+             badt ? "MISMATCH" : "BIT-EXACT", maxrel, maxrelt);
     }
   }
   printf("\nreference points: engine achieves 17.1 GB/s, measured ceiling 21.9 GB/s\n");
   printf("(2-bit PQ1_0 hs kernel at the same 7680x2048 shape: 0.398 ms)\n");
-  cudaFree(dq); cudaFree(ds); cudaFree(dx); cudaFree(dy);
+  printf("build for bit-exactness: -O3 -fmad=false (NO --use_fast_math)\n");
+  cudaFree(dq); cudaFree(ds); cudaFree(dx); cudaFree(dy); cudaFree(dref);
   free(qh); free(sh); free(xh); free(yh);
   return 0;
 }

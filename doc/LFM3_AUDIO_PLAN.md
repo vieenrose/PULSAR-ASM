@@ -614,16 +614,34 @@ at K=2048 reaches 13.0 GB/s, 76% of what this engine achieves with its tuned
 activation traffic you stage into shared, and check the shared-index stride of
 any kernel where a warp reads a column of a `[block][32]` tile.
 
-**Correctness is not finished.** It reports `differs` against the sequential
-host reference at maxabs 1.2e-3 / maxrel 2.9e-4, for two known reasons: the 64
-block-partials of a row are combined by a warp-shuffle **tree**, not the
-reference's sequential `acc += p[b]` (fp add is not associative), and
-`--use_fast_math` contracts the 32-term sums into FMAs. The repo already owns
-the fix — `pq1_swar_sm53.cu:19-22`, "the fp accumulation is made bit-exact too
-by reducing per-group products in GROUP ORDER in fp32 (`__fmul_rn`/`__fadd_rn`,
-no contraction)" — which here means making the reference mirror the kernel's
-tree and dropping contraction. Until that is done this is a bandwidth probe,
-not a shippable kernel.
+**Correctness: bit-exact against a device reference.** The first cut reported
+`differs` at maxabs 1.2e-3 / maxrel 2.9e-4 against a sequential reference, for
+two known reasons: the 64 block-partials of a row are combined by a warp-shuffle
+**tree**, not the reference's sequential `acc += p[b]` (fp add is not
+associative), and `--use_fast_math` contracts the 32-term sums into FMAs. The
+repo already owns the fix — `pq1_swar_sm53.cu:19-22`, "the fp accumulation is
+made bit-exact too by reducing per-group products in GROUP ORDER in fp32
+(`__fmul_rn`/`__fadd_rn`, no contraction)". Applied here: `q8_ref_tree_kernel`
+mirrors the kernel's arithmetic operation for operation (index-order
+`__fmul_rn`/`__fadd_rn` per Q8_0 block, then the same butterfly32 at
+o = 16,8,4,2,1, then `part[0] + part[1]`). Result, all shapes, all R:
+
+```
+tree BIT-EXACT   seq maxrel 0.00029   tree maxrel 0
+```
+
+**BIT-EXACT in both builds**, `-fmad=false` and `--use_fast_math` alike, at
+12.35–12.45 GB/s in the principled `-fmad=false` build (only ~4% under the fast
+build, so contraction is not what buys the bandwidth). The `__fadd_rn`/
+`__fmul_rn` intrinsics are `__device__`-only — nvcc rejects calling them from a
+host function ("calling a __device__ function from a __host__ function is not
+allowed"), which is why the bit-exactness reference runs as a GPU kernel, one
+thread per row. Caveat worth stating: bit-exactness in the `--use_fast_math`
+build is verified on this data only — fma-vs-mul-then-add differs on rare
+inputs, so `-fmad=false` is the build to gate on.
+
+So this is now a shippable primitive, not a bandwidth probe: parity-checkable
+against a reference the way `pq1_parity` requires, at 12.4 GB/s.
 
 **And it does not change the §11 verdict.** At the measured 13.0 GB/s the Q8_0
 backbone is 2.082 GB/token = 160 ms/token = **6.2 tok/s** (the §11 estimate of
