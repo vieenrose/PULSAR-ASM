@@ -358,6 +358,23 @@ the backbone). So:
   at Q6 — the spread means the gate needs more prompts before any tolerance is
   frozen.
 
+**Validation that the quantizer really ran** (the failure mode is a filter that
+matches nothing, which reads as "4-bit is lossless"). Relative Frobenius error
+on `layers.20.feed_forward.w2` (2048x7680, the deepest dot in the model):
+
+| scheme | max abs delta | rel. Frobenius | greedy A / B |
+|---|---|---|---|
+| q8_0 | 0.00229 | **0.57%** | 48/48, 48/48 |
+| q6_0 | 0.00928 | 2.23% | 48/48, 32/48 |
+| q5_0 | 0.02026 | 4.61% | 48/48, 14/48 |
+| q4_1 | 0.02151 | 7.90% | 48/48, 12/48 |
+| q4_0 | 0.04150 | 9.88% | 9/48, 0/48 |
+| q2_0 | 0.20215 | 65.9% | 0/48, 0/48 |
+
+Monotone in the right places: 0.57% noise is small enough not to flip any argmax
+across 48 greedy steps, 2.2% already flips prompt B at token 32. That is the
+shape a genuine quantization study has, so the Q8 floor is not a no-op artifact.
+
 ### 9.1 Memory verdict against the two boards
 
 | board | role | MemAvailable | passwordless sudo | EMC clock |
