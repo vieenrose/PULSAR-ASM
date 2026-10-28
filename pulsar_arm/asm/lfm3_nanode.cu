@@ -813,6 +813,22 @@ static void eadd(Model& M, const bf16* a, const bf16* b, bf16* y, int n) {
   k_add_bf<<<(n + 255) / 256, 256>>>(a, b, y, n);
 }
 
+// Per-layer fingerprint for localizing a divergence (the perlayer_probe role
+// the Pi engine plays with tools/perlayer_probe.patch). rms, not a hash: the
+// first layer where this stops tracking HF's hidden_states rms is the layer
+// that is wrong, and rms is cheap to print from both sides.
+static std::vector<uint16_t> g_scr;
+static float rms_host(Model& M, const bf16* x) {
+  g_scr.resize(H);
+  cudaMemcpy(g_scr.data(), x, (size_t)H * 2, cudaMemcpyDeviceToHost);
+  double acc = 0;
+  for (int i = 0; i < H; i++) {
+    uint32_t u = ((uint32_t)g_scr[i]) << 16; float v; memcpy(&v, &u, 4);
+    acc += (double)v * (double)v;
+  }
+  return (float)sqrt(acc / (double)H);
+}
+
 static void build_invf(float* out, float base, int dim, double partial) {
   const int angles = (int)(partial * dim) / 2;
   for (int i = 0; i < dim / 2; i++)
@@ -1025,6 +1041,8 @@ int main(int argc, char** argv) {
       gemv(M, LN(L, "feed_forward.w2.weight"), M.h2, M.h2);
       rms1(M, M.h2, NW(M, L, "post_ffn_norm.weight"), M.h3);
       eadd(M, M.x, M.h3, M.x, H);
+      if (trace) printf("  L%-2d %s rms %.4f\n", L, is_attn[L] ? "attn" : "conv",
+                        rms_host(M, M.x));
     }
     // model.embedding_norm runs on the last layer's output BEFORE the tied
     // lm_head (modeling_lfm3.py:760, right after the layer loop). Feeding
@@ -1036,6 +1054,7 @@ int main(int argc, char** argv) {
       rms1(M, M.x, fn ? fn->df : nullptr, M.h1);
       M.x = M.h1;   // deliberate: the dump/trace path then shows the normalised stream
     }
+    if (trace) printf("  final rms %.4f\n", rms_host(M, M.x));
     if (M.emb_mode == 1) lm_head_host(M, M.hemb, M.x, M.lgf);   // streamed from pinned host
     else gemv_f(M, EMBNAME, M.x, M.lgf);                         // tied lm_head, resident
     k_argmax<<<1, 256>>>(M.lgf, M.tok_dev, VOCAB);

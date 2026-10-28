@@ -1843,3 +1843,26 @@ probe source is in `.auto/attic/fwd35_liv_probe.cu`.
   Do not trust a self-test that compares two paths built from the same assumption -- the lm_head
   selftest is bit-exact by construction and proved nothing about layout; the independent HF
   comparison is what found the real issues (5fd7e79's lesson, again).
+- [LFM3/Nano] Localization of the logits divergence, layer-0 table (engine vs HF, pos 0, prompt
+  [124894]). Engine: ./lfm3_nanode <blob> --emb-host --steps 1 --prompt 124894 --trace
+  (the --trace hook prints rms of the residual stream after every layer). HF: /tmp/probe_rms.py
+  (venvs/lfm3) saves /tmp/hf_pos0_rms.npy, 25 values, embedding through embedding_norm.
+      layer type  engine  HF        L0 conv 0.0280/0.0247  L1 conv 0.0929/0.1564
+      L2 attn 0.0678/0.1125  L3 conv 0.0707/0.1194  L4 attn 0.0701/0.0764
+      L5 conv 0.0871/0.1956  ... L23 conv 0.4938/0.5386  final 2.8949/3.6474
+    Already 13% off at L0 and 41% at L1 (both conv layers), monotonically diverging. No state is
+    involved at pos 0 (1-position attention, zero conv ring), so this is arithmetic, not cache/RoPE.
+  RULED OUT by reading HF's source line by line, not by a self-test (each of these was a candidate):
+    conv in_proj split order (B,C,x = BCx.chunk(3,-2) -> my chunk0=B, chunk1=C, chunk2=x matches),
+    conv gating order (B*x -> conv -> C*y -> out_proj), conv tap alignment (the size-7 kernel pairs
+    the NEWEST input with tap 6; my ring[6]=newest, taps[k]*ring[k] matches), sandwich-norm
+    arrangement (post_operator_norm on the branch output before the add, post_ffn_norm on ffn_out
+    before the add -- matches), SwiGLU (silu(w1)*w3, matches), Q8 scale/block pairing (dequantized
+    the blob in Python: cos 0.99986 vs HF for w1/w2/in_proj, transposed-cos ~0.000), embedding
+    layout (row-major cos 0.99997, col-major 0.008), all 286 CRCs, lm_head bit-exact, logit scale.
+  NEXT: instrument INSIDE layer 0 on both sides (pre-norm, in_proj, B*x, conv, C*y, out_proj,
+  post_operator_norm, add, ffn_norm, FFN, post_ffn_norm, add) -- probe_lfm3_conv.py is the template
+  for the HF side. Top suspect: k_rmsnorm (first op of every layer, so it explains an L0 error;
+  check mean-count, eps placement, rsqrt, and the weight multiply against Lfm3RMSNorm). Second:
+  the Q8 GEMV's row->output-index mapping, which the dequant test cannot see (it validates the
+  matrix, not the index map -- a permutation survives every gate that shares the convention).
