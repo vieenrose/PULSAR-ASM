@@ -648,3 +648,111 @@ backbone is 2.082 GB/token = 160 ms/token = **6.2 tok/s** (the §11 estimate of
 8.2 assumed the engine's 17.1 GB/s, so this is worse, not better). Against the
 incumbent's 27 tok/s. The memory wall is unchanged: 2.08 GB of weights will not
 fit ipho-nano's 1457 MB available, so this kernel cannot even be loaded there.
+
+## 13. The GEMV is solved; memory and the embedding are what is left (measured 2026-10-29, clean Nano)
+
+Everything in §12 was priced with a kernel that could not read K=7680. The
+kernel work is now done and it moved decode a lot; the two open items are
+device memory and the tied embedding. Numbers below are one SM on the clean
+Nano, `-fmad=false`, bit-exact per config, coverage asserted.
+
+### 13.1 The rate, per tensor (`q8_lc3.cu`)
+
+Lane-strided chunked Q8_0: **one warp per row with lanes striding the row's
+blocks** (kg's structure, so `nb` may be any integer) plus **x staged in
+shared and amortized over R rows** (split-K's actual win). Best config each:
+
+| tensor | shape | calls/tok | ms/call | GB/s | ms/token |
+|---|---|---|---|---|---|
+| lm_head (tied embed, Q8) | 128000x2048 | 1 | 17.893 | 16.51 | 17.9 |
+| gate+up w1,w3 | 7680x2048 | 48 | 1.090 | 16.28 | 52.3 |
+| down w2 | 2048x7680 | 24 | 1.184 | 14.98 | 28.4 |
+| conv_in_proj | 6144x2048 | 13 | 0.875 | 16.22 | 11.4 |
+| conv_out / w_q / gate_proj / w_o | 2048x2048 | 46 | 0.313 | 15.12 | 14.4 |
+| w_k, w_v | 2048x512 | 22 | 0.149 | 8.00 | 3.3 |
+| **total (Q8 embedding)** | | | | | **127.7 ms = 7.83 tok/s** |
+
+Three results that took a falsification each to reach:
+
+1. **`split-K` was the wrong variable.** `KCHUNK=7680` is `nchunk=1`, i.e. no
+   splitting at all, and it is the *fastest* down-w2 config (14.31 GB/s vs kg's
+   5.96). The lever is rows-amortized-per-x-stage: R=1 → 5.96, R=64 → 12.96,
+   R=256 → 14.31 GB/s. Occupancy is not a lever here (the 1536/2048
+   threads-per-SM cap binds before shared).
+2. **5fd7e79's 12.88 GB/s on down w2 is withdrawn**: `7680 % 2048 = 1536`, so
+   `nchunk = K/KCHUNK = 3` read 6144 of 7680 columns. No multiple of 1024
+   divides 7680 (7680 = 32×240, 240 % 32 = 16), so a 32-lane-group butterfly
+   cannot cover that K at all. The bit-exact gate printed YES because
+   `ref_chunked` computed `nchunk` the same way — **a reference that mirrors
+   the kernel's structure mirrors its structural bugs.** Coverage
+   (`nchunk*KCHUNK == K`) is now asserted independently.
+3. **fp32 scales are faster than fp16 scales** (16.51 vs 16.33 GB/s), because
+   reading 4 bytes removes a `__half2float` per block while the scale is 1/32
+   of the codes traffic. They are also the *certified* numerics.
+
+14-16.5 GB/s is 64-75% of the 21.9 GB/s ceiling measured in §9.2. The FFN is
+74% of decode.
+
+### 13.2 Accuracy: three ways to shrink the model, each measured (`quant_sensitivity.py`)
+
+| arm | exact | mean prefix | weights |
+|---|---|---|---|
+| `q8_0` — linears Q8, **embed bf16**, fp32 scales | **8/8** | 24.0 | **2174 MB** |
+| `q8_0h` — fp16-rounded scales, ±127 clamp | 7/8 | 20.9 | 2082 MB |
+| `q8_0_embq8` — linears Q8, **embed Q8** | 6/8 | 19.6 | 1836 MB |
+
+The engine's `__half` scale (the pq1/ggml Q8_0 convention) is **not** the arm
+that was certified: prompt F dies at token 6. Quantizing the tied embedding
+costs 2 more prompts and collapses the worst case to prefix 1. Prompt F is the
+canary in every arm (the bf16 control itself reaches only 17/24 there).
+
+So the byte floor at fixed accuracy is **2174 MB**: linears at Q8_0 with fp32
+scales, embedding bf16. §9 closed the per-group direction (Pareto-dominated),
+this closes the scale-dtype and embedding directions. The bytes are not
+reducible at 8/8.
+
+### 13.3 The tied lm_head was missing from every budget
+
+`tie_word_embeddings=true` and the census lists no `lm_head`, so every token
+streams the whole 128000×2048 table: 524 MB/token bf16 = **35.0 ms** at
+15 GB/s, 24% of decode. The "1.558 GB/token" figure counted only the 1466 M
+Linear params. At the certified config the honest GEMV budget is
+
+  127.7 − 17.9 (Q8 lm_head) + 35.0 (bf16 lm_head) = **144.8 ms → 6.90 tok/s**
+
+### 13.4 Memory, measured on the board — not by accounting
+
+`cudaMemGetInfo` on the clean Nano: **2742 MB free at idle, 1867-1872 MB with
+a co-resident service up.** The certified config needs ~2184 MB (2174 weights
++ ~10 arena). So it **runs on a quiet Nano and does not fit a contended one**.
+Supporting observations:
+
+* All allocations succeed at 2.88 GB free, including first-touch writes into a
+  1728 MB block. The first "invalid argument" failures were contention, not a
+  hard wall — the initial 1.77 GB reading was the service, not the board.
+* A progressive 256 MB-step probe ssh-dropped its own session. Do not probe
+  Nano memory in big steps.
+* The harness now checks every `cudaMalloc`, prints free memory in MB, and
+  waits up to 30 min for the board to drain, because a transient is not a
+  result. `MAXTOK` (the KV cache) is benchmark-sized at 64 (6 MB); a
+  256-token context costs 25 MB and needs the headroom to match.
+
+### 13.5 Engine state
+
+`pulsar_asm/lfm3/tools/export_lfm3_q8.py` writes `.lfm3q8` (1946 MB, 286
+tensors) with a per-tensor crc32 and `--selfcheck` → **SELFCHECK OK, 286/286**.
+`pulsar_arm/asm/lfm3_nanode.cu` loads it, re-asserts every crc32 on the bytes
+it loaded (so "the engine runs the certified quantizer" is a load-time
+assertion), and runs the real `Lfm3DecoderLayer.forward` from
+`modeling_lfm3.py`: sandwich norms, per-head QK norms over head_dim=128, GQA
+16q/4kv, sigmoid head gate before o_proj, the conv op's `B*xg → 7-tap depthwise
+→ C*y` ring, zero-tail partial RoPE (θ=1e6 pr=0.5 full / θ=1e4 pr=1.0 sliding),
+SwiGLU, tied logits, greedy argmax. Activations are bf16 rounded at torch's
+points — the §ref_lfm3_np lesson. CUDA 10.2 gates the bf16 intrinsics behind
+`__CUDA_ARCH__ >= 800`, so bf16 is raw `unsigned short` plus hand-written
+RN-even conversions.
+
+**Open:** end-to-end ms/token (needs a quiet board), the non-GEMV elementwise
+cost (unpriced; ~28% of decode in the Bonsai engine), and NEON ports of the
+elementwise ops — the "mostly assembly" half of the target, for which
+`lfm3_conv.S` (bit-exact, 40.2 µs/step) is the template.
