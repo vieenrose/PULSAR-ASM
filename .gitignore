@@ -5,3 +5,7 @@ __pycache__/
 .auto/log.jsonl
 .auto/last_*.txt
 .auto/last_build.log
+
+# LFM3 oracle scratch: regenerable 512 KB/tensor dumps, not gate artifacts
+.auto/lfm3/logits_last_*.npy
+.auto/lfm3/quant_sensitivity.json

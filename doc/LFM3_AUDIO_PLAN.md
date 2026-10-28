@@ -1,9 +1,11 @@
 # LFM3-Audio-2B on a PULSAR asm engine — scope, facts, and plan
 
-Status: **scoping only. No engine code exists for this model.** This document is
-the factual basis for a go/no-go decision. Every number below was read from
-`LiquidAI/LFM3-Audio-2B` (`config.json`, the safetensors header, the file
-listing) on 2026-10-28, not estimated.
+Status: **scoped and partly measured. No engine code exists for this model on
+any target.** Every number below was read from `LiquidAI/LFM3-Audio-2B`
+(`config.json`, the safetensors headers, the file listing), from
+`.auto/HANDOFF_NANO_Q1_0.md`, or measured on the two Jetson Nanos, on
+2026-10-28 — not estimated. §8–§10 are the Nano verdict; §9 is the one that
+decides it.
 
 ## 0. Two open questions that gate everything
 
@@ -199,9 +201,15 @@ single-session change. S0 is the only thing to do immediately.
 
 ## 7. Recommendation
 
-Do S0 now (toolchain + oracle), then S1. Do not start from S5: the codec is the
-largest single item and is useless without S1–S4 producing valid code tokens.
-Confirm the target engine (§0.1) before any kernel is written.
+S0 is done (§8.1). The next thing to build is **not** a kernel: it is the
+pipeline comparison in §10, because the accuracy floor (§9) says LFM3-Audio's
+backbone alone is 1.72 GB minimum, 1.8x the 950 MB Bonsai-4B LLM already
+shipping in the Nano voice-chat stack. Confirm what `pulsar-sam` means (§0.1)
+and which board is the target (§9.1: only picard-desktop has the RAM) before
+writing S1.
+
+Do not start from S5: the codec is the largest single item and is useless
+without S1–S4 producing valid code tokens.
 
 ---
 
@@ -252,11 +260,13 @@ The reference point is what already runs: Bonsai-8B Q1_0 = 1.06 GB weights +
 | 8-bit | 1.729 GB | 0.053 GB | 1.782 GB | 78.9 ms/tok (12.7 tok/s) |
 | **4-bit** | **0.864 GB** | **0.053 GB** | **0.917 GB** | **39.5 ms/tok (25.3 tok/s)** |
 
-Two findings that invert the §5/§0 pessimism:
+Two findings that invert the §5/§0 pessimism (both about structure; **the
+accuracy floor in §9 then reverses finding 1 — read §9 before quoting 0.864 GB**):
 
 1. **At 4-bit the backbone is 0.864 GB — smaller than Bonsai-8B Q1_0's 1.06 GB,
-   which runs on this board today.** It is in the feasible class, not the
-   impossible one.
+   which runs on this board today.** Size-wise it is in the feasible class.
+   **But 4-bit does not survive the accuracy gate** (§9): the greedy stream
+   collapses at Q4. Treat this row as a memory bound, not a candidate.
 2. **The K/V cache is 53 MB, not gigabytes** (11 attention layers × 4 KV heads ×
    head_dim 128; 6 of the 11 are sliding-window-256 bounded). Bonsai-8B pays
    **1.208 GB** for the same 4k context — 36 layers × 8 KV heads. That is what
@@ -265,11 +275,9 @@ Two findings that invert the §5/§0 pessimism:
    about Tegra nvmap RSS accounting at a given arena size), not a physics law;
    re-size it for LFM3's 53 MB cache and re-measure RSS at equal arena size.
 
-At 4-bit the whole S1 text engine (0.917 GB + a ~500 MB arena + ~300 MB RSS)
-sits inside the measured 1476 MB `MemAvailable`. Full speech-to-speech adds
-encoder 0.219 + speech head 0.328 + codec 0.147 = **0.694 GB more**, which is
-what makes S4/S5 genuinely tight against 1476 MB — that, not the backbone, is
-the memory wall.
+Full speech-to-speech adds encoder 0.219 + speech head 0.328 + codec 0.147 =
+**0.694 GB more** on top of the accuracy floor — that is the memory wall for
+S4/S5.
 
 ### 8.4 The real blocker is kernel shape specialization, not RAM
 
@@ -310,3 +318,106 @@ Build S1 first: it is the single item that de-risks everything, and unlike the
 x86 scaffold it must be written in NEON/CUDA sm_53 (no SDOT on Maxwell — use
 the `AND + IADD3` / SMULL+SADALP playbook from `NANO_BRINGUP.md`), not AVX2.
 Do not start from S5.
+
+---
+
+## 9. Accuracy floor: 4-bit does not survive the gate (measured 2026-10-28)
+
+`.auto/lfm3/quant_sensitivity.py` fake-quantizes → dequantizes the 153 backbone
+2-D tensors (same numerics an int-dot GEMV has) and greedy-decodes against the
+frozen HF goldens. Metric = longest common prefix, the repo's metric (`n/48`).
+Group = weights per f16 scale; Q8_0/Q4_0 style is group 32.
+
+| scheme | bits/w | GB backbone | prompt A | prompt B |
+|---|---|---|---|---|
+| bf16 | 16.00 | 3.457 | **48/48** | **48/48** |
+| **q8_0** | 9.64 | **2.082** | **48/48** | **48/48** |
+| q6_0 | 7.94 | 1.716 | 48/48 | 32/48 |
+| q5_0 | 7.09 | 1.532 | 48/48 | 14/48 |
+| q4_1 | 6.67 | 1.441 | 48/48 | 12/48 |
+| q4_g128 | 6.03 | 1.303 | 6/48 | 24/48 |
+| q4_0 | 6.24 | 1.349 | 9/48 | 0/48 |
+| q3_0 | 5.39 | 1.166 | 0/48 | 0/48 |
+| q2_0 | 4.55 | 0.982 | 0/48 | 0/48 |
+| q6_0 + q6 emb | 6.57 | 1.421 | 48/48 | 32/48 |
+| q5_0 + q5 emb | 5.57 | 1.205 | 48/48 | 15/48 |
+| q4_1 + q4 emb | 5.00 | 1.080 | 27/48 | 23/48 |
+
+**Q8_0 is the only scheme that reproduces the BF16 greedy stream on both
+prompts.** Everything below Q8 diverges, prompt B first (it is the harder
+prompt: Q6 already loses it at token 32). Quantizing the embedding table buys
+memory but rescues nothing — sensitivity lives in the FFN (1132.6 M = 66% of
+the backbone). So:
+
+- **Accuracy floor ≈ 1.72 GB** (FFN+conv+attn at Q8_0 = 1.558 GB, embeddings
+  Q4_1 = 0.164 GB). Below that the stream breaks.
+- **§8.3's "4-bit is feasible" was wrong as a proposal.** 0.864 GB is a memory
+  bound, not a candidate: Q4_0 gives 9/48 and 0/48. Corrected above.
+- Caveats: 2 prompts x 48 tokens, greedy only, torch fake-quant (group 32
+  matches llama.cpp Q8_0/Q4_0). Prompt A tolerates down to Q4_1 while B breaks
+  at Q6 — the spread means the gate needs more prompts before any tolerance is
+  frozen.
+
+### 9.1 Memory verdict against the two boards
+
+| board | role | MemAvailable | passwordless sudo | EMC clock |
+|---|---|---|---|---|
+| `picard@100.84.151.116` (picard-desktop) | clean / dedicated | **2542 MB** | no | idle (unpinned) |
+| `pesi@100.70.245.36` (ipho-nano) | **production voice-chat** | **1457 MB** | yes | pinned 1600 MHz |
+
+Both are Tegra X1, cc 5.3, **1 SM**, 4.16 GB, CUDA 10.2; sm_53 builds and runs
+on both (verified with a deviceQuery probe).
+
+- **ipho-nano (1457 MB): S1 at the Q8 floor (1.72–2.08 GB) does not fit.** No-go
+  there. It is also not free to use — mysql, asterisk, erlang, mysqld, gdb and
+  the voice-chat server are resident (~1.1 GB), and it is headless already
+  (lightdm inactive, no Xorg), so the 1457 MB is *not* a display tax.
+- **picard-desktop (2542 MB): S1 at the Q8 floor fits with ~0.4–0.8 GB
+  headroom** — tight, and it needs the small LFM3 arena (53 MB K/V), not
+  Bonsai's 1280 MB. This is the only board where S1 is plausibly runnable.
+- Full speech-to-speech (floor 1.72 + 0.694 GB ≈ 2.4 GB + CUDA context + codec
+  buffers) is **over budget on both** 4 GB boards.
+
+### 9.2 Bandwidth probe: reported as inconclusive, not as a board number
+
+`.auto/lfm3/probe_q8_gemv.cu` measures Q8_0 GEMV at the LFM3 shapes. It read
+0.81 GB/s for the GEMV and ~10 GB/s for its "read ceiling" — **below the repo's
+own *achieved* 17.1 GB/s**, so the probe kernel is the limit, not the board.
+Same result on both boards (EMC pinned 1600 MHz on ipho-nano), so it is not a
+clock artifact. Do not quote 10 GB/s as a Nano ceiling.
+
+The K=2048 question from §8.4 therefore stays open and needs the repo's real
+instrument, not this probe: time the existing `hs` kernel at K=2048/7680 via
+`pq1_parity <rows> <K> all`. Note CLAUDE.md's trap: `ab_kernel.sh` with
+`GITREF=HEAD` appends `ab_delegates.inc`, fails to link, and silently measures
+a stale binary — pre-#42 refs only.
+
+Two bugs found on the way, both worth remembering: an `int` Q8 load indexed
+`+ lane` (stride 1) instead of `+ lane*4` is misaligned and Maxwell kills the
+whole launch with "unspecified launch failure"; and an unchecked launch makes
+that read as `0.000 ms` and an absurd GB/s. `cudaGetLastError()` first, always.
+
+## 10. The deployment this is actually for (found on the board)
+
+`/home/pesi/vc/voicechat-jetson/` on ipho-nano is a **running LAN speech-to-
+speech assistant** (`run.sh`, port 8443) that already does the whole LFM3-Audio
+job as a pipeline of separate models:
+
+| stage | model | size |
+|---|---|---|
+| VAD | `silero_vad.onnx` | small |
+| turn detection | `models/smart-turn` | — |
+| ASR | `~/xasr-new/480` | — |
+| **LLM** | **`Ternary-Bonsai-2-4B-PTQ1_0.gguf`** (the bonsai2 engine) | **950 MB** |
+| TTS | `~/primetts_v2/primetts_v21_3voice.onnx` + `g2pw` | — |
+
+It vendors a copy of this repo's engine at `pulsar/pulsar_arm/bonsai2/
+{glibc_mathf.h, fwd35_sm53.cu}`. This is the strongest `pulsar-sam` candidate
+found so far — a Pulsar-engine voice assistant on the Nano. **Still unconfirmed;
+§0.1 remains open.**
+
+Why it decides the go/no-go: the LLM slot is 950 MB inside a 1457 MB budget, and
+LFM3-Audio's accuracy floor is 1.72 GB for the backbone alone — 1.8x the whole
+incumbent LLM, with ASR and TTS on the same board. LFM3-Audio replaces
+ASR+LLM+TTS with one model, so the fair comparison is the *whole pipeline*, not
+the LLM slot. That comparison is the next thing to measure.
