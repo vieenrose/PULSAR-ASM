@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "autoresearch@autoresearch": true,
+    "usage-guard@cc-guard": true
+  }
+}

@@ -1,0 +1,8 @@
+prefill 3968 tok 371.800 s = 10.67 tok/s | decode 63 tok 7.267 s = 8.67 tok/s
+GOLDEN PASS
+RSSKB 198328
+METRIC prefill_tps=10.67
+METRIC decode_tps=8.67
+METRIC score=9.6182
+METRIC peak_rss_kb=198328
+METRIC golden=PASS

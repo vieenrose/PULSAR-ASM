@@ -1,0 +1,22 @@
+{
+ "version": "2.1.0",
+ "source": "loop",
+ "timestamp": "2026-10-16T16:54:33+08:00",
+ "status": "BOUNDED",
+ "results_tsv": "autoresearch/loop-261016-1216/results.tsv",
+ "findings": [
+  "score 4.4182 -> 9.6182 (+117.7%): prefill 5.53 -> 10.67 tps, decode 3.53 -> 8.67 tps, peak RSS 201800 -> 198328 KB, all bit-exact vs fork golden",
+  "biggest wins: split attention k_fs/k_fw/k_fv (+12%), k_fv FVD=4 (+10%), k_fa smem flag packing (it1, +50%)",
+  "sm_53 single-token GEMV is popc/issue bound; batched prefill is 2x slower, so prefill = per-token decode path",
+  "remaining kernels each <6% of GPU time; host gap 0.2-0.5%",
+  "open: cheaper exact ternary x int8 dot (fewer popc), sticky-nonfinite-flag conversion-free V in k_fvg, k_gdn bandwidth"
+ ],
+ "config": {
+  "goal": "optimize prefill & generation speed of Bonsai-2 ternary 4B at 4k ctx on Jetson Nano Gen1 4GB, bit-exact, peak RSS preserved or reduced",
+  "scope": "pulsar_arm/bonsai2/fwd35_sm53.cu",
+  "metric": "score = sqrt(prefill_tps * decode_tps)",
+  "direction": "higher_is_better",
+  "verify": "bash .auto/measure_b2_4k.sh",
+  "guard": "bash .auto/checks_b2.sh 4B"
+ }
+}
