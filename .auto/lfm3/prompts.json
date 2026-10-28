@@ -1,0 +1,14 @@
+[
+ {"id": "A",  "text": "Name the four seasons, and one thing that changes in each."},
+ {"id": "B",  "text": "Why does a metal spoon feel colder than a wooden one at room temperature?"},
+ {"id": "C",  "text": "List the first ten prime numbers, separated by commas."},
+ {"id": "D",  "text": "A farmer has 17 sheep. All but 9 run away. How many are left? Explain briefly."},
+ {"id": "E",  "text": "Write a Python function fizzbuzz(n) that returns a list for 1..n."},
+ {"id": "F",  "text": "Summarize in one sentence what a compiler does."},
+ {"id": "G",  "text": "用一句话解释为什么天空是蓝色的。"},
+ {"id": "H",  "text": "Translate to French: 'The book is on the table next to the window.'"},
+ {"id": "I",  "text": "Which is heavier, a kilogram of steel or a kilogram of feathers? Explain."},
+ {"id": "J",  "text": "Give three valid ISO date formats and one example of each."},
+ {"id": "K",  "text": "What is the capital of Australia, and why is it not the largest city?"},
+ {"id": "L",  "text": "Balance the chemical equation H2 + O2 -> H2O and explain the coefficients."}
+]

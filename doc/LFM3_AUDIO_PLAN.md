@@ -438,3 +438,44 @@ LFM3-Audio's accuracy floor is 1.72 GB for the backbone alone — 1.8x the whole
 incumbent LLM, with ASR and TTS on the same board. LFM3-Audio replaces
 ASR+LLM+TTS with one model, so the fair comparison is the *whole pipeline*, not
 the LLM slot. That comparison is the next thing to measure.
+
+### 10.1 The comparison, measured (2026-10-28, ipho-nano production log)
+
+Incumbent, from `ps` RSS, `du` on the model files, and `decode N tok T s = X`
+lines in `voicechat-jetson/server.log` (service up 5 d 22 h):
+
+| component | bytes on disk | RSS |
+|---|---|---|
+| `app/server.py` (ASR + TTS + VAD + G2P + turn) | — | **498 MB** |
+| `fwd35_serve` (LLM engine host side) | — | 37 MB |
+| Ternary-Bonsai-2-4B-PTQ1_0.gguf | 906 MB | (in nvmap arena) |
+| xasr ASR `~/xasr-new/480` | 162 MB | in the 498 |
+| g2pw | 153 MB | in the 498 |
+| PrimeTTS v2 `primetts_v21_3voice.onnx` | 112 MB | in the 498 |
+| smart-turn / tok | 11 / 13 MB | in the 498 |
+| **whole speech-to-speech pipeline** | **1357 MB** | **~535 MB + 906 MB arena** |
+
+**Incumbent LLM decode: 25.2–28.3 tok/s** (`decode 11 tok 0.397 s = 27.73`).
+
+LFM3-Audio-2B at the §9 accuracy floor, same function:
+
+| | incumbent | LFM3-Audio @ Q8 floor |
+|---|---|---|
+| weights resident | 1.357 GB | 1.72 (backbone) + 0.219 encoder + 0.328 speech head + 0.147 codec = **2.41 GB** |
+| LLM decode | **27 tok/s** | 2.082 GB/tok ÷ 17.1 GB/s = **8.2 tok/s** (10.5 at the 21.9 ceiling) |
+| fits ipho-nano (1457 MB) | yes, 6 days stable | **no** (1.7x over) |
+| fits picard-desktop (2542 MB) | yes | **no** (2.41 GB + CUDA context > 2542) |
+
+So LFM3-Audio on a 4 GB Nano is **~1.8x the incumbent pipeline's resident bytes
+and ~3x slower on the LLM**, while doing the same job — and it fits on neither
+board. The 1-bit ternary Bonsai pipeline is the reason this is a no-go: it is
+not a slow reference to be beaten, it is a very strong incumbent that this
+model's accuracy floor cannot approach.
+
+What would change the verdict: (a) a quantization tier that preserves the
+stream below Q8 — none found in §9, and the FFN at 66% of weights is the
+sensitivity driver, so it needs more than a better group size; (b) a smaller
+LFM3-Audio checkpoint (2B is the smallest published); (c) accepting a stream
+that diverges from BF16, i.e. redefining "frozen accuracy" — the §9 table is
+the input to that decision, and the 12-prompt extension is in
+`.auto/lfm3/quant_sensitivity_prompts.jsonl`.

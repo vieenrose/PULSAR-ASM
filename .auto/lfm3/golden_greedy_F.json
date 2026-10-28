@@ -1,0 +1,24 @@
+{
+ "prompt": "Summarize in one sentence what a compiler does.",
+ "gen": [
+  41,
+  44775,
+  41842,
+  1068,
+  11181,
+  12528,
+  4713,
+  918,
+  6572,
+  4713,
+  395,
+  267,
+  4853,
+  510,
+  23737,
+  22,
+  124900
+ ],
+ "text": "A compiler translates high-level programming code into machine code that a computer can execute.<|im_end|>",
+ "n": 17
+}

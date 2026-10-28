@@ -115,18 +115,44 @@ def apply_scheme(model, sc):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, default=48)
+    ap.add_argument("--prompts", default=None,
+                    help="JSON [{id,text},...]; default = the two gate prompts A,B")
     ap.add_argument("--schemes", default="bf16,q8_0,q6_0,q5_0,q4_1,q4_0,q4_g128,q3_0,q2_0")
     a = ap.parse_args()
 
-    gold = {k: json.load(open(os.path.join(HERE, "golden_greedy_%s.json" % k)))
-            for k in ("A", "B")}
+    if a.prompts:
+        plist = json.load(open(a.prompts))
+        keys, gold = [], {}
+        for p in plist:
+            gp = os.path.join(HERE, "golden_greedy_%s.json" % p["id"])
+            gold[p["id"]] = json.load(open(gp)) if os.path.exists(gp) \
+                else {"prompt": p["text"], "gen": None}
+            keys.append(p["id"])
+    else:
+        keys = ["A", "B"]
+        gold = {k: json.load(open(os.path.join(HERE, "golden_greedy_%s.json" % k)))
+                for k in keys}
     proc = AutoProcessor.from_pretrained(REPO, trust_remote_code=True)
-    ids = {k: build_ids(proc, gold[k]["prompt"]) for k in gold}
+    ids = {k: build_ids(proc, gold[k]["prompt"]) for k in keys}
 
-    print("scheme       bits/w  GB(bone)  A-prefix  B-prefix   n_q  (of %d)" % a.tokens,
-          flush=True)
-    rows = []
+    # The bf16 pass mints goldens for any prompt lacking one, so a new prompt
+    # set needs no separate oracle run.
+    out_jsonl = os.path.join(HERE, "quant_sensitivity_%s.jsonl"
+                             % (os.path.basename(a.prompts or "gate").split(".")[0]))
+    done = set()
+    if os.path.exists(out_jsonl):
+        for line in open(out_jsonl):
+            try:
+                done.add(json.loads(line)["scheme"])
+            except Exception:
+                pass
+
+    print("scheme       bits/w  GB(bone)  exact  mean_pre  worst  n_q  (of %d tok, %d prompts)"
+          % (a.tokens, len(keys)), flush=True)
     for s in a.schemes.split(","):
+        if s in done:
+            print("%-12s  (already recorded, skipping)" % s, flush=True)
+            continue
         sc = SCHEMES[s]
         t0 = time.time()
         model = AutoModelForMultimodalLM.from_pretrained(
@@ -137,22 +163,33 @@ def main():
         assert n_q > 0 or sc["bits"] >= 16, "quantizer matched zero tensors"
         res = {}
         with torch.no_grad():
-            for k in gold:
+            for k in keys:
                 out = model.generate(ids[k], max_new_tokens=a.tokens, do_sample=False)
                 seq = out.sequences[0] if hasattr(out, "sequences") else out[0]
                 gen = seq[ids[k].shape[1]:].tolist()
                 assert len(gen) > 0, "empty stream: modality tag lost"
+                if gold[k]["gen"] is None:
+                    gold[k]["gen"] = gen
+                    json.dump({"prompt": gold[k]["prompt"], "gen": gen,
+                               "text": proc.tokenizer.decode(gen), "n": len(gen)},
+                              open(os.path.join(HERE, "golden_greedy_%s.json" % k), "w"),
+                              indent=1)
                 res[k] = score(gen, gold[k]["gen"])
+        exact = sum(1 for k in keys if res[k] >= a.tokens)
         bw = 16.0 if sc["bits"] >= 16 else (nbytes * 8) / 1728.8e6
-        print("%-12s  %5.2f   %6.3f    %3d/%-3d   %3d/%-3d   %4d  (%.0fs)"
-              % (s, bw, nbytes / 1e9, res["A"], a.tokens, res["B"], a.tokens,
-                 n_q, time.time() - t0), flush=True)
-        rows.append(dict(scheme=s, bits_w=round(bw, 2), gb=round(nbytes / 1e9, 3),
-                         prefix=res, n_q=n_q, n=a.tokens))
+        print("%-12s  %5.2f   %6.3f   %2d/%-3d  %7.1f   %4d   %4d  (%.0fs)"
+              % (s, bw, nbytes / 1e9, exact, len(keys),
+                 sum(res.values()) / len(res), min(res.values()), n_q, time.time() - t0),
+              flush=True)
+        with open(out_jsonl, "a") as f:
+            f.write(json.dumps(dict(scheme=s, bits_w=round(bw, 2),
+                                    gb=round(nbytes / 1e9, 3), exact=exact,
+                                    mean_prefix=round(sum(res.values()) / len(res), 2),
+                                    worst=min(res.values()), prefix=res, n_q=n_q,
+                                    n=a.tokens, prompts=keys)) + "\n")
         del model
         import gc; gc.collect()
-    json.dump(rows, open(os.path.join(HERE, "quant_sensitivity.json"), "w"), indent=1)
-    print("SENSITIVITY_DONE")
+    print("SENSITIVITY_DONE -> %s" % out_jsonl)
 
 
 if __name__ == "__main__":
