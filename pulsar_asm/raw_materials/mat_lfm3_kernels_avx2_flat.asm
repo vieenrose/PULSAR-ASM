@@ -1,17 +1,17 @@
 ; ==============================================================================
-; mat_lfm3_kernels_avx2_flat.asm  (Project PULSAR-ASM)
-; LFM3-specific kernels: partial rotary, sandwich norm helpers if needed
-; Reuses most from mat_gemma4_kernels_avx2_flat.asm
+; mat_lfm3_kernels_avx2_flat.asm
 ; ==============================================================================
 use64
 
-; Export trailer
+lfm3_dummy:
+    ret
+
+; PLSE export trailer
     align   4
 lfmk_n0: db 'lfm3_dummy', 0
     align   4
-    dd      0
-lfmk_names:
+    dd      lfm3_dummy
+lfmk_noff:
+    dd      lfmk_n0
+lfmk_cnt: dd 1
     db      'PLSE'
-    dd      lfmk_names - $$
-    dd      lfmk_n0 - $$
-    dd      1
