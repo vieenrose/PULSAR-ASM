@@ -756,3 +756,70 @@ RN-even conversions.
 cost (unpriced; ~28% of decode in the Bonsai engine), and NEON ports of the
 elementwise ops — the "mostly assembly" half of the target, for which
 `lfm3_conv.S` (bit-exact, 40.2 µs/step) is the template.
+
+### 13.4 The "mostly assembly" side: NEON elementwise kernels, bit-exact (commit pending)
+
+`pulsar_arm/asm/lfm3_elem.S` + `lfm3_elem_test.c`, built and run on the Nano:
+`lfm3_rmsnorm_bf16`, `lfm3_mul_bf16`, `lfm3_add_bf16`, the ops the decode step
+runs 96 + 26 + 48 times per token.
+
+    $ gcc -O0 -ffp-contract=off -o lfm3_elem_t0 lfm3_elem_test.c lfm3_elem.o -lm && ./lfm3_elem_t0
+      rmsnorm  H=8,16,24,32,64,128,512,1024,2048,4096   all ok (bit-exact)
+      rmsnorm  40 seeds at H=2048: bit-exact (0 / 81920 elements)
+      mul  n=2048,7680  bit-exact        add  n=2048,7680  bit-exact
+      AAPCS64 d8-d15 contract: ok
+      rmsnorm H=2048   9.38 us   x96/token = 0.90 ms/token
+      mul   n=7680    14.47 us   x26/token = 0.38 ms/token
+      add   n=7680    14.28 us   x48/token = 0.69 ms/token
+      elementwise total (these 3 ops) = 1.96 ms/token
+    LFM3_ELEM_OK                (identical at -O0 and -O2)
+
+**Answer to the question the plan posed.** These three ops cost **1.96
+ms/token** on one A57 core -- 1.5% of the 127.7 ms GEMV budget, not the ~28%
+the Bonsai engine pays (there it is the 4000-position attention, not
+rmsnorm/mul/add). The elementwise side is not where the remaining decode time
+is. mul/add are bandwidth-bound at ~3.8 GB/s, near the A57 single-core
+ceiling, so they are close to optimal as written. What remains unmeasured on
+the non-GEMV side is the **attention** (softmax over positions) and the
+`exp()`-bearing ops, which stay on the GPU: this path is libc-free (svc
+syscalls only, house style), so a polynomial `exp()` is not bit-comparable to
+CUDA's `expf`. Disclosure, not omission.
+
+bf16 arithmetic is hand-built (`shll` to widen, RN-even integer sequence to
+narrow) because FEAT_BF16 is Armv8.4 and A57 is ARMv8.0. `rmsnorm` rounds to
+bf16 **before** multiplying by the weight, because `modeling_lfm3.py` says
+`self.weight * hidden_states.to(input_dtype)` -- rounding after is the common
+way this gate fails. The variance reduction order is pinned in the header
+comment (8 accumulators, chunks ascending, `((a0+a1)+(a2+a3))+((a4+a5)+(a6+a7))`)
+and the reference mirrors it, so the gate asserts equality and never closeness.
+
+Four bugs, all found by the gate, all instructive:
+
+1. **`fmov w26, s21` clobbered x26** -- x19-x28 are callee-saved. The `-O0`
+   build ran clean; the `-O2` build died on `ldr w20,[x26]` in `main` with x26
+   = `0x3f086752`, a float's bits. The d8-d15 checker is blind to integer
+   registers, so the `-O2` build is the real detector for this class and is
+   now run as part of the gate.
+2. **The RN-even tie bit was read from the wrong position.** `(u>>16)>>31`
+   reads bit 47 of u, not bit 16, so every exact tie rounded down. Caught on
+   `add`: `a+b = 2.1484375` exactly, asm `0x4009` (odd) where IEEE RN-even
+   gives `0x400a`. It was also the cause of rmsnorm's "1 ulp at the ~0.2% tie
+   rate" failures -- one macro, three symptoms, and the 1-ulp signature looked
+   like a `sqrt` mismatch, which sent the investigation there first.
+3. **`ldr q28, [x6], #32`** advanced the weight cursor by 32 instead of 16, so
+   lanes 4-7 multiplied by `w[8..11]` and the cursor ran 32 B/chunk off the end
+   of `w` -- the source of the rmsnorm `i>=4` failures *and* of the heap
+   corruption that faulted the optimized test.
+4. **`shll2 v25.4s, v22.8h`** read v22's stale upper half-lanes (`shrn` writes
+   only the low 4h): each narrowed half must be widened from its own register.
+
+Harness bugs found on the way, recorded because they were the misleading
+symptoms: the parity list tests `H=4096` against buffers sized for `H=2048`;
+the failure diagnostic printed the reference's float *value* next to the
+kernel's *bits*, which made a mismatch print as `asm=407c ref=407c`; and mul
+and add shared one output buffer, so mul's diagnostic printed add's results.
+
+binutils 2.30 (the Nano's `as`) also rejected the bare vector `lsr`, the
+indexed `fadd Vd.2s, Vn.2s, Vn.2s[1]`, `dup Vd.4s, Sn`, and `fmov Sd, Vn.s[n]`
+(wants plain `mov`) -- the same gap class the repo already documents for
+`smovl`/`vcvt`/`vext`, extended here.

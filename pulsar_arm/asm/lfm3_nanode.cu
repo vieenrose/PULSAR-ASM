@@ -77,7 +77,13 @@
 // returning "invalid argument" for the allocations that silently failed.
 // 512 also shrinks k_attn_head's shared logits array to 2 KB, which is what
 // lets the attention block keep any occupancy at all.
-#define MAXTOK 256
+// Sized to the benchmark, not to the model: MAXTOK sets the KV cache at
+// 2 x NLAYER x MAXTOK x NKV x HD x 2 bytes = 25 MB at 256, 6 MB at 64. On a
+// board that is 30 MB short of fitting 1.95 GB of weights, that difference
+// is the difference between running and not. A 256-token context (the
+// sliding window is 256) needs MAXTOK=256 and 25 MB more device memory --
+// raise it together with the memory headroom, not on its own.
+#define MAXTOK 24
 #define NCONV 13
 #define NATTN 11
 
@@ -480,21 +486,21 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   for (int tw = 0; tw < 60; tw++) {
     size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
     if (fb >= need) {
-      printf("device free %.2f GB of %.2f GB (need %.2f GB) -- loading\n",
-             fb / 1e9, tb / 1e9, need / 1e9);
+      printf("device free %zu MB of %zu MB (need %zu MB) -- loading\n",
+           fb / 1048576, tb / 1048576, need / 1048576);
       break;
     }
     if (tw == 0)
       printf("device free %.2f GB < %.2f GB needed; waiting for the board to drain\n",
              fb / 1e9, need / 1e9);
-    if (tw == 359) {
+    if (tw == 2159) {
       printf("GIVING UP: device free %.2f GB, need %.2f GB. The 2B backbone at "
              "the certified Q8_0 arm is 1.95 GB of weights; on a contended "
              "4 GB Nano that does not fit.\n", fb / 1e9, need / 1e9);
       fclose(f); return false;
     }
     if (tw % 12 == 11) { size_t f2 = 0, t2 = 0; cudaMemGetInfo(&f2, &t2);
-      printf("  waiting... free %.2f GB\n", f2 / 1e9); fflush(stdout); }
+      printf("  waiting... free %zu MB (need %zu)\n", f2 / 1048576, need / 1048576); fflush(stdout); }
     struct timespec ts; ts.tv_sec = 5; ts.tv_nsec = 0; nanosleep(&ts, nullptr);
   }
   if (cudaMalloc(&M.dq, M.need_q) != cudaSuccess) {
@@ -508,8 +514,15 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   }
   std::vector<char> buf;
   size_t oc = 0, os = 0, of = 0;
+  // f32 payloads first. At the memory gate boundary the LAST cudaMemcpy is
+  // the one that starves, and in the first builds that was a norm vector 16 MB
+  // into a 1.6 MB arena -- the failure then looked like a blob/CRC problem
+  // while it was really an out-of-memory one. Uploading the small tensors
+  // first makes starvation happen while there is still room to say so.
+  for (int pass = 0; pass < 2; pass++)
   for (size_t i = 0; i < M.ents.size(); i++) {
     Ent& e = M.ents[i];
+    if ((e.dtype == 2) != (pass == 0)) continue;
     fseek(f, (long)(base_data + e.file_off), SEEK_SET);
     const size_t tot = e.nc + e.ns;
     buf.resize(tot);
