@@ -37,6 +37,7 @@ from safetensors import safe_open
 REPO_LOCAL = "/home/louis/models/lfm3/LFM3-Audio-2B"
 MAGIC = b"LFM3Q8\x01\x00"      # exactly 8 bytes; the reader uses len(MAGIC)
 T_Q8 = 1        # int8 codes + fp32 scales
+T_BF16 = 3      # raw bf16 payload (the certified arm's embedding)
 T_F32 = 2       # f32
 BACKBONE = "lfm."
 
@@ -92,6 +93,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=REPO_LOCAL)
     ap.add_argument("--out", default="/home/louis/models/lfm3/lfm3-audio-2b-q8.lfm3q8")
+    ap.add_argument("--emb-bf16", action="store_true",
+                    help="store the tied embedding as bf16 (dtype 3) instead of Q8. THIS IS "
+                         "THE CERTIFIED 8/8 ARM: quant_sensitivity.py measures q8_0 = linears "
+                         "Q8 + fp32 scales + bf16 embeddings at 8/8 prompts, while Q8 "
+                         "embeddings (q8_0_embq8) cost 2 prompts (6/8, worst prefix 1). It "
+                         "costs 262 MB of device memory and ~17 ms/token of lm_head streaming.")
     ap.add_argument("--selfcheck", action="store_true",
                     help="re-derive the quantization and compare checksums")
     a = ap.parse_args()
@@ -115,6 +122,16 @@ def main():
         shp = list(f.get_slice(k).get_shape())
         t = f.get_tensor(k).to("cpu")          # PySafeSlice has no get_tensor
         is_emb = "embed_tokens" in k
+        if is_emb and a.emb_bf16:
+            # bf16 payload, verbatim: the certified arm keeps the embedding
+            # unquantized. nscales=0, ncodes = the raw bf16 bytes.
+            assert t.dim() == 2, "%s is %d-D" % (k, t.dim())
+            hit["embed_tokens"] += 1
+            w = np.ascontiguousarray(t.view(torch.uint16).numpy())   # bf16 bits, no conversion
+            entries.append(dict(name=k, dtype=T_BF16, ne=shp, off=off,
+                                ncodes=w.nbytes, nscales=0, crc=fnv1a_fast(w.tobytes())))
+            blobs.append(w.tobytes()); off += w.nbytes
+            continue
         q8 = is_emb or any(p in k for p in Q8_PATTERNS)
         if q8:
             assert t.dim() == 2, "%s is %d-D, the Q8 quantizer is 2-D only" % (k, t.dim())

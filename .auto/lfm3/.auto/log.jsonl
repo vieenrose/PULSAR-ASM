@@ -1,0 +1,1 @@
+{"type":"config","name":"LFM3-Audio-2B Q8 decode latency on Jetson Nano (sm_53), quality frozen by HF-derived gates","metricName":"decode_ms_per_tok","metricUnit":"ms","bestDirection":"lower"}

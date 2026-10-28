@@ -92,6 +92,7 @@
 // scales per slab; 16 chunks cover 128000 rows.
 #define EMBNAME "lfm.model.embed_tokens.weight"
 #define LM_ROWS 8192
+#define SLIDE_WIN 256                  // config /lfm/sliding_window
 #define NCONV 13
 #define NATTN 11
 
@@ -329,12 +330,28 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
   __syncthreads();
   const float inv = __fdiv_rn(1.0f, red[0]);
   const int e = lane, seg = wid;
-  float acc = 0.f;
+  // One accumulator PER OUTPUT DIMENSION, and all HD=128 of them must be
+  // written. The first version accumulated only `vr[e]` with e = lane, i.e.
+  // dimensions 0..31, and left segred[seg][32..127] as uninitialized shared
+  // memory -- the combine step reads tid < HD = 128, so three quarters of
+  // every attention head's output was garbage. Symptom: attention rms 3.25x
+  // HF's, head 0's first four values exact (they live in 0..31), attention
+  // LAYERS drifting (0.83-1.30) while conv layers tracked, logits corr 0.83.
+  // The per-dimension sum order is unchanged (p = seg, seg+8, ...), so the
+  // covered dimensions keep producing identical bits.
+  float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
   for (int p = seg; p < np; p += 8) {
     const bf16* vr = vc + (size_t)(lo + p) * nkv * hd + kvh * hd;
-    acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(sl[lo + p], inv), bf2f(vr[e])));
+    const float w = __fmul_rn(sl[lo + p], inv);
+    acc0 = __fadd_rn(acc0, __fmul_rn(w, bf2f(vr[e])));
+    acc1 = __fadd_rn(acc1, __fmul_rn(w, bf2f(vr[e + 32])));
+    acc2 = __fadd_rn(acc2, __fmul_rn(w, bf2f(vr[e + 64])));
+    acc3 = __fadd_rn(acc3, __fmul_rn(w, bf2f(vr[e + 96])));
   }
-  segred[seg][e] = acc;
+  segred[seg][e] = acc0;
+  segred[seg][e + 32] = acc1;
+  segred[seg][e + 64] = acc2;
+  segred[seg][e + 96] = acc3;
   __syncthreads();
   if (tid < HD)
     out[(size_t)h * hd + tid] = f2bf(__fadd_rn(__fadd_rn(__fadd_rn(segred[0][tid], segred[1][tid]),
@@ -556,7 +573,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
     const bool hostemb = (M.emb_mode == 1) && (e.name == EMBNAME);
     const bool skq = (M.emb_mode == 2) && (e.name != EMBNAME);   // selftest: embedding only
     if (skq) {}
-    else if (e.dtype == 1) { if (!hostemb) { M.need_q += e.nc; M.need_s += e.ns; } }
+    else if (e.dtype == 1 || e.dtype == 3) { if (!hostemb) { M.need_q += e.nc; M.need_s += e.ns; } }
     else M.need_f += e.nc;
     if (e.name == EMBNAME) M.emb_file_off = base_data + e.file_off;
     M.ents.push_back(e);
@@ -624,12 +641,21 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
       fclose(f); return false;
     }
     cudaError_t ce = cudaSuccess;
-    if (M.emb_mode == 1 && e.name == EMBNAME) continue;   // CRC checked above; payload goes to pinned host
+    // The bf16 (dtype 3) embedding must be DEVICE-resident: lm_head_bf16
+    // reads it directly, and the Q8 host-staging path has no bf16 form.
+    if (M.emb_mode == 1 && e.name == EMBNAME && e.dtype != 3)
+      continue;   // CRC checked above; payload goes to pinned host
     // Mode 2 (selftest) needs ONLY the embedding resident, so the other 285
     // tensors stay on disk: 262 MB + 270 MB pinned + arena fits, the full
     // 1944 MB does not, and the selftest never touches a layer weight.
     if (M.emb_mode == 2 && e.name != EMBNAME) continue;
-    if (e.dtype == 1) {
+    if (e.dtype == 3) {
+      // raw bf16 payload, verbatim into the codes arena (ns == 0)
+      ce = cudaMemcpy(M.dq + oc, buf.data(), e.nc, cudaMemcpyHostToDevice);
+      e.dq = M.dq + oc; e.ds = nullptr;
+      oc += e.nc;
+    }
+    else if (e.dtype == 1) {
       ce = cudaMemcpy(M.dq + oc, buf.data(), e.nc, cudaMemcpyHostToDevice);
       if (ce == cudaSuccess)
         ce = cudaMemcpy((char*)M.ds + os, buf.data() + e.nc, e.ns, cudaMemcpyHostToDevice);
@@ -740,6 +766,14 @@ static bool lm_host_init(Model& M, HostEmb& E, const char* path) {
   Ent* be = nullptr;
   for (size_t i = 0; i < M.ents.size(); i++) if (M.ents[i].name == EMBNAME) be = &M.ents[i];
   if (!be) { printf("no tied embedding %s in the blob\n", EMBNAME); return false; }
+  if (be->dtype == 3) {
+    // The certified arm's bf16 embedding is read directly by lm_head_bf16
+    // from the device arena; there is no Q8 host-staging form for it, so
+    // there is nothing to pin. (524 MB pinned host + 524 MB device does not
+    // fit a 4 GB Nano anyway.)
+    printf("embedding dtype 3 (bf16): device-resident, no host staging\n");
+    return true;
+  }
   if (be->dtype != 1) { printf("embedding dtype %d is not Q8\n", be->dtype); return false; }
   E.N = be->ne[0]; E.K = be->ne[1];
   if (E.N != VOCAB || E.K != H) { printf("embedding shape %dx%d\n", E.N, E.K); return false; }
@@ -768,6 +802,76 @@ static bool lm_host_init(Model& M, HostEmb& E, const char* path) {
          tot / 1e6, E.rows, (E.rows * E.K + (size_t)E.rows * (E.K / Q8_BLK) * 4) / 1e6);
   fflush(stdout);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// bf16 GEMV for the CERTIFIED arm's lm_head. quant_sensitivity.py: q8_0 =
+// linears Q8 + fp32 scales + bf16 embeddings reproduces 8/8 greedy goldens,
+// while Q8 embeddings (q8_0_embq8) cost 2 prompts (6/8, worst prefix 1). The
+// Q8-embedding blob therefore cannot pass the 8/8 gate at any latency.
+//   out[n] = sum_k f32(x[k]) * f32(W[n,k])
+// Reduction ORDER is documented and fixed: lanes stride k by 32 in ascending
+// order into one fp32 accumulator, then the standard 16,8,4,2,1 butterfly --
+// the same per-row shape as the Q8 kernel, so the arms differ only in the
+// weight source. x is staged in shared (8 KB) and amortized over R rows per
+// block, the lever ideas.md row 3 measures on the Q8 path.
+// ---------------------------------------------------------------------------
+__global__ void k_gemv_bf16(const bf16* __restrict__ W, const float* __restrict__ xf,
+                            float* __restrict__ out, int N, int K, int R) {
+  extern __shared__ float sx[];
+  const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, nw = blockDim.x >> 5;
+  for (int i = tid; i < K; i += blockDim.x) sx[i] = xf[i];
+  __syncthreads();
+  const int r0 = blockIdx.x * R;
+  for (int rr = wid; rr < R; rr += nw) {
+    const int n = r0 + rr;
+    if (n >= N) return;
+    const bf16* wr = W + (size_t)n * K;
+    float s = 0.f;
+    for (int k = lane; k < K; k += 32) s = __fadd_rn(s, __fmul_rn(bf2f(wr[k]), sx[k]));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_down_sync(0xffffffffu, s, o));
+    if (lane == 0) out[n] = s;
+  }
+}
+
+static void lm_head_bf16(Model& M, Ent* emb, const bf16* xb, float* yf) {
+  const int K = (int)emb->ne[1], N = (int)emb->ne[0];
+  k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);   // M.xf is the shared x-float buffer
+  const int R = 32;                       // rows per block; tuned in measure.sh
+  if (getenv("LFM_DBG_SPANS")) {
+    // Validate EVERY Q8 tensor's full span against its arena, on the host, at
+    // load time. A device kernel can only sample; a host check covers the
+    // whole range, and an out-of-arena pointer is what makes an "unspecified
+    // launch failure" surface two kernels later. The certified blob moves the
+    // embedding out of the Q8 arena (524 MB of bf16), shifting every layer's
+    // offset -- exactly the case worth asserting.
+    int bad = 0, nq = 0;
+    for (size_t i2 = 0; i2 < M.ents.size(); i2++) {
+      Ent& e2 = M.ents[i2];
+      if (e2.host || e2.dtype != 1) continue;
+      nq++;
+      const size_t cb = (size_t)e2.ne[0] * e2.ne[1];
+      const size_t sb = (size_t)e2.ne[0] * (e2.ne[1] / 32) * 4;
+      const char* q = (const char*)e2.dq;
+      const char* sc = (const char*)e2.ds;
+      if (!q || q < (const char*)M.dq || q + cb > (const char*)M.dq + M.need_q ||
+          !sc || sc < (const char*)M.ds || sc + sb > (const char*)M.ds + M.need_s) {
+        printf("SPAN BAD %-58s q=[%p,+%zu) s=[%p,+%zu) arena q=[%p,+%.0fMB) s=[%p,+%.0fMB)\n",
+               e2.name.c_str(), (const void*)q, cb, (const void*)sc, sb,
+               (const void*)M.dq, M.need_q / 1e6, (const void*)M.ds, M.need_s / 1e6);
+        bad++;
+      }
+    }
+    printf("SPANS: %d Q8 tensors checked, %d bad\n", nq, bad);
+    fflush(stdout);
+  }
+  if (getenv("LFM_DEBUG_LM"))
+    fprintf(stderr, "[lm] W=%p dq=%p xf=%p yf=%p N=%d K=%d R=%d ne=%ld,%ld dtype=%d nc=%lld ns=%lld\n",
+            (const void*)(const bf16*)emb->dq, (void*)emb->dq, (void*)M.xf, (void*)yf, N, K, R,
+            (long)emb->ne[0], (long)emb->ne[1], emb->dtype, (long long)emb->nc, (long long)emb->ns);
+  k_gemv_bf16<<<(N + R - 1) / R, 256, K * sizeof(float)>>>(
+      (const bf16*)emb->dq, M.xf, yf, N, K, R);
 }
 
 static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
@@ -800,6 +904,18 @@ static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf)
   k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
   q8_partial<<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
   k_combine_f<<<(N + 255) / 256, 256>>>(M.part, yf, N, nchunk);
+  // Per-launch check, env-gated. Without it a faulting kernel is reported by
+  // the NEXT checked call, which in a long layer chain points at an innocent
+  // victim (it cost a cycle chasing the bf16 lm_head for a fault that was in
+  // layer 0's FFN GEMV).
+  if (getenv("LFM_DBG_LAUNCH")) {
+    cudaError_t le = cudaGetLastError();
+    if (le != cudaSuccess)
+      { fprintf(stderr, "[launch] %s N=%d K=%d R=%d TPB=%d nb=%d nchunk=%d shm=%zu dq=%p ds=%p xf=%p part=%p: %s\n",
+                name.c_str(), N, K, c.R, c.TPB, nb, nchunk, shm, (const void*)e->dq, (const void*)e->ds,
+                (void*)M.xf, (void*)M.part, cudaGetErrorString(le)); fflush(stderr); }
+    if (getenv("LFM_DBG_LAUNCH_SYNC")) cudaDeviceSynchronize();
+  }
 }
 // GEMV with an explicit input width (the 2048-wide h1 feeding a 512-column
 // projection is normal; the weight's own K is authoritative).
@@ -818,15 +934,38 @@ static void eadd(Model& M, const bf16* a, const bf16* b, bf16* y, int n) {
 // first layer where this stops tracking HF's hidden_states rms is the layer
 // that is wrong, and rms is cheap to print from both sides.
 static std::vector<uint16_t> g_scr;
-static float rms_host(Model& M, const bf16* x) {
-  g_scr.resize(H);
-  cudaMemcpy(g_scr.data(), x, (size_t)H * 2, cudaMemcpyDeviceToHost);
+static float rms_host_n(const bf16* x, int n) {
+  g_scr.resize(n);
+  // Check the copy. Four consecutive probes printing an IDENTICAL rms is the
+  // tell: a failed cudaMemcpy leaves the shared staging vector at its
+  // previous content, so the probe prints last time's number and looks like
+  // a real measurement. A probe that can silently repeat itself is worse
+  // than no probe -- it manufactures agreement.
+  cudaError_t ce = cudaMemcpy(g_scr.data(), x, (size_t)n * 2, cudaMemcpyDeviceToHost);
+  if (ce != cudaSuccess) { printf("    [probe copy failed: %s]\n", cudaGetErrorString(ce)); return -1.f; }
   double acc = 0;
-  for (int i = 0; i < H; i++) {
+  for (int i = 0; i < n; i++) {
     uint32_t u = ((uint32_t)g_scr[i]) << 16; float v; memcpy(&v, &u, 4);
     acc += (double)v * (double)v;
   }
-  return (float)sqrt(acc / (double)H);
+  return (float)sqrt(acc / (double)n);
+}
+static float rms_host(Model& M, const bf16* x) { return rms_host_n(x, H); }
+// Layer-0 stage probe: rms at every named stage of one layer, printed by the
+// engine and computed for the same stages on the HF side (probe_lfm3_stages.py).
+// rms is a weak fingerprint on purpose -- it is permutation-invariant, so a
+// permuted GEMV output can print the same rms; that is exactly why the
+// divergence table is paired with a positional fingerprint (first 4 values)
+// and why rms equality is never treated as agreement, only rms INEQUALITY is
+// treated as evidence.
+static int g_probe = 0;
+static int g_probe_layer = 0;      // --probe-layer N
+static int g_probe_step = 0;       // --probe-step N (the decode step, == position here)
+#define PROBE(nm, ptr, n) if (g_probe) printf("    %-14s rms %9.5f  %8.4f %8.4f %8.4f %8.4f\n", \
+      nm, rms_host_n(ptr, n), pv4(ptr,0), pv4(ptr,1), pv4(ptr,2), pv4(ptr,3))
+static float pv4(const bf16* x, int i) {
+  uint16_t h; cudaMemcpy(&h, (const char*)x + 2 * i, 2, cudaMemcpyDeviceToHost);
+  uint32_t u = ((uint32_t)h) << 16; float v; memcpy(&v, &u, 4); return v;
 }
 
 static void build_invf(float* out, float base, int dim, double partial) {
@@ -841,12 +980,14 @@ int main(int argc, char** argv) {
     return 1;
   }
   int steps = 8; bool trace = false;
-  int lm_rows_override = 0, emb_mode_req = 0;
+  int lm_rows_override = 0, emb_mode_req = 0, probe_layer = 0, probe_step = 0;
   const char* dump_logits = nullptr;
   std::vector<int> prompt;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--trace")) trace = true;
+    else if (!strcmp(argv[i], "--probe-layer") && i + 1 < argc) probe_layer = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--probe-step") && i + 1 < argc) probe_step = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--emb-host")) emb_mode_req = 1;
     else if (!strcmp(argv[i], "--lm-selftest")) emb_mode_req = 2;
     else if (!strcmp(argv[i], "--lmrows") && i + 1 < argc) lm_rows_override = atoi(argv[++i]);
@@ -860,6 +1001,7 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < prompt.size() && i < 8; i++) printf(" %d", prompt[i]);
   printf("%s\n", prompt.size() > 8 ? " ..." : "");
   fflush(stdout);
+  g_probe_layer = probe_layer; g_probe_step = probe_step;
   Model M; std::string js;
   M.emb_mode = emb_mode_req;        // flags are parsed before M exists
   M.path = argv[1];
@@ -867,7 +1009,7 @@ int main(int argc, char** argv) {
 
   // layer_types, parsed from the blob header (the conv layers carry the
   // operator branch, the attention layers carry self_attn).
-  bool is_attn[NLAYER];
+  bool is_attn[NLAYER]; bool is_slide[NLAYER] = {};
   {
     size_t lt = js.find("\"layer_types\":[");
     if (lt == std::string::npos) { printf("no layer_types in the blob header\n"); return 1; }
@@ -877,6 +1019,15 @@ int main(int argc, char** argv) {
       if (a == std::string::npos || b == std::string::npos) { printf("layer_types truncated at %d\n", L); return 1; }
       std::string s = js.substr(a + 1, b - a - 1);
       is_attn[L] = (s != "conv");
+      // rope_parameters is PER LAYER TYPE (config /lfm/rope_parameters):
+      //   full_attention    -> rope_theta 1e6, partial_rotary_factor 0.5
+      //   sliding_attention -> rope_theta 1e4, full rotation (partial 1.0)
+      // plus a 256-position sliding window. The first version applied
+      // invf_full (1e6, partial) to ALL attention layers and win=0, which is
+      // invisible at position 0 (RoPE is the identity there: cos=1, sin=0)
+      // and wrong everywhere else -- the signature was "pos-0 logits exact
+      // at corr 0.99998, positions >0 garbage".
+      is_slide[L] = (s == "sliding_attention");
       q = b + 1;
     }
   }
@@ -896,7 +1047,15 @@ int main(int argc, char** argv) {
   struct Al { void** p; size_t n; const char* w; };
   const Al als[] = {
     {(void**)&M.x, (size_t)H * 2, "x"}, {(void**)&M.h1, (size_t)H * 2, "h1"},
-    {(void**)&M.h2, (size_t)H * 2, "h2"}, {(void**)&M.h3, (size_t)H * 2, "h3"},
+    // h2/h3 are the FFN intermediates: w1/w3/silu/w2 all hold INTER=7680
+    // elements, not H=2048. Allocated at H they took a 15360-byte write into
+    // a 4096-byte arena slot, so the FFN spilled into its neighbours (h4/q/k
+    // /v/attn). Found because an INTER-sized probe cudaMemcpy returned
+    // "invalid argument" -- CUDA caught the out-of-range read that the
+    // kernel's out-of-range WRITE never reported. The probe's copy check is
+    // what surfaced it: without it the same copy silently returned the
+    // previous contents and four probes printed one identical rms.
+    {(void**)&M.h2, (size_t)INTER * 2, "h2"}, {(void**)&M.h3, (size_t)INTER * 2, "h3"},
     {(void**)&M.h4, (size_t)H * 2, "h4"},
     {(void**)&M.q, (size_t)NH * HD * 2, "q"}, {(void**)&M.k, (size_t)NKV * HD * 2, "k"},
     {(void**)&M.v, (size_t)NKV * HD * 2, "v"}, {(void**)&M.attn, (size_t)NH * HD * 2, "attn"},
@@ -929,6 +1088,25 @@ int main(int argc, char** argv) {
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) { printf("arena setup failed: %s\n", cudaGetErrorString(err)); return 1; }
   size_t freeb = 0, totb = 0; cudaMemGetInfo(&freeb, &totb);
+  {
+    // Tegra is unified: every GPU allocation is backed by OS pages, so the
+    // host side has to hold weights+arena AND the blob's page cache. Print
+    // both free numbers at load -- "unspecified launch failure" deep inside a
+    // layer on a board that "has 2.7 GB of GPU free" is a page-backing
+    // failure, and the host number is the one that reveals it.
+    // C stdio: this file uses fopen for the blob and never includes <fstream>.
+    FILE* mi = fopen("/proc/meminfo", "r");
+    long long memavail = 0, mfree = 0, cached = 0;
+    char ln[128]; long long v;
+    while (mi && fgets(ln, sizeof(ln), mi))
+      if (sscanf(ln, "MemAvailable: %lld kB", &v) == 1) memavail = v;
+      else if (sscanf(ln, "MemFree: %lld kB", &v) == 1) mfree = v;
+      else if (sscanf(ln, "Cached: %lld kB", &v) == 1) cached = v;
+    if (mi) fclose(mi);
+    printf("host at load: MemAvailable %.0f MB, MemFree %.0f MB, Cached %.0f MB\n",
+           memavail / 1024.0, mfree / 1024.0, cached / 1024.0);
+    fflush(stdout);
+  }
   printf("weights+arena: %.2f GB, device free now %.2f GB of %.2f GB\n",
          (M.need_q + M.need_s + M.need_f + kvbytes * 2) / 1e9, freeb / 1e9, totb / 1e9);
   printf("L FM3_NANODE_LOADED\n"); fflush(stdout);
@@ -987,6 +1165,7 @@ int main(int argc, char** argv) {
   for (int s = 0; s < steps; s++) {
     const int pos = s;
     const int tok = toks[s];
+    const bf16* lm_head_input = M.x;   // replaced by the embedding_norm output below
     if (pos >= MAXTOK) break;
     cudaEventRecord(evA);
     if (M.emb_mode == 1) {
@@ -1005,6 +1184,8 @@ int main(int argc, char** argv) {
     int ci = 0;
     for (int L = 0; L < NLAYER; L++) {
       rms1(M, M.x, NW(M, L, "operator_norm.weight"), M.h1);
+      g_probe = trace && L == g_probe_layer && s == g_probe_step;
+      PROBE("operator_norm", M.h1, H);
       if (is_attn[L]) {
         gemv(M, LN(L, "self_attn.q_proj.weight"), M.h1, M.q);
         gemv(M, LN(L, "self_attn.k_proj.weight"), M.h1, M.k);
@@ -1012,36 +1193,82 @@ int main(int argc, char** argv) {
         gemv(M, LN(L, "self_attn.gate_proj.weight"), M.h1, M.gate);
         k_headnorm<<<NH, 32>>>(M.q, NW(M, L, "self_attn.q_norm.weight"), NORM_EPS, HD);
         k_headnorm<<<NKV, 32>>>(M.k, NW(M, L, "self_attn.k_norm.weight"), NORM_EPS, HD);
-        k_rope<<<NH, 64>>>(M.q, M.invf_full, pos, HD, HD / 2);
-        k_rope<<<NKV, 64>>>(M.k, M.invf_full, pos, HD, HD / 2);
+        PROBE("q(postnorm)", M.q, NH * HD);
+        PROBE("k(postnorm)", M.k, NKV * HD);
+        PROBE("v", M.v, NKV * HD);
+        PROBE("gate", M.gate, NH);
+        const float* invf = is_slide[L] ? M.invf_slide : M.invf_full;
+        k_rope<<<NH, 64>>>(M.q, invf, pos, HD, HD / 2);
+        k_rope<<<NKV, 64>>>(M.k, invf, pos, HD, HD / 2);
+        PROBE("q(postrope)", M.q, NH * HD);
         bf16* kbase = M.kc + (size_t)L * MAXTOK * NKV * HD;
         bf16* vbase = M.vc + (size_t)L * MAXTOK * NKV * HD;
         cudaMemcpy(kbase + (size_t)pos * NKV * HD, M.k, (size_t)NKV * HD * 2, cudaMemcpyDeviceToDevice);
         cudaMemcpy(vbase + (size_t)pos * NKV * HD, M.v, (size_t)NKV * HD * 2, cudaMemcpyDeviceToDevice);
         const float scaling = 1.0f / sqrtf((float)HD);
-        k_attn_head<<<NH, 256>>>(M.q, kbase, vbase, M.attn, pos + 1, 0, scaling, HD, NKV);
+        // sliding_attention layers see only the last 256 keys (config
+        // /lfm/sliding_window); full_attention layers see all of them.
+        const int win = is_slide[L] ? SLIDE_WIN : 0;
+        k_attn_head<<<NH, 256>>>(M.q, kbase, vbase, M.attn, pos + 1, win, scaling, HD, NKV);
+        PROBE("attn", M.attn, NH * HD);
         k_sigmoid_gate<<<1, NH>>>(M.gate, M.attn, HD);
+        PROBE("attn*gate", M.attn, NH * HD);
         gemv(M, LN(L, "self_attn.o_proj.weight"), M.attn, M.h2);
+        PROBE("o_proj", M.h2, H);
       } else {
         bf16* ring = M.ring + (size_t)ci * 7 * H;
         gemv(M, LN(L, "conv.in_proj.weight"), M.h1, M.bx);      // [B|C|xg], 3H rows
-        k_shift_in<<<(H + 63) / 64, 64>>>(ring, M.bx + 2 * H, H);
+        PROBE("in_proj", M.bx, 3 * H);
+        // THE BUG THAT BROKE THE ENGINE. HF's conv branch is
+        //     B, C, x = in_proj(h).chunk(3)  ->  conv(B * x)  ->  C * y   (modeling_lfm3.py:372-421)
+        // so the convolves the GATED product. The first version computed
+        // B*x into h3 and then fed the RING the raw x (bx + 2*H) -- the
+        // B*x result was written and immediately discarded, because h3 is
+        // reused for post_operator_norm. Symptom chain: conv branch output
+        // 1.8x too large -> post_op_norm 0.0064 vs HF 0.0052 -> layer 0 rms
+        // 0.0280 vs 0.0247 -> logits uncorrelated with HF (corr -0.05),
+        // teacher-forcing 0/22. Found by printing rms per RING SLOT: slot 6
+        // read 0.21026 = in_proj's rms, while B*x is 0.12444, so the ring
+        // provably did not contain B*x.
+        // Ordering matters: the gate multiply must complete before the
+        // newest ring slot is written, so the shift follows the multiply.
         emul(M, M.bx, M.bx + 2 * H, M.h3, H);                   // B * xg
+        PROBE("B*x", M.h3, H);
+        k_shift_in<<<(H + 63) / 64, 64>>>(ring, M.h3, H);
+        if (g_probe) for (int k = 0; k < 7; k++)
+          printf("    ring slot %d     rms %9.5f\n", k, rms_host_n(ring + (size_t)k * H, H));
         k_conv7<<<(H + 63) / 64, 64>>>(ring, T(M, LN(L, "conv.conv.weight"))->df, M.h4, H);
+        PROBE("conv", M.h4, H);
         emul(M, M.bx + H, M.h4, M.h2, H);                       // C * y
+        PROBE("C*y", M.h2, H);
         gemv(M, LN(L, "conv.out_proj.weight"), M.h2, M.h2);
+        PROBE("out_proj", M.h2, H);
         ci++;
       }
       rms1(M, M.h2, NW(M, L, "post_operator_norm.weight"), M.h3);
+      PROBE("post_op_norm", M.h3, H);
       eadd(M, M.x, M.h3, M.x, H);
+      PROBE("add1", M.x, H);
       rms1(M, M.x, NW(M, L, "ffn_norm.weight"), M.h1);
+      PROBE("ffn_norm", M.h1, H);
       gemv(M, LN(L, "feed_forward.w1.weight"), M.h1, M.h2);
+      PROBE("w1", M.h2, INTER);
       gemv(M, LN(L, "feed_forward.w3.weight"), M.h1, M.h3);
+      PROBE("w3", M.h3, INTER);
       k_silu_mul_bf<<<(INTER + 255) / 256, 256>>>(M.h2, M.h3, M.h2, INTER);
+      PROBE("silu_mul", M.h2, INTER);
       gemv(M, LN(L, "feed_forward.w2.weight"), M.h2, M.h2);
+      PROBE("w2", M.h2, INTER);
       rms1(M, M.h2, NW(M, L, "post_ffn_norm.weight"), M.h3);
+      PROBE("post_ffn_norm", M.h3, H);
       eadd(M, M.x, M.h3, M.x, H);
-      if (trace) printf("  L%-2d %s rms %.4f\n", L, is_attn[L] ? "attn" : "conv",
+      PROBE("add2", M.x, H);
+      g_probe = 0;
+      // Full layer x position matrix in one run: the perlayer_probe role the
+      // Pi engine plays with tools/perlayer_probe.patch. Cheap enough to leave
+      // on under --trace (a 4 KB D2H copy per layer per step).
+      if (trace) printf("POS %2d L%-2d %s%s rms %.5f\n", s, L,
+                        is_attn[L] ? "attn" : "conv", is_slide[L] ? "(slide)" : "",
                         rms_host(M, M.x));
     }
     // model.embedding_norm runs on the last layer's output BEFORE the tied
@@ -1049,14 +1276,32 @@ int main(int argc, char** argv) {
     // raw x gave logits uncorrelated with HF (corr -0.025, std 0.41 vs
     // 2.09) -- the scale of an unnormalised residual stream has no relation
     // to the scale lm_head was trained against.
+    // model.embedding_norm runs on the last layer's output BEFORE the tied
+    // lm_head (modeling_lfm3.py:760, right after the layer loop). Feeding
+    // raw x gave logits uncorrelated with HF (corr -0.025, std 0.41 vs
+    // 2.09) -- the scale of an unnormalised residual stream has no relation
+    // to the scale lm_head was trained against.
+    //
+    // DO NOT write the result back through M.x. The first version did
+    // `M.x = M.h1`, and M.x is a MEMBER OF Model, so the alias survived into
+    // the next step: from step 1 on, the residual stream WAS h1, so
+    // operator_norm's in-place write destroyed the residual the branch is
+    // added to (add1 printed 0.1905, operator_norm's own rms, not the
+    // ~0.018 a real residual add gives). Position 0 was exact because the
+    // alias is installed after step 0's logits -- the classic "first token
+    // is right, everything after is garbage" signature.
     {
       Ent* fn = T(M, "lfm.model.embedding_norm.weight");
       rms1(M, M.x, fn ? fn->df : nullptr, M.h1);
-      M.x = M.h1;   // deliberate: the dump/trace path then shows the normalised stream
+      lm_head_input = M.h1;
     }
-    if (trace) printf("  final rms %.4f\n", rms_host(M, M.x));
-    if (M.emb_mode == 1) lm_head_host(M, M.hemb, M.x, M.lgf);   // streamed from pinned host
-    else gemv_f(M, EMBNAME, M.x, M.lgf);                         // tied lm_head, resident
+    if (trace && s == g_probe_step) printf("  final rms %.4f\n", rms_host(M, M.x));
+    Ent* eemb = T(M, EMBNAME);
+    if (eemb && eemb->dtype == 3)
+      lm_head_bf16(M, eemb, lm_head_input, M.lgf);       // certified arm: bf16, resident
+    else if (M.emb_mode == 1)
+      lm_head_host(M, M.hemb, lm_head_input, M.lgf);     // Q8 streamed from pinned host
+    else gemv_f(M, EMBNAME, lm_head_input, M.lgf);       // tied lm_head, resident
     k_argmax<<<1, 256>>>(M.lgf, M.tok_dev, VOCAB);
     cudaEventRecord(evB);
     cudaEventSynchronize(evB);
@@ -1080,6 +1325,24 @@ int main(int argc, char** argv) {
   if (ng > 0)
     printf("steady-state %.2f ms/token -> %.2f tok/s over %d steps "
            "(GEMV-only budget was 127.7 ms)\n", tot / ng, 1000.0 * ng / tot, ng);
+  {
+    // Peak RSS, from the kernel's own counter. measure.sh needs it and the
+    // Nano's login shell is dash (whose `time` has no -f) with no
+    // /usr/bin/time at all. On Tegra the GPU arenas are nvmap-backed and do
+    // NOT show up in RSS, so this number is host-side cost only -- the right
+    // thing to compare across --emb-host / --arena-mb, and the reason the
+    // plan's memory comparisons are made at equal arena size.
+    FILE* st = fopen("/proc/self/status", "r");
+    char ln[128]; long long hwm = 0, cur = 0;
+    while (st && fgets(ln, sizeof(ln), st)) {
+      long long v;
+      if (sscanf(ln, "VmHWM: %lld kB", &v) == 1) hwm = v;
+      else if (sscanf(ln, "VmRSS: %lld kB", &v) == 1) cur = v;
+    }
+    if (st) fclose(st);
+    printf("RSS_KB=%lld RSS_NOW_KB=%lld\n", hwm, cur);
+    fflush(stdout);
+  }
   printf("FM3_NANODE_DONE\n");
   return 0;
 }
