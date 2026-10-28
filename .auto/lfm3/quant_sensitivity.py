@@ -41,7 +41,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BACKBONE = "model.language_model."          # NOT "lfm." -- see module docstring
 
 
-def fq(w, bits, group, asym):
+def fq(w, bits, group, asym, scale16=False):
     """Quantize -> dequantize a [N, K] weight with per-group scales."""
     N, K = w.shape
     if K % group:
@@ -56,6 +56,18 @@ def fq(w, bits, group, asym):
     else:
         m = wf.abs().amax(-1, keepdim=True)
         s = m / ((1 << (bits - 1)) - 1)
+        # scale16 = the numerics the CUDA kernel ACTUALLY runs. The scale is
+        # stored as __half in the GEMV (pq1/ggml Q8_0 convention), so the
+        # device sees s16 = fp16(m/127), not m/127, and computes codes
+        # against s16 with a +-127 clamp (not +-128, which the plain q8_0
+        # arm allows). Without this arm the 8/8 accuracy result certified a
+        # quantizer the engine does not implement.
+        if scale16:
+            s = s.half().float()
+            hi = (1 << (bits - 1)) - 1
+            s = torch.where(s == 0, torch.ones_like(s), s)
+            d = torch.round(wf / s).clamp(-hi, hi) * s
+            return d.reshape(N, K).to(w.dtype)
         s = torch.where(s == 0, torch.ones_like(s), s)
         d = torch.round(wf / s).clamp(-(1 << (bits - 1)), (1 << (bits - 1)) - 1) * s
     return d.reshape(N, K).to(w.dtype)
@@ -83,6 +95,8 @@ def score(gen, gold):
 SCHEMES = {
     "bf16":    dict(bits=16, group=32, asym=False, emb_bits=16),
     "q8_0":    dict(bits=8,  group=32, asym=False, emb_bits=16),
+    # The arm the Nano engine actually runs: fp16-rounded scale, +-127 clamp.
+    "q8_0h":   dict(bits=8,  group=32, asym=False, emb_bits=16, scale16=True),
     "q6_0":    dict(bits=6,  group=32, asym=False, emb_bits=16),
     "q5_0":    dict(bits=5,  group=32, asym=False, emb_bits=16),
     "q4_0":    dict(bits=4,  group=32, asym=False, emb_bits=16),
@@ -140,16 +154,18 @@ def apply_scheme(model, sc, groups="all"):
             continue
         if name == EMB:
             bits, group, asym = sc["emb_bits"], 32, True
+            scale16 = False
             if bits >= 16:
                 bytes_total += p.numel() * 2
                 continue
         else:
             bits, group, asym = sc["bits"], sc["group"], sc["asym"]
+            scale16 = sc.get("scale16", False)
             if bits >= 16:
                 bytes_total += p.numel() * 2
                 continue
         with torch.no_grad():
-            p.data.copy_(fq(p.data, bits, group, asym))
+            p.data.copy_(fq(p.data, bits, group, asym, scale16))
         n_q += 1
         for g in pats:
             if g in name:
