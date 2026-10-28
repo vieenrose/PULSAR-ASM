@@ -18,6 +18,12 @@ listing) on 2026-10-28, not estimated.
    asm engine, the kernel list below is the same but every implementation is
    different code, and the NEON/F16C availability differs.
 
+   **Resolved 2026-10-28: the target is `pulsar_arm/bonsai2/` on branch
+   `lfm3-audio-jetson-nano`** (the Jetson Nano C + NEON + CUDA sm_53 path, the
+   one that runs Bonsai-8B Q1_0 at 16.11 tok/s). The x86 `pulsar_asm/lfm3/`
+   scaffold stays as a preparation exercise / parity oracle, not the deliverable.
+   See §8 for the measured Nano feasibility, which supersedes §5.
+
 2. **Scope.** "Support LFM3-Audio-2B speech to speech" is not one feature. See §2.
 
 ## 1. What the checkpoint actually contains
@@ -196,3 +202,111 @@ single-session change. S0 is the only thing to do immediately.
 Do S0 now (toolchain + oracle), then S1. Do not start from S5: the codec is the
 largest single item and is useless without S1–S4 producing valid code tokens.
 Confirm the target engine (§0.1) before any kernel is written.
+
+---
+
+## 8. Jetson Nano target — measured 2026-10-28 (supersedes §5)
+
+All figures below are measured: tensor bytes from the safetensors headers, the
+21.9 GB/s streaming ceiling and the Bonsai-8B reference from
+`.auto/HANDOFF_NANO_Q1_0.md`, `MemAvailable` from `free -m` on the live board
+(`pesi@100.70.245.36`).
+
+### 8.1 §5 is stale — S0 is done
+
+| check | §5 said | actual |
+|---|---|---|
+| `fasm` | absent | `~/.local/bin/fasm` 1.73.02 |
+| `torch` | absent | 2.6.0+cu124 in `~/venvs/lfm3` (Python 3.11.15) |
+| `transformers` | 4.38.2 | 5.21.0 (that 4.38.2 is the system py3.8, not the venv) |
+| weights | to download | cached: 4.005 GB main + 0.147 GB LiquidCodec = **4.152 GB** |
+
+The HF oracle exists and loads `Lfm3AudioProcessor` / `AutoModelForMultimodalLM`,
+so every gate in §4 is now checkable. The x86 scaffold runs: `pulsar_asm/lfm3/
+run_lfm3_chat.py` loads 24 layers / 3.458 GB and reports `SMOKE_OK`.
+
+### 8.2 Exact module sizes (safetensors headers)
+
+| module | bytes BF16 |
+|---|---|
+| `lfm` (text backbone, 1728.8 M weights) | 3.458 GB |
+| `encoder` (17-layer LFM2 audio encoder) | 0.219 GB |
+| speech head (`depth_embeddings`+`codebook_embedding`+`depthformer`+`depth_linear`+`mlp`) | 0.328 GB |
+| `audio_tokenizer` (LiquidCodec) | 0.147 GB |
+| **total** | **4.152 GB** |
+
+The backbone breaks down as: FFN w1/w2/w3 1132.6 M (66%), `embed_tokens` 262.1 M
+(15%, tied), conv 218.2 M (13%), attention 115.5 M (7%).
+
+### 8.3 Memory: the text backbone fits; the earlier "won't fit" read was wrong
+
+The board is 4 GB unified shared with the userspace. **Measured `MemAvailable`
+right now: 1476 MB** (`free -m`: 3965 total, 2432 used, 1286 buff/cache).
+
+The reference point is what already runs: Bonsai-8B Q1_0 = 1.06 GB weights +
+1280 MB device arena + ~304 MB RSS.
+
+| LFM3 backbone | weights | f16 K/V @4k | total | decode bus floor |
+|---|---|---|---|---|
+| BF16 | 3.458 GB | 0.053 GB | 3.511 GB | 157.9 ms/tok (6.3 tok/s) |
+| 8-bit | 1.729 GB | 0.053 GB | 1.782 GB | 78.9 ms/tok (12.7 tok/s) |
+| **4-bit** | **0.864 GB** | **0.053 GB** | **0.917 GB** | **39.5 ms/tok (25.3 tok/s)** |
+
+Two findings that invert the §5/§0 pessimism:
+
+1. **At 4-bit the backbone is 0.864 GB — smaller than Bonsai-8B Q1_0's 1.06 GB,
+   which runs on this board today.** It is in the feasible class, not the
+   impossible one.
+2. **The K/V cache is 53 MB, not gigabytes** (11 attention layers × 4 KV heads ×
+   head_dim 128; 6 of the 11 are sliding-window-256 bounded). Bonsai-8B pays
+   **1.208 GB** for the same 4k context — 36 layers × 8 KV heads. That is what
+   the 1280 MB arena is sized for, so **LFM3 needs a far smaller arena**. The
+   CLAUDE.md "do not shrink the 1280 MB arena" rule is Bonsai-shaped (it is
+   about Tegra nvmap RSS accounting at a given arena size), not a physics law;
+   re-size it for LFM3's 53 MB cache and re-measure RSS at equal arena size.
+
+At 4-bit the whole S1 text engine (0.917 GB + a ~500 MB arena + ~300 MB RSS)
+sits inside the measured 1476 MB `MemAvailable`. Full speech-to-speech adds
+encoder 0.219 + speech head 0.328 + codec 0.147 = **0.694 GB more**, which is
+what makes S4/S5 genuinely tight against 1476 MB — that, not the backbone, is
+the memory wall.
+
+### 8.4 The real blocker is kernel shape specialization, not RAM
+
+`pq1_swar_sm53.cu:26` documents the tuned kernels as `K in {4096, 12288}; N
+arbitrary`, and the dispatch gate at `pq1_swar_sm53.cu:1340` is literally
+
+```c
+return N < 16 || (K != 4096 && K != 12288);
+```
+
+**Every LFM3 GEMV has K = 2048 (conv in/out proj, q, k, v, o, gate, w1, w3) or
+K = 7680 (w2). Not one of them is 4096 or 12288** — so all of them take the
+fallback path and none of the 16.11 tok/s work applies. The 16.11 figure came
+from per-shape sweeps (TPB/MINB/RB/PD, §0.3) run at exactly K=4096 and K=12288;
+K=2048 needs its own sweep.
+
+Good news: 2048 = 8 × 256 and 7680 = 30 × 256, so both are exact multiples of
+the Q8_K 256-block and the 128-group structure the repack and bit-plane kernels
+assume. K=2048 is a clean 8-block Q8_K activation — structurally compatible,
+untuned.
+
+So on Nano the work is **not** "port a model"; it is "re-specialize the GEMV
+family for K=2048/7680" plus the §3 kernel gap (17 of 22 primitives absent —
+depthwise conv + conv state cache, partial rotary, dual rope theta, sliding
+window, sandwich norm, per-head gate — all new, in NEON/CUDA rather than AVX2).
+
+### 8.5 Ranked order for the Nano
+
+| stage | Nano deliverable | feasibility at measured numbers |
+|---|---|---|
+| S1 text backbone | 24 mixed conv/attn layers, 4-bit | **fits** (0.917 GB + arena); bus floor 25.3 tok/s, so a tuned K=2048 kernel is the gate |
+| S2 tokenizer | `liquid7.1` 128k BPE blobs | independent, small |
+| S3 encoder + mel | audio-in → text-out | +0.219 GB; **the shippable milestone** |
+| S4 MaskGIT head | audio codes out | +0.328 GB, tight; 3 bidirectional layers × 3 steps per segment; needs rep-penalty sampler (absent in `fwd8.c`, `sub_sampler_*`) |
+| S5 LiquidCodec | waveform out | +0.147 GB; a second full model, streaming conv-transformer — weeks |
+
+Build S1 first: it is the single item that de-risks everything, and unlike the
+x86 scaffold it must be written in NEON/CUDA sm_53 (no SDOT on Maxwell — use
+the `AND + IADD3` / SMULL+SADALP playbook from `NANO_BRINGUP.md`), not AVX2.
+Do not start from S5.
