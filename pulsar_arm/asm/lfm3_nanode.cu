@@ -50,8 +50,11 @@
 //   nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false \
 //        -Xptxas -O3,-dlcm=ca -o lfm3_nanode lfm3_nanode.cu
 //   ./lfm3_nanode <blob.lfm3q8> [--steps N] [--prompt id,id,...] [--trace]
+#define _GNU_SOURCE 1                 // posix_fadvise + POSIX_FADV_* live in <fcntl.h>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstring>
 #include <cstdint>
 #include <cmath>
@@ -83,7 +86,12 @@
 // is the difference between running and not. A 256-token context (the
 // sliding window is 256) needs MAXTOK=256 and 25 MB more device memory --
 // raise it together with the memory headroom, not on its own.
-#define MAXTOK 24
+#define MAXTOK 64
+// The tied embedding's tensor name (the blob's key) and the row-chunk size
+// for the host-staged lm_head. 8192 rows = 16.8 MB of codes + 2.1 MB of
+// scales per slab; 16 chunks cover 128000 rows.
+#define EMBNAME "lfm.model.embed_tokens.weight"
+#define LM_ROWS 8192
 #define NCONV 13
 #define NATTN 11
 
@@ -104,6 +112,17 @@ __device__ __forceinline__ bf16 f2bf(float v) {
 }
 
 // ---------------------------------------------------------------- kernels
+// One row of a Q8 tensor -> bf16. This is the input-embedding lookup: the
+// blob stores the tied embedding as Q8 codes + fp32 scales, so the row is
+// bf16(f32(code) * scale), one round. The first version memcpy'd H*2 raw
+// bytes out of the codes arena and called it bf16 -- correct only for a bf16
+// payload, which this blob does not have. Latent: nothing reached it.
+__global__ void k_dequant_row(const int8_t* __restrict__ c, const float* __restrict__ sc,
+                              bf16* __restrict__ out, int k) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < k) out[i] = f2bf(__fmul_rn((float)c[i], sc[i / Q8_BLK]));
+}
+
 __global__ void k_bf2f(const bf16* __restrict__ in, float* __restrict__ out, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) out[i] = bf2f(in[i]);
@@ -398,10 +417,26 @@ __global__ void k_argmax(const float* __restrict__ lg, int* __restrict__ out, in
 // ------------------------------------------------------------------- loader
 struct Ent {
   std::string name;
-  int dtype, ne[4], nd;
+  // ne[4] MUST be zero-initialised: the blob stores nd dims, and a 1-D
+  // tensor (every norm vector) left ne[1..3] as stack garbage. It surfaced
+  // as `UPLOAD FAIL ... ne=[2048,-555441400]`, which reads like blob
+  // corruption and is really an uninitialised field -- and the diagnostic
+  // printed the garbage, so it pointed at the exporter, not at this struct.
+  int dtype, ne[4] = {0,0,0,0}, nd = 0;
   size_t file_off, nc, ns;
   uint32_t crc;
+  bool host = false;          // payload lives in pinned host memory, not device
   int8_t* dq = nullptr; float* ds = nullptr; float* df = nullptr;
+};
+
+// The tied embedding, kept in PINNED HOST memory and streamed into a device
+// slab per row-chunk. Defined above Model because Model holds one by value.
+struct HostEmb {
+  int8_t* hc = nullptr;   // pinned host codes, N*K
+  float*  hs = nullptr;   // pinned host scales, N*(K/32)
+  int8_t* dc = nullptr;   // device slab (codes)
+  float*  dsl = nullptr;  // device slab (scales)
+  int N = 0, K = 0, rows = 0;
 };
 
 struct Model {
@@ -409,6 +444,13 @@ struct Model {
   std::map<std::string, Ent*> by;
   int8_t* dq = nullptr; float* ds = nullptr; float* df = nullptr;
   size_t need_q = 0, need_s = 0, need_f = 0;
+  // 0 = embedding resident on device (the original path), 1 = pinned host
+  // only (--emb-host, what makes the model fit a 4 GB Nano), 2 = both
+  // (--lm-selftest, so the two paths can be compared bitwise).
+  int emb_mode = 0;
+  HostEmb hemb;
+  std::string path;
+  size_t emb_file_off = 0;
   bf16 *x, *h1, *h2, *h3, *h4, *q, *k, *v, *attn, *gate, *bx, *cy, *ring;
   float *xf, *lgf, *part;          // part = GEMV per-chunk partials, f32 by contract
   bf16 *kc, *vc;
@@ -419,6 +461,27 @@ struct Model {
 static bool load_blob(const char* path, Model& M, std::string& js) {
   FILE* f = fopen(path, "rb");
   if (!f) { printf("cannot open %s\n", path); return false; }
+  const int bfd = fileno(f);
+  // A 1.95 GB blob read into RAM is read ONCE and never reused -- but the
+  // page cache keeps it, and on Tegra CUDA's device pool is carved from
+  // reclaimable system memory: reading the blob filled 1838 MB of cache and
+  // cudaMemGetInfo's free fell from 1803 MB to 883 MB, so the run that
+  // "does not fit" was starved by its own weights sitting in the cache.
+  // DONTNEED after each read drops those pages; it needs no root (unlike
+  // drop_caches), and the cost is one eMMC reread of the 295 MB embedding
+  // for the host-staged lm_head. This is a deployment fix, not a benchmark
+  // trick: the shipped engine has to coexist with the page cache on a 4 GB
+  // board, and every MB it evicts is an MB the GPU cannot get back.
+  posix_fadvise(bfd, 0, 0, POSIX_FADV_RANDOM);      // no readahead: we seek per tensor
+  // Evict the WHOLE file up front, before the memory gate. The 1.8 GB of
+  // cache this blob leaves behind comes from PREVIOUS runs and is shared, so
+  // a later per-tensor DONTNEED cannot undo what is already squatting on the
+  // GPU's pool: with it, cudaMemGetInfo's free sat at 1325 MB against a need
+  // of 1622 MB; in a run that never read the file it measured 1803 MB.
+  // Doing it here, before the gate, is what makes the gate see the board's
+  // real ceiling. (0,0) = the whole file, and it is advisory: check nothing,
+  // because a failure just means the run may have to wait for reclaim.
+  posix_fadvise(bfd, 0, 0, POSIX_FADV_DONTNEED);
   char magic[8];
   if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "LFM3Q8\x01\x00", 8) != 0) {
     printf("bad magic in %s\n", path); fclose(f); return false;
@@ -461,16 +524,41 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
     e.nd = 0;
     size_t nz = rec.find("\"ne\":[");
     if (nz == std::string::npos) { printf("tensor %s has no ne\n", e.name.c_str()); fclose(f); return false; }
+    // The first version passed (char**)&z2 to strtol with z2 a size_t. On
+    // LP64 that compiles and runs, and strtol writes an ABSOLUTE address
+    // into it, so the `z2 < rec.size()` test failed after the first element:
+    // every tensor parsed as 1-D with ne[1] = 0. gemv_f takes K from ne[1],
+    // so the whole engine was about to run with K=0. Caught by printing the
+    // shape on a mismatch instead of trusting it.
     size_t z2 = rec.find('[', nz) + 1;
-    while (e.nd < 4 && z2 < rec.size()) {
-      e.ne[e.nd++] = (int)strtol(rec.c_str() + z2, (char**)&z2, 10);
-      if (z2 < rec.size() && rec[z2] == ',') z2++; else break;
+    const char* cp = rec.c_str() + z2;
+    while (e.nd < 4) {
+      char* endp = nullptr;
+      const long v = strtol(cp, &endp, 10);
+      if (endp == cp) break;
+      e.ne[e.nd++] = (int)v;
+      cp = endp;
+      if (*cp == ',') cp++; else break;
+    }
+    // Fail loudly on a shape the engine cannot use, rather than deriving
+    // K=0 and silently launching an empty grid.
+    if (e.dtype == 1 && (e.nd != 2 || e.ne[0] <= 0 || e.ne[1] <= 0)) {
+      printf("tensor %s: Q8 payload with nd=%d ne=[%d,%d,%d,%d] -- want 2 dims\n",
+             e.name.c_str(), e.nd, e.ne[0], e.ne[1], e.ne[2], e.ne[3]);
+      fclose(f); return false;
     }
     if (e.dtype < 0 || e.file_off == (size_t)-1 || e.nc == (size_t)-1 || e.nd == 0) {
       printf("record for %s is incomplete\n", e.name.c_str()); fclose(f); return false;
     }
-    if (e.dtype == 1) { M.need_q += e.nc; M.need_s += e.ns; }
+    // mode 1 keeps the tied embedding in pinned host memory, so it must not
+    // be counted in the device arenas -- that 270 MB is what makes the model
+    // fit. Mode 2 (selftest) counts it AND takes the host copy.
+    const bool hostemb = (M.emb_mode == 1) && (e.name == EMBNAME);
+    const bool skq = (M.emb_mode == 2) && (e.name != EMBNAME);   // selftest: embedding only
+    if (skq) {}
+    else if (e.dtype == 1) { if (!hostemb) { M.need_q += e.nc; M.need_s += e.ns; } }
     else M.need_f += e.nc;
+    if (e.name == EMBNAME) M.emb_file_off = base_data + e.file_off;
     M.ents.push_back(e);
     p = e1 + 1;
   }
@@ -527,6 +615,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
     const size_t tot = e.nc + e.ns;
     buf.resize(tot);
     if (fread(buf.data(), 1, tot, f) != tot) { printf("short read %s\n", e.name.c_str()); fclose(f); return false; }
+    posix_fadvise(bfd, (off_t)(base_data + e.file_off), (off_t)tot, POSIX_FADV_DONTNEED);
     // Recomputing the exporter's per-tensor crc32 is what turns "the engine
     // runs the quantizer that was certified 8/8" into a load-time assertion.
     const uint32_t c = (uint32_t)crc32(0, (const Bytef*)buf.data(), (uInt)tot);
@@ -535,6 +624,11 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
       fclose(f); return false;
     }
     cudaError_t ce = cudaSuccess;
+    if (M.emb_mode == 1 && e.name == EMBNAME) continue;   // CRC checked above; payload goes to pinned host
+    // Mode 2 (selftest) needs ONLY the embedding resident, so the other 285
+    // tensors stay on disk: 262 MB + 270 MB pinned + arena fits, the full
+    // 1944 MB does not, and the selftest never touches a layer weight.
+    if (M.emb_mode == 2 && e.name != EMBNAME) continue;
     if (e.dtype == 1) {
       ce = cudaMemcpy(M.dq + oc, buf.data(), e.nc, cudaMemcpyHostToDevice);
       if (ce == cudaSuccess)
@@ -542,19 +636,34 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
       e.dq = M.dq + oc; e.ds = (float*)((char*)M.ds + os);
       oc += e.nc; os += e.ns;
     } else {
-      ce = cudaMemcpy(M.df + of, buf.data(), e.nc, cudaMemcpyHostToDevice);
-      e.df = M.df + of;
+      // `M.df + of` is float* arithmetic on a BYTE offset: it advanced 4*of,
+      // so the first ~48 norm vectors landed inside the arena by luck (4*of
+      // < 1.55 MB) and the 49th faulted. Every "UPLOAD FAIL ... invalid
+      // argument" in this session, and the memory misdiagnosis that came
+      // with it, traces to this one line -- the f32 arena is the last
+      // allocation, so it is where typed-pointer arithmetic first bites.
+      ce = cudaMemcpy((char*)M.df + of, buf.data(), e.nc, cudaMemcpyHostToDevice);
+      e.df = (float*)((char*)M.df + of);
       of += e.nc;
     }
     if (ce != cudaSuccess) {
-      printf("UPLOAD FAIL %s dtype=%d ne=[%d,%d] nc=%zu ns=%zu dst=%p -> %s\n",
-             e.name.c_str(), e.dtype, e.ne[0], e.ne[1], e.nc, e.ns,
-             (void*)(e.dtype == 1 ? (void*)(M.dq + oc - e.nc) : (void*)(M.df + of - e.nc)),
+      // The first version printed only dst, and every one of these failures
+      // was blamed on memory. Print the arena window so an out-of-range
+      // offset is obvious: it is the thing the gate boundary hid.
+      printf("UPLOAD FAIL %s dtype=%d nd=%d ne=[%d,%d,%d,%d] nc=%zu ns=%zu src=%p\n"
+             "  dst=%p  arenas: codes=%p/%zu used=%zu  scales=%p/%zu used=%zu  f32=%p/%zu used=%zu\n"
+             "  -> %s\n",
+             e.name.c_str(), e.dtype, e.nd, e.ne[0], e.ne[1], e.ne[2], e.ne[3], e.nc, e.ns,
+             (void*)buf.data(),
+             (void*)(e.dtype == 1 ? (void*)(M.dq + oc) : (void*)((char*)M.df + of)),
+             (void*)M.dq, M.need_q, oc, (void*)M.ds, M.need_s, os, (void*)M.df, M.need_f, of,
              cudaGetErrorString(ce));
       fclose(f); return false;
     }
     M.by[e.name] = &M.ents[i];
   }
+  for (size_t i = 0; i < M.ents.size(); i++)
+    if (M.ents[i].name == EMBNAME) M.ents[i].host = (M.emb_mode == 1);
   fclose(f);
   if (oc != M.need_q || os != M.need_s || of != M.need_f) {
     printf("arena accounting mismatch: codes %zu/%zu scales %zu/%zu f32 %zu/%zu\n",
@@ -603,6 +712,83 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   q8_partial<<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
   k_combine_bf<<<(N + 255) / 256, 256>>>(M.part, yb, N, nchunk);
 }
+// ------------------------------------------------------------------ lm_head
+// The tied embedding is 128000 x 2048 -- 262 MB of Q8 codes + 8 MB of fp32
+// scales -- and it is streamed exactly ONCE per token, as the lm_head GEMV
+// (it is tied to the input embedding, so there is no separate output matrix).
+// On a 4 GB Nano that 270 MB is the difference between fitting and not:
+// device free on an IDLE board measured 1826 MB, and the whole-backbone Q8_0
+// config needs 1944 MB of weights + ~48 MB arena. Keeping the embedding in
+// PINNED HOST memory and streaming it in row chunks drops the device need to
+// ~1682 MB, which fits.
+//
+// This does not change one bit of arithmetic: each output row's reduction is
+// independent of every other row, so computing rows [r0,r0+nr) from a slab
+// that happens to hold exactly those rows is the same computation the
+// one-shot path does. `--lm-selftest` asserts exactly that, bitwise, over
+// all 128000 logits, before any timing number is believed.
+//
+// Sequential copies for now (copy chunk, GEMV chunk), with pinned host memory
+// so the H2D runs at DMA speed. Double-buffering over the 17.5 ms copy and
+// the 17.5 ms read is the obvious follow-up; measured first, then optimised.
+
+// Read the tied embedding into pinned host memory and check its CRC. Pinned
+// (not pageable) is what lets the per-chunk H2D run at DMA speed; on Tegra
+// the copy shares the same 21.9 GB/s bus the GEMV reads from, so streaming
+// the embedding costs a second pass over those bytes -- priced in 13.5.
+static bool lm_host_init(Model& M, HostEmb& E, const char* path) {
+  Ent* be = nullptr;
+  for (size_t i = 0; i < M.ents.size(); i++) if (M.ents[i].name == EMBNAME) be = &M.ents[i];
+  if (!be) { printf("no tied embedding %s in the blob\n", EMBNAME); return false; }
+  if (be->dtype != 1) { printf("embedding dtype %d is not Q8\n", be->dtype); return false; }
+  E.N = be->ne[0]; E.K = be->ne[1];
+  if (E.N != VOCAB || E.K != H) { printf("embedding shape %dx%d\n", E.N, E.K); return false; }
+  E.rows = LM_ROWS;
+  const size_t tot = be->nc + be->ns;
+  if (cudaHostAlloc((void**)&E.hc, tot, cudaHostAllocDefault) != cudaSuccess) {
+    printf("cudaHostAlloc(%.0f MB pinned) failed\n", tot / 1e6); return false;
+  }
+  E.hs = (float*)(E.hc + be->nc);
+  FILE* f = fopen(path, "rb");
+  if (!f) { printf("cannot reopen %s\n", path); return false; }
+  fseek(f, (long)M.emb_file_off, SEEK_SET);
+  size_t got = fread(E.hc, 1, tot, f);
+  posix_fadvise(fileno(f), (off_t)M.emb_file_off, (off_t)tot, POSIX_FADV_DONTNEED);
+  fclose(f);
+  if (got != tot) { printf("short read on the embedding (%zu/%zu)\n", got, tot); return false; }
+  const uint32_t c = (uint32_t)crc32(0, (const Bytef*)E.hc, (uInt)tot);
+  if (c != be->crc) { printf("host embedding CRC %08x want %08x\n", c, be->crc); return false; }
+  if (cudaMalloc((void**)&E.dc, (size_t)E.rows * E.K) != cudaSuccess) {
+    printf("lm slab codes (%.0f MB) failed\n", E.rows * E.K / 1e6); return false;
+  }
+  if (cudaMalloc((void**)&E.dsl, (size_t)E.rows * (E.K / Q8_BLK) * 4) != cudaSuccess) {
+    printf("lm slab scales failed\n"); return false;
+  }
+  printf("lm_head staged in host: %.0f MB pinned, %d rows/slab (%.0f MB device)\n",
+         tot / 1e6, E.rows, (E.rows * E.K + (size_t)E.rows * (E.K / Q8_BLK) * 4) / 1e6);
+  fflush(stdout);
+  return true;
+}
+
+static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
+  const int N = E.N, K = E.K;
+  GemvCfg c = pick(N, K);                       // SAME config as the resident
+  const int nb = c.KCHUNK / Q8_BLK, nchunk = K / c.KCHUNK;   // path -> same bits
+  k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
+  const int sb = K / Q8_BLK;                    // scales per row
+  for (int r0 = 0; r0 < N; r0 += E.rows) {
+    const int nr = (N - r0 < E.rows) ? (N - r0) : E.rows;
+    cudaMemcpyAsync(E.dc, E.hc + (size_t)r0 * K, (size_t)nr * K,
+                    cudaMemcpyHostToDevice, 0);
+    cudaMemcpyAsync(E.dsl, E.hs + (size_t)r0 * sb, (size_t)nr * sb * 4,
+                    cudaMemcpyHostToDevice, 0);
+    const int nblk = ((nr + c.R - 1) / c.R) * nchunk;
+    const size_t shm = (size_t)nb * 33 * 4;
+    q8_partial<<<nblk, c.TPB, shm>>>(E.dc, E.dsl, M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
+    k_combine_f<<<(nr + 255) / 256, 256>>>(M.part, yf + r0, nr, nchunk);
+  }
+}
+
 static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf) {
   Ent* e = T(M, name);
   const int N = e->ne[0], K = e->ne[1];
@@ -639,16 +825,28 @@ int main(int argc, char** argv) {
     return 1;
   }
   int steps = 8; bool trace = false;
+  int lm_rows_override = 0, emb_mode_req = 0;
+  const char* dump_logits = nullptr;
   std::vector<int> prompt;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--trace")) trace = true;
+    else if (!strcmp(argv[i], "--emb-host")) emb_mode_req = 1;
+    else if (!strcmp(argv[i], "--lm-selftest")) emb_mode_req = 2;
+    else if (!strcmp(argv[i], "--lmrows") && i + 1 < argc) lm_rows_override = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump_logits = argv[++i];
     else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) {
       char* s = argv[++i];
       while (*s) { prompt.push_back((int)strtol(s, &s, 10)); if (*s == ',') s++; }
     }
   }
+  printf("prompt: %zu ids:", prompt.size());
+  for (size_t i = 0; i < prompt.size() && i < 8; i++) printf(" %d", prompt[i]);
+  printf("%s\n", prompt.size() > 8 ? " ..." : "");
+  fflush(stdout);
   Model M; std::string js;
+  M.emb_mode = emb_mode_req;        // flags are parsed before M exists
+  M.path = argv[1];
   if (!load_blob(argv[1], M, js)) return 1;
 
   // layer_types, parsed from the blob header (the conv layers carry the
@@ -719,8 +917,50 @@ int main(int argc, char** argv) {
          (M.need_q + M.need_s + M.need_f + kvbytes * 2) / 1e9, freeb / 1e9, totb / 1e9);
   printf("L FM3_NANODE_LOADED\n"); fflush(stdout);
 
-  Ent* emb = T(M, "lfm.model.embed_tokens.weight");
+  Ent* emb = nullptr;
+  for (size_t i = 0; i < M.ents.size(); i++) if (M.ents[i].name == EMBNAME) emb = &M.ents[i];
+  if (!emb) { printf("no %s in the blob\n", EMBNAME); return 1; }
   if (emb->ne[0] != VOCAB || emb->ne[1] != H) { printf("embed shape %dx%d\n", emb->ne[0], emb->ne[1]); return 1; }
+  if (M.emb_mode >= 1) {
+    if (!lm_host_init(M, M.hemb, argv[1])) return 1;
+    if (lm_rows_override > 0 && (VOCAB % lm_rows_override) == 0) M.hemb.rows = lm_rows_override;
+  }
+  if (M.emb_mode == 2) {
+    // Bitwise gate for the host-staged lm_head: same x, both paths, all
+    // 128000 logits compared as raw fp32 bits. Row reductions are
+    // independent, so any difference here is a bug in the chunking, not a
+    // rounding choice -- and it must pass before a single timing number
+    // from this path is believed.
+    // Build the pattern on the host and copy it up: the first draft wrote
+    // ((bf16*)M.x)[i] from the host, and M.x is a DEVICE pointer -- segfault.
+    {
+      std::vector<uint16_t> pat(H);
+      for (int i = 0; i < H; i++) pat[i] = (uint16_t)(0x3c00 + ((i * 37) & 0x3ff));
+      cudaMemcpy(M.x, pat.data(), (size_t)H * 2, cudaMemcpyHostToDevice);
+    }
+    std::vector<float> a(VOCAB), b(VOCAB);
+    gemv_f(M, EMBNAME, M.x, M.lgf);
+    cudaMemcpy(a.data(), M.lgf, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost);
+    lm_head_host(M, M.hemb, M.x, M.lgf);
+    cudaMemcpy(b.data(), M.lgf, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost);
+    long bad = 0; int first = -1;
+    for (int i = 0; i < VOCAB; i++)
+      if (memcmp(&a[i], &b[i], 4) != 0) { if (first < 0) first = i; bad++; }
+    double mx = 0; for (int i = 0; i < VOCAB; i++) if (fabs(b[i]) > mx) mx = fabs(b[i]);
+    printf("lm_head staged vs resident: rows/slab=%d  %s (%ld/%d logits differ, max |logit| %.4f)\n",
+           M.hemb.rows, bad ? "MISMATCH" : "BIT-EXACT", bad, VOCAB, mx);
+    if (first >= 0) printf("  first i=%d resident %.9g staged %.9g\n", first, a[first], b[first]);
+    for (int rr = 1024; rr <= 32768; rr *= 2) {
+      if (VOCAB % rr) continue;
+      M.hemb.rows = rr;
+      lm_head_host(M, M.hemb, M.x, M.lgf);
+      cudaMemcpy(b.data(), M.lgf, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost);
+      long bb = 0; for (int i = 0; i < VOCAB; i++) bb += (memcmp(&a[i], &b[i], 4) != 0);
+      printf("  rows/slab %6d: %s (%ld differ)\n", rr, bb ? "MISMATCH" : "bit-exact", bb);
+    }
+    printf("%s\n", bad ? "LFM_LM_FAIL" : "LFM_LM_OK");
+    return bad ? 1 : 0;
+  }
 
   if (prompt.empty()) prompt.push_back(124894);                 // bos
   std::vector<int> toks = prompt;
@@ -733,7 +973,18 @@ int main(int argc, char** argv) {
     const int tok = toks[s];
     if (pos >= MAXTOK) break;
     cudaEventRecord(evA);
-    cudaMemcpy(M.x, emb->dq + (size_t)tok * H, (size_t)H * 2, cudaMemcpyDeviceToDevice);
+    if (M.emb_mode == 1) {
+      // row of the pinned host embedding -> slab -> bf16
+      const int sb = H / Q8_BLK;
+      cudaMemcpyAsync(M.hemb.dc, M.hemb.hc + (size_t)tok * H, (size_t)H,
+                      cudaMemcpyHostToDevice, 0);
+      cudaMemcpyAsync(M.hemb.dsl, M.hemb.hs + (size_t)tok * sb, (size_t)sb * 4,
+                      cudaMemcpyHostToDevice, 0);
+      k_dequant_row<<<(H + 255) / 256, 256>>>(M.hemb.dc, M.hemb.dsl, M.x, H);
+    } else {
+      k_dequant_row<<<(H + 255) / 256, 256>>>(emb->dq + (size_t)tok * H,
+                                             emb->ds + (size_t)tok * (H / Q8_BLK), M.x, H);
+    }
 
     int ci = 0;
     for (int L = 0; L < NLAYER; L++) {
@@ -775,7 +1026,18 @@ int main(int argc, char** argv) {
       rms1(M, M.h2, NW(M, L, "post_ffn_norm.weight"), M.h3);
       eadd(M, M.x, M.h3, M.x, H);
     }
-    gemv_f(M, "lfm.model.embed_tokens.weight", M.x, M.lgf);     // tied lm_head
+    // model.embedding_norm runs on the last layer's output BEFORE the tied
+    // lm_head (modeling_lfm3.py:760, right after the layer loop). Feeding
+    // raw x gave logits uncorrelated with HF (corr -0.025, std 0.41 vs
+    // 2.09) -- the scale of an unnormalised residual stream has no relation
+    // to the scale lm_head was trained against.
+    {
+      Ent* fn = T(M, "lfm.model.embedding_norm.weight");
+      rms1(M, M.x, fn ? fn->df : nullptr, M.h1);
+      M.x = M.h1;   // deliberate: the dump/trace path then shows the normalised stream
+    }
+    if (M.emb_mode == 1) lm_head_host(M, M.hemb, M.x, M.lgf);   // streamed from pinned host
+    else gemv_f(M, EMBNAME, M.x, M.lgf);                         // tied lm_head, resident
     k_argmax<<<1, 256>>>(M.lgf, M.tok_dev, VOCAB);
     cudaEventRecord(evB);
     cudaEventSynchronize(evB);
@@ -783,6 +1045,13 @@ int main(int argc, char** argv) {
     int nt = -1;
     cudaMemcpy(&nt, M.tok_dev, 4, cudaMemcpyDeviceToHost);
     toks.push_back(nt);
+    if (dump_logits && s == steps - 1) {
+      std::vector<float> lg(VOCAB);
+      cudaMemcpy(lg.data(), M.lgf, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost);
+      FILE* g = fopen(dump_logits, "wb");
+      if (g) { fwrite(lg.data(), 4, VOCAB, g); fclose(g);
+               printf("wrote logits after step %d (tok %d) to %s\n", s, nt, dump_logits); }
+    }
     printf("%4d %7d %9.2f %8.2f\n", s, nt, ms, 1000.0 / ms);
     fflush(stdout);
     if (s >= 2) { tot += ms; ng++; }

@@ -1824,3 +1824,22 @@ rollback and nt=2 attention not counted): 2B 1.04-1.23x, 9B 0.96-1.14x, prompt d
 verifies ~16-token blocks (>= 4.7 steps here) and needs ~1.6 GB drafts on a 4 GB board: out.
 The sm_53 GEMV is MAC-issue bound once a second token is added, so speculation buys little. The
 probe source is in `.auto/attic/fwd35_liv_probe.cu`.
+- [LFM3/Nano] Engine runs end-to-end at 5.84 tok/s (171.1 ms/token) on the Nano, logits NOT yet
+  matching HF (corr -0.046 vs logits_last_A.npy, hf-top1 ranked 31005). Validated so far: blob CRCs,
+  embedding layout row-major (cos 0.99997; col-major 0.008), lm_head host-staging bit-exact vs
+  resident (all 128000 logits, all row-slab sizes), logit SCALE correct after adding the missing
+  embedding_norm (std 2.167 vs 2.093; was 0.41). So the residual stream has the right magnitude and
+  the wrong direction => divergence is INSIDE the 24 layers, not in lm_head/norm/blob.
+  NEXT (localization order, cheapest first, repo-standard perlayer_probe style):
+   1. position 0 only (--steps 1 --prompt 124894): exercises embedding -> 24 layers with a 1-position
+      attention and a ZERO conv ring -> norm -> lm_head. If pos 0 matches HF, the bug is in
+      attention/conv STATE at pos>0 (RoPE invf, sliding window, ring indexing, GQA head map).
+   2. If pos 0 already fails: check the conv branch math first (13 of 24 layers, B*xg -> 7-tap -> C*y,
+      ring layout), then the sandwich-norm placement (operator_norm / post_operator_norm /
+      ffn_norm / post_ffn_norm), then attention (head gates: sigmoid(gate_proj) applied to attn
+      BEFORE o_proj, per-head q_norm/k_norm, GQA 16q/4kv).
+   3. Dump x per layer (--trace hook is the place: max|x|, NaN count, and a 8-float fingerprint) and
+      compare to oracle.py intermediates at the same layer.
+  Do not trust a self-test that compares two paths built from the same assumption -- the lm_head
+  selftest is bit-exact by construction and proved nothing about layout; the independent HF
+  comparison is what found the real issues (5fd7e79's lesson, again).
