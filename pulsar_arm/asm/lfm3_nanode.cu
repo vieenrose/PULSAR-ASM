@@ -476,6 +476,12 @@ struct Ent {
 // split is guessing. Events + one sync per phase, so the instrumentation
 // itself costs ~0.25 ms/token -- a diagnostic, not a shipping mode.
 static const bool g_time = getenv("LFM_TIME") != nullptr;
+// LFM_EMB=resident|host: same as --emb-resident / --emb-host, as an env knob
+// so ab.sh (which passes env per arm) can A/B the two lm_head streaming
+// modes. Empty = the program default.
+static const char* g_emb = getenv("LFM_EMB");
+// LFM_LMDBUF=1: double-buffer the lm_head's pinned-host row streaming.
+static const bool g_lmdbuf = getenv("LFM_LMDBUF") != nullptr;
 // LFM_NOFUSE=1 restores the separate k_bf2f pass (the A/B control for the
 // fused GEMV prologue; the fused form is the default and is bit-identical).
 static const bool g_nofuse = getenv("LFM_NOFUSE") != nullptr;
@@ -504,6 +510,16 @@ struct HostEmb {
   float*  hs = nullptr;   // pinned host scales, N*(K/32)
   int8_t* dc = nullptr;   // device slab (codes)
   float*  dsl = nullptr;  // device slab (scales)
+  // Double-buffered streaming (LFM_LMDBUF=1): two slabs, a second stream for
+  // the H2D copies, and events so the GEMV of slab i runs while the copy
+  // engine loads slab i+1. evC = "slab b is loaded", evG = "slab b consumed"
+  // (the WAR guard: the copy for slab i+2 reuses slab b's memory and must not
+  // start before GEMV(i) has read it).
+  int8_t* dc2[2] = {nullptr, nullptr};
+  float*  dsl2[2] = {nullptr, nullptr};
+  cudaStream_t st = nullptr;
+  cudaEvent_t evC[2] = {nullptr, nullptr}, evG[2] = {nullptr, nullptr};
+  bool dbuf = false;
   int N = 0, K = 0, rows = 0;
 };
 
@@ -963,6 +979,23 @@ static bool lm_host_init(Model& M, HostEmb& E, const char* path) {
   if (cudaMalloc((void**)&E.dsl, (size_t)E.rows * (E.K / Q8_BLK) * 4) != cudaSuccess) {
     printf("lm slab scales failed\n"); return false;
   }
+  if (g_lmdbuf) {
+    E.dbuf = true;
+    for (int b = 0; b < 2; b++) {
+      if (cudaMalloc((void**)&E.dc2[b], (size_t)E.rows * E.K) != cudaSuccess ||
+          cudaMalloc((void**)&E.dsl2[b], (size_t)E.rows * (E.K / Q8_BLK) * 4) != cudaSuccess) {
+        printf("LM_HEAD_DBUF: slab %d allocation failed\n", b); E.dbuf = false; break;
+      }
+      cudaEventCreateWithFlags(&E.evC[b], cudaEventDisableTiming);
+      cudaEventCreateWithFlags(&E.evG[b], cudaEventDisableTiming);
+    }
+    if (E.dbuf) cudaStreamCreateWithFlags(&E.st, cudaStreamNonBlocking);
+    if (!E.st) E.dbuf = false;
+    printf("LM_HEAD_DBUF=on slabs=%d x2 rows=%d (proof: 2 slabs + stream + 4 events)\n",
+           E.dbuf ? 2 : 0, E.rows);
+    fflush(stdout);
+  }
+
   printf("lm_head staged in host: %.0f MB pinned, %d rows/slab (%.0f MB device)\n",
          tot / 1e6, E.rows, (E.rows * E.K + (size_t)E.rows * (E.K / Q8_BLK) * 4) / 1e6);
   fflush(stdout);
@@ -1062,6 +1095,28 @@ static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
   const int nb = c.KCHUNK / Q8_BLK, nchunk = K / c.KCHUNK;   // path -> same bits
   k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
   const int sb = K / Q8_BLK;                    // scales per row
+  if (E.dbuf) {
+    const int nslab = (N + E.rows - 1) / E.rows;
+    const int nblk = ((E.rows + c.R - 1) / c.R) * nchunk;
+    const size_t shm = (size_t)nb * 33 * 4;
+    for (int i = 0; i < nslab; i++) {
+      const int r0 = i * E.rows;
+      const int nr = (N - r0 < E.rows) ? (N - r0) : E.rows;
+      const int b = i & 1;
+      const int nb2 = ((nr + c.R - 1) / c.R) * nchunk;      // last slab is short
+      if (i >= 2) cudaStreamWaitEvent(E.st, E.evG[b], 0);   // WAR: GEMV(i-2) must have read slab b
+      cudaMemcpyAsync(E.dc2[b], E.hc + (size_t)r0 * K, (size_t)nr * K,
+                      cudaMemcpyHostToDevice, E.st);
+      cudaMemcpyAsync(E.dsl2[b], E.hs + (size_t)r0 * sb, (size_t)nr * sb * 4,
+                      cudaMemcpyHostToDevice, E.st);
+      cudaEventRecord(E.evC[b], E.st);
+      cudaStreamWaitEvent((cudaStream_t)0, E.evC[b], 0);
+      q8_partial<float><<<nb2, c.TPB, shm, 0>>>(E.dc2[b], E.dsl2[b], M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
+      k_combine_f<<<(nr + 255) / 256, 256, 0>>>(M.part, yf + r0, nr, nchunk);
+      cudaEventRecord(E.evG[b], (cudaStream_t)0);
+    }
+    return;
+  }
   for (int r0 = 0; r0 < N; r0 += E.rows) {
     const int nr = (N - r0 < E.rows) ? (N - r0) : E.rows;
     cudaMemcpyAsync(E.dc, E.hc + (size_t)r0 * K, (size_t)nr * K,
@@ -1190,6 +1245,8 @@ int main(int argc, char** argv) {
   fflush(stdout);
   g_probe_layer = probe_layer; g_probe_step = probe_step;
   Model M; std::string js;
+  if (g_emb && !strcmp(g_emb, "resident")) emb_mode_req = 0;
+  else if (g_emb && !strcmp(g_emb, "host")) emb_mode_req = 1;
   M.emb_mode = emb_mode_req;        // flags are parsed before M exists
   M.path = argv[1];
   if (!load_blob(argv[1], M, js)) return 1;
