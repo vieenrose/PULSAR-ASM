@@ -456,6 +456,21 @@ struct Ent {
 
 // The tied embedding, kept in PINNED HOST memory and streamed into a device
 // slab per row-chunk. Defined above Model because Model holds one by value.
+// LFM_TIME=1: per-phase decode timing (embedding lookup, conv layers,
+// attention layers, final norm, lm_head). The plan's discipline is "prove the
+// code path ran before believing a timing"; optimizing 139 ms without the
+// split is guessing. Events + one sync per phase, so the instrumentation
+// itself costs ~0.25 ms/token -- a diagnostic, not a shipping mode.
+static const bool g_time = getenv("LFM_TIME") != nullptr;
+static cudaEvent_t g_evA, g_evB;
+static double g_tEmb = 0, g_tConv = 0, g_tAttn = 0, g_tNorm = 0, g_tHead = 0;
+static inline void phBegin() { if (g_time) cudaEventRecord(g_evA); }
+static inline void phEnd(double& acc) {
+  if (!g_time) return;
+  cudaEventRecord(g_evB); cudaEventSynchronize(g_evB);
+  float ms = 0.f; cudaEventElapsedTime(&ms, g_evA, g_evB); acc += ms;
+}
+
 struct HostEmb {
   int8_t* hc = nullptr;   // pinned host codes, N*K
   float*  hs = nullptr;   // pinned host scales, N*(K/32)
@@ -760,7 +775,12 @@ static GemvCfg pick(int N, int K) {
   if (K == 512) { c.KCHUNK = 512; c.TPB = 128; }
   if (fKC && K % fKC == 0) c.KCHUNK = fKC;
   if (fTPB >= 32 && fTPB <= 1024) c.TPB = fTPB;
-  if (fR >= 32 && fR <= 1024) c.R = fR;
+  // R is capped at RMAX, not 1024: q8_partial stages its per-row accumulators
+  // in __shared__ float sh[RMAX] indexed by r < R, so an override above RMAX
+  // writes out of bounds in shared memory -- silently, and it would show up as
+  // wrong logits, not as an error.
+  if (fR >= 32 && fR <= RMAX) c.R = fR;
+  else if (fR > RMAX) { printf("LFM_R=%d exceeds RMAX=%d (shared sh[RMAX]) -- using RMAX\n", fR, RMAX); c.R = RMAX; }
   return c;
 }
 static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
@@ -1238,6 +1258,7 @@ int main(int argc, char** argv) {
   if (prompt.empty()) prompt.push_back(124894);                 // bos
   std::vector<int> toks = prompt;
   cudaEvent_t evA, evB; cudaEventCreate(&evA); cudaEventCreate(&evB);
+  if (g_time) { cudaEventCreate(&g_evA); cudaEventCreate(&g_evB); }
 
   printf("step tok        ms   tok/s\n");
   double tot = 0; int ng = 0;
@@ -1247,6 +1268,7 @@ int main(int argc, char** argv) {
     const bf16* lm_head_input = M.x;   // replaced by the embedding_norm output below
     if (pos >= MAXTOK) break;
     cudaEventRecord(evA);
+    phBegin();
     if (emb->dtype == 3) {
       // bf16 payload: the row IS bf16, so it is a 4 KB copy -- no dequant.
       // Handing k_dequant_row a dtype-3 entry reads emb->ds, which is null
@@ -1277,7 +1299,9 @@ int main(int argc, char** argv) {
     }
 
     int ci = 0;
+    double* phase = nullptr;
     for (int L = 0; L < NLAYER; L++) {
+      if (g_time) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[L] ? &g_tAttn : &g_tConv; }
       rms1(M, M.x, NW(M, L, "operator_norm.weight"), M.h1);
       g_probe = trace && L == g_probe_layer && s == g_probe_step;
       PROBE("operator_norm", M.h1, H);
@@ -1385,6 +1409,8 @@ int main(int argc, char** argv) {
     // ~0.018 a real residual add gives). Position 0 was exact because the
     // alias is installed after step 0's logits -- the classic "first token
     // is right, everything after is garbage" signature.
+    if (g_time && phase) phEnd(*phase);
+    phBegin();
     {
       Ent* fn = T(M, "lfm.model.embedding_norm.weight");
       rms1(M, M.x, fn ? fn->df : nullptr, M.h1);
@@ -1395,6 +1421,8 @@ int main(int argc, char** argv) {
     // upload, and T() only knows registered/uploaded entries, so it prints
     // "MISSING TENSOR" and falls through to the Q8 lm_head. `emb` is the
     // pointer the ents loop above already resolved, host mode or not.
+    phEnd(g_tNorm);
+    phBegin();
     Ent* eemb = emb;
     if (eemb && eemb->dtype == 3 && M.emb_mode == 1 && M.hemb.hc)
       lm_head_bf16_host(M, M.hemb, lm_head_input, M.lgf);  // certified arm, host-staged
@@ -1410,6 +1438,7 @@ int main(int argc, char** argv) {
     int nt = -1;
     cudaMemcpy(&nt, M.tok_dev, 4, cudaMemcpyDeviceToHost);
     toks.push_back(nt);
+    phEnd(g_tHead);
     if (dump_logits && s == steps - 1) {
       std::vector<float> lg(VOCAB);
       cudaMemcpy(lg.data(), M.lgf, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost);
@@ -1423,6 +1452,10 @@ int main(int argc, char** argv) {
     cudaError_t e2 = cudaGetLastError();
     if (e2 != cudaSuccess) { printf("CUDA ERROR after step %d: %s\n", s, cudaGetErrorString(e2)); return 1; }
   }
+  if (g_time && ng > 0)
+    printf("PHASES ms/tok: emb %.2f  conv %.2f  attn %.2f  finalnorm %.2f  lm_head %.2f  sum %.2f\n",
+           g_tEmb / ng, g_tConv / ng, g_tAttn / ng, g_tNorm / ng, g_tHead / ng,
+           (g_tEmb + g_tConv + g_tAttn + g_tNorm + g_tHead) / ng);
   if (ng > 0)
     printf("steady-state %.2f ms/token -> %.2f tok/s over %d steps "
            "(GEMV-only budget was 127.7 ms)\n", tot / ng, 1000.0 * ng / tot, ng);
