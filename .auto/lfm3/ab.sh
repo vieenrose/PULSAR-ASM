@@ -20,10 +20,10 @@ A1="${1:-}"
 A2="${2:-}"
 PROMPT="$(python3 -c "import json;print(','.join(map(str,json.load(open('golden_greedy_A.json'))['prompt_ids'])))")"
 N="${STEPS:-48}"
+ARGS="${LFM3_ARGS:-}"
 
 # One build, both arms: rebuilding between arms would measure the compiler.
 scp -o ConnectTimeout=20 -q ../../pulsar_arm/asm/lfm3_nanode.cu "$NANO:$DIR/" 2>/dev/null || { echo "scp failed"; exit 2; }
-ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
 BOUT=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
   "cd $DIR && rm -f $BIN.new && export PATH=/usr/local/cuda/bin:\$PATH && nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o $BIN.new lfm3_nanode.cu -lz 2>&1; test -x $BIN.new && mv -f $BIN.new $BIN && echo BUILT_OK" 2>/dev/null | grep -vi setlocale)
 echo "$BOUT" | grep -E "error:" | head -12

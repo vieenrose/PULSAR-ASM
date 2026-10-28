@@ -194,3 +194,28 @@ device memory; est. 1.5-3%; the Bonsai Nano engine's kept lever on this board); 
 three zombie `lfm3_conv_test` processes (unkillable, blocking reboot) steal 3 of 4 cores, so
 today's absolutes are inflated; (4) a top-k-vs-HF logit agreement gate, which is the
 quantitative version of "how close is this engine to HF".
+
+### CUDA graphs: scoped, not attempted (est. 1.5-3%, ~2 h, hot-kernel risk)
+
+Scoping found five classes of per-step state baked into launch parameters, all of which must
+move to device memory before a capture is valid:
+
+1. `k_dequant_row` (Q8 path): the host computes codes/scale pointers with `tok` and does two
+   pinned-host `cudaMemcpyAsync` at token-dependent offsets.
+2. the input embedding row for `dtype == 3`: a `cudaMemcpy` at `tok * H * 2`.
+3. `k_rope(q)`, `k_rope(k)`: `pos` is a kernel argument (2 launches per attention layer).
+4. **The KV cache writes: the q/k/v GEMVs write directly into `M.kc + L*MAXTOK*NKV*HD +
+   pos*NKV*HD`, so `pos` is baked into the *output pointer* of 3 GEMV launches per attention
+   layer = 33 pointers.** This is the blocker: fixing it means adding
+   `(base, const int* pos, stride)` to `q8_partial`/its combine, i.e. changing the most
+   performance-critical kernel in the file — the one the plan certifies bit-exact on 18 shapes.
+5. `k_attn_head`: `np = pos + 1` (its grid is over heads, so a device-read `np` is fine).
+
+The pinned-host-slot trick handles 1-2 (a kernel reads pinned memory at execution time, so a
+fixed source address carries a changing value); 3 and 5 are one-line kernel changes; **4 is the
+work, and it touches the certified kernel.** Suggested order: (a) add the pos-indirect output
+pointer to the GEMV behind a flag, verify bit-exactness on the 18-shape probe and the gates;
+(b) then capture on a non-default stream after 2 warmup steps and replay, keeping the logits
+D2H readback outside the graph; (c) `--trace` probes must stay off under graphs (their
+destination buffers are per-call locals). Measure with `ab.sh`; expect the win to be largest
+while the board is CPU-starved, which is also when the estimate is noisiest.

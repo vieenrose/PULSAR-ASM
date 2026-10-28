@@ -141,11 +141,21 @@ __global__ void k_bf2f(const bf16* __restrict__ in, float* __restrict__ out, int
   if (i < n) out[i] = bf2f(in[i]);
 }
 
+// Stage an activation value into shared. The float overload is the historical
+// path (k_bf2f converted bf16 -> float into M.xf first, then the GEMV copied
+// floats); the bf16 overload folds that conversion into the GEMV's own x
+// staging, so the ~110 k_bf2f launches per token (~0.5 ms of launch overhead +
+// one full pass over x) disappear. Bit-identical by construction: both put
+// bf2f(x_bf16) in the same shared slots in the same order.
+__device__ __forceinline__ float lfm_stage(float v) { return v; }
+__device__ __forceinline__ float lfm_stage(bf16 v) { return bf2f(v); }
+
 // Q8_0 pass 1: R rows x one chunk, one WARP per row, lanes striding the
 // chunk's blocks, x staged in shared. This is the kernel whose 14-16.5 GB/s
 // rate underlies the 127.7 ms/token budget (q8_lc3.cu, commit 2b5cbe5).
+template <typename TX>
 __global__ void q8_partial(const int8_t* __restrict__ q, const float* __restrict__ s,
-                           const float* __restrict__ x, float* __restrict__ part,
+                           const TX* __restrict__ x, float* __restrict__ part,
                            int N, int K, int KCHUNK, int R, int nb) {
   extern __shared__ float xs[];
   const int nchunk = K / KCHUNK;
@@ -153,10 +163,10 @@ __global__ void q8_partial(const int8_t* __restrict__ q, const float* __restrict
   const int chunk = blockIdx.x % nchunk;
   const int koff = chunk * KCHUNK;
   const int NT = blockDim.x, tid = threadIdx.x;
-  const float* xg = x + koff;
+  const TX* xg = x + koff;
   for (int i = tid; i < KCHUNK; i += NT) {
     const int b = i >> 5, j = i & 31;
-    xs[b * 33 + j] = xg[i];
+    xs[b * 33 + j] = lfm_stage(xg[i]);
   }
   __syncthreads();
   __shared__ float sh[RMAX];
@@ -466,6 +476,9 @@ struct Ent {
 // split is guessing. Events + one sync per phase, so the instrumentation
 // itself costs ~0.25 ms/token -- a diagnostic, not a shipping mode.
 static const bool g_time = getenv("LFM_TIME") != nullptr;
+// LFM_NOFUSE=1 restores the separate k_bf2f pass (the A/B control for the
+// fused GEMV prologue; the fused form is the default and is bit-identical).
+static const bool g_nofuse = getenv("LFM_NOFUSE") != nullptr;
 // LFM_MERGE=1: concatenate the FFN's gate (w1) and up (w3) projections into
 // ONE Q8 tensor per layer and run a single GEMV. Each is N=6144, K=2048, so
 // alone they launch 24 blocks of R=256 rows each; merged they are 48 blocks
@@ -858,8 +871,12 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   if (nchunk * c.KCHUNK != K) { printf("%s: coverage FAIL\n", name.c_str()); exit(2); }
   const int nblk = ((N + c.R - 1) / c.R) * nchunk;
   const size_t shm = (size_t)nb * 33 * 4;
-  k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
-  q8_partial<<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
+  if (g_nofuse) {
+    k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
+    q8_partial<float><<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
+  } else {
+    q8_partial<bf16><<<nblk, c.TPB, shm>>>(e->dq, e->ds, xb, M.part, N, K, c.KCHUNK, c.R, nb);
+  }
   k_combine_bf<<<(N + 255) / 256, 256>>>(M.part, yb, N, nchunk);
 }
 // ------------------------------------------------------------------ lm_head
@@ -1053,7 +1070,7 @@ static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
                     cudaMemcpyHostToDevice, 0);
     const int nblk = ((nr + c.R - 1) / c.R) * nchunk;
     const size_t shm = (size_t)nb * 33 * 4;
-    q8_partial<<<nblk, c.TPB, shm>>>(E.dc, E.dsl, M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
+    q8_partial<float><<<nblk, c.TPB, shm>>>(E.dc, E.dsl, M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
     k_combine_f<<<(nr + 255) / 256, 256>>>(M.part, yf + r0, nr, nchunk);
   }
 }
@@ -1066,8 +1083,12 @@ static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf)
   const int nb = c.KCHUNK / Q8_BLK, nchunk = K / c.KCHUNK;
   const int nblk = ((N + c.R - 1) / c.R) * nchunk;
   const size_t shm = (size_t)nb * 33 * 4;
-  k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
-  q8_partial<<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
+  if (g_nofuse) {
+    k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
+    q8_partial<float><<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
+  } else {
+    q8_partial<bf16><<<nblk, c.TPB, shm>>>(e->dq, e->ds, xb, M.part, N, K, c.KCHUNK, c.R, nb);
+  }
   k_combine_f<<<(N + 255) / 256, 256>>>(M.part, yf, N, nchunk);
   // Per-launch check, env-gated. Without it a faulting kernel is reported by
   // the NEXT checked call, which in a long layer chain points at an innocent
