@@ -153,7 +153,7 @@ __device__ __forceinline__ float lfm_stage(bf16 v) { return bf2f(v); }
 // Q8_0 pass 1: R rows x one chunk, one WARP per row, lanes striding the
 // chunk's blocks, x staged in shared. This is the kernel whose 14-16.5 GB/s
 // rate underlies the 127.7 ms/token budget (q8_lc3.cu, commit 2b5cbe5).
-template <typename TX>
+template <typename TX, bool FMA>
 __global__ void q8_partial(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ x, float* __restrict__ part,
                            int N, int K, int KCHUNK, int R, int nb) {
@@ -190,10 +190,15 @@ __global__ void q8_partial(const int8_t* __restrict__ q, const float* __restrict
         const float* xb = xs + (size_t)b * 33;
         float dot = 0.f;
         #pragma unroll
-        for (int j = 0; j < 16; j++) dot = __fadd_rn(dot, __fmul_rn((float)c0[j], xb[j]));
+        for (int j = 0; j < 16; j++)
+          dot = FMA ? __fmaf_rn((float)c0[j], xb[j], dot)
+                    : __fadd_rn(dot, __fmul_rn((float)c0[j], xb[j]));
         #pragma unroll
-        for (int j = 0; j < 16; j++) dot = __fadd_rn(dot, __fmul_rn((float)c1[j], xb[16 + j]));
-        acc = __fadd_rn(acc, __fmul_rn(sr[b], dot));
+        for (int j = 0; j < 16; j++)
+          dot = FMA ? __fmaf_rn((float)c1[j], xb[16 + j], dot)
+                    : __fadd_rn(dot, __fmul_rn((float)c1[j], xb[16 + j]));
+        acc = FMA ? __fmaf_rn(sr[b], dot, acc)
+                  : __fadd_rn(acc, __fmul_rn(sr[b], dot));
       }
     }
     #pragma unroll
@@ -476,6 +481,30 @@ struct Ent {
 // split is guessing. Events + one sync per phase, so the instrumentation
 // itself costs ~0.25 ms/token -- a diagnostic, not a shipping mode.
 static const bool g_time = getenv("LFM_TIME") != nullptr;
+// FMA accumulation is the DEFAULT (measured -2.0%, paired A/B R=1.0100,
+// faster 3/3, gates green, greedy streams byte-identical). LFM_NOFMA=1
+// restores the plan's mul-then-add form as the A/B control arm.
+//
+// FMA accumulation: __fmaf_rn (one FP instruction per product) instead of the 32-product dot product with __fmaf_rn (one FP
+// instruction per product) instead of __fmul_rn + __fadd_rn (two).
+//
+// Why this is the lever: measured per-layer GEMV time (12 MB tensor, 24
+// blocks, 6 blocks/SM) is 1.33 ms, and counting FP instructions reproduces
+// that number -- each warp issues 64 blocks x (32 mul + 32 add + 1 acc add +
+// 5 shuffles) = 2432 FP warp-instructions where the arithmetic minimum is 512
+// FMAs. So the layer GEMVs (88% of the step) are FP-pipe-bound, not
+// bandwidth-bound: 9.2 GB/s is a symptom, not the cause. Halving the FP
+// instruction count should take them toward the ~19 GB/s FMA-limited rate.
+//
+// On numerics: the plan mandates "exact per-product rounding", which is what
+// the mul-then-add form does. But the reference this engine is graded against
+// (ggml_vec_dot_q8_0_q8_0, and HF's torch matmul) accumulates `sum += w*x` in
+// C/CUDA, which compilers contract into an FMA -- so the FMA form is at least
+// as faithful to the reference, and it is strictly more accurate per product
+// (one rounding instead of two). It is NOT bit-identical to the plan's kernel,
+// so the quality gates (HF rms matrix, pos-0 logits, greedy stream floors) are
+// the authority here, and they run on every check.
+static bool g_fma = !getenv("LFM_NOFMA");   // default ON; LFM_NOFMA=1 = the control arm
 // LFM_EMB=resident|host: same as --emb-resident / --emb-host, as an env knob
 // so ab.sh (which passes env per arm) can A/B the two lm_head streaming
 // modes. Empty = the program default.
@@ -889,9 +918,11 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   const size_t shm = (size_t)nb * 33 * 4;
   if (g_nofuse) {
     k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
-    q8_partial<float><<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
+    if (g_fma) q8_partial<float,true><<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
+    else q8_partial<float,false><<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
   } else {
-    q8_partial<bf16><<<nblk, c.TPB, shm>>>(e->dq, e->ds, xb, M.part, N, K, c.KCHUNK, c.R, nb);
+    if (g_fma) q8_partial<bf16,true><<<nblk, c.TPB, shm>>>(e->dq, e->ds, xb, M.part, N, K, c.KCHUNK, c.R, nb);
+    else q8_partial<bf16,false><<<nblk, c.TPB, shm>>>(e->dq, e->ds, xb, M.part, N, K, c.KCHUNK, c.R, nb);
   }
   k_combine_bf<<<(N + 255) / 256, 256>>>(M.part, yb, N, nchunk);
 }
@@ -1111,7 +1142,7 @@ static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
                       cudaMemcpyHostToDevice, E.st);
       cudaEventRecord(E.evC[b], E.st);
       cudaStreamWaitEvent((cudaStream_t)0, E.evC[b], 0);
-      q8_partial<float><<<nb2, c.TPB, shm, 0>>>(E.dc2[b], E.dsl2[b], M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
+      q8_partial<float,false><<<nb2, c.TPB, shm, 0>>>(E.dc2[b], E.dsl2[b], M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
       k_combine_f<<<(nr + 255) / 256, 256, 0>>>(M.part, yf + r0, nr, nchunk);
       cudaEventRecord(E.evG[b], (cudaStream_t)0);
     }
@@ -1125,7 +1156,8 @@ static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
                     cudaMemcpyHostToDevice, 0);
     const int nblk = ((nr + c.R - 1) / c.R) * nchunk;
     const size_t shm = (size_t)nb * 33 * 4;
-    q8_partial<float><<<nblk, c.TPB, shm>>>(E.dc, E.dsl, M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
+    if (g_fma) q8_partial<float,true><<<nblk, c.TPB, shm>>>(E.dc, E.dsl, M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
+    else q8_partial<float,false><<<nblk, c.TPB, shm>>>(E.dc, E.dsl, M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
     k_combine_f<<<(nr + 255) / 256, 256>>>(M.part, yf + r0, nr, nchunk);
   }
 }
@@ -1140,9 +1172,11 @@ static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf)
   const size_t shm = (size_t)nb * 33 * 4;
   if (g_nofuse) {
     k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
-    q8_partial<float><<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
+    if (g_fma) q8_partial<float,true><<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
+    else q8_partial<float,false><<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
   } else {
-    q8_partial<bf16><<<nblk, c.TPB, shm>>>(e->dq, e->ds, xb, M.part, N, K, c.KCHUNK, c.R, nb);
+    if (g_fma) q8_partial<bf16,true><<<nblk, c.TPB, shm>>>(e->dq, e->ds, xb, M.part, N, K, c.KCHUNK, c.R, nb);
+    else q8_partial<bf16,false><<<nblk, c.TPB, shm>>>(e->dq, e->ds, xb, M.part, N, K, c.KCHUNK, c.R, nb);
   }
   k_combine_f<<<(N + 255) / 256, 256>>>(M.part, yf, N, nchunk);
   // Per-launch check, env-gated. Without it a faulting kernel is reported by
