@@ -219,3 +219,93 @@ pointer to the GEMV behind a flag, verify bit-exactness on the 18-shape probe an
 D2H readback outside the graph; (c) `--trace` probes must stay off under graphs (their
 destination buffers are per-call locals). Measure with `ab.sh`; expect the win to be largest
 while the board is CPU-starved, which is also when the estimate is noisiest.
+
+## Session 3 (2026-10-29, runs #92-#101): the GEMV is FP-pipe-bound, not bandwidth-bound
+
+`LFM_TIME` said conv 77 + attn 61 = 88% of the step in the 24 layer GEMVs at 9.0-9.4 GB/s,
+against the lm_head's 14 and a measured 17 GB/s streaming ceiling. Four structural levers were
+implemented and measured; all four are measured out. The win came from instruction counting.
+
+### The finding
+
+Per row the inner loop did `dot = __fadd_rn(dot, __fmul_rn(c[j], x[j]))` for 32 products, then
+`acc = __fadd_rn(acc, __fmul_rn(scale, dot))` over 64 blocks. That is **2 FP instructions per
+product** (the plan's deliberate exact-per-product rounding, reinforced by the build's
+`-fmad=false`), plus a loop-carried serial chain. Counting them -- 64 x (32 mul + 32 add +
+1 acc + 5 shuffles) = 2432 FP warp-instructions per warp, where the arithmetic minimum is 512
+FMAs -- reproduces the measured 1.33 ms/layer almost exactly. **The kernel was issuing 4.75x
+the necessary FP work; 9.2 GB/s was a symptom, not a cause.**
+
+`__fmaf_rn` accumulation: **139.14 -> 136.41 ms/token (-2.0%, R=1.0100, faster 3/3)**, every
+GEMV phase improving 6-8.5% (conv 76.4->70.6, attn 60.3->56.6, lm_head 19.8->18.5), gates green,
+greedy streams byte-identical, logit corr unchanged at 0.99998, and the logit std moved marginally
+*closer* to HF (4.564 vs 4.558 against HF's 4.547). ggml's own reference dot product is
+`sum += w*x` in C, which compilers contract to an FMA -- so the FMA form is at least as faithful
+to the reference as the plan's mul-then-add, and strictly more accurate per product.
+**Shipped: 141.04 -> 136.4 ms/token (7.33 tok/s), -3.3%.**
+
+### Measured out this session (paired A/B, one pair in each order)
+
+| lever | result |
+|---|---|
+| fused `k_bf2f` into the GEMV's x staging (bit-identical, ~110 fewer launches) | **+0.39%, kept** |
+| resident vs the plan's prescribed `--emb-host` lm_head streaming | **+10.4%, resident is already the default** |
+| double-buffered lm_head row streaming (2 slabs, 2nd stream, events, WAR guard) | **2.6x WORSE** (lm_head 19.8 -> 52.5 ms) |
+| CUDA graphs of the 24-layer loop (the plan's #1 next lever, est. 1.5-3%) | **-0.55%** |
+| merged gate+up GEMV (the Bonsai Nano technique) | +0.33% for 679 MB |
+| `-fmad=true` build-wide (contracts the conv/attention/norm kernels too) | +0.06% = nothing |
+| `__ldcs` streaming loads on the once-read Q8 code bytes | R = 1.0001 = nothing |
+| KCHUNK=1024 / TPB=512 / R=64, **re-run under FMA** | -5.3% / -3.6% / -6.5% (all confirmed, all slightly worse than pre-FMA) |
+
+**Why CUDA graphs lose here** (worth recording, since the plan recommends them): the GPU spends
+136 ms per step and the CPU issues all ~250 launches in ~1 ms, so the launch queue runs 250
+steps ahead and launches are nowhere near the critical path. A graph can only add its own
+launch cost. The Bonsai Nano engine gains from graphs because its per-phase work is 5-kernel
+chains with a captured graph per phase; this engine's hot path is 2 launches of 500 blocks
+(lm_head) plus 24 layers of large blocks.
+
+**Why streaming the lm_head from pinned host is 10% slower**: on Tegra the H2D copy and the GEMV
+share the 21.9 GB/s bus, so streaming costs *two* full passes over 278 MB. The plan's `--emb-host`
+requirement was sized for the 1944 MB whole-backbone-Q8_0 config; the Q8-embedding blob is
+1466 MB and fits resident with ~2.8 GB device free, so no streaming is needed at all.
+
+### Where the remaining time is, and why it is hard
+
+conv 70.6 + attn 56.6 + lm_head 18.5 = 136 ms. The GEMV is now at 512 FMA-instructions/warp --
+the arithmetic minimum -- and the config (R=256, TPB=256, KCHUNK=K=2048) is a characterized
+optimum on both accumulation forms. Per-layer time exceeds the GEMV byte floor by 1.9 ms
+(attention) and 2.9 ms (conv), and graphs proved that is not launch overhead: it is the strict
+q/k/v -> rope -> cache -> attention -> o_proj dependency chain plus the elementwise kernels
+inside those phases, which are small and latency-bound. Bytes per token are pinned by the
+quality gate: further large gains need fewer bytes per token (lower-bit weights), which is
+measured out on quality (plan: Q4 = 5/8, worst prefix 0).
+
+### Process notes (the expensive ones)
+
+* **The "prove the code path ran" rule caught three false results this session**: the
+  double-buffer A/B reported R=0.9999 on a path that never executed (the default lm_head is
+  resident, so `lm_head_host` was not called); the FMA gate run through `PQ1_EXTRA` reported
+  byte-identical green gates while measuring the *non-FMA* arm (`checks.sh` has no env
+  propagation -- use `LFM_FMA=1 bash checks.sh`, which flows shell -> python -> subprocess);
+  two `__ldcs` A/Bs measured unmodified code because the patch's patterns had drifted
+  (indentation, the `g_launch` argument). Tell for a null probe: R exactly 1.0000 *and* arm
+  numbers matching the control to 4 digits means the knob was inert.
+* `log_experiment`'s auto-revert does not reliably restore files that a later patch also
+  touched: the CUDA-graph code survived the #99 discard and is in the tree (behind its flag,
+  gates green), which is how I had documented it -- verified, not assumed.
+* Greedy stream prefixes are stable to a 1-ULP perturbation on these two prompts (all 16
+  tokens unchanged by the FMA switch), so stream equality is a weak discriminator for
+  accumulation-order changes; the rms matrix and logit std/corr are the sensitive ones.
+
+### Open items
+
+* **Power cycle the Nano.** Three unkillable `lfm3_conv_test` processes from 2026-10-28 own 3
+  of 4 A57 cores; today's absolutes are inflated, only paired A/B is sound.
+* A top-k-vs-HF logit agreement gate: the quantitative version of "how close is this engine to
+  HF", and the natural gate for any future accumulation-order change.
+* Prompts C-L goldens carry no `prompt_ids`, so the stream gate scores only A/B.
+* Promising-but-deferred: (1) FMA'ing the fp32 scale path in the lm_head combine (0.2 ms of 18.5,
+  marginal); (2) a persistent-kernel GEMV to test whether the per-layer 1.9-2.9 ms excess is
+  block-scheduling rather than the dependency chain; (3) re-measuring the resident lm_head's
+  14 GB/s against the 17 GB/s ceiling after the power cycle -- if the ceiling moves, the GEMV
+  config sweep should be repeated, since it was run under CPU starvation.
