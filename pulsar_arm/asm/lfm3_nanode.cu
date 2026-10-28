@@ -119,18 +119,12 @@ __device__ __forceinline__ bf16 f2bf(float v) {
 // bytes out of the codes arena and called it bf16 -- correct only for a bf16
 // payload, which this blob does not have. Latent: nothing reached it.
 
-// Env-gated per-launch diagnostics. A faulting kernel is reported by the NEXT
-// checked call, which in a 300-launch layer chain points at an innocent
-// victim -- it cost a full cycle blaming the bf16 lm_head for a fault that
-// surfaced two kernels later. LFM_DBG_LAUNCH prints the first error per
-// launch site; LFM_DBG_LAUNCH_SYNC also syncs, making it exact.
-static const bool g_dbg_launch = getenv("LFM_DBG_LAUNCH") != nullptr;
-static const bool g_dbg_sync   = getenv("LFM_DBG_LAUNCH_SYNC") != nullptr;
-#define CHKLAUNCH(nm) do { if (g_dbg_launch) {                                       \
-    cudaError_t le_ = cudaGetLastError();                                            \
-    if (le_ != cudaSuccess) { fprintf(stderr, "[launch] %s: %s\n", nm,               \
-                                      cudaGetErrorString(le_)); fflush(stderr); }     \
-    if (g_dbg_sync) cudaDeviceSynchronize(); } } while (0)
+// (Per-launch diagnostics live here when needed: an env-gated CHKLAUNCH at every
+//  launch site, LFM_DBG_LAUNCH=1 prints cudaGetLastError() after each, LFM_DBG_
+//  LAUNCH_SYNC also syncs. Added 2026-10-29 to separate "this kernel faults" from
+//  "the async fault surfaced two kernels later"; removed again because the macro's
+//  line continuations broke three builds while chasing a loader bug. Re-add as a
+//  static function, not a multiline macro.)
 
 __global__ void k_dequant_row(const int8_t* __restrict__ c, const float* __restrict__ sc,
                               bf16* __restrict__ out, int k) {
@@ -589,6 +583,16 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
     if (skq) {}
     else if (e.dtype == 1 || e.dtype == 3) { if (!hostemb) { M.need_q += e.nc; M.need_s += e.ns; } }
     else M.need_f += e.nc;
+    // LFM_DBG_SIZE=1 dumps the per-tensor sizing decisions: the upload loop
+    // and this pass MUST agree, and when they don't the failure is an
+    // "invalid argument" cudaMemcpy 1.47 GB into the load with only the
+    // arena's totals to go on. (Certified blob, mode 1: sizing 1,466,269,696
+    // vs upload 1,471,381,504 = 5,111,808 bytes unaccounted.)
+    if (getenv("LFM_DBG_SIZE"))
+      printf("SIZE %-56s dtype=%d nc=%zu ns=%zu -> %s\n", e.name.c_str(), e.dtype,
+             (size_t)e.nc, (size_t)e.ns, skq ? "skip(selftest)"
+                                 : hostemb ? "skip(emb-host)"
+                                 : (e.dtype == 1 || e.dtype == 3) ? "codes" : "f32");
     if (e.name == EMBNAME) M.emb_file_off = base_data + e.file_off;
     M.ents.push_back(e);
     p = e1 + 1;
@@ -769,11 +773,8 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   const int nblk = ((N + c.R - 1) / c.R) * nchunk;
   const size_t shm = (size_t)nb * 33 * 4;
   k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
-  CHKLAUNCH("k_bf2f");
   q8_partial<<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
-  CHKLAUNCH("q8_partial");
   k_combine_bf<<<(N + 255) / 256, 256>>>(M.part, yb, N, nchunk);
-  CHKLAUNCH("k_combine_bf");
 }
 // ------------------------------------------------------------------ lm_head
 // The tied embedding is 128000 x 2048 -- 262 MB of Q8 codes + 8 MB of fp32
@@ -899,7 +900,6 @@ __global__ void k_gemv_bf16(const bf16* __restrict__ W, const float* __restrict_
 static void lm_head_bf16(Model& M, Ent* emb, const bf16* xb, float* yf) {
   const int K = (int)emb->ne[1], N = (int)emb->ne[0];
   k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);   // M.xf is the shared x-float buffer
-  CHKLAUNCH("k_bf2f");
   const int R = 32;                       // rows per block; tuned in measure.sh
   if (getenv("LFM_DBG_SPANS")) {
     // Validate EVERY Q8 tensor's full span against its arena, on the host, at
@@ -934,8 +934,6 @@ static void lm_head_bf16(Model& M, Ent* emb, const bf16* xb, float* yf) {
             (long)emb->ne[0], (long)emb->ne[1], emb->dtype, (long long)emb->nc, (long long)emb->ns);
   k_gemv_bf16<<<(N + R - 1) / R, 256, K * sizeof(float)>>>(
       (const bf16*)emb->dq, M.xf, yf, N, K, R);
-  CHKLAUNCH("k_gemv_bf16");
-      (const bf16*)emb->dq, M.xf, yf, N, K, R);
 }
 
 // Certified arm, host-staged: stream rows/slab of the pinned bf16 embedding
@@ -945,15 +943,12 @@ static void lm_head_bf16(Model& M, Ent* emb, const bf16* xb, float* yf) {
 static void lm_head_bf16_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
   const int N = E.N, K = E.K;
   k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
-  CHKLAUNCH("k_bf2f");
   const int R = 32;
   for (int r0 = 0; r0 < N; r0 += E.rows) {
     const int nr = (N - r0 < E.rows) ? (N - r0) : E.rows;
     cudaMemcpyAsync(E.dc, (const char*)E.hc + (size_t)r0 * K * 2, (size_t)nr * K * 2,
                     cudaMemcpyHostToDevice, 0);
     k_gemv_bf16<<<(nr + R - 1) / R, 256, K * sizeof(float)>>>(
-        (const bf16*)E.dc, M.xf, yf + r0, nr, K, R);
-    CHKLAUNCH("k_gemv_bf16");
         (const bf16*)E.dc, M.xf, yf + r0, nr, K, R);
   }
 }
@@ -963,7 +958,6 @@ static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
   GemvCfg c = pick(N, K);                       // SAME config as the resident
   const int nb = c.KCHUNK / Q8_BLK, nchunk = K / c.KCHUNK;   // path -> same bits
   k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
-  CHKLAUNCH("k_bf2f");
   const int sb = K / Q8_BLK;                    // scales per row
   for (int r0 = 0; r0 < N; r0 += E.rows) {
     const int nr = (N - r0 < E.rows) ? (N - r0) : E.rows;
@@ -974,9 +968,7 @@ static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
     const int nblk = ((nr + c.R - 1) / c.R) * nchunk;
     const size_t shm = (size_t)nb * 33 * 4;
     q8_partial<<<nblk, c.TPB, shm>>>(E.dc, E.dsl, M.xf, M.part, nr, K, c.KCHUNK, c.R, nb);
-    CHKLAUNCH("q8_partial");
     k_combine_f<<<(nr + 255) / 256, 256>>>(M.part, yf + r0, nr, nchunk);
-    CHKLAUNCH("k_combine_f");
   }
 }
 
@@ -989,11 +981,8 @@ static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf)
   const int nblk = ((N + c.R - 1) / c.R) * nchunk;
   const size_t shm = (size_t)nb * 33 * 4;
   k_bf2f<<<(K + 255) / 256, 256>>>(xb, M.xf, K);
-  CHKLAUNCH("k_bf2f");
   q8_partial<<<nblk, c.TPB, shm>>>(e->dq, e->ds, M.xf, M.part, N, K, c.KCHUNK, c.R, nb);
-  CHKLAUNCH("q8_partial");
   k_combine_f<<<(N + 255) / 256, 256>>>(M.part, yf, N, nchunk);
-  CHKLAUNCH("k_combine_f");
   // Per-launch check, env-gated. Without it a faulting kernel is reported by
   // the NEXT checked call, which in a long layer chain points at an innocent
   // victim (it cost a cycle chasing the bf16 lm_head for a fault that was in
@@ -1011,15 +1000,12 @@ static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf)
 // projection is normal; the weight's own K is authoritative).
 static void rms1(Model& M, const bf16* x, const float* w, bf16* y) {
   k_rmsnorm<<<1, 256>>>(x, w, y, NORM_EPS, H);
-  CHKLAUNCH("k_rmsnorm");
 }
 static void emul(Model& M, const bf16* a, const bf16* b, bf16* y, int n) {
   k_mul_bf<<<(n + 255) / 256, 256>>>(a, b, y, n);
-  CHKLAUNCH("k_mul_bf");
 }
 static void eadd(Model& M, const bf16* a, const bf16* b, bf16* y, int n) {
   k_add_bf<<<(n + 255) / 256, 256>>>(a, b, y, n);
-  CHKLAUNCH("k_add_bf");
 }
 
 // Per-layer fingerprint for localizing a divergence (the perlayer_probe role
@@ -1270,9 +1256,13 @@ int main(int argc, char** argv) {
       // like a memory-pool problem.
       const char* src = (M.emb_mode == 1 && M.hemb.hc) ? (const char*)M.hemb.hc
                                                        : (const char*)emb->dq;
-      CUDACHK(cudaMemcpy(M.x, src + (size_t)tok * H * 2, (size_t)H * 2,
-                         M.emb_mode == 1 ? cudaMemcpyHostToDevice
-                                         : cudaMemcpyDeviceToDevice));
+      cudaError_t ce = cudaMemcpy(M.x, src + (size_t)tok * H * 2, (size_t)H * 2,
+                                  M.emb_mode == 1 ? cudaMemcpyHostToDevice
+                                                  : cudaMemcpyDeviceToDevice);
+      if (ce != cudaSuccess) {
+        printf("bf16 embedding row copy failed: %s\n", cudaGetErrorString(ce));
+        return 1;
+      }
     } else if (M.emb_mode == 1) {
       // row of the pinned host embedding -> slab -> bf16
       const int sb = H / Q8_BLK;
@@ -1281,11 +1271,8 @@ int main(int argc, char** argv) {
       cudaMemcpyAsync(M.hemb.dsl, M.hemb.hs + (size_t)tok * sb, (size_t)sb * 4,
                       cudaMemcpyHostToDevice, 0);
       k_dequant_row<<<(H + 255) / 256, 256>>>(M.hemb.dc, M.hemb.dsl, M.x, H);
-      CHKLAUNCH("k_dequant_row");
     } else {
       k_dequant_row<<<(H + 255) / 256, 256>>>(emb->dq + (size_t)tok * H,
-                                             emb->ds + (size_t)tok * (H / Q8_BLK), M.x, H);
-      CHKLAUNCH("k_dequant_row");
                                              emb->ds + (size_t)tok * (H / Q8_BLK), M.x, H);
     }
 
@@ -1300,18 +1287,14 @@ int main(int argc, char** argv) {
         gemv(M, LN(L, "self_attn.v_proj.weight"), M.h1, M.v);
         gemv(M, LN(L, "self_attn.gate_proj.weight"), M.h1, M.gate);
         k_headnorm<<<NH, 32>>>(M.q, NW(M, L, "self_attn.q_norm.weight"), NORM_EPS, HD);
-        CHKLAUNCH("k_headnorm");
         k_headnorm<<<NKV, 32>>>(M.k, NW(M, L, "self_attn.k_norm.weight"), NORM_EPS, HD);
-        CHKLAUNCH("k_headnorm");
         PROBE("q(postnorm)", M.q, NH * HD);
         PROBE("k(postnorm)", M.k, NKV * HD);
         PROBE("v", M.v, NKV * HD);
         PROBE("gate", M.gate, NH);
         const float* invf = is_slide[L] ? M.invf_slide : M.invf_full;
         k_rope<<<NH, 64>>>(M.q, invf, pos, HD, HD / 2);
-        CHKLAUNCH("k_rope");
         k_rope<<<NKV, 64>>>(M.k, invf, pos, HD, HD / 2);
-        CHKLAUNCH("k_rope");
         PROBE("q(postrope)", M.q, NH * HD);
         bf16* kbase = M.kc + (size_t)L * MAXTOK * NKV * HD;
         bf16* vbase = M.vc + (size_t)L * MAXTOK * NKV * HD;
@@ -1322,10 +1305,8 @@ int main(int argc, char** argv) {
         // /lfm/sliding_window); full_attention layers see all of them.
         const int win = is_slide[L] ? SLIDE_WIN : 0;
         k_attn_head<<<NH, 256>>>(M.q, kbase, vbase, M.attn, pos + 1, win, scaling, HD, NKV);
-        CHKLAUNCH("k_attn_head");
         PROBE("attn", M.attn, NH * HD);
         k_sigmoid_gate<<<1, NH>>>(M.gate, M.attn, HD);
-        CHKLAUNCH("k_sigmoid_gate");
         PROBE("attn*gate", M.attn, NH * HD);
         gemv(M, LN(L, "self_attn.o_proj.weight"), M.attn, M.h2);
         PROBE("o_proj", M.h2, H);
@@ -1349,11 +1330,9 @@ int main(int argc, char** argv) {
         emul(M, M.bx, M.bx + 2 * H, M.h3, H);                   // B * xg
         PROBE("B*x", M.h3, H);
         k_shift_in<<<(H + 63) / 64, 64>>>(ring, M.h3, H);
-        CHKLAUNCH("k_shift_in");
         if (g_probe) for (int k = 0; k < 7; k++)
           printf("    ring slot %d     rms %9.5f\n", k, rms_host_n(ring + (size_t)k * H, H));
         k_conv7<<<(H + 63) / 64, 64>>>(ring, T(M, LN(L, "conv.conv.weight"))->df, M.h4, H);
-        CHKLAUNCH("k_conv7");
         PROBE("conv", M.h4, H);
         emul(M, M.bx + H, M.h4, M.h2, H);                       // C * y
         PROBE("C*y", M.h2, H);
@@ -1372,7 +1351,6 @@ int main(int argc, char** argv) {
       gemv(M, LN(L, "feed_forward.w3.weight"), M.h1, M.h3);
       PROBE("w3", M.h3, INTER);
       k_silu_mul_bf<<<(INTER + 255) / 256, 256>>>(M.h2, M.h3, M.h2, INTER);
-      CHKLAUNCH("k_silu_mul_bf");
       PROBE("silu_mul", M.h2, INTER);
       gemv(M, LN(L, "feed_forward.w2.weight"), M.h2, M.h2);
       PROBE("w2", M.h2, INTER);
@@ -1413,7 +1391,11 @@ int main(int argc, char** argv) {
       lm_head_input = M.h1;
     }
     if (trace && s == g_probe_step) printf("  final rms %.4f\n", rms_host(M, M.x));
-    Ent* eemb = T(M, EMBNAME);
+    // NOT T(M, EMBNAME): under --emb-host the loader skips the embedding's
+    // upload, and T() only knows registered/uploaded entries, so it prints
+    // "MISSING TENSOR" and falls through to the Q8 lm_head. `emb` is the
+    // pointer the ents loop above already resolved, host mode or not.
+    Ent* eemb = emb;
     if (eemb && eemb->dtype == 3 && M.emb_mode == 1 && M.hemb.hc)
       lm_head_bf16_host(M, M.hemb, lm_head_input, M.lgf);  // certified arm, host-staged
     else if (eemb && eemb->dtype == 3)
@@ -1422,7 +1404,6 @@ int main(int argc, char** argv) {
       lm_head_host(M, M.hemb, lm_head_input, M.lgf);     // Q8 streamed from pinned host
     else gemv_f(M, EMBNAME, lm_head_input, M.lgf);       // tied lm_head, resident
     k_argmax<<<1, 256>>>(M.lgf, M.tok_dev, VOCAB);
-    CHKLAUNCH("k_argmax");
     cudaEventRecord(evB);
     cudaEventSynchronize(evB);
     float ms = 0; cudaEventElapsedTime(&ms, evA, evB);

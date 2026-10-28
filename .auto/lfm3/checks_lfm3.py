@@ -108,6 +108,15 @@ def gate_streams(prompts, gen=16, floor=1):
     n_exact = 0
     for p in prompts:
         g = ids_of(p)
+        if "prompt_ids" not in g:
+            # Only A/B carry prompt_ids; the rest store prompt text (the
+            # ids need the chat template + the <|text_start|> modality tag
+            # from oracle.py's build_ids, i.e. the processor). Score what is
+            # machine-checkable and say what was skipped, rather than
+            # crashing mid-gate -- a gate that dies at prompt C reports
+            # nothing about D..L.
+            print("    %s: SKIPPED (golden has no prompt_ids; needs oracle.build_ids)" % p)
+            continue
         out = run_remote("cd %s && timeout 1800 ./%s %s --steps %d --prompt %s 2>&1"
                          % (DIR, BIN, BLOB, len(g["prompt_ids"]) + gen - 1,
                             ",".join(map(str, g["prompt_ids"]))))

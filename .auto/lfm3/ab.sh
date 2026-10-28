@@ -24,7 +24,10 @@ N="${STEPS:-48}"
 # One build, both arms: rebuilding between arms would measure the compiler.
 scp -o ConnectTimeout=20 -q ../../pulsar_arm/asm/lfm3_nanode.cu "$NANO:$DIR/" 2>/dev/null || { echo "scp failed"; exit 2; }
 ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
-  "cd $DIR && export PATH=/usr/local/cuda/bin:\$PATH && nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o $BIN lfm3_nanode.cu -lz 2>&1 | head -20 && test -x $BIN && echo BUILT" 2>/dev/null | grep -vi setlocale | grep -q BUILT || { echo "BUILD FAILED"; exit 1; }
+BOUT=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
+  "cd $DIR && rm -f $BIN.new && export PATH=/usr/local/cuda/bin:\$PATH && nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o $BIN.new lfm3_nanode.cu -lz 2>&1; test -x $BIN.new && mv -f $BIN.new $BIN && echo BUILT_OK" 2>/dev/null | grep -vi setlocale)
+echo "$BOUT" | grep -E "error:" | head -12
+echo "$BOUT" | grep -q BUILT_OK || { echo "BUILD FAILED (refusing to measure a stale binary)"; exit 1; }
 
 run() {   # $1 = env string
   local out

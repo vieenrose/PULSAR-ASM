@@ -28,8 +28,15 @@ scp -o ConnectTimeout=20 -q "$SRC" "$NANO:$DIR/" 2>/dev/null || { echo "scp fail
 
 # Build (the flags are the same set build_lfm3.sh uses -- keep them in sync).
 ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
-  "cd $DIR && export PATH=/usr/local/cuda/bin:\$PATH && nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o $BIN lfm3_nanode.cu -lz 2>&1 | head -20" 2>/dev/null | grep -vi setlocale
-ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" "test -x $DIR/$BIN && echo BUILT || echo BUILD_FAILED" 2>/dev/null | grep -vi setlocale | grep -q BUILT || { echo "BUILD FAILED"; exit 1; }
+# `test -x $BIN` is NOT a build check: nvcc leaves the previous binary in
+# place when compilation fails, so a broken tree measures the last good
+# build and every number is silently stale (this repo's handoff warns about
+# exactly this: "nvcc -o exits 0 on link failure", "a missing -DPQ1_REAL_CUDA
+# and the branch that returned early"). Require an error-free compile.
+BOUT=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
+  "cd $DIR && rm -f $BIN.new && export PATH=/usr/local/cuda/bin:\$PATH && nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o $BIN.new lfm3_nanode.cu -lz 2>&1; test -x $BIN.new && mv -f $BIN.new $BIN && echo BUILT_OK" 2>/dev/null | grep -vi setlocale)
+echo "$BOUT" | grep -E "error:" | head -12
+echo "$BOUT" | grep -q BUILT_OK || { echo "BUILD FAILED (refusing to measure a stale binary)"; exit 1; }
 
 # Cold page cache, so every sample sees the same first-touch cost (the plan's
 # 740 MB/s eMMC finding is why this matters for --emb-host).
