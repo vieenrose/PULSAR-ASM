@@ -757,7 +757,7 @@ cost (unpriced; ~28% of decode in the Bonsai engine), and NEON ports of the
 elementwise ops — the "mostly assembly" half of the target, for which
 `lfm3_conv.S` (bit-exact, 40.2 µs/step) is the template.
 
-### 13.4 The "mostly assembly" side: NEON elementwise kernels, bit-exact (commit pending)
+### 13.4 The "mostly assembly" side: NEON elementwise kernels, bit-exact (commit 9417183)
 
 `pulsar_arm/asm/lfm3_elem.S` + `lfm3_elem_test.c`, built and run on the Nano:
 `lfm3_rmsnorm_bf16`, `lfm3_mul_bf16`, `lfm3_add_bf16`, the ops the decode step
