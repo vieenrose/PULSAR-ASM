@@ -96,11 +96,47 @@ SCHEMES = {
 }
 EMB = "model.language_model.embed_tokens.weight"
 
+# Per-group arms. Why these exist: the FFN (gate/up/down) is 108.8 of the
+# 143.7 ms/token decode GEMV (measured in q8_gemv_splitk.cu), i.e. 76% of the
+# cost, and 1132 M of the 1466 M streamed params. Every prior arm in this file
+# quantized the WHOLE backbone at one scheme, which measures the floor of the
+# most sensitive group and hides which group it was. Only ffn-only quantization
+# can buy the 2x between 6.96 tok/s and the 14 tok/s ceiling at 21.9 GB/s, so
+# the sensitivity curve has to be separable per group.
+GROUPS = {
+    "ffn":  ("feed_forward.w1", "feed_forward.w2", "feed_forward.w3"),
+    # The attention projections are self_attn.{q,k,v,o}_proj -- NOT
+    # attention.wq and NOT attention.w_q. Both guesses matched zero tensors
+    # and the assert below fired both times, which is the whole reason the
+    # assert exists. gate_proj is included: it is the per-head sigmoid gate,
+    # a real [2048,2048] GEMV per attention layer, and it was MISSING from the
+    # per-token GEMV budget in q8_gemv_splitk.cu (see that commit's note).
+    "attn": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+             "self_attn.o_proj", "self_attn.gate_proj"),
+    # conv.conv.weight is [H, 1, 7] -- 3-D, so the 2-D quantizer never sees it
+    # and listing it here made the assert fire. The short conv weight is 7*H
+    # floats per layer (14.7 M total, 0.4% of the backbone), far too small to
+    # matter for the memory number, so it stays bf16.
+    "conv": ("conv.in_proj", "conv.out_proj"),
+    "all":  ("feed_forward.w1", "feed_forward.w2", "feed_forward.w3",
+             "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+             "self_attn.o_proj", "self_attn.gate_proj",
+             "conv.in_proj", "conv.out_proj"),
+}
 
-def apply_scheme(model, sc):
+
+def apply_scheme(model, sc, groups="all"):
     n_q, bytes_total = 0, 0
+    pats = GROUPS[groups]
+    matched = {g: 0 for g in pats}
     for name, p in model.named_parameters():
         if p.dim() != 2 or not name.startswith(BACKBONE):
+            continue
+        if name == EMB:
+            pass
+        elif not any(g in name for g in pats):
+            # not in this arm -> stays bf16, and counts as bf16 bytes
+            bytes_total += p.numel() * 2
             continue
         if name == EMB:
             bits, group, asym = sc["emb_bits"], 32, True
@@ -115,9 +151,17 @@ def apply_scheme(model, sc):
         with torch.no_grad():
             p.data.copy_(fq(p.data, bits, group, asym))
         n_q += 1
+        for g in pats:
+            if g in name:
+                matched[g] += 1
         # codes + one f16 scale per group (+ f16 min for asymmetric)
         b = bits + 16.0 / group + (16.0 / group if asym else 0)
         bytes_total += p.numel() * b / 8
+    # The parameter filter has already cost one debugging cycle at the group
+    # level (a filter matching ZERO tensors silently reports the bf16 result
+    # for every scheme). Each named pattern in the arm must land on tensors.
+    empty = [g for g, c in matched.items() if c == 0]
+    assert not empty, "group patterns matched no tensors: %s" % empty
     return n_q, bytes_total
 
 
@@ -127,6 +171,9 @@ def main():
     ap.add_argument("--prompts", default=None,
                     help="JSON [{id,text},...]; default = the two gate prompts A,B")
     ap.add_argument("--schemes", default="bf16,q8_0,q6_0,q5_0,q4_1,q4_0,q4_g128,q3_0,q2_0")
+    ap.add_argument("--groups", default="all",
+                    help="comma list of %s: which weight groups get quantized,"
+                         " the rest stay bf16" % sorted(GROUPS))
     a = ap.parse_args()
 
     if a.prompts:
@@ -152,21 +199,24 @@ def main():
     if os.path.exists(out_jsonl):
         for line in open(out_jsonl):
             try:
-                done.add(json.loads(line)["scheme"])
+                rec = json.loads(line)
+                done.add((rec["scheme"], rec.get("n")))
             except Exception:
                 pass
 
     print("scheme       bits/w  GB(bone)  exact  mean_pre  worst  n_q  (of %d tok, %d prompts)"
           % (a.tokens, len(keys)), flush=True)
     for s in a.schemes.split(","):
-        if s in done:
-            print("%-12s  (already recorded, skipping)" % s, flush=True)
-            continue
         sc = SCHEMES[s]
+        label = s if a.groups == "all" else "%s:%s" % (a.groups, s)
+        # stored scheme string is `label`, so resume keys are per group+scheme
+        if (label, a.tokens) in done:
+            print("%-16s  (already recorded, skipping)" % label, flush=True)
+            continue
         t0 = time.time()
         model = AutoModelForMultimodalLM.from_pretrained(
             REPO, trust_remote_code=True, dtype=torch.bfloat16).eval()
-        n_q, nbytes = apply_scheme(model, sc)
+        n_q, nbytes = apply_scheme(model, sc, a.groups)
         # Prove the quantizer ran. A filter that matches nothing would report
         # the BF16 result for every scheme and look like "4-bit is lossless".
         assert n_q > 0 or sc["bits"] >= 16, "quantizer matched zero tensors"
@@ -202,7 +252,7 @@ def main():
                     if res[k] >= min(len(gold[k]["gen"]), a.tokens))
         bw = 16.0 if sc["bits"] >= 16 else (nbytes * 8) / 1728.8e6
         print("%-12s  %5.2f   %6.3f   %2d/%-3d  %7.1f   %4d   %4d  (%.0fs)%s"
-              % (s, bw, nbytes / 1e9, exact, len(keys),
+              % (label, bw, nbytes / 1e9, exact, len(keys),
                  sum(res.values()) / len(res), min(res.values()), n_q, time.time() - t0,
                  "  early-EOS:" + ",".join(eos_early) if eos_early else ""),
               flush=True)
@@ -218,7 +268,7 @@ def main():
                   % (len(bad), bad, torch.get_num_threads()), flush=True)
             sys.exit(3)
         with open(out_jsonl, "a") as f:
-            f.write(json.dumps(dict(scheme=s, bits_w=round(bw, 2),
+            f.write(json.dumps(dict(scheme=label, groups=a.groups, bits_w=round(bw, 2),
                                     gb=round(nbytes / 1e9, 3), exact=exact,
                                     mean_prefix=round(sum(res.values()) / len(res), 2),
                                     worst=min(res.values()), prefix=res, n_q=n_q,
