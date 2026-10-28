@@ -117,3 +117,80 @@ re-certification plan.
   Nano ceiling measurement is the place to look for what a single kernel can reach.
 * Long-chain attention (ctx > 256) is untested; the sliding-window path (`SLIDE_WIN 256`)
   has only been exercised at ctx ≤ 48.
+
+## Session 2 (2026-10-29, autoresearch runs #81-#90): where the 139 ms actually goes
+
+`LFM_TIME=1` per-phase decode timing (added run #89) reframed the whole problem:
+
+| phase | ms/token | bytes/token | effective GB/s |
+|---|---|---|---|
+| embedding lookup | 0.00 | 4 KB | – |
+| 13 conv layers | 76.44 | ~715 MB | 9.4 |
+| 11 attention layers | 60.31 | ~545 MB | 9.0 |
+| final norm | 0.05 | 4 KB | – |
+| **lm_head** | **19.79** | 278 MB | **14.0** |
+
+The lm_head is **14%** of the step, not the ~50% the plan's 127.7 ms budget assumed — that is
+exactly why the slab-size knob measured `R = 1.0000`. It streams at 14 GB/s, which is the
+achievable ceiling on this board, so all remaining headroom is in the 24 layer GEMVs at
+9.0-9.4 GB/s.
+
+### Measured out (paired A/B, 3-4 runs each, one pair in each order)
+
+| lever | result |
+|---|---|
+| R=256 rows/block for all shapes | **+1.0%, kept** (bit-identical; RMAX=256 is the hard ceiling — `sh[RMAX]` overflows above it, now clamped with a warning) |
+| lm_head slab rows 8192→4096 | R = 1.0000, saturated |
+| TPB 256→512 | **−2.3%** (fewer blocks; the 8 KB shared x-stage + syncthreads dominates) |
+| KCHUNK 2048→1024 | **−4.4%** (more partials, more x re-staging; also changes the combine order) |
+| R=64 for the small-N shapes | **−5.7%** (x-stage amortization beats block fill) |
+| merged gate+up GEMV (the plan's Bonsai technique, 24→48 blocks) | +0.33% for 679 MB — **not kept** |
+
+Conclusion: the GEMV config is at a measured local optimum (R=256, TPB=256, KCHUNK=2048), and
+the layer GEMVs are **not** block-fill limited — merging rows to double the block count bought
+0.33%. The gap to 14 GB/s is the *access pattern*: the lm_head streams one 524 MB contiguous
+region with perfect DRAM locality, while a layer GEMV runs 8-24 blocks bursting over a 12 MB
+tensor. The plan's merge win was measured on 24576-row gate+up tensors, 4x these shapes.
+
+Bytes/token are pinned by the quality gate: Q8 linears + fp32 scales ≈ 1.2 GB + 183 MB scales
++ 278 MB lm_head ≈ 1.34 GB/token. At 139.6 ms that is 9.6 GB/s aggregate. Q4 linears would
+halve the bytes (~2x) and are measured out on quality (plan: 5/8, worst prefix 0).
+
+### The plan's 8/8 goldens gate is not reachable by a from-scratch GEMV
+
+The certified `q8_0` arm (linears Q8 + fp32 scales + **bf16** embeddings, blob
+`lfm3-audio-2b-cert.lfm3q8`, export with `--emb-bf16`) runs at **161.67 ms/token (6.19 tok/s)**
+device-resident and **223.46 ms/token (4.48 tok/s)** with `--emb-host`. Its greedy streams are
+**byte-identical to the Q8-embedding arm's** (prefix 2 / 1 on prompts A / B), so embedding
+quantization is *not* the divergence, and the 15% latency + 262 MB the bf16 embedding costs
+buys nothing here.
+
+Why the goldens cannot be matched: they are HF/**cuBLAS** outputs. This repo's Q8 kernel is
+bit-exact against the *ggml* reference (the plan's 18/18-shape claim) — a different summation
+order. Each Linear then differs by ~1 bf16 ulp, the per-layer rms ratio table sits at
+0.995-1.006 (i.e. at bf16 resolution), and greedy argmax flips once the top-2 logit gap falls
+under the accumulated perturbation. **G6 as written is not achievable**; the defensible gates
+are the HF-derived ones in `checks_lfm3.py` (23x23 layer/position rms within 3%, pos-0 logit
+top-1 equality + corr ≥ 0.999, greedy prefix ≥ the arm's certified floor, stated per arm).
+
+### Infra bugs found in the harness itself (these invalidate numbers if unfixed)
+
+* `test -x $BIN` is **not** a build check: nvcc leaves the previous binary in place on compile
+  failure, so three broken builds measured stale numbers silently. All three scripts now
+  compile to `$BIN.new` and `mv` only on success, and refuse to run without `BUILT_OK`.
+  Runs #83-#86 predate this; their numbers were re-validated on a clean build (139.54 vs 139.56).
+* `PQ1_EXTRA` does **not** propagate through the ssh quoting layer in `measure.sh` (an env knob
+  set that way silently does nothing). `ab.sh` passes its arm as `env $1` inside the ssh command
+  and *does* work. Use `LFM3_ARGS=--flag` or set the env directly.
+* `ab.sh`/`checks.sh` picked up a dangling `ssh ... \` line from the build-hardening patch, and
+  `ARGS` was unbound under `set -u`. Fixed.
+
+### State and next steps
+
+Best kept: **139.62 ms/token (7.16 tok/s)**, RSS 306 MB, gates green, 9 kept runs.
+Deferred, ranked: (1) CUDA graphs for the ~300 launches/token (needs `tok`/`pos` moved into
+device memory; est. 1.5-3%; the Bonsai Nano engine's kept lever on this board); (2) fuse
+`k_bf2f` into the GEMV prologue (~0.7%); (3) re-baseline after the board's power cycle — the
+three zombie `lfm3_conv_test` processes (unkillable, blocking reboot) steal 3 of 4 cores, so
+today's absolutes are inflated; (4) a top-k-vs-HF logit agreement gate, which is the
+quantitative version of "how close is this engine to HF".

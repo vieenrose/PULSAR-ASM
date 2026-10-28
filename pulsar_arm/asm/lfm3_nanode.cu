@@ -87,6 +87,10 @@
 // sliding window is 256) needs MAXTOK=256 and 25 MB more device memory --
 // raise it together with the memory headroom, not on its own.
 #define MAXTOK 64
+// fwd: the merge pass in the loader looks tensors up by name
+struct Model; struct Ent;
+static Ent* T(Model&, const std::string&);
+
 // The tied embedding's tensor name (the blob's key) and the row-chunk size
 // for the host-staged lm_head. 8192 rows = 16.8 MB of codes + 2.1 MB of
 // scales per slab; 16 chunks cover 128000 rows.
@@ -462,6 +466,17 @@ struct Ent {
 // split is guessing. Events + one sync per phase, so the instrumentation
 // itself costs ~0.25 ms/token -- a diagnostic, not a shipping mode.
 static const bool g_time = getenv("LFM_TIME") != nullptr;
+// LFM_MERGE=1: concatenate the FFN's gate (w1) and up (w3) projections into
+// ONE Q8 tensor per layer and run a single GEMV. Each is N=6144, K=2048, so
+// alone they launch 24 blocks of R=256 rows each; merged they are 48 blocks
+// of one kernel, which matters on a 4-SM part where short bursts from few
+// blocks run at 9.0-9.4 GB/s while the N=128000 lm_head reaches 14 GB/s.
+// BIT-IDENTICAL BY CONSTRUCTION: concatenating ROWS does not touch any row's
+// reduction order, so the outputs are the same bits and the gates cannot
+// regress; the merge costs 679 MB of device memory (the originals stay).
+// This is the Bonsai Nano engine's kept technique on this exact board
+// (merged q+k+v and gate+up tensors, .auto/HANDOFF_NANO_Q1_0.md).
+static bool g_merge = getenv("LFM_MERGE") != nullptr;   // --merge also sets it
 static cudaEvent_t g_evA, g_evB;
 static double g_tEmb = 0, g_tConv = 0, g_tAttn = 0, g_tNorm = 0, g_tHead = 0;
 static inline void phBegin() { if (g_time) cudaEventRecord(g_evA); }
@@ -492,6 +507,7 @@ struct Model {
   std::string path;
   size_t emb_file_off = 0;
   bf16 *x, *h1, *h2, *h3, *h4, *q, *k, *v, *attn, *gate, *bx, *cy, *ring;
+  bf16* hgu = nullptr;   // 2*INTER: merged gate/up GEMV output (LFM_MERGE)
   float *xf, *lgf, *part;          // part = GEMV per-chunk partials, f32 by contract
   bf16 *kc, *vc;
   float *invf_full, *invf_slide;
@@ -620,6 +636,11 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   // between 2.87 GB and 1.78 GB, and this model needs 1.95 GB. Failing on a
   // transient is not useful, so wait for room, and say so while waiting. The
   // slack is the arena (KV, ring, partials, ~30 MB) plus CUDA headroom.
+  if (g_merge) {
+    // gate/up per layer: 2 x (INTER rows x H codes) + 2 x (INTER scales fp32)
+    M.need_q += (size_t)NLAYER * 2ull * ((size_t)INTER * H);
+    M.need_s += (size_t)NLAYER * 2ull * ((size_t)INTER * (H / Q8_BLK) * 4);
+  }
   const size_t need = M.need_q + M.need_s + M.need_f + (size_t)48 * 1024 * 1024;   // arena is KV 25 MB + ring 0.4 + partials 4.5 MB
   for (int tw = 0; tw < 60; tw++) {
     size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
@@ -724,7 +745,52 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   }
   for (size_t i = 0; i < M.ents.size(); i++)
     if (M.ents[i].name == EMBNAME) M.ents[i].host = (M.emb_mode == 1);
-  fclose(f);
+  fclose(f);  // Build the merged gate/up tensors (device-to-device copies of the Q8 rows
+  // into the tail of the same arenas). Q8 rows are [K codes][K/32 fp32
+  // scales] per row, and codes/scales live in separate arenas, so a plain
+  // concatenation of the two tensors' code blocks and of their scale blocks
+  // IS a valid 2N-row Q8 tensor: no re-quantization, no layout change.
+  if (g_merge) {
+    M.ents.reserve(M.ents.size() + NLAYER);          // keep M.by's Ent* valid
+    int nm = 0;
+    for (int L = 0; L < NLAYER; L++) {
+      char na[96], nb[96], mn[96];
+      snprintf(na, sizeof na, "lfm.model.layers.%d.feed_forward.w1.weight", L);
+      snprintf(nb, sizeof nb, "lfm.model.layers.%d.feed_forward.w3.weight", L);
+      snprintf(mn, sizeof mn, "MERGE:%d:gate_up", L);
+      Ent* ea = T(M, na); Ent* eb = T(M, nb);
+      if (!ea || !eb || ea->dtype != 1 || eb->dtype != 1 ||
+          ea->ne[0] != eb->ne[0] || ea->ne[1] != eb->ne[1]) continue;
+      Ent me; me.name = mn; me.dtype = 1; me.nd = 2;
+      me.ne[0] = ea->ne[0] + eb->ne[0]; me.ne[1] = ea->ne[1];
+      const size_t ncA = (size_t)ea->ne[0] * ea->ne[1];
+      const size_t nsA = (size_t)ea->ne[0] * (ea->ne[1] / Q8_BLK) * 4;
+      const size_t nc = ncA * 2, ns = nsA * 2;
+      if (oc + nc > M.need_q || os + ns > M.need_s) {
+        printf("merged tensor %s does not fit: codes %zu+%zu/%zu scales %zu+%zu/%zu\n",
+               mn, oc, nc, M.need_q, os, ns, M.need_s);
+        fclose(f); return false;
+      }
+      me.dq = M.dq + oc; me.ds = (float*)((char*)M.ds + os);
+      cudaError_t c1 = cudaMemcpy(me.dq, ea->dq, ncA, cudaMemcpyDeviceToDevice);
+      cudaError_t c2 = cudaMemcpy(me.dq + ncA, eb->dq, ncA, cudaMemcpyDeviceToDevice);
+      cudaError_t c3 = cudaMemcpy(me.ds, ea->ds, nsA, cudaMemcpyDeviceToDevice);
+      cudaError_t c4 = cudaMemcpy((char*)me.ds + nsA, eb->ds, nsA, cudaMemcpyDeviceToDevice);
+      if (c1 || c2 || c3 || c4) {
+        printf("merge copy failed for %s: %s\n", mn, cudaGetErrorString(c1 ? c1 : (c2 ? c2 : (c3 ? c3 : c4))));
+        fclose(f); return false;
+      }
+      oc += nc; os += ns;
+      M.ents.push_back(me);
+      M.by[mn] = &M.ents.back();
+      nm++;
+    }
+    printf("MERGED %d gate/up pairs into single GEMV tensors (proof: %d of %d layers)\n",
+           nm, nm, NLAYER);
+    fflush(stdout);
+  }
+
+
   if (oc != M.need_q || os != M.need_s || of != M.need_f) {
     printf("arena accounting mismatch: codes %zu/%zu scales %zu/%zu f32 %zu/%zu\n",
            oc, M.need_q, os, M.need_s, of, M.need_f);
@@ -1089,6 +1155,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--probe-step") && i + 1 < argc) probe_step = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--emb-host")) emb_mode_req = 1;
     else if (!strcmp(argv[i], "--lm-selftest")) emb_mode_req = 2;
+    else if (!strcmp(argv[i], "--merge")) g_merge = true;   // merged gate/up GEMV
     else if (!strcmp(argv[i], "--lmrows") && i + 1 < argc) lm_rows_override = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump_logits = argv[++i];
     else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) {
@@ -1145,7 +1212,8 @@ int main(int argc, char** argv) {
   printf("device free before arena: %.2f GB of %.2f GB\n", freeb0 / 1e9, totb0 / 1e9);
   struct Al { void** p; size_t n; const char* w; };
   const Al als[] = {
-    {(void**)&M.x, (size_t)H * 2, "x"}, {(void**)&M.h1, (size_t)H * 2, "h1"},
+    {(void**)&M.x, (size_t)H * 2, "x"}, {(void**)&M.hgu, (size_t)2 * INTER * 2, "hgu"},
+    {(void**)&M.h1, (size_t)H * 2, "h1"},
     // h2/h3 are the FFN intermediates: w1/w3/silu/w2 all hold INTER=7680
     // elements, not H=2048. Allocated at H they took a 15360-byte write into
     // a 4096-byte arena slot, so the FFN spilled into its neighbours (h4/q/k
@@ -1370,11 +1438,22 @@ int main(int argc, char** argv) {
       PROBE("add1", M.x, H);
       rms1(M, M.x, NW(M, L, "ffn_norm.weight"), M.h1);
       PROBE("ffn_norm", M.h1, H);
+      char mn[96]; snprintf(mn, sizeof mn, "MERGE:%d:gate_up", L);
+      if (g_merge && T(M, mn)) {
+        // One GEMV over 2*INTER rows; rows [0,INTER) are w1 (gate), rows
+        // [INTER,2*INTER) are w3 (up). k_silu_mul_bf takes the two halves as
+        // its two input pointers, so no kernel change is needed.
+        gemv(M, mn, M.h1, M.hgu);
+        PROBE("w1", M.hgu, INTER);
+        PROBE("w3", M.hgu + INTER, INTER);
+        k_silu_mul_bf<<<(INTER + 255) / 256, 256>>>(M.hgu, M.hgu + INTER, M.h2, INTER);
+      } else {
       gemv(M, LN(L, "feed_forward.w1.weight"), M.h1, M.h2);
       PROBE("w1", M.h2, INTER);
       gemv(M, LN(L, "feed_forward.w3.weight"), M.h1, M.h3);
       PROBE("w3", M.h3, INTER);
       k_silu_mul_bf<<<(INTER + 255) / 256, 256>>>(M.h2, M.h3, M.h2, INTER);
+      }
       PROBE("silu_mul", M.h2, INTER);
       gemv(M, LN(L, "feed_forward.w2.weight"), M.h2, M.h2);
       PROBE("w2", M.h2, INTER);
