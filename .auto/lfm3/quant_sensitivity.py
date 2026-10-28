@@ -97,6 +97,13 @@ SCHEMES = {
     "q8_0":    dict(bits=8,  group=32, asym=False, emb_bits=16),
     # The arm the Nano engine actually runs: fp16-rounded scale, +-127 clamp.
     "q8_0h":   dict(bits=8,  group=32, asym=False, emb_bits=16, scale16=True),
+    # The Nano blob Q8_0's the TIED embedding too (it is 524 MB bf16, 24% of
+    # decode, and the table is streamed every token as lm_head). Every
+    # existing arm keeps emb at bf16, so that saving was never certified --
+    # and the emb branch below is ASYMMETRIC, which is q8_1, not the
+    # symmetric fp32-scale q8_0 the exporter writes. emb_asym=False makes
+    # this arm the numerics export_lfm3_q8.py actually produces.
+    "q8_0_embq8": dict(bits=8, group=32, asym=False, emb_bits=8, emb_asym=False),
     "q6_0":    dict(bits=6,  group=32, asym=False, emb_bits=16),
     "q5_0":    dict(bits=5,  group=32, asym=False, emb_bits=16),
     "q4_0":    dict(bits=4,  group=32, asym=False, emb_bits=16),
@@ -153,8 +160,8 @@ def apply_scheme(model, sc, groups="all"):
             bytes_total += p.numel() * 2
             continue
         if name == EMB:
-            bits, group, asym = sc["emb_bits"], 32, True
-            scale16 = False
+            bits, group, asym = sc["emb_bits"], 32, sc.get("emb_asym", True)
+            scale16 = sc.get("emb_scale16", False)
             if bits >= 16:
                 bytes_total += p.numel() * 2
                 continue
