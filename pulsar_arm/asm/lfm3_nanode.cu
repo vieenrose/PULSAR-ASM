@@ -732,7 +732,12 @@ static GemvCfg pick(int N, int K) {
   GemvCfg c;
   c.KCHUNK = (K >= 2048 && K % 2048 == 0) ? 2048 : K;
   c.TPB = 256;
-  c.R = (N >= 8192) ? 256 : (N >= 1024 ? 128 : 64);
+  // R = rows per block, amortizing the 8 KB x-stage. Measured (run #82,
+  // paired A/B in both orders, arm2 faster 4/4): 256 for every shape beats
+  // the old 128-for-N-in-[1024,8192) by 0.5% (141.02 -> 140.32 ms/token).
+  // R only remaps rows to blocks, so per-row reduction order -- and every
+  // output bit -- is unchanged.
+  c.R = (N >= 1024) ? 256 : 64;
   if (K == 512) { c.KCHUNK = 512; c.TPB = 128; }
   if (fKC && K % fKC == 0) c.KCHUNK = fKC;
   if (fTPB >= 32 && fTPB <= 1024) c.TPB = fTPB;
