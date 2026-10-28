@@ -578,3 +578,55 @@ Nano regardless is a **Q8_0 GEMV at K=2048** — it is the missing primitive for
 *any* 8-bit model on this tree (LFM3, and the Q8-embedding GGUFs already sitting
 on picard-desktop), and it is self-contained: `pq1_parity`-style bit-exactness
 against a host reference, then a TPB/MINB/RB/PD sweep like K=4096 got.
+
+---
+
+## 12. That Q8_0 GEMV exists now: 13.0 GB/s at K=2048 (`.auto/lfm3/q8_gemv_sm53.cu`)
+
+Built and measured on ipho-nano (Tegra X1, 1 SM, EMC pinned 1600 MHz, CUDA
+10.2, `-O3 --use_fast_math -Xptxas -O3,-dlcm=ca`). Bytes counted as codes +
+f16 scale per 32-code block (codes-only flatters the number by 6%).
+
+| rows | shape (K=2048) | MB | ms/call | GB/s | % of 21.9 ceiling |
+|---|---|---|---|---|---|
+| 7680 | w1/w3 | 16.7 | 1.282 | **13.04** | 60% |
+| 6144 | conv_in_proj | 13.4 | 1.006 | **13.29** | 61% |
+| 2048 | w_q / w_o | 4.5 | 0.350 | **12.73** | 58% |
+
+R (rows per block) sweeps 6.4 -> 10.5 -> 12.9 -> 13.0 GB/s at 4/8/16/32/64,
+flat past 16; that curve is the amortization of staging `x` into shared memory.
+
+The path there is the useful part, because every step was a silent-performance
+bug of the kind this repo's measurement discipline exists to catch:
+
+| cut | GB/s | what was wrong |
+|---|---|---|
+| throwaway probe (§9.2) | 0.81 | 1 warp/row, per-row `atomicAdd`, 4 separate byte loads |
+| thread-per-Q8_0-block, int4 loads | 3.10 | `x` re-staged into shared **per block**: 15.4 MB of `x` traffic on top of 15.7 MB of weights, so half the bus was moving activations |
+| naive row-loop | 0.79 | dropped the `tid / nb` term, so only 64 of 256 threads' block indices were used: **4x redundant work** (3.10/4 = 0.79 exactly — the arithmetic named the bug) |
+| thread mapping fixed | 3.40 | — |
+| **padded shared row stride 32 -> 33** | **12.50** | 32-way shared **bank conflict**: lanes 0..31 read `xs[0*32+j] … xs[31*32+j]`, all stride-32 floats = the same bank, on all 32 shared loads |
+| R = 16…64, scales counted | **13.0** | honest byte count |
+
+So the §9.2 answer is: **the 0.81 GB/s was kernel quality, not physics** — Q8
+at K=2048 reaches 13.0 GB/s, 76% of what this engine achieves with its tuned
+2-bit kernels. Two lessons that generalize to the rest of the tree: count the
+activation traffic you stage into shared, and check the shared-index stride of
+any kernel where a warp reads a column of a `[block][32]` tile.
+
+**Correctness is not finished.** It reports `differs` against the sequential
+host reference at maxabs 1.2e-3 / maxrel 2.9e-4, for two known reasons: the 64
+block-partials of a row are combined by a warp-shuffle **tree**, not the
+reference's sequential `acc += p[b]` (fp add is not associative), and
+`--use_fast_math` contracts the 32-term sums into FMAs. The repo already owns
+the fix — `pq1_swar_sm53.cu:19-22`, "the fp accumulation is made bit-exact too
+by reducing per-group products in GROUP ORDER in fp32 (`__fmul_rn`/`__fadd_rn`,
+no contraction)" — which here means making the reference mirror the kernel's
+tree and dropping contraction. Until that is done this is a bandwidth probe,
+not a shippable kernel.
+
+**And it does not change the §11 verdict.** At the measured 13.0 GB/s the Q8_0
+backbone is 2.082 GB/token = 160 ms/token = **6.2 tok/s** (the §11 estimate of
+8.2 assumed the engine's 17.1 GB/s, so this is worse, not better). Against the
+incumbent's 27 tok/s. The memory wall is unchanged: 2.08 GB of weights will not
+fit ipho-nano's 1457 MB available, so this kernel cannot even be loaded there.
