@@ -718,11 +718,25 @@ static float* NW(Model& M, int L, const char* which) { return T(M, LN(L, which))
 // mirrored reference agreed with it, so bit-exact printed YES.
 struct GemvCfg { int KCHUNK, TPB, R; };
 static GemvCfg pick(int N, int K) {
+  // Env overrides exist for A/B measurement, not as shipped tuning: the plan
+  // (row 3) measured 2.6x on this shape family from R alone, so every R/KCHUNK
+  // claim has to be measured, not assumed. NOTE on numerical safety: KCHUNK
+  // sets nchunk, which is the number of partials k_combine_f sums, so changing
+  // it changes the summation ORDER of every GEMV output. The K-coverage assert
+  // in the launchers (nchunk * KCHUNK == K) is what stops the "nchunk = 3 read
+  // 80% of K" truncation bug that a 5fd7e79-era commit shipped with, so
+  // overrides that do not divide K are rejected by the caller's check.
+  static const int fR  = getenv("LFM_R")  ? atoi(getenv("LFM_R"))  : 0;
+  static const int fKC = getenv("LFM_KCHUNK") ? atoi(getenv("LFM_KCHUNK")) : 0;
+  static const int fTPB = getenv("LFM_TPB") ? atoi(getenv("LFM_TPB")) : 0;
   GemvCfg c;
   c.KCHUNK = (K >= 2048 && K % 2048 == 0) ? 2048 : K;
   c.TPB = 256;
   c.R = (N >= 8192) ? 256 : (N >= 1024 ? 128 : 64);
   if (K == 512) { c.KCHUNK = 512; c.TPB = 128; }
+  if (fKC && K % fKC == 0) c.KCHUNK = fKC;
+  if (fTPB >= 32 && fTPB <= 1024) c.TPB = fTPB;
+  if (fR >= 32 && fR <= 1024) c.R = fR;
   return c;
 }
 static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
@@ -778,6 +792,7 @@ static bool lm_host_init(Model& M, HostEmb& E, const char* path) {
   E.N = be->ne[0]; E.K = be->ne[1];
   if (E.N != VOCAB || E.K != H) { printf("embedding shape %dx%d\n", E.N, E.K); return false; }
   E.rows = LM_ROWS;
+  if (getenv("LFM_ROWS")) E.rows = atoi(getenv("LFM_ROWS"));   // slab rows, A/B knob
   const size_t tot = be->nc + be->ns;
   if (cudaHostAlloc((void**)&E.hc, tot, cudaHostAllocDefault) != cudaSuccess) {
     printf("cudaHostAlloc(%.0f MB pinned) failed\n", tot / 1e6); return false;
