@@ -299,10 +299,52 @@ the Q8_K 256-block and the 128-group structure the repack and bit-plane kernels
 assume. K=2048 is a clean 8-block Q8_K activation — structurally compatible,
 untuned.
 
+**This optimism was wrong, and `pq1_parity` is what disproved it (§8.4b).**
+Probing the real kernels at the LFM3 shapes returned bit-exact 7680/7680,
+6144/6144, 2048/2048, 512/512 at K=2048 — which looked like the answer. It is
+not: those kernels are a **2-bit** format (`pq1_swar_sm53.cu:1-30`: "EXACT
+PQ1_0 GEMV", `code c = b0 + 2*b1, value v = c-1`, layout `w_bits [N, K/32] u32`
+= two bit planes + fp16 scales per 128-group ≈ 2.125 bits/weight). LFM3 cannot
+use that format — §9 scores Q2_0 at 0/48. So K=2048 being clean says nothing
+about the Q8 GEMV LFM3 actually needs, and **a Q8_0 GEMV does not exist in the
+Nano tree**. The K=2048 question stays open, and it is bigger than tuning.
+
 So on Nano the work is **not** "port a model"; it is "re-specialize the GEMV
 family for K=2048/7680" plus the §3 kernel gap (17 of 22 primitives absent —
 depthwise conv + conv state cache, partial rotary, dual rope theta, sliding
 window, sandwich norm, per-head gate — all new, in NEON/CUDA rather than AVX2).
+
+### 8.4b What `pq1_parity` does say (measured, ipho-nano, EMC pinned 1600 MHz)
+
+`PQ1_TIME=15 ./pq1_parity <rows> <K> all`, ms/call, hot loop (gap=0 so GPU
+ clocks boost — the engine's real pattern has CPU work between GEMVs, so these
+ are best-case). `hs` is the production kernel (default since loop-261014-2216
+ row 12).
+
+| shape | rows | K | swar | r128 | r256 | tm | **hs** | bit-exact |
+|---|---|---|---|---|---|---|---|---|
+| w1/w3 | 7680 | 2048 | 0.822 | 0.605 | 0.581 | 0.361 | **0.398** | 7680/7680 ✓ |
+| conv_in_proj | 6144 | 2048 | 0.561 | 0.414 | 0.454 | 0.255 | **0.258** | 6144/6144 ✓ |
+| w_q / w_o | 2048 | 2048 | 0.220 | 0.232 | 0.195 | 0.125 | **0.119** | 2048/2048 ✓ |
+| w_k / w_v | 512 | 2048 | 0.108 | 0.088 | 0.097 | 0.061 | **0.056** | 512/512 ✓ |
+| **w2 (FFN down)** | 2048 | **7680** | 0.507 | 0.415 | 0.685 | 0.259 | 0.259 | **0/2048 MISMATCH maxrel 1.47e+02** |
+| ref (Bonsai) | 4096 | 4096 | 0.632 | 0.508 | 0.543 | 0.308 | **0.205** | 4096/4096 ✓ |
+| ref (Bonsai) | 4096 | 12288 | 1.700 | 1.378 | 2.454 | 0.838 | **0.485** | 4096/4096 ✓ |
+
+Two findings:
+
+1. **K=7680 is not supported at all** — every kernel returns 0/2048 bit-exact
+   with maxrel 1.47e+02 (total mismatch, not rounding). That is the FFN
+   down-projection, 377.5 M weights = 22% of the backbone, so an LFM3 GEMV port
+   has to add a third K to a family whose tile/warp decomposition is built for
+   K = 2^12·{1,3}. The parity gate catches it loudly, which is the gate working
+   as intended.
+2. **K=2048 needs no retuning for correctness**, and `hs` already beats `tm`
+   there (ratios 1.04–1.09x on the small shapes) — unlike K=4096/12288 where
+   `hs` wins by 1.50x/1.73x. The big K=2048 shape (w1/w3, 15.7 MB) is the
+   exception: `hs` 0.398 ms is **24% slower than `tm` 0.361 ms**, because RB/PD
+   /NT were swept for the two Bonsai K only. That is the one place §8.4's
+   "needs its own sweep" is directly confirmed.
 
 ### 8.5 Ranked order for the Nano
 

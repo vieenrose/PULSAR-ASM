@@ -9,3 +9,5 @@ __pycache__/
 # LFM3 oracle scratch: regenerable 512 KB/tensor dumps, not gate artifacts
 .auto/lfm3/logits_last_*.npy
 .auto/lfm3/quant_sensitivity.json
+.auto/lfm3/quant_sensitivity_*.jsonl
+.auto/lfm3/__pycache__/

@@ -23,8 +23,17 @@ prefix, not the module path. A filter on "lfm." matches ZERO tensors and
 silently reports the BF16 result for every scheme. n_q is asserted > 0 for
 that reason.
 """
-import argparse, json, os, time
+import argparse, json, os, sys, time
 import torch
+# Pin the CPU reduction order BEFORE any torch op that matters. The default
+# thread count makes bf16 CPU matmuls reduce in a varying order, which flips
+# near-tie argmaxes: the bf16 reference then fails to reproduce its OWN goldens
+# (measured: 8/12 prompts exact, worst divergence at token 15 of 40). Greedy
+# goldens are only meaningful if the oracle is deterministic, so threads are
+# pinned here and the bf16 pass is asserted to be self-reproducing.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+torch.set_num_threads(1)
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 
 REPO = "LiquidAI/LFM3-Audio-2B"
@@ -162,6 +171,7 @@ def main():
         # the BF16 result for every scheme and look like "4-bit is lossless".
         assert n_q > 0 or sc["bits"] >= 16, "quantizer matched zero tensors"
         res = {}
+        eos_early = []
         with torch.no_grad():
             for k in keys:
                 out = model.generate(ids[k], max_new_tokens=a.tokens, do_sample=False)
@@ -175,12 +185,38 @@ def main():
                               open(os.path.join(HERE, "golden_greedy_%s.json" % k), "w"),
                               indent=1)
                 res[k] = score(gen, gold[k]["gen"])
-        exact = sum(1 for k in keys if res[k] >= a.tokens)
+                # "exact" = agreement over the whole COMPARED SPAN, which is
+                # min(len(golden), --tokens). Two conflated cases cost two
+                # false FATALs and one bogus "oracle is nondeterministic" call:
+                #   golden shorter than --tokens (prompt hit EOS, e.g. the
+                #     "one sentence" prompts) -> comparing against --tokens
+                #     makes it permanently non-exact: the 12-prompt run scored
+                #     bf16 8/12, worst 15/40, for this reason alone.
+                #   golden LONGER than --tokens (A,B minted at 48, run caps 24)
+                #     -> the run is truncated, not divergent, so it is exact.
+                span = min(len(gold[k]["gen"]), a.tokens)
+                res[k] = min(res[k], span)
+                if len(gold[k]["gen"]) < a.tokens:
+                    eos_early.append(k)
+        exact = sum(1 for k in keys
+                    if res[k] >= min(len(gold[k]["gen"]), a.tokens))
         bw = 16.0 if sc["bits"] >= 16 else (nbytes * 8) / 1728.8e6
-        print("%-12s  %5.2f   %6.3f   %2d/%-3d  %7.1f   %4d   %4d  (%.0fs)"
+        print("%-12s  %5.2f   %6.3f   %2d/%-3d  %7.1f   %4d   %4d  (%.0fs)%s"
               % (s, bw, nbytes / 1e9, exact, len(keys),
-                 sum(res.values()) / len(res), min(res.values()), n_q, time.time() - t0),
+                 sum(res.values()) / len(res), min(res.values()), n_q, time.time() - t0,
+                 "  early-EOS:" + ",".join(eos_early) if eos_early else ""),
               flush=True)
+        # The bf16 row is the harness's own control: it compares the oracle
+        # against itself. Anything short of all-exact means the reference is
+        # not reproducible and EVERY scheme below it is measured against noise.
+        if s == "bf16" and exact != len(keys):
+            bad = {k: (res[k], len(gold[k]["gen"])) for k in keys
+                   if res[k] < min(len(gold[k]["gen"]), a.tokens)}
+            print("FATAL: bf16 did not reproduce its own goldens on %d prompts: %s\n"
+                  "       threads=%d -- goldens are not reproducible; delete them\n"
+                  "       and re-mint under 1 thread before trusting any scheme."
+                  % (len(bad), bad, torch.get_num_threads()), flush=True)
+            sys.exit(3)
         with open(out_jsonl, "a") as f:
             f.write(json.dumps(dict(scheme=s, bits_w=round(bw, 2),
                                     gb=round(nbytes / 1e9, 3), exact=exact,

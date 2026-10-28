@@ -1,0 +1,31 @@
+{
+ "prompt": "Balance the chemical equation H2 + O2 -> H2O and explain the coefficients.",
+ "gen": [
+  597,
+  19274,
+  5136,
+  10304,
+  355,
+  34,
+  229,
+  26,
+  48,
+  26,
+  1510,
+  480,
+  26,
+  9495,
+  229,
+  26,
+  48,
+  26,
+  55,
+  22,
+  440,
+  25368,
+  437,
+  1092
+ ],
+ "text": "The balanced chemical equation is: 2H2 + O2 -> 2H2O. The coefficients are used",
+ "n": 24
+}

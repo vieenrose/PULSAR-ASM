@@ -24,24 +24,8 @@
   374,
   723,
   296,
-  3294,
-  16,
-  25,
-  20,
-  316,
-  1510,
-  229,
-  25,
-  4673,
-  463,
-  787,
-  723,
-  3061,
-  229,
-  27,
-  3468,
-  229
+  3294
  ],
- "text": "Here's the function:\n\n```python\ndef fizzbuzz(n):\n    result = []\n    for i in range(1, n + 1):\n        if i % 3 == ",
- "n": 40
+ "text": "Here's the function:\n\n```python\ndef fizzbuzz(n):\n    result = []\n    for i in range",
+ "n": 24
 }
