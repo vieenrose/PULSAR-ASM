@@ -163,7 +163,7 @@ __device__ __forceinline__ float lfm_stage(bf16 v) { return bf2f(v); }
 // Q8_0 pass 1: R rows x one chunk, one WARP per row, lanes striding the
 // chunk's blocks, x staged in shared. This is the kernel whose 14-16.5 GB/s
 // rate underlies the 127.7 ms/token budget (q8_lc3.cu, commit 2b5cbe5).
-template <typename TX, bool FMA, bool STREAM = false>
+template <typename TX, bool FMA, bool STREAM = false, int UNROLL = 1>
 __global__ void q8_partial(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ x, float* __restrict__ part,
                            int N, int K, int KCHUNK, int R, int nb) {
@@ -183,7 +183,7 @@ __global__ void q8_partial(const int8_t* __restrict__ q, const float* __restrict
   const int base = rowblk * R;
   const int lane = tid & 31, wid = tid >> 5;
   const int WPB = NT >> 5, GR = R / WPB;
-  #pragma unroll 1
+  #pragma unroll (UNROLL)
   for (int g = 0; g < GR; g++) {
     const int r = wid + g * WPB;
     const int row = base + r;
@@ -496,6 +496,46 @@ struct Ent {
 // split is guessing. Events + one sync per phase, so the instrumentation
 // itself costs ~0.25 ms/token -- a diagnostic, not a shipping mode.
 static const bool g_time = getenv("LFM_TIME") != nullptr;
+// LFM_UNROLL2=1: let the GEMV's row loop overlap two rows per warp. The loop
+// is #pragma unroll 1, so a warp walks its GR rows strictly serially and
+// exposes each row's load latency in full. That is the shape of ffn.w2
+// (N=2048, K=6144 -> 192 elements per lane per row, 1.773 ms measured vs
+// 1.161 ms for ffn.w1's 6144x2048 with the same bytes): long rows, few of
+// them, no inter-row overlap. Rows are independent and each row's reduction
+// order is untouched, so this is bit-identical.
+static const bool g_unroll2 = getenv("LFM_UNROLL2") != nullptr;
+// LFM_RADAPT=1: shape-dependent rows-per-block. LFM_KTIME showed ffn.w2
+// (N=2048, K=6144) at 1.773 ms vs ffn.w1/w3 (N=6144, K=2048) at 1.161 ms for
+// the SAME 12.6 MB of weights: at R=256 a 2048-row tensor is only 8 blocks on
+// this 4-SM board (2 blocks/SM), so it is the long-K, few-row shapes that
+// underfill, not the short ones. The global R=64 test penalized the 6144-row
+// shapes (which amortize the 8 KB x-stage across 256 rows) to fix them.
+// R only remaps rows to blocks: per-row reduction order, and every output
+// bit, is unchanged.
+static const bool g_radapt = getenv("LFM_RADAPT") != nullptr;
+// LFM_KTIME=1: per-kernel timing inside the layer loop. LFM_TIME only splits by
+// layer TYPE (conv 70.6 / attn 56.6 ms), and the conv layers run 5.4 ms against
+// a 2.5 ms byte floor while attention layers run 5.15 against 3.3, so most of
+// the step is unexplained excess. Each wrapped statement is bracketed by events
+// and synced, so the TOTAL is inflated by serialization: read the split, not
+// the sum. Printed at exit.
+static const bool g_ktime = getenv("LFM_KTIME") != nullptr;
+static cudaEvent_t g_ka = nullptr, g_kb = nullptr;
+static std::map<std::string, std::pair<double,int> > g_kt;
+static void kt_add(const char* n, float ms) { g_kt[n].first += ms; g_kt[n].second++; }
+#define KT(name, ...)                                                        \
+  do {                                                                        \
+    if (g_ktime) {                                                            \
+      if (!g_ka) { cudaEventCreate(&g_ka); cudaEventCreate(&g_kb); }          \
+      cudaEventRecord(g_ka, g_launch);                                        \
+      __VA_ARGS__;                                                             \
+      cudaEventRecord(g_kb, g_launch);                                        \
+      cudaEventSynchronize(g_kb);                                             \
+      float _ms = 0.f; cudaEventElapsedTime(&_ms, g_ka, g_kb);                \
+      kt_add(name, _ms);                                                      \
+    } else { __VA_ARGS__; }                                                    \
+  } while (0)
+
 // LFM_STREAM=1: read the Q8 code bytes with __ldcs (evict-first / streaming).
 // Each code byte is read exactly once per token, by exactly one lane, so a
 // normal load leaves the whole 32-byte sector in L2 for a reader that never
@@ -948,6 +988,7 @@ static GemvCfg pick(int N, int K) {
   // R only remaps rows to blocks, so per-row reduction order -- and every
   // output bit -- is unchanged.
   c.R = (N >= 1024) ? 256 : 64;
+  if (g_radapt) c.R = (N >= 4096) ? 256 : (N >= 1024 ? 64 : 32);
   if (K == 512) { c.KCHUNK = 512; c.TPB = 128; }
   if (fKC && K % fKC == 0) c.KCHUNK = fKC;
   if (fTPB >= 32 && fTPB <= 1024) c.TPB = fTPB;
@@ -964,10 +1005,11 @@ static GemvCfg pick(int N, int K) {
 static void q8_launch_bf(int nblk, int TPB, size_t shm, const int8_t* q, const float* sc,
                          const bf16* x, float* part, int N, int K, int KC, int R, int nb,
                          cudaStream_t st) {
-  if (g_fma && g_stream)      q8_partial<bf16,true ,true ><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
-  else if (g_fma)             q8_partial<bf16,true ,false><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
-  else if (g_stream)          q8_partial<bf16,false,true ><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
-  else                        q8_partial<bf16,false,false><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
+  const int U = g_unroll2 ? 2 : 1;
+  if (g_fma && U == 2)        q8_partial<bf16,true ,false,2><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
+  else if (g_fma)             q8_partial<bf16,true ,false,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
+  else if (g_stream)          q8_partial<bf16,false,true ,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
+  else                        q8_partial<bf16,false,false,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
 }
 
 static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
@@ -1574,7 +1616,7 @@ int main(int argc, char** argv) {
     int ci = 0;
     for (int L = 0; L < NLAYER; L++) {
       if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[L] ? &g_tAttn : &g_tConv; }
-      rms1(M, M.x, NW(M, L, "operator_norm.weight"), M.h1);
+      KT("rms operator_norm", rms1(M, M.x, NW(M, L, "operator_norm.weight"), M.h1));
       g_probe = trace && L == g_probe_layer && s == g_probe_step;
       PROBE("operator_norm", M.h1, H);
       if (is_attn[L]) {
@@ -1617,7 +1659,7 @@ int main(int argc, char** argv) {
         PROBE("o_proj", M.h2, H);
       } else {
         bf16* ring = M.ring + (size_t)ci * 7 * H;
-        gemv(M, LN(L, "conv.in_proj.weight"), M.h1, M.bx);      // [B|C|xg], 3H rows
+        KT("gemv conv.in_proj", gemv(M, LN(L, "conv.in_proj.weight"), M.h1, M.bx));
         PROBE("in_proj", M.bx, 3 * H);
         // THE BUG THAT BROKE THE ENGINE. HF's conv branch is
         //     B, C, x = in_proj(h).chunk(3)  ->  conv(B * x)  ->  C * y   (modeling_lfm3.py:372-421)
@@ -1632,24 +1674,24 @@ int main(int argc, char** argv) {
         // provably did not contain B*x.
         // Ordering matters: the gate multiply must complete before the
         // newest ring slot is written, so the shift follows the multiply.
-        emul(M, M.bx, M.bx + 2 * H, M.h3, H);                   // B * xg
+        KT("emul B*xg", emul(M, M.bx, M.bx + 2 * H, M.h3, H));
         PROBE("B*x", M.h3, H);
-        k_shift_in<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, M.h3, H);
+        KT("k_shift_in", k_shift_in<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, M.h3, H));
         if (g_probe) for (int k = 0; k < 7; k++)
           printf("    ring slot %d     rms %9.5f\n", k, rms_host_n(ring + (size_t)k * H, H));
-        k_conv7<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, T(M, LN(L, "conv.conv.weight"))->df, M.h4, H);
+        KT("k_conv7", k_conv7<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, T(M, LN(L, "conv.conv.weight"))->df, M.h4, H));
         PROBE("conv", M.h4, H);
-        emul(M, M.bx + H, M.h4, M.h2, H);                       // C * y
+        KT("emul C*y", emul(M, M.bx + H, M.h4, M.h2, H));
         PROBE("C*y", M.h2, H);
-        gemv(M, LN(L, "conv.out_proj.weight"), M.h2, M.h2);
+        KT("gemv conv.out_proj", gemv(M, LN(L, "conv.out_proj.weight"), M.h2, M.h2));
         PROBE("out_proj", M.h2, H);
         ci++;
       }
-      rms1(M, M.h2, NW(M, L, "post_operator_norm.weight"), M.h3);
+      KT("rms post_op_norm", rms1(M, M.h2, NW(M, L, "post_operator_norm.weight"), M.h3));
       PROBE("post_op_norm", M.h3, H);
       eadd(M, M.x, M.h3, M.x, H);
       PROBE("add1", M.x, H);
-      rms1(M, M.x, NW(M, L, "ffn_norm.weight"), M.h1);
+      KT("rms ffn_norm", rms1(M, M.x, NW(M, L, "ffn_norm.weight"), M.h1));
       PROBE("ffn_norm", M.h1, H);
       char mn[96]; snprintf(mn, sizeof mn, "MERGE:%d:gate_up", L);
       if (g_merge && T(M, mn)) {
@@ -1661,16 +1703,16 @@ int main(int argc, char** argv) {
         PROBE("w3", M.hgu + INTER, INTER);
         k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(M.hgu, M.hgu + INTER, M.h2, INTER);
       } else {
-      gemv(M, LN(L, "feed_forward.w1.weight"), M.h1, M.h2);
+      KT("gemv ffn.w1", gemv(M, LN(L, "feed_forward.w1.weight"), M.h1, M.h2));
       PROBE("w1", M.h2, INTER);
-      gemv(M, LN(L, "feed_forward.w3.weight"), M.h1, M.h3);
+      KT("gemv ffn.w3", gemv(M, LN(L, "feed_forward.w3.weight"), M.h1, M.h3));
       PROBE("w3", M.h3, INTER);
       k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(M.h2, M.h3, M.h2, INTER);
       }
       PROBE("silu_mul", M.h2, INTER);
-      gemv(M, LN(L, "feed_forward.w2.weight"), M.h2, M.h2);
+      KT("gemv ffn.w2", gemv(M, LN(L, "feed_forward.w2.weight"), M.h2, M.h2));
       PROBE("w2", M.h2, INTER);
-      rms1(M, M.h2, NW(M, L, "post_ffn_norm.weight"), M.h3);
+      KT("rms post_ffn_norm", rms1(M, M.h2, NW(M, L, "post_ffn_norm.weight"), M.h3));
       PROBE("post_ffn_norm", M.h3, H);
       eadd(M, M.x, M.h3, M.x, H);
       PROBE("add2", M.x, H);
@@ -1787,6 +1829,12 @@ int main(int argc, char** argv) {
     }
     if (st) fclose(st);
     printf("RSS_KB=%lld RSS_NOW_KB=%lld\n", hwm, cur);
+    fflush(stdout);
+  }
+  if (g_ktime) {
+    printf("KTIME per-kernel ms/token (serialized: read the split, not the sum)\n");
+    for (std::map<std::string,std::pair<double,int> >::iterator it = g_kt.begin(); it != g_kt.end(); ++it)
+      printf("  %-24s %8.3f ms  n=%d\n", it->first.c_str(), it->second.first, it->second.second);
     fflush(stdout);
   }
   printf("FM3_NANODE_DONE\n");
