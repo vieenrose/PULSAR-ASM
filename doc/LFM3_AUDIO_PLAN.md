@@ -1,11 +1,14 @@
 # LFM3-Audio-2B on a PULSAR asm engine — scope, facts, and plan
 
-Status: **scoped and partly measured. No engine code exists for this model on
-any target.** Every number below was read from `LiquidAI/LFM3-Audio-2B`
-(`config.json`, the safetensors headers, the file listing), from
-`.auto/HANDOFF_NANO_Q1_0.md`, or measured on the two Jetson Nanos, on
-2026-10-28 — not estimated. §8–§10 are the Nano verdict; §9 is the one that
-decides it.
+Status: **measured; verdict in §11 — no-go for full speech-to-speech on a 4 GB
+Jetson Nano, and S1 fits only on a dedicated board.** Not an opinion: the
+accuracy floor is measured (§11, Q8_0 is bit-identical to BF16 and nothing
+below it survives), the incumbent it must beat is measured (§10.1, a 27 tok/s
+ASR+LLM+TTS stack in 1357 MB running 6 days), and the kernel gap is measured
+(§8.4b, the Nano has no Q8 GEMV and K=7680 is unsupported). Every number below
+was read from `LiquidAI/LFM3-Audio-2B` (`config.json`, the safetensors headers,
+the file listing), from `.auto/HANDOFF_NANO_Q1_0.md`, or measured on the two
+Jetson Nanos, on 2026-10-28 — not estimated.
 
 ## 0. Two open questions that gate everything
 
@@ -398,7 +401,9 @@ the backbone). So:
 - Caveats: 2 prompts x 48 tokens, greedy only, torch fake-quant (group 32
   matches llama.cpp Q8_0/Q4_0). Prompt A tolerates down to Q4_1 while B breaks
   at Q6 — the spread means the gate needs more prompts before any tolerance is
-  frozen.
+  frozen. **The 8-prompt deterministic replication is §11 and it confirms this
+  table**; the prefix columns here are valid, only the `exact` boolean in the
+  harness was broken at the time (see §11's note on the metric).
 
 **Validation that the quantizer really ran** (the failure mode is a filter that
 matches nothing, which reads as "4-bit is lossless"). Relative Frobenius error
@@ -519,5 +524,57 @@ stream below Q8 — none found in §9, and the FFN at 66% of weights is the
 sensitivity driver, so it needs more than a better group size; (b) a smaller
 LFM3-Audio checkpoint (2B is the smallest published); (c) accepting a stream
 that diverges from BF16, i.e. redefining "frozen accuracy" — the §9 table is
-the input to that decision, and the 12-prompt extension is in
-`.auto/lfm3/quant_sensitivity_prompts.jsonl`.
+the input to that decision, and the deterministic 8-prompt extension is in
+`.auto/lfm3/quant_sensitivity_prompts8.jsonl` (results, §11).
+
+---
+
+## 11. Verdict (definitive numbers, deterministic harness)
+
+`.auto/lfm3/quant_sensitivity_prompts8.jsonl` — 8 prompts (factual, arithmetic,
+code, translation, chemistry, date formats, explanation), 24 greedy tokens,
+1 thread, bf16 control row passing 8/8. `exact` = agreement over the compared
+span `min(len(golden), --tokens)`; `worst` = the minimum prefix over the 8.
+
+| scheme | bits/w | GB backbone | exact | mean prefix | worst |
+|---|---|---|---|---|---|
+| bf16 (control) | 16.00 | 3.457 | **8/8** | 23.1 | 17 |
+| **q8_0** | 9.64 | **2.082** | **8/8** | **23.1** | 17 |
+| q6_0 | 7.94 | 1.716 | 6/8 | 19.4 | **0** |
+| q5_0 | 7.09 | 1.532 | 3/8 | 16.1 | 6 |
+| q4_1 | 6.67 | 1.441 | 2/8 | 10.4 | 0 |
+| q4_0 | 6.24 | 1.349 | 1/8 | 9.1 | 0 |
+| q2_0 | 4.55 | 0.982 | **0/8** | **0.0** | 0 |
+
+**Q8_0 is bit-identical to BF16 on all 8 prompts** (same 8/8, same 23.1 mean
+prefix — quantization noise at 0.57% rel. Frobenius never flips an argmax).
+Below it the collapse is steep and monotone: Q6 already loses 2 prompts
+entirely, Q4_0 survives 1 of 8, Q2_0 diverges at the **first token of every
+prompt** (mean prefix 0.0).
+
+The verdict, per stage, against measured budgets (ipho-nano 1457 MB available,
+picard-desktop 2542 MB, Tegra X1 1 SM, 21.9 GB/s ceiling / 17.1 GB/s achieved):
+
+| stage | needs | verdict |
+|---|---|---|
+| S1 text backbone | 2.082 GB (Q8_0) + 53 MB K/V + arena + ~300 MB RSS | **only on picard-desktop**, tight; **no** on ipho-nano. ~8 tok/s (2.082 GB ÷ 17.1 GB/s), vs the 27 tok/s incumbent |
+| S1+S2+S3 (audio-in → text-out) | + 0.219 GB encoder | marginal on picard-desktop only |
+| S4 MaskGIT head | + 0.328 GB, 3 bidirectional layers × 3 steps, rep-penalty sampler (absent) | **no** on either board |
+| S5 full speech-to-speech | ≈ 2.41 GB weights + CUDA context + codec buffers | **no** on 4 GB, and ~1.8x the incumbent pipeline's 1357 MB at ~1/3 its speed |
+
+The reason this is a no-go rather than a "slow start" is the incumbent: the
+Nano already runs ASR + 4B-ternary-LLM + TTS + VAD + turn-detection in
+1357 MB at 27 tok/s, stably for 6 days (§10.1). LFM3-Audio's accuracy floor is
+1.72 GB for the backbone alone — it cannot approach that footprint, and the
+kernel story is worse than the memory story: the Nano has **no Q8 GEMV** (the
+`pq1_*` family is 2-bit PQ1_0, §8.4b), K=7680 is unsupported outright, and the
+only Q8 measurement available is 0.81 GB/s, ~20x short of the 17.1 GB/s the
+estimate above assumes.
+
+If the goal is speech-to-speech on a Jetson Nano, the measured evidence says
+keep the existing pipeline. If the goal is specifically LFM3-Audio's quality,
+the target needs more RAM than 4 GB. The one piece of S1 worth doing on the
+Nano regardless is a **Q8_0 GEMV at K=2048** — it is the missing primitive for
+*any* 8-bit model on this tree (LFM3, and the Q8-embedding GGUFs already sitting
+on picard-desktop), and it is self-contained: `pq1_parity`-style bit-exactness
+against a host reference, then a TPB/MINB/RB/PD sweep like K=4096 got.
