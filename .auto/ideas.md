@@ -2005,3 +2005,13 @@ A Kahan accumulation would have cost +6-12% FP work on an FP-pipe-bound kernel (
 mechanism of the -2.0% FMA win, inverted) to chase the smaller term. Not built, and the
 reason is now on the record: **the 2-3x ratio is the price of Q8 weights, and reducing it
 means buying bytes back (fp16 linears = 2x the stream = ~2x the step), not better arithmetic.**
+
+## Stuck-process CPU contention is NOT inflating decode (run #118): the reboot re-sweep is dropped
+
+The three un-reapable `lfm3_conv_test` processes spin cores 0/2/3 (load ~3.9). Paired,
+order-balanced A/B of the shipping binary, unpinned vs `taskset -c 1` (the idle core):
+free 137.50/137.67/137.73/137.64 (median 137.66), pinned 137.60/137.56/137.66/137.40
+(median 137.58), R = 1.0006, 2/4 pairs each way -> null. The launch thread is off the
+critical path (same mechanism as CUDA graphs -0.55%, #99). My earlier "absolutes are
+inflated, re-sweep after a reboot" caveat was an untested assumption and is withdrawn; the
+README is corrected. The stuck processes remain worth clearing for hygiene, not for latency.

@@ -261,11 +261,14 @@ probe that never executed: `R` exactly 1.0000, or gate output identical to the d
 
 ## Known issues
 
-* **The Nano needs a power cycle.** Three `lfm3_conv_test` processes from 2026-10-28 are stuck
-  in state R inside the CUDA driver; `kill -9` does not reap them and `systemctl reboot` is
-  swallowed because shutdown waits on them. 3 of 4 A57 cores spin permanently, so today's
-  absolutes are inflated (the GEMV config sweep should be repeated after a reboot). Same-session
-  paired A/B is unaffected.
+* **Three stuck processes on the Nano, measured harmless to decode.** Three `lfm3_conv_test`
+  processes from 2026-10-28 are stuck in state R inside the CUDA driver (`kill -9` does not
+  reap them, `systemctl reboot` is swallowed), spinning cores 0, 2 and 3. Pinning the engine
+  to the one idle core (`taskset -c 1`) is a null result in a paired, order-balanced A/B
+  (137.66 vs 137.58 ms/token, R = 1.0006, 2/4 pairs each way): the launch thread is not on
+  the critical path, consistent with CUDA graphs measuring -0.55%. So the absolutes are
+  **not** inflated by them, and the GEMV config sweep does not need repeating after a reboot.
+  The ~1% gap between this session's 137.5 and the 136.3 best is ordinary board drift.
 * Prompt D cannot be scored (see above), and the stream gate therefore covers 7 of 8 prompts.
 * `--trace` (the per-layer/per-position matrix) cannot run inside a graph capture, so
   `LFM_GRAPHS` forces it off.
