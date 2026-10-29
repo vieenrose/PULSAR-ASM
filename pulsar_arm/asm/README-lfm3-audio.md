@@ -172,7 +172,8 @@ The formal gate suite itself passes on the raw arm (#182, current tree): matrix,
 and the same 130/131 logit top-1 the shipped arm gets. The one formal long-context gate
 (matrix_long, 7200 layer x position rms cells at 300 positions) shows 5/7200 over 3% vs the
 shipped arm's 1/7200 -- all engine-low by at most 3.2%, at positions 209/232/278 in layers
-10-13 (#184). Top-1 agreement is 47/48 in every arm on
+10-13 (#184). The rescaled arm, by contrast, formally FAILS the logit gate (127/131, F 19/21,
+one top-1 short on four prompts, #186) at ~0% speed: it is dominated on every axis. Top-1 agreement is 47/48 in every arm on
 every divergence prompt; nothing grows. At audio-length
 context the raw arm is also clean (#171): on a 300-id prompt scored on HF fp16's own states, the
 20 long-context states give shipped KL 0.0008 top-1 19/20 vs H2=1 KL 0.0005 top-1 20/20 -- the
