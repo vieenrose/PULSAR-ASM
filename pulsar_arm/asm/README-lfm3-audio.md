@@ -168,7 +168,9 @@ LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.00
                                                            a floor the shipped passes)
 
 speed rows: same-session pairs 2026-02-10 (#180/#189). At AUDIO scale the raw arm widens:
-360-token prefill 36.8 s vs 39.7 s, -8.0%, order-balanced two pairs (#203). Quality: formal
+360-token prefill -8.0% (order-balanced, #203), replicated at 300 tokens -7.8% a separate
+sample day (#206); the 23-token ratio stays -5.7% on a hot board (#205), so the widening is
+context-length-dependent (per-step saving 5.5 -> 7.3-8.2 ms), mechanism open. Quality: formal
 suite gate-for-gate identical to shipped (#182 short, #199 full --long), tie-landscape argmax
 identical on both references (#195/#196), rms vs fp16 reference 0/24000 cells to 1000
 positions in both arms (#192/#201).
