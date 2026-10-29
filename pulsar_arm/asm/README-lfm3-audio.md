@@ -155,12 +155,39 @@ bash .auto/lfm3/checks.sh A B C E F K L
 |---|---|
 | per-layer × per-position rms vs HF, 23 layers × 23 positions | all within 3% |
 | pos-0 logits | top-1 = HF's (11), corr 0.99998, std 4.564 vs 4.547 |
+| **all 23 positions × 128,000 logits** | **top-1 = HF's 23/23**, top-8 coverage 1.000 both ways, corr 0.99964 (min 0.99900), KL 0.0014 (max 0.0084) |
 | greedy stream prefix vs HF goldens, 7 prompts | every prompt ≥ floor (A=2, B/C/E/F/K/L=1) |
 
 **Read this honestly.** Prefixes are 1–2 tokens of 16 and **0/7 prompts fully match**: the
 engine diverges from HF within a couple of tokens on every prompt. `CHECKS OK` certifies the
-arm's floor (1 token, the plan's certified worst prefix for this arm), not stream equality; the
-strong quality signals are the 23×23 rms matrix and the pos-0 logits.
+arm's floor (1 token, the plan's certified worst prefix for this arm), not stream equality.
+
+The 23-position logit gate is what makes that disclosure mean what it should: over the whole
+distribution the engine's top-1 equals HF's at **every** position, HF's top-1 is always inside
+the engine's top-8 (and the converse), and mean KL is 1.4e-3. So the greedy divergence is
+argmax/tie amplification on a distribution that agrees closely — not a distributional gap.
+This gate is also the reason to distrust the stream gate as a quality instrument: the
+`__fmaf_rn` switch that bought −2.0% left all 16 stream tokens on both prompts unchanged,
+so stream equality could not have detected a regression there. Running it on the FMA decision
+directly (prompt A, all 23 positions):
+
+```
+                                        top-1   top-8 cov   corr      KL mean   KL max
+__fmaf_rn accumulation   (shipped)       23/23     1.000     0.99964   0.0014    0.0084
+exact mul-then-add       (LFM_NOFMA=1)   23/23     1.000     0.99961   0.0015    0.0114
+```
+
+So the −2.0% cost nothing in quality; if anything the FMA form agrees with HF *better*, which
+is what expecting ggml's reference `sum += w*x` (compiled to an FMA) predicts. Thresholds in
+`gate_logits_seq` are a **regression ratchet** measured on the shipped arm — passing means "no
+worse than the arm this gate was written on", and every number is printed each run so drift is
+visible even on a pass.
+
+**Env forwarding gotcha (cost an hour, now fixed):** engine knobs reach the Nano through
+`LFM3_ENV`, not by setting them in the shell — `LFM_NOFMA=1 bash checks.sh A` sets the
+variable *locally only*, the engine runs the default arm, and every gate number comes back
+byte-identical. Use `LFM3_ENV="LFM_NOFMA=1" bash checks.sh A`; the header echoes
+`engine env: …` so an arm is self-documenting. Identical-to-the-digit gate output is the tell.
 
 Two structural facts about the goldens, both measured:
 
@@ -183,7 +210,8 @@ prefix is cliff-like — stream equality is a weak discriminator for accumulatio
 
 ```bash
 bash .auto/lfm3/measure.sh                      # sync -> build -> fixed job -> METRIC lines
-bash .auto/lfm3/checks.sh A B C E F K L         # the gates (env flows: LFM_FMA=1 bash checks.sh …)
+bash .auto/lfm3/checks.sh A B C E F K L         # the gates
+LFM3_ENV="LFM_NOFMA=1" bash .auto/lfm3/checks.sh A   # same gates, other engine arm (see gotcha below)
 bash .auto/lfm3/ab.sh "" "LFM_NOFMA=1"          # paired A/B of an env knob, both orders
 LFM_TIME=1  ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --steps 24 --prompt …   # per-phase
 LFM_KTIME=1 ./lfm3_nanode …                     # per-kernel table at exit
@@ -200,10 +228,11 @@ Knobs (all default to the shipping configuration): `LFM_NOFMA`, `LFM_NOFUSE`, `L
 
 Two harness traps cost real time and are now defended against: `test -x $BIN` is **not** a
 build check (nvcc leaves the previous binary on failure, so three broken builds silently
-measured stale numbers), and `PQ1_EXTRA` does not propagate through the ssh quoting layer in
-`measure.sh` — env knobs must be set directly (`LFM_FMA=1 bash checks.sh …`) or passed as
-program args via `LFM3_ARGS`. The tell for a probe that never executed: `R` exactly 1.0000 and
-the two arms matching to four digits.
+measured stale numbers), and engine env does **not** reach the Nano by setting it in the
+shell — `LFM_NOFMA=1 bash checks.sh A` sets it locally only, the engine runs the default arm,
+and every gate number comes back byte-identical. Use `LFM3_ENV="LFM_NOFMA=1" bash checks.sh A`
+(the header echoes `engine env: …`), and pass program args through `LFM3_ARGS`. The tell for a
+probe that never executed: `R` exactly 1.0000, or gate output identical to the digit.
 
 ## Known issues
 

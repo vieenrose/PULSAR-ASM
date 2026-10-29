@@ -27,6 +27,14 @@ NANO = os.environ.get("NANO", "picard@100.84.151.116")
 DIR = os.environ.get("NANO_DIR", "/home/picard/lfm3")
 BLOB = os.environ.get("LFM3_BLOB", "lfm3-audio-2b-q8.lfm3q8")
 BIN = os.environ.get("LFM3_BIN", "lfm3_nanode")
+# Engine env to forward into every remote run, e.g.
+#   LFM3_ENV="LFM_NOFMA=1" bash .auto/lfm3/checks.sh A
+# Without this, `LFM_NOFMA=1 bash checks.sh A` sets the variable LOCALLY only:
+# the engine runs the default arm and every metric comes back byte-identical,
+# which is how a quality A/B of the FMA switch first reported a fake tie. The
+# string is echoed in the header so an arm's output is self-documenting.
+GENV = os.environ.get("LFM3_ENV", "").strip()
+ENVQ = ("env " + GENV + " ") if GENV else ""
 FAIL = []
 
 
@@ -44,8 +52,8 @@ def ids_of(tag):
 
 def gate_matrix():
     ids = ids_of("A")["prompt_ids"]
-    out = run_remote("cd %s && timeout 1800 ./%s %s --steps %d --prompt %s --trace 2>&1"
-                     % (DIR, BIN, BLOB, len(ids), ",".join(map(str, ids))))
+    out = run_remote("cd %s && timeout 1800 %s./%s %s --steps %d --prompt %s --trace 2>&1"
+                     % (DIR, ENVQ, BIN, BLOB, len(ids), ",".join(map(str, ids))))
     eng = {}
     for l in out.splitlines():
         m = re.match(r"POS\s+(\d+)\s+L(\d+)\s+(\S+)\s+rms\s+([-\d.]+)", l)
@@ -69,9 +77,9 @@ def gate_matrix():
 
 
 def gate_logits0():
-    out = run_remote("cd %s && rm -f lg0.bin; timeout 900 ./%s %s --steps 1 --prompt %d "
+    out = run_remote("cd %s && rm -f lg0.bin; timeout 900 %s./%s %s --steps 1 --prompt %d "
                      "--dump-logits lg0.bin >/dev/null 2>&1; ls -l lg0.bin 2>&1"
-                     % (DIR, BIN, BLOB, ids_of("A")["prompt_ids"][0]))
+                     % (DIR, ENVQ, BIN, BLOB, ids_of("A")["prompt_ids"][0]))
     if "lg0.bin" not in out:
         FAIL.append("logits0: no dump produced (%s)" % out.strip()[:80]); return
     run_remote("cd %s && true" % DIR)
@@ -117,9 +125,9 @@ def gate_logits_seq(n=23, k=8):
     n = min(n, hf.shape[0])
     ids = ids_of("A")["prompt_ids"][:n]
     run_remote("cd %s && rm -f lgall.bin" % DIR)
-    out = run_remote("cd %s && timeout 1800 ./%s %s --steps %d --prompt %s "
+    out = run_remote("cd %s && timeout 1800 %s./%s %s --steps %d --prompt %s "
                      "--dump-logits-all lgall.bin >/dev/null 2>&1; ls -l lgall.bin 2>&1"
-                     % (DIR, BIN, BLOB, n, ",".join(map(str, ids))))
+                     % (DIR, ENVQ, BIN, BLOB, n, ",".join(map(str, ids))))
     if "lgall.bin" not in out:
         FAIL.append("logits-seq: no dump produced (%s)" % out.strip()[:80]); return
     subprocess.run(["scp", "-o", "ConnectTimeout=20", "-q", "%s:%s/lgall.bin" % (NANO, DIR),
@@ -192,8 +200,8 @@ def gate_streams(prompts, gen=16, floor=1):
             # nothing about D..L.
             print("    %s: SKIPPED (golden has no prompt_ids; needs oracle.build_ids)" % p)
             continue
-        out = run_remote("cd %s && timeout 1800 ./%s %s --steps %d --prompt %s 2>&1"
-                         % (DIR, BIN, BLOB, len(g["prompt_ids"]) + gen - 1,
+        out = run_remote("cd %s && timeout 1800 %s./%s %s --steps %d --prompt %s 2>&1"
+                         % (DIR, ENVQ, BIN, BLOB, len(g["prompt_ids"]) + gen - 1,
                             ",".join(map(str, g["prompt_ids"]))))
         # Step lines are "  <step>  <token>  <ms>  <tok/s>", and the token
         # column is the token FED at that step. The harness feeds
@@ -232,7 +240,7 @@ def gate_streams(prompts, gen=16, floor=1):
 
 if __name__ == "__main__":
     prompts = (sys.argv[1:] or ["A", "B"])
-    print("== gate: %s / %s ==" % (BLOB, BIN))
+    print("== gate: %s / %s%s ==" % (BLOB, BIN, ("  engine env: " + GENV) if GENV else ""))
     gate_matrix()
     gate_logits0()
     gate_logits_seq()
