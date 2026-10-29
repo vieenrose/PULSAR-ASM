@@ -142,10 +142,13 @@ TTFT, prompt A (each step paired A/B in both orders where noted)
        ┃ load, absorbing the devfreq DVFS ramp (idle board runs 76.8-153.6 MHz
        ┃ for the first ~5-24 s, #210/#209): neutral in the normal state, recovers
        ┃ ~1% from an 8-min idle start, and is the fix for +7% cold-board days.
-       ┃ The GPU clock decays 921.6 -> 76.8 MHz within ~2-4 s of process exit
-       ┃ (#223), so ANY query gap >~5 s starts cold: for interactive/audio use
-       ┃ WARMMS=6000 is the per-startup recommendation; the -20 ms cold penalty
-       ┃ is front-loaded, hence -0.1% at 300-token prefills (#220)
+       ┃ CAVEAT (#235, clean spinner-free board): the earlier idle-start wins
+       ┃ were measured with the core-spinner contamination -- on the clean board
+       ┃ WARMMS=6000 is +7.7% SLOWER from 8-min idle (2466.5 vs 2289.5): the
+       ┃ 6 s dummy load shifts the power-aware GPU governor down before the
+       ┃ measured window. Treat WARMMS as a board-state-dependent experiment,
+       ┃ not a recommendation; default 0 is the only supported mode until
+       ┃ governor-level analysis exists (needs root, #177).
 2271.1 ┃█-318.5 ms  feeding fix + lm_head skip on prompt steps 0..n-2
        ┃           (the loop fed every prompt step's prediction back as input;
        ┃           LFM_LEGACYFEED=1 is the control)
