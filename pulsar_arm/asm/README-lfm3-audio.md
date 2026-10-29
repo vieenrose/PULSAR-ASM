@@ -180,10 +180,10 @@ shipped (fp32 path)              2283.5    113.4     6/7      0.0013/0.0005/0.00
 LFM_H2=1 (raw half2 + HFMA2)     2243.7    111.6     6/7      0.0016/0.0006/0.0005  28% of one layer's
  -1.8% TTFT / -1.7% decode                                        inputs in fp16's low-        precision range;             theoretical accumulator        overflow on ffn.w2
 LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.0005  safe by construction
- rescale; the scan costs what                              (post-RoPE re-score,     (bound 65024, no
- the faster loop saves)                                    #159: the 7/7 was tie     subnormals)
-                                                           luck; F drops to 19/21,
-                                                           a floor the shipped passes)
+ rescale; clean-board 360-pos     (360-pos:  (short-         (post-RoPE re-score,     (bound 65024, no
+ -0.9% vs raw's -1.4%: the scan    -0.9%)    prompt          #159: the 7/7 was tie     subnormals)
+ costs ~0.5 pt (#242)                         record,         luck; F drops to 19/21,
+                                             #142)           a floor the shipped passes)
 
 SPEED ROWS CORRECTED (#236/#237): the -5.3..-8.0% family was measured with the 3-core
 `lfm3_conv_test` spinners (#230 kill) contending with the engine's CPU side; the shorter H2
