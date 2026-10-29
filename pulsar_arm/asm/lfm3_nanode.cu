@@ -1193,6 +1193,155 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   }
   k_combine_bf<<<(N + 255) / 256, 256, 0, g_launch>>>(M.part, yb, N, nchunk);
 }
+// Batched H2 prefill, clean-room (#162 continued). VALIDATED PIECES ONLY:
+// - staging layout identical to q8_partial<H2=1> (proven bit-exact by v3a);
+// - per-lane register acc (shared acc was a cross-lane race -- the v1 bug);
+// - shm sized exactly CT*nb*17 half2 = 8704 B (the v1 ULF was OOB shared use).
+// The minimal direct-call probe just proved direct launches + shared + H2 all
+// work in this context, so any failure here is in the newly added structure.
+template <typename TX, int CT>
+__global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restrict__ s,
+                           const TX* __restrict__ xall, float* __restrict__ part,
+                           int N, int K, int KCHUNK, int R, int nb, int T) {
+  extern __shared__ float smf[];
+  __half2* xh = reinterpret_cast<__half2*>(smf);
+  const int nchunk = K / KCHUNK, rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
+  const int koff = chunk * KCHUNK, NT = blockDim.x, tid = threadIdx.x;
+  const int lane = tid & 31, wid = tid >> 5, WPB = NT >> 5, GR = R / WPB, base = rowblk * R;
+  const __half2 off = __floats2half2_rn(1152.f, 1152.f);
+  for (int t0 = 0; t0 < T; t0 += CT) {
+    int ct = T - t0; if (ct > CT) ct = CT;
+    for (int i = tid; i < ct * nb * 16; i += NT) {
+      const int c = i / (nb * 16), rem = i % (nb * 16);
+      const int b = rem / 16, k = rem % 16;
+      int tt = t0 + c; if (tt >= T) tt = T - 1;
+      xh[((size_t)c * nb + (size_t)b) * 17 + (size_t)k] =
+        __floats2half2_rn(lfm_stage(xall[((size_t)tt) * K + koff + (size_t)b * 32 + 2 * k]),
+                           lfm_stage(xall[((size_t)tt) * K + koff + (size_t)b * 32 + 2 * k + 1]));
+    }
+    __syncthreads();
+    for (int g = 0; g < GR; g++) {
+      const int r = wid + g * WPB, row = base + r;
+      float acc[CT];
+#pragma unroll
+      for (int c = 0; c < CT; c++) acc[c] = 0.f;
+      if (row < N) {
+        const int8_t* qr = q + (size_t)row * K + koff;
+        const float* sr = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb;
+        for (int b = lane; b < nb; b += 32) {
+          const int4 a0 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK);
+          const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
+          const uint32_t w[8] = {(uint32_t)a0.x, (uint32_t)a0.y, (uint32_t)a0.z, (uint32_t)a0.w,
+                                 (uint32_t)a1.x, (uint32_t)a1.y, (uint32_t)a1.z, (uint32_t)a1.w};
+#pragma unroll
+          for (int c = 0; c < CT; c++) {
+            const __half2* xb2 = xh + ((size_t)c * nb + (size_t)b) * 17;
+            __half2 h2 = __floats2half2_rn(0.f, 0.f);
+#pragma unroll
+            for (int k = 0; k < 8; k++) {
+              const uint32_t u = w[k] ^ 0x80808080u;
+              const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+              const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+              __half2 cl = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+              __half2 ch = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+              h2 = __hfma2(cl, xb2[2 * k], h2);
+              h2 = __hfma2(ch, xb2[2 * k + 1], h2);
+            }
+            const float2 f = __half22float2(h2);
+            acc[c] = __fmaf_rn(sr[b], f.x + f.y, acc[c]);
+          }
+        }
+      }
+#pragma unroll
+      for (int c = 0; c < CT; c++) {
+        float v = (row < N) ? acc[c] : 0.f;
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+        if (lane == 0 && row < N && t0 + c < T)
+          part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+
+// Minimal direct-call diagnostic (run #162): one q8_partial<H2=1> launch,
+// every step checked. Determines whether direct calls work at all.
+static int prefill_minimal(Model& M) {
+  Ent* e = nullptr;
+  for (size_t i = 0; i < M.ents.size(); i++)
+    if (M.ents[i].dq && M.ents[i].ds && M.ents[i].ne[0] >= 1024 && M.ents[i].ne[1] % 32 == 0) { e = &M.ents[i]; break; }
+  if (!e) return 1;
+  const int N = e->ne[0], K = e->ne[1], TPB = 256;
+  const int KC = (K >= 2048 && K % 2048 == 0) ? 2048 : K, nb = KC / Q8_BLK;
+  const int nblk = ((N + 255) / 256);
+  printf("prefill-minimal %s N=%d K=%d nblk=%d shm=%zu\n", e->name.c_str(), N, K, nblk, (size_t)nb * 33 * 4); fflush(stdout);
+  uint16_t* xd = nullptr; float* out = nullptr;
+  printf("m-alloc=%s %s\n", cudaGetErrorString(cudaMalloc(&xd, (size_t)K * 2)), cudaGetErrorString(cudaMalloc(&out, (size_t)N * 4))); fflush(stdout);
+  std::vector<uint16_t> pat((size_t)K);
+  for (size_t i = 0; i < pat.size(); i++) pat[i] = (uint16_t)(0x3c00 + ((i * 37) & 0x3ff));
+  printf("m-h2d=%s\n", cudaGetErrorString(cudaMemcpy(xd, pat.data(), pat.size() * 2, cudaMemcpyHostToDevice))); fflush(stdout);
+  cudaMemset(out, 0xFF, (size_t)N * 4);
+  cudaEvent_t ea, eb; cudaEventCreate(&ea); cudaEventCreate(&eb);
+  cudaEventRecord(ea);
+  q8_partial<bf16,true,false,1,1><<<nblk, TPB, (size_t)nb * 33 * 4>>>(e->dq, e->ds, (const bf16*)xd, out, N, K, KC, 256, nb);
+  printf("m-launch=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
+  cudaEventRecord(eb); cudaEventSynchronize(eb);
+  printf("m-sync=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
+  float ms = 0; cudaEventElapsedTime(&ms, ea, eb);
+  std::vector<float> h(8, -999.f);
+  cudaError_t me = cudaMemcpy(h.data(), out, 32, cudaMemcpyDeviceToHost);
+  printf("m-read=%s ms=%.2f out[0..3]=%.9g %.9g %.9g %.9g (numpy row0: -0.110298038)\n", cudaGetErrorString(me), ms, h[0], h[1], h[2], h[3]); fflush(stdout);
+  return 0;
+}
+
+// Batched H2 selftest (#162 continued): 23 sequential H2 GEMVs (proven above)
+// vs one batched call. Bit-exactness expected by construction (same per-position
+// order); the question is only whether it runs and how fast.
+static int prefill_h2batched(Model& M) {
+  Ent* e = nullptr;
+  for (size_t i = 0; i < M.ents.size(); i++)
+    if (M.ents[i].dq && M.ents[i].ds && M.ents[i].ne[0] >= 1024 && M.ents[i].ne[1] % 32 == 0) { e = &M.ents[i]; break; }
+  if (!e) return 1;
+  const int N = e->ne[0], K = e->ne[1], T = 23, R = 256, TPB = 256, CT = 2;
+  const int KC = (K >= 2048 && K % 2048 == 0) ? 2048 : K, nb = KC / Q8_BLK, nch = K / KC;
+  const int nblk = ((N + R - 1) / R) * nch;
+  const size_t shm = (size_t)CT * nb * 17 * sizeof(__half2);
+  printf("prefill-h2batched %s N=%d K=%d T=%d shm=%zu\n", e->name.c_str(), N, K, T, shm); fflush(stdout);
+  uint16_t* xd = nullptr; float *seq = nullptr, *bat = nullptr;
+  printf("a=%s\n", cudaGetErrorString(cudaMalloc(&xd, (size_t)T * K * 2))); fflush(stdout);
+  printf("b=%s\n", cudaGetErrorString(cudaMalloc(&seq, (size_t)T * N * 4))); fflush(stdout);
+  printf("c=%s\n", cudaGetErrorString(cudaMalloc(&bat, (size_t)T * N * 4))); fflush(stdout);
+  std::vector<uint16_t> pat((size_t)T * K);
+  for (size_t i = 0; i < pat.size(); i++) pat[i] = (uint16_t)(0x3c00 + ((i * 37) & 0x3ff));
+  printf("h2d=%s\n", cudaGetErrorString(cudaMemcpy(xd, pat.data(), pat.size() * 2, cudaMemcpyHostToDevice))); fflush(stdout);
+  cudaEvent_t ea, eb; cudaEventCreate(&ea); cudaEventCreate(&eb); float ms = 0;
+  cudaEventRecord(ea);
+  for (int t = 0; t < T; t++)
+    q8_partial<bf16,true,false,1,1><<<nblk, TPB, (size_t)nb * 33 * 4>>>(e->dq, e->ds, (const bf16*)(xd + (size_t)t * K),
+      seq + (size_t)t * N, N, K, KC, R, nb);
+  cudaEventRecord(eb); cudaEventSynchronize(eb);
+  cudaEventElapsedTime(&ms, ea, eb);
+  printf("seq23 err=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
+  std::vector<float> a((size_t)T * N);
+  printf("cp-seq=%s\n", cudaGetErrorString(cudaMemcpy(a.data(), seq, a.size() * 4, cudaMemcpyDeviceToHost))); fflush(stdout);
+  printf("seq[0]=%.9g (expect H2 ~-0.10976)\n", a[0]); fflush(stdout);
+  cudaEventRecord(ea);
+  q8_prefill_h2<bf16,CT><<<nblk, TPB, shm>>>(e->dq, e->ds, (const bf16*)xd, bat, N, K, KC, R, nb, T);
+  printf("bat-launch=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
+  cudaEventRecord(eb); cudaEventSynchronize(eb);
+  printf("bat-sync=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
+  float ms2 = 0; cudaEventElapsedTime(&ms2, ea, eb);
+  std::vector<float> b(a.size(), -999.f);
+  printf("cp-bat=%s\n", cudaGetErrorString(cudaMemcpy(b.data(), bat, b.size() * 4, cudaMemcpyDeviceToHost))); fflush(stdout);
+  printf("bat[0]=%.9g\n", b[0]); fflush(stdout);
+  long bad = 0; for (size_t i = 0; i < a.size() && bad < 5; i++) if (memcmp(&a[i], &b[i], 4)) { bad++; if (bad == 1) printf("first diff at %zu: seq=%.9g bat=%.9g\n", i, a[i], b[i]); }
+  long nbad = 0; for (size_t i = 0; i < a.size(); i++) nbad += memcmp(&a[i], &b[i], 4) != 0;
+  printf("prefill-h2batched: %s (%ld/%zu differ) seq %.2f ms bat %.2f ms\n", nbad ? "MISMATCH" : "BIT-EXACT", nbad, a.size(), ms, ms2);
+  fflush(stdout);
+  return nbad ? 1 : 0;
+}
+
 // ------------------------------------------------------------------ lm_head
 // The tied embedding is 128000 x 2048 -- 262 MB of Q8 codes + 8 MB of fp32
 // scales -- and it is streamed exactly ONCE per token, as the lm_head GEMV
@@ -1532,6 +1681,8 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--probe-step") && i + 1 < argc) probe_step = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--emb-host")) emb_mode_req = 1;
     else if (!strcmp(argv[i], "--lm-selftest")) emb_mode_req = 2;
+    else if (!strcmp(argv[i], "--prefill-minimal")) emb_mode_req = 3;
+    else if (!strcmp(argv[i], "--prefill-h2batched")) emb_mode_req = 4;
     else if (!strcmp(argv[i], "--merge")) g_merge = true;   // merged gate/up GEMV
     else if (!strcmp(argv[i], "--lmrows") && i + 1 < argc) lm_rows_override = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump_logits = argv[++i];
@@ -1669,6 +1820,8 @@ int main(int argc, char** argv) {
   Ent* emb = nullptr;
   for (size_t i = 0; i < M.ents.size(); i++) if (M.ents[i].name == EMBNAME) emb = &M.ents[i];
   if (!emb) { printf("no %s in the blob\n", EMBNAME); return 1; }
+  if (emb_mode_req == 3) return prefill_minimal(M);
+  if (emb_mode_req == 4) return prefill_h2batched(M);
   if (emb->ne[0] != VOCAB || emb->ne[1] != H) { printf("embed shape %dx%d\n", emb->ne[0], emb->ne[1]); return 1; }
   if (M.emb_mode >= 1) {
     if (!lm_host_init(M, M.hemb, argv[1])) return 1;
