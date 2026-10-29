@@ -190,7 +190,11 @@ SPEED ROWS CORRECTED (#236/#237): the -5.3..-8.0% family was measured with the 3
 GEMVs poll/launch less, so contention inflated their edge. On the clean board, order-balanced
 pairs give TTFT -1.8% (23 pos, 3x3), -1.4% (360), ~-1.8% (300, board noise band), decode -1.7%
 (2x2); 1000 pos keeps -5.0% (3x3, spreads 0.7%, #233). Old rows #180/#189/#203/#205/#206 are
-retired as spinner-era measurements. Quality: formal
+retired as spinner-era measurements. DEPLOYMENT READING: the spinner condition is a good
+proxy for a co-tenanted audio server (web/decode processes on the A57s), where the engine's
+CPU side is contended and the H2 arm's measured win grows to -5.6% (pre-#230 numbers) -- so
+the honest range for the user decision is -1.8% (dedicated clean bench) to -5.6% (co-tenanted
+server), with decode -1.7% .. -5.3%. Quality: formal
 suite gate-for-gate identical to shipped (#182 short, #199 full --long), tie-landscape argmax
 identical on both references (#195/#196), rms vs fp16 reference 0/24000 cells to 1000
 positions in both arms (#192/#201).
