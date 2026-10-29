@@ -75,19 +75,16 @@
 #define HD 128
 #define VOCAB 128000
 #define NORM_EPS 1e-5f
-// 512 positions, not 4096. The KV cache is 2 x NLAYER x MAXTOK x NKV x HD x
-// 2 bytes: at MAXTOK=4096 that is 1.0 GB on top of 1.95 GB of weights, which
-// on a 4 GB unified-memory Nano leaves nothing and cudaMemcpy starts
-// returning "invalid argument" for the allocations that silently failed.
-// 512 also shrinks k_attn_head's shared logits array to 2 KB, which is what
-// lets the attention block keep any occupancy at all.
-// Sized to the benchmark, not to the model: MAXTOK sets the KV cache at
-// 2 x NLAYER x MAXTOK x NKV x HD x 2 bytes = 25 MB at 256, 6 MB at 64. On a
-// board that is 30 MB short of fitting 1.95 GB of weights, that difference
-// is the difference between running and not. A 256-token context (the
-// sliding window is 256) needs MAXTOK=256 and 25 MB more device memory --
-// raise it together with the memory headroom, not on its own.
-#define MAXTOK 64
+// 4096 positions: the plan's 4k context. The KV cache is 2 arrays (k, v) x
+// NLAYER x MAXTOK x NKV x HD x 2 bytes: 3 MB at 64, 12.6 MB at 256, 201 MB at
+// 4096. The old 64 was sized to the benchmark and silently truncated anything
+// longer (`pos >= MAXTOK` breaks the step loop with no warning), which makes
+// audio-length prompts unservable -- run #149. Measured device-free after load
+// is 1.31 GB, so 4096 fits with ~1.1 GB to spare. k_attn_head's shared logits
+// array grows with MAXTOK (256 B at 64, 16 KB at 4096; +4 KB segred), which
+// costs that kernel some occupancy, but attention is KV-bandwidth-bound, not
+// occupancy-bound, and the array size cannot change a value.
+#define MAXTOK 4096
 // fwd: the merge pass in the loader looks tensors up by name
 struct Model; struct Ent;
 static Ent* T(Model&, const std::string&);
