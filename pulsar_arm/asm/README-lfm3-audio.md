@@ -1,4 +1,4 @@
-# LFM3-Audio-2B on a Jetson Nano — decode latency
+# LFM3-Audio-2B on a Jetson Nano — decode latency and time to first token
 
 Pure-CUDA (`sm_53`, CUDA 10.2) decode engine for **LFM3-Audio-2B** at Q8 on a Jetson Nano
 Gen1 (Tegra X1: 4× Cortex-A57 + 4 SM Maxwell, 4 GB unified, 21.9 GB/s bus). One translation
@@ -95,6 +95,36 @@ kept chain, ms/token (each step paired A/B in both orders)
        ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  110      141 ms
 ```
 
+## Time to first token (the e2e objective)
+
+Steady-state decode is the wrong number for interactive use: what matters is last input to
+first output token. On prompt A (23 ids) the engine prefills sequentially -- one prompt id per
+full decode step -- so TTFT was 2648 ms, 96% of it prefill. Two changes moved it:
+
+```
+TTFT, prompt A (each step paired A/B in both orders where noted)
+2755.4 ┃  baseline (sequential prefill, cold start, shifted feeding)
+2648.2 ┃  -107 ms  first-true-token accounting (the step lines print sampled tokens;
+       ┃           the first true output completes at step n-1, not n)
+2589.6 ┃█ -58.7 ms  load-time warm-up (one BOS forward at startup, state reset;
+       ┃           LFM_NOWARM=1 is the control; +166.7 ms at load)
+2271.1 ┃█-318.5 ms  feeding fix + lm_head skip on prompt steps 0..n-2
+       ┃           (the loop fed every prompt step's prediction back as input;
+       ┃           LFM_LEGACYFEED=1 is the control)
+2270.6 ┃█          reproduced on a fresh build (step 0 now the fastest step: no lm_head)
+```
+
+Prefill is still ~95% of TTFT, and batching positions with identical arithmetic tops out near
+1.0x (two tile sizes measured, both bit-exact) because the GEMVs are FP-pipe-bound: batching
+removes weight bytes but not a single FMA. The remaining prefill lever is fewer FP operations
+per weight -- half2 HFMA2 (measured: −5.6% TTFT, −5.2% decode, off by default as `LFM_H2=1`,
+quality-indistinguishable on every gate) or int8 activations. Both change numerics and are the
+user's call; an exact per-block 2^k rescale exists (`LFM_H2=2`, streams 7/7, ~0% speedup --
+the rescale scan costs what the faster loop saves).
+
+Scope: this engine is a text-backbone harness -- it takes token ids, so audio→tokens runs
+upstream and all 8 gate prompts are text-only. TTFT here is in-engine e2e.
+
 ## Bandwidth by shape — the one anomaly left
 
 Per-kernel timing (`LFM_KTIME=1`) gives a clean correlation between achieved bandwidth and
@@ -176,7 +206,7 @@ bash .auto/lfm3/checks.sh A B C E F K L
 | per-layer × per-position rms vs HF, 23 layers × 23 positions | all within 3% |
 | pos-0 logits | top-1 = HF's (11), corr 0.99998, std 4.564 vs 4.547 |
 | **131 positions × 128,000 logits, 6 prompts** | **top-1 = HF's on 130/131**, top-8 coverage 1.000 everywhere, corr 0.99946–0.99973, KL 0.0007–0.0019 |
-| greedy stream prefix vs HF goldens, 7 prompts | every prompt ≥ floor (A=2, B/C/E/F/K/L=1) |
+| greedy stream vs HF goldens, 7 prompts, 16 tokens | **6/7 exact** (F 11/16, at its known near-tie); floor stays 1 |
 
 ```
 prompt    top-1    top-8 cov    corr (min)          KL mean   KL max
@@ -188,19 +218,25 @@ K         23/23      1.000     0.99973 (0.99932)    0.0007    0.0029
 L         23/23      1.000     0.99966 (0.99921)    0.0019    0.0126
 ```
 
-**Read this honestly.** Prefixes are 1–2 tokens of 16 and **0/7 prompts fully match**: the
-engine diverges from HF within a couple of tokens on every prompt. `CHECKS OK` certifies the
-arm's floor (1 token, the plan's certified worst prefix for this arm), not stream equality.
+**Read this honestly.** Streams are **6/7 exact over 16 tokens** (F stops at 11/16, at its
+known near-tie). `CHECKS OK` still certifies the arm's floor (1 token, the plan's certified
+worst prefix for this arm) — the floor was not raised to chase 6/7.
 
-The logit gate is what makes that disclosure mean what it should: over the full distribution
-the engine's top-1 equals HF's at 130 of 131 positions, HF's top-1 is always inside the
-engine's top-8 (and the converse), and mean KL is under 2e-3. So the greedy divergence is
-argmax/tie amplification on a distribution that agrees closely — not a distributional gap.
-The one miss is prompt F at a single position, where HF's top-1 is still in the engine's top-8:
-a near-tie, which is what the "one lost position warns, two fails" floor exists to surface.
-Prompt A alone would never have shown it.
+The 6/7 is recent: until the feeding fix the score was 0/7 with prefixes of 1–2, and two
+session conclusions were built on that number. Both were wrong, and both are retracted here:
+the streams did not diverge by argmax/tie amplification on an agreeing distribution — the
+step loop fed every prompt step's prediction back as generation input, so only the first
+output token was ever right. And the plan's greedy-goldens gate is not unreachable by a
+from-scratch GEMV after all: with correct feeding this Q8 arm reaches its certified 6/8
+figure (D remains unscored, refused for device-dependent ties -- see below). The logit gate
+was right all along (130/131 top-1, KL under 2e-3): the distributions agreed; the harness
+was feeding the wrong tokens.
 
-**The logit gate is also the reason to distrust the stream gate as an instrument.** The
+The one logit miss is prompt F at a single position, where HF's top-1 is still in the engine's
+top-8: a near-tie, which is what the "one lost position warns, two fails" floor exists to
+surface. Prompt A alone would never have shown it.
+
+**The logit gate is still the reason to distrust the stream gate as a fine instrument.** The
 `__fmaf_rn` switch that bought −2.0% left all 16 stream tokens on both prompts unchanged, so
 stream equality could not have detected a regression there. Running every kept change through
 the 6-prompt gate, against the same HF reference, with no threshold moved:
@@ -233,22 +269,15 @@ variable *locally only*, the engine runs the default arm, and every gate number 
 byte-identical. Use `LFM3_ENV="LFM_NOFMA=1" bash checks.sh A`; the header echoes
 `engine env: …` so an arm is self-documenting. Identical-to-the-digit gate output is the tell.
 
-Two structural facts about the goldens, both measured:
-
-* **The plan's 8/8 greedy-goldens gate is not reachable by a from-scratch GEMV.** The goldens
-  are HF/cuBLAS outputs; this engine matches the *ggml* summation order. Each Linear differs by
-  ~1 bf16 ulp (the per-layer ratio table sits at 0.995–1.006 = bf16 resolution) and greedy
-  argmax flips once the top-2 gap falls under the accumulated perturbation.
-* **They are not reproducible even by HF across devices.** Regenerating golden D on GPU from its
-  own stored prompt diverges at token 6 (22 vs 20) — oracle.py generates on CPU and bf16 logit
-  ties break per device/kernel. C/E/F/K/L reproduce exactly (24/24, 24/24, 24/24, 17/17, 24/24)
-  and carry verified `prompt_ids`; D is refused by `.auto/lfm3/make_prompt_ids.py`, which writes
-  ids only when (a) rebuilding A/B from their stored text equals their stored ids and (b) HF
-  greedy reproduces the golden's own `gen`.
-
-The natural next gate is **top-k logit agreement vs HF**, which is quantitative where stream
-prefix is cliff-like — stream equality is a weak discriminator for accumulation-order changes
-(16 tokens were unchanged by the FMA switch).
+One structural fact about the goldens, measured: **they are not reproducible even by HF across
+devices.** Regenerating golden D on GPU from its own stored prompt diverges at token 6
+(22 vs 20) — oracle.py generates on CPU and bf16 logit ties break per device/kernel.
+C/E/F/K/L reproduce exactly (24/24, 24/24, 24/24, 17/17, 24/24) and carry verified
+`prompt_ids`; D is refused by `.auto/lfm3/make_prompt_ids.py`, which writes ids only when
+(a) rebuilding A/B from their stored text equals their stored ids and (b) HF greedy
+reproduces the golden's own `gen`. (An earlier version of this section claimed the goldens
+were unreachable by a from-scratch GEMV; the feeding fix retracted that — 6/7 is the arm's
+certified figure.)
 
 ## Build, run, knobs
 
