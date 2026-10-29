@@ -40,6 +40,15 @@ readback of the sampled token. Repeat spread on one binary is **0.03–0.14%**; 
 **2–6% between hours**, so every claim below is a same-session paired A/B (`ab.sh`, one build,
 both arms, each pair in both orders, `R = sqrt(o1/o2)`), never a comparison across sessions.
 
+Board state (audited, not changed): `nvpmodel` MAXN, but clocks are **not pinned** -- CPU
+governor `schedutil`, GPU governor `nvhost_podgov`, ranging 76.8 MHz idle to 921.6 MHz under
+load. That is a mechanistic source of the drift (clock ramp on first kernels, which is part
+of what the load-time warm-up pays for) and a reason the absolutes here would not reproduce
+on a clock-locked board. Three unreapable `lfm3_conv_test` zombies keep 3 of 4 A57 cores
+spinning permanently (thermal pressure plus the load average ~3.2); #118 showed they do not
+affect decode, but they are part of the thermal backdrop. Clocks were deliberately left
+unlocked so every number stays comparable with the session baseline.
+
 ## Where the 112.8 ms goes
 
 `LFM_TIME=1` splits the step by layer type. Its timers carry their own sync overhead, so the
