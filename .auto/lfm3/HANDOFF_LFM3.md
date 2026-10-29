@@ -40,8 +40,10 @@ Quality (all closed, gates green on fresh builds, #166):
 
 ## Open (user decisions, all evidenced in the README table)
 
-1. **Raw H2** (`LFM_H2=1`): TTFT -5.6% (4 days reproduced, latest #180),
-   decode -5.3% same-session today (#189); FORMAL gates all green at shipped
+1. **Raw H2** (`LFM_H2=1`): CLEAN-BOARD numbers (#236/#237, spinner-era rows
+   retired): TTFT -1.8% (23 pos 3x3), -1.4% (360), -5.0% (1000 pos 3x3
+   #233), decode -1.7%; the -5.3..-8.0% family was 3-core-spinner
+   contention inflation (see Board-state block). FORMAL gates all green at shipped
    parity: checks suite 130/131 (#182), 7-prompt streams 6/7 with the same
    L tie case (#188), matrix_long 5/7200 vs 1/7200 -- and BOTH arms 0 cells
    vs an fp16 reference to 1000 positions (#184/#192); tie-landscape argmax
