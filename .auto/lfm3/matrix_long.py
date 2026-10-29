@@ -29,12 +29,13 @@ def prompt_ids(nt=NT):
     return (a * ((nt // len(a)) + 1))[:nt]
 
 
-def dump_hf(ids, path):
+def dump_hf(ids, path, dtype=None):
     import numpy as np
     import torch
+    dtype = dtype or torch.bfloat16
     from transformers import AutoModelForMultimodalLM
     model = AutoModelForMultimodalLM.from_pretrained(
-        "LiquidAI/LFM3-Audio-2B", dtype=torch.bfloat16, trust_remote_code=True).to("cuda").eval()
+        "LiquidAI/LFM3-Audio-2B", dtype=dtype, trust_remote_code=True).to("cuda").eval()
     with torch.no_grad():
         out = model(input_ids=torch.tensor([ids], device="cuda"), output_hidden_states=True)
     hs = out.hidden_states            # [embed, L0..L23]
@@ -54,13 +55,15 @@ def main():
     ap.add_argument("--ref", default=os.path.join(HERE, "hf_matrix_long.npy"))
     ap.add_argument("--tol", type=float, default=0.03)
     ap.add_argument("--nt", type=int, default=NT)
+    ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     a = ap.parse_args()
     import numpy as np
     ids = prompt_ids(a.nt)
-    if a.nt != NT and a.ref == os.path.join(HERE, "hf_matrix_long.npy"):
-        a.ref = os.path.join(HERE, "hf_matrix_long_%d.npy" % a.nt)
+    if (a.nt != NT or a.dtype != "bf16") and a.ref == os.path.join(HERE, "hf_matrix_long.npy"):
+        a.ref = os.path.join(HERE, "hf_matrix_long_%d_%s.npy" % (a.nt, a.dtype))
     if a.hf_only or not os.path.exists(a.ref):
-        dump_hf(ids, a.ref)
+        import torch
+        dump_hf(ids, a.ref, getattr(torch, {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}[a.dtype]))
         if a.hf_only:
             return 0
     hf = np.load(a.ref)
