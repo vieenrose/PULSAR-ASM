@@ -1808,8 +1808,16 @@ int main(int argc, char** argv) {
         PROBE("gate", M.gate, NH);
         const float* invf = is_slide[L] ? M.invf_slide : M.invf_full;
         const int* posp = g_graphs ? M.dpos : nullptr;
-        k_rope<<<NH, 64, 0, g_launch>>>(M.q, invf, pos, HD, HD / 2, posp);
-        k_rope<<<NKV, 64, 0, g_launch>>>(M.k, invf, pos, HD, HD / 2, posp);
+        // rot is per-layer-type: full_attention rotates half the dims
+        // (partial_rotary_factor 0.5), sliding_attention rotates all of them
+        // (partial 1.0). The old code passed HD/2 for both, leaving sliding
+        // layers' slow half (dims 32..63) unrotated -- invisible at pos 0
+        // (RoPE is the identity there) and under the 3% gate at pos <= 22,
+        // but a position-growing phase error after that (#151: 243/7200 long
+        // cells outside 3%, engine-low, first sliding layer L4 origin).
+        const int rot = is_slide[L] ? HD : HD / 2;
+        k_rope<<<NH, 64, 0, g_launch>>>(M.q, invf, pos, HD, rot, posp);
+        k_rope<<<NKV, 64, 0, g_launch>>>(M.k, invf, pos, HD, rot, posp);
         PROBE("q(postrope)", M.q, NH * HD);
         bf16* kbase = M.kc + (size_t)L * MAXTOK * NKV * HD;
         bf16* vbase = M.vc + (size_t)L * MAXTOK * NKV * HD;

@@ -2325,3 +2325,25 @@ shapes, reuse q8_partial/k_attn_head/k_rmsnorm, gate against HF's tower.
   is the result.
 - Mel frontend measured: ~10 ms per 5 s audio on host CPU (negligible next to seconds of
   prefill).
+
+## Sliding-window RoPE was half-missing (run #158): the long-range drift, found and fixed
+
+`.auto/lfm3/matrix_long.py` (new gate: per-layer x per-position rms vs HF at 300 teacher-forced
+positions, same 3% rule) showed 243/7200 cells outside 3%, all engine-LOW, growing smoothly from
+1.000 at pos 0 to ~0.98 at pos 300, originating in the first sliding-attention layer (L4; L0-L3
+clean everywhere). Root cause: k_rope was launched with rot=HD/2 for ALL layers, but sliding
+layers need full rotation (partial_rotary_factor 1.0 vs 0.5). Their slow half (dims 32..63) went
+unrotated -- invisible at pos 0 (RoPE is the identity), under 3% at pos <= 22, then a
+position-growing phase error. Fix: rot = is_slide[L] ? HD : HD/2.
+
+- Long gate after fix: 243/7200 -> 1/7200 (one cell at pos 186/L13, ratio 0.97, a near-tie).
+- Short gates unchanged-or-better: matrix green, logits0 identical, every logit metric improved
+  on every prompt (e.g. A corr 0.99964 -> 0.99973, KL 0.0014 -> 0.0009; all six prompts likewise),
+  still 130/131 (F 20/21).
+- Streams: F 11/16 -> 16/16 (!), L 16/16 -> 5/16. Still 6/7. The L regression is proven tie luck:
+  traj_drift on L's own free-running states gives top-1 = HF's at 47/48 with KL 0.0007 flat
+  (F 46/48, KL 0.0009) -- the distributions agree closely and greedy flips on ties.
+- TTFT A/B: base 2271.94 vs fixed 2270.46, R=1.0003, null (RoPE is negligible either way).
+- Lesson recorded earlier stands: a serialized per-kernel timer would have shown nothing here;
+  only a same-state comparison across positions could see a smooth 2% drift, and only a gate
+  that EXCEEDS the benchmark length could see it at all. The 23-pos suite was blind by design.
