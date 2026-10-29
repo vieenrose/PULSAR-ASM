@@ -1,440 +1,478 @@
-# LFM3-Audio-2B on a Jetson Nano — decode latency and time to first token
+# LFM3-Audio-2B on a Jetson Nano — the port
 
-Pure-CUDA (`sm_53`, CUDA 10.2) decode engine for **LFM3-Audio-2B** at Q8 on a Jetson Nano
-Gen1 (Tegra X1: 4× Cortex-A57 + 4 SM Maxwell, 4 GB unified, 21.9 GB/s bus). One translation
-unit — [`lfm3_nanode.cu`](lfm3_nanode.cu) — built with `nvcc` and nothing else; weights come
-from a `.lfm3q8` blob (Q8 linears + fp32 scales + Q8 tied embedding, 286 tensors, 1466 MB).
+Pure-CUDA (`sm_53`, CUDA 10.2) inference path for **LFM3-Audio-2B** on a Jetson Nano Gen1
+(Tegra X1: 4× Cortex-A57 + 4 SM Maxwell, 4 GB unified). One translation unit,
+[`lfm3_nanode.cu`](lfm3_nanode.cu), built by `nvcc` and nothing else; weights come from a
+`.lfm3q8` blob. Alongside it: AArch64 NEON kernels for the non-GPU side
+([`lfm3_conv.S`](lfm3_conv.S), [`lfm3_elem.S`](lfm3_elem.S)), and a Python gate suite in
+`.auto/lfm3/`.
 
-Primary metric: **decode ms/token, lower is better**, single sequence, greedy.
-
-```
-current  112.79 ms/token   =   8.87 tok/s        (RSS 306 MB, 4 GB board)
-baseline 141.04 ms/token   =   7.09 tok/s        ->  -20.0%
-```
-
-## How the number is measured
-
-`.auto/lfm3/measure.sh` scps the `.cu`, builds it on the Nano (compile to `$BIN.new`, `mv`
-only on a clean compile, refuse to run without `BUILT_OK`), drops the page cache, then runs
-one fixed job: blob `lfm3-audio-2b-q8.lfm3q8`, the 23 prompt ids of prompt A, `--steps 48`.
-
-Timing is **on the device**, bracketing one decode step with `cudaEventRecord`:
+**This engine ports the text backbone only.** It takes token ids and returns token ids:
+everything left of the tokenizer (log-mel, the 17-layer audio encoder, the projector) and
+everything right of the backbone (MaskGIT depth head, LiquidCodec) is **not ported yet**.
+The port status, the contract each new component has to satisfy, and the measured facts a
+new component inherits are what this document is about.
 
 ```
- evA ─► embedding-row dequant
-      ─► 24 layers: operator_norm ─► GEMVs ─► ( conv branch | q,k,v ─► headnorm
-      │                                        ─► RoPE ─► KV write ─► attention ─► gate )
-      │                                        ─► FFN w1/w3 ─► silu ─► w2
-      │                                        ─► post-op norm ─► add1 ─► ffn_norm
-      │                                        ─► post-ffn norm ─► add2
-      ─► final embedding_norm
-      ─► lm_head GEMV over all 128,000 rows
-      ─► k_argmax                                   (greedy token, on-device)
- evB ─► cudaEventElapsedTime
+ported and gated      text backbone (LFM3, 24 mixed conv/attention layers, "lfm." 286 tensors)
+                      112.8 ms/token decode, 3 gates green, at the board's bandwidth ceiling
+not started           log-mel front end, audio encoder (17 layers), depthformer head,
+                      LiquidCodec decoder, tokenizer, interleaved text/audio controller
 ```
 
-Steps 0–22 feed the prompt ids (one position each), 23–47 are free-running greedy; the first
-two steps are dropped and the average is over the remaining 46 (`steady-state … over 46
-steps`, which is what the harness parses). It excludes blob load, tokenisation and the 4-byte
-readback of the sampled token. Repeat spread on one binary is **0.03–0.14%**; the board drifts
-**2–6% between hours**, so every claim below is a same-session paired A/B (`ab.sh`, one build,
-both arms, each pair in both orders, `R = sqrt(o1/o2)`), never a comparison across sessions.
+---
 
-Board state (audited, not changed): `nvpmodel` MAXN, but clocks are **not pinned** -- CPU
-governor `schedutil`, GPU governor `nvhost_podgov`, ranging 76.8 MHz idle to 921.6 MHz under
-load. That is a mechanistic source of the drift (clock ramp on first kernels, which is part
-of what the load-time warm-up pays for) and a reason the absolutes here would not reproduce
-on a clock-locked board. At run lengths >=60 s the state can shift ~15% between consecutive
-runs (#227: shipped 1000-token samples {105.1, 120.8} s), so ratios at that length need >=3
-samples per arm and best-of comparisons -- single pairs are not informative there.
-Three orphaned `lfm3_conv_test` processes (STAT=R, NOT zombies -- the #118 reading was
-wrong, corrected by #230) kept 3 of 4 A57 cores spinning for days: neutral at steady state,
-but under sustained load they drive the +15..47% degraded board states (nvhost_podgov is
-power-aware). KILL THEM before measuring: `for p in $(pgrep -x lfm3_conv_test); do kill -9 $p;
-done` (do NOT use pkill -f -- it matches the ssh command line and kills your own session);
-after the kill the band returns within two runs (#230). Check `pgrep -x lfm3_conv_test | wc -l`
-== 0 as the pre-measurement gate. Clocks were deliberately left
-unlocked so every number stays comparable with the session baseline.
+## 1. Port status, component by component
 
-Two harness facts from #177: `jetson_clocks` is not installed on this board and governor
-writes need sudo, and sudo is `requiretty` -- so the `echo PW | sudo -S` pattern used by
-measure.sh/ab.sh for `drop_caches` has always silently no-opped (hidden by 2>/dev/null;
-true). The metric is unaffected -- the engine fadvise(DONTNEED)s the blob at load and the
-warm-up absorbs first-touch, so cache state is engine-managed run to run -- but do not
-claim "cold page cache" in anything citing these scripts, and clock-pinning is not
-available to quantify the drift with current permissions.
+Tensor counts and bytes below are **measured from the checkpoint header and the exported blob**
+(`.lfm3q8` table), not estimated — except where marked *derived*.
 
-Metric-definition caveat (#176): measure.sh's `decode_ms_per_tok` averages steps 2..47,
-which INCLUDES the 21 prompt steps. Since #139 skipped the lm_head on prompt steps, the
-same definition moved from ~112.8 to ~106.2 ms/token with no arithmetic change. Decode
-cross-era comparisons must use the step lines' decode-phase average (112.4-112.8 all
-session), not the mixed steady-state mean.
+| component | checkpoint prefix | tensors | Q8 bytes | engine | gates | status |
+|---|---|---|---|---|---|---|
+| text backbone (LFM3, 24 layers) | `lfm.` | 286 | **1946 MB** | `lfm3_nanode.cu` | 4 green | **ported** |
+| audio encoder (LFM2, 17 layers) | `encoder.` | 170 | ~119 MB *derived* | — | — | not started |
+| downsample front end (2-D convs) | `encoder.downsample.` | — | ~4 MB *derived* | — | — | not started |
+| audio→backbone projector | `mlp.` | 6 | ~7 MB *derived* | — | — | not started |
+| MaskGIT speech head | `depthformer.` | 37 | ~29 MB *derived* | — | — | not started |
+| per-codebook logits | `depth_embeddings.` | 36 | ~56 MB *derived* | — | — | not started |
+| backbone → 12 depth streams | `depth_linear.` | 2 | ~28 MB *derived* | — | — | not started |
+| audio codebook table | `codebook_embedding.` | 1 | ~56 MB *derived* | — | — | not started |
+| MaskGIT mask token | `mask_embedding.` | 1 | 4 KB | — | — | not started |
+| LiquidCodec decoder | *(separate checkpoint)* | — | 147 MB | — | — | not started |
+| log-mel front end | *(no weights)* | — | — | — | — | not started |
+| `liquid7.1` BPE tokenizer | *(18 MB json)* | — | — | — | — | not started |
 
-## Where the 112.8 ms goes
+The blob carries the backbone and nothing else: the exporter filters on the `lfm.` prefix, and
+the audio-side prefixes above are simply not in it. A ported component is therefore *always*
+visible as (a) new tensors in the blob, (b) a `T(M, "<hf name>")` lookup in the engine, and
+(c) a gate that scores it. Nothing is silently half-loaded — the loader prints its census
+(``layer types: 11 attention, 13 conv``, arena accounting) and fails loudly with
+``MISSING TENSOR <name>`` on any lookup that does not resolve.
 
-`LFM_TIME=1` splits the step by layer type. Its timers carry their own sync overhead, so the
-parts sum to ~127.0 ms against a ~114.9 ms whole on a short run — read the split, not the
-sum. (Pre-launch-bounds: conv 70.6 / attn 56.6 / lm_head 18.5 ms; the win spread evenly
-because every layer GEMV shares the one `q8_partial` kernel.)
+## 2. The port contract: checkpoint → blob → engine
+
+### 2.1 Blob format (`.lfm3q8`)
 
 ```
-per-phase ms/token (LFM_TIME)          bytes/token  GB/s   [ 1 block = 2 ms ]
-conv layers (13)  ███████████████████████████████░░░░░  61.8     ~715 MB  10.6→11.6
-attention (11)    ████████████████████████░░░░░░░░░░░░  48.9     ~545 MB  10.4→11.1
-lm_head           ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░  16.3      278 MB      14.0
-final norm        ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.1        4 KB         —
-embedding         ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.0        4 KB         —
-
-Same scale for every row: conv 31 blocks, attention 24, lm_head 8. Parts sum to ~127.0
-ms against a ~114.9 ms whole because each phase timer carries its own sync.
-
-The plan's budget assumed the lm_head was ~half the step. It is **14%**, and it already runs at
-14 GB/s against a **measured 17 GB/s streaming ceiling** on this board — which is why tuning the
-lm_head slab size measured exactly `R = 1.0000`. All the headroom is in the 24 layer GEMVs.
-
-## The diagnosis that produced the win
-
-The layer GEMVs sat at 9.0–9.4 GB/s, so they looked bandwidth-bound. Counting FP instructions
-said otherwise: the inner loop did `dot = __fadd_rn(dot, __fmul_rn(c[j], x[j]))` — **two FP
-instructions per product** (the plan's exact-per-product rounding, reinforced by the build's
-`-fmad=false`) — plus a loop-carried `acc` chain. That is 2432 FP warp-instructions per warp
-where the arithmetic minimum is 512 FMAs, and it reproduces the measured 1.33 ms/layer almost
-exactly. **FP-pipe-bound; 9.2 GB/s was a symptom.**
-
-`__fmaf_rn` accumulation: **−2.0%** (paired, R=1.0100, faster 3/3), every GEMV phase −6 to
-−8.5%, gates green, greedy streams byte-identical. ggml's own reference dot product is
-`sum += w*x` in C, which compilers contract to an FMA — so this is at least as faithful to the
-reference, with one rounding per product instead of two.
-
-`__launch_bounds__(256, 6)` on the Q8 GEMV: **−17.3%** (paired, R=1.1043, faster 4/4).
-The kernel used 40 regs/thread at TPB=256, so six blocks/SM already fit — but the compiler
-did not know that. Declaring the target moved it to 39 regs with no spills and much better
-scheduling; gates green with numbers identical to the unannotated build. Register caps in
-the other direction (`-maxrregcount=32`) cost +12.5% in forced spills, and relaxing to
-five blocks/SM is a measured null (compiler keeps 39 regs), so six is the characterized
-target. A resource hint only: it cannot change a value or the reduction order.
-
-```
-kept chain, ms/token (each step paired A/B in both orders)
-141.04 ┃█ baseline (measured on the real CUDA path)
-140.32 ┃█−0.5%  R=256 rows/block for all shapes (bit-identical row→block remap)
-139.62 ┃█       bake R=256 into pick()
-139.12 ┃█−0.39% fuse k_bf2f into the GEMV's x staging (~110 launches/token gone)
-136.41 ┃ −2.0%  __fmaf_rn accumulation in the Q8 GEMV
-112.79 ┃█−17.3% __launch_bounds__(256,6) on the Q8 GEMV (resource hint, exact)
-       ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  110      141 ms
+8 B    magic          "LFM3Q8\x01\x00"
+u32    header length
+json   header:  { magic, cfg, n_tensors, vocab_size, hidden_size, data_bytes,
+                  table: [ {name, dtype, ne[], off, ncodes, nscales, crc}, ... ] }
+bytes  payload, in table order, each entry at `off`
 ```
 
-## Time to first token (the e2e objective)
+`dtype` is the only thing the engine switches on:
 
-Steady-state decode is the wrong number for interactive use: what matters is last input to
-first output token. On prompt A (23 ids) the engine prefills sequentially -- one prompt id per
-full decode step -- so TTFT was 2648 ms, 96% of it prefill. Two changes moved it:
+| code | payload | used for |
+|---|---|---|
+| 1 | Q8 codes (`H×K` int8) + fp32 scales, one per 32-weight block (**1.125 B/weight**) | every 2-D linear that clears the gates |
+| 2 | fp32 verbatim | norms, 3-D conv taps, anything the 2-D quantizer cannot see |
+| 3 | bf16 verbatim | the tied embedding in the `--emb-bf16` arm |
 
-```
-TTFT, prompt A (each step paired A/B in both orders where noted)
-2755.4 ┃  baseline (sequential prefill, cold start, shifted feeding)
-2648.2 ┃  -107 ms  first-true-token accounting (the step lines print sampled tokens;
-       ┃           the first true output completes at step n-1, not n)
-2589.6 ┃█ -58.7 ms  load-time warm-up (one BOS forward at startup, state reset;
-       ┃           LFM_NOWARM=1 is the control; +166.7 ms at load)
-       ┃ LFM_WARMMS=N (default 0) extends that warm-up to N ms of wall-clock GPU
-       ┃ load, absorbing the devfreq DVFS ramp (idle board runs 76.8-153.6 MHz
-       ┃ for the first ~5-24 s, #210/#209): neutral in the normal state, recovers
-       ┃ ~1% from an 8-min idle start, and is the fix for +7% cold-board days.
-       ┃ CAVEAT (#235, clean spinner-free board): the earlier idle-start wins
-       ┃ were measured with the core-spinner contamination -- on the clean board
-       ┃ WARMMS=6000 is +7.7% SLOWER from 8-min idle (2466.5 vs 2289.5): the
-       ┃ 6 s dummy load shifts the power-aware GPU governor down before the
-       ┃ measured window. Treat WARMMS as a board-state-dependent experiment,
-       ┃ not a recommendation; default 0 is the only supported mode until
-       ┃ governor-level analysis exists (needs root, #177).
-2271.1 ┃█-318.5 ms  feeding fix + lm_head skip on prompt steps 0..n-2
-       ┃           (the loop fed every prompt step's prediction back as input;
-       ┃           LFM_LEGACYFEED=1 is the control)
-2270.6 ┃█          reproduced on a fresh build (step 0 now the fastest step: no lm_head)
-2260.4 ┃█          band re-verified post #162-#165 (gates green on a fresh build; step 0 =
-       ┃           steady prompt step 97.6 ms -- #138's warm-up is complete, and TTFT is
-       ┃           fully attributed: 22 x 97.6 + 112.4. Prompt B runs 98.2 ms/step: the
-       ┃           per-step cost is prompt-independent, not prompt-A overfit.)
-```
+`cfg` is the backbone's own `config.json["lfm"]` verbatim — the engine reads `layer_types`,
+`sliding_window`, `conv_L_cache`, `head_dim`, `norm_eps`, `use_sandwich_norm`,
+`rope_parameters`, `tie_word_embeddings` out of it rather than hard-coding them. **This is what
+makes a port mechanical: architecture facts travel in the blob, not in the C++.** A new
+component exports its sub-config the same way.
 
-Prefill is still ~95% of TTFT, and batching positions with identical arithmetic tops out near
-1.0x (four tile-size/staging variants measured, all bit-exact, best 1.02x) because the GEMVs
-are FP-pipe-bound: batching removes weight bytes but not a single FMA -- and an unpadded
-staging variant proved the padding load-bearing by running 0.09x (16-way bank conflicts).
-A fifth variant (CT=2 weight-reuse tiles, bit-exact at 8/8 shapes and 1.15-1.45x standalone,
-#162-#164) was integrated as a layer-first batched prefill in #165 and CLOSED there: the
-engine's ffn.w2 GEMV indexes x at row*K, so its rows 1..2047 read step-recursive arena
-scratch beyond the 7680-element silu buffer, and no per-position tiling reproduces those
-bytes. Layer-first w2 moved positions 10-17 by +37..+158% and made step-22 logits garbage
-(top-1 survived on tie luck). w2 is pinned sequential by the goldens; batching the other
-nine GEMVs does not pay. Batching prefill would now require changing the engine's w2
-x-layout -- a goldens change, the user's call.
-The remaining prefill lever is fewer FP operations per weight. Measured, all behind flags,
-all gates green; the call is the user's since every option below breaks bit-exactness:
+`name` is the **HF tensor name verbatim** (`lfm.model.layers.7.feed_forward.w1.weight`). The
+engine has no renaming table; it looks up `M.by[name]`. A new component keeps its own prefix
+and lands in the same dictionary untouched.
+
+### 2.2 What a new component must add to the exporter
+
+`pulsar_asm/lfm3/tools/export_lfm3_q8.py` is 214 lines and the pattern is small:
+
+1. a **prefix filter** for the component's tensors (`BACKBONE = "lfm."` today);
+2. the **Q8 pattern list** — substrings that select 2-D linears for quantization;
+3. the **exceptions**: 3-D tensors (`conv.conv.weight` is `[H,1,7]`) and 1-D norms go F32;
+4. **assertions, not hopes** — every Q8 pattern must match ≥1 tensor (`a filter matching ZERO
+   tensors silently reports the bf16 result` has cost this repo a debugging cycle twice), and
+   the conv-tap count must equal the layer census from `layer_types`.
+
+The engine side then needs: the tensor in the arena accounting (`need_q/need_s/need_f`, asserted
+at load — a mismatch prints `arena accounting mismatch` and refuses to run), a dispatch site,
+and shape coverage in the GEMV config picker.
+
+### 2.3 Shape coverage is asserted, not assumed
+
+`GemvCfg { KCHUNK, TPB, R }` is chosen per shape and **checked**: an earlier bug computed
+`nchunk = 7680/2048 = 3` and read 80% of K — and the mirrored reference agreed with it, so the
+bit-exactness printout said YES. Two lessons carried in the code: every shape a new component
+introduces must go through the config picker with an explicit coverage assert, and a
+bit-exactness gate is only as good as the reference it mirrors.
+
+## 3. The backbone port (done) — the worked example
+
+### 3.1 Architecture facts, as the engine sees them
+
+Read from the blob's `cfg` and tensor list (all measured):
 
 ```
-arm                              TTFT      decode    streams  KL A/C/K          range review
-shipped (fp32 path)              2283.5    113.4     6/7      0.0013/0.0005/0.0006  n/a
-LFM_H2=1 (raw half2 + HFMA2)     2243.7    111.6     6/7      0.0016/0.0006/0.0005  28% of one layer's
- -1.8% TTFT / -1.7% decode                                        inputs in fp16's low-        precision range;             theoretical accumulator        overflow on ffn.w2
-LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.0005  safe by construction
- rescale; clean-board 360-pos     (360-pos:  (short-         (post-RoPE re-score,     (bound 65024, no
- -0.9% vs raw's -1.4%: the scan    -0.9%)    prompt          #159: the 7/7 was tie     subnormals)
- costs ~0.5 pt (#242)                         record,         luck; F drops to 19/21,
-                                             #142)           a floor the shipped passes)
-
-SPEED ROWS CORRECTED (#236/#237): the -5.3..-8.0% family was measured with the 3-core
-`lfm3_conv_test` spinners (#230 kill) contending with the engine's CPU side; the shorter H2
-GEMVs poll/launch less, so contention inflated their edge. On the clean board, order-balanced
-pairs give TTFT -1.8% (23 pos, 3x3), -2.5+-0.7% (300, 3x3, #248), -3.9% (360, 3/3 pairs,
-#260), decode -1.7% (2x2); 1000 pos keeps -5.0% (3x3, spreads 0.7%, #233) -- the clean curve
-is MONOTONIC in context length. Old rows #180/#189/#203/#205/#206 are
-retired as spinner-era measurements. DEPLOYMENT READING: the spinner condition is a good
-proxy for a co-tenanted audio server (web/decode processes on the A57s): VERIFIED with one
-controlled renice-10 CPU spin-loop, 2x2 at 23 pos -- H2 {2241, 2205} vs shipped {2381, 2280}
-= -4.6% mean (-5.9% best pair, #245), reproducing the spinner-era -5.6% from the clean board.
-The honest range for the user decision is -1.8% (dedicated clean bench, #236) to -4.6..-5.6%
-(co-tenanted server, #245/pre-#230); decode -1.7% clean (#237), -2.6% co-tenanted -- both
-orders, 0.3% spreads (#254: 25-step decode averages are the tightest A/B channel here);
-decode curve under co-tenant (2nd-in-order samples after equal prefills, #258/#270): -2.6%
-(23 pos), -4.6% (300), -5.0% (360) ms/token -- monotonic, mirrors the TTFT curve; the server
-steady-state H2 signal at audio decode scale is -5% tokens/s.
-Full arm matrix, clean/co-tenanted (ms): TTFT 2280|2278-2381 shipped, 2244|2205-2241 raw H2,
-~2280|~2280 rescaled; decode 113.4|113.4 shipped, 111.6|110.5 raw, ~113|113.0 rescaled.
-Quality at long context (discrete metric): 600-position trajectory, 12 long states -- both
-arms 12/12 top-1 vs both references, 0 reference disagreements (#272); at 300 positions 19-20/20
-vs fp16 with a 15% tie density (#263). Quality: formal
-suite gate-for-gate identical to shipped (#182 short, #199 full --long), tie-landscape argmax
-identical on both references (#195/#196), rms vs fp16 reference 0/24000 cells to 1000
-positions in both arms (#192/#201).
+hidden 2048   intermediate 7680   vocab 128000 (tied)   24 layers
+16 heads / 4 KV heads, head_dim 128      norm_eps 1e-5   use_sandwich_norm true
+conv_L_cache 7 (depthwise, causal)       sliding_window 256
+rope   full_attention:    partial_rotary_factor 0.5, theta 1e6
+       sliding_attention: theta 1e4, no partial factor -> FULL head dim rotation
+layer_types = conv, conv, full, conv, sliding, conv, full, ... (13 conv, 6 full, 5 sliding)
 ```
 
-The formal gate suite itself passes on the raw arm (#182, current tree): matrix, logits0, streams,
-and the same 130/131 logit top-1 the shipped arm gets. The formal long-context gate
-(matrix_long, layer x position rms cells) shows 5/7200 over 3% at 300 positions vs the shipped
-arm's 1/7200 -- all engine-low by at most 3.2% (#184) -- but against an fp16 HF reference both
-arms are 0 cells, at 300 AND at 1000 positions (#192): those cells are bf16 reference
-quantization at the largest residuals, not engine arithmetic. The engine tracks fp16 truth
-within 3% across the full 1000-position ladder, in both arms. The rescaled arm, by contrast, formally FAILS the logit gate (127/131, F 19/21,
-one top-1 short on four prompts, #186) at ~0% speed: it is dominated on every axis. Top-1 agreement is 47/48 in every arm on
-every divergence prompt; nothing grows. At audio-length
-context the raw arm is also clean (#171): on a 300-id prompt scored on HF fp16's own states, the
-20 long-context states give shipped KL 0.0008 top-1 19/20 vs H2=1 KL 0.0005 top-1 20/20 -- the
-fp16 range exposure flagged on one conv layer shows no measurable cost at 300+ positions. int8
-activations were considered and rejected without building: sm_53 has no int8 dot-product
-instruction, so there is no FMA-count win, only smaller x traffic that the L2 already
-serves -- the mechanism does not exist on this board.
+**Two layer templates**, and the difference matters for byte accounting:
 
-Scope: this engine is a text-backbone harness -- it takes token ids, so audio→tokens runs
-upstream and all 8 gate prompts are text-only. TTFT here is in-engine e2e.
+| template | tensors | per layer |
+|---|---|---|
+| `conv` (13 layers) | `conv.{in_proj [6144,2048], out_proj [2048,2048], conv [2048,1,7]}` + FFN + 4 norms | **72.1 MB** |
+| `full`/`sliding` (11 layers) | `self_attn.{q [2048,2048], k [512,2048], v [512,2048], o [2048,2048], q_norm[128], k_norm[128], gate_proj[16,2048]}` + FFN + 4 norms | **65.0 MB** |
 
-Context is 4096 positions (raised from a benchmark-sized 64 that silently truncated anything
-longer). A 300-token prompt runs to completion with per-step cost rising 98 → 112 ms;
-the KV cache at 4k costs 192 MB against 1.1 GB free. Per-step cost is essentially flat to
-300 positions, so a 1500-token audio prefill is ~170 s sequential -- which is why batching
-the prefill matters ~70x more for audio than for the 23-token benchmark.
+13 × 72.1 + 11 × 65.0 = **1651 MB** of layers, + the tied embedding/lm_head **295 MB** =
+**1946 MB streamed per decode step** (every linear is touched once; the tied head is a full
+128 000-row pass). At the measured 112.8 ms/step that is **17.3 GB/s**, i.e. at the ceiling that
+`tools/stream_ceiling.cu` measures for a pure read stream (17 GB/s; one GM20B SM, grid-stride
+uint4) — the achieved rate sits at, marginally above, that probe, so the backbone is
+bandwidth-saturated. Earlier revisions of this file quoted "14 GB/s against a 17 GB/s ceiling" from a
+per-phase table whose byte counts assumed a 6144-wide FFN — the checkpoint's is 7680, so the
+per-phase bytes understated the stream and the engine is in fact already saturated. Arithmetic levers are
+therefore capped at ~2% on this port (measured: doubling GEMV FLOPs with `LFM_NOFMA=1` costs
++1.8%, i.e. the kernels are ~90% DRAM-bound). **Any new component's runtime is its bytes divided
+by 11–17 GB/s — budget in bytes, not in FLOPs.**
 
-## Bandwidth by shape — the one anomaly left
+### 3.2 The five things that bite when mapping LFM3 to kernels
 
-Per-kernel timing (`LFM_KTIME=1`) gives a clean correlation between achieved bandwidth and
-**row length**, at fixed bytes:
+1. **`conv` in `layer_types` means there is no `self_attn` at all** in those layers — 13 of 24
+   layers have no attention, no RoPE, no KV cache. A port that builds one uniform "transformer
+   block" wastes a third of the model's structure.
+2. **Sliding layers rotate the whole head dim; full layers rotate half.** `partial_rotary_factor
+   0.5` lives *inside* the `full_attention` rope params; sliding layers have no factor and must
+   use `rot = head_dim`. Getting this wrong is invisible at position 0, stays under a 3% gate to
+   position ~22, and then grows into a position-proportional phase error — it cost this port a
+   full debugging session (#158: 243/7200 rms cells outside 3% before, 1/7200 after).
+3. **`use_sandwich_norm` = four norms per layer**, applied around both the operator and the FFN
+   (`operator_norm`, `post_operator_norm`, `ffn_norm`, `post_ffn_norm`) — 96 norm launches per
+   token, not 48.
+4. **The per-head gate** is `self_attn.gate_proj [16, 2048]` → sigmoid multiplied into the
+   attention output *before* `o_proj`. It is a `[16]`-wide vector per token, not a tensor-wide
+   gate.
+5. **The tied lm_head is not optional and not cheap**: 295 MB, 15% of every decode step. (It is
+   skipped only on prompt positions 0..n-2, where nothing consumes it.)
 
-```
-GB/s (measured streaming ceiling on this board = 17)
-lm_head        N=128000 K=2048   ██████████████░░░░░░░░░░░░░░  14.0
-conv.in_proj   N=  6144 K=2048   █████████████░░░░░░░░░░░░░░░  13.3
-ffn.w1         N=  6144 K=2048   ███████████░░░░░░░░░░░░░░░░░  10.9
-ffn.w3         N=  6144 K=2048   ███████████░░░░░░░░░░░░░░░░░  10.9
-conv.out_proj  N=  2048 K=2048   ██████████░░░░░░░░░░░░░░░░░░  10.3
-ffn.w2         N=  2048 K=6144   ███████░░░░░░░░░░░░░░░░░░░░░   7.1   ◄─ same BYTES as w1/w3
-                 0     5    10    15   17
-```
+### 3.3 Numerics contract (carried from the HF reference)
 
-`ffn.w2` (N=2048, K=6144) cost 1.773 ms where `ffn.w1` (N=6144, K=2048) cost 1.161 ms for an
-identical 12.6 MB. Five hypotheses were implemented and measured against it — block fill
-(R=64, shape-adaptive R), inter-row ILP (`#pragma unroll 2`), cache hints (`__ldcs`), chunk
-interleaving (KCHUNK=3072), and per-lane row ownership (a one-row-per-lane wide-K GEMV) — and
-**all five are measured out**. The launch-bounds codegen narrowed the same-byte w2/w1 ratio
-from 1.47× to 1.17× (per-kernel timing under the new allocation), so the new codegen helped
-the long-K shape most — but w2 remains the single costliest GEMV, and the narrowed ratio does
-not reopen any of the five: they address the old 1.47× signature, and R/KCHUNK re-tunes under
-the new codegen both failed (R=128 −2.7%, KCHUNK=1024 −5.5%). The strided-lane form, per-lane 32-block stride + warp tree, is
-the right structure for this layout on this board: giving each lane a whole row makes every
-warp instruction read 32 bytes from 32 different rows, consuming 32 sectors per 1 KB of useful
-data instead of covering 1024 contiguous bytes.
+The model runs in bf16 and the goldens come from it, so **activations are stored bf16 and
+arithmetic happens in fp32 with an explicit bf16 round at every op boundary**. An fp32 engine is
+*more* accurate than its reference and can never match it — it looks exactly like a math bug
+(cos 0.955 on a 7680-term dot). Widening and narrowing are exact bit operations (shift by 16,
+and round-to-nearest-even on the way down).
 
-## Structural levers measured out (so nobody re-walks them)
+The GEMV accumulates with `__fmaf_rn` (one rounding per product) — ggml's own reference dot
+product is `sum += w*x`, which compilers contract to an FMA, so this is *more* faithful to the
+reference than the exact-two-rounding form. It is also 2.0% faster. Build flag `-fmad=false`
+holds everywhere else.
 
-All are paired A/B, one build, both orders. Kept behind env flags, **off by default**; the
-shipping path never touches them.
+The porting rule this implies: **reproduce the reference's rounding points first, then optimize
+arithmetic only where the gate says you may.** Two levers here are bit-identical
+(`LFM_NOFUSE`, `LFM_R=64`) and double as the gate's own determinism control.
 
-```
-faster ◄──────────────────────────────────────────────────────────────► slower
- +0.33 │ merged gate+up GEMV (24→48 blocks)        +0.33% for 679 MB — rejected
- +0.06 │ -fmad=true build-wide                      nothing to contract (GEMVs already FMA)
- +0.01 │ __ldcs streaming loads                     L2 pollution costs nothing
- +0.01 │ KCHUNK=3072 for K=6144                     verified null at the kernel level
-   0   ┼───────────────────────────────────────────────────────────────────
- -0.55 │ CUDA graphs of the layer loop              ~250 launches ≈ 1 ms of CPU vs a 136 ms
-                                                     step — launches were never the bottleneck
- -2.7  │ R=128 under launch-bounds codegen          re-tune after the codegen change; R=256 stands
- -3.0  │ shape-adaptive R (64/32 for few-row shapes)
- -3.6  │ TPB=512
- -5.3  │ KCHUNK=1024 (also −5.5% under launch bounds; KCHUNK=K stands under all three codegens)
- -6.5  │ R=64 (global)                              x-stage amortization dominates
- -6.9  │ exact integer int8→float (skip I2F)        extra integer op + FADD outweigh the saved I2F
--10.5  │ inter-row ILP (unroll 2)                   register spill at R=256/TPB=256
--12.5  │ -maxrregcount=32 (force 8 blocks/SM)       forced spills outweigh the occupancy gain
--157   │ one-row-per-lane wide-K GEMV               32 scattered sectors per warp instruction
--162   │ double-buffered lm_head streaming          19.8 → 52.5 ms; Tegra copy engine + events
-   0   │ launch bounds (256,5) on the Q8 GEMV       compiler keeps 39 regs; identical codegen, null
-   0   │ launch bounds (256,8) on the lm_head GEMV  30 regs both builds; bandwidth-bound, null
-```
+## 4. Audio encoder — the next port
 
-Two configuration findings worth carrying forward:
-
-* **Do not stream the lm_head from pinned host on Tegra.** The resident tied embedding beats
-  the plan's prescribed `--emb-host` row streaming by **10.4%** (139.19 vs 169.65 ms/token,
-  paired 3/3). The H2D copy and the GEMV share the same 21.9 GB/s bus, so streaming costs
-  *two* full passes over 278 MB. The plan's `--emb-host` requirement was sized for the
-  1944 MB whole-backbone-Q8_0 config; this Q8-embedding blob is 1466 MB and fits resident with
-  ~2.8 GB device free, so streaming is pure loss. `LFM_EMB=resident|host` A/Bs it.
-* **GEMV config is a characterised optimum**: R=256, TPB=256, KCHUNK=K, FMA on, serial row
-  loop, plain loads, `__launch_bounds__(256,6)` — confirmed on all three codegen regimes
-  (pre-FMA, FMA, launch-bounds). TPB=512 cannot be re-tested without touching the
-  annotation (max 256 threads is baked in).
-
-## Quality gates
+### 4.1 Facts (from the checkpoint's `encoder` sub-config and safetensors headers)
 
 ```
-bash .auto/lfm3/checks.sh A B C E F K L
+17 LFM2 layers, hidden 768, intermediate 1792 (2560 auto-adjusted down by block_multiple_of 256)
+8 heads / 4 KV heads, head_dim 96   sliding_window 32   conv_L_cache 3
+10 conv layers + 7 attention layers        ~106.2 M params
+downsample front end: 3x [256,1,3,3] + 2x [256,256,1,1] convs, lin_out [768, 4096, 1]
+   (4096 = 4 x 256 frame concat -> the encoder emits 25 tokens per second of audio)
+projector: 3 x 768->768, then into the 2048-wide backbone
+mel front end: 16 kHz, n_mels 128, n_fft 400, win 400, hop 160, hann periodic, center false,
+   power 2.0, slaney mel + slaney norm, f0/f8k, log10 with floor -12, affine (x-4)/4
 ```
 
-| gate | current |
-|---|---|
-| per-layer × per-position rms vs HF, 23 layers × 23 positions | all within 3% |
-| pos-0 logits | top-1 = HF's (11), corr 0.99998, std 4.564 vs 4.547 |
-| **131 positions × 128,000 logits, 6 prompts** | **top-1 = HF's on 130/131**, top-8 coverage 1.000 everywhere, corr 0.99946–0.99973, KL 0.0007–0.0019 |
-| greedy stream vs HF goldens, 7 prompts, 16 tokens | **6/7 exact** (F 11/16, at its known near-tie); floor stays 1 |
+### 4.2 Reuse matrix
+
+| need | backbone has | verdict |
+|---|---|---|
+| Q8 GEMV, any `N`, `K∈{2048, 7680, 2816, ...}` | `q8_partial` family + config picker | **reuse** (K=768/1792/1024 are new shapes → new `GemvCfg` entries + coverage assert) |
+| RMSNorm / per-head norm | `k_rmsnorm`, `k_headnorm` | **reuse** with `H=768`, `hd=96` as parameters |
+| depthwise causal conv + ring state | `k_conv7`, `k_shift_in` (width 7) | **generalize** to width 3 (`conv_L_cache` 3) |
+| GQA attention with sliding window | `k_attn_head` (window parameter) | **reuse**; window 32, `hd=96`, 8 heads |
+| RoPE | `k_rope` (rot is a parameter) | **reuse** (LFM2 encoder config decides full vs partial) |
+| silu·gate, sigmoid gate, residual add | `k_silu_mul_bf`, `k_sigmoid_gate`, `k_add_bf` | **reuse** |
+| **strided / 2-D convs, 4-frame concat** | — | **new kernel** (`downsample`) |
+| **log-mel (FFT-400, slaney filterbank)** | — | **new** (DSP; no weights, no reuse) |
+
+### 4.3 Cost, derived from bytes
+
+119 MB of weights per encoder frame × 100 frames/s = **~11.9 GB per second of audio**, i.e.
+**0.7–1.0 s of GPU per second of audio** at 11–17 GB/s — the encoder is roughly realtime on this
+board and is *not* a rounding error in an audio deployment. For comparison the backbone costs
+25 tokens per second of audio × ~98 ms/token of sequential prefill ≈ **2.4 s per second of
+audio**. Both numbers are byte/rate derivations, flagged as such: the encoder is unported, and
+the backbone figure is the measured per-step cost applied to the derived token rate (25/s from
+the 4-frame concat above).
+
+That ordering is the port's decision input: **the backbone prefill dominates audio latency, the
+encoder is second, and the mel front end (a few ms per 5 s of audio) is free.** Anything that
+batches the backbone prefill is worth ~70× more for audio than for a 23-token text prompt — and
+batching is currently blocked by `ffn.w2`'s x-layout (Appendix A).
+
+### 4.4 Gate plan for the encoder
+
+Gate the component **at its own boundary**, not through the backbone: dump the encoder's last
+hidden state per frame from HF for a fixed audio fixture, then teacher-force the engine with the
+same encoder inputs and compare with the matrix gate (per-layer × per-frame rms within 3%) plus a
+logit-level gate after the projector. This is the same protocol the backbone used (§6), applied
+one level down — and it needs the mel fixture to be bit-reproducible, which means the front end
+has to be ported (or frozen to a file) before the encoder can be scored.
+
+## 5. Depthformer head and codec — a different pattern
 
 ```
-prompt    top-1    top-8 cov    corr (min)          KL mean   KL max
-A         23/23      1.000     0.99964 (0.99900)    0.0014    0.0084
-C         21/21      1.000     0.99946 (0.99770)    0.0015    0.0161
-E         23/23      1.000     0.99968 (0.99897)    0.0017    0.0121
-F         20/21      1.000     0.99963 (0.99884)    0.0015    0.0079
-K         23/23      1.000     0.99973 (0.99932)    0.0007    0.0029
-L         23/23      1.000     0.99966 (0.99921)    0.0019    0.0126
+depthformer  3 layers, hidden 1024, intermediate 2816, 32 heads / 8 KV heads, head_dim 32
+             max_position_embeddings 12, is_causal FALSE (bidirectional), maskgit_steps 3
+depth_linear [12288, 2048]   = 12 codebooks x 1024
+            12 x depth_embeddings: embed [2017,1024], norm, to_logits [2017,1024]
+codebooks 12, audio_vocab 2017, codebook_embedding [24204, 2048] (= 12 x 2017, exact)
+interleave: 6 text tokens / 12 audio tokens per step
 ```
 
-**Read this honestly.** Streams are **6/7 exact over 16 tokens** (F stops at 11/16, at its
-known near-tie). `CHECKS OK` still certifies the arm's floor (1 token, the plan's certified
-worst prefix for this arm) — the floor was not raised to chase 6/7.
+Why this is not "more of the same":
 
-The 6/7 is recent: until the feeding fix the score was 0/7 with prefixes of 1–2, and two
-session conclusions were built on that number. Both were wrong, and both are retracted here:
-the streams did not diverge by argmax/tie amplification on an agreeing distribution — the
-step loop fed every prompt step's prediction back as generation input, so only the first
-output token was ever right. And the plan's greedy-goldens gate is not unreachable by a
-from-scratch GEMV after all: with correct feeding this Q8 arm reaches its certified 6/8
-figure (D remains unscored, refused for device-dependent ties -- see below). The logit gate
-was right all along (130/131 top-1, KL under 2e-3): the distributions agreed; the harness
-was feeding the wrong tokens.
+* **Bidirectional over 12 positions.** There is no KV cache, no sliding window, no ring: the
+  whole sequence is 12 tokens, so one block per frame can hold q/k/v in shared memory. The
+  causal `k_attn_head` does not apply — a 12×12 full-mask variant is a genuinely new kernel, and
+  it is small enough to be trivially correct (the cheapest place in the whole port to start).
+* **12 logits heads in one GEMV**: `depth_linear` gives `N = 12288`, then 12 independent
+  `[2017,1024]` to_logits — a single `N = 24204` GEMV if the 12 weights are stacked at repack
+  time (the same merge trick the backbone uses for gate+up).
+* **MaskGIT is a sampling loop, not a forward pass**: 3 steps of mask/predict, with the
+  repetition penalty and top-k from the model card. That is controller logic, and it belongs in
+  the same place as the interleaved text/audio controller.
+* **LiquidCodec is a separate 147 MB model** (tokens → 24 kHz waveform, streaming, 12 tokens per
+  80 ms). It is the largest untouched surface in the whole port and has no kernel overlap with
+  anything above except elementwise and conv.
 
-The one logit miss is prompt F at a single position, where HF's top-1 is still in the engine's
-top-8: a near-tie, which is what the "one lost position warns, two fails" floor exists to
-surface. Prompt A alone would never have shown it.
+## 6. How a port is gated (the protocol, reusable as-is)
 
-**The logit gate is still the reason to distrust the stream gate as a fine instrument.** The
-`__fmaf_rn` switch that bought −2.0% left all 16 stream tokens on both prompts unchanged, so
-stream equality could not have detected a regression there. Running every kept change through
-the 6-prompt gate, against the same HF reference, with no threshold moved:
+### 6.1 The four reference gates
 
-```
-arm                                top-1 (of 131)   corr range       KL mean range   verdict
-shipped (__fmaf_rn, fused staging)      130         .99946-.99973    .0014-.0019     reference
-LFM_NOFMA=1 (exact mul-then-add)        130         .99942-.99970    .0015-.0019     indistinguishable
-LFM_NOFUSE=1 (separate k_bf2f)          130         .99946-.99973    .0014-.0019     bit-identical
-LFM_R=64 (row->block remap)             130         .99946-.99973    .0014-.0019     bit-identical
-```
+| gate | what it catches | current backbone result |
+|---|---|---|
+| per-layer × per-position rms vs HF (`--trace` matrix) | a wrong wiring in one layer/op | 23 layers × 23 positions all within 3% |
+| pos-0 logits vs HF | wrong embedding/head wiring | top-1 = HF's (11), corr 0.99998 |
+| 131 positions × 128 000 logits, 6 prompts | accumulation-order drift | top-1 = HF on 130/131, KL 0.0007–0.0019 |
+| greedy streams vs HF goldens, 7 prompts × 16 | end-to-end | 6/7 exact (floor is a ratchet) |
 
-Two things follow. The fused-staging and R knobs are **bit-identical**, so their lines above
-are also a positive control: a bit-exact arm must print identical numbers, and it does — that
-is the determinism check for the gate itself. (Speed side, #266: LFM_NOFMA=1 doubles GEMV
-FLOPs and costs only +1.8% of the decode step -- the kernels are ~90% DRAM-bound, which caps
-every arithmetic-shrinking lever at ~2% and matches the clean-board H2 decode win exactly.)
-And the FMA switch is **quality-neutral**:
-FMA wins corr on 4 prompts (A, C, F, K) and loses on 2 (E, L) by ~2e-5, while the spread
-*between prompts* (KL 0.0007–0.0019) is about 10× the spread *between arms*. An early
-two-prompt read said FMA "agrees with HF better"; that was prompt-A-specific and did not
-survive the other five, so it is not claimed here. What is claimed is the safe half: the
-−2.0% cost nothing measurable.
+Long-context additions (all in `checks_lfm3.py --long`): the rms matrix to 1000 positions
+against an **fp16** reference (0/24 000 cells outside 3%), the short-prompt tie landscape
+(top-1 vs fp16 and vs bf16 references separately), and a 300-position tie gate.
 
-Thresholds in `gate_logits_seq` are a **regression ratchet** measured on the shipped arm —
-passing means "no worse than the arm this gate was written on", and every number is printed
-each run so drift is visible even on a pass. The measured KL sits 25×+ below the 0.05 floor,
-so the ratchet has room and is not fitted to these prompts.
+### 6.2 Making references for a new component
 
-**Env forwarding gotcha (cost an hour, now fixed):** engine knobs reach the Nano through
-`LFM3_ENV`, not by setting them in the shell — `LFM_NOFMA=1 bash checks.sh A` sets the
-variable *locally only*, the engine runs the default arm, and every gate number comes back
-byte-identical. Use `LFM3_ENV="LFM_NOFMA=1" bash checks.sh A`; the header echoes
-`engine env: …` so an arm is self-documenting. Identical-to-the-digit gate output is the tell.
-
-One structural fact about the goldens, measured: **they are not reproducible even by HF across
-devices.** Regenerating golden D on GPU from its own stored prompt diverges at token 6
-(22 vs 20) — oracle.py generates on CPU and bf16 logit ties break per device/kernel.
-C/E/F/K/L reproduce exactly (24/24, 24/24, 24/24, 17/17, 24/24) and carry verified
-`prompt_ids`; D is refused by `.auto/lfm3/make_prompt_ids.py`, which writes ids only when
-(a) rebuilding A/B from their stored text equals their stored ids and (b) HF greedy
-reproduces the golden's own `gen`. (An earlier version of this section claimed the goldens
-were unreachable by a from-scratch GEMV; the feeding fix retracted that — 6/7 is the arm's
-certified figure.)
-
-## Build, run, knobs
+The suite's whole value is that the reference is **the same model run by HF on the same inputs**,
+dumped at the exact boundary being scored:
 
 ```bash
-bash .auto/lfm3/measure.sh                      # sync -> build -> fixed job -> METRIC lines
-bash .auto/lfm3/checks.sh A B C E F K L         # the gates
-~/venvs/lfm3/bin/python .auto/lfm3/hf_logits_seq.py --prompt A,C,E,F,K,L   # regen logit refs
-LFM3_ENV="LFM_NOFMA=1" bash .auto/lfm3/checks.sh   # same gates, other engine arm (see gotcha)
-bash .auto/lfm3/ab.sh "" "LFM_NOFMA=1"          # paired A/B of an env knob, both orders
-LFM_TIME=1  ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --steps 24 --prompt …   # per-phase
-LFM_KTIME=1 ./lfm3_nanode …                     # per-kernel table at exit
+~/venvs/lfm3/bin/python .auto/lfm3/hf_logits_seq.py --prompt A,C,E,F,K,L --dtype fp16|bf16
+~/venvs/lfm3/bin/python .auto/lfm3/matrix_long.py --nt 1000 --dtype fp16
+```
+
+Two reference-precision lessons, both measured, both load-bearing:
+
+* **bf16 and fp16 references disagree with each other** at ~4.5% of teacher-forced positions
+  (6/134 short-prompt, 3/20 at 300 positions). Those are argmax ties where precision flips the
+  answer. A "miss" inside the tie zone is not an engine regression — score both references.
+* **The engine tracks the fp16 reference on magnitudes and the bf16 reference on argmax** (rms
+  0 cells outside 3% vs fp16 to 1000 positions; 133/134 top-1 vs bf16). Both are true, and a gate
+  must say which question it asks.
+
+### 6.3 Floors are ratchets, not targets
+
+`gate_logits_seq` thresholds were measured on the shipped arm; passing means "no worse than the
+arm this gate was written on", and every number prints each run so drift is visible on a pass.
+When a floor fails, the question is *which* position and *whether the references agree there* —
+never "raise the floor".
+
+### 6.4 Measurement discipline (all of these cost a session to learn)
+
+* **Engine knobs reach the board only through `LFM3_ENV`** (`LFM3_ENV="LFM_H2=1" bash
+  .auto/lfm3/checks.sh A`). Setting the variable in the shell sets it locally only and every gate
+  number comes back byte-identical — that identity is the tell.
+* **Prove the code path ran** before believing a timing: `R` exactly 1.0000, or gate output
+  identical to the digit, means the probe never executed.
+* **`test -x $BIN` is not a build check**: nvcc leaves the previous binary on failure. Build to
+  `.new`, `mv` only on a clean compile.
+* **`pgrep -x lfm3_conv_test` must be 0** before measuring. Three orphaned (killable, `STAT=R`,
+  *not* zombies) processes held 3 of 4 A57 cores for days; at steady state they were invisible,
+  under sustained load they produced +15…47% degraded board states. Kill recipe in place; they
+  are not respawning.
+* Single samples swing ±1% (unpinned clocks: `schedutil` / `nvhost_podgov`, 76.8 → 921.6 MHz).
+  Every claim here is a same-session paired A/B in both orders, `R = sqrt(o1/o2)`. Runs ≥60 s
+  need ≥3 samples per arm. Never compare against a number from another session.
+
+## 7. Memory and bandwidth budget for the whole port
+
+Measured on the board (engine startup lines):
+
+```
+device: 4.16 GB total, 0.82 GB free before the arena is created
+weights+arena with the backbone blob: 2.15 GB   ->  0.79 GB free while running
+host: MemAvailable 1252 MB, RSS 307 MB
+```
+
+*Derived* size of everything still to port, at Q8 (1.125 B/weight):
+
+```
+audio encoder + downsample + projector   ~119 MB
+depthformer + depth_embeddings + depth_linear + codebook_embedding   ~169 MB
+LiquidCodec decoder (shipped weights)     147 MB
+                                    total ~435 MB
+```
+
+So the full LFM3-Audio port at Q8 is ~2.4 GB of weights on a 4 GB unified board with ~0.8 GB
+free today — feasible, but only just, and the codec (needed last) should be loaded worst-case as
+an evict-and-load rather than resident. **Do not plan on raising precision anywhere**: the plan
+doc's measured verdict is that 4-bit does not survive the gates (0/48 prompts at Q2), and the
+certified arm is Q8 linears + fp32 scales + bf16 embeddings.
+
+Time budget follows bytes at 11–17 GB/s. A worked example, 5 s of audio:
+
+```
+encoder   119 MB x 100 frames/s x 5 s = 59.5 GB  / ~14 GB/s   ~= 4.3 s
+backbone  125 audio tokens x 98 ms/step (sequential prefill)  ~= 12.3 s
+depth head + codec 12 tokens/80 ms, small bytes, per-frame    ~= to be measured
+```
+
+Both rows are derivations, not measurements — but they are why the port order in §1 is what it
+is, and why the backbone prefill (not the encoder, not the head) is the first latency problem the
+audio path will hit.
+
+## 8. Build and run
+
+```bash
+bash .auto/lfm3/measure.sh                  # sync -> build -> fixed job -> METRIC lines
+bash .auto/lfm3/checks.sh A B C E F K L     # the four gates
+LFM3_ENV="LFM_H2=1" bash .auto/lfm3/checks.sh A   # same gates, other engine arm
+bash .auto/lfm3/ab.sh "" "LFM_NOFMA=1"      # paired A/B of an env knob, both orders
+python .auto/lfm3/checks_lfm3.py --long A B C E F K L   # + long-context and tie gates
 ```
 
 ```
 nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca lfm3_nanode.cu -lz
 ```
 
-Knobs (all default to the shipping configuration): `LFM_NOFMA`, `LFM_NOFUSE`, `LFM_EMB`,
-`LFM_R`, `LFM_TPB`, `LFM_KCHUNK`, `LFM_TIME`, `LFM_KTIME`, and the measured-out probes
-`LFM_MERGE`, `LFM_LMDBUF`, `LFM_GRAPHS`, `LFM_STREAM`, `LFM_RADAPT`, `LFM_UNROLL2`,
-`LFM_ROWLANE` (the last two measured +3.8% and +189% on the co-tenant decode channel,
-runs #274/#275: the GEMV is ~90% DRAM-bound, so ILP widening cannot help and layouts that
-break coalescing destroy it -- do not revisit either).
+Engine usage: `./lfm3_nanode <blob.lfm3q8> --steps N --prompt id,id,...`. Flags: `--trace`
+(per-layer x per-position rms matrix, what the matrix gate parses), `--probe-layer L
+--probe-step P`, `--dump-logits FILE`, `--dump-logits-all FILE` (appends every step — the
+logit gates), `--emb-host`, `--merge`, `--lmrows N`, `--prefill-minimal`, `--lm-selftest`.
+Context is compile-time (`MAXTOK`, 4096).
 
-Two harness traps cost real time and are now defended against: `test -x $BIN` is **not** a
-build check (nvcc leaves the previous binary on failure, so three broken builds silently
-measured stale numbers), and engine env does **not** reach the Nano by setting it in the
-shell — `LFM_NOFMA=1 bash checks.sh A` sets it locally only, the engine runs the default arm,
-and every gate number comes back byte-identical. Use `LFM3_ENV="LFM_NOFMA=1" bash checks.sh A`
-(the header echoes `engine env: …`), and pass program args through `LFM3_ARGS`. The tell for a
-probe that never executed: `R` exactly 1.0000, or gate output identical to the digit.
+Env knobs, all defaulting to the shipping configuration: `LFM_TIME` (per-phase),
+`LFM_KTIME` (per-kernel), `LFM_H2` (half2 inner loop), `LFM_WARMMS` (DVFS-ramp warm-up,
+default 0), `LFM_NOWARM` (control for the load-time warm-up), `LFM_LEGACYFEED` (feeding fix
+control), `LFM_NOFMA`, `LFM_NOFUSE`, `LFM_EMB`, `LFM_R`, `LFM_TPB`, `LFM_KCHUNK`, `LFM_ROWS`,
+`LFM_GRAPHS`, `LFM_STREAM`, `LFM_XRANGE`, `LFM_DBG_*`. The measured-out probes (`LFM_MERGE`,
+`LFM_UNROLL2`, `LFM_ROWLANE`, `LFM_LMDBUF`, `LFM_RADAPT`) carry their numbers in Appendix A —
+do not re-walk them.
 
-## Known issues
+## 9. Known issues
 
-* **Three stuck processes on the Nano, measured harmless to decode.** Three `lfm3_conv_test`
-  processes from 2026-10-28 are stuck in state R inside the CUDA driver (`kill -9` does not
-  reap them, `systemctl reboot` is swallowed), spinning cores 0, 2 and 3. Pinning the engine
-  to the one idle core (`taskset -c 1`) is a null result in a paired, order-balanced A/B
-  (137.66 vs 137.58 ms/token, R = 1.0006, 2/4 pairs each way): the launch thread is not on
-  the critical path, consistent with CUDA graphs measuring -0.55%. So the absolutes are
-  **not** inflated by them, and the GEMV config sweep does not need repeating after a reboot.
-  (Superseded in the best sense: the launch-bounds win moved the best from 136.30 to 112.79,
-  and the post-win numbers reproduce to 0.05%.)
-* Prompt D cannot be scored (see above), and the stream gate therefore covers 7 of 8 prompts.
-* `--trace` (the per-layer/per-position matrix) cannot run inside a graph capture, so
-  `LFM_GRAPHS` forces it off.
+* **Prompt D cannot be scored**: goldens are not reproducible even by HF across devices (a bf16
+  tie breaks differently on CPU vs GPU and diverges at token 6), so `make_prompt_ids.py` refuses
+  to certify ids for it. The stream gate covers 7 of 8 prompts.
+* **`ffn.w2` reads `x + row*K`** beyond the 7680-element silu buffer, so its output depends on
+  step-recursive arena scratch. This pins the prefill to one position at a time (Appendix A). Any
+  change to that layout is a **goldens change** — a deliberate decision, not a cleanup.
+* `--trace` cannot run inside a graph capture, so `LFM_GRAPHS` forces it off.
+* Clocks are unpinned and unstabilisable without root (`jetson_clocks` absent, sudo
+  `requiretty`), so absolutes here would not reproduce on a clock-locked board; ratios do.
+
+---
+
+## Appendix A — the backbone latency record (evidence, not the objective)
+
+Decode, 141.04 → **112.79 ms/token** (−20.0%), each step paired A/B in both orders:
+
+```
+141.04 ┃█ baseline (real CUDA path)
+139.12 ┃█−0.39% fuse k_bf2f into the GEMV's x staging (~110 launches/token gone)
+136.41 ┃ −2.0%  __fmaf_rn accumulation in the Q8 GEMV
+112.79 ┃█−17.3% __launch_bounds__(256,6) on the Q8 GEMV (resource hint, exact)
+```
+
+TTFT on the 23-token prompt: 2755.4 → **2256.2 ms** (−18.1%), from first-true-token accounting
+(−107 ms), the load-time warm-up (−58.7 ms), and the feeding fix + lm_head skip on prompt steps
+(−318.5 ms). Prefill is sequential (one position per full step), so TTFT ≈ 22 × 97.6 ms + one
+112.4 ms step.
+
+**Measured-out, with numbers** (`faster ◄─────────────────────────► slower`):
+
+```
+ +0.33  merged gate+up GEMV          +0.33% for 679 MB — rejected
+ -0.55  CUDA graphs of the layer loop    ~250 launches ≈ 1 ms of CPU vs a 112 ms step
+ -2.7   R=128 under launch bounds       R=256 stands
+ -3.6   TPB=512                         512 threads halve the block count on 4 SMs
+ -5.3   KCHUNK=1024                     KCHUNK=K under all three codegens
+ -6.9   exact integer int8→float        extra integer op outweighs the saved I2F
+-10.5   inter-row ILP (unroll 2)        register spill at R=256/TPB=256
+-12.5   -maxrregcount=32                forced spills
+-157    one-row-per-lane wide-K GEMV    32 scattered sectors per warp instruction
+-162    double-buffered lm_head         H2D + GEMV share the one bus: two full passes
+```
+
+Two configuration findings worth carrying: **never stream the lm_head from pinned host on Tegra**
+(the copy and the GEMV share the 21.9 GB/s bus — 10.4% worse), and the GEMV config is a
+characterised optimum (R=256, TPB=256, KCHUNK=K, FMA on, serial row loop,
+`__launch_bounds__(256,6)`), confirmed across three codegen regimes.
+
+**`ffn.w2` (N=2048, K=7680) is the one remaining shape anomaly** — same bytes as `w1`
+(N=7680, K=2048), ~17% slower after launch bounds (1.47× before them). Five hypotheses are measured out (block fill, ILP,
+cache hints, chunk interleaving, per-lane rows). **Prefill batching is therefore closed**: a
+bit-exact CT=2 weight-reuse kernel existed and was 1.15–1.45× standalone (8/8 shapes bit-exact),
+but a layer-first integration diverged because `w2`'s x-indexing reads arena scratch (§9), and no
+per-position tiling reproduces those bytes. Batching the other nine GEMVs does not pay.
+
+**The H2 arm** (raw `half2`/HFMA2 inner loop, `LFM_H2=1`, not bit-exact) is measured and gated
+but **not shipped**: clean board −1.8% TTFT (23 pos), −2.5% (300), −3.9% (360), −5.0% (1000),
+decode −1.7%; with one CPU co-tenant −4.6…−5.9% TTFT and −2.6…−5.0% decode. Quality is at the
+shipped arm's level on every axis (formal gates gate-for-gate identical, KL at the floor short
+and long, argmax identical on both references, rms 0 cells vs fp16 to 1000 positions). The
+`H2=2` rescaled variant is **dominated**: ~0% speed and it fails the logit gate (127/131).
+
+Board state is a first-class measurement condition: unpinned clocks (76.8–921.6 MHz), a 2–6%
+hour-to-hour drift, ~15% state shifts during ≥60 s runs, and three orphaned CPU spinners that
+were killable all along — killing them restored a clean board whose shipped band is
+**2280 ± 2 ms** with a 0.13% spread. Every speed number above is from that clean board; pre-kill
+speed figures are retired.
+
+## Appendix B — gate results on the current tree
+
+```
+bash .auto/lfm3/checks.sh A B C E F K L        # short
+python .auto/lfm3/checks_lfm3.py --long A B C E F K L   # + long-context + ties
+```
+
+```
+matrix (23 layers x 23 positions vs HF)      all within 3%
+matrix_long, 1000 positions vs fp16 ref      0 / 24000 cells outside 3%
+pos-0 logits                                 top-1 = HF's (11), corr 0.99998
+131 positions x 128k logits, 6 prompts       top-1 130/131, top-8 coverage 1.000,
+                                             corr 0.99946-0.99973, KL 0.0007-0.0019
+greedy streams, 7 prompts x 16 tokens        6/7 exact (F 11/16, its known near-tie)
+tie landscape, 134 positions                 top-1 133/134 vs bf16, 127/134 vs fp16
+tie landscape, 300-position trajectory       19-20/20 vs fp16 (15% ref-disagreement density)
+tie landscape, 600-position trajectory       12/12 both arms, both references
+```
+
+```
+prompt   top-1   top-8 cov   corr (min)          KL mean   KL max
+A        23/23     1.000     0.99964 (0.99900)    0.0014    0.0084
+C        21/21     1.000     0.99946 (0.99770)    0.0015    0.0161
+E        23/23     1.000     0.99968 (0.99897)    0.0017    0.0121
+F        20/21     1.000     0.99963 (0.99884)    0.0015    0.0079
+K        23/23     1.000     0.99973 (0.99932)    0.0007    0.0029
+L        23/23     1.000     0.99966 (0.99921)    0.0019    0.0126
+```
+
+Arm-neutrality of the gates themselves: `LFM_NOFUSE=1` and `LFM_R=64` are bit-identical to the
+shipped arm and print the same numbers to the digit — that is the determinism control, and it is
+why a probe whose output is byte-identical to the default arm means "the code never ran".

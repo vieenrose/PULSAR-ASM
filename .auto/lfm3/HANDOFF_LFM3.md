@@ -8,8 +8,14 @@ lines 0..nprompt-1 on prompt A (23 ids); benchmark band 2258-2274, baseline
 2755.41 (-17.8%). Decode steps 112.4-112.8 (session); prompt steps 97.6-99.5
 (no lm_head since #139). Full attribution: 22 x 97.6 + 112.4.
 
-Read `pulsar_arm/asm/README-lfm3-audio.md` — the quality record, TTFT
-waterfall, H2 decision table, measurement section are all current.
+Read `pulsar_arm/asm/README-lfm3-audio.md`. It is now organised as a PORTING
+document (component-by-component status, the checkpoint->blob->engine contract,
+per-component port recipes for the audio encoder / depthformer / codec, the
+gate protocol, and the memory+bandwidth budget for the whole port). The
+backbone latency record and the gate-result tables moved to Appendix A/B.
+Current state: text backbone ported and gated; encoder/depthformer/codec open.
+Blob payload 1946 MB = 1651 MB layers + 295 MB tied head; at 112.8 ms/step
+that is ~17.3 GB/s, i.e. the backbone is at the board's bandwidth ceiling.
 
 ## Measured-out — do NOT re-walk
 
