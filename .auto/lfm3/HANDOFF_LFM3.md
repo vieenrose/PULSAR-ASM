@@ -73,6 +73,26 @@ Quality (all closed, gates green on fresh builds, #166):
 - /tmp/poller.sh + /tmp/clkrun.sh on the Nano sample the GPU clock (tail -f
   on sysfs does NOT work; EMC is not readable unprivileged, #214).
 
+## Hygiene era (#230-#268) — read this before trusting ANY speed number
+
+- SPINNERS: pgrep -x lfm3_conv_test must be 0 (they were killable R-state
+  orphans, #230; kills persist). Pre-#230 SPEED numbers are contention-
+  inflated (quality gates unaffected). Clean-board shipped TTFT band =
+  2280+-2 (0.13% spread, #253); session best 2256.19 is pre-hygiene.
+- H2 CLEAN TRUTH: TTFT -1.8/-2.5/-3.9/-5.0% at 23/300/360/1000 pos
+  (monotonic, all 3x3), decode -1.7%; co-tenanted (1 renice-10 spinner):
+  TTFT -4.6..-5.9%, decode -2.6% both orders, long decode -4.6% (#245/#254/
+  #258). H2=2 ~0% everywhere clean. NOFMA: 2x FLOPs = +1.8% decode ->
+  GEMV ~90% DRAM-bound; arithmetic levers capped at ~2% (#266).
+- CO-TENANT DECODE CHANNEL (25-step avg, 1 co-tenant): 0.05-0.3% spreads —
+  the tightest A/B tool on this board; use it for kernel probes.
+- LFM_WARMMS: RETRACTED (clean-board +7.7% harm, #235); default 0 is the
+  only supported mode. taskset at <=2 co-tenants: null (#252). Graphs under
+  co-tenant: -12% (warm-up off), closed (#247).
+- New standing gates in checks_lfm3.py --long: matrix_long fp16, tie-fp16
+  short (127/134), tie-long (19-20/20 vs fp16; 15% ref-disagreement density
+  at long states, #263). Full-suite cert = `checks_lfm3.py --long A B C E F K L`.
+
 ## Harness
 
 - `bash .auto/lfm3/checks.sh` — full gates (rebuilds from tree).
