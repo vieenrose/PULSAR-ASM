@@ -23,10 +23,10 @@ from checks_lfm3 import NANO, DIR, BLOB, BIN, ENVQ, run_remote  # noqa: E402
 NT = 300
 
 
-def prompt_ids():
+def prompt_ids(nt=NT):
     import json
     a = json.load(open(os.path.join(HERE, "golden_greedy_A.json")))["prompt_ids"]
-    return (a * ((NT // len(a)) + 1))[:NT]
+    return (a * ((nt // len(a)) + 1))[:nt]
 
 
 def dump_hf(ids, path):
@@ -53,9 +53,12 @@ def main():
     ap.add_argument("--hf-only", action="store_true")
     ap.add_argument("--ref", default=os.path.join(HERE, "hf_matrix_long.npy"))
     ap.add_argument("--tol", type=float, default=0.03)
+    ap.add_argument("--nt", type=int, default=NT)
     a = ap.parse_args()
     import numpy as np
-    ids = prompt_ids()
+    ids = prompt_ids(a.nt)
+    if a.nt != NT and a.ref == os.path.join(HERE, "hf_matrix_long.npy"):
+        a.ref = os.path.join(HERE, "hf_matrix_long_%d.npy" % a.nt)
     if a.hf_only or not os.path.exists(a.ref):
         dump_hf(ids, a.ref)
         if a.hf_only:
