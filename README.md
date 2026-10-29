@@ -287,7 +287,16 @@ all still here and working:
   with no libc;
 - the C + NEON Bonsai port that runs Ternary-Bonsai 8B and 27B on a DGX
   Spark CPU;
-- the original x86-64 Gemma engines.
+- the original x86-64 Gemma engines;
+- a single-translation-unit CUDA engine for **LFM3-Audio-2B** at Q8 on the same
+  Jetson Nano — 136.30 ms/token (7.34 tok/s), 306 MB RSS on a 4 GB board,
+  quality frozen by HF-derived gates.
+
+See [pulsar_arm/asm/README-lfm3-audio.md](pulsar_arm/asm/README-lfm3-audio.md)
+for that engine: where the 136 ms goes per phase, bandwidth by GEMV shape, the
+FP-pipe-bound diagnosis behind the largest win, and the twelve structural levers
+that are measured out (including CUDA graphs, which lose 0.55% here because
+~250 launches cost ~1 ms of CPU against a 136 ms step).
 
 See [doc/OTHER_ENGINES.md](doc/OTHER_ENGINES.md) and
 [pulsar_arm/bonsai2/README.md](pulsar_arm/bonsai2/README.md). The
