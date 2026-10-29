@@ -138,6 +138,12 @@ serves -- the mechanism does not exist on this board.
 Scope: this engine is a text-backbone harness -- it takes token ids, so audio→tokens runs
 upstream and all 8 gate prompts are text-only. TTFT here is in-engine e2e.
 
+Context is 4096 positions (raised from a benchmark-sized 64 that silently truncated anything
+longer). A 300-token prompt runs to completion with per-step cost rising 98 → 112 ms;
+the KV cache at 4k costs 192 MB against 1.1 GB free. Per-step cost is essentially flat to
+300 positions, so a 1500-token audio prefill is ~170 s sequential -- which is why batching
+the prefill matters ~70x more for audio than for the 23-token benchmark.
+
 ## Bandwidth by shape — the one anomaly left
 
 Per-kernel timing (`LFM_KTIME=1`) gives a clean correlation between achieved bandwidth and
