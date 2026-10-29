@@ -115,12 +115,25 @@ TTFT, prompt A (each step paired A/B in both orders where noted)
 ```
 
 Prefill is still ~95% of TTFT, and batching positions with identical arithmetic tops out near
-1.0x (two tile sizes measured, both bit-exact) because the GEMVs are FP-pipe-bound: batching
-removes weight bytes but not a single FMA. The remaining prefill lever is fewer FP operations
-per weight -- half2 HFMA2 (measured: −5.6% TTFT, −5.2% decode, off by default as `LFM_H2=1`,
-quality-indistinguishable on every gate) or int8 activations. Both change numerics and are the
-user's call; an exact per-block 2^k rescale exists (`LFM_H2=2`, streams 7/7, ~0% speedup --
-the rescale scan costs what the faster loop saves).
+1.0x (four tile-size/staging variants measured, all bit-exact, best 1.02x) because the GEMVs
+are FP-pipe-bound: batching removes weight bytes but not a single FMA -- and an unpadded
+staging variant proved the padding load-bearing by running 0.09x (16-way bank conflicts).
+The remaining prefill lever is fewer FP operations per weight. Measured, all behind flags,
+all gates green; the call is the user's since every option below breaks bit-exactness:
+
+```
+arm                              TTFT      decode    streams  KL A/C/K          range review
+shipped (fp32 path)              2270.6    112.8     6/7      0.0013/0.0005/0.0006  n/a
+LFM_H2=1 (raw half2 + HFMA2)     2141.8    107.0     6/7      0.0016/0.0006/0.0005  28% of one layer's
+ -5.6% / -5.2%, 4/4 paired                                          inputs in fp16's low-        precision range;             theoretical accumulator        overflow on ffn.w2
+LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    7/7      0.0012/0.0007/0.0005  safe by construction
+ rescale; the scan costs what                                        (best-or-tied)              (bound 65024, no              the faster loop saves)                                                                   subnormals)
+```
+
+Top-1 agreement is 47/48 in every arm on every divergence prompt; nothing grows. int8
+activations were considered and rejected without building: sm_53 has no int8 dot-product
+instruction, so there is no FMA-count win, only smaller x traffic that the L2 already
+serves -- the mechanism does not exist on this board.
 
 Scope: this engine is a text-backbone harness -- it takes token ids, so audio→tokens runs
 upstream and all 8 gate prompts are text-only. TTFT here is in-engine e2e.
