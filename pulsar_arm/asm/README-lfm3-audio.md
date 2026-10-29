@@ -183,12 +183,10 @@ LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.00
                                                            a floor the shipped passes)
 
 speed rows: same-session pairs 2026-02-10 (#180/#189). The raw arm's win is REGIME-dependent
-(same-session pairs at each length): 23 pos -5.7% (#205), 300 pos -7.8% (#206), 360 pos -8.0%
-(order-balanced, #203); at 1000 pos not resolvable on this board -- the four samples span a
-~15% board-state drift (shipped {105.1, 120.8} s vs H2 {105.3, 106.1} s: the H2 arm is
-state-insensitive, the shipped arm degrades in bad states, #225/#227). HFMA2 pays while the
-GEMVs are the GPU-side bottleneck; audio sweet spot is the 5-30 s prefill band (300-360
-tokens); chat-class -5.7%; 80 s+ single-shot prefills at best neutral. Quality: formal
+(same-session pairs, spinner-free board): 23 pos -5.7% (#205), 300 pos -7.8% (#206), 360 pos
+-8.0% (#203), 1000 pos -5.0% (3x3 order-balanced, both spreads 0.7%, #225/#227 anomalies were
+the killable-spinner degraded states, retired by #233) -- H2 wins across the whole audio
+deployment range (5 s to 83 s prefills), peaking in the 300-360 band; chat-class -5.7%. Quality: formal
 suite gate-for-gate identical to shipped (#182 short, #199 full --long), tie-landscape argmax
 identical on both references (#195/#196), rms vs fp16 reference 0/24000 cells to 1000
 positions in both arms (#192/#201).
