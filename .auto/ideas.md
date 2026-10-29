@@ -2062,3 +2062,4 @@ embedding tensor (N=128000, K=2048, T=23) against 23 sequential `q8_partial` lau
    once occupancy is restored. Next design: CT=2 (16.9 KB, 2 blocks/SM) or unpadded bf16 x staging
    (halves shared memory), then a TTFT A/B through the full layer loop. The prize is still about
    17x (#134), so this remains the e2e lever.
+- #136: CT=2 (16.9 KB shared, 2 blocks/SM) is BIT-EXACT again (0/2,944,000) and much closer to sequential: 379 vs 334 ms (0.88x, two runs agree). CT=4 was 0.52x. Moving from 1 to 2 blocks/SM recovered most of the occupancy loss, but weight reuse still doesn't beat 6-block sequential. Next: unpadded bf16 x staging (halves shared memory again, giving 4+ blocks/SM at CT=2) before wiring the kernel into the layer loop.
