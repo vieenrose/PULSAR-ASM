@@ -1199,25 +1199,36 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
 // - shm sized exactly CT*nb*17 half2 = 8704 B (the v1 ULF was OOB shared use).
 // The minimal direct-call probe just proved direct launches + shared + H2 all
 // work in this context, so any failure here is in the newly added structure.
-template <typename TX, int CT>
+template <typename TX, int CT, bool H2>
 __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ xall, float* __restrict__ part,
                            int N, int K, int KCHUNK, int R, int nb, int T) {
   extern __shared__ float smf[];
-  __half2* xh = reinterpret_cast<__half2*>(smf);
+  __half2* xh = reinterpret_cast<__half2*>(smf);   // H2 staging: [CT][nb][17] half2
+  float* xf = smf;                                 // fp32 staging: [CT][nb][33] float
   const int nchunk = K / KCHUNK, rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
   const int koff = chunk * KCHUNK, NT = blockDim.x, tid = threadIdx.x;
   const int lane = tid & 31, wid = tid >> 5, WPB = NT >> 5, GR = R / WPB, base = rowblk * R;
   const __half2 off = __floats2half2_rn(1152.f, 1152.f);
   for (int t0 = 0; t0 < T; t0 += CT) {
     int ct = T - t0; if (ct > CT) ct = CT;
-    for (int i = tid; i < ct * nb * 16; i += NT) {
-      const int c = i / (nb * 16), rem = i % (nb * 16);
-      const int b = rem / 16, k = rem % 16;
-      int tt = t0 + c; if (tt >= T) tt = T - 1;
-      xh[((size_t)c * nb + (size_t)b) * 17 + (size_t)k] =
-        __floats2half2_rn(lfm_stage(xall[((size_t)tt) * K + koff + (size_t)b * 32 + 2 * k]),
-                           lfm_stage(xall[((size_t)tt) * K + koff + (size_t)b * 32 + 2 * k + 1]));
+    if (H2) {
+      for (int i = tid; i < ct * nb * 16; i += NT) {
+        const int c = i / (nb * 16), rem = i % (nb * 16);
+        const int b = rem / 16, k = rem % 16;
+        int tt = t0 + c; if (tt >= T) tt = T - 1;
+        xh[((size_t)c * nb + (size_t)b) * 17 + (size_t)k] =
+          __floats2half2_rn(lfm_stage(xall[((size_t)tt) * K + koff + (size_t)b * 32 + 2 * k]),
+                             lfm_stage(xall[((size_t)tt) * K + koff + (size_t)b * 32 + 2 * k + 1]));
+      }
+    } else {
+      for (int i = tid; i < ct * KCHUNK; i += NT) {
+        const int c = i / KCHUNK, rem = i % KCHUNK;
+        const int b = rem >> 5, j = rem & 31;
+        int tt = t0 + c; if (tt >= T) tt = T - 1;
+        xf[(((size_t)c * nb) + (size_t)b) * 33 + (size_t)j] =
+          lfm_stage(xall[((size_t)tt) * K + koff + (size_t)b * 32 + j]);
+      }
     }
     __syncthreads();
     for (int g = 0; g < GR; g++) {
@@ -1233,22 +1244,37 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
           const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
           const uint32_t w[8] = {(uint32_t)a0.x, (uint32_t)a0.y, (uint32_t)a0.z, (uint32_t)a0.w,
                                  (uint32_t)a1.x, (uint32_t)a1.y, (uint32_t)a1.z, (uint32_t)a1.w};
+if (H2) {
 #pragma unroll
-          for (int c = 0; c < CT; c++) {
-            const __half2* xb2 = xh + ((size_t)c * nb + (size_t)b) * 17;
-            __half2 h2 = __floats2half2_rn(0.f, 0.f);
+            for (int c = 0; c < CT; c++) {
+              const __half2* xb2 = xh + ((size_t)c * nb + (size_t)b) * 17;
+              __half2 h2 = __floats2half2_rn(0.f, 0.f);
 #pragma unroll
-            for (int k = 0; k < 8; k++) {
-              const uint32_t u = w[k] ^ 0x80808080u;
-              const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
-              const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
-              __half2 cl = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
-              __half2 ch = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
-              h2 = __hfma2(cl, xb2[2 * k], h2);
-              h2 = __hfma2(ch, xb2[2 * k + 1], h2);
+              for (int k = 0; k < 8; k++) {
+                const uint32_t u = w[k] ^ 0x80808080u;
+                const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+                __half2 cl = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+                __half2 ch = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+                h2 = __hfma2(cl, xb2[2 * k], h2);
+                h2 = __hfma2(ch, xb2[2 * k + 1], h2);
+              }
+              const float2 f = __half22float2(h2);
+              acc[c] = __fmaf_rn(sr[b], f.x + f.y, acc[c]);
             }
-            const float2 f = __half22float2(h2);
-            acc[c] = __fmaf_rn(sr[b], f.x + f.y, acc[c]);
+          } else {
+            const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
+            const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              const float* xb = xf + (((size_t)c * nb) + (size_t)b) * 33;
+              float dot = 0.f;
+#pragma unroll
+              for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c0[j], xb[j], dot);
+#pragma unroll
+              for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c1[j], xb[16 + j], dot);
+              acc[c] = __fmaf_rn(sr[b], dot, acc[c]);
+            }
           }
         }
       }
@@ -1298,46 +1324,68 @@ static int prefill_minimal(Model& M) {
 // Batched H2 selftest (#162 continued): 23 sequential H2 GEMVs (proven above)
 // vs one batched call. Bit-exactness expected by construction (same per-position
 // order); the question is only whether it runs and how fast.
-static int prefill_h2_one(Model& M, Ent* e, int T);
+static int prefill_h2_one(Model& M, Ent* e, int T, int h2);
 static int prefill_h2batched(Model& M) {
+  const char* want[4] = {"embed_tokens.weight", "feed_forward.w2.weight",
+                            "feed_forward.w1.weight", "conv.out_proj.weight"};
   int fails = 0, ntested = 0;
-  for (size_t i = 0; i < M.ents.size() && ntested < 4; i++) {
-    Ent* e = &M.ents[i];
-    if (!(e->dq && e->ds && e->ne[0] >= 1024 && e->ne[1] % 32 == 0)) continue;
-    fails += prefill_h2_one(M, e, 8);
-    ntested++;
-  }
+  for (int h2 = 0; h2 <= 1; h2++)
+    for (int w = 0; w < 4; w++)
+      for (size_t i = 0; i < M.ents.size(); i++) {
+        Ent* e = &M.ents[i];
+        if (!(e->dq && e->ds)) continue;
+        if (strstr(e->name.c_str(), want[w]) == nullptr) continue;
+        if (e->ne[0] < 1024 || e->ne[1] % 32 != 0) continue;
+        fails += prefill_h2_one(M, e, 8, h2);
+        ntested++;
+        break;
+      }
   printf("prefill-h2batched: %d shapes tested, %s\n", ntested, fails ? "FAILURES" : "ALL BIT-EXACT");
   fflush(stdout);
   return fails ? 1 : 0;
 }
-static int prefill_h2_one(Model& M, Ent* e, int T) {
+static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   (void)M;
   const int N = e->ne[0], K = e->ne[1], R = 256, TPB = 256, CT = 2;
-  const int KC = (K >= 2048 && K % 2048 == 0) ? 2048 : K, nb = KC / Q8_BLK, nch = K / KC;
+  int KC = K;
+  while (KC > 32) {
+    int nbtry = KC / Q8_BLK;
+    size_t need = h2 ? (size_t)CT * nbtry * 17 * sizeof(__half2) : (size_t)CT * nbtry * 33 * 4;
+    if (need <= 49152 && K % KC == 0) break;
+    KC /= 2;
+  }
+  const int nb = KC / Q8_BLK, nch = K / KC;
   const int nblk = ((N + R - 1) / R) * nch;
-  const size_t shm = (size_t)CT * nb * 17 * sizeof(__half2);
-  printf("prefill-h2batched %s N=%d K=%d T=%d shm=%zu\n", e->name.c_str(), N, K, T, shm); fflush(stdout);
+  const size_t shm = h2 ? (size_t)CT * nb * 17 * sizeof(__half2) : (size_t)CT * nb * 33 * 4;
+  printf("prefill-h2batched H2=%d %s N=%d K=%d T=%d shm=%zu\n", h2, e->name.c_str(), N, K, T, shm); fflush(stdout);
   uint16_t* xd = nullptr; float *seq = nullptr, *bat = nullptr;
   printf("a=%s\n", cudaGetErrorString(cudaMalloc(&xd, (size_t)T * K * 2))); fflush(stdout);
-  printf("b=%s\n", cudaGetErrorString(cudaMalloc(&seq, (size_t)T * N * 4))); fflush(stdout);
-  printf("c=%s\n", cudaGetErrorString(cudaMalloc(&bat, (size_t)T * N * 4))); fflush(stdout);
+  printf("b=%s\n", cudaGetErrorString(cudaMalloc(&seq, (size_t)T * N * nch * 4))); fflush(stdout);
+  printf("c=%s\n", cudaGetErrorString(cudaMalloc(&bat, (size_t)T * N * nch * 4))); fflush(stdout);
   std::vector<uint16_t> pat((size_t)T * K);
   for (size_t i = 0; i < pat.size(); i++) pat[i] = (uint16_t)(0x3c00 + ((i * 37) & 0x3ff));
   printf("h2d=%s\n", cudaGetErrorString(cudaMemcpy(xd, pat.data(), pat.size() * 2, cudaMemcpyHostToDevice))); fflush(stdout);
   cudaEvent_t ea, eb; cudaEventCreate(&ea); cudaEventCreate(&eb); float ms = 0;
   cudaEventRecord(ea);
-  for (int t = 0; t < T; t++)
-    q8_partial<bf16,true,false,1,1><<<nblk, TPB, (size_t)nb * 33 * 4>>>(e->dq, e->ds, (const bf16*)(xd + (size_t)t * K),
-      seq + (size_t)t * N, N, K, KC, R, nb);
+  for (int t = 0; t < T; t++) {
+    if (h2)
+      q8_partial<bf16,true,false,1,1><<<nblk, TPB, (size_t)nb * 33 * 4>>>(e->dq, e->ds, (const bf16*)(xd + (size_t)t * K),
+        seq + (size_t)t * N * nch, N, K, KC, R, nb);
+    else
+      q8_partial<bf16,true,false,1,0><<<nblk, TPB, (size_t)nb * 33 * 4>>>(e->dq, e->ds, (const bf16*)(xd + (size_t)t * K),
+        seq + (size_t)t * N * nch, N, K, KC, R, nb);
+  }
   cudaEventRecord(eb); cudaEventSynchronize(eb);
   cudaEventElapsedTime(&ms, ea, eb);
   printf("seq23 err=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
-  std::vector<float> a((size_t)T * N);
+  std::vector<float> a((size_t)T * N * nch);
   printf("cp-seq=%s\n", cudaGetErrorString(cudaMemcpy(a.data(), seq, a.size() * 4, cudaMemcpyDeviceToHost))); fflush(stdout);
   printf("seq[0]=%.9g (expect H2 ~-0.10976)\n", a[0]); fflush(stdout);
   cudaEventRecord(ea);
-  q8_prefill_h2<bf16,CT><<<nblk, TPB, shm>>>(e->dq, e->ds, (const bf16*)xd, bat, N, K, KC, R, nb, T);
+  if (h2)
+    q8_prefill_h2<bf16,CT,true><<<nblk, TPB, shm>>>(e->dq, e->ds, (const bf16*)xd, bat, N, K, KC, R, nb, T);
+  else
+    q8_prefill_h2<bf16,CT,false><<<nblk, TPB, shm>>>(e->dq, e->ds, (const bf16*)xd, bat, N, K, KC, R, nb, T);
   printf("bat-launch=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
   cudaEventRecord(eb); cudaEventSynchronize(eb);
   printf("bat-sync=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
@@ -1347,7 +1395,7 @@ static int prefill_h2_one(Model& M, Ent* e, int T) {
   printf("bat[0]=%.9g\n", b[0]); fflush(stdout);
   long bad = 0; for (size_t i = 0; i < a.size() && bad < 5; i++) if (memcmp(&a[i], &b[i], 4)) { bad++; if (bad == 1) printf("first diff at %zu: seq=%.9g bat=%.9g\n", i, a[i], b[i]); }
   long nbad = 0; for (size_t i = 0; i < a.size(); i++) nbad += memcmp(&a[i], &b[i], 4) != 0;
-  printf("prefill-h2batched %s: %s (%ld/%zu differ) seq %.2f ms bat %.2f ms\n", e->name.c_str(), nbad ? "MISMATCH" : "BIT-EXACT", nbad, a.size(), ms, ms2);
+  printf("prefill-h2batched H2=%d %s: %s (%ld/%zu differ) seq %.2f ms bat %.2f ms\n", h2, e->name.c_str(), nbad ? "MISMATCH" : "BIT-EXACT", nbad, a.size(), ms, ms2);
   fflush(stdout);
   return nbad ? 1 : 0;
 }
