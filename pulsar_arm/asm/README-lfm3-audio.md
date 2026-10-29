@@ -134,7 +134,11 @@ TTFT, prompt A (each step paired A/B in both orders where noted)
        ┃ LFM_WARMMS=N (default 0) extends that warm-up to N ms of wall-clock GPU
        ┃ load, absorbing the devfreq DVFS ramp (idle board runs 76.8-153.6 MHz
        ┃ for the first ~5-24 s, #210/#209): neutral in the normal state, recovers
-       ┃ ~1% from an 8-min idle start, and is the fix for +7% cold-board days
+       ┃ ~1% from an 8-min idle start, and is the fix for +7% cold-board days.
+       ┃ The GPU clock decays 921.6 -> 76.8 MHz within ~2-4 s of process exit
+       ┃ (#223), so ANY query gap >~5 s starts cold: for interactive/audio use
+       ┃ WARMMS=6000 is the per-startup recommendation; the -20 ms cold penalty
+       ┃ is front-loaded, hence -0.1% at 300-token prefills (#220)
 2271.1 ┃█-318.5 ms  feeding fix + lm_head skip on prompt steps 0..n-2
        ┃           (the loop fed every prompt step's prediction back as input;
        ┃           LFM_LEGACYFEED=1 is the control)
