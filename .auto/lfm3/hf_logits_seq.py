@@ -26,13 +26,15 @@ def main():
     ap.add_argument("--prompt", default="A", help="tag, or comma-separated tags")
     ap.add_argument("--n", type=int, default=23, help="positions to dump (0..n-1)")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16"])
     a = ap.parse_args()
 
     import numpy as np
     import torch
     from transformers import AutoModelForMultimodalLM
     model = AutoModelForMultimodalLM.from_pretrained(
-        REPO, dtype=torch.bfloat16, trust_remote_code=True).to("cuda").eval()
+        REPO, dtype=torch.float16 if a.dtype == "fp16" else torch.bfloat16,
+        trust_remote_code=True).to("cuda").eval()
     for tag in a.prompt.split(","):
         g = json.load(open(os.path.join(HERE, "golden_greedy_%s.json" % tag)))
         ids = list(g["prompt_ids"])
@@ -44,7 +46,7 @@ def main():
             lg.append(o.float().cpu().numpy())
         arr = np.stack(lg).astype(np.float32)
         out = a.out if (a.out and len(a.prompt.split(",")) == 1) else \
-            os.path.join(HERE, "hf_logits_%s_seq.npy" % tag)
+            os.path.join(HERE, "hf_logits_%s_seq%s.npy" % (tag, "_fp16" if a.dtype == "fp16" else ""))
         np.save(out, arr)
         print("wrote %s: %s (position p = logits after ids[:p+1], teacher forced)" % (out, arr.shape))
 
