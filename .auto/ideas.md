@@ -2164,3 +2164,21 @@ each 32-code block. The accumulation across blocks stays fp32.
   - Side effect for the log: the feeding fix's stream scores moved the floor -- with 7/7 exact on
     the H2=2 arm, the stream gate now discriminates between arms that differ only in the fourth
     decimal of KL. Keep floor=1 (it is the arm's certified floor); do not chase the gate upward.
+
+## Cert (bf16-embedding) arm re-scored with fixed feeding (run #143): declined harder
+
+`LFM3_BLOB=lfm3-audio-2b-cert.lfm3q8` through the full gate suite (fixed feeding, default FMA path):
+
+- Streams: **6/7 exact** (F 11/16), up from 2/1 -- the feeding fix repaired the cert arm exactly as
+  much as the Q8 arm. So the +18.6% latency (161.67 vs 136.30 ms/token decode-era; TTFT gap scales
+  the same way) buys ZERO stream advantage: both arms 6/7 with the same F miss.
+- Logit gate: 130/131 overall, but **prompt E drops to 21/23 top-1 (floor 22) -> CHECKS FAILED**.
+  The worst-KL position (0.0063 at pos 10) shows engine and HF agreeing on the SAME token (12008),
+  so the two misses are near-tie flips elsewhere; mean KL is unchanged (0.0017, same as Q8). The
+  bf16 embedding is not systematically better -- ties flip either way -- and the floor is the floor.
+- Verdict: the #116 decline stands, strengthened. The cert arm now costs +18.6% latency for
+  (a) identical streams, (b) a gate failure where Q8 passes. Do not revisit unless the embedding
+  changes (different quant, or the tied-embedding lm_head path specifically).
+- Side note: E 21/23 vs Q8's 23/23 is a 2-position tie-flip difference at KL 0.0017 in both arms.
+  It is evidence FOR the "top-1 counts are cliff-like, KL is the signal" position, not evidence
+  the cert arm is worse in any distributional sense.
