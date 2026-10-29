@@ -175,10 +175,11 @@ LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.00
                                                            luck; F drops to 19/21,
                                                            a floor the shipped passes)
 
-speed rows: same-session pairs 2026-02-10 (#180/#189). At AUDIO scale the raw arm widens:
-360-token prefill -8.0% (order-balanced, #203), replicated at 300 tokens -7.8% a separate
-sample day (#206); the 23-token ratio stays -5.7% on a hot board (#205), so the widening is
-context-length-dependent (per-step saving 5.5 -> 7.3-8.2 ms), mechanism open. Quality: formal
+speed rows: same-session pairs 2026-02-10 (#180/#189). The raw arm's win is REGIME-dependent
+(same-session pairs at each length): 23 pos -5.7% (#205), 300 pos -7.8% (#206), 360 pos -8.0%
+(order-balanced, #203), 1000 pos +0.2% (#225) -- HFMA2 pays while the GEMVs are the GPU-side
+bottleneck and vanishes in the DRAM-saturated long-attention regime. Audio sweet spot: the
+5-30 s prefill band (300-360 tokens); chat-class -5.7%; 80 s+ single-shot prefills neutral. Quality: formal
 suite gate-for-gate identical to shipped (#182 short, #199 full --long), tie-landscape argmax
 identical on both references (#195/#196), rms vs fp16 reference 0/24000 cells to 1000
 positions in both arms (#192/#201).
