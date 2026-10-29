@@ -2372,3 +2372,10 @@ Back-to-back 300-id runs (hot board throughout run 2): run1 first-10 = 97.94, ru
 start slow. It does not. The +5% growth over 300 positions here (+14% on the day of #150 --
 magnitude varies with board state) is attention/KV growth, not heat. Either way the GEMV
 phase dominates and no lever follows; this only prevents misattribution.
+
+## H2 raw re-verified post RoPE-fix + MAXTOK (run #161): -5.4%, both orders
+
+One paired A/B each order on the current tree: shipped 2265.88/2269.00 vs H2=1 2141.60/2148.13
+(R = 1.057/1.056, H2 faster 2/2). The -5.6% survives the intervening changes, as expected: the
+RoPE fix adds identical work to both arms and MAXTOK only enlarges an allocation. Same first
+token. This was the last un-re-measured number in the H2 decision table; it is now current.
