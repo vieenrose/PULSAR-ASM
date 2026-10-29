@@ -49,6 +49,20 @@ spinning permanently (thermal pressure plus the load average ~3.2); #118 showed 
 affect decode, but they are part of the thermal backdrop. Clocks were deliberately left
 unlocked so every number stays comparable with the session baseline.
 
+Two harness facts from #177: `jetson_clocks` is not installed on this board and governor
+writes need sudo, and sudo is `requiretty` -- so the `echo PW | sudo -S` pattern used by
+measure.sh/ab.sh for `drop_caches` has always silently no-opped (hidden by 2>/dev/null;
+true). The metric is unaffected -- the engine fadvise(DONTNEED)s the blob at load and the
+warm-up absorbs first-touch, so cache state is engine-managed run to run -- but do not
+claim "cold page cache" in anything citing these scripts, and clock-pinning is not
+available to quantify the drift with current permissions.
+
+Metric-definition caveat (#176): measure.sh's `decode_ms_per_tok` averages steps 2..47,
+which INCLUDES the 21 prompt steps. Since #139 skipped the lm_head on prompt steps, the
+same definition moved from ~112.8 to ~106.2 ms/token with no arithmetic change. Decode
+cross-era comparisons must use the step lines' decode-phase average (112.4-112.8 all
+session), not the mixed steady-state mean.
+
 ## Where the 112.8 ms goes
 
 `LFM_TIME=1` splits the step by layer type. Its timers carry their own sync overhead, so the
