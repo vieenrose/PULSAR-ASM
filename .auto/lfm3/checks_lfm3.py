@@ -260,13 +260,57 @@ def gate_streams(prompts, gen=16, floor=1):
     print("  streams: %d/%d prompts fully match (%d gen tokens each)" % (n_exact, len(prompts), gen))
 
 
+def gate_tie_fp16(prompts, floor_total=120):
+    """Top-1 agreement vs the fp16-precision HF reference (tie landscape).
+
+    ~4.5% of teacher-forced positions are argmax ties where the bf16 and fp16
+    references disagree with each other (#195). Both shipping arms score
+    127/134 vs fp16 and 133/134 vs bf16 (#195/#196): agreement here means the
+    arm makes the same argmax choices in the tie zone. Uses the fp16 dumps
+    (hf_logits_seq.py --dtype fp16, run once) and the lgall_*.bin dumps left
+    by gate_logits_seq in this same run.
+    """
+    import numpy as np
+    t16 = t16b = ntot = 0
+    for tag in prompts:
+        ref16 = os.path.join(HERE, "hf_logits_%s_seq_fp16.npy" % tag)
+        lp = "/tmp/lgall_%s.bin" % tag
+        if not (os.path.exists(ref16) and os.path.exists(lp)):
+            print("  tie-fp16[%s]: skipped (missing %s or lgall dump)" % (tag, ref16))
+            continue
+        hf16 = np.load(ref16); hfb = np.load(os.path.join(HERE, "hf_logits_%s_seq.npy" % tag))
+        ids = ids_of(tag)["prompt_ids"]
+        eng = np.fromfile(lp, dtype=np.float32).reshape(-1, hf16.shape[1])
+        n = min(eng.shape[0], hf16.shape[0], len(ids))
+        et = eng[:n].argmax(-1)
+        s16 = int((et == hf16[:n].argmax(-1)).sum()); sb = int((et == hfb[:n].argmax(-1)).sum())
+        t16 += s16; t16b += sb; ntot += n
+        print("  tie-fp16[%s]: %d/%d vs fp16, %d/%d vs bf16" % (tag, s16, n, sb, n))
+    if ntot == 0:
+        FAIL.append("tie-fp16: no prompt could be scored")
+    elif t16 < floor_total:
+        FAIL.append("tie-fp16: total top-1 vs fp16 reference %d/%d < floor %d "
+                    "(shipped arms: 127/134)" % (t16, ntot, floor_total))
+    else:
+        print("  tie-fp16: total %d/%d vs fp16 (%d/%d vs bf16) -- arms score 127/134" % (t16, ntot, t16b, ntot))
+
+
 if __name__ == "__main__":
-    prompts = (sys.argv[1:] or ["A", "B"])
+    argv = sys.argv[1:]
+    longmode = "--long" in argv
+    prompts = [a for a in argv if not a.startswith("--")] or ["A", "B"]
     print("== gate: %s / %s%s ==" % (BLOB, BIN, ("  engine env: " + GENV) if GENV else ""))
     gate_matrix()
     gate_logits0()
     gate_logits_seq()
     gate_streams(prompts)
+    if longmode:
+        import subprocess as sp
+        rc = sp.run([sys.executable, os.path.join(HERE, "matrix_long.py"),
+                     "--dtype", "fp16"], timeout=3600).returncode
+        if rc != 0:
+            FAIL.append("matrix_long fp16 gate failed (rc=%d)" % rc)
+        gate_tie_fp16(["A", "C", "E", "F", "K", "L"])
     if FAIL:
         print("\nCHECKS FAILED (%d):" % len(FAIL))
         for f in FAIL:
