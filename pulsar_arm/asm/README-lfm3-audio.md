@@ -47,9 +47,13 @@ of what the load-time warm-up pays for) and a reason the absolutes here would no
 on a clock-locked board. At run lengths >=60 s the state can shift ~15% between consecutive
 runs (#227: shipped 1000-token samples {105.1, 120.8} s), so ratios at that length need >=3
 samples per arm and best-of comparisons -- single pairs are not informative there.
-Three unreapable `lfm3_conv_test` zombies keep 3 of 4 A57 cores
-spinning permanently (thermal pressure plus the load average ~3.2); #118 showed they do not
-affect decode, but they are part of the thermal backdrop. Clocks were deliberately left
+Three orphaned `lfm3_conv_test` processes (STAT=R, NOT zombies -- the #118 reading was
+wrong, corrected by #230) kept 3 of 4 A57 cores spinning for days: neutral at steady state,
+but under sustained load they drive the +15..47% degraded board states (nvhost_podgov is
+power-aware). KILL THEM before measuring: `for p in $(pgrep -x lfm3_conv_test); do kill -9 $p;
+done` (do NOT use pkill -f -- it matches the ssh command line and kills your own session);
+after the kill the band returns within two runs (#230). Check `pgrep -x lfm3_conv_test | wc -l`
+== 0 as the pre-measurement gate. Clocks were deliberately left
 unlocked so every number stays comparable with the session baseline.
 
 Two harness facts from #177: `jetson_clocks` is not installed on this board and governor
