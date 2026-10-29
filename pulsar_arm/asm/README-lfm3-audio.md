@@ -46,8 +46,8 @@ The blob carries the backbone and nothing else: the exporter filters on the `lfm
 the audio-side prefixes above are simply not in it. A ported component is therefore *always*
 visible as (a) new tensors in the blob, (b) a `T(M, "<hf name>")` lookup in the engine, and
 (c) a gate that scores it. Nothing is silently half-loaded — the loader prints its census
-(``layer types: 11 attention, 13 conv``, arena accounting) and fails loudly with
-``MISSING TENSOR <name>`` on any lookup that does not resolve.
+(its startup census, e.g. `layer types: 11 attention, 13 conv`, plus arena accounting) and
+fails loudly with `MISSING TENSOR <name>` on any lookup that does not resolve.
 
 ## 2. The port contract: checkpoint → blob → engine
 
