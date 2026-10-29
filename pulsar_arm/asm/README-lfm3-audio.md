@@ -158,14 +158,20 @@ all gates green; the call is the user's since every option below breaks bit-exac
 
 ```
 arm                              TTFT      decode    streams  KL A/C/K          range review
-shipped (fp32 path)              2270.6    112.8     6/7      0.0013/0.0005/0.0006  n/a
-LFM_H2=1 (raw half2 + HFMA2)     2141.8    107.0     6/7      0.0016/0.0006/0.0005  28% of one layer's
- -5.6% / -5.2%, 4/4 paired                                          inputs in fp16's low-        precision range;             theoretical accumulator        overflow on ffn.w2
+shipped (fp32 path)              2257.7    112.6     6/7      0.0013/0.0005/0.0006  n/a
+LFM_H2=1 (raw half2 + HFMA2)     2132.3    106.6     6/7      0.0016/0.0006/0.0005  28% of one layer's
+ -5.6% TTFT / -5.3% decode                                        inputs in fp16's low-        precision range;             theoretical accumulator        overflow on ffn.w2
 LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.0005  safe by construction
  rescale; the scan costs what                              (post-RoPE re-score,     (bound 65024, no
  the faster loop saves)                                    #159: the 7/7 was tie     subnormals)
                                                            luck; F drops to 19/21,
                                                            a floor the shipped passes)
+
+speed rows: same-session pairs 2026-02-10 (#180/#189). At AUDIO scale the raw arm widens:
+360-token prefill 36.8 s vs 39.7 s, -8.0%, order-balanced two pairs (#203). Quality: formal
+suite gate-for-gate identical to shipped (#182 short, #199 full --long), tie-landscape argmax
+identical on both references (#195/#196), rms vs fp16 reference 0/24000 cells to 1000
+positions in both arms (#192/#201).
 ```
 
 The formal gate suite itself passes on the raw arm (#182, current tree): matrix, logits0, streams,
