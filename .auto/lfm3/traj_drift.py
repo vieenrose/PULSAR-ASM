@@ -124,9 +124,17 @@ def main():
             seq = fed
         else:
             toks, eng = engine_traj(tag, a.steps)
-            # toks[0:len(gids)] were sampled while the prompt was consumed and
-            # are not context; the generated tail starts at len(gids).
-            seq = gids + toks[len(gids):]
+            # Step lines print the SAMPLED token (argmax of that step's logits),
+            # not the fed token: toks[t] is the prediction AFTER state
+            # seq[:t+1]. The engine consumes prompt ids for t < len(gids) and
+            # its own earlier predictions toks[t-len(gids)] after that, so the
+            # actually-consumed sequence -- the only valid seq -- is the prompt
+            # followed by ALL sampled tokens from index 0. Slicing toks at
+            # len(gids) (the first version of this gate) skips the first
+            # len(gids) predictions and scores HF on states the engine never
+            # stood in; the early window still reproduced the teacher-forced
+            # gate because both slicings agree for t < len(gids).
+            seq = gids + toks[:a.steps]
         if eng is None:
             fails.append("traj[%s]: engine produced no usable logit dump" % tag)
             print("  traj[%s]: NO DUMP" % tag)

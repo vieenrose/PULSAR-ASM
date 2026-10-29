@@ -2015,3 +2015,29 @@ free 137.50/137.67/137.73/137.64 (median 137.66), pinned 137.60/137.56/137.66/13
 critical path (same mechanism as CUDA graphs -0.55%, #99). My earlier "absolutes are
 inflated, re-sweep after a reboot" caveat was an untested assumption and is withdrawn; the
 README is corrected. The stuck processes remain worth clearing for hygiene, not for latency.
+
+## The step lines print SAMPLED tokens, not fed tokens (run #133): #113's free-running number is retracted
+
+Re-reading the step loop while scoping the lm_head skip: `printf(s, nt, ms)` prints nt,
+the argmax JUST sampled -- not the fed token. Three consequences:
+
+1. The `LFM_SKIP` idea (skip lm_head on prompt steps, ~13% TTFT) is INVALID and was not
+   built: every step's argmax is pushed and steps >= n consume the pushed tokens starting
+   with nt_0, so every step's logits are load-bearing. (Whether that shifted continuation
+   is the *right* decoding is a separate harness question; the gates certify it as-is.)
+2. traj_drift's free-running alignment was wrong for t >= n: it built
+   seq = prompt + parsed[n:] (skipping the first n predictions) while the engine actually
+   consumed prompt + parsed[0:]. HF was scored on states the engine never stood in, so the
+   +0.147 nats/token growth and 151/288 top-1 were misalignment artifacts, not engine
+   drift. Corrected (seq = prompt + parsed[:steps]): 6-prompt free-running KL is
+   0.0023-0.0072 mean, top-1 45-48/48 per prompt (282/288 total), slopes ~1e-4/tok, TRAJ
+   DRIFT OK. The engine stays in-distribution on its own trajectory; 0/7 stream matches is
+   pure argmax/tie amplification. The on-manifold control (KL 0.0012, teacher-forced,
+   always aligned) and divergence_floor (teacher-forced, always aligned) are unaffected.
+3. The gate comment claiming "the token column is the token FED at that step" was wrong and
+   is fixed; the stream gate's slicing (parsed[n-1:] starts with the first TRUE token,
+   prediction after the full prompt) was already correct, which is why the gates never
+   caught this.
+4. TTFT baseline corrected: the first TRUE output token completes at step n-1, so prompt-A
+   TTFT is sum(steps 0..22) = 2642.89 ms, not 2755.41 (which included the step-23 decode
+   of the shifted continuation). -112ms of definition, not performance.

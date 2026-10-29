@@ -224,12 +224,14 @@ def gate_streams(prompts, gen=16, floor=1):
                          % (DIR, ENVQ, BIN, BLOB, len(g["prompt_ids"]) + gen - 1,
                             ",".join(map(str, g["prompt_ids"]))))
         # Step lines are "  <step>  <token>  <ms>  <tok/s>", and the token
-        # column is the token FED at that step. The harness feeds
-        # prompt[0..n-2] as teacher-forcing steps (prompt[n-1] is consumed by
-        # the initial forward), so the GENERATED stream starts at index n-1.
-        # Slicing at n drops gen[0] (207 = "\n" on prompt A) and makes every
-        # prompt score a 0-token prefix; slicing at 0 decodes the prompt and
-        # shows a stray <|startoftext|> mid-string. Both were hit here.
+        # column is the SAMPLED token (argmax of that step's logits), not the
+        # fed token: step s prints the prediction AFTER state toks[0..s]. The
+        # harness consumes prompt ids for s < n and its own earlier predictions
+        # after that, so the generated stream starts at parsed index n-1 with
+        # the first TRUE token (prediction after the full prompt). Slicing at
+        # n drops gen[0] (207 = "\n" on prompt A) and makes every prompt score
+        # a 0-token prefix; slicing at 0 decodes the prompt and shows a stray
+        # <|startoftext|> mid-string. Both were hit here.
         toks = [int(m.group(2)) for m in
                 (re.match(r"\s*(\d+)\s+(\d+)\s+[\d.]+\s+[\d.]+$", l) for l in out.splitlines())
                 if m]
