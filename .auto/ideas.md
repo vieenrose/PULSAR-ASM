@@ -2207,3 +2207,21 @@ board drift between sessions, not the norm: lesson re-learned -- never compare a
 Reverted: the tree keeps measured wins only, and ~1 ms expected savings (22 launches + 22 x 16 KB
 passes) is below what this board resolves. The 10-line patch is trivial to resurrect if a future
 pass ever needs the launch count down.
+
+## H2=2 divergence floor completes its quality record (run #147): best-or-tied everywhere
+
+`LFM_H2=2` (exact per-block 2^k rescale) on identical fp32 trajectories, bf16 floor as control:
+
+| prompt | bf16 floor | shipped | H2 raw (#141) | H2 rescaled (#147) |
+|---|---|---|---|---|
+| A | 0.0005 | 0.0013 | 0.0016 | **0.0012** |
+| C | 0.0001 | 0.0005 | 0.0006 | 0.0007 |
+| K | 0.0002 | 0.0006 | 0.0005 | **0.0005** |
+
+Top-1 47/48 in every arm on every prompt; slopes ~1e-5 (nothing grows). The rescaled arm is
+best-or-tied on all three prompts, and it is also the arm with 7/7 exact streams. Combined with
+#142 (gates pass, E top-1 recovered) and the range analysis (no overflow possible by
+construction, no subnormals by construction), H2=2 has the most complete quality record of any
+arm -- at ~0% latency change. The -5.6% raw H2 keeps the speed record with a slightly worse A
+(0.0016) and unmitigated range exposure. Both stay behind the flag; the documented trade for the
+user is now: exactness (shipped) vs speed (raw H2) vs evidence-of-fidelity (rescaled H2).
