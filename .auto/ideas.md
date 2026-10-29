@@ -2225,3 +2225,23 @@ construction, no subnormals by construction), H2=2 has the most complete quality
 arm -- at ~0% latency change. The -5.6% raw H2 keeps the speed record with a slightly worse A
 (0.0016) and unmitigated range exposure. Both stay behind the flag; the documented trade for the
 user is now: exactness (shipped) vs speed (raw H2) vs evidence-of-fidelity (rescaled H2).
+
+## MAXTOK=64 silently truncates any audio-length prompt (run #149): the engine cannot serve audio inputs as configured
+
+A 100-token synthetic prompt (prompt A ids cycled) with --steps 110 prints steps 0..63 and
+stops: `if (pos >= MAXTOK) break` with MAXTOK=64. The remaining 36 prompt tokens are never
+consumed, zero generation happens, and nothing warns -- the run just prints steady-state over
+62 steps. Per-step cost is flat at ~98 ms out to the cap (prompt steps without lm_head).
+
+Implications for e2e: TTFT for a real audio prompt (hundreds to thousands of tokens) is not
+"170 s", it is UNSUPPORTED. The comment above the define says it was sized to the benchmark,
+and raising it is priced as follows: KV cache is 2 x 24 layers x MAXTOK x 4 kv-heads x 128 dim
+x 2 bytes = 3 MB at 64, 192 MB at 4096. Device free after load is 1.31 GB, so 64 -> 4096 costs
+~192 MB and fits with ~1.1 GB to spare. (The in-code comment's "1.0 GB at 4096" is stale; the
+arithmetic gives 192 MB.) The sliding window is 256, so full-attention layers are what need
+the depth; the 25 MB figure in the comment is for 256.
+
+Next: raise MAXTOK to 4096 (matching the plan's 4k context), re-run the full gate suite (the
+binary changes, so gates must re-verify even though the cache size cannot change numerics),
+confirm the 100-id prompt runs past 64, and check steady-state at long positions for the
+attention O(t) growth the linear model predicts (~3-5% per step at t=1500).
