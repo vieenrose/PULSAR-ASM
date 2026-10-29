@@ -169,10 +169,12 @@ LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.00
 ```
 
 The formal gate suite itself passes on the raw arm (#182, current tree): matrix, logits0, streams,
-and the same 130/131 logit top-1 the shipped arm gets. The one formal long-context gate
-(matrix_long, 7200 layer x position rms cells at 300 positions) shows 5/7200 over 3% vs the
-shipped arm's 1/7200 -- all engine-low by at most 3.2%, at positions 209/232/278 in layers
-10-13 (#184). The rescaled arm, by contrast, formally FAILS the logit gate (127/131, F 19/21,
+and the same 130/131 logit top-1 the shipped arm gets. The formal long-context gate
+(matrix_long, layer x position rms cells) shows 5/7200 over 3% at 300 positions vs the shipped
+arm's 1/7200 -- all engine-low by at most 3.2% (#184) -- but against an fp16 HF reference both
+arms are 0 cells, at 300 AND at 1000 positions (#192): those cells are bf16 reference
+quantization at the largest residuals, not engine arithmetic. The engine tracks fp16 truth
+within 3% across the full 1000-position ladder, in both arms. The rescaled arm, by contrast, formally FAILS the logit gate (127/131, F 19/21,
 one top-1 short on four prompts, #186) at ~0% speed: it is dominated on every axis. Top-1 agreement is 47/48 in every arm on
 every divergence prompt; nothing grows. At audio-length
 context the raw arm is also clean (#171): on a 300-id prompt scored on HF fp16's own states, the
