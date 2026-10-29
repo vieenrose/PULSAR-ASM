@@ -160,6 +160,43 @@ __global__ void k_bf2f(const bf16* __restrict__ in, float* __restrict__ out, int
 __device__ __forceinline__ float lfm_stage(float v) { return v; }
 __device__ __forceinline__ float lfm_stage(bf16 v) { return bf2f(v); }
 
+// One row per lane: lane `l` of warp `w` owns row blockIdx.x*blockDim.x + tid
+// and walks its K codes serially, dotting against x staged in shared. Returns
+// one partial per row (nchunk = 1), so the caller uses k_combine_* with
+// nchunk == 1. `launched` is set so the caller can prove this kernel ran and
+// fall back if the 24 KB shared request is refused.
+template <typename TX>
+__global__ void q8_rowlane(const int8_t* __restrict__ q, const float* __restrict__ s,
+                           const TX* __restrict__ x, float* __restrict__ part,
+                           int N, int K) {
+  extern __shared__ float xs[];
+  const int tid = threadIdx.x;
+  for (int i = tid; i < K; i += blockDim.x) xs[i] = lfm_stage(x[i]);
+  __syncthreads();
+  const int row = blockIdx.x * blockDim.x + tid;
+  if (row >= N) return;
+  const int8_t* qr = q + (size_t)row * K;
+  const float* sr = s + (size_t)row * (K / Q8_BLK);
+  float acc = 0.f;
+  #pragma unroll 1
+  for (int b = 0; b < K / Q8_BLK; b++) {
+    const int8_t* qb = qr + (size_t)b * Q8_BLK;
+    const float* xb = xs + (size_t)b * Q8_BLK;
+    const int4 a0 = *reinterpret_cast<const int4*>(qb);
+    const int4 a1 = *reinterpret_cast<const int4*>(qb + 16);
+    const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
+    const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+    float dot = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c0[j], xb[j], dot);
+    #pragma unroll
+    for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c1[j], xb[16 + j], dot);
+    acc = __fmaf_rn(sr[b], dot, acc);
+  }
+  part[row] = acc;
+}
+
+
 // Q8_0 pass 1: R rows x one chunk, one WARP per row, lanes striding the
 // chunk's blocks, x staged in shared. This is the kernel whose 14-16.5 GB/s
 // rate underlies the 127.7 ms/token budget (q8_lc3.cu, commit 2b5cbe5).
@@ -496,6 +533,29 @@ struct Ent {
 // split is guessing. Events + one sync per phase, so the instrumentation
 // itself costs ~0.25 ms/token -- a diagnostic, not a shipping mode.
 static const bool g_time = getenv("LFM_TIME") != nullptr;
+// LFM_ROWLANE=1: a one-row-per-lane GEMV for the long-K shapes.
+//
+// Why: the per-kernel table gives a clean correlation between achieved
+// bandwidth and ROW LENGTH, at fixed bytes. conv.in_proj 13.3 GB/s, ffn.w1
+// 10.9, ffn.w3 10.9, conv.out_proj 10.3 -- all K=2048 -- while ffn.w2
+// (N=2048, K=6144) gets 7.1 GB/s for the same 12.6 MB. Block fill (R),
+// inter-row ILP (unroll), chunk interleaving (KCHUNK) and cache hints
+// (__ldcs) are all measured out for it. At R=256 a block of that shape
+// addresses 256 rows x 6 KB = 1.5 MB; the K=2048 shapes address 0.5 MB. That
+// is a DRAM page-thrashing signature: each warp instruction advances 32 rows
+// by 32 bytes, so a block keeps R row-streams open at a K-byte stride.
+//
+// The fix is the classic wide-K GEMV shape: give each LANE a whole row and
+// walk it serially. Then a warp holds 32 fully contiguous 6 KB streams, there
+// is no cross-lane reduction and no shuffle, and x is staged once per block in
+// shared (K floats = 24 KB at K=6144, which fits the Nano's 64 KB/SM).
+//
+// NOT bit-identical: each lane sums its own row, so the reduction order
+// differs from the 32-lane-strided + warp-tree + combine form. The HF-derived
+// gates (rms matrix, pos-0 logits, greedy stream floors) are the authority, as
+// they were for the FMA switch.
+static const bool g_rowlane = getenv("LFM_ROWLANE") != nullptr;
+static int g_rowlane_printed = 0;
 // LFM_UNROLL2=1: let the GEMV's row loop overlap two rows per warp. The loop
 // is #pragma unroll 1, so a warp walks its GR rows strictly serially and
 // exposes each row's load latency in full. That is the shape of ffn.w2
@@ -1005,6 +1065,15 @@ static GemvCfg pick(int N, int K) {
 static void q8_launch_bf(int nblk, int TPB, size_t shm, const int8_t* q, const float* sc,
                          const bf16* x, float* part, int N, int K, int KC, int R, int nb,
                          cudaStream_t st) {
+  if (g_rowlane && nb * Q8_BLK == K && KC == K) {          // single-chunk shapes only
+    const int nblk2 = (N + 255) / 256;
+    const size_t shm2 = (size_t)K * 4;
+    q8_rowlane<bf16><<<nblk2, 256, shm2, st>>>(q, sc, x, part, N, K);
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) { if (g_rowlane_printed++ == 0) printf("Q8_ROWLANE=on (256 threads, %zu KB shared, one row per lane)\n", shm2 >> 10); return; }
+    static int warned = 0;
+    if (!warned++) printf("Q8_ROWLANE launch refused (%s) -- using q8_partial\n", cudaGetErrorString(e));
+  }
   const int U = g_unroll2 ? 2 : 1;
   if (g_fma && U == 2)        q8_partial<bf16,true ,false,2><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
   else if (g_fma)             q8_partial<bf16,true ,false,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);

@@ -20,5 +20,28 @@
   124900
  ],
  "text": "A compiler translates high-level programming code into machine code that a computer can execute.<|im_end|>",
- "n": 17
+ "n": 17,
+ "prompt_ids": [
+  124894,
+  124899,
+  5922,
+  207,
+  59,
+  2673,
+  63515,
+  296,
+  734,
+  12683,
+  1119,
+  267,
+  44775,
+  1676,
+  22,
+  124900,
+  207,
+  124899,
+  63514,
+  207,
+  125013
+ ]
 }

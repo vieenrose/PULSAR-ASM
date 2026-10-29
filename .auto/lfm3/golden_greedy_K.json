@@ -27,5 +27,33 @@
   3949
  ],
  "text": "The capital of Australia is Canberra. It is not the largest city because Sydney and Melbourne are both larger cities in terms",
- "n": 24
+ "n": 24,
+ "prompt_ids": [
+  124894,
+  124899,
+  5922,
+  207,
+  2992,
+  355,
+  278,
+  5205,
+  302,
+  5881,
+  20,
+  309,
+  3420,
+  355,
+  435,
+  513,
+  278,
+  6083,
+  3270,
+  39,
+  124900,
+  207,
+  124899,
+  63514,
+  207,
+  125013
+ ]
 }
