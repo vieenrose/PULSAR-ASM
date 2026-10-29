@@ -41,10 +41,15 @@ Quality (all closed, gates green on fresh builds, #166):
 ## Open (user decisions, all evidenced in the README table)
 
 1. **Raw H2** (`LFM_H2=1`): TTFT -5.6% (4 days reproduced, latest #180),
-   decode -5.2%; quality at-or-better than shipped short (#141/#147 re-
-   scored #159) AND long-context (#171/#174: KL 0.0004-0.0005, top-1 ~20/20
-   at 300+ states); free-run divergence is the generic tie property (#173).
-   Not bit-exact: needs the user's sign-off to flip the default.
+   decode -5.3% same-session today (#189); FORMAL gates all green at shipped
+   parity: checks suite 130/131 (#182), 7-prompt streams 6/7 with the same
+   L tie case (#188), matrix_long 5/7200 vs 1/7200 -- and BOTH arms 0 cells
+   vs an fp16 reference to 1000 positions (#184/#192); tie-landscape argmax
+   identical to shipped on both references, 133/134 bf16 / 127/134 fp16
+   (#195/#196). H2=2 (rescaled) is formally DOMINATED (127/131 logit gate,
+   ~0% speed, #186). Not bit-exact: needs the user's sign-off to flip.
+   Reference-precision note: ~4.5% of teacher-forced positions are argmax
+   ties where bf16/fp16 references disagree (#195) -- gate "misses" live there.
 2. **w2 x-layout change** (unlocks batched prefill; changes goldens).
 3. Audio path port (encoder + depth decoder) — scoped in #153/#157, outside
    this metric.
