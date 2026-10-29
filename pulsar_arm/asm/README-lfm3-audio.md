@@ -155,33 +155,57 @@ bash .auto/lfm3/checks.sh A B C E F K L
 |---|---|
 | per-layer × per-position rms vs HF, 23 layers × 23 positions | all within 3% |
 | pos-0 logits | top-1 = HF's (11), corr 0.99998, std 4.564 vs 4.547 |
-| **all 23 positions × 128,000 logits** | **top-1 = HF's 23/23**, top-8 coverage 1.000 both ways, corr 0.99964 (min 0.99900), KL 0.0014 (max 0.0084) |
+| **131 positions × 128,000 logits, 6 prompts** | **top-1 = HF's on 130/131**, top-8 coverage 1.000 everywhere, corr 0.99946–0.99973, KL 0.0007–0.0019 |
 | greedy stream prefix vs HF goldens, 7 prompts | every prompt ≥ floor (A=2, B/C/E/F/K/L=1) |
+
+```
+prompt    top-1    top-8 cov    corr (min)          KL mean   KL max
+A         23/23      1.000     0.99964 (0.99900)    0.0014    0.0084
+C         21/21      1.000     0.99946 (0.99770)    0.0015    0.0161
+E         23/23      1.000     0.99968 (0.99897)    0.0017    0.0121
+F         20/21      1.000     0.99963 (0.99884)    0.0015    0.0079
+K         23/23      1.000     0.99973 (0.99932)    0.0007    0.0029
+L         23/23      1.000     0.99966 (0.99921)    0.0019    0.0126
+```
 
 **Read this honestly.** Prefixes are 1–2 tokens of 16 and **0/7 prompts fully match**: the
 engine diverges from HF within a couple of tokens on every prompt. `CHECKS OK` certifies the
 arm's floor (1 token, the plan's certified worst prefix for this arm), not stream equality.
 
-The 23-position logit gate is what makes that disclosure mean what it should: over the whole
-distribution the engine's top-1 equals HF's at **every** position, HF's top-1 is always inside
-the engine's top-8 (and the converse), and mean KL is 1.4e-3. So the greedy divergence is
+The logit gate is what makes that disclosure mean what it should: over the full distribution
+the engine's top-1 equals HF's at 130 of 131 positions, HF's top-1 is always inside the
+engine's top-8 (and the converse), and mean KL is under 2e-3. So the greedy divergence is
 argmax/tie amplification on a distribution that agrees closely — not a distributional gap.
-This gate is also the reason to distrust the stream gate as a quality instrument: the
-`__fmaf_rn` switch that bought −2.0% left all 16 stream tokens on both prompts unchanged,
-so stream equality could not have detected a regression there. Running it on the FMA decision
-directly (prompt A, all 23 positions):
+The one miss is prompt F at a single position, where HF's top-1 is still in the engine's top-8:
+a near-tie, which is what the "one lost position warns, two fails" floor exists to surface.
+Prompt A alone would never have shown it.
+
+**The logit gate is also the reason to distrust the stream gate as an instrument.** The
+`__fmaf_rn` switch that bought −2.0% left all 16 stream tokens on both prompts unchanged, so
+stream equality could not have detected a regression there. Running every kept change through
+the 6-prompt gate, against the same HF reference, with no threshold moved:
 
 ```
-                                        top-1   top-8 cov   corr      KL mean   KL max
-__fmaf_rn accumulation   (shipped)       23/23     1.000     0.99964   0.0014    0.0084
-exact mul-then-add       (LFM_NOFMA=1)   23/23     1.000     0.99961   0.0015    0.0114
+arm                                top-1 (of 131)   corr range       KL mean range   verdict
+shipped (__fmaf_rn, fused staging)      130         .99946-.99973    .0014-.0019     reference
+LFM_NOFMA=1 (exact mul-then-add)        130         .99942-.99970    .0015-.0019     indistinguishable
+LFM_NOFUSE=1 (separate k_bf2f)          130         .99946-.99973    .0014-.0019     bit-identical
+LFM_R=64 (row->block remap)             130         .99946-.99973    .0014-.0019     bit-identical
 ```
 
-So the −2.0% cost nothing in quality; if anything the FMA form agrees with HF *better*, which
-is what expecting ggml's reference `sum += w*x` (compiled to an FMA) predicts. Thresholds in
-`gate_logits_seq` are a **regression ratchet** measured on the shipped arm — passing means "no
-worse than the arm this gate was written on", and every number is printed each run so drift is
-visible even on a pass.
+Two things follow. The fused-staging and R knobs are **bit-identical**, so their lines above
+are also a positive control: a bit-exact arm must print identical numbers, and it does — that
+is the determinism check for the gate itself. And the FMA switch is **quality-neutral**:
+FMA wins corr on 4 prompts (A, C, F, K) and loses on 2 (E, L) by ~2e-5, while the spread
+*between prompts* (KL 0.0007–0.0019) is about 10× the spread *between arms*. An early
+two-prompt read said FMA "agrees with HF better"; that was prompt-A-specific and did not
+survive the other five, so it is not claimed here. What is claimed is the safe half: the
+−2.0% cost nothing measurable.
+
+Thresholds in `gate_logits_seq` are a **regression ratchet** measured on the shipped arm —
+passing means "no worse than the arm this gate was written on", and every number is printed
+each run so drift is visible even on a pass. The measured KL sits 25×+ below the 0.05 floor,
+so the ratchet has room and is not fitted to these prompts.
 
 **Env forwarding gotcha (cost an hour, now fixed):** engine knobs reach the Nano through
 `LFM3_ENV`, not by setting them in the shell — `LFM_NOFMA=1 bash checks.sh A` sets the
@@ -211,7 +235,8 @@ prefix is cliff-like — stream equality is a weak discriminator for accumulatio
 ```bash
 bash .auto/lfm3/measure.sh                      # sync -> build -> fixed job -> METRIC lines
 bash .auto/lfm3/checks.sh A B C E F K L         # the gates
-LFM3_ENV="LFM_NOFMA=1" bash .auto/lfm3/checks.sh A   # same gates, other engine arm (see gotcha below)
+~/venvs/lfm3/bin/python .auto/lfm3/hf_logits_seq.py --prompt A,C,E,F,K,L   # regen logit refs
+LFM3_ENV="LFM_NOFMA=1" bash .auto/lfm3/checks.sh   # same gates, other engine arm (see gotcha)
 bash .auto/lfm3/ab.sh "" "LFM_NOFMA=1"          # paired A/B of an env knob, both orders
 LFM_TIME=1  ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --steps 24 --prompt …   # per-phase
 LFM_KTIME=1 ./lfm3_nanode …                     # per-kernel table at exit
