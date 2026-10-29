@@ -2273,3 +2273,19 @@ Measured against the HF repo (host, for scoping -- numbers do not transfer to th
 - Consequence: in-engine TTFT work (prefill batching, H2) applies to ~360-token audio prefills
   where it matters ~15x more than on the 23-token benchmark; but complete audio e2e needs the
   encoder + depth decoder ported first, which is a separate project, not an iteration of this one.
+
+## Audio-length TTFT, measured on the engine (run #154): 36.0 s for 360 tokens
+
+360-id synthetic prompt (prompt A cycled, all ids valid), --steps 380: all steps run, TTFT_360
+(sum steps 0..359) = 36027.5 ms = 100.08 ms/step. Per-step cost 97.9 ms (positions 0-9) ->
+103.3 ms (positions 350-359): +5.5%, still GEMV-dominated, linear model holds to 360.
+
+- No cliff at the 256 sliding-window boundary and no failure anywhere to 380 steps; MAXTOK=4096
+  path is sound.
+- The garbage cyclic prompt makes the model emit EOS (125014) repeatedly from the first
+  generated token -- clean termination, no runaway, no hang. (Quality gates do not apply; this
+  is a timing/scaling probe, not a benchmark.)
+- E2e meaning: 30 s of audio (~360 tokens at 12 tok/s) costs ~36 s of prefill on this engine
+  before the first real output token, plus answer decode, plus the unported encoder (109.5M)
+  and depth decoder (83.9M + codec). Prefill batching's prize at audio scale is tens of
+  seconds, not the 0.13 s visible on the 23-token benchmark.
