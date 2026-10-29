@@ -412,7 +412,9 @@ nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca lf
 Knobs (all default to the shipping configuration): `LFM_NOFMA`, `LFM_NOFUSE`, `LFM_EMB`,
 `LFM_R`, `LFM_TPB`, `LFM_KCHUNK`, `LFM_TIME`, `LFM_KTIME`, and the measured-out probes
 `LFM_MERGE`, `LFM_LMDBUF`, `LFM_GRAPHS`, `LFM_STREAM`, `LFM_RADAPT`, `LFM_UNROLL2`,
-`LFM_ROWLANE`.
+`LFM_ROWLANE` (the last two measured +3.8% and +189% on the co-tenant decode channel,
+runs #274/#275: the GEMV is ~90% DRAM-bound, so ILP widening cannot help and layouts that
+break coalescing destroy it -- do not revisit either).
 
 Two harness traps cost real time and are now defended against: `test -x $BIN` is **not** a
 build check (nvcc leaves the previous binary on failure, so three broken builds silently
