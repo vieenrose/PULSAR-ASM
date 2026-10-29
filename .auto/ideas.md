@@ -2041,3 +2041,24 @@ the argmax JUST sampled -- not the fed token. Three consequences:
 4. TTFT baseline corrected: the first TRUE output token completes at step n-1, so prompt-A
    TTFT is sum(steps 0..22) = 2642.89 ms, not 2755.41 (which included the step-23 decode
    of the shifted continuation). -112ms of definition, not performance.
+
+## Batched prefill GEMV, first bring-up (run #135): bit-exact, but 2x SLOWER than sequential
+
+The `q8_prefill<bf16,CT=4>` kernel reuses each Q8 weight block across a tile of 4 prompt positions,
+keeping the reduction order identical to `q8_partial`. `--prefill-selftest` compares it on the
+embedding tensor (N=128000, K=2048, T=23) against 23 sequential `q8_partial` launches:
+**BIT-EXACT (0/2,944,000 partials differ)**, T=1 also bit-exact, but it takes 775 ms against
+400 ms sequential (ratio 0.52). The code is not kept, but the design lessons are:
+
+1. Per-lane partials must be **registers**. A shared `acc[r][c]` array is a race, because all 32
+   lanes of a warp reduce the same row, so they read-modify-write the same slot. It was
+   deterministic and plausible-looking (-0.965 vs -0.110). Bisect kernels found it: a verbatim
+   copy of `q8_partial` (v2) and the staging rewrite (v3a) were exact; adding only a shared
+   accumulator (v3c) broke it.
+2. **x must be staged in shared memory.** Reading x from global was exact but 8x slower
+   (3498 ms), because the serial FMA chain waits ~400 cycles on each x load.
+3. Staged at CT=4, shared memory is 33.8 KB per block, so only **one block fits per SM** (vs 6 for
+   `q8_partial`). It is then latency-bound, and that is the 2x loss. Weight reuse only pays off
+   once occupancy is restored. Next design: CT=2 (16.9 KB, 2 blocks/SM) or unpadded bf16 x staging
+   (halves shared memory), then a TTFT A/B through the full layer loop. The prize is still about
+   17x (#134), so this remains the e2e lever.
