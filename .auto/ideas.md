@@ -2182,3 +2182,16 @@ each 32-code block. The accumulation across blocks stays fp32.
 - Side note: E 21/23 vs Q8's 23/23 is a 2-position tie-flip difference at KL 0.0017 in both arms.
   It is evidence FOR the "top-1 counts are cliff-like, KL is the signal" position, not evidence
   the cert arm is worse in any distributional sense.
+
+## Unpadded bf16 staging is dead: 0.09x via 16-way bank conflicts (run #145)
+
+Tried dropping the x-staging pad (stride 32 bf16 instead of 34) to halve shared memory again,
+with R=128 to double block count. Result: BIT-EXACT but 0.09x (3540 vs 334 ms), R-independent.
+Mechanism, verified by arithmetic: lanes in a warp read different 32-code blocks simultaneously;
+with stride-32 halfwords the per-lane addresses step 64 bytes = 16 banks, so 16 lanes pile onto
+each of 2 banks -- a 16-way conflict on every x read in the serial dot chain. The pad exists to
+avoid exactly this, and the constraints pin it down: stride S must satisfy S >= 32 (blocks must
+not overlap) and S/2 coprime to 32 (consecutive lanes must land on distinct banks, i.e. S = 2
+mod 4). S = 34 is minimal: 8.7 KB at CT=2, which is #137's design (1.02x). There is no smaller
+conflict-free layout for warp-strided-b x reads, so same-arithmetic prefill batching is closed
+at ~1.0x from both sides (occupancy via padding, conflicts via stride).
