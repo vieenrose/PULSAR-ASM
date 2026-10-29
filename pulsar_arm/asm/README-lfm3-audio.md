@@ -359,7 +359,10 @@ LFM_R=64 (row->block remap)             130         .99946-.99973    .0014-.0019
 
 Two things follow. The fused-staging and R knobs are **bit-identical**, so their lines above
 are also a positive control: a bit-exact arm must print identical numbers, and it does — that
-is the determinism check for the gate itself. And the FMA switch is **quality-neutral**:
+is the determinism check for the gate itself. (Speed side, #266: LFM_NOFMA=1 doubles GEMV
+FLOPs and costs only +1.8% of the decode step -- the kernels are ~90% DRAM-bound, which caps
+every arithmetic-shrinking lever at ~2% and matches the clean-board H2 decode win exactly.)
+And the FMA switch is **quality-neutral**:
 FMA wins corr on 4 prompts (A, C, F, K) and loses on 2 (E, L) by ~2e-5, while the spread
 *between prompts* (KL 0.0007–0.0019) is about 10× the spread *between arms*. An early
 two-prompt read said FMA "agrees with HF better"; that was prompt-A-specific and did not
