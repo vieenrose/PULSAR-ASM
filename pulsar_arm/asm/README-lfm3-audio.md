@@ -121,12 +121,24 @@ TTFT, prompt A (each step paired A/B in both orders where noted)
        ┃           (the loop fed every prompt step's prediction back as input;
        ┃           LFM_LEGACYFEED=1 is the control)
 2270.6 ┃█          reproduced on a fresh build (step 0 now the fastest step: no lm_head)
+2260.4 ┃█          band re-verified post #162-#165 (gates green on a fresh build; step 0 =
+       ┃           steady prompt step 97.6 ms -- #138's warm-up is complete, and TTFT is
+       ┃           fully attributed: 22 x 97.6 + 112.4. Prompt B runs 98.2 ms/step: the
+       ┃           per-step cost is prompt-independent, not prompt-A overfit.)
 ```
 
 Prefill is still ~95% of TTFT, and batching positions with identical arithmetic tops out near
 1.0x (four tile-size/staging variants measured, all bit-exact, best 1.02x) because the GEMVs
 are FP-pipe-bound: batching removes weight bytes but not a single FMA -- and an unpadded
 staging variant proved the padding load-bearing by running 0.09x (16-way bank conflicts).
+A fifth variant (CT=2 weight-reuse tiles, bit-exact at 8/8 shapes and 1.15-1.45x standalone,
+#162-#164) was integrated as a layer-first batched prefill in #165 and CLOSED there: the
+engine's ffn.w2 GEMV indexes x at row*K, so its rows 1..2047 read step-recursive arena
+scratch beyond the 7680-element silu buffer, and no per-position tiling reproduces those
+bytes. Layer-first w2 moved positions 10-17 by +37..+158% and made step-22 logits garbage
+(top-1 survived on tie luck). w2 is pinned sequential by the goldens; batching the other
+nine GEMVs does not pay. Batching prefill would now require changing the engine's w2
+x-layout -- a goldens change, the user's call.
 The remaining prefill lever is fewer FP operations per weight. Measured, all behind flags,
 all gates green; the call is the user's since every option below breaks bit-exactness:
 
@@ -135,8 +147,11 @@ arm                              TTFT      decode    streams  KL A/C/K          
 shipped (fp32 path)              2270.6    112.8     6/7      0.0013/0.0005/0.0006  n/a
 LFM_H2=1 (raw half2 + HFMA2)     2141.8    107.0     6/7      0.0016/0.0006/0.0005  28% of one layer's
  -5.6% / -5.2%, 4/4 paired                                          inputs in fp16's low-        precision range;             theoretical accumulator        overflow on ffn.w2
-LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    7/7      0.0012/0.0007/0.0005  safe by construction
- rescale; the scan costs what                                        (best-or-tied)              (bound 65024, no              the faster loop saves)                                                                   subnormals)
+LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.0005  safe by construction
+ rescale; the scan costs what                              (post-RoPE re-score,     (bound 65024, no
+ the faster loop saves)                                    #159: the 7/7 was tie     subnormals)
+                                                           luck; F drops to 19/21,
+                                                           a floor the shipped passes)
 ```
 
 Top-1 agreement is 47/48 in every arm on every divergence prompt; nothing grows. int8
