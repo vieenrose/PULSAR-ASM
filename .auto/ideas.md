@@ -2134,3 +2134,16 @@ each 32-code block. The accumulation across blocks stays fp32.
   user's call. Before any adoption: run divergence_floor.py on it (shared-trajectory KL vs the bf16
   floor), and watch for fp16 range limits (|x| > 65504 overflows, |x| < 6e-5 goes subnormal). The
   gates passed on 7 prompts, but activations on long or unusual audio inputs were not covered.
+- #141, the checks owed on the half2 probe:
+  - divergence_floor (fp32 reference, same trajectory, shipped arm reproduces #128 exactly as a control):
+    shipped KL A/C/K = 0.0013/0.0005/0.0006; H2 = 0.0016/0.0006/0.0005; top-1 47/48 in both on all
+    three. A small, mixed cost (+20% on two prompts, -17% on one).
+  - fp16 range on the 7 gate prompts (LFM_XRANGE=1, ~200M GEMV inputs): no input overflow (max |x|
+    45.5 in ffn.w2), but conv.out_proj has 28.3% of its nonzero inputs in fp16's subnormal range
+    (max |x| only 5.0), and ffn.w2/o_proj ~1%. The in-block fp16 accumulator has only theoretical
+    headroom: 45.5 x 127 x 32 = 185k > 65504. It never overflowed here, but nothing bounds it on
+    unseen audio.
+  - Verdict: H2 stays default OFF. If adopted, first add exact power-of-two rescaling of each
+    32-input block (multiply x by 2^k before conversion, multiply the block dot by 2^-k after; both
+    exact), which moves conv.out_proj out of the subnormal range and bounds the accumulator.
+    Re-gate after that. -5.6% TTFT is the prize.

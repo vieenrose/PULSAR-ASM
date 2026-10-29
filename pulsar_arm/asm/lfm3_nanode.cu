@@ -1126,9 +1126,40 @@ static void q8_launch_bf(int nblk, int TPB, size_t shm, const int8_t* q, const f
   else                        q8_partial<bf16,false,false,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
 }
 
+// LFM_XRANGE=1: diagnostic for the half2 probe (#141). Records, per tensor
+// family, the largest |x| fed to the GEMV and how many nonzero inputs fall
+// below fp16's normal range (6.1e-5, where half goes subnormal) or above its
+// max (65504). Syncs every GEMV: a measurement mode, never a timing mode.
+static const bool g_xrange = getenv("LFM_XRANGE") != nullptr;
+struct XR { double mx = 0; long n = 0, sub = 0, over = 0; };
+static std::map<std::string, XR> g_xr;
+static void xrange_add(const std::string& name, const bf16* xb, int K) {
+  std::vector<uint16_t> h(K);
+  cudaMemcpy(h.data(), xb, (size_t)K * 2, cudaMemcpyDeviceToHost);
+  std::string fam = name;
+  const size_t d = fam.find(".layers.");
+  if (d != std::string::npos) { size_t e2 = fam.find('.', d + 8); fam = fam.substr(e2 + 1); }
+  XR& r = g_xr[fam];
+  for (int i = 0; i < K; i++) {
+    uint32_t u = (uint32_t)h[i] << 16; float f; memcpy(&f, &u, 4);
+    const double a = fabs(f);
+    if (a > r.mx) r.mx = a;
+    if (a > 0 && a < 6.1035e-5) r.sub++;
+    if (a > 65504.0) r.over++;
+    r.n++;
+  }
+}
+static void xrange_print() {
+  for (auto& kv : g_xr)
+    printf("XRANGE %-28s n=%9ld max|x|=%10.4f subnormal-in-fp16=%8ld (%.4f%%) overflow=%ld\n",
+           kv.first.c_str(), kv.second.n, kv.second.mx, kv.second.sub,
+           100.0 * kv.second.sub / (kv.second.n ? kv.second.n : 1), kv.second.over);
+}
+
 static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   Ent* e = T(M, name);
   const int N = e->ne[0], K = e->ne[1];
+  if (g_xrange) xrange_add(name, xb, K);
   GemvCfg c = pick(N, K);
   if (K % c.KCHUNK) { printf("%s: K=%d not divisible by KCHUNK=%d\n", name.c_str(), K, c.KCHUNK); exit(2); }
   const int nb = c.KCHUNK / Q8_BLK, nchunk = K / c.KCHUNK;
@@ -1965,6 +1996,7 @@ int main(int argc, char** argv) {
     cudaError_t e2 = cudaGetLastError();
     if (e2 != cudaSuccess) { printf("CUDA ERROR after step %d: %s\n", s, cudaGetErrorString(e2)); return 1; }
   }
+  if (g_xrange) xrange_print();
   if (g_time && ng > 0)
     printf("PHASES ms/tok: emb %.2f  conv %.2f  attn %.2f  finalnorm %.2f  lm_head %.2f  sum %.2f\n",
            g_tEmb / ng, g_tConv / ng, g_tAttn / ng, g_tNorm / ng, g_tHead / ng,
