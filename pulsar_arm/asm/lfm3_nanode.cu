@@ -200,8 +200,12 @@ __global__ void q8_rowlane(const int8_t* __restrict__ q, const float* __restrict
 // Q8_0 pass 1: R rows x one chunk, one WARP per row, lanes striding the
 // chunk's blocks, x staged in shared. This is the kernel whose 14-16.5 GB/s
 // rate underlies the 127.7 ms/token budget (q8_lc3.cu, commit 2b5cbe5).
+// Declare the 256-thread GEMV's six-block/SM target explicitly. The clean
+// 40-register build already allows six blocks (40*256 = 10240 regs/block), so this only lets
+// the compiler optimize for a known occupancy target. Register allocation or
+// scheduling may change; values and reduction order cannot, so it stays exact.
 template <typename TX, bool FMA, bool STREAM = false, int UNROLL = 1>
-__global__ void q8_partial(const int8_t* __restrict__ q, const float* __restrict__ s,
+__global__ void __launch_bounds__(256, 6) q8_partial(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ x, float* __restrict__ part,
                            int N, int K, int KCHUNK, int R, int nb) {
   extern __shared__ float xs[];
@@ -1366,15 +1370,7 @@ static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf)
 }
 // GEMV with an explicit input width (the 2048-wide h1 feeding a 512-column
 // projection is normal; the weight's own K is authoritative).
-// LFM_ABLATE=1 skips the 96 per-token rmsnorm launches. The OUTPUT IS THEN
-// WRONG -- this is a timing attribution probe, not a runnable configuration:
-// its only purpose is to price those kernels so fusion work is sized against a
-// measured number instead of the serialized KTIME table, whose per-launch
-// values carry a sync tax (its GEMV rows alone sum past the real step cost).
-// Default off; the gates must never be run with it.
-static const bool g_ablate_norm = getenv("LFM_ABLATE") != nullptr;
 static void rms1(Model& M, const bf16* x, const float* w, bf16* y) {
-  if (g_ablate_norm) return;
   k_rmsnorm<<<1, 256, 0, g_launch>>>(x, w, y, NORM_EPS, H);
 }
 static void emul(Model& M, const bf16* a, const bf16* b, bf16* y, int n) {
