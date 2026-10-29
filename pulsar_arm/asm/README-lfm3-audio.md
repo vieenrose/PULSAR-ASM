@@ -8,8 +8,8 @@ from a `.lfm3q8` blob (Q8 linears + fp32 scales + Q8 tied embedding, 286 tensors
 Primary metric: **decode ms/token, lower is better**, single sequence, greedy.
 
 ```
-current  136.30 ms/token   =   7.34 tok/s        (RSS 306 MB, 4 GB board)
-baseline 141.04 ms/token   =   7.09 tok/s        ->  -3.4%
+current  112.79 ms/token   =   8.87 tok/s        (RSS 306 MB, 4 GB board)
+baseline 141.04 ms/token   =   7.09 tok/s        ->  -20.0%
 ```
 
 ## How the number is measured
@@ -40,21 +40,23 @@ readback of the sampled token. Repeat spread on one binary is **0.03–0.14%**; 
 **2–6% between hours**, so every claim below is a same-session paired A/B (`ab.sh`, one build,
 both arms, each pair in both orders, `R = sqrt(o1/o2)`), never a comparison across sessions.
 
-## Where the 136 ms goes
+## Where the 112.8 ms goes
 
 `LFM_TIME=1` splits the step by layer type. Its timers carry their own sync overhead, so the
-parts sum to ~145.8 ms against a 136.3 ms whole — read the split, not the sum.
+parts sum to ~127.0 ms against a ~114.9 ms whole on a short run — read the split, not the
+sum. (Pre-launch-bounds: conv 70.6 / attn 56.6 / lm_head 18.5 ms; the win spread evenly
+because every layer GEMV shares the one `q8_partial` kernel.)
 
 ```
 per-phase ms/token (LFM_TIME)          bytes/token  GB/s   [ 1 block = 2 ms ]
-conv layers (13)  ███████████████████████████████████░  70.6     ~715 MB  9.4→10.1
-attention (11)    ████████████████████████████░░░░░░░░  56.6     ~545 MB  9.0→ 9.6
-lm_head           █████████░░░░░░░░░░░░░░░░░░░░░░░░░░░  18.5      278 MB      14.0
+conv layers (13)  ███████████████████████████████░░░░░  61.8     ~715 MB  10.6→11.6
+attention (11)    ████████████████████████░░░░░░░░░░░░  48.9     ~545 MB  10.4→11.1
+lm_head           ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░  16.3      278 MB      14.0
 final norm        ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.1        4 KB         —
 embedding         ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.0        4 KB         —
 
-Same scale for every row: conv 35 blocks, attention 28, lm_head 9. Parts sum to ~145.8
-ms against a 136.3 ms whole because each phase timer carries its own sync.
+Same scale for every row: conv 31 blocks, attention 24, lm_head 8. Parts sum to ~127.0
+ms against a ~114.9 ms whole because each phase timer carries its own sync.
 
 The plan's budget assumed the lm_head was ~half the step. It is **14%**, and it already runs at
 14 GB/s against a **measured 17 GB/s streaming ceiling** on this board — which is why tuning the
@@ -74,16 +76,23 @@ exactly. **FP-pipe-bound; 9.2 GB/s was a symptom.**
 `sum += w*x` in C, which compilers contract to an FMA — so this is at least as faithful to the
 reference, with one rounding per product instead of two.
 
+`__launch_bounds__(256, 6)` on the Q8 GEMV: **−17.3%** (paired, R=1.1043, faster 4/4).
+The kernel used 40 regs/thread at TPB=256, so six blocks/SM already fit — but the compiler
+did not know that. Declaring the target moved it to 39 regs with no spills and much better
+scheduling; gates green with numbers identical to the unannotated build. Register caps in
+the other direction (`-maxrregcount=32`) cost +12.5% in forced spills, and relaxing to
+five blocks/SM is a measured null (compiler keeps 39 regs), so six is the characterized
+target. A resource hint only: it cannot change a value or the reduction order.
+
 ```
 kept chain, ms/token (each step paired A/B in both orders)
 141.04 ┃█ baseline (measured on the real CUDA path)
 140.32 ┃█−0.5%  R=256 rows/block for all shapes (bit-identical row→block remap)
 139.62 ┃█       bake R=256 into pick()
-139.56 ┃█       bf16 payload support for the certified arm
 139.12 ┃█−0.39% fuse k_bf2f into the GEMV's x staging (~110 launches/token gone)
 136.41 ┃ −2.0%  __fmaf_rn accumulation in the Q8 GEMV
-136.30 ┃█       shipped (RSS 306 MB, gates green)
-       ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  135      141 ms
+112.79 ┃█−17.3% __launch_bounds__(256,6) on the Q8 GEMV (resource hint, exact)
+       ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  110      141 ms
 ```
 
 ## Bandwidth by shape — the one anomaly left
@@ -102,11 +111,15 @@ ffn.w2         N=  2048 K=6144   ███████░░░░░░░░�
                  0     5    10    15   17
 ```
 
-`ffn.w2` (N=2048, K=6144) costs 1.773 ms where `ffn.w1` (N=6144, K=2048) costs 1.161 ms for an
+`ffn.w2` (N=2048, K=6144) cost 1.773 ms where `ffn.w1` (N=6144, K=2048) cost 1.161 ms for an
 identical 12.6 MB. Five hypotheses were implemented and measured against it — block fill
 (R=64, shape-adaptive R), inter-row ILP (`#pragma unroll 2`), cache hints (`__ldcs`), chunk
 interleaving (KCHUNK=3072), and per-lane row ownership (a one-row-per-lane wide-K GEMV) — and
-**all five are measured out**. The strided-lane form, per-lane 32-block stride + warp tree, is
+**all five are measured out**. The launch-bounds codegen narrowed the same-byte w2/w1 ratio
+from 1.47× to 1.17× (per-kernel timing under the new allocation), so the new codegen helped
+the long-K shape most — but w2 remains the single costliest GEMV, and the narrowed ratio does
+not reopen any of the five: they address the old 1.47× signature, and R/KCHUNK re-tunes under
+the new codegen both failed (R=128 −2.7%, KCHUNK=1024 −5.5%). The strided-lane form, per-lane 32-block stride + warp tree, is
 the right structure for this layout on this board: giving each lane a whole row makes every
 warp instruction read 32 bytes from 32 different rows, consuming 32 sectors per 1 KB of useful
 data instead of covering 1024 contiguous bytes.
@@ -125,13 +138,18 @@ faster ◄───────────────────────�
    0   ┼───────────────────────────────────────────────────────────────────
  -0.55 │ CUDA graphs of the layer loop              ~250 launches ≈ 1 ms of CPU vs a 136 ms
                                                      step — launches were never the bottleneck
+ -2.7  │ R=128 under launch-bounds codegen          re-tune after the codegen change; R=256 stands
  -3.0  │ shape-adaptive R (64/32 for few-row shapes)
  -3.6  │ TPB=512
- -5.3  │ KCHUNK=1024
+ -5.3  │ KCHUNK=1024 (also −5.5% under launch bounds; KCHUNK=K stands under all three codegens)
  -6.5  │ R=64 (global)                              x-stage amortization dominates
+ -6.9  │ exact integer int8→float (skip I2F)        extra integer op + FADD outweigh the saved I2F
 -10.5  │ inter-row ILP (unroll 2)                   register spill at R=256/TPB=256
+-12.5  │ -maxrregcount=32 (force 8 blocks/SM)       forced spills outweigh the occupancy gain
 -157   │ one-row-per-lane wide-K GEMV               32 scattered sectors per warp instruction
 -162   │ double-buffered lm_head streaming          19.8 → 52.5 ms; Tegra copy engine + events
+   0   │ launch bounds (256,5) on the Q8 GEMV       compiler keeps 39 regs; identical codegen, null
+   0   │ launch bounds (256,8) on the lm_head GEMV  30 regs both builds; bandwidth-bound, null
 ```
 
 Two configuration findings worth carrying forward:
@@ -143,7 +161,9 @@ Two configuration findings worth carrying forward:
   1944 MB whole-backbone-Q8_0 config; this Q8-embedding blob is 1466 MB and fits resident with
   ~2.8 GB device free, so streaming is pure loss. `LFM_EMB=resident|host` A/Bs it.
 * **GEMV config is a characterised optimum**: R=256, TPB=256, KCHUNK=K, FMA on, serial row
-  loop, plain loads — confirmed on both accumulation forms.
+  loop, plain loads, `__launch_bounds__(256,6)` — confirmed on all three codegen regimes
+  (pre-FMA, FMA, launch-bounds). TPB=512 cannot be re-tested without touching the
+  annotation (max 256 threads is baked in).
 
 ## Quality gates
 
@@ -268,7 +288,8 @@ probe that never executed: `R` exactly 1.0000, or gate output identical to the d
   (137.66 vs 137.58 ms/token, R = 1.0006, 2/4 pairs each way): the launch thread is not on
   the critical path, consistent with CUDA graphs measuring -0.55%. So the absolutes are
   **not** inflated by them, and the GEMV config sweep does not need repeating after a reboot.
-  The ~1% gap between this session's 137.5 and the 136.3 best is ordinary board drift.
+  (Superseded in the best sense: the launch-bounds win moved the best from 136.30 to 112.79,
+  and the post-win numbers reproduce to 0.05%.)
 * Prompt D cannot be scored (see above), and the stream gate therefore covers 7 of 8 prompts.
 * `--trace` (the per-layer/per-position matrix) cannot run inside a graph capture, so
   `LFM_GRAPHS` forces it off.
