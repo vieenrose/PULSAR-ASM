@@ -188,7 +188,7 @@ LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.00
 SPEED ROWS CORRECTED (#236/#237): the -5.3..-8.0% family was measured with the 3-core
 `lfm3_conv_test` spinners (#230 kill) contending with the engine's CPU side; the shorter H2
 GEMVs poll/launch less, so contention inflated their edge. On the clean board, order-balanced
-pairs give TTFT -1.8% (23 pos, 3x3), -1.4% (360), ~-1.8% (300, board noise band), decode -1.7%
+pairs give TTFT -1.8% (23 pos, 3x3), -2.5+-0.7% (300, 3x3, #248), -1.4% (360), decode -1.7%
 (2x2); 1000 pos keeps -5.0% (3x3, spreads 0.7%, #233). Old rows #180/#189/#203/#205/#206 are
 retired as spinner-era measurements. DEPLOYMENT READING: the spinner condition is a good
 proxy for a co-tenanted audio server (web/decode processes on the A57s): VERIFIED with one
