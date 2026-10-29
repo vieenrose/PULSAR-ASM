@@ -1199,6 +1199,21 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
 // - shm sized exactly CT*nb*17 half2 = 8704 B (the v1 ULF was OOB shared use).
 // The minimal direct-call probe just proved direct launches + shared + H2 all
 // work in this context, so any failure here is in the newly added structure.
+//
+// WHY IT IS NOT INTEGRATED AS PREFILL (run #165 root cause, do not re-walk):
+// a layer-first batched prefill using this kernel is bit-exact for every
+// GEMV whose K equals the per-position row stride (q/k/v/gate/o, in_proj,
+// out_proj, w1/w3: K=2048 = H) -- but NOT for ffn.w2 (N=2048 rows, K=7680).
+// gemv() indexes x + row*K, so the sequential engine's w2 reads row n from
+// h2 + n*7680: row 0 is the real silu output, rows 1..2047 read the arena
+// scratch BEYOND the 7680-element buffer (q/k/v/attn/ring, step-recursive
+// through every prompt/decode step). That garbage is deterministic and no
+// per-position tiling reproduces it. Layer-first w2 gave position 16 the
+// silu rows of positions 17-19 where the engine had position-16 bytes:
+// L0 x rms at positions 10-17 off by +37..+158%, step-22 logits mean-abs
+// 9.5 vs sequential (top-1 matched by tie luck, top-5 garbage). The w2
+// GEMV must stay sequential gemv() calls for bit-exactness, and batching
+// 9 of 10 GEMVs does not pay while w2 (a top-3 GEMV by time) is pinned.
 template <typename TX, int CT, bool H2>
 __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ xall, float* __restrict__ part,
