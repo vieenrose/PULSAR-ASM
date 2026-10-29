@@ -197,6 +197,8 @@ controlled renice-10 CPU spin-loop, 2x2 at 23 pos -- H2 {2241, 2205} vs shipped 
 The honest range for the user decision is -1.8% (dedicated clean bench, #236) to -4.6..-5.6%
 (co-tenanted server, #245/pre-#230); decode -1.7% clean (#237), -2.6% co-tenanted -- both
 orders, 0.3% spreads (#254: 25-step decode averages are the tightest A/B channel here).
+Full arm matrix, clean/co-tenanted (ms): TTFT 2280|2278-2381 shipped, 2244|2205-2241 raw H2,
+~2280|~2280 rescaled; decode 113.4|113.4 shipped, 111.6|110.5 raw, ~113|113.0 rescaled.
 Quality: formal
 suite gate-for-gate identical to shipped (#182 short, #199 full --long), tie-landscape argmax
 identical on both references (#195/#196), rms vs fp16 reference 0/24000 cells to 1000
