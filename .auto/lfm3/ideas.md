@@ -195,7 +195,11 @@ three zombie `lfm3_conv_test` processes (unkillable, blocking reboot) steal 3 of
 today's absolutes are inflated; (4) a top-k-vs-HF logit agreement gate, which is the
 quantitative version of "how close is this engine to HF".
 
-### CUDA graphs: scoped, not attempted (est. 1.5-3%, ~2 h, hot-kernel risk)
+### CUDA graphs: CLOSED by measurement (est. was 1.5-3%; measured -0.55%, README e2e table)
+
+The pre-measurement estimate overstated launch overhead 3-5x: ~250 async launches cost ~1 ms CPU against a
+136 ms step -- launches pipeline behind GPU work. Do not reopen on the "28% CPU" argument:
+the CPU time lives in the attention/quant path, not in launch queueing.
 
 Scoping found five classes of per-step state baked into launch parameters, all of which must
 move to device memory before a capture is valid:
