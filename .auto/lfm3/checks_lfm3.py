@@ -233,7 +233,7 @@ def gate_streams(prompts, gen=16, floor=1):
         # a 0-token prefix; slicing at 0 decodes the prompt and shows a stray
         # <|startoftext|> mid-string. Both were hit here.
         toks = [int(m.group(2)) for m in
-                (re.match(r"\s*(\d+)\s+(\d+)\s+[\d.]+\s+[\d.]+$", l) for l in out.splitlines())
+                (re.match(r"\s*(\d+)\s+(-?\d+)\s+[\d.]+\s+[\d.]+$", l) for l in out.splitlines())
                 if m]
         got = toks[len(g["prompt_ids"]) - 1:]
         # Token-level prefix, the unit quant_sensitivity.py certifies in

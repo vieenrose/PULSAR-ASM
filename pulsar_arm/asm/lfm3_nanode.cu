@@ -674,6 +674,7 @@ static const bool g_nofuse = getenv("LFM_NOFUSE") != nullptr;
 static bool g_merge = getenv("LFM_MERGE") != nullptr;   // --merge also sets it
 static cudaEvent_t g_evA, g_evB;
 static double g_tEmb = 0, g_tConv = 0, g_tAttn = 0, g_tNorm = 0, g_tHead = 0;
+static const bool g_legacy_feed = getenv("LFM_LEGACYFEED") != nullptr;  // pre-#139 feeding (A/B control)
 static inline void phBegin() { if (g_time) cudaEventRecord(g_evA); }
 static inline void phEnd(double& acc) {
   if (!g_time) return;
@@ -1863,15 +1864,27 @@ int main(int argc, char** argv) {
     // pointer the ents loop above already resolved, host mode or not.
     phEnd(g_tNorm);
     phBegin();
+    // Feeding fix (#139). The old loop pushed EVERY step's argmax into toks,
+    // including the n-1 predictions made mid-prompt, so the first generation
+    // step consumed toks[n] = step 0's prediction (made after one prompt
+    // token), and every later step consumed a stale mid-prompt guess. Only
+    // the prediction after the full context (step n-1 onward) is a real
+    // output. With that fixed, the lm_head on prompt steps 0..n-2 produces
+    // nothing anyone consumes, so it is skipped -- unless --dump-logits-all is
+    // set: the logit gate compares every teacher-forced position against HF.
+    // LFM_LEGACYFEED=1 restores the old loop as the A/B control.
+    const int nprompt = (int)prompt.size();
+    const bool need_head = s < 0 || g_legacy_feed || s >= nprompt - 1 || dump_logits_all;
     Ent* eemb = emb;
-    if (eemb && eemb->dtype == 3 && M.emb_mode == 1 && M.hemb.hc)
+    if (!need_head) {}
+    else if (eemb && eemb->dtype == 3 && M.emb_mode == 1 && M.hemb.hc)
       lm_head_bf16_host(M, M.hemb, lm_head_input, M.lgf);  // certified arm, host-staged
     else if (eemb && eemb->dtype == 3)
       lm_head_bf16(M, eemb, lm_head_input, M.lgf);         // certified arm, resident
     else if (M.emb_mode == 1)
       lm_head_host(M, M.hemb, lm_head_input, M.lgf);     // Q8 streamed from pinned host
     else gemv_f(M, EMBNAME, lm_head_input, M.lgf);       // tied lm_head, resident
-    k_argmax<<<1, 256, 0, g_launch>>>(M.lgf, M.tok_dev, VOCAB);
+    if (need_head) k_argmax<<<1, 256, 0, g_launch>>>(M.lgf, M.tok_dev, VOCAB);
     cudaEventRecord(evB, g_launch);
     cudaEventSynchronize(evB);
     if (s < 0) {
@@ -1884,9 +1897,9 @@ int main(int argc, char** argv) {
       continue;
     }
     float ms = 0; cudaEventElapsedTime(&ms, evA, evB);
-    int nt = -1;
-    cudaMemcpy(&nt, M.tok_dev, 4, cudaMemcpyDeviceToHost);
-    toks.push_back(nt);
+    int nt = -1;   // printed as -1 on prompt steps whose lm_head was skipped
+    if (need_head) cudaMemcpy(&nt, M.tok_dev, 4, cudaMemcpyDeviceToHost);
+    if (g_legacy_feed || s >= nprompt - 1) toks.push_back(nt);
     phEnd(g_tHead);
     // --dump-logits-all appends EVERY step's logits, so the gate can compare
     // the whole teacher-forced prefix, not just position 0. Greedy stream

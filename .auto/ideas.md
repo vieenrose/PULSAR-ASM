@@ -2082,3 +2082,37 @@ What can still shrink prefill is **less FP work per product**, and every option 
   to int8 (a Q8_1-style activation quant, as ggml does), which is a reference-order change.
 Both are quality trades that must go through the 6-prompt logit gate + divergence_floor, not
 through the stream gate. Prefill is still 96% of TTFT; batching alone is not the lever.
+
+## The feeding bug (run #139): "0/7 stream matches" was a harness bug, not numerics. Now 6/7.
+
+The step loop pushed EVERY step's argmax into `toks`, including the n-1 predictions made
+mid-prompt. The first generation step therefore consumed toks[n] = step 0's prediction (made
+after ONE prompt token), and each later step consumed a stale mid-prompt guess. Only the first
+output (step n-1) was ever right. That is exactly why every prompt scored "prefix 1-2", and why
+the streams read like garbage ("11)1 four seasons obvious the the the").
+
+Fixed: only predictions from step n-1 onward are appended. With the fix, the lm_head on prompt
+steps 0..n-2 feeds nothing, so it is skipped (except under --dump-logits-all, which the
+teacher-forced logit gate needs). `LFM_LEGACYFEED=1` keeps the old loop as a control.
+
+| | legacy feed | fixed feed |
+|---|---|---|
+| streams vs HF goldens (16 tok) | 0/7 full, prefixes 1-2 | **6/7 full**, F = 11/16 (its known near-tie) |
+| teacher-forced gates | unchanged to the digit | unchanged to the digit |
+| TTFT, prompt A, warm, paired 4/4 | 2593.4 ms | **2271.1 ms (-322 ms, -12.4%)** |
+| first output token | 207 | 207 |
+
+6/7 exact is the plan's certified figure for this arm ("q8_0_embq8: 6/8 exact"), now reached.
+
+**Retractions this forces:**
+- #113/#133's reading that 0/7 stream matches were "argmax/tie amplification on agreeing
+  distributions" is wrong. The distributions did agree (the teacher-forced gates were always
+  right), but the streams diverged because the harness fed the wrong tokens.
+- #87's "the plan's 8/8 goldens gate is not reachable by a from-scratch GEMV (cuBLAS-order
+  dependent)" was built on the same broken streams and is withdrawn. With correct feeding the
+  Q8 arm reaches 6/7, matching its certification. The bf16-embedding arm should be re-scored.
+- traj_drift's free-running numbers (#133) measured the legacy trajectory; the script now
+  follows the fixed feeding (LFM_LEGACYFEED in LFM3_ENV selects the old alignment).
+- measure.sh's steady-state "decode ms/token" averages steps 2..47, which includes prompt steps
+  that no longer run the lm_head. It is not comparable across this commit; a decode-only number
+  needs steps >= n.

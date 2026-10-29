@@ -134,7 +134,11 @@ def main():
             # len(gids) predictions and scores HF on states the engine never
             # stood in; the early window still reproduced the teacher-forced
             # gate because both slicings agree for t < len(gids).
-            seq = gids + toks[:a.steps]
+            # Since #139 the engine consumes prompt + its outputs from step
+            # n-1 onward (prompt steps print -1); before #139 it consumed
+            # prompt + ALL predictions (LFM_LEGACYFEED=1 reproduces that).
+            legacy = "LFM_LEGACYFEED" in (ENVQ or "")
+            seq = gids + (toks[:a.steps] if legacy else toks[len(gids) - 1:])
         if eng is None:
             fails.append("traj[%s]: engine produced no usable logit dump" % tag)
             print("  traj[%s]: NO DUMP" % tag)
