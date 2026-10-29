@@ -205,7 +205,7 @@ __global__ void q8_rowlane(const int8_t* __restrict__ q, const float* __restrict
 // 40-register build already allows six blocks (40*256 = 10240 regs/block), so this only lets
 // the compiler optimize for a known occupancy target. Register allocation or
 // scheduling may change; values and reduction order cannot, so it stays exact.
-template <typename TX, bool FMA, bool STREAM = false, int UNROLL = 1, bool H2 = false>
+template <typename TX, bool FMA, bool STREAM = false, int UNROLL = 1, int H2 = 0>
 __global__ void __launch_bounds__(256, 6) q8_partial(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ x, float* __restrict__ part,
                            int N, int K, int KCHUNK, int R, int nb) {
@@ -219,7 +219,26 @@ __global__ void __launch_bounds__(256, 6) q8_partial(const int8_t* __restrict__ 
   // LFM_H2 probe: x staged as half2 pairs, 16 pairs per 32-code block, padded
   // to 17 so the per-lane block reads spread across banks.
   __half2* xh = reinterpret_cast<__half2*>(xs);
-  if (H2) {
+  // H2 == 2: exact power-of-two rescale per 32-input block (#142). Scale the
+  // block so max|x| lands in [8, 16) before fp16 conversion, and scale the
+  // block dot back after: both multiplies are exact, so the only rounding is
+  // the fp16 conversion itself, now in fp16's normal range. It also bounds the
+  // in-block fp16 accumulator at 32 x 127 x 16 = 65024 < 65504.
+  float* xsc = xs + (size_t)(KCHUNK / 32) * 17;      // [nb] inverse scales
+  if (H2 == 2) {
+    for (int b = tid; b < KCHUNK / 32; b += NT) {
+      float mx = 0.f;
+      for (int j = 0; j < 32; j++) mx = fmaxf(mx, fabsf(lfm_stage(xg[b * 32 + j])));
+      int e = 0;
+      if (mx > 0.f) frexpf(mx, &e);
+      const int k = (mx > 0.f) ? 4 - e : 0;           // mx * 2^k in [8, 16)
+      xsc[b] = ldexpf(1.f, -k);
+      const float up = ldexpf(1.f, k);
+      for (int q2 = 0; q2 < 16; q2++)
+        xh[b * 17 + q2] = __floats2half2_rn(lfm_stage(xg[b * 32 + 2 * q2]) * up,
+                                            lfm_stage(xg[b * 32 + 2 * q2 + 1]) * up);
+    }
+  } else if (H2) {
     for (int p = tid; p < KCHUNK / 2; p += NT) {
       const int b = p >> 4, k = p & 15;
       xh[b * 17 + k] = __floats2half2_rn(lfm_stage(xg[2 * p]), lfm_stage(xg[2 * p + 1]));
@@ -272,7 +291,8 @@ __global__ void __launch_bounds__(256, 6) q8_partial(const int8_t* __restrict__ 
             h2 = __hfma2(ch, xb2[2 * k + 1], h2);
           }
           const float2 f = __half22float2(h2);
-          acc = __fmaf_rn(sr[b], f.x + f.y, acc);
+          const float bd = (H2 == 2) ? (f.x + f.y) * xsc[b] : (f.x + f.y);
+          acc = __fmaf_rn(sr[b], bd, acc);
           continue;
         }
         const float* xb = xs + (size_t)b * 33;
@@ -713,7 +733,7 @@ static const bool g_legacy_feed = getenv("LFM_LEGACYFEED") != nullptr;  // pre-#
 // LFM_H2=1: measurement-only probe (#140), half2 code conversion + HFMA2 in the
 // layer GEMVs. NOT bit-exact (fp16 accumulator inside each 32-code block);
 // default off; shipping it is a quality decision for the gates and the user.
-static const bool g_h2 = getenv("LFM_H2") != nullptr;
+static const int g_h2 = getenv("LFM_H2") ? atoi(getenv("LFM_H2")) : 0;   // 1 = raw, 2 = per-block 2^k rescale
 static inline void phBegin() { if (g_time) cudaEventRecord(g_evA); }
 static inline void phEnd(double& acc) {
   if (!g_time) return;
@@ -1120,7 +1140,8 @@ static void q8_launch_bf(int nblk, int TPB, size_t shm, const int8_t* q, const f
   }
   const int U = g_unroll2 ? 2 : 1;
   if (g_fma && U == 2)        q8_partial<bf16,true ,false,2><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
-  else if (g_fma && g_h2)     q8_partial<bf16,true ,false,1,true><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
+  else if (g_fma && g_h2 == 2) q8_partial<bf16,true ,false,1,2><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
+  else if (g_fma && g_h2)     q8_partial<bf16,true ,false,1,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
   else if (g_fma)             q8_partial<bf16,true ,false,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
   else if (g_stream)          q8_partial<bf16,false,true ,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
   else                        q8_partial<bf16,false,false,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);

@@ -2147,3 +2147,20 @@ each 32-code block. The accumulation across blocks stays fp32.
     32-input block (multiply x by 2^k before conversion, multiply the block dot by 2^-k after; both
     exact), which moves conv.out_proj out of the subnormal range and bounds the accumulator.
     Re-gate after that. -5.6% TTFT is the prize.
+- #142: `LFM_H2=2` (per-32-input-block exact 2^k rescale into [8,16) before half conversion):
+  - Gates: everything passes, and compared with the unscaled H2 probe it recovers prompt E's lost
+    top-1 (23/23 vs 22/23) and prompt C's worst KL (0.0240 -> 0.0084 is pre-#139; now E 22->23).
+    Streams are **7/7 exact** (F 11/16 before) -- the first 7/7 on any arm. The rescale removed
+    exactly the fp16-induced penalty the diagnostic predicted, so the design is confirmed.
+  - Cost: all speed gone. TTFT 2267.7 (shipped) vs 2258.1 (median of 4, -0.4%); decode 112.8 vs
+    112.5 (-0.3%). The fmaxf/frexpfldexpf staging pass costs what the faster dot loop saves:
+    +1 staging pass over x per block plus per-thread max reduction. Raw H2 stays at -5.6% TTFT /
+    -5.2% decode. Measured null, keep raw + scaled both behind the flag.
+  - Lesson: rescaling arithmetically perfect work back into fp16's good range does not make it
+    free -- the scan that finds the scale factor is itself a full pass over x. A free version would
+    need the scale from statistics the prefill already computes (e.g. the norm's rms, which is
+    max-adjacent, not max -- not a bound). Until such a source exists, H2 stays a measured
+    quality/speed option, not the default.
+  - Side effect for the log: the feeding fix's stream scores moved the floor -- with 7/7 exact on
+    the H2=2 arm, the stream gate now discriminates between arms that differ only in the fourth
+    decimal of KL. Keep floor=1 (it is the arm's certified floor); do not chase the gate upward.
