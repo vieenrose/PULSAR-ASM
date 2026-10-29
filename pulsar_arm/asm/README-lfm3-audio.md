@@ -131,6 +131,10 @@ TTFT, prompt A (each step paired A/B in both orders where noted)
        ┃           the first true output completes at step n-1, not n)
 2589.6 ┃█ -58.7 ms  load-time warm-up (one BOS forward at startup, state reset;
        ┃           LFM_NOWARM=1 is the control; +166.7 ms at load)
+       ┃ LFM_WARMMS=N (default 0) extends that warm-up to N ms of wall-clock GPU
+       ┃ load, absorbing the devfreq DVFS ramp (idle board runs 76.8-153.6 MHz
+       ┃ for the first ~5-24 s, #210/#209): neutral in the normal state, recovers
+       ┃ ~1% from an 8-min idle start, and is the fix for +7% cold-board days
 2271.1 ┃█-318.5 ms  feeding fix + lm_head skip on prompt steps 0..n-2
        ┃           (the loop fed every prompt step's prediction back as input;
        ┃           LFM_LEGACYFEED=1 is the control)
