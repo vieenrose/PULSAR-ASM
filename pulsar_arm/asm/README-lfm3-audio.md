@@ -203,7 +203,9 @@ decode curve under co-tenant (2nd-in-order samples after equal prefills, #258/#2
 steady-state H2 signal at audio decode scale is -5% tokens/s.
 Full arm matrix, clean/co-tenanted (ms): TTFT 2280|2278-2381 shipped, 2244|2205-2241 raw H2,
 ~2280|~2280 rescaled; decode 113.4|113.4 shipped, 111.6|110.5 raw, ~113|113.0 rescaled.
-Quality: formal
+Quality at long context (discrete metric): 600-position trajectory, 12 long states -- both
+arms 12/12 top-1 vs both references, 0 reference disagreements (#272); at 300 positions 19-20/20
+vs fp16 with a 15% tie density (#263). Quality: formal
 suite gate-for-gate identical to shipped (#182 short, #199 full --long), tie-landscape argmax
 identical on both references (#195/#196), rms vs fp16 reference 0/24000 cells to 1000
 positions in both arms (#192/#201).
