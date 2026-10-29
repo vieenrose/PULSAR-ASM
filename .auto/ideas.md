@@ -1983,3 +1983,25 @@ Priced decision: the certified arm costs 161.67 vs 136.30 ms/token (+18.6%) for 
 blob. If a future objective wants the last token of fidelity, this is the lever and it costs
 one sixth of the step - and the remaining 2-3x ratio is NOT reachable by dequantizing the
 embedding, which is where it would have been cheapest.
+
+## The 2-3x divergence ratio is the Q8 weights, not the summation (run #117, closed analytically + empirically)
+
+Candidate levers for the engine's excess over the bf16 floor were scale granularity, and
+compensated (Kahan/2-sum) accumulation. Both are dead:
+
+* Scale granularity: the blobs are Q8_0 -- one fp32 scale per 32 codes, already the
+  fine end of the family. Nothing left to buy.
+* Accumulation, analytically: float32 summation of K=2048 products carries relative
+  error ~ eps*sqrt(K) = 1.2e-7*45 ~ 5e-6, while per-weight Q8 error is (scale/2)/|w|
+  ~ 0.4% which averages over K to ~9e-4. **The accumulation is ~200x below the
+  quantization term**, so perfect summation could not move the ratio.
+* Accumulation, empirically, from data already on the books (#112): LFM_NOFMA=1 doubles
+  the per-product rounding (mul-then-add instead of FMA, 2 roundings vs 1) and KL moved
+  0.0014 -> 0.0015 on prompt A, i.e. ~8% of the 0.0013 excess for a 2x change in
+  accumulation error. Extrapolating, summation accounts for ~8% of the excess and
+  quantization for the remaining ~92%.
+
+A Kahan accumulation would have cost +6-12% FP work on an FP-pipe-bound kernel (the
+mechanism of the -2.0% FMA win, inverted) to chase the smaller term. Not built, and the
+reason is now on the record: **the 2-3x ratio is the price of Q8 weights, and reducing it
+means buying bytes back (fp16 linears = 2x the stream = ~2x the step), not better arithmetic.**
