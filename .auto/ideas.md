@@ -2306,3 +2306,22 @@ while keeping exactness. It cannot work, for three structural reasons:
 H2 == 2 as landed IS the fused-optimal form (single global read, cooperative scan). The -0.4%
 vs -5.6% gap is the scan's ALU cost, and no restructuring removes it. If the safe version must
 be faster, that needs hardware counters on the scan loop, not another variant.
+
+## Audio tower architecture: a 17-layer LFM, i.e. portable with existing kernels (run #157 scoping)
+
+`audio_encoder` = downsample convs (3.3M) + `lfm`: 17-layer transformer, hidden 768, 8 heads
+(106.2M), consuming spectrogram features directly (no token embedding registered). Plus a
+5.8M projector. Total audio path ~115M -- same kernel family as the text backbone (Q8 GEMVs,
+attention, norms), different shapes. A port is mechanical, not research: repack the new
+shapes, reuse q8_partial/k_attn_head/k_rmsnorm, gate against HF's tower.
+
+- Downsample convs need a shape check (stride/channel structure unknown from the outside).
+- The depth decoder is a different pattern: bidirectional masked model over codebook slots
+  PER speech frame (non-causal within a frame), then the liquid codec. It needs its own
+  kernel design, not the decode loop.
+- Direct HF timing of the encoder failed three ways (internal mask/length calling convention,
+  plus a missing-kernel fallback that pollutes host numbers anyway); host timings would not
+  transfer to the Nano, so no number is claimed. The structural finding (same kernel family)
+  is the result.
+- Mel frontend measured: ~10 ms per 5 s audio on host CPU (negligible next to seconds of
+  prefill).
