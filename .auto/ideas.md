@@ -2245,3 +2245,13 @@ Next: raise MAXTOK to 4096 (matching the plan's 4k context), re-run the full gat
 binary changes, so gates must re-verify even though the cache size cannot change numerics),
 confirm the 100-id prompt runs past 64, and check steady-state at long positions for the
 attention O(t) growth the linear model predicts (~3-5% per step at t=1500).
+
+## H2's win holds at 300 tokens: -5.4%, 4/4 (run #151)
+
+`LFM_H2=1` vs shipped on the 300-id prompt (sum steps 0..299, paired, both orders, cold page
+cache): shipped median 29879.03 ms vs H2 28243.83 ms, R = 1.0285, H2 faster 4/4. Same ratio
+as prompt A (-5.6%), so the attention/KV growth at long positions (+14%/step at t=300) does
+not dilute it -- the Q/K/V/O GEMV savings dominate the attention-dot growth. Absolute terms:
+1.6 s saved on 300 tokens (~8 s projected at 1500 audio tokens) vs 0.13 s on prompt A. For the
+pending user decision: the H2 prize scales WITH context length, so the audio case (where TTFT
+is minutes) is where -5.6% matters most. Still default OFF pending the call.
