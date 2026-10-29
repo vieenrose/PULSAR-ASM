@@ -2063,3 +2063,22 @@ embedding tensor (N=128000, K=2048, T=23) against 23 sequential `q8_partial` lau
    (halves shared memory), then a TTFT A/B through the full layer loop. The prize is still about
    17x (#134), so this remains the e2e lever.
 - #136: CT=2 (16.9 KB shared, 2 blocks/SM) is BIT-EXACT again (0/2,944,000) and much closer to sequential: 379 vs 334 ms (0.88x, two runs agree). CT=4 was 0.52x. Moving from 1 to 2 blocks/SM recovered most of the occupancy loss, but weight reuse still doesn't beat 6-block sequential. Next: unpadded bf16 x staging (halves shared memory again, giving 4+ blocks/SM at CT=2) before wiring the kernel into the layer loop.
+- #137: bf16 x staging (8.7 KB at CT=2) is BIT-EXACT and reaches **1.02x** (325.6 vs 333.3 ms, two runs).
+  CT=4 at 17.4 KB gives 0.71x. Occupancy is fixed, but weight reuse still buys only ~2%.
+
+## Correction to #134's "~17x prefill prize": the GEMVs are FP-bound, so weight reuse cannot deliver it
+
+#134 assumed prefill was bandwidth-bound: read the weights once instead of 23 times and get ~17x.
+But #94 had already shown these GEMVs are **FP-pipe-bound**, and the launch-bounds win (#121) was a
+scheduling win, not a bandwidth one. Batching removes weight *bytes* but not a single FMA: each
+(row, position) still needs its 32 int8->float conversions and 32 FMAs. Three tile sizes, all
+bit-exact, agree: CT=4 0.52x / 0.71x, CT=2 0.88x, CT=2 + bf16 staging 1.02x. The ceiling for
+"same arithmetic, fewer bytes" on this board is about 1.0x, not 17x.
+
+What can still shrink prefill is **less FP work per product**, and every option changes numerics:
+- sm_53 has native half2 (HFMA2, 2 products per instruction): about 2x on the FP pipe, but fp16
+  accumulation would need the logit/divergence gates to decide whether that's acceptable.
+- No dp4a on sm_53 (it's sm_61+), so an int8 x int8 dot product means emulating it, or quantizing x
+  to int8 (a Q8_1-style activation quant, as ggml does), which is a reference-order change.
+Both are quality trades that must go through the 6-prompt logit gate + divergence_floor, not
+through the stream gate. Prefill is still 96% of TTFT; batching alone is not the lever.
