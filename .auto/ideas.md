@@ -2255,3 +2255,21 @@ not dilute it -- the Q/K/V/O GEMV savings dominate the attention-dot growth. Abs
 1.6 s saved on 300 tokens (~8 s projected at 1500 audio tokens) vs 0.13 s on prompt A. For the
 pending user decision: the H2 prize scales WITH context length, so the audio case (where TTFT
 is minutes) is where -5.6% matters most. Still default OFF pending the call.
+
+## Full e2e pipeline map (run #153): the engine is the text backbone only
+
+Measured against the HF repo (host, for scoping -- numbers do not transfer to the Nano):
+
+- Audio encodes at ~12 tokens/s: 1 s -> 18 ids, 5 s -> 68 ids (mel 128x499), 15 s -> 193 ids.
+  A 30 s query is ~360 prefill tokens, i.e. ~36 s on the Nano engine today at ~100 ms/step.
+- Upstream of the engine and unported: mel frontend (~10 ms/5 s on host CPU, measured) and the
+  audio tower (audio_encoder 109.5M + audio_projector 5.8M). Direct encoder timing failed on an
+  internal mask-format mismatch; end-to-end host generate (1.55 s for 68+4) is polluted by a
+  missing-kernel fallback, so the encoder's GPU cost is still unmeasured anywhere.
+- "First speech output" runs through the depth decoder (83.9M) + codebook embeddings (49.6M),
+  which predict speech codebooks from LM hidden states, plus the liquid codec -- all present in
+  the HF tree, all unported to the Nano engine, which covers only the 1.7B text backbone (1729M)
+  + tied head (262M).
+- Consequence: in-engine TTFT work (prefill batching, H2) applies to ~360-token audio prefills
+  where it matters ~15x more than on the 23-token benchmark; but complete audio e2e needs the
+  encoder + depth decoder ported first, which is a separate project, not an iteration of this one.
