@@ -311,6 +311,12 @@ if __name__ == "__main__":
         if rc != 0:
             FAIL.append("matrix_long fp16 gate failed (rc=%d)" % rc)
         gate_tie_fp16(["A", "C", "E", "F", "K", "L"])
+        # long-context tie landscape (#263): fp16/bf16 refs disagree at ~15% of the 20
+        # long states; both shipping arms score 19-20/20 vs fp16. Floor 17 = two ties'
+        # worth of slack below the measured band.
+        rc = sp.run([sys.executable, os.path.join(HERE, "longctx_tie.py")], timeout=3600)
+        if rc != 0:
+            FAIL.append("longctx_tie gate failed (rc=%d)" % rc)
     if FAIL:
         print("\nCHECKS FAILED (%d):" % len(FAIL))
         for f in FAIL:
