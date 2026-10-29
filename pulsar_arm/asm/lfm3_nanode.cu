@@ -63,6 +63,7 @@
 #include <map>
 #include <time.h>
 #include <zlib.h>
+#include <cuda_fp16.h>
 
 #define Q8_BLK 32
 #define RMAX 256
@@ -204,7 +205,7 @@ __global__ void q8_rowlane(const int8_t* __restrict__ q, const float* __restrict
 // 40-register build already allows six blocks (40*256 = 10240 regs/block), so this only lets
 // the compiler optimize for a known occupancy target. Register allocation or
 // scheduling may change; values and reduction order cannot, so it stays exact.
-template <typename TX, bool FMA, bool STREAM = false, int UNROLL = 1>
+template <typename TX, bool FMA, bool STREAM = false, int UNROLL = 1, bool H2 = false>
 __global__ void __launch_bounds__(256, 6) q8_partial(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ x, float* __restrict__ part,
                            int N, int K, int KCHUNK, int R, int nb) {
@@ -215,9 +216,19 @@ __global__ void __launch_bounds__(256, 6) q8_partial(const int8_t* __restrict__ 
   const int koff = chunk * KCHUNK;
   const int NT = blockDim.x, tid = threadIdx.x;
   const TX* xg = x + koff;
-  for (int i = tid; i < KCHUNK; i += NT) {
-    const int b = i >> 5, j = i & 31;
-    xs[b * 33 + j] = lfm_stage(xg[i]);
+  // LFM_H2 probe: x staged as half2 pairs, 16 pairs per 32-code block, padded
+  // to 17 so the per-lane block reads spread across banks.
+  __half2* xh = reinterpret_cast<__half2*>(xs);
+  if (H2) {
+    for (int p = tid; p < KCHUNK / 2; p += NT) {
+      const int b = p >> 4, k = p & 15;
+      xh[b * 17 + k] = __floats2half2_rn(lfm_stage(xg[2 * p]), lfm_stage(xg[2 * p + 1]));
+    }
+  } else {
+    for (int i = tid; i < KCHUNK; i += NT) {
+      const int b = i >> 5, j = i & 31;
+      xs[b * 33 + j] = lfm_stage(xg[i]);
+    }
   }
   __syncthreads();
   __shared__ float sh[RMAX];
@@ -240,6 +251,30 @@ __global__ void __launch_bounds__(256, 6) q8_partial(const int8_t* __restrict__ 
                               : *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
         const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
         const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+        if (H2) {
+          // int8 -> half2 without I2F: (c ^ 0x80) = c + 128 in [0,255]; placed
+          // as the low mantissa byte under 0x64 it reads as 1024 + c + 128
+          // exactly, and subtracting 1152 is exact. Two codes per PRMT+HSUB2,
+          // two products per HFMA2. The accumulator is fp16 inside a block.
+          const __half2 off = __floats2half2_rn(1152.f, 1152.f);
+          const __half2* xb2 = xh + (size_t)b * 17;
+          const uint32_t w[8] = {(uint32_t)a0.x, (uint32_t)a0.y, (uint32_t)a0.z, (uint32_t)a0.w,
+                                 (uint32_t)a1.x, (uint32_t)a1.y, (uint32_t)a1.z, (uint32_t)a1.w};
+          __half2 h2 = __floats2half2_rn(0.f, 0.f);
+          #pragma unroll
+          for (int k = 0; k < 8; k++) {
+            const uint32_t u = w[k] ^ 0x80808080u;
+            const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+            const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+            __half2 cl = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+            __half2 ch = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+            h2 = __hfma2(cl, xb2[2 * k], h2);
+            h2 = __hfma2(ch, xb2[2 * k + 1], h2);
+          }
+          const float2 f = __half22float2(h2);
+          acc = __fmaf_rn(sr[b], f.x + f.y, acc);
+          continue;
+        }
         const float* xb = xs + (size_t)b * 33;
         float dot = 0.f;
         #pragma unroll
@@ -675,6 +710,10 @@ static bool g_merge = getenv("LFM_MERGE") != nullptr;   // --merge also sets it
 static cudaEvent_t g_evA, g_evB;
 static double g_tEmb = 0, g_tConv = 0, g_tAttn = 0, g_tNorm = 0, g_tHead = 0;
 static const bool g_legacy_feed = getenv("LFM_LEGACYFEED") != nullptr;  // pre-#139 feeding (A/B control)
+// LFM_H2=1: measurement-only probe (#140), half2 code conversion + HFMA2 in the
+// layer GEMVs. NOT bit-exact (fp16 accumulator inside each 32-code block);
+// default off; shipping it is a quality decision for the gates and the user.
+static const bool g_h2 = getenv("LFM_H2") != nullptr;
 static inline void phBegin() { if (g_time) cudaEventRecord(g_evA); }
 static inline void phEnd(double& acc) {
   if (!g_time) return;
@@ -1081,6 +1120,7 @@ static void q8_launch_bf(int nblk, int TPB, size_t shm, const int8_t* q, const f
   }
   const int U = g_unroll2 ? 2 : 1;
   if (g_fma && U == 2)        q8_partial<bf16,true ,false,2><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
+  else if (g_fma && g_h2)     q8_partial<bf16,true ,false,1,true><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
   else if (g_fma)             q8_partial<bf16,true ,false,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
   else if (g_stream)          q8_partial<bf16,false,true ,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);
   else                        q8_partial<bf16,false,false,1><<<nblk, TPB, shm, st>>>(q, sc, x, part, N, K, KC, R, nb);

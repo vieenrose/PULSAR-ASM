@@ -2116,3 +2116,21 @@ teacher-forced logit gate needs). `LFM_LEGACYFEED=1` keeps the old loop as a con
 - measure.sh's steady-state "decode ms/token" averages steps 2..47, which includes prompt steps
   that no longer run the lm_head. It is not comparable across this commit; a decode-only number
   needs steps >= n.
+
+## half2 GEMV probe (run #140): -5.6% TTFT at gate-indistinguishable quality, NOT bit-exact, default OFF
+
+`LFM_H2=1` swaps the layer GEMVs' inner loop to exact int8->half2 conversion (byte-permute under
+0x64, then HSUB2 1152) plus HFMA2, two products per instruction, with an fp16 accumulator inside
+each 32-code block. The accumulation across blocks stays fp32.
+
+- Quality (full gate suite, LFM3_ENV="LFM_H2=1"): matrix 23x23 within 3%, logits0 unchanged, logit gate
+  top-1 130/131, KL 0.0006-0.0017 (shipping 0.0007-0.0019), streams 6/7 exact (same as shipping).
+  The numbers differ from shipping, so the path ran. Indistinguishable within prompt-to-prompt spread.
+- Speed (paired 4/4, order-balanced, cold page cache, prompt A): TTFT 2267.7 -> 2141.8 ms (-125.9 ms,
+  -5.6%); steady decode 112.8 -> 107.0 ms/token (-5.2%); same first token.
+- The gain is ~5%, not ~2x, so after launch-bounds the GEMVs are no longer cleanly FP-bound; bytes
+  and FP now share the limit.
+- Not adopted by default because it trades bit-reproducibility with the fp32 path for 5.6%. That's the
+  user's call. Before any adoption: run divergence_floor.py on it (shared-trajectory KL vs the bf16
+  floor), and watch for fp16 range limits (|x| > 65504 overflows, |x| < 6e-5 goes subnormal). The
+  gates passed on 7 prompts, but activations on long or unusual audio inputs were not covered.
