@@ -2347,3 +2347,20 @@ position-growing phase error. Fix: rot = is_slide[L] ? HD : HD/2.
 - Lesson recorded earlier stands: a serialized per-kernel timer would have shown nothing here;
   only a same-state comparison across positions could see a smooth 2% drift, and only a gate
   that EXCEEDS the benchmark length could see it at all. The 23-pos suite was blind by design.
+
+## H2=2 re-scored post-RoPE-fix: 7/7 was tie luck, and it now fails the F floor (run #159)
+
+`LFM_H2=2` through the full gate suite on the fixed tree: streams 6/7 (F 16/16, L 5/16 --
+the same L tie-flip the shipped arm shows), and the logit gate FALLS to 128/131 with F at
+19/21 (floor 20): A 22/23, C 20/21, E 22/23, F 19/21, K 22/23, L 22/23 -- one top-1 lost per
+prompt vs its own pre-fix record, all near-ties (KL 0.0006-0.0012, worst-KL positions agree
+with HF on the same token). The rescale is still exact-arithmetic-safe by construction, but
+empirically it now fails a ratchet the shipped arm passes, so the #142 "7/7, best-or-tied"
+record is retracted as tie luck on both sides.
+
+What this means for the pending H2 call: raw H2 (-5.6%, needs re-timing post-fix but the
+RoPE delta is arm-independent and negligible) keeps the speed record with an unmitigated
+range exposure; rescaled H2 keeps the range guarantee but now fails the F floor on ties
+while costing the whole speedup. Neither dominates; shipped stays default. Do not soften
+the floor to accommodate H2=2 -- the floor is the arm's certified worst case, and H2=2's
+misses are the same near-ties the floor exists to surface without failing on.
