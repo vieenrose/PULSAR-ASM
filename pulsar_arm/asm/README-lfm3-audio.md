@@ -168,7 +168,9 @@ LFM_H2=2 (exact per-block 2^k     ~2270    ~112.8    6/7      0.0012/0.0007/0.00
                                                            a floor the shipped passes)
 ```
 
-Top-1 agreement is 47/48 in every arm on every divergence prompt; nothing grows. At audio-length
+The formal gate suite itself passes on the raw arm (#182, current tree): matrix, logits0, streams,
+and the same 130/131 logit top-1 the shipped arm gets. Top-1 agreement is 47/48 in every arm on
+every divergence prompt; nothing grows. At audio-length
 context the raw arm is also clean (#171): on a 300-id prompt scored on HF fp16's own states, the
 20 long-context states give shipped KL 0.0008 top-1 19/20 vs H2=1 KL 0.0005 top-1 20/20 -- the
 fp16 range exposure flagged on one conv layer shows no measurable cost at 300+ positions. int8
