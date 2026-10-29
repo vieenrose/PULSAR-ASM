@@ -1298,12 +1298,22 @@ static int prefill_minimal(Model& M) {
 // Batched H2 selftest (#162 continued): 23 sequential H2 GEMVs (proven above)
 // vs one batched call. Bit-exactness expected by construction (same per-position
 // order); the question is only whether it runs and how fast.
+static int prefill_h2_one(Model& M, Ent* e, int T);
 static int prefill_h2batched(Model& M) {
-  Ent* e = nullptr;
-  for (size_t i = 0; i < M.ents.size(); i++)
-    if (M.ents[i].dq && M.ents[i].ds && M.ents[i].ne[0] >= 1024 && M.ents[i].ne[1] % 32 == 0) { e = &M.ents[i]; break; }
-  if (!e) return 1;
-  const int N = e->ne[0], K = e->ne[1], T = 23, R = 256, TPB = 256, CT = 2;
+  int fails = 0, ntested = 0;
+  for (size_t i = 0; i < M.ents.size() && ntested < 4; i++) {
+    Ent* e = &M.ents[i];
+    if (!(e->dq && e->ds && e->ne[0] >= 1024 && e->ne[1] % 32 == 0)) continue;
+    fails += prefill_h2_one(M, e, 8);
+    ntested++;
+  }
+  printf("prefill-h2batched: %d shapes tested, %s\n", ntested, fails ? "FAILURES" : "ALL BIT-EXACT");
+  fflush(stdout);
+  return fails ? 1 : 0;
+}
+static int prefill_h2_one(Model& M, Ent* e, int T) {
+  (void)M;
+  const int N = e->ne[0], K = e->ne[1], R = 256, TPB = 256, CT = 2;
   const int KC = (K >= 2048 && K % 2048 == 0) ? 2048 : K, nb = KC / Q8_BLK, nch = K / KC;
   const int nblk = ((N + R - 1) / R) * nch;
   const size_t shm = (size_t)CT * nb * 17 * sizeof(__half2);
@@ -1337,7 +1347,7 @@ static int prefill_h2batched(Model& M) {
   printf("bat[0]=%.9g\n", b[0]); fflush(stdout);
   long bad = 0; for (size_t i = 0; i < a.size() && bad < 5; i++) if (memcmp(&a[i], &b[i], 4)) { bad++; if (bad == 1) printf("first diff at %zu: seq=%.9g bat=%.9g\n", i, a[i], b[i]); }
   long nbad = 0; for (size_t i = 0; i < a.size(); i++) nbad += memcmp(&a[i], &b[i], 4) != 0;
-  printf("prefill-h2batched: %s (%ld/%zu differ) seq %.2f ms bat %.2f ms\n", nbad ? "MISMATCH" : "BIT-EXACT", nbad, a.size(), ms, ms2);
+  printf("prefill-h2batched %s: %s (%ld/%zu differ) seq %.2f ms bat %.2f ms\n", e->name.c_str(), nbad ? "MISMATCH" : "BIT-EXACT", nbad, a.size(), ms, ms2);
   fflush(stdout);
   return nbad ? 1 : 0;
 }
