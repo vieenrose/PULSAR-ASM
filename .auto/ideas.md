@@ -1866,3 +1866,37 @@ probe source is in `.auto/attic/fwd35_liv_probe.cu`.
   check mean-count, eps placement, rsqrt, and the weight multiply against Lfm3RMSNorm). Second:
   the Q8 GEMV's row->output-index mapping, which the dequant test cannot see (it validates the
   matrix, not the index map -- a permutation survives every gate that shares the convention).
+
+## Trajectory drift (runs #109-#113): the engine is faithful on-manifold, divergent off-manifold
+
+`.auto/lfm3/traj_drift.py` measures KL(HF || engine) at every state the engine actually
+visits, plus `--on-manifold`, which feeds HF's own golden continuation and scores both sides
+on it. Measured on the shipped arm (48 steps, 6 prompts):
+
+| mode | states | mean KL | top-1 = HF's | slope (nats/token) |
+|---|---|---|---|---|
+| on-manifold (golden fed) | 275 | **0.0012** | **273/275 (99.3%)** | ~0 (+/-3e-5) |
+| free-running (engine's own tokens) | 288 | 2.60 | 151/288 (52%) | **+0.147 median** |
+
+Read together: the arithmetic is faithful wherever HF's own distribution puts weight (KL
+1.2e-3, zero slope over 48 steps, top-1 at 273 of 275 states), and the greedy stream
+divergence is the feedback loop leaving that manifold -- after the first near-tie flip, the
+engine and HF are answering different questions, and KL grows ~0.15 nats/token from there.
+This is what the "0/7 full stream matches" line really means, and teacher-forced gates
+structurally cannot see it (they re-anchor on HF's tokens every position).
+
+- **Open control that decides how to read this: the generic divergence floor.** Run HF at
+  fp32 free-running and score HF-bf16 on the fp32 trajectory. If a *stronger* HF also
+  diverges at ~0.15 nats/token, then +0.147 is what any imperfect decoder does off-manifold
+  and the engine's number is normal, not a defect. Without it we are reading a ratio with no
+  denominator.
+- Gate-design lesson: a growth *ratio* test on near-zero KLs is a false-positive generator
+  (prompt K "failed" at x3.3 growth from 0.0005 to 0.0015). The growth test now requires an
+  absolute late-window floor too (default 0.02; the free-running signal is at 4.3-5.2, 200x
+  above it, so nothing real is masked).
+- Alignment is the whole bug surface for this gate: at free-running step t the engine has
+  consumed prompt_ids + *generated* tokens; the tokens it sampled while consuming the prompt
+  are not context. Feeding HF `toks[:t]` measures a state that never existed (KL 6.6 nats at
+  t=0 against a teacher-forced 0.0014 was the tell).
+- Do not relax the free-running floors to make the gate green. It is a diagnostic that fails
+  on a real property of the shipped engine, disclosed in the README, not a gate to satisfy.
