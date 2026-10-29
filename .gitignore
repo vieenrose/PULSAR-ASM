@@ -11,3 +11,4 @@ __pycache__/
 .auto/lfm3/quant_sensitivity.json
 .auto/lfm3/quant_sensitivity_*.jsonl
 .auto/lfm3/__pycache__/
+.auto/lfm3/hf_logits_*_seq.npy

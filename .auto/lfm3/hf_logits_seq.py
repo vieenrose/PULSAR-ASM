@@ -23,7 +23,7 @@ REPO = "LiquidAI/LFM3-Audio-2B"
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--prompt", default="A")
+    ap.add_argument("--prompt", default="A", help="tag, or comma-separated tags")
     ap.add_argument("--n", type=int, default=23, help="positions to dump (0..n-1)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
@@ -31,25 +31,22 @@ def main():
     import numpy as np
     import torch
     from transformers import AutoModelForMultimodalLM
-    g = json.load(open(os.path.join(HERE, "golden_greedy_%s.json" % a.prompt)))
-    ids = list(g["prompt_ids"])
-    if len(ids) < a.n:
-        print("prompt %s has only %d ids; --n clamped" % (a.prompt, len(ids)))
-        a.n = len(ids)
-
     model = AutoModelForMultimodalLM.from_pretrained(
         REPO, dtype=torch.bfloat16, trust_remote_code=True).to("cuda").eval()
-    lg = []
-    for p in range(a.n):
-        with torch.no_grad():
-            o = model(input_ids=torch.tensor([ids[:p + 1]], device="cuda")).logits[0, -1]
-        lg.append(o.float().cpu().numpy())
-    arr = np.stack(lg).astype(np.float32)
-    out = a.out or os.path.join(HERE, "hf_logits_%s_seq.npy" % a.prompt)
-    np.save(out, arr)
-    print("wrote %s: %s (position p = logits after ids[:p+1], teacher forced)" % (out, arr.shape))
-    top = arr.argmax(-1)
-    print("HF top-1 per position:", " ".join(str(int(t)) for t in top[:12]), "...")
+    for tag in a.prompt.split(","):
+        g = json.load(open(os.path.join(HERE, "golden_greedy_%s.json" % tag)))
+        ids = list(g["prompt_ids"])
+        n = min(a.n, len(ids))
+        lg = []
+        for p in range(n):
+            with torch.no_grad():
+                o = model(input_ids=torch.tensor([ids[:p + 1]], device="cuda")).logits[0, -1]
+            lg.append(o.float().cpu().numpy())
+        arr = np.stack(lg).astype(np.float32)
+        out = a.out if (a.out and len(a.prompt.split(",")) == 1) else \
+            os.path.join(HERE, "hf_logits_%s_seq.npy" % tag)
+        np.save(out, arr)
+        print("wrote %s: %s (position p = logits after ids[:p+1], teacher forced)" % (out, arr.shape))
 
 
 if __name__ == "__main__":
