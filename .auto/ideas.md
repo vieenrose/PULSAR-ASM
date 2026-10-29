@@ -1936,3 +1936,50 @@ Open follow-up, if the quantization ratio is ever worth pushing: the ratio's big
 suspect is the Q8 embedding (the lm_head streams 278 MB/token of Q8 rows at 14 GB/s); the
 certified 8/8 arm (bf16 embeddings) is the variant that isolates it, and it measured
 161.67 ms/token, i.e. +18% -- a quality/latency trade to state, not to chase silently.
+
+## Non-GEMV kernels are NOT a lever (run #115): the KTIME table's 17 ms was an artifact
+
+The serialized per-kernel table (`LFM_KTIME=1`) shows the four per-layer rmsnorms at
+0.125-0.20 ms per call, 96 calls/token, i.e. ~17 ms = 12.5% of the step. That number is
+bogus: every timed launch carries a sync tax, and the same table's GEMV rows alone sum to
+~139 ms against a 136.3 ms step, so ~+20 us per launch is instrumentation, not work.
+
+Priced directly with a timing-only ablation (`LFM_ABLATE=1`, skips the rmsnorm launches;
+**output is invalid** - attribution probe, never a runnable configuration):
+
+    arm1 (shipping)          median 137.44 ms/token
+    arm2 (LFM_ABLATE=1)      median 136.70 ms/token
+    R = 1.0027  ->  all 96 rmsnorm launches cost 0.74 ms/token = 0.54%
+
+So norm fusion (the natural move: fuse `post_op_norm`+`add1` and `post_ffn_norm`+`add2`)
+recovers at most ~0.5%, and the obvious pair `post_op_norm`+`ffn_norm` is NOT fusable at
+all - `ffn_norm` reads `x` *after* `add1` has consumed `post_op_norm`'s output, so they are
+dependent, not the independent adjacent pair the call sites look like. Not worth touching
+bit-exact normalization code for.
+
+Consequence for the search: the GEMVs are ~97% of the step and are a characterized optimum
+under ten structural probes. The small-kernel surface is closed too. Remaining levers are
+environmental (the Nano reboot to de-bias the config absolutes) and quality-side, not
+latency-side.
+
+## The Q8-embedding is NOT the divergence source (run #116): the +18% arm is priced and declined
+
+`divergence_floor.py --prompt A,C` against the certified blob (`lfm3-audio-2b-cert.lfm3q8`,
+bf16 embeddings, Q8 linears) vs the shipping blob (Q8 embeddings, Q8 linears), same fp16-HF
+trajectory, same bf16 floor:
+
+| prompt | bf16 floor | Q8-emb (shipping) | bf16-emb (cert arm) |
+|---|---|---|---|
+| A | 0.0004 | 0.0013 (3.3x) | 0.0012 (3.0x) |
+| C | 0.0002 | 0.0005 (2.5x) | 0.0003 (1.5x) |
+
+Swapping the embedding quantization changes the ratio by ~8% on A and ~40% on C - small,
+prompt-dependent, and the two arms are within noise of each other on A. So the engine's
+excess over the pure-quantization floor is carried by the **Q8 linears and the ggml
+summation order**, which are identical in both blobs. The embedding hypothesis is dead.
+
+Priced decision: the certified arm costs 161.67 vs 136.30 ms/token (+18.6%) for a top-1 of
+48/48 vs 47/48 and this marginal KL change. Declined; shipping default stays the Q8-embedding
+blob. If a future objective wants the last token of fidelity, this is the lever and it costs
+one sixth of the step - and the remaining 2-3x ratio is NOT reachable by dequantizing the
+embedding, which is where it would have been cheapest.

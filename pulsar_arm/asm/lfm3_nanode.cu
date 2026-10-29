@@ -1366,7 +1366,15 @@ static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf)
 }
 // GEMV with an explicit input width (the 2048-wide h1 feeding a 512-column
 // projection is normal; the weight's own K is authoritative).
+// LFM_ABLATE=1 skips the 96 per-token rmsnorm launches. The OUTPUT IS THEN
+// WRONG -- this is a timing attribution probe, not a runnable configuration:
+// its only purpose is to price those kernels so fusion work is sized against a
+// measured number instead of the serialized KTIME table, whose per-launch
+// values carry a sync tax (its GEMV rows alone sum past the real step cost).
+// Default off; the gates must never be run with it.
+static const bool g_ablate_norm = getenv("LFM_ABLATE") != nullptr;
 static void rms1(Model& M, const bf16* x, const float* w, bf16* y) {
+  if (g_ablate_norm) return;
   k_rmsnorm<<<1, 256, 0, g_launch>>>(x, w, y, NORM_EPS, H);
 }
 static void emul(Model& M, const bf16* a, const bf16* b, bf16* y, int n) {
