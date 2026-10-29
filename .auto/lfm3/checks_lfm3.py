@@ -91,6 +91,81 @@ def gate_logits0():
           % (top_e, top_h, corr, a.std(), b.std()))
 
 
+def gate_logits_seq(n=23, k=8):
+    """Per-position top-1 / top-k coverage / correlation / KL vs HF, over the
+    whole teacher-forced prefix of prompt A.
+
+    Why this gate exists: the greedy stream gate scores 1-2 matching tokens out
+    of 16 on every prompt and 0/7 prompts fully match, so it is nearly blind to
+    summation-order changes -- the __fmaf_rn switch that bought -2.0% left all
+    16 stream tokens unchanged. Position-wise continuous metrics turn a cliff
+    into a slope: a regression shows up as a shift in top-1 agreement, top-k
+    coverage, correlation or KL, where a stream prefix cannot move.
+
+    The thresholds are a REGRESSION RATCHET measured on the shipped arm, not a
+    quality claim: passing means 'no worse than the arm this gate was written
+    on'. Every number is printed on every run, so drift is visible even when it
+    passes. HF is teacher forced on ids[:p+1], the same convention the matrix
+    gate uses; the engine's --dump-logits-all appends one VOCAB-float vector per
+    decode step, so row p is position p.
+    """
+    ref = os.path.join(HERE, "hf_logits_A_seq.npy")
+    if not os.path.exists(ref):
+        FAIL.append("logits-seq: %s missing (run .auto/lfm3/hf_logits_seq.py)" % ref)
+        return
+    hf = np.load(ref)
+    n = min(n, hf.shape[0])
+    ids = ids_of("A")["prompt_ids"][:n]
+    run_remote("cd %s && rm -f lgall.bin" % DIR)
+    out = run_remote("cd %s && timeout 1800 ./%s %s --steps %d --prompt %s "
+                     "--dump-logits-all lgall.bin >/dev/null 2>&1; ls -l lgall.bin 2>&1"
+                     % (DIR, BIN, BLOB, n, ",".join(map(str, ids))))
+    if "lgall.bin" not in out:
+        FAIL.append("logits-seq: no dump produced (%s)" % out.strip()[:80]); return
+    subprocess.run(["scp", "-o", "ConnectTimeout=20", "-q", "%s:%s/lgall.bin" % (NANO, DIR),
+                    "/tmp/lgall.bin"], check=False, timeout=300)
+    a = np.fromfile("/tmp/lgall.bin", dtype=np.float32)
+    if a.size != n * hf.shape[1]:
+        FAIL.append("logits-seq: dump is %d floats, expected %d (%d positions x vocab %d)"
+                    % (a.size, n * hf.shape[1], n, hf.shape[1])); return
+    eng = a.reshape(n, hf.shape[1])
+
+    def softmax(v):
+        m = v.max(-1, keepdims=True)
+        e = np.exp(v - m)
+        return e / e.sum(-1, keepdims=True)
+
+    same, cov, corrs, kls, worst = 0, 0, [], [], None
+    for p in range(n):
+        e, h = eng[p], hf[p]
+        te, th = int(e.argmax()), int(h.argmax())
+        same += int(te == th)
+        # HF's top-1 inside the engine's top-k, and the reverse: catches a
+        # near-tie that top-1 alone reports as a hard miss.
+        cov += int(th in np.argpartition(e, -k)[-k:]) + int(te in np.argpartition(h, -k)[-k:])
+        corrs.append(float(np.corrcoef(e, h)[0, 1]))
+        pe, ph = softmax(e), softmax(h)
+        kls.append(float(np.sum(ph * (np.log(ph + 1e-30) - np.log(pe + 1e-30)))))
+        if worst is None or kls[-1] > worst[1]:
+            worst = (p, kls[-1], te, th)
+    ntop, ncov, mcorr, mkl = same / n, cov / (2 * n), sum(corrs) / n, sum(kls) / n
+    # Floors sit one step below a measured clean pass, so a single lost top-1
+    # position warns and two fails. See the measured line printed below.
+    if same < n - 1:
+        FAIL.append("logits-seq: top-1 agreement %d/%d positions (worst KL %.4f at pos %d, "
+                    "engine %d vs HF %d)" % (same, n, worst[1], worst[0], worst[2], worst[3]))
+    if ncov < 1.0:
+        FAIL.append("logits-seq: top-%d coverage %.3f < 1.0" % (k, ncov))
+    if mcorr < 0.999:
+        FAIL.append("logits-seq: mean corr %.5f < 0.999 (min %.5f)" % (mcorr, min(corrs)))
+    if mkl > 0.05:
+        FAIL.append("logits-seq: mean KL %.4f > 0.05 (max %.4f at pos %d)"
+                    % (mkl, max(kls), int(np.argmax(kls))))
+    print("  logits-seq: %d/%d top-1, top-%d cov %.3f, corr %.5f (min %.5f), "
+          "KL %.4f (max %.4f @pos %d)"
+          % (same, n, k, ncov, mcorr, min(corrs), mkl, max(kls), int(np.argmax(kls))))
+
+
 def gate_streams(prompts, gen=16, floor=1):
     """Greedy stream vs the HF goldens.
 
@@ -160,6 +235,7 @@ if __name__ == "__main__":
     print("== gate: %s / %s ==" % (BLOB, BIN))
     gate_matrix()
     gate_logits0()
+    gate_logits_seq()
     gate_streams(prompts)
     if FAIL:
         print("\nCHECKS FAILED (%d):" % len(FAIL))

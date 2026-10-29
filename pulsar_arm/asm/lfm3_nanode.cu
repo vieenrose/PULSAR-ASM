@@ -1429,6 +1429,7 @@ int main(int argc, char** argv) {
   int steps = 8; bool trace = false;
   int lm_rows_override = 0, emb_mode_req = 0, probe_layer = 0, probe_step = 0;
   const char* dump_logits = nullptr;
+  const char* dump_logits_all = nullptr;   // every decode step, appended (gate: top-k vs HF)
   std::vector<int> prompt;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
@@ -1440,6 +1441,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--merge")) g_merge = true;   // merged gate/up GEMV
     else if (!strcmp(argv[i], "--lmrows") && i + 1 < argc) lm_rows_override = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump_logits = argv[++i];
+    else if (!strcmp(argv[i], "--dump-logits-all") && i + 1 < argc) dump_logits_all = argv[++i];
     else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) {
       char* s = argv[++i];
       while (*s) { prompt.push_back((int)strtol(s, &s, 10)); if (*s == ',') s++; }
@@ -1862,6 +1864,17 @@ int main(int argc, char** argv) {
     cudaMemcpy(&nt, M.tok_dev, 4, cudaMemcpyDeviceToHost);
     toks.push_back(nt);
     phEnd(g_tHead);
+    // --dump-logits-all appends EVERY step's logits, so the gate can compare
+    // the whole teacher-forced prefix, not just position 0. Greedy stream
+    // prefixes are 1-2 tokens of 16 and 0/7 prompts fully match, so the stream
+    // gate cannot see a quality regression from an accumulation change; a
+    // per-position top-k / correlation / KL comparison can.
+    if (dump_logits_all) {
+      std::vector<float> lg(VOCAB);
+      cudaMemcpy(lg.data(), M.lgf, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost);
+      FILE* g = fopen(dump_logits_all, "ab");
+      if (g) { fwrite(lg.data(), 4, VOCAB, g); fclose(g); }
+    }
     if (dump_logits && s == steps - 1) {
       std::vector<float> lg(VOCAB);
       cudaMemcpy(lg.data(), M.lgf, (size_t)VOCAB * 4, cudaMemcpyDeviceToHost);
