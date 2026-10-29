@@ -2289,3 +2289,20 @@ Measured against the HF repo (host, for scoping -- numbers do not transfer to th
   before the first real output token, plus answer decode, plus the unported encoder (109.5M)
   and depth decoder (83.9M + codec). Prefill batching's prize at audio scale is tens of
   seconds, not the 0.13 s visible on the 23-token benchmark.
+
+## Fused H2 rescale killed by construction, without building (run #153 analysis)
+
+Considered fusing H2 == 2's rescale scan into the staging/dot loop to recover H2 == 1's -5.6%
+while keeping exactness. It cannot work, for three structural reasons:
+
+1. Same global reads: H2 == 2's scan reads x once from global -- exactly like any staging.
+   There is no second global pass to eliminate; a fused version reads the same bytes.
+2. Irreducible per-element scale cost: applying 2^k needs a multiply per converted element
+   (or HMUL2, which needs k in [-24,15] and breaks on the tiny inputs this exists for).
+   H2 == 1 has no per-element scale at all.
+3. The max itself is a serial fmaxf chain (loop-carried dependency, ~4 cycles each); an
+   exponent-OR variant saves the frexp but not the chain, and OR can only underestimate the
+   range (safe direction, but then it is just a clumsier H2 == 1).
+H2 == 2 as landed IS the fused-optimal form (single global read, cooperative scan). The -0.4%
+vs -5.6% gap is the scan's ALU cost, and no restructuring removes it. If the safe version must
+be faster, that needs hardware counters on the scan loop, not another variant.
