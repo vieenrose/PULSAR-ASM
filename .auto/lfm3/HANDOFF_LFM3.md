@@ -54,6 +54,23 @@ Quality (all closed, gates green on fresh builds, #166):
 3. Audio path port (encoder + depth decoder) — scoped in #153/#157, outside
    this metric.
 
+## Board-state / DVFS findings (this block, #203-#216)
+
+- H2's win is context-length-dependent: -5.7% at 23 pos (hot-board control
+  #205), **-7.8..-8.0% at 300/360 pos** (order-balanced pairs, two days,
+  #203/#206) = ~2.7 s saved per 30-s-query prefill. In-run decomposition
+  (#208): per-step saving grows 5.57 -> 7.93 ms with position. Power/clock
+  coupling REFUTED (devfreq GPU clock identical 922 MHz both arms, #209);
+  leading mechanism is CPU/GPU pipeline overlap with the growing CPU-side
+  attention path.
+- Cold-board TTFT: idle boards start at 76.8-153.6 MHz; the ~5-24 s devfreq
+  ramp lands inside the measured window (+1% at 8-min idle, +7% on drift
+  days, #210). `LFM_WARMMS=N` (default 0, #211/#212) absorbs the ramp in
+  the unmeasured warm-up; neutral in the normal state, gates green (#215),
+  RSS stable (#216). Acceptance test for the +7% case: pair on a drift day.
+- /tmp/poller.sh + /tmp/clkrun.sh on the Nano sample the GPU clock (tail -f
+  on sysfs does NOT work; EMC is not readable unprivileged, #214).
+
 ## Harness
 
 - `bash .auto/lfm3/checks.sh` — full gates (rebuilds from tree).
