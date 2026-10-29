@@ -1900,3 +1900,39 @@ structurally cannot see it (they re-anchor on HF's tokens every position).
   t=0 against a teacher-forced 0.0014 was the tell).
 - Do not relax the free-running floors to make the gate green. It is a diagnostic that fails
   on a real property of the shipped engine, disclosed in the README, not a gate to satisfy.
+
+## The divergence floor (run #114): what a known perturbation does, and what the engine does
+
+`.auto/lfm3/divergence_floor.py` scores three models on ONE token sequence (the reference's
+own greedy trajectory), so all arms see identical states:
+
+reference = HF **fp16** (chosen because fp32 does not fit: the host's GPUs have 1.9 GiB and
+1.3 GiB free and the fp32 model needs 5.7 GiB -- it OOMs. fp16 has a 10-bit mantissa vs
+bf16's 7, so it is the strictly more precise reference that fits, which makes the bf16 arm a
+quantization perturbation of *known size* -- the denominator this experiment exists for).
+
+| prompt | bf16 HF (quantization floor) | engine Q8 (same states) | ratio | top-1 |
+|---|---|---|---|---|
+| A | KL 0.0004, slope -1e-5 | KL 0.0013, slope +1e-5 | 3.3x | 47/48 both |
+| C | KL 0.0002, slope -1e-5 | KL 0.0005, slope -2e-5 | 2.5x | 47/48 both |
+| K | KL 0.0003, slope  0     | KL 0.0006, slope +2e-5 | 2.0x | 47/48 both |
+
+Three conclusions, and they close the quality investigation:
+
+1. **On a shared trajectory nothing grows.** Slopes are +-1e-5 nats/token for both the
+   pure-quantization arm and the engine. So the +0.147 nats/token measured by traj_drift in
+   free-running mode is NOT quantization drift -- it is trajectory divergence: once each
+   model picks its own tokens, the states themselves differ, and state divergence dominates
+   per-state logit perturbation. That is a measurement effect of comparing free-running
+   streams, and it is the right reading of "0/7 full stream matches".
+2. **The engine's per-state error is 2-3x the bf16 rounding of the same weights**, same order
+   of magnitude, identical top-1 agreement (47/48). That is the quantitative cost of Q8
+   linears + fp32 scales + ggml summation order, against the best perturbation achievable by
+   merely rounding the same model.
+3. **Top-1 agreement is 47/48 for both arms on all three prompts** -- the engine loses the
+   same single near-tie position bf16 loses. It is not losing positions the bf16 model wins.
+
+Open follow-up, if the quantization ratio is ever worth pushing: the ratio's biggest
+suspect is the Q8 embedding (the lm_head streams 278 MB/token of Q8 rows at 14 GB/s); the
+certified 8/8 arm (bf16 embeddings) is the variant that isolates it, and it measured
+161.67 ms/token, i.e. +18% -- a quality/latency trade to state, not to chase silently.
