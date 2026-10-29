@@ -44,7 +44,10 @@ Board state (audited, not changed): `nvpmodel` MAXN, but clocks are **not pinned
 governor `schedutil`, GPU governor `nvhost_podgov`, ranging 76.8 MHz idle to 921.6 MHz under
 load. That is a mechanistic source of the drift (clock ramp on first kernels, which is part
 of what the load-time warm-up pays for) and a reason the absolutes here would not reproduce
-on a clock-locked board. Three unreapable `lfm3_conv_test` zombies keep 3 of 4 A57 cores
+on a clock-locked board. At run lengths >=60 s the state can shift ~15% between consecutive
+runs (#227: shipped 1000-token samples {105.1, 120.8} s), so ratios at that length need >=3
+samples per arm and best-of comparisons -- single pairs are not informative there.
+Three unreapable `lfm3_conv_test` zombies keep 3 of 4 A57 cores
 spinning permanently (thermal pressure plus the load average ~3.2); #118 showed they do not
 affect decode, but they are part of the thermal backdrop. Clocks were deliberately left
 unlocked so every number stays comparable with the session baseline.
