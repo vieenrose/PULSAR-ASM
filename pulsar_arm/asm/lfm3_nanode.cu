@@ -1956,7 +1956,17 @@ int main(int argc, char** argv) {
   // Measured (#138, paired 4/4, order-balanced, cold page cache): TTFT on
   // prompt A 2649.3 -> 2589.6 ms (-59.8 ms); 40-step streams identical.
   const bool warm = getenv("LFM_NOWARM") == nullptr && !g_graphs;
-  for (int s = warm ? -1 : 0; s < steps; s++) {
+  // LFM_WARMMS=N (default 0 = shipped behavior): keep running dummy forwards
+  // at position 0 until N ms of wall-clock GPU load, absorbing the devfreq
+  // DVFS ramp the same way the single step absorbs the page cache. Measured
+  // (run #210/#211): an idle-start board sits at 76.8-153.6 MHz for the first
+  // ~5-24 s; the 97 ms single warm-up step cannot complete that ramp, so a
+  // cold-board TTFT pays ~+7% in the measured window. A server pays the ramp
+  // once at startup -- this moves it out of the query path.
+  const double warmms = warm ? atof(getenv("LFM_WARMMS") ? getenv("LFM_WARMMS") : "0") : 0.0;
+  struct timespec tw0; clock_gettime(CLOCK_MONOTONIC, &tw0);
+  int nwarm = 0;
+  for (int s = warm ? -1 : 0; s < steps || s < 0; s++) {
     const int pos = s < 0 ? 0 : s;
     const int tok = s < 0 ? 124894 : toks[s];
     const bf16* lm_head_input = M.x;   // replaced by the embedding_norm output below
@@ -2216,6 +2226,14 @@ int main(int argc, char** argv) {
       cudaMemset(M.kc, 0, kvbytes); cudaMemset(M.vc, 0, kvbytes);
       cudaDeviceSynchronize();
       g_tEmb = g_tConv = g_tAttn = g_tNorm = g_tHead = 0;
+      nwarm++;
+      if (warmms > 0) {
+        struct timespec tw; clock_gettime(CLOCK_MONOTONIC, &tw);
+        double el = (tw.tv_sec - tw0.tv_sec) * 1e3 + (tw.tv_nsec - tw0.tv_nsec) * 1e-6;
+        if (el < warmms) { s = -2; continue; }   // keep ramping (any s<0 is a dummy step)
+        printf("warm-up: %d steps, %.0f ms GPU load (DVFS ramp absorbed; state reset)\n", nwarm, el);
+        continue;
+      }
       printf("warm-up step %.2f ms (load time, not part of TTFT; state reset)\n", wms);
       continue;
     }
