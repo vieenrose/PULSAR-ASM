@@ -2195,3 +2195,15 @@ not overlap) and S/2 coprime to 32 (consecutive lanes must land on distinct bank
 mod 4). S = 34 is minimal: 8.7 KB at CT=2, which is #137's design (1.02x). There is no smaller
 conflict-free layout for warp-strided-b x reads, so same-arithmetic prefill batching is closed
 at ~1.0x from both sides (occupancy via padding, conflicts via stride).
+
+## Norm skip on lm_head-skipped prompt steps: exact, but unresolvable from noise (run #146, discarded)
+
+With fixed feeding, prompt steps 0..n-2 skip the lm_head, which makes the final embedding_norm dead
+too (its output feeds only the lm_head). Skipping it as well is exact by construction -- and the
+40-step generated streams are identical with/without the skip. But the paired A/B (same session,
+order-balanced, cold page cache) is null: keep-norm median 2266.94 vs skip-norm 2267.86 ms TTFT
+(R=0.9998, skip faster in 3/4, delta 0.9 ms = 0.04%). The ~8 ms gap seen the day before was
+board drift between sessions, not the norm: lesson re-learned -- never compare across sessions.
+Reverted: the tree keeps measured wins only, and ~1 ms expected savings (22 launches + 22 x 16 KB
+passes) is below what this board resolves. The 10-line patch is trivial to resurrect if a future
+pass ever needs the launch count down.
