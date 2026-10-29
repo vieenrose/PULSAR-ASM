@@ -2364,3 +2364,11 @@ range exposure; rescaled H2 keeps the range guarantee but now fails the F floor 
 while costing the whole speedup. Neither dominates; shipped stays default. Do not soften
 the floor to accommodate H2=2 -- the floor is the arm's certified worst case, and H2=2's
 misses are the same near-ties the floor exists to surface without failing on.
+
+## Thermal vs attention, disambiguated (run #157): the long-range growth is positional
+
+Back-to-back 300-id runs (hot board throughout run 2): run1 first-10 = 97.94, run2 first-10 =
+97.83 -- identical. If thermal throttling caused the position-dependent slowdown, run 2 would
+start slow. It does not. The +5% growth over 300 positions here (+14% on the day of #150 --
+magnitude varies with board state) is attention/KV growth, not heat. Either way the GEMV
+phase dominates and no lever follows; this only prevents misattribution.
