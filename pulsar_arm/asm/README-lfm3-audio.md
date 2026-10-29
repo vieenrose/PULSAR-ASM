@@ -46,14 +46,15 @@ both arms, each pair in both orders, `R = sqrt(o1/o2)`), never a comparison acro
 parts sum to ~145.8 ms against a 136.3 ms whole — read the split, not the sum.
 
 ```
-per-phase ms/token (LFM_TIME)                     bytes/token   effective GB/s
-conv layers (13)     ████████████████████████████████░░  70.6     ~715 MB       9.4→10.1
-attention (11)       ███████████████████████░░░░░░░░░░░  56.6     ~545 MB       9.0→ 9.6
-lm_head              █████████░░░░░░░░░░░░░░░░░░░░░░░░░  18.5     278 MB        14.0
-final norm           ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.1
-embedding            ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.0
-                     0        15       30       45       60      70 ms
-```
+per-phase ms/token (LFM_TIME)          bytes/token  GB/s   [ 1 block = 2 ms ]
+conv layers (13)  ███████████████████████████████████░  70.6     ~715 MB  9.4→10.1
+attention (11)    ████████████████████████████░░░░░░░░  56.6     ~545 MB  9.0→ 9.6
+lm_head           █████████░░░░░░░░░░░░░░░░░░░░░░░░░░░  18.5      278 MB      14.0
+final norm        ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.1        4 KB         —
+embedding         ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   0.0        4 KB         —
+
+Same scale for every row: conv 35 blocks, attention 28, lm_head 9. Parts sum to ~145.8
+ms against a 136.3 ms whole because each phase timer carries its own sync.
 
 The plan's budget assumed the lm_head was ~half the step. It is **14%**, and it already runs at
 14 GB/s against a **measured 17 GB/s streaming ceiling** on this board — which is why tuning the
