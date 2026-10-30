@@ -1220,7 +1220,7 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
 // acc interleaved by block parity, halving BOTH dependency depths. ARM=1 changes
 // the summation parenthesization, so the harness pairs it against ITS OWN T=1
 // launches (batch-correctness) and prints the ARM0-vs-ARM1 relative delta.
-template <typename TX, int CT, bool H2, int ARM>
+template <typename TX, int CT, bool H2, int ARM, int RB = 2, int GRP = 4>
 __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ xall, float* __restrict__ part,
                            int N, int K, int KCHUNK, int R, int nb, int T) {
@@ -1252,6 +1252,201 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
       }
     }
     __syncthreads();
+    float acc5[GRP][CT];
+#pragma unroll
+    for (int gg = 0; gg < GRP; gg++)
+#pragma unroll
+      for (int cc = 0; cc < CT; cc++) acc5[gg][cc] = 0.f;
+    if (ARM == 5) {
+      // x into REGISTERS, rows inner. LSU accounting for w2 at CT=4: 64 shared
+      // half2 loads per (b,row) x GR=32 rows x nb=120 x 128 warps = 31.5M
+      // warp-cycles of shared-load issue on 4 SMs ~= 7.9 ms of the measured
+      // 11.7 ms -- the LSU is ~2/3 of the time. ARM3 cut that traffic by 2x but
+      // paid more in other instructions; here x is loaded ONCE per (b,c) into
+      // 16 registers and reused by all GR rows of the warp, so shared loads per
+      // b are CT*16 INDEPENDENT of GR. Requires small GR (rows/warp), which the
+      // harness sets with R = WPB*RPB; weight global traffic grows CT-fold, and
+      // the stream is at 8% of bandwidth, so that is the cheap side.
+      // Per (row,c) the k-chain order is ARM0's -> bit-exact by construction.
+      if (GR != GRP) continue;   // harness sets R = WPB*RPB; guard against mismatch
+      for (int b = lane; b < nb; b += 32) {
+#pragma unroll
+        for (int c = 0; c < CT; c++) {
+          const __half2* xb2 = xh + ((size_t)c * nb + (size_t)b) * 17;
+          __half2 x[16];
+#pragma unroll
+          for (int k = 0; k < 16; k++) x[k] = xb2[k];
+#pragma unroll
+          for (int g = 0; g < GRP; g++) {
+            const int r = wid + g * WPB, row = base + r;
+            if (row >= N) continue;
+            const int8_t* qr = q + (size_t)row * K + koff + (size_t)b * Q8_BLK;
+            const int4 a0 = *reinterpret_cast<const int4*>(qr);
+            const int4 a1 = *reinterpret_cast<const int4*>(qr + 16);
+            const uint32_t w[8] = {(uint32_t)a0.x, (uint32_t)a0.y, (uint32_t)a0.z, (uint32_t)a0.w,
+                                   (uint32_t)a1.x, (uint32_t)a1.y, (uint32_t)a1.z, (uint32_t)a1.w};
+            __half2 h2 = __floats2half2_rn(0.f, 0.f);
+#pragma unroll
+            for (int k = 0; k < 8; k++) {
+              const uint32_t u = w[k] ^ 0x80808080u;
+              const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+              const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+              h2 = __hfma2(__hsub2(*reinterpret_cast<const __half2*>(&lo), off), x[2 * k], h2);
+              h2 = __hfma2(__hsub2(*reinterpret_cast<const __half2*>(&hi), off), x[2 * k + 1], h2);
+            }
+            const float2 f = __half22float2(h2);
+            const float* sr = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb + b;
+            acc5[g][c] = __fmaf_rn(sr[0], f.x + f.y, acc5[g][c]);
+          }
+        }
+      }
+#pragma unroll
+      for (int g = 0; g < GRP; g++) {
+        const int r = wid + g * WPB, row = base + r;
+#pragma unroll
+        for (int c = 0; c < CT; c++) {
+          float v = (row < N) ? acc5[g][c] : 0.f;
+          for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+          if (lane == 0 && row < N && t0 + c < T)
+            part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
+        }
+      }
+      continue;
+    }
+    if (ARM == 4) {
+      // Software-pipelined ARM0: the b loop is serial and each iteration's two
+      // int4 weight loads feed a ~48-op dependent chain, with no overlap across
+      // b. w2 streams at 1.34 GB/s = 8% of the measured 17 GB/s ceiling, while
+      // ARM2 (no conversions, 66% occ) and ARM3 (2x less shared traffic, no
+      // spills) both failed to help -- the signature is load latency, not ops.
+      // Here the b+32 load is issued BEFORE the current b's compute. Values are
+      // ARM0's exactly -> bit-exact by construction, and verified.
+      for (int g = 0; g < GR; g++) {
+        const int r = wid + g * WPB, row = base + r;
+        float acc4[CT];
+#pragma unroll
+        for (int c = 0; c < CT; c++) acc4[c] = 0.f;
+        if (row < N) {
+          const int8_t* qr = q + (size_t)row * K + koff;
+          const float* sr = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb;
+          int4 a0 = *reinterpret_cast<const int4*>(qr + (size_t)lane * Q8_BLK);
+          int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)lane * Q8_BLK + 16);
+          for (int b = lane; b < nb; b += 32) {
+            int4 n0, n1;
+            if (b + 32 < nb) {
+              n0 = *reinterpret_cast<const int4*>(qr + (size_t)(b + 32) * Q8_BLK);
+              n1 = *reinterpret_cast<const int4*>(qr + (size_t)(b + 32) * Q8_BLK + 16);
+            }
+            const uint32_t w[8] = {(uint32_t)a0.x, (uint32_t)a0.y, (uint32_t)a0.z, (uint32_t)a0.w,
+                                   (uint32_t)a1.x, (uint32_t)a1.y, (uint32_t)a1.z, (uint32_t)a1.w};
+            const float sb = sr[b];
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              const __half2* xb2 = xh + ((size_t)c * nb + (size_t)b) * 17;
+              __half2 h2 = __floats2half2_rn(0.f, 0.f);
+#pragma unroll
+              for (int k = 0; k < 8; k++) {
+                const uint32_t u = w[k] ^ 0x80808080u;
+                const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+                h2 = __hfma2(__hsub2(*reinterpret_cast<const __half2*>(&lo), off), xb2[2 * k], h2);
+                h2 = __hfma2(__hsub2(*reinterpret_cast<const __half2*>(&hi), off), xb2[2 * k + 1], h2);
+              }
+              const float2 f = __half22float2(h2);
+              acc4[c] = __fmaf_rn(sb, f.x + f.y, acc4[c]);
+            }
+            a0 = n0; a1 = n1;
+          }
+        }
+#pragma unroll
+        for (int c = 0; c < CT; c++) {
+          float v = (row < N) ? acc4[c] : 0.f;
+          for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+          if (lane == 0 && row < N && t0 + c < T)
+            part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
+        }
+      }
+      continue;
+    }
+    if (ARM == 3) {
+      // Register-blocked rows: RB rows share ONE x load per (b,c,k). In ARM0-2
+      // the g-loop is outside the b-loop, so every row re-reads the whole x
+      // block from shared -- R/WPB x redundant shared traffic, and the ARM2
+      // result (fewer registers, higher occupancy, SLOWER) rules out conversion
+      // work and occupancy as binders, which leaves this traffic. Per (row,c)
+      // the k-chain order is unchanged -> bit-exact by construction, verified.
+      for (int rb = 0; rb < GR; rb += RB) {
+        float acc3[RB][CT];
+        __half2 h3[RB][CT];
+        const int8_t* qr[RB]; const float* srp[RB]; bool act[RB];
+#pragma unroll
+        for (int rr = 0; rr < RB; rr++) {
+          const int row = base + wid + (rb + rr) * WPB;
+          act[rr] = row < N;
+#pragma unroll
+          for (int c = 0; c < CT; c++) { acc3[rr][c] = 0.f; h3[rr][c] = __floats2half2_rn(0.f, 0.f); }
+          srp[rr] = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb;
+          qr[rr]  = q + (size_t)row * K + koff;
+        }
+        for (int b = lane; b < nb; b += 32) {
+          int4 wq[RB], wl[RB];
+#pragma unroll
+          for (int rr = 0; rr < RB; rr++)
+            if (act[rr]) {
+              const int8_t* p = qr[rr] + (size_t)b * Q8_BLK;
+              wq[rr] = *reinterpret_cast<const int4*>(p);
+              wl[rr] = *reinterpret_cast<const int4*>(p + 16);
+            }
+          const __half2* pb = xh + (size_t)b * 17;
+          const size_t stride = (size_t)nb * 17;
+#pragma unroll
+          for (int k = 0; k < 8; k++) {
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              const __half2 xl = pb[(size_t)c * stride + 2 * k];
+              const __half2 xv = pb[(size_t)c * stride + 2 * k + 1];
+#pragma unroll
+              for (int rr = 0; rr < RB; rr++) {
+                if (!act[rr]) continue;
+                const int8_t* cw = reinterpret_cast<const int8_t*>(&wq[rr]) + 4 * k;
+                const int8_t* cv = reinterpret_cast<const int8_t*>(&wl[rr]) + 4 * k;
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                  const uint32_t u = (uint32_t)(uint8_t)cw[j] ^ 0x80u;
+                  const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                  h3[rr][c] = __hfma2(__hsub2(*reinterpret_cast<const __half2*>(&lo), off), xl, h3[rr][c]);
+                  const uint32_t v = (uint32_t)(uint8_t)cv[j] ^ 0x80u;
+                  const uint32_t hi = __byte_perm(v, 0x64646464u, 0x4140);
+                  h3[rr][c] = __hfma2(__hsub2(*reinterpret_cast<const __half2*>(&hi), off), xv, h3[rr][c]);
+                }
+              }
+            }
+          }
+#pragma unroll
+          for (int rr = 0; rr < RB; rr++) {
+            if (!act[rr]) continue;
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              const float2 f = __half22float2(h3[rr][c]);
+              acc3[rr][c] = __fmaf_rn(srp[rr][b], f.x + f.y, acc3[rr][c]);
+              h3[rr][c] = __floats2half2_rn(0.f, 0.f);
+            }
+          }
+        }
+#pragma unroll
+        for (int rr = 0; rr < RB; rr++) {
+          const int row = base + wid + (rb + rr) * WPB;
+#pragma unroll
+          for (int c = 0; c < CT; c++) {
+            float v = act[rr] ? acc3[rr][c] : 0.f;
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+            if (lane == 0 && act[rr] && t0 + c < T)
+              part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
+          }
+        }
+      }
+      continue;
+    }
     for (int g = 0; g < GR; g++) {
       const int r = wid + g * WPB, row = base + r;
       float acc[CT][2];          // [c][block-parity chain]; ARM0 uses [0] only
@@ -1265,13 +1460,69 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
           const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
           const uint32_t w[8] = {(uint32_t)a0.x, (uint32_t)a0.y, (uint32_t)a0.z, (uint32_t)a0.w,
                                  (uint32_t)a1.x, (uint32_t)a1.y, (uint32_t)a1.z, (uint32_t)a1.w};
-          const int pi = ARM ? ((b >> 5) & 1) : 0;   // ARM0: constant 0, folds away
+          const int pi = (ARM == 1) ? ((b >> 5) & 1) : 0;   // ARM0/2: constant 0, folds away
+          if (ARM == 2) {
+            // ARM=2: convert the weights ONCE per b and interleave the CT h2
+            // chains across k. ARM=0 rebuilds cl/ch inside the c loop (CT x the
+            // conversion work) and runs each c's 16-deep hfma2 chain back-to-back
+            // with no overlap. Per-c chain ORDER is unchanged, so the arithmetic
+            // is identical to ARM=0 -- bit-exactness is by construction, and
+            // ARM2-vs-ARM0 max-rel is an external check that should be exactly 0.
+            if (H2) {
+              __half2 cl[8], ch[8];
+#pragma unroll
+              for (int k = 0; k < 8; k++) {
+                const uint32_t u = w[k] ^ 0x80808080u;
+                const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+                cl[k] = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+                ch[k] = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+              }
+              const __half2* pb = xh + (size_t)b * 17;
+              const size_t stride = (size_t)nb * 17;
+              __half2 h2[CT];
+#pragma unroll
+              for (int c = 0; c < CT; c++) h2[c] = __floats2half2_rn(0.f, 0.f);
+#pragma unroll
+              for (int k = 0; k < 8; k++) {
+#pragma unroll
+                for (int c = 0; c < CT; c++) {
+                  h2[c] = __hfma2(cl[k], pb[(size_t)c * stride + 2 * k], h2[c]);
+                  h2[c] = __hfma2(ch[k], pb[(size_t)c * stride + 2 * k + 1], h2[c]);
+                }
+              }
+#pragma unroll
+              for (int c = 0; c < CT; c++) {
+                const float2 f = __half22float2(h2[c]);
+                acc[c][0] = __fmaf_rn(sr[b], f.x + f.y, acc[c][0]);
+              }
+            } else {
+              const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
+              const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+              float wv[32];
+#pragma unroll
+              for (int j = 0; j < 16; j++) wv[j] = (float)c0[j];
+#pragma unroll
+              for (int j = 0; j < 16; j++) wv[16 + j] = (float)c1[j];
+#pragma unroll
+              for (int c = 0; c < CT; c++) {
+                const float* xb = xf + (((size_t)c * nb) + (size_t)b) * 33;
+                float dot = 0.f;
+#pragma unroll
+                for (int j = 0; j < 16; j++) dot = __fmaf_rn(wv[j], xb[j], dot);
+#pragma unroll
+                for (int j = 0; j < 16; j++) dot = __fmaf_rn(wv[16 + j], xb[16 + j], dot);
+                acc[c][0] = __fmaf_rn(sr[b], dot, acc[c][0]);
+              }
+            }
+            continue;
+          }
 if (H2) {
 #pragma unroll
             for (int c = 0; c < CT; c++) {
               const __half2* xb2 = xh + ((size_t)c * nb + (size_t)b) * 17;
               float bd;
-              if (ARM) {
+              if (ARM == 1) {
                 /* two 4-iteration chains (depth 8 hfma2 each vs one depth 16) */
                 __half2 ha = __floats2half2_rn(0.f, 0.f), hb = __floats2half2_rn(0.f, 0.f);
 #pragma unroll
@@ -1320,7 +1571,7 @@ if (H2) {
             for (int c = 0; c < CT; c++) {
               const float* xb = xf + (((size_t)c * nb) + (size_t)b) * 33;
               float dot;
-              if (ARM) {
+              if (ARM == 1) {
                 float d0 = 0.f, d1 = 0.f;
 #pragma unroll
                 for (int j = 0; j < 16; j++) d0 = __fmaf_rn((float)c0[j], xb[j], d0);
@@ -1412,35 +1663,60 @@ static int prefill_h2batched(Model& M) {
 }
 // Test-only launcher: CT x ARM x H2 in one place (section 14 experiment).
 // Instantiations: bf16 only (the selftest's dtype), CT in {2,4}, ARM in {0,1}.
-static void pf_launch(int ct, int arm, int h2, const int8_t* q, const float* s,
+static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const float* s,
                       const bf16* x, float* part, int N, int K, int KC, int R,
                       int nb, int T, int nblk, int TPB, size_t shm) {
 #define PF(CT_, H2_, AR_) \
   q8_prefill_h2<bf16, CT_, H2_, AR_><<<nblk, TPB, shm>>>(q, s, x, part, N, K, KC, R, nb, T)
-  if (h2) { if (ct == 2) { if (arm) PF(2, true, 1); else PF(2, true, 0); }
-            else if (ct == 4) { if (arm) PF(4, true, 1); else PF(4, true, 0); }
-            else if (ct == 6) { if (arm) PF(6, true, 1); else PF(6, true, 0); }
-            else          { if (arm) PF(8, true, 1); else PF(8, true, 0); } }
-  else    { if (ct == 2) { if (arm) PF(2, false, 1); else PF(2, false, 0); }
-            else if (ct == 4) { if (arm) PF(4, false, 1); else PF(4, false, 0); }
-            else if (ct == 6) { if (arm) PF(6, false, 1); else PF(6, false, 0); }
-            else          { if (arm) PF(8, false, 1); else PF(8, false, 0); } }
+#define PF3(CT_, RB_) \
+  q8_prefill_h2<bf16, CT_, true, 3, RB_><<<nblk, TPB, shm>>>(q, s, x, part, N, K, KC, R, nb, T)
+  if (arm == 3 && h2) {
+    if (ct == 2) { if (rb == 2) PF3(2,2); else if (rb == 4) PF3(2,4); else PF3(2,8); }
+    else         { if (rb == 2) PF3(4,2); else if (rb == 4) PF3(4,4); else PF3(4,8); }
+    return;
+  }
+  if (arm == 4 && h2) {
+    if (ct == 2) PF(2, true, 4); else PF(4, true, 4);
+    return;
+  }
+  if (arm == 5 && h2) {
+#define PF5(CT_, G_) q8_prefill_h2<bf16, CT_, true, 5, 2, G_><<<nblk, TPB, shm>>>(q, s, x, part, N, K, KC, R, nb, T)
+    if (ct == 2) { if (rb == 2) PF5(2,2); else if (rb == 4) PF5(2,4); else PF5(2,8); }
+    else         { if (rb == 2) PF5(4,2); else if (rb == 4) PF5(4,4); else PF5(4,8); }
+#undef PF5
+    return;
+  }
+  if (arm >= 3) { arm = 0; }   // f32 path: these arms not instantiated
+  if (h2) { if (ct == 2) { if (arm == 2) PF(2, true, 2); else if (arm) PF(2, true, 1); else PF(2, true, 0); }
+            else if (ct == 4) { if (arm == 2) PF(4, true, 2); else if (arm) PF(4, true, 1); else PF(4, true, 0); }
+            else if (ct == 6) { if (arm == 2) PF(6, true, 2); else if (arm) PF(6, true, 1); else PF(6, true, 0); }
+            else          { if (arm == 2) PF(8, true, 2); else if (arm) PF(8, true, 1); else PF(8, true, 0); } }
+  else    { if (ct == 2) { if (arm == 2) PF(2, false, 2); else if (arm) PF(2, false, 1); else PF(2, false, 0); }
+            else if (ct == 4) { if (arm == 2) PF(4, false, 2); else if (arm) PF(4, false, 1); else PF(4, false, 0); }
+            else if (ct == 6) { if (arm == 2) PF(6, false, 2); else if (arm) PF(6, false, 1); else PF(6, false, 0); }
+            else          { if (arm == 2) PF(8, false, 2); else if (arm) PF(8, false, 1); else PF(8, false, 0); } }
 #undef PF
+#undef PF3
 }
 
 static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   (void)M;
-  const int N = e->ne[0], K = e->ne[1], R = 256, TPB = 256;
+  const int N = e->ne[0], K = e->ne[1], TPB = 256;
   // LFM_PF_CT (2|4) / LFM_PF_ARM (0|1): test-only knobs, defaults = today's
   // structure (CT=2, ARM=0) so the shipped selftest output is unchanged.
-  static int pfCT = -1, pfARM = -1;
+  static int pfCT = -1, pfARM = -1, pfRB = -1, pfRPB = -1;
   if (pfCT < 0) {
     pfCT = getenv("LFM_PF_CT") ? atoi(getenv("LFM_PF_CT")) : 2;
     pfARM = getenv("LFM_PF_ARM") ? atoi(getenv("LFM_PF_ARM")) : 0;
     if (pfCT != 2 && pfCT != 4 && pfCT != 6 && pfCT != 8) { printf("LFM_PF_CT=%d unsupported (2|4|6|8) -- using 2\n", pfCT); pfCT = 2; }
-    if (pfARM != 0 && pfARM != 1) { printf("LFM_PF_ARM=%d unsupported (0|1) -- using 0\n", pfARM); pfARM = 0; }
+    if (pfARM < 0 || pfARM > 5) { printf("LFM_PF_ARM=%d unsupported (0..5) -- using 0\n", pfARM); pfARM = 0; }
+    pfRPB = getenv("LFM_PF_RPB") ? atoi(getenv("LFM_PF_RPB")) : 4;
+    if (pfRPB != 1 && pfRPB != 2 && pfRPB != 4 && pfRPB != 8) { printf("LFM_PF_RPB=%d unsupported (1|2|4|8) -- using 4\n", pfRPB); pfRPB = 4; }
+    pfRB = getenv("LFM_PF_RB") ? atoi(getenv("LFM_PF_RB")) : 2;
+    if (pfRB != 1 && pfRB != 2 && pfRB != 4) { printf("LFM_PF_RB=%d unsupported (1|2|4) -- using 2\n", pfRB); pfRB = 2; }
   }
-  const int CT = pfCT, ARM = pfARM;
+  const int CT = pfCT, ARM = pfARM, RB = pfRB;
+  const int R = (ARM == 5) ? (256 / 32) * pfRPB : 256;   // ARM5 needs small rows/warp
   int KC = K;
   while (KC > 32) {
     int nbtry = KC / Q8_BLK;
@@ -1470,7 +1746,7 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
     // ARM=1 the q8_partial serial structure computes different parenthesization
     // than ARM=1, so comparing against it would test numerics, not batching.
     for (int t = 0; t < T; t++)
-      pf_launch(CT, 1, h2, e->dq, e->ds, (const bf16*)(xd + (size_t)t * K),
+      pf_launch(CT, ARM, h2, RB, e->dq, e->ds, (const bf16*)(xd + (size_t)t * K),
                 seq + (size_t)t * N * nch, N, K, KC, R, nb, 1, nblk, TPB, shm);
   } else
   for (int t = 0; t < T; t++) {
@@ -1488,7 +1764,7 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   printf("cp-seq=%s\n", cudaGetErrorString(cudaMemcpy(a.data(), seq, a.size() * 4, cudaMemcpyDeviceToHost))); fflush(stdout);
   printf("seq[0]=%.9g (expect H2 ~-0.10976)\n", a[0]); fflush(stdout);
   cudaEventRecord(ea);
-  pf_launch(CT, ARM, h2, e->dq, e->ds, (const bf16*)xd, bat,
+  pf_launch(CT, ARM, h2, RB, e->dq, e->ds, (const bf16*)xd, bat,
             N, K, KC, R, nb, T, nblk, TPB, shm);
   printf("bat-launch=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
   cudaEventRecord(eb); cudaEventSynchronize(eb);
@@ -1506,7 +1782,7 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   // Batch-correctness (above) says ARM1-batch == ARM1-sequential; this says what
   // the arm change does to the values themselves.
   if (ARM && !nbad) {
-    pf_launch(CT, 0, h2, e->dq, e->ds, (const bf16*)xd, bat0,
+    pf_launch(CT, 0, h2, RB, e->dq, e->ds, (const bf16*)xd, bat0,
               N, K, KC, R, nb, T, nblk, TPB, shm);
     printf("arm0-launch=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
     cudaDeviceSynchronize();

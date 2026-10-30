@@ -758,3 +758,57 @@ integration-level gate §14/14a already scoped.
 
 Speed claims here are same-session same-binary A/B of env knobs; the board
 baseline drift caveat does not apply within one harness run.
+
+### 14d. The binder was shared-load traffic: ARM=5 gives ~5x, ~100 GMAC/s (run #297)
+
+Four arms were built and measured on `q8_prefill_h2` after CT=4, all
+bit-exact against their structure-consistent sequential pairs (8/8 shapes in
+every configuration), all in one binary so the ratios are drift-immune:
+
+| arm | mechanism | verdict (w2 / w1 / embed, T=24, CT=4) |
+|---|---|---|
+| ARM=2 | convert weights once per `b`, interleave the CT chains across `k` (−75% conversion ops) | **refuted**: 16.67 / 13.99 / 222 ms vs ARM0's 11.70 / 12.75 / 211. 56 regs, 66% occupancy -- *higher* occupancy, fewer ops, slower. `max rel = 0` vs ARM0 (numerically identical, as designed) |
+| ARM=3 | register-blocked rows (x reused across `RB` rows, 2x less shared traffic) | **refuted**: 52.6 / 47.8 / 772 ms (4.5x slower). At RB=2: 63 regs, no spills, 66% occupancy -- so not spills either |
+| ARM=4 | software-pipelined weight loads (prefetch `b+32` before computing `b`) | **refuted**: 12.61 / 13.67 / 224.9 ms (−7%) -- weight-load latency was not the binder |
+| **ARM=5** | **x into registers, rows inner**: load the 16 x half2 once per `(b,c)` into registers, loop the warp's rows inside; rows/warp set small (`GRP`) so the accumulators fit | **5.0x vs the shipped CT=2 structure**: 4.62 / 3.40 / 55.0 ms. ~80-114 GMAC/s |
+
+Why ARM=5 works and ARM=3 did not: the LSU accounting says 64 shared half2
+loads per `(b,row)` x GR=32 rows x nb=120 x 128 warps = 31.5M warp-cycles of
+shared-load issue on 4 SMs, ~7.9 ms of w2's measured 11.7 ms. ARM=5 makes
+shared loads per `b` = `CT*16` **independent of rows/warp** (they are amortised
+over GRP rows in registers); ARM=3 cut the same traffic only 2x and paid more
+in restructured instructions. Corollary: at GRP=8 the kernel runs at 126 regs,
+**2 blocks/SM (33% occupancy)** and is the fastest of all -- occupancy is
+formally not the binder, which the ARM2/ARM3 results already implied.
+
+Achieved rates at the ASR chunk shape (T=24), CT=4/GRP=8:
+
+| shape | shipped CT=2 | ARM=5 CT=4 GRP=8 | ratio | GMAC/s |
+|---|---|---|---|---|
+| embed 128000x2048 | 283.29 ms | **55.0** | 5.14x | 114 |
+| w2 2048x7680 | 24.28 | **4.62** | 5.08x | 81 |
+| w1 7680x2048 | 17.80 | **3.40** | 5.01x | 111 |
+| conv.out 2048x2048 | 4.76 | **0.97** | 4.25x | 104 |
+
+Reproducibility: embed 54.92 / 55.05 / 55.08 ms over three repeats (±0.3%).
+T=8: embed 19.14 ms vs the shipped 95.07 (5.0x), w2 1.21 vs 8.43 (7.0x).
+T=4: embed 10.02, w2 0.69, w1 0.65. The T=1 launches (the sequential side of
+the pair, i.e. today's decode-adjacent prefill shape) also improve 4x: embed
+seq 338 -> 84 ms -- that is a TTFT-relevant win independent of batching.
+
+**Realtime budget after ARM=5.** Prefill work is 43.2 GMAC per audio-second; at
+the measured 80-114 GMAC/s that is 0.38-0.54 s, plus text decode 4 tok/s x
+113 ms = 0.45 s -> **~0.83-0.99 s GPU per audio second = 1.0-1.2x realtime**.
+First time the target is met on paper. Status: NOT achieved -- this is a kernel
+measurement, not an end-to-end run (encoder tower unbuilt, no integration run
+yet), and the decode share assumes 4 tok/s.
+
+Two harness facts to carry forward. (1) The ARM=5 config needs rows/warp small
+(the harness sets `R = WPB*RPB`; GRP=8 -> R=64 is the best; GRP=2/4 are 2-3x
+slower; GRP=16 ran 8/8 bit-exact but its timings were filtered out of the
+captured output and need a rerun to record). (2) The harness KC chooser has a truncation bug for CT=8
+at K=7680: it picks KC=240, where nb = KC/32 = 7 truncates and 16 columns per
+chunk go uncomputed (both sides share it, so the pair still prints BIT-EXACT).
+CT=2/CT=4 configs are exact (KC=7680/nb=240 and KC=3840/nb=120). Wiring ARM=5
+into the engine must set KC exactly, and the w2 KC=3840 (nch=2) vs shipped
+KC=7680 (nch=1) question still needs the integration gate of section 14.
