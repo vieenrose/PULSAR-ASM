@@ -37,11 +37,11 @@ next starts.
 |---|---|---|---|---|---|
 | text backbone | `lfm.` | 286 | 3458 MB | 1728.8 M | **1946 MB** (shipped) |
 | audio encoder | `encoder.lfm.lfm.` | 159 | 219 MB | 109.5 M | ~123 MB |
-| encoder downsample front end | `encoder.downsample.` | 11 | 3.7 MB | 1.85 M | fp32, keep |
+| encoder downsample front end | `encoder.downsample.` | 12 (6w+6b; GGUF cross-check §13) | 3.7 MB | 1.85 M | fp32, keep |
 | audio→backbone projector | `mlp.` | 6 | 11.5 MB | 5.77 M | ~6.5 MB |
 | MaskGIT depth head | `depthformer.` | 37 | 67.8 MB | 33.9 M | ~38 MB |
 | 12 codebook logits | `depth_embeddings.` | 36 | 99.2 MB | 49.6 M | ~56 MB |
-| backbone→12 streams | `depth_linear.` | 2 | 50.4 MB | 25.2 M | ~28 MB |
+| backbone→12 streams | `depth_linear.` (+bias) | 2 | 50.4 MB | 25.2 M | ~28 MB |
 | audio codebook table | `codebook_embedding.` | 1 | 99.1 MB | 49.6 M | ~56 MB |
 | mask token | `mask_embedding.` | 1 | 0.004 MB | 1 K | fp32 |
 | LiquidCodec **decoder only** | `decoder.*` (`audio_tokenizer`) | 104 | 73.0 MB | 36.5 M | **keep bf16** |
@@ -155,6 +155,13 @@ every encoder gate rides on it, so it is green before S3 starts.
 
 ### S3 — audio encoder tower + downsample
 
+Downsampler, exactly (`Lfm3AudioDownsampler.forward`): dense Conv2d(1→256, 3×3/2, pad 1)
+→ SiLU → depthwise Conv2d(256, 3×3/2, groups=256) → 1×1 → SiLU → depthwise → 1×1 →
+SiLU → `lin_out` Conv1d(4096→768, 1×1, no act) over the flattened 4-frame groups;
+every stage has a bias, every conv stage is preceded by a padding mask
+(`lengths=(lengths+1)//2` per stride-2). Projector (`Lfm3AudioProjector`): LN(768)
+→ Linear(768→2048, bias) → **GELU** (not SiLU) → Linear(2048→2048, bias).
+
 *Build*: batched Q8 GEMV/GEMM at K∈{768, 1792} (new `GemvCfg` entries, with the coverage assert),
 3×3 strided 2-D conv + 1×1 convs for the front end, 4-frame concat + `lin_out`, attention with
 hd 96 / 8 heads / window 32 / per-head norms, conv_L 3 (extend `k_conv7`/`k_shift_in` to a
@@ -170,9 +177,10 @@ quant-sensitivity test → keep bf16 (219 MB, still fits, §6).
 
 *Build*: three **non-causal** attention layers over 12 positions (small enough for one block per
 frame, all of q/k/v in shared memory — the causal `k_attn_head` does not apply and must not be
-bent into this), the per-head gate `[32,1024]`, stacked `depth_linear` (12288×2048) and 12
+bent into this), the per-head gate `[32,1024]`, stacked `depth_linear` (12288×2048, **plus its [12288] bias**) and 12
 `to_logits` (2017×1024 each) as one `N = 12288` and one `N = 24204` GEMV at repack time, then the
-maskgit loop (3 steps) with the model card's sampler: temperature 1.0, top-k 128, repetition
+maskgit loop (3 steps) with the vendor-corroborated sampler (§13: mmproj KV gives exactly
+temperature 1.0, top-k 128, repetition
 penalty 1.1 over a 4096 window, on raw logits in the fork's chain order.
 *Gate*: (a) per-layer rms vs HF on teacher-forced states; (b) per-step top-1 agreement over
 12 codebooks × 20 frames; (c) **full codebook-token stream equality** vs HF on 5 fixtures with a
@@ -488,3 +496,52 @@ symptom (wrong ids several positions in) was far from the cause (one split bound
 Unicode note: `\\s` is White_Space=yes (11 ranges, verified 0..0x4000 against Python
 `regex` with 0 mismatches); L/N come from `unicodedata` 14.0.0, so a Unicode-version
 drift against Rust `regex` surfaces as a gate failure, not a silent difference.
+
+## 13. Vendor GGUF release (2026-Q4): what it validates and what it doesn't
+
+Liquid published `LiquidAI/LFM3-Audio-2B-GGUF` (main BF16/F16/Q8_0/Q4_0/Q4_K_M +
+mmproj BF16/F16/Q8_0/Q4_0/Q4_K_M; llama.cpp b11960+/v0.8.0, `tokenizer.ggml.pre =
+lfm2`, chat templates `asr`/`tts`). Only headers were fetched (2–16 MB Range
+requests); no weights downloaded. Findings, each checked against the census:
+
+1 **Sizes validate the census to the scale dtype.** Summing the GGUF tensor tables
+   with Q8_0 at its true 34 B/32 (fp16 scales) gives main 1837 MB vs the file's
+   1846.2, mmproj 303.7 vs 303.8 — exact. Our `.lfm3q8` (1946 MB) is 5.4% larger
+   for one reason only: fp32 block scales (36 B/32). No missing tensors: main has
+   287 = our 286 + `rope_freqs` (computed, not in safetensors); mmproj's 319 are
+   all accounted for (157 encoder + 10 front-end + 43 depth/code + 4 quant + ~96
+   codec-tfm + 9 projector/misc).
+2 **The vendor's split is our split.** Main = backbone only; mmproj = encoder +
+   downsample + projector + depthformer + codebooks + the full codec decoder
+   transformer (`a.gen.wav.tfm`, 8 blks @512 with sandwich norms, `in_proj`
+   256→512, `out_proj` 512→1282 + biases, `output_norm`). The codec transformer
+   rides the same repack path as S3/S4 — S5's transformer weights arrive via
+   mmproj, not via the audio_tokenizer file. (Only `quant.first`, the FSQ
+   dequant, is tiny and F32.)
+3 **Structural census, confirmed field by field:** encoder attention layers at
+   2,5,8,11,14,15,16; q/k/v [768/384] + q/k_norm [96] F32 + out_proj; conv layers
+   [2304/768] in + [768] out with F32 depthwise [3,768] and 2 norms (no sandwich);
+   FPN 1792 (not the config's 2560); depthformer 3 blks, q/k/v/o [1024/256],
+   gate [1024,32], q/k_norm [32], FFN 2816, 2 norms; stacked codebook
+   `embd [1024,2017,12]` + `out_embd [2048,24204]` (i.e. exactly the N=24204
+   GEMV S4 already specifies); `proj_in [2048,12288]` + bias.
+4 **Census corrections (small, all in the S3/S4 repack inventory):** downsample is
+   12 tensors (6 weights + 6 biases), not 11; `depth_linear` has a [12288] bias;
+   12 per-codebook `embedding_norm`s exist (= GGUF `head_norm [1024,12]`) plus an
+   `output_norm [1024]`; projector linears all carry biases and the activation is
+   GELU; encoder `out_proj` naming confirmed.
+5 **Sampler corroborated by the vendor's own packaging.** mmproj KV:
+   `gen.audio.sampling: temp 1.0, top_k 128, penalty_repeat 1.1, penalty_last_n
+   4096` — exactly the S4 spec. Main KV: `temp 0.0, top_k 1` (greedy text) —
+   exactly the shipped default. Chat templates `asr` (live-ASR system prompt) and
+   `tts` (per-language voice prompts) are S6 prompt material.
+6 **Q4 changes nothing in the plan.** Q4_K_M (1.10 GB) exists and runs in
+   llama.cpp, but the plan's precisions are set by HF-derived gates, and the
+   measured verdict on this model (4-bit does not survive the gates) stands until
+   a gate says otherwise. Q4_K_M is now the download-and-run baseline for M4
+   latency comparisons and the quality reference if 4-bit is ever revisited; Q8_0
+   (fp16 scales) is a cross-check blob for ours (same quant, 5.4% smaller).
+7 **llama.cpp is a second oracle.** b11960+ implements the full pipeline
+   (serve/CLI/TTS/realtime voice). Uses: its `lfm2` pre-tokenizer as a cross-check
+   for the S1 splitter (independent of both HF and our C), and its generate loop
+   for S6 stream comparisons with fixed seeds.
