@@ -31,4 +31,8 @@ void ltok_free(LTok *t);
 /* Encode UTF-8 text (bytes, len) to ids. Returns count, or -1 on error. ids must hold
    at least (len*2 + 16) entries (fuzz-tested worst case is far below). */
 int ltok_encode(const LTok *t, const uint8_t *text, size_t n, uint32_t *ids, int cap);
+/* Decode ids to UTF-8 bytes. Returns byte count, or -1 on error. out must hold at
+   least (count*16 + 64) bytes. Added tokens emit their literal text; ByteLevel
+   maps visible codepoints back to bytes (inverse of the encode map). */
+int ltok_decode(const LTok *t, const uint32_t *ids, size_t n, uint8_t *out, size_t cap);
 #endif

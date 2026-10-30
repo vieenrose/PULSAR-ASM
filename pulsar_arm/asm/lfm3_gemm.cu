@@ -81,13 +81,13 @@ __global__ void k_gemm_q8(const signed char* __restrict__ W, const float* __rest
         for (int i = tid; i < TILE * SCALE_BLK; i += nt) {
             int t = i / SCALE_BLK, k = i - t * SCALE_BLK;
             union { unsigned int u; float f; } cv;
-            cv.u = (t0 + t < T) ? (((unsigned int)X[(size_t)(t0 + t) * K + (b << 7) + k]) << 16) : 0u;
+            cv.u = (t0 + t < T) ? (((unsigned int)X[(t0 + t) * K + (b << 7) + k]) << 16) : 0u;
             sx[t * KCHPAD + k] = cv.f;
         }
         __syncthreads();
         if (active) {
-            const signed char* wb = W + (size_t)n * K + (b << 7);
-            const float sc = SC[(size_t)n * nb + b];
+            const signed char* wb = W + n * K + (b << 7);
+            const float sc = SC[n * nb + b];
             /* v2: scale folded into the 4 weights (no ps[TILE]), float4 x reads.
                Per chunk ci the 8 lanes cover 32 contiguous bytes (lane*4), so a
                float4 at o touches banks o..o+3: lanes give 0-3,4-7,...,28-31,
@@ -95,8 +95,9 @@ __global__ void k_gemm_q8(const signed char* __restrict__ W, const float* __rest
 #pragma unroll
             for (int ci = 0; ci < SCALE_BLK / 32; ci++) {
                 const int o = ci * 32 + lane * 4;      /* 8 lanes -> 32 contiguous bytes */
-                int q;
-                memcpy(&q, wb + o, 4);
+                /* __ldcs (evict-first): weights are re-read ceil(T/TILE) times with no
+                   L2 reuse across passes (25 MB >> 2 MB L2), so cache-all pollutes. */
+                const int q = __ldcs(reinterpret_cast<const int*>(wb + o));
                 const signed char* qb = reinterpret_cast<const signed char*>(&q);
                 const float w0 = (float)qb[0] * sc, w1 = (float)qb[1] * sc;
                 const float w2 = (float)qb[2] * sc, w3 = (float)qb[3] * sc;
@@ -119,7 +120,7 @@ __global__ void k_gemm_q8(const signed char* __restrict__ W, const float* __rest
            n-N. Symptom was 30 x (T-1) zeros scattered into the following row
            (330 at T=12) and a gate failure only for N=1282, never for N=1280
            or N=1312. */
-        if (active && lane == 0 && t0 + t < T) C[(size_t)(t0 + t) * N + n] = acc[t];
+        if (active && lane == 0 && t0 + t < T) C[(t0 + t) * N + n] = acc[t];
     }
 }
 

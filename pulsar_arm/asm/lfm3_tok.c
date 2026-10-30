@@ -396,3 +396,38 @@ int ltok_encode(const LTok *t, const uint8_t *text, size_t n, uint32_t *ids, int
     if (e.err) return -1;
     return e.n;
 }
+
+int ltok_decode(const LTok *t, const uint32_t *ids, size_t n, uint8_t *out, size_t cap) {
+    /* inverse byte map: visible codepoint -> byte (encode map is bijective) */
+    int inv[512];
+    for (int i = 0; i < 512; i++) inv[i] = -1;
+    for (int b = 0; b < 256; b++) inv[t->bmap[b]] = b;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t id = ids[i];
+        /* added tokens emit literally */
+        int added = 0;
+        for (uint32_t a = 0; a < t->n_added; a++) {
+            if (t->add_id[a] == id) {
+                if (o + t->add_len[a] > cap) return -1;
+                memcpy(out + o, t->add_bytes[a], t->add_len[a]);
+                o += t->add_len[a];
+                added = 1;
+                break;
+            }
+        }
+        if (added) continue;
+        if (id >= t->n_vocab) return -1;
+        /* vocab string is UTF-8 of visible codepoints: decode each, map back */
+        const uint8_t *s = t->vbytes[id];
+        size_t L = t->vlen[id], p = 0;
+        while (p < L) {
+            uint32_t cp; int bl = utf8_dec(s + p, L - p, &cp);
+            if (!bl || cp >= 512 || inv[cp] < 0) return -1;
+            if (o + 1 > cap) return -1;
+            out[o++] = (uint8_t)inv[cp];
+            p += (size_t)bl;
+        }
+    }
+    return (int)o;
+}

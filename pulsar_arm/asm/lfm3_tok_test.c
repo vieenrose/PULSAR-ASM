@@ -57,9 +57,20 @@ int main(int argc, char **argv) {
             }
             if (nbad > 5) { printf("  ...stopping after 6 mismatches\n"); break; }
         }
+        /* round-trip: decode(encode(x)) must reproduce the input bytes exactly */
+        if (ng >= 0) {
+            uint8_t *rt = malloc(nl ? nl : 1);
+            int nr = ltok_decode(&t, got, (size_t)ng, rt, nl ? nl : 1);
+            if (nr != (int)nl || (nl && memcmp(rt, txt, nl))) {
+                nbad++;
+                printf("ROUNDTRIP-FAIL %s: %ld bytes in, %d back\n", e->d_name, nl, nr);
+                if (nbad > 5) { printf("  ...stopping after 6 mismatches\n"); free(rt); break; }
+            }
+            free(rt);
+        }
         free(txt); free(want); free(got);
     }
     closedir(d);
-    printf("tok gate: %d/%d fixtures exact (%ld ids)\n", nfix - nbad, nfix, tot_ids);
+    printf("tok gate: %d/%d fixtures exact+roundtrip (%ld ids)\n", nfix - nbad, nfix, tot_ids);
     return nbad ? 1 : 0;
 }
