@@ -1214,7 +1214,13 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
 // 9.5 vs sequential (top-1 matched by tie luck, top-5 garbage). The w2
 // GEMV must stay sequential gemv() calls for bit-exactness, and batching
 // 9 of 10 GEMVs does not pay while w2 (a top-3 GEMV by time) is pinned.
-template <typename TX, int CT, bool H2>
+// ARM=0 is the #162-#165 structure and must keep producing today's bits.
+// ARM=1 (plan section 14, TEST-ONLY): the inner half2 chain split into two
+// 4-iteration chains (k 0-3, k 4-7, summed before the block FMA) and the outer
+// acc interleaved by block parity, halving BOTH dependency depths. ARM=1 changes
+// the summation parenthesization, so the harness pairs it against ITS OWN T=1
+// launches (batch-correctness) and prints the ARM0-vs-ARM1 relative delta.
+template <typename TX, int CT, bool H2, int ARM>
 __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ xall, float* __restrict__ part,
                            int N, int K, int KCHUNK, int R, int nb, int T) {
@@ -1248,9 +1254,9 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
     __syncthreads();
     for (int g = 0; g < GR; g++) {
       const int r = wid + g * WPB, row = base + r;
-      float acc[CT];
+      float acc[CT][2];          // [c][block-parity chain]; ARM0 uses [0] only
 #pragma unroll
-      for (int c = 0; c < CT; c++) acc[c] = 0.f;
+      for (int c = 0; c < CT; c++) { acc[c][0] = 0.f; acc[c][1] = 0.f; }
       if (row < N) {
         const int8_t* qr = q + (size_t)row * K + koff;
         const float* sr = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb;
@@ -1259,23 +1265,53 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
           const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
           const uint32_t w[8] = {(uint32_t)a0.x, (uint32_t)a0.y, (uint32_t)a0.z, (uint32_t)a0.w,
                                  (uint32_t)a1.x, (uint32_t)a1.y, (uint32_t)a1.z, (uint32_t)a1.w};
+          const int pi = ARM ? ((b >> 5) & 1) : 0;   // ARM0: constant 0, folds away
 if (H2) {
 #pragma unroll
             for (int c = 0; c < CT; c++) {
               const __half2* xb2 = xh + ((size_t)c * nb + (size_t)b) * 17;
-              __half2 h2 = __floats2half2_rn(0.f, 0.f);
+              float bd;
+              if (ARM) {
+                /* two 4-iteration chains (depth 8 hfma2 each vs one depth 16) */
+                __half2 ha = __floats2half2_rn(0.f, 0.f), hb = __floats2half2_rn(0.f, 0.f);
 #pragma unroll
-              for (int k = 0; k < 8; k++) {
-                const uint32_t u = w[k] ^ 0x80808080u;
-                const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
-                const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
-                __half2 cl = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
-                __half2 ch = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
-                h2 = __hfma2(cl, xb2[2 * k], h2);
-                h2 = __hfma2(ch, xb2[2 * k + 1], h2);
+                for (int k = 0; k < 4; k++) {
+                  const uint32_t u = w[k] ^ 0x80808080u;
+                  const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                  const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+                  __half2 cl = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+                  __half2 ch = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+                  ha = __hfma2(cl, xb2[2 * k], ha);
+                  ha = __hfma2(ch, xb2[2 * k + 1], ha);
+                }
+#pragma unroll
+                for (int k = 4; k < 8; k++) {
+                  const uint32_t u = w[k] ^ 0x80808080u;
+                  const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                  const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+                  __half2 cl = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+                  __half2 ch = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+                  hb = __hfma2(cl, xb2[2 * k], hb);
+                  hb = __hfma2(ch, xb2[2 * k + 1], hb);
+                }
+                const float2 fa = __half22float2(ha), fb = __half22float2(hb);
+                bd = (fa.x + fa.y) + (fb.x + fb.y);
+              } else {
+                __half2 h2 = __floats2half2_rn(0.f, 0.f);
+#pragma unroll
+                for (int k = 0; k < 8; k++) {
+                  const uint32_t u = w[k] ^ 0x80808080u;
+                  const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                  const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+                  __half2 cl = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+                  __half2 ch = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+                  h2 = __hfma2(cl, xb2[2 * k], h2);
+                  h2 = __hfma2(ch, xb2[2 * k + 1], h2);
+                }
+                const float2 f = __half22float2(h2);
+                bd = f.x + f.y;
               }
-              const float2 f = __half22float2(h2);
-              acc[c] = __fmaf_rn(sr[b], f.x + f.y, acc[c]);
+              acc[c][pi] = __fmaf_rn(sr[b], bd, acc[c][pi]);
             }
           } else {
             const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
@@ -1283,19 +1319,30 @@ if (H2) {
 #pragma unroll
             for (int c = 0; c < CT; c++) {
               const float* xb = xf + (((size_t)c * nb) + (size_t)b) * 33;
-              float dot = 0.f;
+              float dot;
+              if (ARM) {
+                float d0 = 0.f, d1 = 0.f;
 #pragma unroll
-              for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c0[j], xb[j], dot);
+                for (int j = 0; j < 16; j++) d0 = __fmaf_rn((float)c0[j], xb[j], d0);
 #pragma unroll
-              for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c1[j], xb[16 + j], dot);
-              acc[c] = __fmaf_rn(sr[b], dot, acc[c]);
+                for (int j = 0; j < 16; j++) d1 = __fmaf_rn((float)c1[j], xb[16 + j], d1);
+                dot = d0 + d1;
+              } else {
+                dot = 0.f;
+#pragma unroll
+                for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c0[j], xb[j], dot);
+#pragma unroll
+                for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c1[j], xb[16 + j], dot);
+              }
+              acc[c][pi] = __fmaf_rn(sr[b], dot, acc[c][pi]);
             }
           }
         }
       }
 #pragma unroll
       for (int c = 0; c < CT; c++) {
-        float v = (row < N) ? acc[c] : 0.f;
+        float v = (row < N) ? acc[c][0] : 0.f;
+        if (ARM && row < N) v += acc[c][1];
         for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
         if (lane == 0 && row < N && t0 + c < T)
           part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
@@ -1341,6 +1388,10 @@ static int prefill_minimal(Model& M) {
 // order); the question is only whether it runs and how fast.
 static int prefill_h2_one(Model& M, Ent* e, int T, int h2);
 static int prefill_h2batched(Model& M) {
+  // LFM_PF_T: the batch size the harness tests (default 8 = today). The ASR
+  // chunk is 24 backbone tokens per 0.96 s of audio, so 24 is the shape that
+  // decides the realtime budget.
+  const int TPT = getenv("LFM_PF_T") ? atoi(getenv("LFM_PF_T")) : 8;
   const char* want[4] = {"embed_tokens.weight", "feed_forward.w2.weight",
                             "feed_forward.w1.weight", "conv.out_proj.weight"};
   int fails = 0, ntested = 0;
@@ -1351,7 +1402,7 @@ static int prefill_h2batched(Model& M) {
         if (!(e->dq && e->ds)) continue;
         if (strstr(e->name.c_str(), want[w]) == nullptr) continue;
         if (e->ne[0] < 1024 || e->ne[1] % 32 != 0) continue;
-        fails += prefill_h2_one(M, e, 8, h2);
+        fails += prefill_h2_one(M, e, TPT, h2);
         ntested++;
         break;
       }
@@ -1359,9 +1410,37 @@ static int prefill_h2batched(Model& M) {
   fflush(stdout);
   return fails ? 1 : 0;
 }
+// Test-only launcher: CT x ARM x H2 in one place (section 14 experiment).
+// Instantiations: bf16 only (the selftest's dtype), CT in {2,4}, ARM in {0,1}.
+static void pf_launch(int ct, int arm, int h2, const int8_t* q, const float* s,
+                      const bf16* x, float* part, int N, int K, int KC, int R,
+                      int nb, int T, int nblk, int TPB, size_t shm) {
+#define PF(CT_, H2_, AR_) \
+  q8_prefill_h2<bf16, CT_, H2_, AR_><<<nblk, TPB, shm>>>(q, s, x, part, N, K, KC, R, nb, T)
+  if (h2) { if (ct == 2) { if (arm) PF(2, true, 1); else PF(2, true, 0); }
+            else if (ct == 4) { if (arm) PF(4, true, 1); else PF(4, true, 0); }
+            else if (ct == 6) { if (arm) PF(6, true, 1); else PF(6, true, 0); }
+            else          { if (arm) PF(8, true, 1); else PF(8, true, 0); } }
+  else    { if (ct == 2) { if (arm) PF(2, false, 1); else PF(2, false, 0); }
+            else if (ct == 4) { if (arm) PF(4, false, 1); else PF(4, false, 0); }
+            else if (ct == 6) { if (arm) PF(6, false, 1); else PF(6, false, 0); }
+            else          { if (arm) PF(8, false, 1); else PF(8, false, 0); } }
+#undef PF
+}
+
 static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   (void)M;
-  const int N = e->ne[0], K = e->ne[1], R = 256, TPB = 256, CT = 2;
+  const int N = e->ne[0], K = e->ne[1], R = 256, TPB = 256;
+  // LFM_PF_CT (2|4) / LFM_PF_ARM (0|1): test-only knobs, defaults = today's
+  // structure (CT=2, ARM=0) so the shipped selftest output is unchanged.
+  static int pfCT = -1, pfARM = -1;
+  if (pfCT < 0) {
+    pfCT = getenv("LFM_PF_CT") ? atoi(getenv("LFM_PF_CT")) : 2;
+    pfARM = getenv("LFM_PF_ARM") ? atoi(getenv("LFM_PF_ARM")) : 0;
+    if (pfCT != 2 && pfCT != 4 && pfCT != 6 && pfCT != 8) { printf("LFM_PF_CT=%d unsupported (2|4|6|8) -- using 2\n", pfCT); pfCT = 2; }
+    if (pfARM != 0 && pfARM != 1) { printf("LFM_PF_ARM=%d unsupported (0|1) -- using 0\n", pfARM); pfARM = 0; }
+  }
+  const int CT = pfCT, ARM = pfARM;
   int KC = K;
   while (KC > 32) {
     int nbtry = KC / Q8_BLK;
@@ -1372,16 +1451,28 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   const int nb = KC / Q8_BLK, nch = K / KC;
   const int nblk = ((N + R - 1) / R) * nch;
   const size_t shm = h2 ? (size_t)CT * nb * 17 * sizeof(__half2) : (size_t)CT * nb * 33 * 4;
-  printf("prefill-h2batched H2=%d %s N=%d K=%d T=%d shm=%zu\n", h2, e->name.c_str(), N, K, T, shm); fflush(stdout);
-  uint16_t* xd = nullptr; float *seq = nullptr, *bat = nullptr;
+  printf("prefill-h2batched H2=%d CT=%d ARM=%d %s N=%d K=%d T=%d shm=%zu\n",
+         h2, CT, ARM, e->name.c_str(), N, K, T, shm); fflush(stdout);
+  uint16_t* xd = nullptr; float *seq = nullptr, *bat = nullptr, *bat0 = nullptr;
   printf("a=%s\n", cudaGetErrorString(cudaMalloc(&xd, (size_t)T * K * 2))); fflush(stdout);
   printf("b=%s\n", cudaGetErrorString(cudaMalloc(&seq, (size_t)T * N * nch * 4))); fflush(stdout);
   printf("c=%s\n", cudaGetErrorString(cudaMalloc(&bat, (size_t)T * N * nch * 4))); fflush(stdout);
+  if (ARM) {
+    printf("b0=%s\n", cudaGetErrorString(cudaMalloc(&bat0, (size_t)T * N * nch * 4))); fflush(stdout);
+  }
   std::vector<uint16_t> pat((size_t)T * K);
   for (size_t i = 0; i < pat.size(); i++) pat[i] = (uint16_t)(0x3c00 + ((i * 37) & 0x3ff));
   printf("h2d=%s\n", cudaGetErrorString(cudaMemcpy(xd, pat.data(), pat.size() * 2, cudaMemcpyHostToDevice))); fflush(stdout);
   cudaEvent_t ea, eb; cudaEventCreate(&ea); cudaEventCreate(&eb); float ms = 0;
   cudaEventRecord(ea);
+  if (ARM) {
+    // Structure-consistent pair: T=1 launches of the SAME armed kernel. With
+    // ARM=1 the q8_partial serial structure computes different parenthesization
+    // than ARM=1, so comparing against it would test numerics, not batching.
+    for (int t = 0; t < T; t++)
+      pf_launch(CT, 1, h2, e->dq, e->ds, (const bf16*)(xd + (size_t)t * K),
+                seq + (size_t)t * N * nch, N, K, KC, R, nb, 1, nblk, TPB, shm);
+  } else
   for (int t = 0; t < T; t++) {
     if (h2)
       q8_partial<bf16,true,false,1,1><<<nblk, TPB, (size_t)nb * 33 * 4>>>(e->dq, e->ds, (const bf16*)(xd + (size_t)t * K),
@@ -1397,10 +1488,8 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   printf("cp-seq=%s\n", cudaGetErrorString(cudaMemcpy(a.data(), seq, a.size() * 4, cudaMemcpyDeviceToHost))); fflush(stdout);
   printf("seq[0]=%.9g (expect H2 ~-0.10976)\n", a[0]); fflush(stdout);
   cudaEventRecord(ea);
-  if (h2)
-    q8_prefill_h2<bf16,CT,true><<<nblk, TPB, shm>>>(e->dq, e->ds, (const bf16*)xd, bat, N, K, KC, R, nb, T);
-  else
-    q8_prefill_h2<bf16,CT,false><<<nblk, TPB, shm>>>(e->dq, e->ds, (const bf16*)xd, bat, N, K, KC, R, nb, T);
+  pf_launch(CT, ARM, h2, e->dq, e->ds, (const bf16*)xd, bat,
+            N, K, KC, R, nb, T, nblk, TPB, shm);
   printf("bat-launch=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
   cudaEventRecord(eb); cudaEventSynchronize(eb);
   printf("bat-sync=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
@@ -1410,8 +1499,28 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   printf("bat[0]=%.9g\n", b[0]); fflush(stdout);
   long bad = 0; for (size_t i = 0; i < a.size() && bad < 5; i++) if (memcmp(&a[i], &b[i], 4)) { bad++; if (bad == 1) printf("first diff at %zu: seq=%.9g bat=%.9g\n", i, a[i], b[i]); }
   long nbad = 0; for (size_t i = 0; i < a.size(); i++) nbad += memcmp(&a[i], &b[i], 4) != 0;
-  printf("prefill-h2batched H2=%d %s: %s (%ld/%zu differ) seq %.2f ms bat %.2f ms\n", h2, e->name.c_str(), nbad ? "MISMATCH" : "BIT-EXACT", nbad, a.size(), ms, ms2);
+  printf("prefill-h2batched H2=%d CT=%d ARM=%d %s: %s (%ld/%zu differ) seq %.2f ms bat %.2f ms\n",
+         h2, CT, ARM, e->name.c_str(), nbad ? "MISMATCH" : "BIT-EXACT", nbad, a.size(), ms, ms2);
   fflush(stdout);
+  // ARM=1: numerics sanity -- rel-vs the ARM=0 structure on identical inputs.
+  // Batch-correctness (above) says ARM1-batch == ARM1-sequential; this says what
+  // the arm change does to the values themselves.
+  if (ARM && !nbad) {
+    pf_launch(CT, 0, h2, e->dq, e->ds, (const bf16*)xd, bat0,
+              N, K, KC, R, nb, T, nblk, TPB, shm);
+    printf("arm0-launch=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
+    cudaDeviceSynchronize();
+    std::vector<float> b0(a.size(), -999.f);
+    cudaMemcpy(b0.data(), bat0, b0.size() * 4, cudaMemcpyDeviceToHost);
+    double worst = 0.0;
+    for (size_t i = 0; i < b0.size(); i++) {
+      double den = fabs((double)b0[i]);
+      double rel = fabs((double)b[i] - (double)b0[i]) / (den > 1e-6 ? den : 1e-6);
+      if (rel > worst) worst = rel;
+    }
+    printf("prefill-h2batched ARM1-vs-ARM0 %s: max rel %.3g\n", e->name.c_str(), worst);
+    fflush(stdout);
+  }
   return nbad ? 1 : 0;
 }
 

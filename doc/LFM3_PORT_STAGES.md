@@ -710,3 +710,51 @@ excludes the target: 43.2 GMAC/s is 18% of the 236 GFMA/s peak.
    11-18 GMAC/s; if >=45 holds on w2/w1/embed, the budget table above closes to
    ASR_RT <= 1.00 with margin (prefill 43.2 GMAC at 45 = 960 ms -- needs the decode
    overlap shown in the table: <= 6 tok/s text on the bandwidth side).
+
+### 14c. First in-engine lever banked: CT=4 (run #296)
+
+`q8_prefill_h2` gained two TEST-ONLY template knobs (the harness is
+`--prefill-h2batched`, pairs stay bit-exact by construction): `LFM_PF_CT`
+(batch width 2|4|6|8) and `LFM_PF_ARM` (0 = shipped structure; 1 = split inner
+half2 chain + parity-interleaved outer acc). `LFM_PF_T` sets the tested batch
+size (24 = one ASR chunk of 0.96 s audio). Results, H2=1, ARM=0, T=24, all
+BIT-EXACT vs the structure-consistent sequential pair (8/8 shapes in every
+config):
+
+| bat T=24 | CT=2 (today) | CT=4 | ratio | CT4 rate |
+|---|---|---|---|---|
+| embed 128000x2048 | 283.29 ms | **211.43** | 1.34x | 29.8 GMAC/s |
+| w2 2048x7680 | 24.28 | **11.71** | 2.07x | 32.2 GMAC/s |
+| w1 7680x2048 | 17.80 | **12.82** | 1.39x | 29.4 GMAC/s |
+| conv.out 2048x2048 | 4.76 | **3.52** | 1.35x | 28.7 GMAC/s |
+
+**CT=4 is the optimum of {2,4,6,8}** (CT=6 and CT=8 are regressive: w2 at
+CT6/T24 is 31.6 vs CT4's 11.7 -- the extra `acc[CT]` registers cost more
+occupancy than the chains return; CT8 embed 160.9 vs 71.2 at T=8). **ARM=1
+(chain split) is redundant once CT=4** -- four per-position chains already hide
+the serial latency, and the split's register cost made it slower than plain
+CT4 (w1 4.97 vs 4.43 at T=8). ARM=1's numerics are UNRESOLVED by design: its
+selftest pair (ARM1-T1 vs ARM8-arm) is self-consistent by construction, so only
+an external reference tests the values; vs ARM0 the f32-arm delta was 1e-4
+(ordinary reassociation) but the H2-arm max-rel hit 41.7 on near-zero cells
+(f32 fp16-in-block cancellation), which max-rel cannot judge -- needs an
+f32-reference quality metric before ARM1 is ever used. ARM=0 stays the
+recommendation.
+
+**Budget status after this win.** Prefill needs 43.2 GMAC/s of audio-second;
+at CT4's 30 that is 1.44 s, plus text decode 4 tok/s x 113 ms = 0.45 s of
+bandwidth time on the same serial GPU -> **~0.53x realtime**, not yet 1.0. The
+realtime target needs prefill compute >= ~79 GMAC/s (at 4 tok/s decode): a
+**x2.6 from today's 30**. An instruction-issue count (4 IPC x ~20 lane-MAC per
+warp-instruction at this loop's mix) bounds ~75 GMAC/s, so the remaining gap is
+approximately the stall gap -- plausible, but stall counters are not available
+on this board (nvprof needs root), so the next probes are scheduling variants
+that are testable blind: staging/compute overlap across the c loop, HFMA2 chain
+interleaving that does not spend registers (reuse the c-loop slots), and an
+ARM variant combined with CT=2 where its registers fit. Also recorded: w2 at
+CT4 uses KC=3840 (nch=2) vs shipped KC=7680 (nch=1) -- bit-exact vs its own
+config's pair but numerically distinct from shipped; that shape needs the same
+integration-level gate §14/14a already scoped.
+
+Speed claims here are same-session same-binary A/B of env knobs; the board
+baseline drift caveat does not apply within one harness run.
