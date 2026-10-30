@@ -16,9 +16,19 @@ PORTED AND GATED    text backbone — 24 layers, 286 tensors, 1946 MB at Q8
                     112.8 ms/token (8.9 tok/s) · 2280 ms to first token on a 23-token
                     prompt · 307 MB RSS on a 4 GB board
                     at the board's ~17 GB/s streaming ceiling — bandwidth-saturated
-NOT STARTED         log-mel front end · 17-layer audio encoder · audio→text projector
-                    MaskGIT depth head + 12 codebook heads · LiquidCodec decoder
-                    liquid7.1 tokenizer · interleaved text/audio controller
+                    log-mel front end — NEON, 0.554 ms/frame, 19 fixtures;
+                    as accurate as HF against an exact-f64 referee
+                    liquid7.1 tokenizer — 531/531 fixtures id-for-id vs HF
+                    AND byte-exact round-trip (encode+decode, 5.4 MB blob)
+                    iSTFT spike — SNR 103–130 dB vs torch on 9 cases (S5's first step)
+BUILT, NOT WIRED    audio blob (encoder + downsample + projector) — 130 MB,
+                    176 tensors, every dtype decision cross-checked against Liquid's
+                    own mmproj GGUF table (176/176)
+IN PROGRESS         batched prefill (realtime-ASR challenge) — CT=4 banked:
+                    1.35–2.07× at 29–32 GMAC/s, bit-exact at T=24; budget 0.53×
+                    realtime with ×2.6 to go (see plan §14)
+NOT STARTED         encoder tower · MaskGIT depth head + 12 codebook heads
+                    LiquidCodec decoder transformer · interleaved text/audio controller
 ```
 
 The staged plan for the rest of the port — every remaining component with its gate, its
@@ -40,19 +50,28 @@ except where marked.
 | component | tensors | Q8 bytes | status |
 |---|---|---|---|
 | text backbone (LFM3, 24 layers) | 286 | **1946 MB** | **ported, 4 gates green** |
-| audio encoder (LFM2, 17 layers) | 170 | ~119 MB | not started |
-| downsample front end + projector | 19 | ~11 MB | not started |
+| log-mel front end | *(no weights)* | — | **ported, gated** (bit-exact vs its C mirror; HF tolerance 8.3e-6 live-cell) |
+| liquid7.1 tokenizer | — | 5.4 MB blob | **ported, gated** (531/531 id parity + byte round-trip; `tokenizer_config.json`'s `pre_tokenizer:null` is wrong — see plan §12) |
+| iSTFT + overlap-add (S5 spike) | *(no weights)* | — | **gated** (SNR 103–130 dB; `__sincosf` arm) |
+| audio encoder (LFM2, 17 layers) | 158 | ~119 MB | blob built (S3); tower not started |
+| downsample front end + projector | 18 | fp32 + ~6 MB | blob built; 176/176 GGUF cross-check |
 | MaskGIT head, depth embeddings, depth_linear, codebook | 77 | ~169 MB | not started |
-| LiquidCodec decoder | — | 147 MB | not started |
-| log-mel front end | *(no weights)* | — | not started |
+| LiquidCodec decoder transformer | — | 73 MB (vendor mmproj carries it) | iSTFT spiked; stack not started |
+| batched prefill (backbone, audio path) | — | — | **CT=4 in-engine, bit-exact, 1.35–2.07×**; S8 integration gate pending (w2 chunk config) |
 
-**Why the port is ordered this way.** Time on this board follows bytes at 11–17 GB/s, so
-a component's cost can be budgeted before it is written. The encoder streams its ~119 MB
-once per audio frame (100 frames/s) ≈ 0.7–1.0 s of GPU per second of audio; the backbone
-costs ~25 tokens per second of audio × ~98 ms/step of sequential prefill ≈ 2.4 s per
-second of audio. **The backbone prefill dominates an audio query, the encoder is second,
-and the mel front end is free.** Both figures are byte/rate derivations from measured
-per-step costs, flagged as such in the porting document — the encoder is not ported yet.
+**Why the port is ordered this way — and the correction that changed the budget.**
+Time on this board follows bytes at 11–17 GB/s, so a component's cost can be budgeted
+before it is written — but bytes are only half the roofline. The first version of this
+paragraph was bandwidth-only and understated the codec 2.7×; the corrected per-component
+floors (max(bytes/17 GB/s, MACs/236 GFMA/s), plan §2/§13): the encoder is compute-bound
+at **10–20 ms per 0.96 s chunk**, the depth head ~13 ms minimum / 25–40 ms realistic per
+frame, the codec transformer 11.6 ms minimum / 25–50 ms realistic — 4.3 ms was bandwidth
+alone and needs an unachievable 1100 GFLOP/s. The backbone prefill still dominates an
+audio query (25 tokens/s × sequential prefill ≈ 2.4 s per second of audio) and the mel
+front end is free. **The active target is speech-in/text-out realtime** (plan §14):
+prefill needs ≥43.2 GMAC/s of audio-second; the banked CT=4 batched prefill delivers
+29–32 GMAC/s (bit-exact at T=24), putting the board at 0.53× realtime with ×2.6 to go —
+the remainder identified as the instruction-stall gap under a ~75 GMAC/s issue bound.
 
 ## What makes the port mechanical
 
@@ -92,6 +111,12 @@ measured out with numbers in the document's appendix. **Do not re-walk them.**
 bash .auto/lfm3/checks.sh A B C E F K L                    # the four reference gates
 python .auto/lfm3/checks_lfm3.py --long A B C E F K L      # + long-context and tie-zone
 bash .auto/lfm3/measure.sh                                 # sync, build, fixed job, METRIC lines
+
+# component gates, one per ported stage:
+python .auto/lfm3/checks_mel.py                            # S2 log-mel (fixtures + HF + f64 referee)
+python .auto/lfm3/checks_tok.py                             # S1 tokenizer (531 fixtures + round-trip)
+python .auto/lfm3/checks_istft.py                           # S5 iSTFT spike (9 cases, SNR >= 60 dB)
+bash  .auto/lfm3/checks_gemm.sh                            # batched Q8 GEMM (fp64 gate, audio shapes)
 ```
 
 ```
@@ -109,7 +134,10 @@ answer), and the engine tracks the fp16 reference on magnitudes while matching t
 one on argmax. Both are true; a gate says which question it asks.
 
 Engine: `nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca
-lfm3_nanode.cu -lz`. It takes and prints token ids; there is no tokenizer on the board.
+lfm3_nanode.cu -lz`. The engine itself takes and prints token ids; the tokenizer is now
+a separately gated component (`pulsar_arm/asm/lfm3_tok.c`, id parity with HF proven) not
+yet linked into the engine binary. Test-only knobs for the prefill experiment:
+`LFM_PF_CT` (batch width), `LFM_PF_ARM`, `LFM_PF_T`; harness `--prefill-h2batched`.
 
 ## Layout
 
@@ -117,7 +145,13 @@ lfm3_nanode.cu -lz`. It takes and prints token ids; there is no tokenizer on the
 pulsar_arm/asm/lfm3_nanode.cu          LFM3 text backbone: Q8 GEMV, attention, short conv, head
 pulsar_arm/asm/lfm3_conv.S             gated short-conv decode kernel, AArch64 NEON, bit-exact
 pulsar_arm/asm/lfm3_elem.S             rmsnorm / mul / add on bf16, AArch64 NEON, bit-exact
+pulsar_arm/asm/lfm3_mel.S/.c           S2 log-mel front end, AArch64 NEON (gated)
+pulsar_arm/asm/lfm3_tok.c/.h           S1 liquid7.1 tokenizer, C (gated, encode+decode)
+pulsar_arm/asm/lfm3_istft.cu           S5 iSTFT spike, CUDA (gated, SNR 103–130 dB)
+pulsar_arm/asm/lfm3_gemm.cu            batched Q8 GEMM instrument, audio shapes (fp64-gated)
+pulsar_arm/tools/mkmel.py/.mktok.py/.mkaudio.py  build-time: mel tables, tokenizer blob, audio blob
 pulsar_arm/asm/README-lfm3-audio.md    the porting document (status, contract, recipes, budgets)
+doc/LFM3_PORT_STAGES.md                the staged plan + measurement record (§13 GGUF, §14 challenge)
 pulsar_asm/lfm3/tools/export_lfm3_q8.py  checkpoint -> .lfm3q8 blob exporter
 .auto/lfm3/                            gate suite, HF reference dumpers, A/B harness
 doc/LFM3_AUDIO_PLAN.md                 the original scoping study and measured facts
