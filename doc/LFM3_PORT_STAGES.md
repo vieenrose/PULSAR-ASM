@@ -615,3 +615,75 @@ Three things it caught before any tower code was written:
 Result: `lfm3-audio-2b-enc.lfm3q8`, 130 MB (was 151 MB before lin_out went Q8),
 176 tensors, SELFCHECK OK, 176/176 GGUF agreement. The blob is the S3 foundation;
 the tower kernels and the per-layer gate against HF are the remaining S3 work.
+
+## 14. Challenge: realtime speech-in / text-out (2026-10-31 acceptance frame)
+
+Target set by the operator: **process speech audio in at >= 1.0x realtime sustained
+(ASR_RT = wall / clip <= 1.00 on a >= 60 s clip), with the existing text gates green.**
+Text-out mode sidesteps the speech-out hard limit (section 13's 24.3 GB/s arithmetic
+excludes TTS at 8-bit; ASR has no such wall). The budget:
+
+| per wall second | work | rate needed | today | verdict |
+|---|---|---|---|---|
+| mel | 100 frames x 0.554 ms / 100 | 55 ms CPU | measured | free |
+| encoder | 2.5 GMAC (25 tok x 100 M) | 2.5 GMAC/s | v3 GEMM 16 GMAC/s -> 156 ms | fits as-is |
+| backbone prefill | 43.2 GMAC (25 tok x 1.73) | **43.2 GMAC/s** | batched 11-18 GMAC/s | **THE gap: x2.4-3.9** |
+| text decode | 4-6 tok/s x 1.946 GB (T=1, GEMV) | 7.8-11.7 GB/s of ~17 | 112.8 ms/tok measured | fits at <= 6 tok/s |
+| KV reads | ~33 MB/tok at 4096 ctx | 0.2 GB/s | — | free |
+
+Prefill batching amortizes the weight stream (one 1946 MB pass serves T positions),
+so at T>=4 the prefill side becomes compute-bound and the text side keeps its
+bandwidth — the two share the bus at ~13-14 GB/s of the measured 17. Nothing physical
+excludes the target: 43.2 GMAC/s is 18% of the 236 GFMA/s peak.
+
+### What run #294 measured (fresh build, `--prefill-h2batched`, shipped blob)
+
+1 **The #165 blocker's premise does not reproduce at kernel level.** The kept selftest
+   reports **8/8 shapes BIT-EXACT including `feed_forward.w2.weight` in both fp32 and
+   H2 arms** (0/32768 and 0/16384 cells differ, batched T=8 vs per-position sequential
+   at the same KCHUNK config). The kernel comment's claim -- "gemv() indexes x + row*K
+   ... non-bit-exact BY CONSTRUCTION, no per-position tiling reproduces those bytes" --
+   matches no visible launcher (q8_partial stages `x + koff`; rowlane stages x once;
+   prefill_h2 stages `xall[tt*K + koff]`). The observed #165 divergence (position 16
+   got 17-19's bytes) is consistent with a bug in the REMOVED integration's
+   per-position persistence, not with the math. **Status: "by construction" downgraded
+   to "integration bug, mechanism misattributed"; S8 needs one integration-level gate
+   run (logits vs sequential), not a goldens waiver.** One open detail before S8 v2:
+   the selftest's seq arm uses the same KCHUNK search as its batch arm (w2 f32 lands
+   at KC=3840 nchunk=2, H2 at KC=7680 nchunk=1), so batch==sequential-at-that-config;
+   batch==SHIPPED-sequential (KC=7680 nchunk=1 for w2, f32) must be re-checked once at
+   the integration level, where the chunk-split parenthesization question lives.
+
+2 **Decode sits at an exact crossover, which is why it has no headroom.** Q8 weights
+   cost 1.125 B/MAC; the bus sustains ~17 GB/s; crossover = 15.1 GMAC/s. The H2
+   kernels measure 17-18 GMAC/s at T=1 (embed: 14.7 ms/pos = 17.8 GB/s AND 17.8
+   GMAC/s simultaneously). Bandwidth and compute hit together -- there is no slack on
+   either side at T=1.
+
+3 **The batched form exposes the real ceiling: ~11-18 GMAC/s of 236 (5-8% of peak),
+   and it is shared by every kernel family in this repo.** At T=8, weight traffic
+   drops 8x (bandwidth should free up) yet throughput stays put:
+
+   | kernel | rate | chain depth nb |
+   |---|---|---|
+   | v3 `lfm3_gemm` | 16 GMAC/s | 8-64 |
+   | q8_partial H2 (T=1, embed) | 17.8 GMAC/s | 64 |
+   | q8_prefill_h2 H2 bat (embed, w1) | 17.9-18.2 GMAC/s | 64 |
+   | q8_prefill bat (w2, K=7680) | **11-12 GMAC/s** | **240** |
+
+   The w2-vs-w1 rate tracks the block count (dependency-chain depth): the inner H2
+   unpack+HFMA2 loop and the outer `acc` chain are both serial. Four independent
+   implementations converging on one number means the limit is the instruction
+   structure, not shared memory, not banks, not occupancy, not bandwidth.
+
+4 **Therefore the challenge reduces to: break the serial chains to >= 45 GMAC/s
+   batched (x2.4) while keeping T=1 behavior at 17 GB/s (decode untouched).** The
+   experiment, exact design: interleave 2-4 independent accumulators in the inner loop
+   (N partial dot products summed at the end of each block) plus 4-8 independent chunk
+   partials for the outer `acc` (summed ascending, so T=1 summation order and every
+   shipped bit are preserved when the interleave count is 1 = current code). Register
+   cost is the risk (v1's 159-reg TILE was refused); budget <= 110 regs for 2
+   blocks/SM. Gate: fp64 relative 2e-5 (existing) + a timing sweep against today's
+   11-18 GMAC/s; if >=45 holds on w2/w1/embed, the budget table above closes to
+   ASR_RT <= 1.00 with margin (prefill 43.2 GMAC at 45 = 960 ms -- needs the decode
+   overlap shown in the table: <= 6 tok/s text on the bandwidth side).
