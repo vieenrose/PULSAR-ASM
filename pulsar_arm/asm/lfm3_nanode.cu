@@ -1278,6 +1278,9 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
   extern __shared__ float smf[];
   __half2* xh = reinterpret_cast<__half2*>(smf);   // H2 staging: [CT][nb][17] half2
   float* xf = smf;                                 // fp32 staging: [CT][nb][33] float
+  // ARM=6 only: per-warp coalesced weight staging, 32 blocks x 32 B = 256 words.
+  // Zero-size for every other arm (the array dimension is a constant expression).
+  __shared__ uint32_t wst[ARM == 6 ? 8 : 1][ARM == 6 ? 256 : 1];
   const int nchunk = K / KCHUNK, rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
   const int koff = chunk * KCHUNK, NT = blockDim.x, tid = threadIdx.x;
   const int lane = tid & 31, wid = tid >> 5, WPB = NT >> 5, GR = R / WPB, base = rowblk * R;
@@ -1397,6 +1400,62 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
 #pragma unroll
         for (int c = 0; c < CT; c++) {
           float v = (row < N) ? acc5[g][c] : 0.f;
+          for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+          if (lane == 0 && row < N && t0 + c < T)
+            part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
+        }
+      }
+      continue;
+    }
+    if (ARM == 6 && H2) {
+      // Coalesced weight staging (bench_h2: 2.9x the direct per-lane pattern in
+      // isolation). The warp reads 32 consecutive 32-byte blocks as 64 int4
+      // (fully coalesced, 1 KB), stages them in its own shared slice, and each
+      // lane then reads ITS block from shared. Same lane->b mapping and same
+      // k-chain as ARM0, so each (row,c) accumulates in ARM0's order.
+      uint32_t* ws = &wst[wid][0];
+      for (int g = 0; g < GR; g++) {
+        const int r = wid + g * WPB, row = base + r;
+        float acc6[CT];
+#pragma unroll
+        for (int c = 0; c < CT; c++) acc6[c] = 0.f;
+        const int8_t* qr = q + (size_t)row * K + koff;
+        const float* sr = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb;
+        for (int b0 = 0; b0 < nb; b0 += 32) {
+          const int nbl = (nb - b0 < 32) ? (nb - b0) : 32;
+          if (row < N) {                       // uniform across the warp
+            const int8_t* src = qr + (size_t)b0 * Q8_BLK;
+            for (int i = lane; i < nbl * 2; i += 32) {
+              const int4 v = *reinterpret_cast<const int4*>(src + (size_t)i * 16);
+              ws[i * 4 + 0] = v.x; ws[i * 4 + 1] = v.y; ws[i * 4 + 2] = v.z; ws[i * 4 + 3] = v.w;
+            }
+          }
+          __syncwarp();
+          const int b = b0 + lane;
+          if (row < N && b < nb) {
+            const uint32_t* w = &ws[lane * 8];
+            const float sb[1] = {sr[b]};
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              const __half2* xb2 = xh + ((size_t)c * nb + (size_t)b) * 17;
+              __half2 h2 = __floats2half2_rn(0.f, 0.f);
+#pragma unroll
+              for (int k = 0; k < 8; k++) {
+                const uint32_t u = w[k] ^ 0x80808080u;
+                const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+                h2 = __hfma2(__hsub2(*reinterpret_cast<const __half2*>(&lo), off), xb2[2 * k], h2);
+                h2 = __hfma2(__hsub2(*reinterpret_cast<const __half2*>(&hi), off), xb2[2 * k + 1], h2);
+              }
+              const float2 f = __half22float2(h2);
+              acc6[c] = __fmaf_rn(sb[0], f.x + f.y, acc6[c]);
+            }
+          }
+          __syncwarp();                        // staging is reused by the next b0
+        }
+#pragma unroll
+        for (int c = 0; c < CT; c++) {
+          float v = (row < N) ? acc6[c] : 0.f;
           for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
           if (lane == 0 && row < N && t0 + c < T)
             part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
@@ -1957,6 +2016,10 @@ static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const fl
 #undef PF5
     return;
   }
+  if (arm == 6 && h2) {
+    if (ct == 2) PF(2, true, 6); else PF(4, true, 6);
+    return;
+  }
   if (arm >= 3) { arm = 0; }   // f32 path: these arms not instantiated
   if (h2) { if (ct == 2) { if (arm == 2) PF(2, true, 2); else if (arm) PF(2, true, 1); else PF(2, true, 0); }
             else if (ct == 4) { if (arm == 2) PF(4, true, 2); else if (arm) PF(4, true, 1); else PF(4, true, 0); }
@@ -1980,7 +2043,7 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
     pfCT = getenv("LFM_PF_CT") ? atoi(getenv("LFM_PF_CT")) : 2;
     pfARM = getenv("LFM_PF_ARM") ? atoi(getenv("LFM_PF_ARM")) : 0;
     if (pfCT != 2 && pfCT != 4 && pfCT != 6 && pfCT != 8) { printf("LFM_PF_CT=%d unsupported (2|4|6|8) -- using 2\n", pfCT); pfCT = 2; }
-    if (pfARM < 0 || pfARM > 5) { printf("LFM_PF_ARM=%d unsupported (0..5) -- using 0\n", pfARM); pfARM = 0; }
+    if (pfARM < 0 || pfARM > 6) { printf("LFM_PF_ARM=%d unsupported (0..6) -- using 0\n", pfARM); pfARM = 0; }
     pfRPB = getenv("LFM_PF_RPB") ? atoi(getenv("LFM_PF_RPB")) : 4;
     if (pfRPB != 1 && pfRPB != 2 && pfRPB != 4 && pfRPB != 8) { printf("LFM_PF_RPB=%d unsupported (1|2|4|8) -- using 4\n", pfRPB); pfRPB = 4; }
     pfRB = getenv("LFM_PF_RB") ? atoi(getenv("LFM_PF_RB")) : 2;

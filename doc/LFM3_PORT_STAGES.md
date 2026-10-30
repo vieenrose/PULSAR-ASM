@@ -911,3 +911,32 @@ differed, rel ~1e38); non-finite cells are a failure only when **asymmetric**
 (the shipped path's own bf16 inf at layers 12/23 is reproduced bit-identically
 and is not this gate's business); and a refused launch is silent -- the f32
 arm's first version measured zeros because nothing read `cudaGetLastError()`.
+
+### 16. Coalesced weight staging: ARM=6, bit-exact and 2x SLOWER in the engine (run #300)
+
+The bench (`pulsar_arm/asm/bench/bench_h2.cu`, 4164a32) showed coalesced loads
+at 2.9x the direct pattern in isolation. The engine test did not transfer.
+
+ARM=6 stages each warp's 32 consecutive 32-byte weight blocks (1 KB, coalesced
+int4 loads) into a per-warp shared slice, then each lane reads its own block.
+Same lane->b map and k-chain as ARM0, so the arithmetic is ARM0's.
+
+Results, T=24, CT=4, H2, nonzero verified, same session:
+
+| tensor | ARM0 (shipped structure) | ARM6 (coalesced staging) | max rel vs ARM0 |
+|---|---|---|---|
+| embed 128000x2048 | 29.8 GMAC/s | 16.9 | 0 |
+| w2 2048x7680 | 32.0 | 8.6 | 0 |
+| w1 7680x2048 | 29.3 | 16.7 | 0 |
+| conv.out 2048x2048 | 27.7 | 16.4 | 0 |
+
+ARM6 is bit-exact (every cell, ARM1-vs-ARM0 max rel 0) and 2-3.5x slower.
+Plausible explanation, not measured: each 32-block group adds shared stores
+(8 words per lane) and loads, plus a warp sync, to the path the arm was meant
+to relieve. That is the shared-traffic direction the ARM3/ARM5 results already
+ruled out. The bench's 2.9x was for a kernel with x in global memory, so the
+bottleneck it removed is not the engine's.
+
+Verdict: refuted in the engine. The shipped structure (ARM0, CT=4) stays.
+The binder is still unidentified; this run removes "uncoalesced weight loads"
+from the candidate list for this kernel.
