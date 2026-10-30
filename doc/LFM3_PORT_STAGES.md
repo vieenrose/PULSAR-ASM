@@ -323,8 +323,14 @@ codec, no iSTFT, and it exercises the entire input path against HF.
    `.auto/lfm3/quant_sensitivity.py`), since §6's 123 MB assumes Q8 passes.
 2. Codec decoder bf16 vs fp32: SNR per §4-S5 on 5 sequences.
 3. Batched GEMV efficiency at the audio shapes (K = 768 / 1792 / 512 / 2304, tile 12 / 75 / 96
-   positions) — the 1.15–1.45× standalone figure from the backbone's CT=2 kernel is the precedent,
-   but the audio shapes are wider-K and should do better.
+   positions) — **MEASURED 2026-10-30, and the answer is negative for the naive form**:
+   `pulsar_arm/asm/lfm3_gemm.cu` sweeps 18 audio shapes x T in {1,6,12,24,75} x 7 tile sizes and
+   every single one lands at **7.0-7.1 GFLOP/s** (3% of the board's ~230 GFLOP/s fp32 peak), with
+   per-position cost flat in T (batching win 0.01-0.23x, i.e. worse than the T=1 GEMV), and
+   T=1 weight streaming at 1.0-3.5 GB/s against the engine's measured 17 GB/s. Accuracy is fine
+   (fp64 gate: max relative error 2.9e-8 everywhere), so this is a structural limit, not a bug:
+   one shared-memory load per (weight, position) pair. Consequence: **the D2 cost table stays
+   DERIVED**, and S3's GEMM is specified as a port of `q8_partial`, whose x is register-staged.
 4. iSTFT determinism: `torch.fft.irfft` vs our fixed 1280-point inverse on the same spectra.
 5. MaskGIT tie density, as the backbone's reference-precision work did for text.
 
@@ -336,6 +342,7 @@ Until those five exist, every timing in this document stays labelled *derived*.
 |---|---|---|
 | **S2 log-mel front end** | **done, gated** | `pulsar_arm/tools/mkmel.py` (build-time: the reference's own `mel_filter_bank` + `torch.hann_window` + twiddles -> `mel.bin`), `pulsar_arm/asm/lfm3_mel.S` (window + half-length pair-form direct DFT 400->201, 128x208 mel matmul, clamp+affine -- NEON, documented reduction order), `lfm3_mel.c` (HF's `pad_length`/`num_frames` padding, `log10f`), `lfm3_mel_test.c` (bit-exact C mirror). Gate `.auto/lfm3/checks_mel.py`, 19 fixtures: **asm vs C mirror 29,412 checks 0 mismatches (bit-exact)**; vs HF frame counts exact on all 19, live-cell (within 6 decades of the frame peak) max 8.3e-6, live mean 2.2e-7; exact-f64 referee says the engine is as accurate as HF (worst mean-ratio 1.28); all-cell max 0.0499 disclosed (one chirp cell 13.5 decades under its peak, where HF is 0.039 from exact). Cost **0.554 ms/frame** = 5.5% of realtime, so the front end is free. |
 | **S5 iSTFT spike** | **done, gated** (transformer stack not started) | `pulsar_arm/asm/lfm3_istft.cu`: direct inverse 641->1280 in a documented order, x hann, overlap-add hop 320 with a fixed 4-term contribution order (no atomics), envelope divide, `trim=480`/`tail=960` per `decode`. Gate `.auto/lfm3/checks_istft.py`: **9 cases, SNR 103-130 dB vs torch** (cases built from the checkpoint's real `decoder.lin` weights, bf16-rounded like the engine will, plus a 440 Hz tone and a window-centred click), well past the 60 dB bar; max abs scales with the case (relative bound 1e-3 x rms). **Decision: the `__sincosf` arm ships** -- it is faster in 9/9 cases (the 3.2 MB/frame twiddle table is DRAM-bound). Cost 0.7-4.5 ms/frame (board drift included; 75 frames per audio second => 5-11% RT, acceptable next to the backbone's 141% RT). **Follow-up: an FFT form** (1280 = 2^7 x 5) if it ever matters -- the direct form is SFU-bound on `__sincosf` (measured 2 ms/frame vs a 1.64 MFLOP/frame FLOP count => 0.8 GFLOP/s of ~100). |
+| batched Q8 GEMM (D2's enabling kernel) | **measured, not shipped** | `pulsar_arm/asm/lfm3_gemm.cu` + `.auto/lfm3/checks_gemm.sh`: fp64 gate PASS on all 18 audio shapes x 5 T x 7 tiles (max relative error 2.9e-8). Performance verdict: **7.1 GFLOP/s ceiling on every shape, no batching win** (per-position cost flat in T; T=1 streams weights at 1.0-3.5 GB/s vs the engine's 17 GB/s). Two bugs the fp64 gate caught: an out-of-bounds write when T is not a multiple of TILE (`ceil(T/TILE)` tiles need the `t0+t<T` guard on both the x load and the store -- symptom: scattered zeros plus a poisoned CUDA context that made every later shape "fail to allocate"); and scalar `int8` weight loads (2.4x at T=1, and the 40x-off streaming rate). Root cause of the ceiling: the inner loop reads x from shared once per (weight, position) pair -> shared-bandwidth bound. **Action: port `q8_partial` (x register-staged, KCHUNK partials, R rows/block, warp-shuffle reductions) to the batched form; do not ship a from-scratch GEMM.** |
 | S1 tokenizer | not started | |
 | S3 encoder tower | not started (unblocked: S2's gate is green) | |
 | S4 depth head + MaskGIT | not started | |
@@ -356,3 +363,14 @@ survives a tolerance check:
 * **CUDA: stdio in a `.cu` host function hits CUDA's device-side `fopen/fread/
   fwrite` overloads** ("too few arguments in function call", pointing at the wrong
   line). Use POSIX `open/read/write` in tool drivers, as `lfm3_istft.cu` does.
+
+## 11. What the batched-GEMM measurement changes
+
+The plan's D2 table (encoder 13 ms per chunk, codec 4.3 ms per frame) is a **bandwidth**
+statement: weights streamed once at 17 GB/s. The sweep in §10 shows a naive batched kernel
+never reaches that regime -- it sits at 7.1 GFLOP/s, where the encoder is 3.1 s per audio
+second (300x realtime) instead of 0.13 s. So the table is not wrong, it is *conditional*: it
+holds only for a kernel built like the engine's `q8_partial`, which is the component that
+streamed 1946 MB in 112.8 ms on this same board. S3 therefore starts from that kernel, and
+`lfm3_gemm.cu` stays in the tree as the instrument (its fp64 gate is what any future form has
+to pass).
