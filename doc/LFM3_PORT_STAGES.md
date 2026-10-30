@@ -36,7 +36,7 @@ next starts.
 | component | prefix | tensors | bf16 | params | Q8 estimate |
 |---|---|---|---|---|---|
 | text backbone | `lfm.` | 286 | 3458 MB | 1728.8 M | **1946 MB** (shipped) |
-| audio encoder | `encoder.lfm.lfm.` | 159 | 219 MB | 109.5 M | ~123 MB |
+| audio encoder | `encoder.lfm.lfm.` | 158 (10 conv x 8 + 7 attn x 11 + embedding_norm) | 219 MB | 109.5 M | ~123 MB |
 | encoder downsample front end | `encoder.downsample.` | 12 (6w+6b; GGUF cross-check §13) | 3.7 MB | 1.85 M | fp32, keep |
 | audio→backbone projector | `mlp.` | 6 | 11.5 MB | 5.77 M | ~6.5 MB |
 | MaskGIT depth head | `depthformer.` | 37 | 67.8 MB | 33.9 M | ~38 MB |
@@ -385,7 +385,7 @@ reference. Neither claim is "bit-exact to the reference". Cost **0.554 ms/frame*
 | **S5 iSTFT spike** | **done, gated** (transformer stack not started) | `pulsar_arm/asm/lfm3_istft.cu`: direct inverse 641->1280 in a documented order, x hann, overlap-add hop 320 with a fixed 4-term contribution order (no atomics), envelope divide, `trim=480`/`tail=960` per `decode`. Gate `.auto/lfm3/checks_istft.py`: **9 cases, SNR 103-130 dB vs torch** (cases built from the checkpoint's real `decoder.lin` weights, bf16-rounded like the engine will, plus a 440 Hz tone and a window-centred click), well past the 60 dB bar; max abs scales with the case (relative bound 1e-3 x rms). **Decision: the `__sincosf` arm ships** -- it is faster in 9/9 cases (the 3.2 MB/frame twiddle table is DRAM-bound). Cost 0.7-4.5 ms/frame (board drift included; 75 frames per audio second => 5-11% RT, acceptable next to the backbone's 141% RT). **Follow-up: an FFT form** (1280 = 2^7 x 5) if it ever matters -- the direct form is SFU-bound on `__sincosf` (measured 2 ms/frame vs a 1.64 MFLOP/frame FLOP count => 0.8 GFLOP/s of ~100). |
 | batched Q8 GEMM (D2's enabling kernel) | **measured, not shipped** | `pulsar_arm/asm/lfm3_gemm.cu` + `.auto/lfm3/checks_gemm.sh`: fp64 gate PASS on all 18 audio shapes x 5 T x 7 tiles (max relative error 2.9e-8). Performance verdict: **7.1 GFLOP/s ceiling on every shape, no batching win** (per-position cost flat in T; T=1 streams weights at 1.0-3.5 GB/s vs the engine's 17 GB/s). Two bugs the fp64 gate caught: an out-of-bounds write when T is not a multiple of TILE (`ceil(T/TILE)` tiles need the `t0+t<T` guard on both the x load and the store -- symptom: scattered zeros plus a poisoned CUDA context that made every later shape "fail to allocate"); and scalar `int8` weight loads (2.4x at T=1, and the 40x-off streaming rate). Root cause of the ceiling: the inner loop reads x from shared once per (weight, position) pair -> shared-bandwidth bound. **Action: port `q8_partial` (x register-staged, KCHUNK partials, R rows/block, warp-shuffle reductions) to the batched form; do not ship a from-scratch GEMM.** |
 | S1 tokenizer | **done, gated (encode+decode)** | `pulsar_arm/tools/mktok.py` (blob: vocab 124893 + 293320 merges + 140 added + 782 L/N ranges + 10 White_Space ranges + byte map, 5.4 MB) + `pulsar_arm/asm/lfm3_tok.c` (hand-rolled Split regex, ByteLevel, ignore_merges BPE) + gate `.auto/lfm3/checks_tok.py`: **531/531 fixtures id-for-id vs HF (9988 ids) AND byte-exact round-trip** decode(encode(x))==x on all 531. The A6 (`\\s+(?!\\S)`) trap is documented in §12. |
-| S3 encoder tower | not started (unblocked: S2's gate is green) | |
+| S3 encoder tower | **blob done; tower not started** | `pulsar_arm/tools/mkaudio.py` builds `lfm3-audio-2b-enc.lfm3q8` (130 MB, 176 tensors, 102 Q8 / 74 f32) with SELFCHECK OK and **176/176 dtype decisions matching Liquid's mmproj GGUF table**. Census corrections found by the cross-check (§13a): encoder is **158** tensors (not 159), tower-final `embedding_norm` exists (= GGUF `a.post_ln`), `self_attn.out_proj` needed its own Q8 pattern (the backbone's `o_proj` name didn't match it -- caught in the tool's first run), `lin_out` is Conv1d [768,4096,1] squeezed to 2-D and Q8 (GGUF `a.pre_encode.out`). Tower implementation + per-layer gate still to come. |
 | S4 depth head + MaskGIT | not started | |
 | S5 codec transformer | not started | |
 | S6 controller / S7 shell / S9 packaging | not started | |
@@ -588,3 +588,30 @@ requests); no weights downloaded. Findings, each checked against the census:
    (serve/CLI/TTS/realtime voice). Uses: its `lfm2` pre-tokenizer as a cross-check
    for the S1 splitter (independent of both HF and our C), and its generate loop
    for S6 stream comparisons with fixed seeds.
+
+## 13a. S3's blob: what the GGUF cross-check caught on its first run
+
+`mkaudio.py` exports the M1 audio path (encoder + downsample + projector) in the
+backbone blob's container (same magic, same certified quantizer copied verbatim,
+per-tensor crc, `--selfcheck` re-derives and compares). Its distinguishing feature
+is `--gguf`: a 16 MB Range fetch of Liquid's mmproj header is enough to parse their
+319-tensor table, and every dtype decision is asserted to match theirs (Q8_0 <-> our
+Q8, F32 <-> our f32), tensor for tensor.
+
+Three things it caught before any tower code was written:
+
+1 **`self_attn.out_proj` (encoder) was not in the Q8 patterns** -- the patterns had
+   the backbone's `self_attn.o_proj` spelling, so the encoder's seven attention
+   output projections would have shipped f32 (and the f32/f32 cross-check on
+   `conv.out_proj` pattern-matched, hiding it). This is the zero-match filter class
+   this repo has been burned by twice; here the *vendor's own table* is the
+   referee, which is stronger than any internal assert.
+2 **`lin_out` is Conv1d [768, 4096, 1]**, squeezed to 2-D for the quantizer, and is
+   **Q8** in Liquid's table (`a.pre_encode.out`), not f32 as the first draft had it.
+3 **The encoder census was 158, not 159**, and the missing tensor is
+   `encoder.lfm.lfm.embedding_norm.weight` -- a tower-final rmsnorm the safetensors
+   census had skipped and which explains GGUF's `a.post_ln`. Table §1 updated.
+
+Result: `lfm3-audio-2b-enc.lfm3q8`, 130 MB (was 151 MB before lin_out went Q8),
+176 tensors, SELFCHECK OK, 176/176 GGUF agreement. The blob is the S3 foundation;
+the tower kernels and the per-layer gate against HF are the remaining S3 work.
