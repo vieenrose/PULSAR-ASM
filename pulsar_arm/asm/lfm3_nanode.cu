@@ -1174,6 +1174,31 @@ static void xrange_print() {
            100.0 * kv.second.sub / (kv.second.n ? kv.second.n : 1), kv.second.over);
 }
 
+// ---- S8 integration gate: capture the REAL activations every shipped gemv
+// call sees, so the batched kernel can be replayed on them (a synthetic
+// pattern proves the kernel; real activations prove the swap).
+static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const float* s,
+                      const bf16* x, float* part, int N, int K, int KC, int R,
+                      int nb, int T, int nblk, int TPB, size_t shm);
+static int g_prefill_phase = 0;   // 1 while the prompt is being fed (S8 arm scope)
+struct CapRec { std::string name; int N = 0, K = 0; std::vector<uint16_t> x, y; };
+static int g_cap_on = 0;
+static std::vector<CapRec> g_caps;
+static std::map<std::string, size_t> g_capidx;
+static void cap_add(const std::string& name, const bf16* xb, const bf16* yb, int N, int K) {
+  size_t idx;
+  auto it = g_capidx.find(name);
+  if (it == g_capidx.end()) {
+    idx = g_caps.size(); g_capidx[name] = idx; g_caps.push_back(CapRec());
+    CapRec& c = g_caps.back(); c.name = name; c.N = N; c.K = K;
+  } else idx = it->second;
+  CapRec& c = g_caps[idx];
+  const size_t o = c.x.size();
+  c.x.resize(o + (size_t)K); c.y.resize(o + (size_t)N);
+  cudaMemcpy(c.x.data() + o, xb, (size_t)K * 2, cudaMemcpyDeviceToHost);
+  cudaMemcpy(c.y.data() + o, yb, (size_t)N * 2, cudaMemcpyDeviceToHost);
+}
+
 static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   Ent* e = T(M, name);
   const int N = e->ne[0], K = e->ne[1];
@@ -1182,6 +1207,29 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   if (K % c.KCHUNK) { printf("%s: K=%d not divisible by KCHUNK=%d\n", name.c_str(), K, c.KCHUNK); exit(2); }
   const int nb = c.KCHUNK / Q8_BLK, nchunk = K / c.KCHUNK;
   if (nchunk * c.KCHUNK != K) { printf("%s: coverage FAIL\n", name.c_str()); exit(2); }
+  // LFM_PF_USE=1: route the T=1 GEMV through the batched ARM=5 kernel (CT=4,
+  // GRP=8, R=64). Numerics = q8_partial's order -- proven bit-exact on every
+  // real activation of prompt A by --prefill-arm5-gate -- NOT q8_gemv_hs's, so
+  // the goldens are the acceptance bar for this arm. Falls back to the shipped
+  // path when the shape does not fit (K not a multiple of 32, shm over budget,
+  // or the KC chooser cannot split K exactly).
+  static int pfUse = -1;   // prefill-only: g_prefill_phase gates the arm
+  if (pfUse < 0) { pfUse = getenv("LFM_PF_USE") ? atoi(getenv("LFM_PF_USE")) : 0; if (pfUse < 0) pfUse = 0; }
+  if (pfUse && g_prefill_phase && !g_nofuse && K % Q8_BLK == 0) {
+    const int CTq = 4, RPBq = 8, Rq = (256 / 32) * RPBq;
+    int KCq = K; size_t shmq = (size_t)CTq * (KCq / Q8_BLK) * 17 * sizeof(__half2);
+    while (KCq > 32 && (K % KCq || shmq > 49152)) { KCq /= 2; shmq = (size_t)CTq * (KCq / Q8_BLK) * 17 * sizeof(__half2); }
+    if (K % KCq == 0 && shmq <= 49152) {
+      const int nbq = KCq / Q8_BLK, nchq = K / KCq;
+      if (nchq * nbq * Q8_BLK == K) {
+        pf_launch(CTq, 5, 1, RPBq, e->dq, e->ds, xb, M.part, N, K, KCq, Rq, nbq, 1,
+                  ((N + Rq - 1) / Rq) * nchq, 256, shmq);
+        k_combine_bf<<<(N + 255) / 256, 256, 0, g_launch>>>(M.part, yb, N, nchq);
+        if (g_cap_on) cap_add(name, xb, yb, N, K);
+        return;
+      }
+    }
+  }
   const int nblk = ((N + c.R - 1) / c.R) * nchunk;
   const size_t shm = (size_t)nb * 33 * 4;
   if (g_nofuse) {
@@ -1192,6 +1240,9 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
     q8_launch_bf(nblk, c.TPB, shm, e->dq, e->ds, xb, M.part, N, K, c.KCHUNK, c.R, nb, g_launch);
   }
   k_combine_bf<<<(N + 255) / 256, 256, 0, g_launch>>>(M.part, yb, N, nchunk);
+  // capture AFTER the combine wrote yb (a top-of-function capture reads the
+  // previous call's stale output -- every cell mismatched, rel ~1e38)
+  if (g_cap_on) cap_add(name, xb, yb, N, K);
 }
 // Batched H2 prefill, clean-room (#162 continued). VALIDATED PIECES ONLY:
 // - staging layout identical to q8_partial<H2=1> (proven bit-exact by v3a);
@@ -1269,6 +1320,46 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
       // the stream is at 8% of bandwidth, so that is the cheap side.
       // Per (row,c) the k-chain order is ARM0's -> bit-exact by construction.
       if (GR != GRP) continue;   // harness sets R = WPB*RPB; guard against mismatch
+      if (!H2) {
+        for (int b = lane; b < nb; b += 32) {
+#pragma unroll
+          for (int c = 0; c < CT; c++) {
+            const float* xb = xf + (((size_t)c * nb) + (size_t)b) * 33;
+            float xv[32];
+#pragma unroll
+            for (int j = 0; j < 32; j++) xv[j] = xb[j];
+#pragma unroll
+            for (int g = 0; g < GRP; g++) {
+              const int r = wid + g * WPB, row = base + r;
+              if (row >= N) continue;
+              const int8_t* qr = q + (size_t)row * K + koff + (size_t)b * Q8_BLK;
+              const int4 a0 = *reinterpret_cast<const int4*>(qr);
+              const int4 a1 = *reinterpret_cast<const int4*>(qr + 16);
+              const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
+              const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+              float dot = 0.f;
+#pragma unroll
+              for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c0[j], xv[j], dot);
+#pragma unroll
+              for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c1[j], xv[16 + j], dot);
+              const float* sr = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb + b;
+              acc5[g][c] = __fmaf_rn(sr[0], dot, acc5[g][c]);
+            }
+          }
+        }
+#pragma unroll
+        for (int g = 0; g < GRP; g++) {
+          const int r = wid + g * WPB, row = base + r;
+#pragma unroll
+          for (int c = 0; c < CT; c++) {
+            float v = (row < N) ? acc5[g][c] : 0.f;
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+            if (lane == 0 && row < N && t0 + c < T)
+              part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
+          }
+        }
+        continue;
+      }
       for (int b = lane; b < nb; b += 32) {
 #pragma unroll
         for (int c = 0; c < CT; c++) {
@@ -1638,6 +1729,172 @@ static int prefill_minimal(Model& M) {
 // vs one batched call. Bit-exactness expected by construction (same per-position
 // order); the question is only whether it runs and how fast.
 static int prefill_h2_one(Model& M, Ent* e, int T, int h2);
+static long g_last_partial_bad = 0;
+static uint16_t host_f2bf(float f) {   // RTN-even, matches __float2bfloat16_rn on finite input
+  uint32_t u; memcpy(&u, &f, 4);
+  if ((u & 0x7f800000u) == 0x7f800000u && (u & 0xffffu)) return (uint16_t)((u >> 16) | 0x0040u); // NaN -> quiet
+  uint32_t lsb = (u >> 16) & 1u; u += 0x7fffu + lsb; return (uint16_t)(u >> 16);
+}
+static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const float* s,
+                      const bf16* x, float* part, int N, int K, int KC, int R,
+                      int nb, int T, int nblk, int TPB, size_t shm);
+static int prefill_arm5_gate(Model& M) {
+  if (g_caps.empty()) { printf("LFM_ARM5_GATE: nothing captured\n"); return 1; }
+  int fails = 0, tested = 0;
+  for (size_t i = 0; i < g_caps.size(); i++) {
+    CapRec& c = g_caps[i];
+    if (c.K % Q8_BLK || c.N <= 0) continue;
+    const int N = c.N, K = c.K, TPB = 256, CT = 4, RPB = 8, R = (TPB / 32) * RPB;
+    const int Tn = (int)(c.x.size() / (size_t)K);
+    if (Tn < 2) continue;
+    // KC configs: exact whole-K (nch=1, the shipped shape for K<=5760) and the
+    // chunked 3840 (nch=2) that the CT=4 shared budget forces for K=7680.
+    for (int cfg = 0; cfg < 2; cfg++) {
+      int KC = (cfg == 0) ? K : 3840;
+      if (K % KC) continue;
+      int nb = KC / Q8_BLK;
+      size_t shm = (size_t)CT * nb * 17 * sizeof(__half2);
+      if (shm > 49152) continue;
+      if (cfg == 0 && shm > 49152) continue;
+      const int nch = K / KC, nblk = ((N + R - 1) / R) * nch;
+      uint16_t* xd = nullptr; float* pd = nullptr;
+      cudaMalloc(&xd, (size_t)Tn * K * 2);
+      cudaMalloc(&pd, (size_t)Tn * N * nch * 4);
+      cudaMemcpy(xd, c.x.data(), (size_t)Tn * K * 2, cudaMemcpyHostToDevice);
+      Ent* e = T(M, c.name);
+      // Per-token T=1 comparison against the SHIPPED kernel. The harness pair
+      // proves ARM5-batch == ARM5-seq == q8_partial; the engine's decode GEMV is
+      // q8_gemv_hs, a different summation order, so "batched == shipped" needs
+      // this link: ARM5 at T=1 vs the shipped output, on real activations.
+      for (int t = 0; t < Tn; t++)
+        pf_launch(CT, 5, 1, RPB, e->dq, e->ds, xd + (size_t)t * K, pd + (size_t)t * N * nch,
+                  N, K, KC, R, nb, 1, nblk, TPB, shm);
+      {
+        std::vector<float> h1((size_t)Tn * N * nch);
+        cudaMemcpy(h1.data(), pd, h1.size() * 4, cudaMemcpyDeviceToHost);
+        long bad1 = 0; double worst1 = 0; int ninf1 = 0;
+        for (int t = 0; t < Tn; t++)
+          for (int r = 0; r < N; r++) {
+            float acc = 0.f;
+            for (int ch = 0; ch < nch; ch++) acc = acc + h1[((size_t)t * N + r) * nch + ch];
+            uint16_t got = host_f2bf(acc), want = c.y[(size_t)t * N + r];
+            if (got != want) {
+              bad1++;
+              float gf, wf;
+              { uint32_t bu = (uint32_t)got << 16; memcpy(&gf, &bu, 4); }
+              { uint32_t bu = (uint32_t)want << 16; memcpy(&wf, &bu, 4); }
+              const int gf_ok = std::isfinite(gf), wf_ok = std::isfinite(wf);
+              if (!gf_ok || !wf_ok) { if (gf_ok != wf_ok) ninf1++; continue; }   // asymmetric = failure
+              double den = fabs((double)wf);
+              double rel = den > 0 ? fabs(gf - wf) / den : (gf == wf ? 0.0 : 1.0);
+              if (rel > worst1) worst1 = rel;
+            }
+          }
+        printf("arm5-gate-T1 %s T=%d KC=%d nch=%d: %s (%ld/%zu differ, max rel %.3g, nonfinite %d)\n",
+               c.name.c_str(), Tn, KC, nch, bad1 ? "MISMATCH" : "BIT-EXACT", bad1,
+               (size_t)Tn * N, worst1, ninf1);
+        fflush(stdout);
+        // Plumbing control: ARM=5 T=1 vs the port's reference GEMV (q8_partial)
+        // on the SAME real activations, comparing f32 partials bit-for-bit.
+        // Bit-exact here => the gate's layout/combine/rounding are right and
+        // the shipped-vs-ARM5 gap is genuinely q8_gemv_hs's own summation order.
+        float* pd2 = nullptr; cudaMalloc(&pd2, (size_t)Tn * N * nch * 4);
+        for (int t = 0; t < Tn; t++)
+          q8_partial<bf16,true,false,1,1><<<nblk, TPB, (size_t)nb * 33 * 4>>>(
+              e->dq, e->ds, xd + (size_t)t * K, pd2 + (size_t)t * N * nch, N, K, KC, R, nb);
+        std::vector<float> h2v((size_t)Tn * N * nch);
+        cudaMemcpy(h2v.data(), pd2, h2v.size() * 4, cudaMemcpyDeviceToHost);
+        long bad2 = 0;
+        for (size_t j = 0; j < h1.size(); j++) if (memcmp(&h1[j], &h2v[j], 4)) bad2++;
+        // f32 (H2=0) ARM=5 T=1 vs the shipped output: the candidate for a
+        // bit-exact-vs-shipped prefill arm (fp32 FMA order, no fp16 pairs).
+        float* pd3 = nullptr; cudaMalloc(&pd3, (size_t)Tn * N * nch * 4);
+        const int R3 = (TPB / 32) * 2;
+        const int nblk3 = ((N + R3 - 1) / R3) * nch;
+        for (int t = 0; t < Tn; t++)
+          pf_launch(CT, 5, 0, 2, e->dq, e->ds, xd + (size_t)t * K, pd3 + (size_t)t * N * nch,
+                    N, K, KC, R3, nb, 1, nblk3, TPB, (size_t)CT * nb * 33 * 4);
+        cudaError_t le3 = cudaGetLastError();
+        cudaDeviceSynchronize();
+        if (le3) { printf("arm5f32 %s: LAUNCH ERROR %s\n", c.name.c_str(), cudaGetErrorString(le3)); fflush(stdout); }
+        std::vector<float> h3v((size_t)Tn * N * nch);
+        cudaMemcpy(h3v.data(), pd3, h3v.size() * 4, cudaMemcpyDeviceToHost);
+        long bad3 = 0; double worst3 = 0; int ninf3 = 0;
+        for (int t = 0; t < Tn; t++)
+          for (int r = 0; r < N; r++) {
+            float acc = 0.f;
+            for (int ch = 0; ch < nch; ch++) acc = acc + h3v[((size_t)t * N + r) * nch + ch];
+            uint16_t got = host_f2bf(acc), want = c.y[(size_t)t * N + r];
+            if (got != want) {
+              bad3++;
+              float gf, wf;
+              { uint32_t bu = (uint32_t)got << 16; memcpy(&gf, &bu, 4); }
+              { uint32_t bu = (uint32_t)want << 16; memcpy(&wf, &bu, 4); }
+              const int okf = std::isfinite(gf), okw = std::isfinite(wf);
+              if (!okf || !okw) { if (okf != okw) ninf3++; continue; }
+              double den = fabs((double)wf);
+              double rel = den > 0 ? fabs(gf - wf) / den : (gf == wf ? 0.0 : 1.0);
+              if (rel > worst3) worst3 = rel;
+            }
+          }
+        printf("arm5f32-gate-T1 %s T=%d KC=%d nch=%d: %s (%ld/%zu differ, max rel %.3g, nonfinite %d)\n",
+               c.name.c_str(), Tn, KC, nch, bad3 ? "MISMATCH" : "BIT-EXACT", bad3,
+               (size_t)Tn * N, worst3, ninf3);
+        fflush(stdout);
+        g_last_partial_bad += bad3 ? 0 : 0;
+        cudaFree(pd3);
+        printf("arm5-vs-q8partial %s T=%d KC=%d nch=%d: %s (%ld/%zu partials differ)\n",
+               c.name.c_str(), Tn, KC, nch, bad2 ? "MISMATCH" : "BIT-EXACT", bad2, h1.size());
+        fflush(stdout);
+        g_last_partial_bad = bad2;
+        cudaFree(pd2);
+      }
+      pf_launch(CT, 5, 1, RPB, e->dq, e->ds, xd, pd, N, K, KC, R, nb, Tn, nblk, TPB, shm);
+      cudaError_t le = cudaGetLastError();
+      cudaDeviceSynchronize();
+      std::vector<float> hpd((size_t)Tn * N * nch);
+      cudaMemcpy(hpd.data(), pd, hpd.size() * 4, cudaMemcpyDeviceToHost);
+      long bad = 0; double worst = 0; int ninf = 0; long first = -1;
+      for (int t = 0; t < Tn; t++) {
+        for (int r = 0; r < N; r++) {
+          float acc = 0.f;
+          // plain C++ float add == IEEE-754 RN on this host (aarch64, no
+          // fast-math), which is what __fadd_rn does on the device.
+          for (int ch = 0; ch < nch; ch++) acc = acc + hpd[((size_t)t * N + r) * nch + ch];
+          uint16_t got = host_f2bf(acc);
+          uint16_t want = c.y[(size_t)t * N + r];
+          if (got != want) {
+            if (first < 0) first = (long)((size_t)t * N + r);
+            bad++;
+            float gf, wf;
+            { uint32_t bu = (uint32_t)got << 16; memcpy(&gf, &bu, 4); }
+            { uint32_t bu = (uint32_t)want << 16; memcpy(&wf, &bu, 4); }
+            const int gf_ok = std::isfinite(gf), wf_ok = std::isfinite(wf);
+            if (!gf_ok || !wf_ok) { if (gf_ok != wf_ok) ninf++; continue; }   // asymmetric = failure
+            double den = fabs((double)wf);
+            double rel = den > 0 ? fabs(gf - wf) / den : (gf == wf ? 0.0 : 1.0);
+            if (rel > worst) worst = rel;
+          }
+        }
+      }
+      const char* st = (!bad && !le) ? "BIT-EXACT" : "MISMATCH";
+      printf("arm5-gate-batched %s T=%d KC=%d nch=%d: %s (%ld/%zu cells vs shipped, max rel %.3g, nonfinite %d) %s\n",
+             c.name.c_str(), Tn, KC, nch, st, bad, (size_t)Tn * N, worst, ninf,
+             le ? cudaGetErrorString(le) : "");
+      fflush(stdout);
+      cudaFree(xd); cudaFree(pd);
+      tested++;
+      if (le || ninf) fails++;   // launch errors / non-finite are hard failures;
+                                 // the shipped-kernel delta is reported, not gated
+      if (g_last_partial_bad) fails++;   // set by the arm5-vs-q8partial control
+    }
+  }
+  printf("LFM_ARM5_GATE: %d configs tested, %s (certifies ARM5==q8_partial bit-exact; the shipped-kernel delta is reported, arbitrated by the goldens)\n",
+         tested, fails ? "FAILURES" : "ALL PASS");
+  fflush(stdout);
+  return fails ? 1 : 0;
+}
+
 static int prefill_h2batched(Model& M) {
   // LFM_PF_T: the batch size the harness tests (default 8 = today). The ASR
   // chunk is 24 backbone tokens per 0.96 s of audio, so 24 is the shape that
@@ -1677,6 +1934,16 @@ static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const fl
   }
   if (arm == 4 && h2) {
     if (ct == 2) PF(2, true, 4); else PF(4, true, 4);
+    return;
+  }
+  if (arm == 5 && !h2) {
+#define PF5F(CT_, G_) q8_prefill_h2<bf16, CT_, false, 5, 2, G_><<<nblk, TPB, shm>>>(q, s, x, part, N, K, KC, R, nb, T)
+    // GRP is small here on purpose: xv[32] + acc5[GRP][CT] hits the 255-register
+    // cap at GRP=8 and the launch is REFUSED (a refused launch is silent unless
+    // the error is read -- the first version of this arm measured zeros).
+    if (ct == 2) { if (rb == 4) PF5F(2, 4); else if (rb == 2) PF5F(2, 2); else PF5F(2, 1); }
+    else         { if (rb == 4) PF5F(4, 4); else if (rb == 2) PF5F(4, 2); else PF5F(4, 1); }
+#undef PF5F
     return;
   }
   if (arm == 5 && h2) {
@@ -2141,6 +2408,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--lm-selftest")) emb_mode_req = 2;
     else if (!strcmp(argv[i], "--prefill-minimal")) emb_mode_req = 3;
     else if (!strcmp(argv[i], "--prefill-h2batched")) emb_mode_req = 4;
+    else if (!strcmp(argv[i], "--prefill-arm5-gate")) emb_mode_req = 5;
     else if (!strcmp(argv[i], "--merge")) g_merge = true;   // merged gate/up GEMV
     else if (!strcmp(argv[i], "--lmrows") && i + 1 < argc) lm_rows_override = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) dump_logits = argv[++i];
@@ -2280,6 +2548,7 @@ int main(int argc, char** argv) {
   if (!emb) { printf("no %s in the blob\n", EMBNAME); return 1; }
   if (emb_mode_req == 3) return prefill_minimal(M);
   if (emb_mode_req == 4) return prefill_h2batched(M);
+  if (emb_mode_req == 5) g_cap_on = 1;   // capture during the normal run; gate runs at the end
   if (emb->ne[0] != VOCAB || emb->ne[1] != H) { printf("embed shape %dx%d\n", emb->ne[0], emb->ne[1]); return 1; }
   if (M.emb_mode >= 1) {
     if (!lm_host_init(M, M.hemb, argv[1])) return 1;
@@ -2351,8 +2620,10 @@ int main(int argc, char** argv) {
   const double warmms = warm ? atof(getenv("LFM_WARMMS") ? getenv("LFM_WARMMS") : "0") : 0.0;
   struct timespec tw0; clock_gettime(CLOCK_MONOTONIC, &tw0);
   int nwarm = 0;
+  const int nprompt_all = (int)prompt.size();   // for the S8 arm's prefill scope
   for (int s = warm ? -1 : 0; s < steps || s < 0; s++) {
     const int pos = s < 0 ? 0 : s;
+    g_prefill_phase = (s < 0 || s < nprompt_all - 1) ? 1 : 0;   // S8 arm scope: prompt steps only
     const int tok = s < 0 ? 124894 : toks[s];
     const bf16* lm_head_input = M.x;   // replaced by the embedding_norm output below
     if (pos >= MAXTOK) break;
@@ -2684,5 +2955,6 @@ int main(int argc, char** argv) {
     fflush(stdout);
   }
   printf("FM3_NANODE_DONE\n");
+  if (emb_mode_req == 5) return prefill_arm5_gate(M);
   return 0;
 }

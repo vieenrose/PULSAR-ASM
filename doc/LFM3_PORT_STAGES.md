@@ -812,3 +812,54 @@ chunk go uncomputed (both sides share it, so the pair still prints BIT-EXACT).
 CT=2/CT=4 configs are exact (KC=7680/nb=240 and KC=3840/nb=120). Wiring ARM=5
 into the engine must set KC exactly, and the w2 KC=3840 (nch=2) vs shipped
 KC=7680 (nch=1) question still needs the integration gate of section 14.
+
+### 15. S8 gate built: ARM=5 == the port's reference GEMV, bit-exact on real activations; the shipped-kernel swap is measured out (run #298)
+
+`--prefill-arm5-gate` captures the **real** activations every shipped `gemv()`
+call sees during prompt A (24 ids + 24 greedy = 25 rows/tensor, 153 shape/KC
+configs), then replays them through the batched kernels. Three comparisons per
+config:
+
+| comparison | result |
+|---|---|
+| ARM=5 (H2) T=1 vs `q8_partial` f32 partials, bit-for-bit | **153/153 BIT-EXACT** |
+| ARM=5 (H2) T=1 vs the shipped `q8_gemv_hs` output | 153/153 MISMATCH, ~99.1% of bf16 cells, max rel ~1e38; **6 configs straddle the bf16 overflow asymmetrically** (layers 12 `w1`, 23 `conv.in_proj`: one side inf, the other finite) |
+| ARM=5 (f32, H2=0) T=1 vs shipped | 22/153 bit-exact, 131 mismatch, 24 launch refusals at shm>48K (now reported) -- no bit-exact-vs-shipped form found |
+
+So ARM=5 is exactly the port's reference order (the same one every published
+gate was built on, `q8_partial`) -- including w2 at KC=3840/nch=2, which
+closes the section-14 chunk-split question -- and the engine's shipped decode
+kernel `q8_gemv_hs` is a **different summation order by construction**. The
+engine's prefill runs through `gemv()`, i.e. through `q8_gemv_hs`, so adopting
+ARM=5 for prefill is an order change, not a bit-exact substitution.
+
+**The swap arm was built and measured out.** `LFM_PF_USE=1` routes `gemv()`
+through `q8_prefill_h2<CT=4, ARM=5, GRP=8>` with `g_prefill_phase` scoping it
+to prompt steps. Two findings:
+
+* **Goldens.** Every quantitative gate stays green -- matrix 23x23 within 3%,
+  pos-0 top-1 = HF's with corr 0.99998, per-prompt top-1 100% (F 20/21), KL
+  0.0006-0.0019 -- but prompt **F's greedy prefix moves from 16/16 to 11/16**
+  (L is the known near-tie in both arms): 5/7 vs the shipped 6/7. Prefill order
+  propagates through the KV cache into the generated stream.
+* **Speed.** `decode_ms_per_tok 304.34 vs 107.17` (2.8x WORSE; same session,
+  two measure.sh runs). The harness job's 20 steps all sit inside the prompt
+  window, so they all take the arm, and ARM=5's T=1 form is the wrong shape for
+  a decode step: R=64 means 2 blocks/SM and it loses the per-shape R/TPB tuning
+  `pick()` gives the shipped kernel. The 5x win is specific to batched T>=4
+  GEMMs (T=24: embed 55 vs 283 ms), which the engine can only exploit through a
+  real batched prefill, not a T=1 substitution.
+
+**Verdict: keep the shipped decode/prefill kernel; ARM=5 enters through S8's
+batched prefill** (batch the prompt/audio-token block: q/k/v/o, gate/up/down,
+conv projections at T=24; rmsnorm/rope/conv/attention batched over the block;
+decode steps stay on `q8_gemv_hs`, so the certified decode order is untouched).
+Expected TTFT for prompt A: GEMV work ~41.5 GMAC at ~100 GMAC/s = 0.42 s plus
+the sequential elementwise/attention remainder, against 2.28 s today.
+
+Measurement-discipline additions from building this gate: a top-of-function
+capture reads the *previous* call's output (first version: 99.95% cells
+differed, rel ~1e38); non-finite cells are a failure only when **asymmetric**
+(the shipped path's own bf16 inf at layers 12/23 is reproduced bit-identically
+and is not this gate's business); and a refused launch is silent -- the f32
+arm's first version measured zeros because nothing read `cudaGetLastError()`.
