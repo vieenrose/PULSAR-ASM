@@ -364,55 +364,61 @@ survives a tolerance check:
   fwrite` overloads** ("too few arguments in function call", pointing at the wrong
   line). Use POSIX `open/read/write` in tool drivers, as `lfm3_istft.cu` does.
 
-## 11. What the batched-GEMM measurement changes (corrected)
+## 11. S0: the batched Q8 GEMM throughput floor (OPEN, with a measured negative)
 
-The first version of this section claimed a shared-memory bandwidth wall at
-7.1 GFLOP/s. **That was wrong**, and the way it was wrong is worth keeping: the
-figure was invariant in N, K, T and tile size, and I read that invariance as a
-hardware signature when it was the signature of a bug. The actual causes, in the
-order they were found:
+S0 exists because D2's cost table is a **bandwidth** statement (weights streamed
+once at ~17 GB/s) and the first GEMM I wrote ran at 7.1 GFLOP/s. The 7.1 turned
+out to be my bug, not a wall; the corrected kernel is 11-28 GFLOP/s with the fp64
+gate green on every sampled output of 18 audio shapes x T in {12,24,48,75}
+(max relative error 3e-8). Status: **the floor is NOT met.**
 
-1. **Uncoalesced weight loads.** Lane *b* owned k-block *b*, so the eight lanes
-   of a group read bytes 128 apart: 32 distinct 32-byte sectors per load
-   instruction for 512 useful bytes. Fixing the layout (all eight lanes on one
-   128-element block, each taking a 4-byte quarter of it, so a warp group reads
-   32 contiguous bytes) gave **7.1 -> 30 GFLOP/s, 4.2x**.
-2. **Wrong stride arithmetic**, caught by the fp64 gate at rel=0.18: "lane *b*
-   owns block *b*" and "a lane-relative in-block offset" are incompatible, and
-   mixing them computes each block from 16 of its 128 elements.
-3. **Weight re-streaming.** Holding the whole `[TILE][K]` x-tile in shared caps
-   TILE at `sharedMemPerBlock/4K` -- 9 at K=1024 -- so weights are re-read
-   `ceil(T/TILE)` times. Chunking K instead (shared holds one 128-element scale
-   block for all TILE positions) drops the tile to 13 KB and lets TILE be set by
-   registers.
-4. **TILE is capped by REGISTERS, not shared memory.** `acc[TILE]` plus
-   `ps[TILE]` are live: TILE=16 uses ~110 regs/thread, TILE=24 needs 159 and the
-   per-block register limit refuses the launch.
+| | value | needed for D2 |
+|---|---|---|
+| throughput | 11-28 GFLOP/s | ~60 GFLOP/s |
+| effective weight streaming | **0.9 GB/s** | 17 GB/s |
+| fraction of DRAM bound | 0.0-0.1x | 1.0x |
 
-Measured after all four (gate: fp64, every sampled output, 18 audio shapes x
-T in {12,24,48,75}, max relative error 3e-8):
+What the four fixes bought, in the order they were found (each measured):
 
-| shape | T | ms | GFLOP/s | x of DRAM-bound |
-|---|---|---|---|---|
-| dep 12x to_logit (24204x1024) | 75 | 135.7 | 27.4 | 0.1x |
-| dep depth_linear (12288x2048) | 75 | 142.2 | 26.6 | 0.1x |
-| enc lin_out (768x4096) | 75 | 22.0 | 21.5 | 0.0x |
-| cod w1/w3 (2304x512) | 75 | 7.2 | 24.4 | 0.0x |
+1. **Uncoalesced weight loads** were the 7.1 explanation. Lane *b* owned k-block
+   *b*, so the eight lanes of a group read bytes 128 apart: 32 distinct 32-byte
+   sectors per load instruction for 512 useful bytes. Predicted 0.5 MAC/SM/cycle
+   against 0.96 measured. Putting all eight lanes on one 128-element block, each
+   taking a 4-byte quarter so the group reads 32 contiguous bytes, gave
+   **7.1 -> 30 GFLOP/s**.
+2. Chunking K to a single 128-element scale block instead of holding `[TILE][K]`
+   in shared, so TILE is not capped at `sharedMemPerBlock/4K` = 9.
+3. TILE is capped by **registers**, not shared: `acc[TILE]` plus `ps[TILE]` are
+   live, TILE=16 needs ~110 regs/thread, TILE=24 needs 159 and the per-block
+   register limit refuses the launch.
+4. The store needed an `active` guard: for N not a multiple of 32 the surplus
+   groups wrote `C[(t0+t)*N + n]` for n = N..N+29 into the next row at n-N.
 
-So the kernel now sits at 13-28 GFLOP/s and **0.0-0.1x of the DRAM bound**: it is
-ALU/instruction-bound, not memory-bound. This changes the conclusion for the
-plan, and not in a comfortable direction:
+**The attempt to close the rest of the gap failed, and the failure is
+informative.** Register-blocking the way D2 implies — one `int4` (16-byte) weight
+load per lane per block so the group reads a full 128-byte cacheline, `float4`
+shared reads, and the block scale folded into the weights to drop `ps[TILE]` and
+free registers for TILE=32 — ran at **5-11 GFLOP/s, i.e. slower than the code it
+replaced**. ptxas confirms no spills (93 regs max), so the cause is the shared
+pattern, not local memory: with each lane owning 16 *contiguous* floats, the eight
+lanes of a group sit 16 floats apart and alias onto **2** shared banks, where the
+4-float stride of the 4-byte-load form hits **8** distinct banks. Four times fewer
+`LDS` instructions bought four times more bank conflicts, and the register
+pressure of `wz[16]` cost the rest. Kept as a recorded negative rather than
+tuned away: the next attempt has to satisfy both constraints at once, which means
+a swizzled shared layout (lane base = `lane*16` XOR a per-(t, v) skew) rather than
+a bigger tile.
 
-- D2's cost table (encoder 13 ms/chunk, codec 4.3 ms/frame, depth head 12
-  ms/frame) assumes weights stream at ~17 GB/s. The measured form streams them
-  at **0.9 GB/s effective**. The table is therefore not reachable yet, and every
-  audio-side stage built on it would miss the 80 ms frame budget.
-- Concretely at 25 GFLOP/s: the depth head at T=12 costs 32 ms against a 12 ms
-  target (2.7x over), and the codec decoder's 73 MB of weights cost ~78 ms per
-  80 ms frame -- i.e. **speech out at 1.0x realtime, no headroom**.
-- The next step is therefore not a new kernel design but a *throughput floor*:
-  the batched GEMM must reach the memory-bound regime (>=17 GB/s effective, i.e.
-  ~30 G MAC/s, about 2.2x the current 13.6) before S3/S4/S5 are scheduled. The
-  route is the engine's own `q8_partial` shape -- x staged in registers rather
-  than read from shared once per MAC, which is what costs the 2 instructions per
-  multiply-accumulate here.
+Also added to the kit, because this file's own history demands it: a
+**plausibility gate** that runs before any timing is believed — the launch error
+is read immediately after the launch (`cudaDeviceSynchronize` returns
+`cudaSuccess` for a *refused* launch, so a kernel that never ran reads as
+"all zeros, no error, 174 GB/s"), every output must be non-zero as well as
+fp64-accurate, and the measured rate must be below the board's fp32 peak.
+
+Consequence for the schedule: **S3/S4/S5b stay blocked on S0.** At the measured
+rate the codec decoder's 73 MB of weights cost ~80 ms per 80 ms frame (1.0x
+realtime, no headroom) and the depth head costs 34 ms at T=12 against a 12 ms
+target. Building the audio layers on top of that would mean shipping components
+whose budget is known to be unmet. S1 (tokenizer) and S2/S5a (already green) are
+independent of S0 and proceed in parallel.

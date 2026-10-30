@@ -216,6 +216,30 @@ int main(int argc, char** argv) {
             std::vector<float> hc((size_t)T * N);
             cudaMemcpy(hc.data(), dc, (size_t)T * N * 4, cudaMemcpyDeviceToHost);
 
+            /* PLAUSIBILITY GATE. Every number below is only believed if these
+               pass; this file's own history is why. A REFUSED launch returns
+               cudaSuccess from cudaDeviceSynchronize (nothing to wait for), so
+               a kernel that never ran once read as "all zeros, no error,
+               174 GB/s" across four configurations. */
+            {
+                size_t nz = 0;
+                for (size_t i = 0; i < hc.size(); i++) if (hc[i] == 0.0f) nz++;
+                const double gf_chk = 2.0 * T * N * K / 1e9 / (ms / 1e3);
+                if (nz == hc.size()) {
+                    printf("%-17s T=%2d IMPLAUSIBLE: every output is zero -- the kernel did not run\n", sh.tag, T);
+                    fails++; continue;
+                }
+                if (nz) {
+                    printf("%-17s T=%2d IMPLAUSIBLE: %zu of %zu outputs never written\n", sh.tag, T, nz, hc.size());
+                    fails++; continue;
+                }
+                if (gf_chk > 236.0) {
+                    printf("%-17s T=%2d IMPLAUSIBLE: %.0f GFLOP/s is above the 236 GFLOP/s peak -- "
+                           "the work did not happen\n", sh.tag, T, gf_chk);
+                    fails++; continue;
+                }
+            }
+
             /* EVERY output is checked. The denominator is sum|w_k x_k| -- a
                cancelling dot product has no useful relative error. */
             double worst = 0.0; int wt = -1, wn = -1; long nzero = 0;
