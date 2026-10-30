@@ -188,6 +188,142 @@ __global__ void k_gemm_q8(const signed char* __restrict__ W, const float* __rest
     }
 }
 
+/* Chain-split arm (S0 experiment, plan section 14): identical arithmetic and
+   staging, but the serial acc chain is routed across SPL independent chains by
+   (b * 4 + ci) % SPL, summed ascending at the end. The hypothesis being tested:
+   four independent kernel families converge on 11-18 GMAC/s and the rate tracks
+   block count (nb=240 -> 11, nb=64 -> 18), i.e. the accumulator dependency chain
+   is the limiter -- so dividing its depth by SPL should raise throughput by
+   roughly SPL until issue/occupancy binds elsewhere. SPL=1 routes everything to
+   chain 0 in the same order as k_gemm_q8, so it must be bit-identical to today's
+   code; SPL>1 changes the summation parenthesization and is gated on fp64
+   tolerance, not bits (a shipped adoption would be gated on the engine's own
+   suite). Register cost: SPL * TILE accumulators -- TILE=16 x SPL=4 = 64, the
+   risk to watch is the per-block register limit (the launch check reports it).
+*/
+template <int SPL>
+__global__ void k_gemm_q8sp(const signed char* __restrict__ W, const float* __restrict__ SC,
+                            const unsigned short* __restrict__ X, float* __restrict__ C,
+                            int N, int K, int T) {
+    __shared__ float sx[TILE * KCHPAD];
+    const int t0 = blockIdx.y * TILE;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    const int lane = tid & 7, grp = tid >> 3;
+    const int n = blockIdx.x * ROWS_PER_BLOCK + grp;
+    const bool active = (n < N);
+    const int nb = K >> 7;
+    float acc[SPL][TILE];
+#pragma unroll
+    for (int r = 0; r < SPL; r++)
+#pragma unroll
+        for (int t = 0; t < TILE; t++) acc[r][t] = 0.0f;
+
+    for (int b = 0; b < nb; b++) {
+        for (int i = tid; i < TILE * SCALE_BLK; i += nt) {
+            int t = i / SCALE_BLK, k = i - t * SCALE_BLK;
+            union { unsigned int u; float f; } cv;
+            cv.u = (t0 + t < T) ? (((unsigned int)X[(t0 + t) * K + (b << 7) + k]) << 16) : 0u;
+            sx[t * KCHPAD + k] = cv.f;
+        }
+        __syncthreads();
+        if (active) {
+            const signed char* wb = W + n * K + (b << 7);
+            const float sc = SC[n * nb + b];
+#pragma unroll
+            for (int ci = 0; ci < SCALE_BLK / 32; ci++) {
+                const int r = (b * (SCALE_BLK / 32) + ci) & (SPL - 1);
+                const int o = ci * 32 + lane * 4;
+                const int q = __ldcs(reinterpret_cast<const int*>(wb + o));
+                const signed char* qb = reinterpret_cast<const signed char*>(&q);
+                const float w0 = (float)qb[0] * sc, w1 = (float)qb[1] * sc;
+                const float w2 = (float)qb[2] * sc, w3 = (float)qb[3] * sc;
+#pragma unroll
+                for (int t = 0; t < TILE; t++) {
+                    const float4 xv = *reinterpret_cast<const float4*>(sx + t * KCHPAD + o);
+                    acc[r][t] += w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int t = 0; t < TILE; t++) {
+        float v = 0.0f;
+#pragma unroll
+        for (int r = 0; r < SPL; r++) v += acc[r][t];
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o, 8);
+        if (active && lane == 0 && t0 + t < T) C[(t0 + t) * N + n] = v;
+    }
+}
+
+/* Staging-granularity arm (section 14's second hypothesis): stage G k-blocks of
+   x into shared per sync-pair instead of 1. v3 barrier-counts twice per 128
+   elements of x (nb sync-pairs); q8_partial stages a whole KCHUNK (1 pair per
+   64 blocks) and measures ~1.5-3x the rate of this tool. Occupancy arithmetic
+   at TILE=16: shared = TILE * G * 136 * 4 B -> G=1: 8.7 KB, G=2: 17.4 KB (still
+   3 blocks/SM regs-bound), G=4: 34.8 KB = 1 block/SM on a SINGLE-SM GPU =
+   catastrophe, hence only G in {1,2} by default. Summation order is untouched
+   (blocks ascending, ci ascending), so G is bit-preserving by construction. */
+template <int G>
+__global__ void k_gemm_q8g(const signed char* __restrict__ W, const float* __restrict__ SC,
+                           const unsigned short* __restrict__ X, float* __restrict__ C,
+                           int N, int K, int T) {
+    __shared__ float sx[TILE * G * KCHPAD];
+    const int t0 = blockIdx.y * TILE;
+    const int tid = threadIdx.x, nt = blockDim.x;
+    const int lane = tid & 7, grp = tid >> 3;
+    const int n = blockIdx.x * ROWS_PER_BLOCK + grp;
+    const bool active = (n < N);
+    const int nb = K >> 7;
+    float acc[TILE];
+#pragma unroll
+    for (int t = 0; t < TILE; t++) acc[t] = 0.0f;
+
+    for (int b0 = 0; b0 < nb; b0 += G) {
+        for (int i = tid; i < TILE * G * SCALE_BLK; i += nt) {
+            const int t = i / (G * SCALE_BLK), rem = i - t * (G * SCALE_BLK);
+            const int bi = rem / SCALE_BLK, k = rem - bi * SCALE_BLK;
+            const int bb = b0 + bi;
+            union { unsigned int u; float f; } cv;
+            cv.u = (t0 + t < T && bb < nb)
+                   ? (((unsigned int)X[(t0 + t) * K + (bb << 7) + k]) << 16) : 0u;
+            sx[(t * G + bi) * KCHPAD + k] = cv.f;
+        }
+        __syncthreads();
+        if (active) {
+#pragma unroll
+            for (int bi = 0; bi < G; bi++) {
+                const int bb = b0 + bi;
+                if (bb >= nb) break;
+                const signed char* wb = W + n * K + (bb << 7);
+                const float sc = SC[n * nb + bb];
+#pragma unroll
+                for (int ci = 0; ci < SCALE_BLK / 32; ci++) {
+                    const int o = ci * 32 + lane * 4;
+                    const int q = __ldcs(reinterpret_cast<const int*>(wb + o));
+                    const signed char* qb = reinterpret_cast<const signed char*>(&q);
+                    const float w0 = (float)qb[0] * sc, w1 = (float)qb[1] * sc;
+                    const float w2 = (float)qb[2] * sc, w3 = (float)qb[3] * sc;
+#pragma unroll
+                    for (int t = 0; t < TILE; t++) {
+                        const float4 xv = *reinterpret_cast<const float4*>(
+                            sx + (t * G + bi) * KCHPAD + o);
+                        acc[t] += w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int t = 0; t < TILE; t++) {
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) acc[t] += __shfl_down_sync(0xffffffffu, acc[t], o, 8);
+        if (active && lane == 0 && t0 + t < T) C[(t0 + t) * N + n] = acc[t];
+    }
+}
+
 static unsigned short bf16_of(float f) { union { float f; unsigned int u; } v; v.f = f;
     return (unsigned short)((v.u + 0x7FFF + ((v.u >> 16) & 1)) >> 16); }
 static float f32_of(unsigned short h) { union { float f; unsigned int u; } v;
@@ -211,18 +347,33 @@ static Shape SHAPES[] = {
 
 /* v4 dispatch: LFM_V4=1 selects k_gemm_q8v4 (16x16, no shared). Same gate,
    same plausibility checks; the sweep compares arms in one session. */
-static int g_v4 = -1;
+static int g_v4 = -1, g_split = 0;
 static void gemm_launch(const signed char* dq, const float* ds, const unsigned short* dx,
                         float* dc, int N, int K, int T, dim3 grid) {
     if (g_v4 < 0) {
         g_v4 = getenv("LFM_V4") ? 1 : 0;
+        const char* sp = getenv("LFM_SPLIT");
+        g_split = sp ? atoi(sp) : 1;                     /* 1 = today's code */
+        if (g_split != 1 && g_split != 2 && g_split != 4) {
+            printf("LFM_SPLIT=%d unsupported (1|2|4)\n", g_split);
+            g_split = 1;
+        }
         if (g_v4) cudaFuncSetCacheConfig(k_gemm_q8v4, cudaFuncCachePreferL1);
     }
     if (g_v4) {
         dim3 g4((N + 15) / 16, (T + 15) / 16);
         k_gemm_q8v4<<<g4, 256>>>(dq, ds, dx, dc, N, K, T);
     } else {
-        k_gemm_q8<<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+        static int g_g2 = -1;
+        if (g_g2 < 0) g_g2 = getenv("LFM_G2") ? 1 : 0;
+        if (g_g2) { k_gemm_q8g<2><<<grid, 256>>>(dq, ds, dx, dc, N, K, T); return; }
+    }
+    if (0) {} else if (g_split == 2) {
+        k_gemm_q8sp<2><<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+    } else if (g_split == 4) {
+        k_gemm_q8sp<4><<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+    } else {
+        k_gemm_q8sp<1><<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
     }
 }
 

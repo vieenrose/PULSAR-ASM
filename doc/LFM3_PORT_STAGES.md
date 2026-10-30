@@ -676,6 +676,29 @@ excludes the target: 43.2 GMAC/s is 18% of the 236 GFMA/s peak.
    implementations converging on one number means the limit is the instruction
    structure, not shared memory, not banks, not occupancy, not bandwidth.
 
+4a **Two structural hypotheses tested and refuted (run #295), both in the tool:**
+   (i) chain split `LFM_SPLIT=2` (SPL independent acc chains routed by
+   (b*4+ci)%SPL, summed at end; SPL=1 bit-identical) -- rates unchanged:
+   w2 12.4/12.0 vs 12.4/14.1, w1 13.5/14.5 vs 14.3/14.6, q 10.3/11.8 vs
+   12.6/13.1 (2 interleaved passes). The OUTER chain is not the binder.
+   SPL=4 compiled to 135 regs (SPL=2: 86, SPL=1: 69 -- ptxas register use is
+   erratic across the instances) and its launch was refused; the launch check
+   caught it as designed. (ii) staging granularity `LFM_G2` (stage 2 k-blocks
+   per sync-pair, 17.4 KB, same occupancy, order preserved): w2 +7%, w1 -4%,
+   audio ~0 -- barrier count is not the binder either.
+4b **Cross-finding: the ENGINE's q8_prefill is 2.6x the tool's rate at batch
+   T=8** (w1: engine bat 7.01 ms for 126 MMAC = 17.9 GMAC/s vs tool 6-8 GMAC/s
+   on the same shapes). What the engine does differently: stages the whole
+   KCHUNK in **bf16** (17 half2 = 34 B per 32 inputs vs the tool's 4.25 B/input
+   -- 4x less shared traffic), one sync per chunk not per 128 elements, and the
+   HFMA2 byte-perm unpack. The G2 test at G=2 was too timid to emulate that --
+   the real granularity is KCHUNK-scale, which needs bf16 staging to afford
+   (float staging of K=2048 at TILE=16 = 128 KB, impossible; bf16 = 8.7 KB).
+   **Instrumentation pivots: the challenge's kernel work now happens against
+   q8_prefill_h2 in-engine (test-only arm, H2 selftest as harness), not
+   lfm3_gemm.** The remaining lever list for x2.4: split the inner 8-deep half2
+   chain into two 4-deep accumulators, interleave the outer acc by block parity,
+   then raise CT (register cost watch: acc[CT] floats).
 4 **Therefore the challenge reduces to: break the serial chains to >= 45 GMAC/s
    batched (x2.4) while keeping T=1 behavior at 17 GB/s (decode untouched).** The
    experiment, exact design: interleave 2-4 independent accumulators in the inner loop
