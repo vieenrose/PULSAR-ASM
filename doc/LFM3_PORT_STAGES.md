@@ -348,7 +348,7 @@ mean) because HF itself uses pocketfft plus BLAS and is therefore not a bit
 reference. Neither claim is "bit-exact to the reference". Cost **0.554 ms/frame** = 5.5% of realtime, so the front end is free. |
 | **S5 iSTFT spike** | **done, gated** (transformer stack not started) | `pulsar_arm/asm/lfm3_istft.cu`: direct inverse 641->1280 in a documented order, x hann, overlap-add hop 320 with a fixed 4-term contribution order (no atomics), envelope divide, `trim=480`/`tail=960` per `decode`. Gate `.auto/lfm3/checks_istft.py`: **9 cases, SNR 103-130 dB vs torch** (cases built from the checkpoint's real `decoder.lin` weights, bf16-rounded like the engine will, plus a 440 Hz tone and a window-centred click), well past the 60 dB bar; max abs scales with the case (relative bound 1e-3 x rms). **Decision: the `__sincosf` arm ships** -- it is faster in 9/9 cases (the 3.2 MB/frame twiddle table is DRAM-bound). Cost 0.7-4.5 ms/frame (board drift included; 75 frames per audio second => 5-11% RT, acceptable next to the backbone's 141% RT). **Follow-up: an FFT form** (1280 = 2^7 x 5) if it ever matters -- the direct form is SFU-bound on `__sincosf` (measured 2 ms/frame vs a 1.64 MFLOP/frame FLOP count => 0.8 GFLOP/s of ~100). |
 | batched Q8 GEMM (D2's enabling kernel) | **measured, not shipped** | `pulsar_arm/asm/lfm3_gemm.cu` + `.auto/lfm3/checks_gemm.sh`: fp64 gate PASS on all 18 audio shapes x 5 T x 7 tiles (max relative error 2.9e-8). Performance verdict: **7.1 GFLOP/s ceiling on every shape, no batching win** (per-position cost flat in T; T=1 streams weights at 1.0-3.5 GB/s vs the engine's 17 GB/s). Two bugs the fp64 gate caught: an out-of-bounds write when T is not a multiple of TILE (`ceil(T/TILE)` tiles need the `t0+t<T` guard on both the x load and the store -- symptom: scattered zeros plus a poisoned CUDA context that made every later shape "fail to allocate"); and scalar `int8` weight loads (2.4x at T=1, and the 40x-off streaming rate). Root cause of the ceiling: the inner loop reads x from shared once per (weight, position) pair -> shared-bandwidth bound. **Action: port `q8_partial` (x register-staged, KCHUNK partials, R rows/block, warp-shuffle reductions) to the batched form; do not ship a from-scratch GEMM.** |
-| S1 tokenizer | **algorithm pinned + replayed bit-exact** | `pulsar_arm/tools/mktok.py --corpus`: 31/31 hand-written + 500/500 fuzz strings id-for-id against HF, incl. added tokens, contractions, digit runs, combining accents, emoji and 12 scripts. C/asm port + blob tables still to come. See §12. |
+| S1 tokenizer | **done, gated** | `pulsar_arm/tools/mktok.py` (blob: vocab 124893 + 293320 merges + 140 added + 782 L/N ranges + 10 White_Space ranges + byte map, 5.4 MB) + `pulsar_arm/asm/lfm3_tok.c` (hand-rolled Split regex, ByteLevel, ignore_merges BPE) + gate `.auto/lfm3/checks_tok.py`: **531/531 fixtures id-for-id vs HF (9988 ids)**. The A6 (`\\s+(?!\\S)`) trap is documented in §12. |
 | S3 encoder tower | not started (unblocked: S2's gate is green) | |
 | S4 depth head + MaskGIT | not started | |
 | S5 codec transformer | not started | |
@@ -421,12 +421,21 @@ is read immediately after the launch (`cudaDeviceSynchronize` returns
 "all zeros, no error, 174 GB/s"), every output must be non-zero as well as
 fp64-accurate, and the measured rate must be below the board's fp32 peak.
 
+Update 2026-10-31 (v2: scale folded, float4 shared reads, TILE=24 default): **20-28
+GFLOP/s** across the sweep (best 28.2 at dep 12x to_logit T=48), 71 regs/thread (down
+from 110), fp64 gate still green everywhere (max rel 4e-8). The register win did not
+move the throughput needle: same 10% of peak, still ALU-bound at ~0.1x of DRAM. Next
+up if S0 is revisited: 32-bit indices (the kernel uses 64-bit `size_t` arithmetic for
+products under 2^31), `__ldcs` streaming weight loads (weights are re-read
+ceil(T/TILE) times), and occupancy (3 blocks/SM at 71 regs vs the engine's 6 at 40).
+None of those is attempted here; v2 is committed as the instrument, not the floor.
+
 Consequence for the schedule: **S3/S4/S5b stay blocked on S0.** At the measured
 rate the codec decoder's 73 MB of weights cost ~80 ms per 80 ms frame (1.0x
 realtime, no headroom) and the depth head costs 34 ms at T=12 against a 12 ms
 target. Building the audio layers on top of that would mean shipping components
-whose budget is known to be unmet. S1 (tokenizer) and S2/S5a (already green) are
-independent of S0 and proceed in parallel.
+whose budget is known to be unmet. S1 is now done and gated; S2/S5a were already
+green. All three are independent of S0.
 
 ## 12. S1: the tokenizer is not the simple BPE the plan assumed
 
@@ -461,10 +470,21 @@ is what the reference engine uses by default, so that is what the port reproduce
 the flag is recorded here so nobody "fixes" it later and breaks bit-parity with the
 engine.
 
-Status: the algorithm is pinned and replayed bit-exactly (531/531 strings) by
-`mktok.py --corpus`, which also validates that the 256-entry byte map is a
-bijection onto the vocab's 256 single-character entries and writes the blob
-metadata. The remaining S1 work is mechanical: emit the vocab strings and the
-293,320 merge pairs as sorted tables, write the splitter (the regex, hand-rolled
-against the 782 category ranges) and the merge loop in C, and gate it against the
-same corpus. The regex is the risky part, which is why the replay came first.
+Status: **DONE and gated.** `mktok.py` now writes the full blob (vocab strings by id,
+293,320 merges in rank order, 140 added tokens, L/N/S ranges, byte map; 5.4 MB) and
+`pulsar_arm/asm/lfm3_tok.c` + gate `.auto/lfm3/checks_tok.py` give **531/531 fixtures
+id-for-id vs HF (9988 ids)** on the same corpus the replay used.
+
+The one trap the gate caught, kept because it is the class of bug a tolerance check
+hides: **`\\s+(?!\\S)` (A6) matches a proper prefix of a space run, not just trailing
+whitespace.** Greedy `\\s+` takes the longest prefix whose next char is not non-space;
+inside a maximal spaces-only run of length L followed by a non-space, that is L-1
+(which fails for L==1, falling through to A7). So `'a  b'` splits as `['a',' ',' b']`
+(first space alone, second joins the letter), `'a  1'` as `['a',' ',' ','1']`, and
+`'\\xa0\\xa0\u00fc'` as `['\\xa0','\\xa0\u00fc']` (first space alone, second joins the
+letter via A2's optional prefix). The first C port required the run to reach end for
+A6 and failed ~11% of fuzz fixtures with swapped merge choices downstream; the
+symptom (wrong ids several positions in) was far from the cause (one split boundary).
+Unicode note: `\\s` is White_Space=yes (11 ranges, verified 0..0x4000 against Python
+`regex` with 0 mismatches); L/N come from `unicodedata` 14.0.0, so a Unicode-version
+drift against Rust `regex` surfaces as a gate failure, not a silent difference.

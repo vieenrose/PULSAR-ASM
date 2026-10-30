@@ -54,12 +54,13 @@
 
 #define SCALE_BLK 128
 #define ROWS_PER_BLOCK 32
-/* TILE is capped by REGISTERS PER BLOCK, not by shared memory. acc[TILE] plus
-   ps[TILE] are live registers: TILE=16 uses ~110 regs/thread x 256 threads =
-   28 K, under the 32 K per-block limit; TILE=24 needs 159 and the launch is
-   REFUSED. Which brings us to the mistake that hid this for several runs --
-   see the launch check in main(). */
-#define TILE 16
+/* TILE is capped by REGISTERS PER BLOCK, not by shared memory. v2 folds the
+   block scale into the weights (no ps[TILE] scratch) so acc[TILE] is the only
+   live array: TILE=24 uses ~70 regs/thread, TILE=32 fits. The launch check in
+   main() stays because a refused launch returns cudaSuccess from sync. */
+#ifndef TILE
+#define TILE 24
+#endif
 #define KCHPAD 136                  /* 136 % 32 == 8: 4-byte lane stride -> distinct banks */
 
 __global__ void k_gemm_q8(const signed char* __restrict__ W, const float* __restrict__ SC,
@@ -87,24 +88,24 @@ __global__ void k_gemm_q8(const signed char* __restrict__ W, const float* __rest
         if (active) {
             const signed char* wb = W + (size_t)n * K + (b << 7);
             const float sc = SC[(size_t)n * nb + b];
-            float ps[TILE];
-#pragma unroll
-            for (int t = 0; t < TILE; t++) ps[t] = 0.0f;
+            /* v2: scale folded into the 4 weights (no ps[TILE]), float4 x reads.
+               Per chunk ci the 8 lanes cover 32 contiguous bytes (lane*4), so a
+               float4 at o touches banks o..o+3: lanes give 0-3,4-7,...,28-31,
+               all distinct, no conflict. 1 float4 + 4 FMAs per (chunk, t). */
 #pragma unroll
             for (int ci = 0; ci < SCALE_BLK / 32; ci++) {
                 const int o = ci * 32 + lane * 4;      /* 8 lanes -> 32 contiguous bytes */
                 int q;
                 memcpy(&q, wb + o, 4);
                 const signed char* qb = reinterpret_cast<const signed char*>(&q);
+                const float w0 = (float)qb[0] * sc, w1 = (float)qb[1] * sc;
+                const float w2 = (float)qb[2] * sc, w3 = (float)qb[3] * sc;
 #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    const float wv = (float)qb[i];
-#pragma unroll
-                    for (int t = 0; t < TILE; t++) ps[t] += wv * sx[t * KCHPAD + o + i];
+                for (int t = 0; t < TILE; t++) {
+                    const float4 xv = *reinterpret_cast<const float4*>(sx + t * KCHPAD + o);
+                    acc[t] += w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;
                 }
             }
-#pragma unroll
-            for (int t = 0; t < TILE; t++) acc[t] += ps[t] * sc;
         }
         __syncthreads();
     }

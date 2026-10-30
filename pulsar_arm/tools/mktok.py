@@ -211,15 +211,59 @@ def main():
 
     with open(a.blob, "wb") as f:
         f.write(b"LFM3TOK1")
-        f.write(json.dumps({
+        # Full tables for the C port (S1). Vocab ids are dense 0..n-1, added ids
+        # follow contiguously; merges are in rank order. Strings are UTF-8 of the
+        # visible-codepoint keys (which never contain NUL, so NUL joins pairs).
+        import struct
+        ids = sorted(vocab.values())
+        assert ids == list(range(len(vocab))), "vocab ids must be dense"
+        inv_vocab = {i: s for s, i in vocab.items()}
+        vstr = [inv_vocab[i].encode("utf-8") for i in range(len(vocab))]
+        mstr = []
+        for x, y in merges:
+            mstr.append((x.encode("utf-8"), y.encode("utf-8")))
+        add_items = sorted(((v, k.encode("utf-8")) for k, v in added.items()))
+        # White_Space=yes (Unicode PropList, stable; verified 0..0x4000 against
+        # Python regex \\s with 0 mismatches). This is Rust regex \\s too.
+        Sr = [(0x0009, 0x000D), (0x0020, 0x0020), (0x0085, 0x0085),
+              (0x00A0, 0x00A0), (0x1680, 0x1680), (0x2000, 0x200A),
+              (0x2028, 0x2029), (0x202F, 0x202F), (0x205F, 0x205F),
+              (0x3000, 0x3000)]
+        hdr = json.dumps({
             "n_vocab": len(vocab), "n_merges": len(merges),
+            "n_added": len(add_items),
             "ignore_merges": bool(m.get("ignore_merges")),
             "byte_fallback": bool(m.get("byte_fallback")),
             "regex": SPLIT_PATTERN,
-            "unicode_L": Lr, "unicode_N": Nr,
-        }).encode() + b"\0")
-    print(f"wrote {a.blob} ({os.path.getsize(a.blob)} bytes of metadata; "
-          f"vocab/merges tables are the C port's next step)")
+            "unicode_L": Lr, "unicode_N": Nr, "unicode_S": Sr,
+            "byte_map": [bmap[b] for b in range(256)],
+        }).encode()
+        f.write(struct.pack("<I", len(hdr)))
+        f.write(hdr)
+        f.write(struct.pack("<I", len(vstr)))
+        for b in vstr:
+            f.write(struct.pack("<H", len(b)))
+            f.write(b)
+        f.write(struct.pack("<I", len(mstr)))
+        for x, y in mstr:
+            f.write(struct.pack("<H", len(x)))
+            f.write(x)
+            f.write(struct.pack("<H", len(y)))
+            f.write(y)
+        f.write(struct.pack("<I", len(add_items)))
+        for iid, b in add_items:
+            f.write(struct.pack("<IH", iid, len(b)))
+            f.write(b)
+        def wranges(rs):
+            f.write(struct.pack("<I", len(rs)))
+            for x, y in rs:
+                f.write(struct.pack("<II", x, y))
+        wranges(Lr)
+        wranges(Nr)
+        wranges(Sr)
+        print(f"wrote {a.blob} ({os.path.getsize(a.blob)} bytes: "
+              f"vocab {len(vstr)}, merges {len(mstr)}, added {len(add_items)}, "
+              f"L {len(Lr)} N {len(Nr)} S {len(Sr)} ranges)")
     return 0
 
 
