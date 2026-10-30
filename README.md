@@ -289,14 +289,19 @@ all still here and working:
   Spark CPU;
 - the original x86-64 Gemma engines;
 - a single-translation-unit CUDA engine for **LFM3-Audio-2B** at Q8 on the same
-  Jetson Nano — 136.30 ms/token (7.34 tok/s), 306 MB RSS on a 4 GB board,
-  quality frozen by HF-derived gates.
+  Jetson Nano, **porting the model component by component**: the 24-layer text
+  backbone is ported and gated (112.8 ms/token = 8.9 tok/s, 2280 ms to the
+  first token on a 23-token prompt, 307 MB RSS on a 4 GB board) and runs at the
+  board's ~17 GB/s streaming ceiling; the audio side (log-mel front end,
+  17-layer encoder, MaskGIT depth head, LiquidCodec) is not ported yet.
 
 See [pulsar_arm/asm/README-lfm3-audio.md](pulsar_arm/asm/README-lfm3-audio.md)
-for that engine: where the 136 ms goes per phase, bandwidth by GEMV shape, the
-FP-pipe-bound diagnosis behind the largest win, and the twelve structural levers
-that are measured out (including CUDA graphs, which lose 0.55% here because
-~250 launches cost ~1 ms of CPU against a 136 ms step).
+for that engine, written as a porting document: per-component port status and
+tensor/byte budgets, the checkpoint → `.lfm3q8` blob → engine contract, the
+reuse matrix and traps for each component still to port, the gate protocol a
+port is certified by (HF teacher-forced references, long-context and tie-zone
+gates), and the whole-port memory and bandwidth budget. The backbone's latency
+record and measured-out levers are in its appendices.
 
 See [doc/OTHER_ENGINES.md](doc/OTHER_ENGINES.md) and
 [pulsar_arm/bonsai2/README.md](pulsar_arm/bonsai2/README.md). The
