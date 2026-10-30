@@ -343,7 +343,7 @@ Until those five exist, every timing in this document stays labelled *derived*.
 | **S2 log-mel front end** | **done, gated** | `pulsar_arm/tools/mkmel.py` (build-time: the reference's own `mel_filter_bank` + `torch.hann_window` + twiddles -> `mel.bin`), `pulsar_arm/asm/lfm3_mel.S` (window + half-length pair-form direct DFT 400->201, 128x208 mel matmul, clamp+affine -- NEON, documented reduction order), `lfm3_mel.c` (HF's `pad_length`/`num_frames` padding, `log10f`), `lfm3_mel_test.c` (bit-exact C mirror). Gate `.auto/lfm3/checks_mel.py`, 19 fixtures: **asm vs C mirror 29,412 checks 0 mismatches (bit-exact)**; vs HF frame counts exact on all 19, live-cell (within 6 decades of the frame peak) max 8.3e-6, live mean 2.2e-7; exact-f64 referee says the engine is as accurate as HF (worst mean-ratio 1.28); all-cell max 0.0499 disclosed (one chirp cell 13.5 decades under its peak, where HF is 0.039 from exact). Cost **0.554 ms/frame** = 5.5% of realtime, so the front end is free. |
 | **S5 iSTFT spike** | **done, gated** (transformer stack not started) | `pulsar_arm/asm/lfm3_istft.cu`: direct inverse 641->1280 in a documented order, x hann, overlap-add hop 320 with a fixed 4-term contribution order (no atomics), envelope divide, `trim=480`/`tail=960` per `decode`. Gate `.auto/lfm3/checks_istft.py`: **9 cases, SNR 103-130 dB vs torch** (cases built from the checkpoint's real `decoder.lin` weights, bf16-rounded like the engine will, plus a 440 Hz tone and a window-centred click), well past the 60 dB bar; max abs scales with the case (relative bound 1e-3 x rms). **Decision: the `__sincosf` arm ships** -- it is faster in 9/9 cases (the 3.2 MB/frame twiddle table is DRAM-bound). Cost 0.7-4.5 ms/frame (board drift included; 75 frames per audio second => 5-11% RT, acceptable next to the backbone's 141% RT). **Follow-up: an FFT form** (1280 = 2^7 x 5) if it ever matters -- the direct form is SFU-bound on `__sincosf` (measured 2 ms/frame vs a 1.64 MFLOP/frame FLOP count => 0.8 GFLOP/s of ~100). |
 | batched Q8 GEMM (D2's enabling kernel) | **measured, not shipped** | `pulsar_arm/asm/lfm3_gemm.cu` + `.auto/lfm3/checks_gemm.sh`: fp64 gate PASS on all 18 audio shapes x 5 T x 7 tiles (max relative error 2.9e-8). Performance verdict: **7.1 GFLOP/s ceiling on every shape, no batching win** (per-position cost flat in T; T=1 streams weights at 1.0-3.5 GB/s vs the engine's 17 GB/s). Two bugs the fp64 gate caught: an out-of-bounds write when T is not a multiple of TILE (`ceil(T/TILE)` tiles need the `t0+t<T` guard on both the x load and the store -- symptom: scattered zeros plus a poisoned CUDA context that made every later shape "fail to allocate"); and scalar `int8` weight loads (2.4x at T=1, and the 40x-off streaming rate). Root cause of the ceiling: the inner loop reads x from shared once per (weight, position) pair -> shared-bandwidth bound. **Action: port `q8_partial` (x register-staged, KCHUNK partials, R rows/block, warp-shuffle reductions) to the batched form; do not ship a from-scratch GEMM.** |
-| S1 tokenizer | not started | |
+| S1 tokenizer | **algorithm pinned + replayed bit-exact** | `pulsar_arm/tools/mktok.py --corpus`: 31/31 hand-written + 500/500 fuzz strings id-for-id against HF, incl. added tokens, contractions, digit runs, combining accents, emoji and 12 scripts. C/asm port + blob tables still to come. See §12. |
 | S3 encoder tower | not started (unblocked: S2's gate is green) | |
 | S4 depth head + MaskGIT | not started | |
 | S5 codec transformer | not started | |
@@ -422,3 +422,44 @@ realtime, no headroom) and the depth head costs 34 ms at T=12 against a 12 ms
 target. Building the audio layers on top of that would mean shipping components
 whose budget is known to be unmet. S1 (tokenizer) and S2/S5a (already green) are
 independent of S0 and proceed in parallel.
+
+## 12. S1: the tokenizer is not the simple BPE the plan assumed
+
+`tokenizer_config.json` says `pre_tokenizer: null`. **It is wrong.** The real
+pipeline lives in `tokenizer.json`:
+
+| stage | value |
+|---|---|
+| normalizer | null |
+| pre_tokenizer | `Sequence[ Split(regex, Isolated), ByteLevel(add_prefix_space=False) ]` |
+| model | BPE, 124,893 vocab, **293,320 merges**, `ignore_merges=True`, `byte_fallback=False`, `fuse_unk=False`, no `unk_token`, no `continuing_subword_prefix`/`end_of_word_suffix` |
+| added tokens | 140, ids 124,893..125,032 |
+| post_processor / decoder | `ByteLevel`, `add_prefix_space=True` |
+
+Three consequences the plan did not anticipate:
+
+1 **The Split regex is the GPT-4 pattern**, so it needs Unicode general categories
+   `\p{L}` and `\p{N}`: 648 and 134 codepoint ranges respectively, shipped in the
+   blob. Nothing is approximated, and the tables come from `unicodedata` in the
+   build tool, so a Unicode-version drift between Python and Rust's `regex` is a
+   gate failure rather than a silent behavioural difference.
+2 **`ignore_merges=True`** changes the algorithm: a pre-token that is already in
+   the vocab is emitted directly, with no merge pass. A classic BPE loop is wrong
+   here.
+3 **Added tokens are matched on the raw text before pre-tokenisation**, longest
+   first, and emitted as themselves. Omitting that made `<|im_start|>` come back as
+   ten ordinary byte-level tokens.
+
+`transformers` also prints a warning that this tokenizer uses an "incorrect regex
+pattern" and suggests `fix_mistral_regex=True`. The shipped `tokenizer.json` regex
+is what the reference engine uses by default, so that is what the port reproduces;
+the flag is recorded here so nobody "fixes" it later and breaks bit-parity with the
+engine.
+
+Status: the algorithm is pinned and replayed bit-exactly (531/531 strings) by
+`mktok.py --corpus`, which also validates that the 256-entry byte map is a
+bijection onto the vocab's 256 single-character entries and writes the blob
+metadata. The remaining S1 work is mechanical: emit the vocab strings and the
+293,320 merge pairs as sorted tables, write the splitter (the regex, hand-rolled
+against the 782 category ranges) and the merge loop in C, and gate it against the
+same corpus. The regex is the risky part, which is why the replay came first.
