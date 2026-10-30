@@ -21,7 +21,11 @@ NOT STARTED         log-mel front end · 17-layer audio encoder · audio→text 
                     liquid7.1 tokenizer · interleaved text/audio controller
 ```
 
-The full document is
+The staged plan for the rest of the port — every remaining component with its gate, its
+derived cost and its risks, ending at a self-contained asm + C runtime — is
+[`doc/LFM3_PORT_STAGES.md`](doc/LFM3_PORT_STAGES.md).
+
+The engine document is
 [`pulsar_arm/asm/README-lfm3-audio.md`](pulsar_arm/asm/README-lfm3-audio.md):
 per-component port status with tensor and byte budgets, the checkpoint → `.lfm3q8`
 blob → engine contract, the reuse matrix and the traps for each component still to

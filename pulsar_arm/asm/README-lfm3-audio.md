@@ -27,6 +27,9 @@ not started           log-mel front end, audio encoder (17 layers), depthformer 
 Tensor counts and bytes below are **measured from the checkpoint header and the exported blob**
 (`.lfm3q8` table), not estimated — except where marked *derived*.
 
+The staged plan for everything below — gates, derived costs, risks, milestones — is
+[`doc/LFM3_PORT_STAGES.md`](../../doc/LFM3_PORT_STAGES.md).
+
 | component | checkpoint prefix | tensors | Q8 bytes | engine | gates | status |
 |---|---|---|---|---|---|---|
 | text backbone (LFM3, 24 layers) | `lfm.` | 286 | **1946 MB** | `lfm3_nanode.cu` | 4 green | **ported** |
