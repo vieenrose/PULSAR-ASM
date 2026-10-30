@@ -14,3 +14,7 @@ __pycache__/
 .auto/lfm3/hf_logits_*_seq.npy
 .auto/lfm3/hf_matrix_long.npy
 .auto/lfm3/matrix_long_bad.json
+
+# mel front-end fixtures are deterministic from the seed in checks_mel.py; the
+# HF references (mel_ref/) ARE committed so the gate runs without torch.
+.auto/lfm3/mel_fix/
