@@ -103,6 +103,32 @@ This is the single largest engineering decision in the plan, and it is forced by
 | depth head, one frame (3 maskgit passes) | 3 × 68 MB ≈ **12 ms** | same (it is already 12 parallel positions) |
 | backbone, one frame | **112.8 ms measured** (bandwidth-bound, cannot batch across a frame) | — |
 
+**Correction 2026-10-31: the table above is bandwidth-only and understates the
+batched column wherever the compute roofline binds.** Units first, because the
+plan has mixed them: peak is **236 G FMA/s** (256 cores × 921.6 MHz; one FMA =
+one MAC); the sweep tool reports 2-counted GFLOP/s, so divide by 2 before
+comparing to peak (the "3% of peak" remarks are really ~1.5% — the qualitative
+point stands, the arithmetic is fixed here). Roofline per component from census
+shapes (MACs = params × positions × passes; minimum = max(bytes/17 GB/s,
+MACs/236 GFMA/s), i.e. 100% efficiency, unattainable, a floor not a quote):
+
+| component | MACs | bandwidth floor | compute floor | binding | realistic (30–50% eff) |
+|---|---|---|---|---|---|
+| encoder / 0.96 s chunk (100 M params × 24 pos) | 2.40 G | 7 ms | 10.2 ms | compute | **10–20 ms** (D2's 13 ms stands) |
+| depthformer / frame (33.9 M × 12 pos × 3) | 1.22 G | 4.0 ms | 5.2 ms | compute | |
+| to_logits + depth_linear / frame (50 M × 12 × 3) | 1.80 G | 5.9 ms | 7.6 ms | compute | depth total **13 ms min, 25–40 ms realistic** (D2's 12 ms was right number, wrong reason) |
+| codec transformer / frame (36.5 M × 75) | 2.74 G | 4.3 ms | **11.6 ms** | compute | **25–50 ms realistic (D2's 4.3 ms needs 1100 GFLOP/s — unachievable)** |
+
+Consequences: (1) the codec was understated 2.7× — 4.3 ms assumed the ALUs could
+sustain 1100 GFLOP/s; (2) S0's true need is set by depth+codec ≈ 5.8 GMAC/frame:
+25 ms combined needs ~230 GFMAC/s (~97% of peak), so the 60-floor (30 GFMAC/s)
+is a **halfway milestone, not the need** — at 60 the pair still costs ~190 ms;
+(3) the backbone alone (112.8 ms measured) already exceeds an 80 ms frame, so
+speech-out on this board is **≥1.7× realtime at 100% efficiency and ~2.2×
+realistic, regardless of S0** — S0 decides whether audio adds ~25 ms or ~200 ms
+to the backbone's 113 ms, not whether speech is realtime. D2's decision
+(everything batched) stands; its numbers are superseded by this table.
+
 Unbatched codec decoding is fatal (4× realtime slower); batched it is 5% of an 80 ms frame
 budget. The encoder goes from "as expensive as realtime" to free. **So: no component after the
 backbone may be written token-at-a-time.** The backbone already exists and is token-at-a-time,
@@ -112,8 +138,10 @@ and it is the one place where the plan has to touch shipped numerics (see §5, r
 
 ## 3. What the finished runtime costs (derived)
 
-Speech out: one backbone step (112.8 ms) + depth head (≈12 ms) + codec (≈4.3 ms) per 80 ms frame
-→ **≈129 ms per 80 ms of speech ≈ 1.6× realtime**; a 5 s answer takes ≈8 s. Speech in
+Speech out: one backbone step (112.8 ms) + depth head (≈13 ms minimum, 25–40 ms
+realistic) + codec (≈11.6 ms minimum, 25–50 ms realistic) per 80 ms frame
+→ **≈137 ms minimum (1.7×) and ~180 ms realistic (≈2.2× realtime)**; a 5 s answer
+takes ≈11 s. The old "129 ms / 1.6×" was bandwidth-only. Speech in
 (ASR path): 1 s of audio = 25 encoder tokens = batched encoder ≈13 ms + backbone prefill 25 steps
 × 98 ms = 2.45 s (unbatched, today) or ≈0.3–0.6 s once batched (FLOP-bound: 25 tokens × 3.5 GFLOP
 = 88 GFLOP against ≈236 GFLOP/s fp32 peak) → the input side is where batching pays 5–8×.
