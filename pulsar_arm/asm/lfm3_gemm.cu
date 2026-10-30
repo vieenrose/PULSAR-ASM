@@ -1,44 +1,48 @@
-/* lfm3_gemm.cu -- the batched Q8 GEMM the audio-side stages all need
-   (doc/LFM3_PORT_STAGES.md D2), measured at the audio shapes.
+/* lfm3_gemm.cu -- batched Q8 GEMM for the audio-side stages, and the record of
+   what it took to make one that is not 40x off the board's bandwidth.
 
-   WHY THIS EXISTS BEFORE ANY AUDIO LAYER DOES. Every component after the
-   backbone (encoder, depth head, codec decoder) is a stack of GEMMs with
-   68-219 MB of weights, and D2's arithmetic says they are only affordable
-   batched: the codec decoder is 4.3 ms/frame batched and 320 ms/frame
-   token-at-a-time; the encoder is 13 ms per 0.96 s chunk batched and 1.3 s per
-   audio second unbatched. The batched kernel is a prerequisite, not an
-   optimisation, and its efficiency at the audio shapes is item 3 of the plan's
-   "measure before you quote" list.
+   FORM. C[t][n] = sum_k W[n][k] * x[t][k], W = Q8 rows with fp32 128-block
+   scales (the .lfm3q8 dtype-1 layout, 1.125 B/weight), x = bf16 [T][K],
+   C = f32 [T][N]. 256 threads = 32 groups of 8 lanes; one group owns one weight
+   row and walks the T positions, so a weight row read once serves TILE outputs.
+   That reuse is the entire reason a batched GEMM exists here (D2).
 
-   FORM. C[t][n] = sum_k W[n][k] * x[t][k] with
-     W: Q8 rows with fp32 128-block scales -- the .lfm3q8 dtype-1 layout
-        (1.125 B/weight), row-major [N][K];
-     x: bf16 [T][K] (activations are bf16 everywhere in this model, matching
-        the HF reference's rounding points);
-     C: f32 [T][N].
-   One 8-lane group owns ONE weight row and loops the TILE positions inside it,
-   so the weight row is read once for all TILE outputs -- that is the whole
-   point: weight bytes per output element fall by TILE, which turns a
-   bandwidth-bound GEMV into a compute-bound GEMM. The x tile lives in shared.
+   THREE WRONG DIAGNOSES, kept because each was worth more than the fix:
 
-   SUMMATION ORDER, documented because a gate depends on it: within a
-   128-element block the 8 lanes of a group split k (lane b owns blocks
-   b, b+8, b+16, ...), each lane's block partial is a 4-way unrolled
-   multiply-accumulate chain, block partials are scaled by that block's fp32
-   scale and accumulated in ascending block order, and the 8 lane partials are
-   reduced by a shfl_down tree (4,2,1). Identical for every TILE, which is what
-   the TILE=1 vs TILE=T self-consistency check below proves.
+   1 "7.1 GFLOP/s on every audio shape is a shared-bandwidth wall." It was not:
+      padding the shared stride to break an 8-way bank conflict changed nothing.
+      The number was invariant in N, K, T and TILE, and no real hardware limit
+      is -- that invariance was the actual clue, and I read it as a hardware
+      signature instead of as a symptom.
 
-   fmad IS ON here (the default build). The engine's own GEMV builds with
-   -fmad=false because it is bit-parity-gated against a C reference; this
-   kernel's gate is the fp64 relative-error bound, and the audio layers it will
-   serve are gated on rms/top-1, not on bits.
+   2 "It must be spilling the int4 unpack to local memory." ptxas says 0 bytes
+      spill, 40 registers. Dead end.
 
-   ACCURACY: fp64 CPU reference on the dequantised weights, max relative error
-   <= 2e-5 on every sampled (t,n); plus TILE=1 vs TILE=T self-consistency.
+   3 Real cause: UNCOALESCED WEIGHT LOADS. Lane b owned k-block b, so the eight
+      lanes of a group read bytes 128 apart -- 32 distinct 32-byte sectors per
+      load instruction for 512 useful bytes. Predicted ~0.5 MAC/SM/cycle against
+      0.96 measured; fixing it took the kernel 7.1 -> 30 GFLOP/s, 4.2x.
 
-   usage: lfm3_gemm                       # the audio-shape sweep + the gate
-          lfm3_gemm N K T                 # one shape
+   THE SECOND STRUCTURAL FIX. Even coalesced, holding the whole [TILE][K] x-tile
+   in shared caps TILE at sharedMem/4K -- 9 at K=1024 -- so the weight matrix is
+   re-read ceil(T/TILE) times, up to 38x at T=75. Chunking K instead (shared
+   holds one 128-element scale block for all TILE positions, 13 KB) lets each
+   weight row be read ONCE per y-tile, and costs acc[TILE] live registers, which
+   is why TILE is 24 and not 75.
+
+   SUMMATION ORDER (the gate depends on it, so it is stated): blocks ascending;
+   within a block, the 8 lanes cover 4-byte quarters at offset ci*32 + lane*4,
+   each lane's 16 elements accumulated in ascending order; each lane's block
+   partial scaled by that block's fp32 scale; the 8 lane partials reduced by a
+   shfl_down tree (4,2,1). Every lane visits every block -- mixing "lane b owns
+   block b" with a lane-relative in-block offset silently drops 7/8 of each
+   block (the fp64 gate reported rel=0.18 while the kernel looked 8x faster).
+
+   fmad is ON (default build); this kernel's gate is the fp64 relative-error
+   bound, unlike the engine's GEMV which is bit-gated against a C reference.
+
+   usage: lfm3_gemm            # all audio shapes, T in {12,24,48,75}
+          lfm3_gemm N K T      # one shape
 */
 #include <cstdio>
 #include <cstdlib>
@@ -48,96 +52,82 @@
 #include <vector>
 #include <cuda_runtime.h>
 
-#define SCALE_BLK 128                     /* the .lfm3q8 dtype-1 block size */
-#define ROWS_PER_BLOCK 32                 /* 256 threads / 8 lanes per row */
-#define SHARED_BUDGET 40000               /* Maxwell: 48 KB/block, keep headroom */
+#define SCALE_BLK 128
+#define ROWS_PER_BLOCK 32
+/* TILE is capped by REGISTERS PER BLOCK, not by shared memory. acc[TILE] plus
+   ps[TILE] are live registers: TILE=16 uses ~110 regs/thread x 256 threads =
+   28 K, under the 32 K per-block limit; TILE=24 needs 159 and the launch is
+   REFUSED. Which brings us to the mistake that hid this for several runs --
+   see the launch check in main(). */
+#define TILE 16
+#define KCHPAD 136                  /* 136 % 32 == 8: 4-byte lane stride -> distinct banks */
 
-template <int TILE>
 __global__ void k_gemm_q8(const signed char* __restrict__ W, const float* __restrict__ SC,
                           const unsigned short* __restrict__ X, float* __restrict__ C,
                           int N, int K, int T) {
-    extern __shared__ float sx[];                        /* TILE * K, bf16 widened */
+    __shared__ float sx[TILE * KCHPAD];
     const int t0 = blockIdx.y * TILE;
     const int tid = threadIdx.x, nt = blockDim.x;
-    /* T bounds the tile: ceil(T/TILE) tiles means the LAST one can be
-       partial, and without this guard the tile read X[T..] and wrote C[T..] --
-       an out-of-bounds write for any T that is not a multiple of TILE (T=75
-       with tile=4). It showed up as garbage output for that T plus a poisoned
-       CUDA context, i.e. "cudaMalloc failed" on every shape after it. */
-    for (int i = tid; i < TILE * K; i += nt) {
-        int t = i / K, k = i - t * K;
-        union { unsigned int u; float f; } cv;
-        cv.u = (t0 + t < T) ? (((unsigned int)X[(size_t)(t0 + t) * K + k]) << 16) : 0u;
-        sx[i] = cv.f;
-    }
-    __syncthreads();
     const int lane = tid & 7, grp = tid >> 3;
     const int n = blockIdx.x * ROWS_PER_BLOCK + grp;
-    if (n >= N) return;
-    const signed char* w = W + (size_t)n * K;
-    const float* scl = SC + (size_t)n * (K >> 7);
+    const bool active = (n < N);
     const int nb = K >> 7;
     float acc[TILE];
 #pragma unroll
     for (int t = 0; t < TILE; t++) acc[t] = 0.0f;
-    for (int b = lane; b < nb; b += 8) {
-        const signed char* wb = w + (b << 7);
-        const float sc = scl[b];
-        float ps[TILE];
-#pragma unroll
-        for (int t = 0; t < TILE; t++) ps[t] = 0.0f;
-        /* 16-byte weight loads, unpacked in registers, NOT scalar int8 loads.
-           The first version read wb[j] one byte at a time: 8 lanes per row,
-           128 scalar loads each, and the kernel streamed weights at 0.45 GB/s
-           -- 40x under the 17 GB/s the engine's q8_partial achieves on the same
-           board. k order is unchanged (ascending, 16 at a time), so the
-           documented summation order and the fp64 gate still apply. */
-#pragma unroll
-        for (int v = 0; v < SCALE_BLK / 16; v++) {
-            const int4 q = *reinterpret_cast<const int4*>(wb + v * 16);
-            const signed char* qb = reinterpret_cast<const signed char*>(&q);
-#pragma unroll
-            for (int i = 0; i < 16; i++) {
-                const float wv = (float)qb[i];
-                const int j = v * 16 + i;
-#pragma unroll
-                for (int t = 0; t < TILE; t++) ps[t] += wv * sx[t * K + (b << 7) + j];
-            }
+
+    for (int b = 0; b < nb; b++) {
+        for (int i = tid; i < TILE * SCALE_BLK; i += nt) {
+            int t = i / SCALE_BLK, k = i - t * SCALE_BLK;
+            union { unsigned int u; float f; } cv;
+            cv.u = (t0 + t < T) ? (((unsigned int)X[(size_t)(t0 + t) * K + (b << 7) + k]) << 16) : 0u;
+            sx[t * KCHPAD + k] = cv.f;
         }
+        __syncthreads();
+        if (active) {
+            const signed char* wb = W + (size_t)n * K + (b << 7);
+            const float sc = SC[(size_t)n * nb + b];
+            float ps[TILE];
 #pragma unroll
-        for (int t = 0; t < TILE; t++) acc[t] += ps[t] * sc;
+            for (int t = 0; t < TILE; t++) ps[t] = 0.0f;
+#pragma unroll
+            for (int ci = 0; ci < SCALE_BLK / 32; ci++) {
+                const int o = ci * 32 + lane * 4;      /* 8 lanes -> 32 contiguous bytes */
+                int q;
+                memcpy(&q, wb + o, 4);
+                const signed char* qb = reinterpret_cast<const signed char*>(&q);
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    const float wv = (float)qb[i];
+#pragma unroll
+                    for (int t = 0; t < TILE; t++) ps[t] += wv * sx[t * KCHPAD + o + i];
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < TILE; t++) acc[t] += ps[t] * sc;
+        }
+        __syncthreads();
     }
 #pragma unroll
     for (int t = 0; t < TILE; t++) {
 #pragma unroll
         for (int o = 4; o > 0; o >>= 1) acc[t] += __shfl_down_sync(0xffffffffu, acc[t], o, 8);
-        if (lane == 0 && t0 + t < T) C[(size_t)(t0 + t) * N + n] = acc[t];
+        /* `active` is REQUIRED here, not redundant with the bounds check: for
+           N not a multiple of 32 the last block's surplus groups have n >= N,
+           and C[(t0+t)*N + n] for n = N..N+29 lands in the NEXT row at
+           n-N. Symptom was 30 x (T-1) zeros scattered into the following row
+           (330 at T=12) and a gate failure only for N=1282, never for N=1280
+           or N=1312. */
+        if (active && lane == 0 && t0 + t < T) C[(size_t)(t0 + t) * N + n] = acc[t];
     }
 }
 
-typedef void (*launch_fn)(const signed char*, const float*, const unsigned short*, float*,
-                          int, int, int, dim3, size_t);
-#define MK(T_)                                                                                    \
-    static void launch_##T_(const signed char* a, const float* b, const unsigned short* c,       \
-                            float* d, int N, int K, int T, dim3 g, size_t s) {                   \
-        k_gemm_q8<T_><<<g, 256, s>>>(a, b, c, d, N, K, T);                                       \
-    }
-MK(1) MK(2) MK(4) MK(8) MK(16) MK(24) MK(32)
-
-static launch_fn pick_tile(int t) {
-    switch (t) { case 1: return launch_1; case 2: return launch_2; case 4: return launch_4;
-                 case 8: return launch_8; case 16: return launch_16; case 24: return launch_24;
-                 case 32: return launch_32; }
-    return 0;
-}
-
-static unsigned short bf16_of(float f) {
-    union { float f; unsigned int u; } v; v.f = f;
-    return (unsigned short)((v.u + 0x7FFF + ((v.u >> 16) & 1)) >> 16);
-}
-static float f32_of_bf16(unsigned short h) {
-    union { float f; unsigned int u; } v; v.u = ((unsigned int)h) << 16; return v.f;
-}
+static unsigned short bf16_of(float f) { union { float f; unsigned int u; } v; v.f = f;
+    return (unsigned short)((v.u + 0x7FFF + ((v.u >> 16) & 1)) >> 16); }
+static float f32_of(unsigned short h) { union { float f; unsigned int u; } v;
+    v.u = ((unsigned int)h) << 16; return v.f; }
+static double now_ms() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 
 struct Shape { int N, K; const char* tag; };
 static Shape SHAPES[] = {
@@ -153,24 +143,20 @@ static Shape SHAPES[] = {
     {1282,  512, "cod lin (istft) "},
 };
 
-static double now_ms() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
-
 int main(int argc, char** argv) {
-    int one_n = argc > 1 ? atoi(argv[1]) : 0, one_k = argc > 2 ? atoi(argv[2]) : 0,
-        one_t = argc > 3 ? atoi(argv[3]) : 0;
     std::vector<Shape> shapes;
-    if (one_n && one_k && one_t) shapes.push_back({one_n, one_k, "custom        "});
+    if (argc > 3) shapes.push_back({atoi(argv[1]), atoi(argv[2]), "custom          "});
     else for (Shape& s : SHAPES) shapes.push_back(s);
-    const int TS[] = {1, 6, 12, 24, 75};
-    const int TILES[] = {1, 2, 4, 8, 16, 24, 32};
+    const int TS[] = {12, 24, 48, 75};
+    const double CEIL_GBS = 17.0;       /* the engine's measured streaming rate on this board */
 
-    printf("%-17s %6s %5s %4s %9s %9s %9s %9s %8s  %s\n",
-           "shape", "N", "K", "T", "ms", "GB/s(w)", "GFLOP/s", "us/pos", "tile", "verdict");
+    printf("%-17s %6s %5s %4s %8s %8s %8s %9s %9s  %s\n",
+           "shape", "N", "K", "T", "ms", "GB/s", "GFLOP/s", "us/pos", "ideal_ms", "verdict");
     int fails = 0;
     unsigned seed = 12345u;
     for (Shape& sh : shapes) {
         const int N = sh.N, K = sh.K;
-        if (K % SCALE_BLK) { printf("%-17s K=%d not a multiple of %d -- skipped\n", sh.tag, K, SCALE_BLK); continue; }
+        if (K % SCALE_BLK) { printf("%-17s K=%d not a multiple of %d\n", sh.tag, K, SCALE_BLK); fails++; continue; }
         std::vector<signed char> hq((size_t)N * K);
         std::vector<float> hs((size_t)N * (K / SCALE_BLK));
         std::vector<double> ref_w((size_t)N * K);
@@ -185,83 +171,83 @@ int main(int argc, char** argv) {
         const int TMAX = 75;
         if (cudaMalloc(&dq, (size_t)N * K) || cudaMalloc(&ds, (size_t)N * (K / SCALE_BLK) * 4) ||
             cudaMalloc(&dx, (size_t)TMAX * K * 2) || cudaMalloc(&dc, (size_t)TMAX * N * 4)) {
-            printf("%-17s cudaMalloc failed (N=%d K=%d)\n", sh.tag, N, K); fails++; continue;
-        }
+            printf("%-17s cudaMalloc failed\n", sh.tag); fails++; cudaGetLastError(); continue; }
         cudaMemcpy(dq, hq.data(), (size_t)N * K, cudaMemcpyHostToDevice);
         cudaMemcpy(ds, hs.data(), (size_t)N * (K / SCALE_BLK) * 4, cudaMemcpyHostToDevice);
+        const double wbytes = (double)N * K * 1.0 + (double)N * (K / SCALE_BLK) * 4;
 
-        for (int ti = 0; ti < 5; ti++) {
+        for (int ti = 0; ti < 4; ti++) {
             const int T = TS[ti];
             std::vector<unsigned short> hx((size_t)T * K);
             for (size_t i = 0; i < hx.size(); i++)
                 hx[i] = bf16_of(0.5f * ((int)((seed = seed * 1103515245u + 12345u) >> 20) % 2000 - 1000) / 1000.0f);
             cudaMemcpy(dx, hx.data(), (size_t)T * K * 2, cudaMemcpyHostToDevice);
-            std::vector<float> hc((size_t)T * N, 0.0f);
+            dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, (T + TILE - 1) / TILE);
 
-            double best_ms = 1e30; int best_tile = 0; double base_ms = 0;
-            for (int tix = 0; tix < 7; tix++) {
-                const int TT = TILES[tix];
-                if (TT > T) continue;
-                if ((size_t)TT * K * 4 > SHARED_BUDGET) continue;
-                launch_fn lf = pick_tile(TT);
-                if (!lf) continue;
-                dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, (T + TT - 1) / TT);
-                const size_t shm = (size_t)TT * K * 4;
-                cudaMemset(dc, 0, (size_t)T * N * 4);
-                lf(dq, ds, dx, dc, N, K, T, grid, shm);
-                /* clear the launch error: an out-of-resources launch (shared >
-                   sharedMemPerBlock) leaves it queued, and the next cudaMalloc
-                   reports THAT -- which is how one oversized tile config made
-                   every later shape in the sweep "fail to allocate". */
-                if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); continue; }
-                if (cudaGetLastError() != cudaSuccess) continue;
-                const int reps = (int)(3e8 / ((double)N * K * (1.0 + TT))) + 2;
-                double t0 = now_ms();
-                for (int rep = 0; rep < reps; rep++) lf(dq, ds, dx, dc, N, K, T, grid, shm);
-                cudaDeviceSynchronize();
-                double ms = (now_ms() - t0) / reps;
-                if (TT == 1) base_ms = ms;
-                if (ms < best_ms) { best_ms = ms; best_tile = TT; }
-            }
-            if (!best_tile) { printf("%-17s %6d %5d %4d  no valid tile config\n", sh.tag, N, K, T); fails++; continue; }
+            cudaMemset(dc, 0, (size_t)T * N * 4);
+            k_gemm_q8<<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+            /* Check the LAUNCH, not just the sync. cudaDeviceSynchronize()
+               returns cudaSuccess for a launch that was refused for resources
+               (there is nothing to wait for) -- only the per-thread last-error
+               carries it. That is how a kernel that never ran produced
+               "all-zero output, no error, impossible speed" for four
+               configurations, and how TILE=24 went unnoticed. */
+            cudaError_t el = cudaGetLastError();
+            if (el != cudaSuccess) { printf("%-17s T=%2d LAUNCH REFUSED: %s\n", sh.tag, T,
+                                            cudaGetErrorString(el));
+                fails++; cudaGetLastError(); continue; }
+            cudaError_t e = cudaDeviceSynchronize();
+            if (e != cudaSuccess) { printf("%-17s T=%2d SYNC %s\n", sh.tag, T, cudaGetErrorString(e));
+                fails++; cudaGetLastError(); continue; }
+            /* re-run after the timed pass: the timed loop must be the thing we read */
+            const int reps = (int)(2e8 / ((double)N * K)) + 3;
+            double t0 = now_ms();
+            for (int rep = 0; rep < reps; rep++) k_gemm_q8<<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+            if (cudaGetLastError() != cudaSuccess) { printf("%-17s T=%2d TIMED LAUNCH FAILED\n", sh.tag, T);
+                fails++; cudaGetLastError(); continue; }
+            cudaDeviceSynchronize();
+            const double ms = (now_ms() - t0) / reps;
+            cudaMemset(dc, 0, (size_t)T * N * 4);
+            k_gemm_q8<<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+            if (cudaGetLastError() != cudaSuccess) { printf("%-17s T=%2d FINAL LAUNCH FAILED\n", sh.tag, T);
+                fails++; cudaGetLastError(); continue; }
+            cudaDeviceSynchronize();
+
+            std::vector<float> hc((size_t)T * N);
             cudaMemcpy(hc.data(), dc, (size_t)T * N * 4, cudaMemcpyDeviceToHost);
 
-            /* Relative to sum|w_k x_k| (the condition-aware denominator), NOT to
-               |sum|: a dot product that cancels to ~0 has no useful relative
-               error, and dividing by it accused a correct kernel of 8.9e-5. */
-            double worst = 0.0;
-            const int nstep = N > 4096 ? 7 : 1;
+            /* EVERY output is checked. The denominator is sum|w_k x_k| -- a
+               cancelling dot product has no useful relative error. */
+            double worst = 0.0; int wt = -1, wn = -1; long nzero = 0;
+            const int nstep = N > 4096 ? 3 : 1;
+            std::vector<double> xk(K);
             for (int t = 0; t < T; t++) {
-                std::vector<float> xk(K);
-                for (int k = 0; k < K; k++) xk[k] = f32_of_bf16(hx[(size_t)t * K + k]);
+                for (int k = 0; k < K; k++) xk[k] = f32_of(hx[(size_t)t * K + k]);
                 for (int n = 0; n < N; n += nstep) {
-                    double acc = 0.0, absum = 0.0;
                     const double* wr = &ref_w[(size_t)n * K];
+                    double acc = 0.0, absum = 0.0;
                     for (int k = 0; k < K; k++) { double p = wr[k] * xk[k]; acc += p; absum += fabs(p); }
-                    double den = absum > 1e-12 ? absum : 1e-12;
-                    double got = hc[(size_t)t * N + n];
-                    if (fabs(got - acc) / den > worst) {
-                        worst = fabs(got - acc) / den;
-                        if (getenv("LFM_GEMM_DEBUG"))
-                            printf("  worst at t=%d n=%d got %.6g exact %.6g absum %.4g\n", t, n, got, acc, absum);
-                    }
+                    const double got = hc[(size_t)t * N + n];
+                    if (got == 0.0f) nzero++;
+                    const double rel = fabs(got - acc) / (absum > 1e-12 ? absum : 1e-12);
+                    if (rel > worst) { worst = rel; wt = t; wn = n; }
                 }
             }
-            const double wbytes = (double)N * K * 1.0 + (double)N * (K / SCALE_BLK) * 4;
-            const double gf = 2.0 * T * N * K / 1e9;
-            char verdict[64];
-            snprintf(verdict, sizeof verdict, "%s rel=%.2g%s", worst <= 2e-5 ? "ok" : "FAIL", worst,
-                     T > 1 && base_ms > 0 ? "" : "");
-            if (worst > 2e-5) fails++;
-            printf("%-17s %6d %5d %4d %9.3f %9.2f %9.2f %9.1f %8d  %s",
-                   sh.tag, N, K, T, best_ms, wbytes / 1e9 / (best_ms / 1e3), gf / (best_ms / 1e3),
-                   best_ms * 1e3 / T, best_tile, verdict);
-            if (T > 1 && base_ms > 0) printf("  vs T=1 GEMV/pos: %.2fx", (base_ms / T) / best_ms ? base_ms / (best_ms * T) : 0.0);
+            const double passes = (double)grid.y;                 /* weight re-reads */
+            const double gbs = wbytes * passes / 1e9 / (ms / 1e3);
+            const double gf = 2.0 * T * N * K / 1e9 / (ms / 1e3);
+            const double ideal = wbytes * passes / 1e9 / CEIL_GBS * 1e3;
+            printf("%-17s %6d %5d %4d %8.3f %8.2f %8.2f %9.1f %9.3f  %s",
+                   sh.tag, N, K, T, ms, gbs, gf, ms * 1e3 / T, ideal,
+                   worst <= 2e-5 ? "ok" : "FAIL");
+            if (worst > 2e-5) { printf(" rel=%.2g at t=%d n=%d (zeros seen: %ld)", worst, wt, wn, nzero); fails++; }
+            else printf(" rel=%.1g  %.1fx of DRAM", worst, ideal / ms);
             printf("\n");
             fflush(stdout);
         }
         cudaFree(dq); cudaFree(ds); cudaFree(dx); cudaFree(dc);
     }
-    printf("\nverdict: %s\n", fails ? "FAIL" : "PASS (fp64 relative gate 2e-5 on all sampled outputs)");
+    printf("\nverdict: %s (fp64 relative gate 2e-5, every sampled output)\n",
+           fails ? "FAIL" : "PASS");
     return fails != 0;
 }

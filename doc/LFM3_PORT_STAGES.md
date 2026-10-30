@@ -364,13 +364,55 @@ survives a tolerance check:
   fwrite` overloads** ("too few arguments in function call", pointing at the wrong
   line). Use POSIX `open/read/write` in tool drivers, as `lfm3_istft.cu` does.
 
-## 11. What the batched-GEMM measurement changes
+## 11. What the batched-GEMM measurement changes (corrected)
 
-The plan's D2 table (encoder 13 ms per chunk, codec 4.3 ms per frame) is a **bandwidth**
-statement: weights streamed once at 17 GB/s. The sweep in §10 shows a naive batched kernel
-never reaches that regime -- it sits at 7.1 GFLOP/s, where the encoder is 3.1 s per audio
-second (300x realtime) instead of 0.13 s. So the table is not wrong, it is *conditional*: it
-holds only for a kernel built like the engine's `q8_partial`, which is the component that
-streamed 1946 MB in 112.8 ms on this same board. S3 therefore starts from that kernel, and
-`lfm3_gemm.cu` stays in the tree as the instrument (its fp64 gate is what any future form has
-to pass).
+The first version of this section claimed a shared-memory bandwidth wall at
+7.1 GFLOP/s. **That was wrong**, and the way it was wrong is worth keeping: the
+figure was invariant in N, K, T and tile size, and I read that invariance as a
+hardware signature when it was the signature of a bug. The actual causes, in the
+order they were found:
+
+1. **Uncoalesced weight loads.** Lane *b* owned k-block *b*, so the eight lanes
+   of a group read bytes 128 apart: 32 distinct 32-byte sectors per load
+   instruction for 512 useful bytes. Fixing the layout (all eight lanes on one
+   128-element block, each taking a 4-byte quarter of it, so a warp group reads
+   32 contiguous bytes) gave **7.1 -> 30 GFLOP/s, 4.2x**.
+2. **Wrong stride arithmetic**, caught by the fp64 gate at rel=0.18: "lane *b*
+   owns block *b*" and "a lane-relative in-block offset" are incompatible, and
+   mixing them computes each block from 16 of its 128 elements.
+3. **Weight re-streaming.** Holding the whole `[TILE][K]` x-tile in shared caps
+   TILE at `sharedMemPerBlock/4K` -- 9 at K=1024 -- so weights are re-read
+   `ceil(T/TILE)` times. Chunking K instead (shared holds one 128-element scale
+   block for all TILE positions) drops the tile to 13 KB and lets TILE be set by
+   registers.
+4. **TILE is capped by REGISTERS, not shared memory.** `acc[TILE]` plus
+   `ps[TILE]` are live: TILE=16 uses ~110 regs/thread, TILE=24 needs 159 and the
+   per-block register limit refuses the launch.
+
+Measured after all four (gate: fp64, every sampled output, 18 audio shapes x
+T in {12,24,48,75}, max relative error 3e-8):
+
+| shape | T | ms | GFLOP/s | x of DRAM-bound |
+|---|---|---|---|---|
+| dep 12x to_logit (24204x1024) | 75 | 135.7 | 27.4 | 0.1x |
+| dep depth_linear (12288x2048) | 75 | 142.2 | 26.6 | 0.1x |
+| enc lin_out (768x4096) | 75 | 22.0 | 21.5 | 0.0x |
+| cod w1/w3 (2304x512) | 75 | 7.2 | 24.4 | 0.0x |
+
+So the kernel now sits at 13-28 GFLOP/s and **0.0-0.1x of the DRAM bound**: it is
+ALU/instruction-bound, not memory-bound. This changes the conclusion for the
+plan, and not in a comfortable direction:
+
+- D2's cost table (encoder 13 ms/chunk, codec 4.3 ms/frame, depth head 12
+  ms/frame) assumes weights stream at ~17 GB/s. The measured form streams them
+  at **0.9 GB/s effective**. The table is therefore not reachable yet, and every
+  audio-side stage built on it would miss the 80 ms frame budget.
+- Concretely at 25 GFLOP/s: the depth head at T=12 costs 32 ms against a 12 ms
+  target (2.7x over), and the codec decoder's 73 MB of weights cost ~78 ms per
+  80 ms frame -- i.e. **speech out at 1.0x realtime, no headroom**.
+- The next step is therefore not a new kernel design but a *throughput floor*:
+  the batched GEMM must reach the memory-bound regime (>=17 GB/s effective, i.e.
+  ~30 G MAC/s, about 2.2x the current 13.6) before S3/S4/S5 are scheduled. The
+  route is the engine's own `q8_partial` shape -- x staged in registers rather
+  than read from shared once per MAC, which is what costs the 2 instructions per
+  multiply-accumulate here.
