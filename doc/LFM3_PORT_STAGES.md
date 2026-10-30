@@ -759,6 +759,52 @@ integration-level gate §14/14a already scoped.
 Speed claims here are same-session same-binary A/B of env knobs; the board
 baseline drift caveat does not apply within one harness run.
 
+### 14d. RETRACTED (run #299): the ARM=5 "5x / ~100 GMAC/s" was a no-op kernel
+
+**Everything below this banner in 14d that concerns ARM=5, the "binder was
+shared-load traffic" conclusion, the 1.0-1.2x realtime budget, and the "KC
+chooser truncation" harness note is WRONG and is kept only as a record of the
+error.** What happened: in the harness the row count came from `LFM_PF_RPB`
+but the ARM=5 kernel's `GRP` template came from `LFM_PF_RB` (default 2). With
+RPB=4/8 the kernel's `if (GR != GRP) continue;` guard skipped all compute and
+only staged x into shared memory (time ~ N/R: embed 109.9 -> 55.0 ms exactly 2x
+between GRP 4 and 8). Both sides of the self-consistency pair emitted zeros, so
+the pair printed BIT-EXACT; `seq[0]=0` and `ARM1-vs-ARM0 max rel 1` were
+printed and not read. The one matched config (GRP=2) was real and was 2.6x
+SLOWER than ARM0 -- the evidence was in the same log. This violated the
+plausibility rule recorded at the start of S0 (every output non-zero).
+
+Corrected measurements, T=24, CT=4, H2, same binary, nonzero outputs verified
+(harness now fails on all-zero output or a rate above 236 GFLOP/s, and
+refuses a GRP/R mismatch loudly):
+
+| kernel | embed GMAC/s | w2 | w1 |
+|---|---|---|---|
+| ARM=0 (shipped structure) CT=4 | **29.7** | **32.3** | **29.3** |
+| ARM=5 GRP=2 | 12.1 | 11.1 | -- |
+| ARM=5 GRP=4 | 14.5 | 13.6 | -- |
+| ARM=5 GRP=8 | 9.4 | 10.7 | -- |
+
+ARM=5 is slower than ARM=0 at every GRP (consistent with the live decode-swap
+measurement, 304 vs 107 ms/token, which used the real GRP=8 kernel). So:
+
+* The realtime budget is back to **~0.53x** (CT=4 ARM=0, 29-32 GMAC/s); the
+  remaining gap is again x2.6 to ~79 GMAC/s. CT=4's 1.35-2.07x (nonzero,
+  plausible, bit-exact) STANDS.
+* "Shared-load traffic is the binder" is UNSUPPORTED: ARM=3 and ARM=5 both cut
+  shared loads and both got slower; ARM=2 (fewer ops, higher occupancy) was
+  slower; ARM=4 (prefetch) was -7%. Four hypotheses measured out, none
+  confirmed; the binder is still unidentified.
+* "Occupancy formally refuted by the fastest config at 126 regs" rested on the
+  bogus run; the occupancy evidence is only ARM=2 (66% occ, slower).
+* The KC "truncation" note was wrong: CT=8 at K=7680 picks KC=1920 (nch=4, as
+  the 196608-cell count shows), not 240.
+* What survives from the S8 work (section 15): ARM=5 (H2) T=1 == q8_partial
+  bit-exact on 153/153 real-activation configs, and the shipped-kernel delta.
+  Those compared nonzero data and stand.
+
+Original (incorrect) section follows, unedited, for the record.
+
 ### 14d. The binder was shared-load traffic: ARM=5 gives ~5x, ~100 GMAC/s (run #297)
 
 Four arms were built and measured on `q8_prefill_h2` after CT=4, all
@@ -846,16 +892,18 @@ to prompt steps. Two findings:
   two measure.sh runs). The harness job's 20 steps all sit inside the prompt
   window, so they all take the arm, and ARM=5's T=1 form is the wrong shape for
   a decode step: R=64 means 2 blocks/SM and it loses the per-shape R/TPB tuning
-  `pick()` gives the shipped kernel. The 5x win is specific to batched T>=4
-  GEMMs (T=24: embed 55 vs 283 ms), which the engine can only exploit through a
-  real batched prefill, not a T=1 substitution.
+  `pick()` gives the shipped kernel. (CORRECTED #299: the "5x win at batched
+  T>=4" that used to be asserted here was the no-op kernel; the real ARM=5 is
+  slower than ARM=0 at T=24 too.)
 
-**Verdict: keep the shipped decode/prefill kernel; ARM=5 enters through S8's
-batched prefill** (batch the prompt/audio-token block: q/k/v/o, gate/up/down,
-conv projections at T=24; rmsnorm/rope/conv/attention batched over the block;
-decode steps stay on `q8_gemv_hs`, so the certified decode order is untouched).
-Expected TTFT for prompt A: GEMV work ~41.5 GMAC at ~100 GMAC/s = 0.42 s plus
-the sequential elementwise/attention remainder, against 2.28 s today.
+**Verdict (CORRECTED in run #299): keep the shipped decode/prefill kernel.**
+The sentence that stood here -- "ARM=5 enters through S8's batched prefill ...
+expected TTFT ~0.42 s at ~100 GMAC/s" -- was built on the retracted 14d numbers;
+ARM=5 is in fact 2-3x SLOWER than ARM=0 at T=24 (see the 14d banner). A batched
+S8 prefill would use CT=4 ARM=0 (29-32 GMAC/s, bit-exact vs its own sequential
+pair, q8_partial order), which is ~0.53x realtime, not 1.0x. Its numerics are
+q8_partial's, not q8_gemv_hs's, so the F-stream sensitivity measured above
+applies to it as well.
 
 Measurement-discipline additions from building this gate: a top-of-function
 capture reads the *previous* call's output (first version: 99.95% cells

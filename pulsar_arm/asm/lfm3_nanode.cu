@@ -1946,6 +1946,10 @@ static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const fl
 #undef PF5F
     return;
   }
+  if (arm == 5 && (R / (TPB / 32)) != rb) {
+    printf("pf_launch ARM5: rows/warp %d != GRP %d -- refusing (the kernel would skip its compute)\n", R / (TPB / 32), rb);
+    return;
+  }
   if (arm == 5 && h2) {
 #define PF5(CT_, G_) q8_prefill_h2<bf16, CT_, true, 5, 2, G_><<<nblk, TPB, shm>>>(q, s, x, part, N, K, KC, R, nb, T)
     if (ct == 2) { if (rb == 2) PF5(2,2); else if (rb == 4) PF5(2,4); else PF5(2,8); }
@@ -1980,9 +1984,9 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
     pfRPB = getenv("LFM_PF_RPB") ? atoi(getenv("LFM_PF_RPB")) : 4;
     if (pfRPB != 1 && pfRPB != 2 && pfRPB != 4 && pfRPB != 8) { printf("LFM_PF_RPB=%d unsupported (1|2|4|8) -- using 4\n", pfRPB); pfRPB = 4; }
     pfRB = getenv("LFM_PF_RB") ? atoi(getenv("LFM_PF_RB")) : 2;
-    if (pfRB != 1 && pfRB != 2 && pfRB != 4) { printf("LFM_PF_RB=%d unsupported (1|2|4) -- using 2\n", pfRB); pfRB = 2; }
+    if (pfRB != 1 && pfRB != 2 && pfRB != 4 && pfRB != 8) { printf("LFM_PF_RB=%d unsupported (1|2|4|8)\n", pfRB); exit(2); }
   }
-  const int CT = pfCT, ARM = pfARM, RB = pfRB;
+  const int CT = pfCT, ARM = pfARM, RB = (pfARM == 5) ? pfRPB : pfRB;   // ARM5: GRP == rows/warp, one knob
   const int R = (ARM == 5) ? (256 / 32) * pfRPB : 256;   // ARM5 needs small rows/warp
   int KC = K;
   while (KC > 32) {
@@ -2040,6 +2044,13 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   std::vector<float> b(a.size(), -999.f);
   printf("cp-bat=%s\n", cudaGetErrorString(cudaMemcpy(b.data(), bat, b.size() * 4, cudaMemcpyDeviceToHost))); fflush(stdout);
   printf("bat[0]=%.9g\n", b[0]); fflush(stdout);
+  { // PLAUSIBILITY (a pair that both emit zeros is 'bit-exact' and certifies nothing)
+    size_t nz = 0; for (size_t i = 0; i < a.size(); i++) nz += (a[i] != 0.f) || (b[i] != 0.f);
+    if (nz == 0) { printf("PLAUSIBILITY FAIL: %s all-zero output (launch skipped or refused)\n", e->name.c_str()); fflush(stdout); return 1; }
+    const double gmac = (double)T * N * K / (ms2 * 1e-3) / 1e9;
+    if (gmac > 236.0) { printf("PLAUSIBILITY FAIL: %s %.0f GMAC/s exceeds the 236 GFLOP/s peak\n", e->name.c_str(), gmac); fflush(stdout); return 1; }
+    printf("plausible: %s nonzero=%zu/%zu  bat %.1f GMAC/s\n", e->name.c_str(), nz, a.size(), gmac); fflush(stdout);
+  }
   long bad = 0; for (size_t i = 0; i < a.size() && bad < 5; i++) if (memcmp(&a[i], &b[i], 4)) { bad++; if (bad == 1) printf("first diff at %zu: seq=%.9g bat=%.9g\n", i, a[i], b[i]); }
   long nbad = 0; for (size_t i = 0; i < a.size(); i++) nbad += memcmp(&a[i], &b[i], 4) != 0;
   printf("prefill-h2batched H2=%d CT=%d ARM=%d %s: %s (%ld/%zu differ) seq %.2f ms bat %.2f ms\n",
