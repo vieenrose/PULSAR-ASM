@@ -438,9 +438,20 @@ products under 2^31), `__ldcs` streaming weight loads (weights are re-read
 ceil(T/TILE) times), and occupancy (3 blocks/SM at 71 regs vs the engine's 6 at 40).
 Update (v3: 32-bit indices + `__ldcs` weight loads): **+5%**, 3 interleaved pairs on
 24204x1024 T=24 (v3 wins 2/3, means 28.8 vs 27.6 GFLOP/s; best single-shape 31.7 at
-cod w1/w3 T=24). Same bits (gate green), kept. Remaining if revisited: occupancy
-(3 blocks/SM at 71 regs vs the engine's 6 at 40) and the register-blocked outer
-product (x in registers). Floor NOT met; v3 is the instrument.
+cod w1/w3 T=24). Same bits (gate green), kept. Remaining if revisited: occupancy (3 blocks/SM at 71 regs vs the engine's 6 at 40)
+and the register-blocked outer product (x in registers). Floor NOT met; v3 is the
+instrument.
+Update (v4: 16 rows x 16 positions, one acc/thread, no shared/syncs, L1 broadcast;
+`LFM_V4=1`): **NEGATIVE, -25% vs v3** (22.1/20.4 vs 28.0/27.0 GFLOP/s, 2 shapes x 2
+passes same session). Cause identified: v4 converts weights AND x per MAC with no
+reuse (16 threads redundantly convert the same 16 weights), while v3 amortizes
+weight converts over TILE and x converts over 32 rows -- occupancy (7 blocks/SM
+at 32 regs, 0 spill) did not compensate. v4 kept behind the flag for reference.
+v4 also caught a **gate hole: NaN outputs report rel=0/PASS** (NaN comparisons are
+false, so worst never updates). Closed twice: plausibility now rejects non-finite
+outputs outright, and the sampled loop forces worst=1.0 on non-finite `got`. The
+32-reg figure above is real (spill-free); the 23 GFLOP/s beside the original
+`rel=0` was NaN throughput, not FLOPs.
 
 Consequence for the schedule: **S3/S4/S5b stay blocked on S0.** At the measured
 rate the codec decoder's 73 MB of weights cost ~80 ms per 80 ms frame (1.0x

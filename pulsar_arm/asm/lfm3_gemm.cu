@@ -63,6 +63,70 @@
 #endif
 #define KCHPAD 136                  /* 136 % 32 == 8: 4-byte lane stride -> distinct banks */
 
+/* v4 (S0 redesign, LFM_V4=1): 16 rows x 16 positions per 256-thread block, one
+   accumulator per thread, NO shared memory, NO __syncthreads, NO shuffle.
+   Why: v3's acc[TILE] array costs 71 regs (3 blocks/SM) and its shared x tile
+   costs 2 syncs per K-block; the kernel sits at 10% of peak. v4 stages nothing:
+   weights stream from DRAM once per y-tile (16 t-threads per row share each 128 B
+   line via L1/MSHR coalescing) and x broadcasts across the 16 rows the same way,
+   so DRAM traffic is IDENTICAL to v3 while on-chip state is 2 floats + addresses
+   (~35 regs -> 7 blocks/SM). Per K-block each thread does 128 sequential FMAs
+   into a block partial ps, then acc += ps*sc (1 FMA). Summation order: blocks
+   ascending, k ascending within a block, partials ascending -- the fp64 gate
+   (2e-5, denominator sum|w x|) is what certifies the longer sequential chain. */
+#define R4 16
+#define TILE4 16
+__global__ void k_gemm_q8v4(const signed char* __restrict__ W, const float* __restrict__ SC,
+                            const unsigned short* __restrict__ X, float* __restrict__ C,
+                            int N, int K, int T) {
+    const int tid = threadIdx.x;
+    const int r = tid >> 4, t = tid & 15;
+    const int n = blockIdx.x * R4 + r;
+    const int tt = blockIdx.y * TILE4 + t;
+    const bool active = (n < N) && (tt < T);
+    const int nb = K >> 7;
+    float acc = 0.0f;
+    if (active) {
+        const signed char* wr = W + n * K;
+        const float* sr = SC + n * nb;
+        const unsigned short* xr = X + tt * K;
+#pragma unroll 1
+        for (int b = 0; b < nb; b++) {
+            const float sc = sr[b];
+            /* ps accumulates the unscaled block dot (128 sequential FMAs); the
+               block scale applies once per block below. Per MAC that is 1 FMA
+               instead of MUL+FMA -- the folded-scale form costs an extra MUL
+               per MAC with no accuracy benefit the gate can see. */
+            float ps = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 8; c++) {
+                /* 16 weights (int8) + 16 x (bf16) per chunk. int4 loads are
+                   16 B each: q covers w[c*16..c*16+15], x0/x1 cover
+                   x[c*16..c*16+15]. Shifts are ws*8 for BYTES (weights) and
+                   xs*16 for HALVES (bf16) -- getting this wrong mixes bf16
+                   halves into exponent-all-ones patterns (inf/nan), and NaN
+                   comparisons are false, so a NaN output sails through a
+                   max-relative gate as rel=0. The gate now rejects non-finite. */
+                const int wb = (b << 7) + c * 16;
+                const int4 q = *reinterpret_cast<const int4*>(wr + wb);
+                const int4 x0 = *reinterpret_cast<const int4*>(xr + wb);
+                const int4 x1 = *reinterpret_cast<const int4*>(xr + wb + 8);
+                const int qw[4] = {q.x, q.y, q.z, q.w};
+                const int xw[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    float wf = (float)((signed char)(qw[i >> 2] >> ((i & 3) * 8)));
+                    unsigned int xu = ((unsigned int)(xw[i >> 1] >> ((i & 1) * 16)) & 0xFFFFu) << 16;
+                    float xf; memcpy(&xf, &xu, 4);
+                    ps += wf * xf;
+                }
+            }
+            acc += ps * sc;
+        }
+        if (tt < T) C[(size_t)tt * N + n] = acc;
+    }
+}
+
 __global__ void k_gemm_q8(const signed char* __restrict__ W, const float* __restrict__ SC,
                           const unsigned short* __restrict__ X, float* __restrict__ C,
                           int N, int K, int T) {
@@ -145,6 +209,23 @@ static Shape SHAPES[] = {
     {1282,  512, "cod lin (istft) "},
 };
 
+/* v4 dispatch: LFM_V4=1 selects k_gemm_q8v4 (16x16, no shared). Same gate,
+   same plausibility checks; the sweep compares arms in one session. */
+static int g_v4 = -1;
+static void gemm_launch(const signed char* dq, const float* ds, const unsigned short* dx,
+                        float* dc, int N, int K, int T, dim3 grid) {
+    if (g_v4 < 0) {
+        g_v4 = getenv("LFM_V4") ? 1 : 0;
+        if (g_v4) cudaFuncSetCacheConfig(k_gemm_q8v4, cudaFuncCachePreferL1);
+    }
+    if (g_v4) {
+        dim3 g4((N + 15) / 16, (T + 15) / 16);
+        k_gemm_q8v4<<<g4, 256>>>(dq, ds, dx, dc, N, K, T);
+    } else {
+        k_gemm_q8<<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+    }
+}
+
 int main(int argc, char** argv) {
     std::vector<Shape> shapes;
     if (argc > 3) shapes.push_back({atoi(argv[1]), atoi(argv[2]), "custom          "});
@@ -187,7 +268,7 @@ int main(int argc, char** argv) {
             dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, (T + TILE - 1) / TILE);
 
             cudaMemset(dc, 0, (size_t)T * N * 4);
-            k_gemm_q8<<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+            gemm_launch(dq, ds, dx, dc, N, K, T, grid);
             /* Check the LAUNCH, not just the sync. cudaDeviceSynchronize()
                returns cudaSuccess for a launch that was refused for resources
                (there is nothing to wait for) -- only the per-thread last-error
@@ -204,13 +285,13 @@ int main(int argc, char** argv) {
             /* re-run after the timed pass: the timed loop must be the thing we read */
             const int reps = (int)(2e8 / ((double)N * K)) + 3;
             double t0 = now_ms();
-            for (int rep = 0; rep < reps; rep++) k_gemm_q8<<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+            for (int rep = 0; rep < reps; rep++) gemm_launch(dq, ds, dx, dc, N, K, T, grid);
             if (cudaGetLastError() != cudaSuccess) { printf("%-17s T=%2d TIMED LAUNCH FAILED\n", sh.tag, T);
                 fails++; cudaGetLastError(); continue; }
             cudaDeviceSynchronize();
             const double ms = (now_ms() - t0) / reps;
             cudaMemset(dc, 0, (size_t)T * N * 4);
-            k_gemm_q8<<<grid, 256>>>(dq, ds, dx, dc, N, K, T);
+            gemm_launch(dq, ds, dx, dc, N, K, T, grid);
             if (cudaGetLastError() != cudaSuccess) { printf("%-17s T=%2d FINAL LAUNCH FAILED\n", sh.tag, T);
                 fails++; cudaGetLastError(); continue; }
             cudaDeviceSynchronize();
@@ -224,11 +305,22 @@ int main(int argc, char** argv) {
                a kernel that never ran once read as "all zeros, no error,
                174 GB/s" across four configurations. */
             {
-                size_t nz = 0;
-                for (size_t i = 0; i < hc.size(); i++) if (hc[i] == 0.0f) nz++;
+                size_t nz = 0, nnf = 0;
+                for (size_t i = 0; i < hc.size(); i++) {
+                    if (hc[i] == 0.0f) nz++;
+                    if (!isfinite(hc[i])) nnf++;
+                }
                 const double gf_chk = 2.0 * T * N * K / 1e9 / (ms / 1e3);
                 if (nz == hc.size()) {
                     printf("%-17s T=%2d IMPLAUSIBLE: every output is zero -- the kernel did not run\n", sh.tag, T);
+                    fails++; continue;
+                }
+                /* NaN/Inf outputs: NaN comparisons are false, so a NaN output
+                   sails through a max-relative gate as rel=0 (the v4 bf16-half
+                   shift bug passed the whole sweep this way). Non-finite is an
+                   automatic failure, not a number. */
+                if (nnf) {
+                    printf("%-17s T=%2d IMPLAUSIBLE: %zu of %zu outputs non-finite\n", sh.tag, T, nnf, hc.size());
                     fails++; continue;
                 }
                 if (nz) {
@@ -255,8 +347,14 @@ int main(int argc, char** argv) {
                     for (int k = 0; k < K; k++) { double p = wr[k] * xk[k]; acc += p; absum += fabs(p); }
                     const double got = hc[(size_t)t * N + n];
                     if (got == 0.0f) nzero++;
+                    /* NaN hole, second lock: rel=NaN never exceeds worst, so an
+                       all-NaN output would report rel=0/PASS. Caught above by the
+                       non-finite scan; this guards the sampled comparison too. */
+                    if (!isfinite(got)) { worst = 1.0; wt = t; wn = n; }
+                    else {
                     const double rel = fabs(got - acc) / (absum > 1e-12 ? absum : 1e-12);
-                    if (rel > worst) { worst = rel; wt = t; wn = n; }
+                    if (!(rel <= worst)) { worst = rel; wt = t; wn = n; }
+                    }
                 }
             }
             const double passes = (double)grid.y;                 /* weight re-reads */
