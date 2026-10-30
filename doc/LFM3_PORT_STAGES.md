@@ -302,6 +302,8 @@ codec, no iSTFT, and it exercises the entire input path against HF.
 
 | kernel / tool | surface | new or parameterised |
 |---|---|---|
+| ~~hann + rfft(400) + 128-mel + log10 + affine~~ **DONE** | CPU, NEON asm | shipped: `pulsar_arm/asm/lfm3_mel.S` + `lfm3_mel.c`, gate `.auto/lfm3/checks_mel.py` (S2, §10) |
+| ~~irfft(1280) + hann + overlap-add hop 320~~ **DONE (spike)** | GPU | shipped: `pulsar_arm/asm/lfm3_istft.cu`, gate `.auto/lfm3/checks_istft.py` (S5 spike, §10) |
 | BPE encode/decode + build table | CPU, C/asm | **new** (precedent exists in `tools/mkbpe.py` + `core.S`) |
 | hann + rfft(400) + 128-mel + log10 + affine | CPU, C/NEON | **new** |
 | 3×3 strided conv, 1×1 conv, 4-frame concat | GPU | **new** (`downsample`) |
@@ -327,3 +329,30 @@ codec, no iSTFT, and it exercises the entire input path against HF.
 5. MaskGIT tie density, as the backbone's reference-precision work did for text.
 
 Until those five exist, every timing in this document stays labelled *derived*.
+
+## 10. Status (updated as stages land)
+
+| stage | state | evidence |
+|---|---|---|
+| **S2 log-mel front end** | **done, gated** | `pulsar_arm/tools/mkmel.py` (build-time: the reference's own `mel_filter_bank` + `torch.hann_window` + twiddles -> `mel.bin`), `pulsar_arm/asm/lfm3_mel.S` (window + half-length pair-form direct DFT 400->201, 128x208 mel matmul, clamp+affine -- NEON, documented reduction order), `lfm3_mel.c` (HF's `pad_length`/`num_frames` padding, `log10f`), `lfm3_mel_test.c` (bit-exact C mirror). Gate `.auto/lfm3/checks_mel.py`, 19 fixtures: **asm vs C mirror 29,412 checks 0 mismatches (bit-exact)**; vs HF frame counts exact on all 19, live-cell (within 6 decades of the frame peak) max 8.3e-6, live mean 2.2e-7; exact-f64 referee says the engine is as accurate as HF (worst mean-ratio 1.28); all-cell max 0.0499 disclosed (one chirp cell 13.5 decades under its peak, where HF is 0.039 from exact). Cost **0.554 ms/frame** = 5.5% of realtime, so the front end is free. |
+| **S5 iSTFT spike** | **done, gated** (transformer stack not started) | `pulsar_arm/asm/lfm3_istft.cu`: direct inverse 641->1280 in a documented order, x hann, overlap-add hop 320 with a fixed 4-term contribution order (no atomics), envelope divide, `trim=480`/`tail=960` per `decode`. Gate `.auto/lfm3/checks_istft.py`: **9 cases, SNR 103-130 dB vs torch** (cases built from the checkpoint's real `decoder.lin` weights, bf16-rounded like the engine will, plus a 440 Hz tone and a window-centred click), well past the 60 dB bar; max abs scales with the case (relative bound 1e-3 x rms). **Decision: the `__sincosf` arm ships** -- it is faster in 9/9 cases (the 3.2 MB/frame twiddle table is DRAM-bound). Cost 0.7-4.5 ms/frame (board drift included; 75 frames per audio second => 5-11% RT, acceptable next to the backbone's 141% RT). **Follow-up: an FFT form** (1280 = 2^7 x 5) if it ever matters -- the direct form is SFU-bound on `__sincosf` (measured 2 ms/frame vs a 1.64 MFLOP/frame FLOP count => 0.8 GFLOP/s of ~100). |
+| S1 tokenizer | not started | |
+| S3 encoder tower | not started (unblocked: S2's gate is green) | |
+| S4 depth head + MaskGIT | not started | |
+| S5 codec transformer | not started | |
+| S6 controller / S7 shell / S9 packaging | not started | |
+| S8 batched backbone prefill | not started; needs the `ffn.w2` layout decision (R3) | |
+
+Two lessons the gates earned, recorded here because both are the class of bug that
+survives a tolerance check:
+
+* **AArch64 asm: capture every argument register before it becomes a cursor.**
+  `lfm3_mel_power` used `x5` as the x cursor and only then read `w5` for `n_bins`,
+  so the bin-loop bound was the y-pointer's low word -- the kernel computed bin 0
+  and exited, leaving `pw[k>=1]` at the sentinel. `lfm3_mel_norm` took `n` from
+  `w3`, which is the 4th integer slot: FP args are `s0-s2` *independently* of the
+  integer slots, so `n` was garbage and the kernel stored nothing. Neither is
+  visible to the house `d8-d15` checker; both look like "the output is zero".
+* **CUDA: stdio in a `.cu` host function hits CUDA's device-side `fopen/fread/
+  fwrite` overloads** ("too few arguments in function call", pointing at the wrong
+  line). Use POSIX `open/read/write` in tool drivers, as `lfm3_istft.cu` does.
