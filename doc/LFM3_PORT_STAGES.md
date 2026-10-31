@@ -1055,3 +1055,44 @@ Consequences:
 * Also corrected in place: the engine README's projector ("3 x 768->768" ->
   LayerNorm + 768->2048 + GELU + 2048->2048) and its encoder cost (per mel frame at
   100/s -> per token at 12.5/s, batched).
+
+### 19. S3 spec gate: the audio encoder re-derived in fp32, matches HF to 2e-6 (run #304)
+
+`.auto/lfm3/enc_ref/dump_encoder.py` dumps HF's own stages for a fixed synthetic
+log-mel input (no audio, no mel front end). `.auto/lfm3/enc_ref/enc_numpy.py`
+re-derives the whole encoder from the checkpoint's float32 weights and compares
+stage by stage.
+
+Result, T=400 mel frames (50 tokens): downsampler 2.5e-7; layers 0-15 3e-7 to
+6e-7; final encoder output 2.4e-7; projector 2.2e-6 (rms relative). Odd length
+T=37 (5 tokens, not a multiple of 8): worst 9e-7. **Gate: PASS.**
+
+Three facts in the earlier notes were wrong, and the spec found them:
+
+1. **The encoder is NOT the LFM3 backbone block.** Its `lfm` is transformers'
+   built-in `Lfm2Config` (`Lfm2Model`). Differences that matter: attention has
+   q/k layernorm and `out_proj`, with **no sigmoid output gate** (the gate is
+   backbone-only); no sandwich norm; FFN width 1792 (2560 auto-adjusted by
+   `block_multiple_of` 256).
+2. **The offline encoder uses full causal attention, not a 32-token window.**
+   Every encoder `layer_types` entry is `full_attention`, so HF's offline mask is
+   unwindowed. A windowed reference missed layer 2 by 1e-2; full causal matches
+   to 1.3e-7. The 32-token `sliding_window` belongs to the streaming path, which
+   remaps layers to `sliding_attention`. Streaming is a separate port decision.
+3. **The conv block is width 3** (`conv_L_cache` 3), depthwise, causal, with no
+   bias, on `B * x` gated by `C`.
+
+Structure, confirmed by the spec: downsampler (conv_in 3x3 s2, SiLU; conv_mid
+depthwise 3x3 s2, lin_mid 1x1, SiLU; conv_end depthwise 3x3 s2, lin_end 1x1,
+SiLU; flatten channel-major (c*16 + h); lin_out 4096->768, no activation), then 17
+pre-norm layers (RMSNorm eps 1e-5, RoPE theta 1e6 over all 96 dims as
+rotate-half, q/k norm before rope), then embedding_norm, then the projector
+(LayerNorm 768, Linear 768->2048, GELU exact, Linear 2048->2048).
+
+HF's `hidden_states[17]` is post embedding_norm, so the gate compares layers
+0-15 against HF and covers layer 16 through `enc_out`.
+
+Next (S3 implementation): the same math in C, reading the `.lfm3q8` encoder blob
+(`lfm3-audio-2b-enc.lfm3q8`), stage-gated against these dumps, then Q8 with a
+gate on the quantized path. The encoder runs once per audio token (12.5/s),
+so it is cheap next to the backbone.

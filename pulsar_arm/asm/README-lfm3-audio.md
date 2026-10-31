@@ -181,7 +181,8 @@ arithmetic only where the gate says you may.** Two levers here are bit-identical
 
 ```
 17 LFM2 layers, hidden 768, intermediate 1792 (2560 auto-adjusted down by block_multiple_of 256)
-8 heads / 4 KV heads, head_dim 96   sliding_window 32   conv_L_cache 3
+8 heads / 4 KV heads, head_dim 96   conv_L_cache 3   (sliding_window 32 is STREAMING ONLY:
+   the offline forward uses full causal attention, verified in .auto/lfm3/enc_ref, plan section 19)
 10 conv layers + 7 attention layers        ~106.2 M params
 downsample front end: 3x [256,1,3,3] + 2x [256,256,1,1] convs, lin_out [768, 4096, 1]
    (4096 = 16 mel bins x 256 channels after 8x down on both axes -> 12.5 tokens per second
@@ -199,10 +200,10 @@ mel front end: 16 kHz, n_mels 128, n_fft 400, win 400, hop 160, hann periodic, c
 | Q8 GEMV, any `N`, `K∈{2048, 7680, 2816, ...}` | `q8_partial` family + config picker | **reuse** (K=768/1792/1024 are new shapes → new `GemvCfg` entries + coverage assert) |
 | RMSNorm / per-head norm | `k_rmsnorm`, `k_headnorm` | **reuse** with `H=768`, `hd=96` as parameters |
 | depthwise causal conv + ring state | `k_conv7`, `k_shift_in` (width 7) | **generalize** to width 3 (`conv_L_cache` 3) |
-| GQA attention with sliding window | `k_attn_head` (window parameter) | **reuse**; window 32, `hd=96`, 8 heads |
+| GQA attention, full causal (offline) | `k_attn_head` (window parameter) | **reuse**; window = T (no window offline), `hd=96`, 8 heads, 2 q per kv |
 | RoPE | `k_rope` (rot is a parameter) | **reuse** (LFM2 encoder config decides full vs partial) |
-| silu·gate, sigmoid gate, residual add | `k_silu_mul_bf`, `k_sigmoid_gate`, `k_add_bf` | **reuse** |
-| **strided / 2-D convs, 4-frame concat** | — | **new kernel** (`downsample`) |
+| silu·gate, residual add | `k_silu_mul_bf`, `k_add_bf` | **reuse** (the encoder has NO sigmoid output gate; that is backbone-only) |
+| **strided / 2-D convs (3x stride-2 over mel x time)** | — | **new kernel** (`downsample`); output 12.5 tokens/s, not 25 (plan section 18) |
 | **log-mel (FFT-400, slaney filterbank)** | — | **new** (DSP; no weights, no reuse) |
 
 ### 4.3 Cost, derived from bytes
