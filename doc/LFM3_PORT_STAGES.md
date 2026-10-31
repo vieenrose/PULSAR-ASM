@@ -1096,3 +1096,37 @@ Next (S3 implementation): the same math in C, reading the `.lfm3q8` encoder blob
 (`lfm3-audio-2b-enc.lfm3q8`), stage-gated against these dumps, then Q8 with a
 gate on the quantized path. The encoder runs once per audio token (12.5/s),
 so it is cheap next to the backbone.
+
+### 20. S3 C reference: the encoder runs from the .lfm3q8 blob (run #305)
+
+`pulsar_arm/asm/lfm3_enc.c` (C99, no dependencies beyond libm) reads
+`lfm3-audio-2b-enc.lfm3q8`, dequantizes the Q8 linears once at load, and runs the
+spec's math in fp32: downsampler, 17 layers (10 conv, 7 full-causal attention with
+q/k norm and RoPE), embedding_norm, projector. Build:
+`cc -O2 -std=c99 -Wall -Wextra -o lfm3_enc lfm3_enc.c -lm` (no warnings).
+
+Two gates, `.auto/lfm3/enc_ref/check_enc_c.py` (T=400, 50 tokens):
+
+| comparison | result | what it means |
+|---|---|---|
+| C vs numpy spec, **same dequantized blob weights** | worst rms rel **3.3e-6** (projector); every stage 1e-6 class | the C code is correct |
+| C vs HF, fp32 checkpoint, encoder output | rms rel **2.6e-3** | Q8 quantization error (numpy shows the identical 2.6e-3 on the same weights) |
+| C vs HF, projector output | rms rel **1.8e-2** | Q8 quantization error, accumulated through the projector |
+| per-layer C vs HF | 1.5e-3 at the downsampler, 7.1e-3 at layer 12, 5.5e-3 at layer 15 | all inside the 3 % per-stage bound the backbone gates use |
+
+**The Q8 gap is the encoder's own quantization error and is not yet accepted.**
+The projector's 1.8 % rms is inside the backbone's 3 % per-stage bound, but
+rms is not the criterion that matters: the real test is downstream, whether the
+audio embeddings change the transcript. That needs an audio-input transcript
+gate (speech in, greedy text out, against HF), which needs real speech, not the
+synthetic features used here.
+
+Reference speed: 6.9 s for 400 mel frames (50 tokens) on this host, naive loops,
+dequantization per call, RoPE recomputed with `pow` per element. It is a
+correctness reference, not the target; the Nano build and the GPU kernels are the
+next steps. Accounted cost per audio second (plan section 18): ~1.9 GMAC, which
+at naive C speed is far too slow, so the C path is for gating only.
+
+Known simplifications (must be fixed before the engine uses it): weights are
+dequantized to fp32 (420 MB resident), the conv loops are naive, and the
+attention is not batched across heads.
