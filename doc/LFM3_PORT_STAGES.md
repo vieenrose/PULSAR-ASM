@@ -56,7 +56,9 @@ encoder   17 layers, hidden 768, FFN 1792, 8 heads / 4 KV, head_dim 96, sliding 
           attention layers use q_layernorm/k_layernorm [96] (per-head norm, not the [96] dim of
           the backbone's [128]) and out_proj (not o_proj); conv layers are [2304,768] -> 3x768
           front end: conv 3x3 -> conv 3x3 -> conv 3x3 (stride), lin 1x1 -> lin 1x1 -> lin_out
-          [768, 4096, 1] over 4 concatenated 256-wide frames  => 25 tokens per second of audio
+          [768, 4096, 1] over (128/8 mel bins x 256 channels) => 12.5 tokens per second of audio
+          (CORRECTED run #303: three stride-2 convs shrink BOTH axes 8x; 4096 = 16 x 256, not a
+          4-frame concat. Measured with HF get_audio_features: 125 embeddings for 10 s, 375 for 30 s.)
 depthformer 3 layers, hidden 1024, FFN 2816, 32 heads / 8 KV, head_dim 32, 12 positions,
           is_causal FALSE, 2 norms per layer, maskgit_steps 3, 12 codebooks, vocab 2017
 projector   LayerNorm(768) -> 768->2048 -> activation -> 2048->2048   (note: the output is 2048,
@@ -133,7 +135,7 @@ Unbatched codec decoding is fatal (4× realtime slower); batched it is 5% of an 
 budget. The encoder goes from "as expensive as realtime" to free. **So: no component after the
 backbone may be written token-at-a-time.** The backbone already exists and is token-at-a-time,
 which is fine for its 1-step-per-80 ms speech role (RTF 1.41, §3) but not for audio *prefill*,
-where 25 tokens per second of audio at 98 ms/step = 2.45 s per audio second. That is stage S8,
+where 12.5 tokens per second of audio (corrected #303; was 25) at 98 ms/step = 1.23 s per audio second. That is stage S8,
 and it is the one place where the plan has to touch shipped numerics (see §5, risk R3).
 
 ## 3. What the finished runtime costs (derived)
@@ -142,9 +144,9 @@ Speech out: one backbone step (112.8 ms) + depth head (≈13 ms minimum, 25–40
 realistic) + codec (≈11.6 ms minimum, 25–50 ms realistic) per 80 ms frame
 → **≈137 ms minimum (1.7×) and ~180 ms realistic (≈2.2× realtime)**; a 5 s answer
 takes ≈11 s. The old "129 ms / 1.6×" was bandwidth-only. Speech in
-(ASR path): 1 s of audio = 25 encoder tokens = batched encoder ≈13 ms + backbone prefill 25 steps
-× 98 ms = 2.45 s (unbatched, today) or ≈0.3–0.6 s once batched (FLOP-bound: 25 tokens × 3.5 GFLOP
-= 88 GFLOP against ≈236 GFLOP/s fp32 peak) → the input side is where batching pays 5–8×.
+(ASR path): 1 s of audio = 12.5 encoder tokens (corrected #303; this paragraph said 25) = batched
+encoder ~0.06 s + backbone prefill 12.5 steps × 98 ms = 1.23 s (unbatched, today) or ~0.56-0.61 s
+batched at the measured 30-33 GMAC/s (18.4 GMAC per audio-second). See section 18.
 
 The 112.8 ms backbone step is **76% of the per-frame budget** and it is bandwidth-saturated at
 1946 MB/step. Nothing in this plan can shrink it except fewer bits per weight — which is a quality
@@ -1010,3 +1012,46 @@ GEMM tuning alone; at the best bit-exact arm (~32-35 GMAC/s) the budget is
 non-HFMA2 instructions per MAC, e.g. dp4a-free int8 tricks are unavailable
 on sm_53) or less work (smaller/quantized-activation audio path), which are
 scope decisions, not tuning.
+
+### 18. CORRECTION (run #303): 12.5 audio tokens per second, not 25 -- realtime is borderline, not out of reach
+
+Every realtime budget in sections 2, 3, 13a, 14, 14c, 14d and 17 used **25 backbone
+tokens per second of audio**. That figure came from reading `lin_out`'s 4096-wide
+input as "4 concatenated 256-wide frames". The code
+(`Lfm3AudioDownsampler`) is three stride-2 convolutions over the (mel, time)
+plane: both axes shrink 8x, and 4096 = (128/8 mel bins) x 256 channels. Measured
+with HF's own `get_audio_features`: 13 / 63 / 125 / 375 embeddings for
+1 / 5 / 10 / 30 s of audio = **12.5 per second** (dim 2048, after the projector).
+
+Also measured: the batched rates do not depend on the chunk size. A 0.96 s chunk
+is now T=12, and T=12 runs at the same GMAC/s as T=24 (CT=4: 29.7 / 32.5 / 29.7 /
+29.7; ARM10 RB=2: 31.6 / 35.3 / 31.3 / 31.4; embed/w2/w1/conv, all bit-exact).
+Text rate: the tokenizer gives 1.141 tokens per word on English prose (99 words ->
+113 tokens); at 2.5-3.5 words/s of speech that is 2.85-4.0 text tokens/s.
+
+Corrected budget per second of audio:
+
+| item | old | corrected | basis |
+|---|---|---|---|
+| backbone prefill | 43.2 GMAC | **18.4 GMAC** (12.5 x 1.47; the head is not run on audio tokens) | measured token rate |
+| prefill time | 1.31-1.44 s | **0.56-0.61 s** | measured 30-33 GMAC/s |
+| encoder + downsampler + projector | uncounted | ~1.9 GMAC, **~0.06 s** | estimate |
+| text decode | 0.45 s | **0.31-0.44 s** | 1.141 tok/word (measured) x 2.5-3.5 words/s (assumed) x 110 ms |
+| prefill non-GEMM (attention, norms, conv) | uncounted | **unmeasured** | |
+| **total** | **1.9 s (0.53x)** | **~0.93-1.11 s (~0.9-1.07x)** | |
+
+Consequences:
+* Section 17's "realtime out of reach for this kernel family" is **withdrawn**. The
+  kernel ceiling analysis there stands, but it was compared against a 2.3x
+  overstated requirement. At 12.5 tokens/s the required prefill rate for a 1.0 s
+  total is ~18.4 / (1.0 - 0.06 - 0.31..0.44) = **29-36 GMAC/s**, which the measured
+  bit-exact arms (30-35) are at.
+* It is **borderline, not achieved**. The margin depends on speech rate (decode
+  share) and on the unmeasured non-GEMM prefill work, and nothing has run end to end
+  (the encoder tower is unported, batched prefill is not integrated).
+* The next deliverable is therefore the end-to-end path, not more GEMM tuning:
+  S3 encoder tower (gated per layer against HF), then S8 batched prefill
+  integration, then an `ASR_RT` measurement on >= 60 s of real speech.
+* Also corrected in place: the engine README's projector ("3 x 768->768" ->
+  LayerNorm + 768->2048 + GELU + 2048->2048) and its encoder cost (per mel frame at
+  100/s -> per token at 12.5/s, batched).

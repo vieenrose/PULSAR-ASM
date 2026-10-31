@@ -184,8 +184,10 @@ arithmetic only where the gate says you may.** Two levers here are bit-identical
 8 heads / 4 KV heads, head_dim 96   sliding_window 32   conv_L_cache 3
 10 conv layers + 7 attention layers        ~106.2 M params
 downsample front end: 3x [256,1,3,3] + 2x [256,256,1,1] convs, lin_out [768, 4096, 1]
-   (4096 = 4 x 256 frame concat -> the encoder emits 25 tokens per second of audio)
-projector: 3 x 768->768, then into the 2048-wide backbone
+   (4096 = 16 mel bins x 256 channels after 8x down on both axes -> 12.5 tokens per second
+   of audio; measured with HF, plan section 18. An earlier version said "4-frame concat, 25/s".)
+projector: LayerNorm(768) -> Linear 768->2048 -> GELU -> Linear 2048->2048 (was mis-stated
+   here as "3 x 768->768")
 mel front end: 16 kHz, n_mels 128, n_fft 400, win 400, hop 160, hann periodic, center false,
    power 2.0, slaney mel + slaney norm, f0/f8k, log10 with floor -12, affine (x-4)/4
 ```
@@ -205,13 +207,13 @@ mel front end: 16 kHz, n_mels 128, n_fft 400, win 400, hop 160, hann periodic, c
 
 ### 4.3 Cost, derived from bytes
 
-119 MB of weights per encoder frame × 100 frames/s = **~11.9 GB per second of audio**, i.e.
-**0.7–1.0 s of GPU per second of audio** at 11–17 GB/s — the encoder is roughly realtime on this
-board and is *not* a rounding error in an audio deployment. For comparison the backbone costs
-25 tokens per second of audio × ~98 ms/token of sequential prefill ≈ **2.4 s per second of
-audio**. Both numbers are byte/rate derivations, flagged as such: the encoder is unported, and
-the backbone figure is the measured per-step cost applied to the derived token rate (25/s from
-the 4-frame concat above).
+CORRECTED (run #303). The encoder runs once per audio TOKEN, 12.5 per second, batched, not
+once per mel frame: ~146 M MAC per token (17 layers + downsampler + projector) is ~1.9 GMAC per
+second of audio, **~0.06 s** at the measured 30 GMAC/s batched rate (estimate; the encoder is
+unported). The backbone costs 12.5 prefill tokens per second of audio: 1.23 s sequential at
+~98 ms/token, or 0.56–0.61 s batched (18.4 GMAC at 30–33 GMAC/s). The earlier text here
+(119 MB per frame x 100 frames/s, and 25 tokens/s from a "4-frame concat") misread the
+downsampler.
 
 That ordering is the port's decision input: **the backbone prefill dominates audio latency, the
 encoder is second, and the mel front end (a few ms per 5 s of audio) is free.** Anything that

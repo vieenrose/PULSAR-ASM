@@ -67,11 +67,12 @@ floors (max(bytes/17 GB/s, MACs/236 GFMA/s), plan §2/§13): the encoder is comp
 at **10–20 ms per 0.96 s chunk**, the depth head ~13 ms minimum / 25–40 ms realistic per
 frame, the codec transformer 11.6 ms minimum / 25–50 ms realistic — 4.3 ms was bandwidth
 alone and needs an unachievable 1100 GFLOP/s. The backbone prefill still dominates an
-audio query (25 tokens/s × sequential prefill ≈ 2.4 s per second of audio) and the mel
-front end is free. **The active target is speech-in/text-out realtime** (plan §14):
-prefill needs ≥43.2 GMAC/s of audio-second; the banked CT=4 batched prefill delivers
-29–32 GMAC/s (bit-exact at T=24), putting the board at 0.53× realtime with ×2.6 to go —
-the remainder identified as the instruction-stall gap under a ~75 GMAC/s issue bound.
+audio query and the mel front end is free. **The active target is speech-in/text-out
+realtime** (plan §14–18). The encoder emits **12.5 tokens per second of audio** (measured
+with HF; the earlier "25/s" misread the downsampler, plan §18), so prefill is 18.4 GMAC
+per audio-second. At the measured batched rates (30–33 GMAC/s, bit-exact) the budget is
+prefill 0.56–0.61 s + encoder ~0.06 s (estimate) + text decode 0.31–0.44 s ≈ **0.9–1.07×
+realtime: borderline, not yet demonstrated end to end**.
 
 ## What makes the port mechanical
 
