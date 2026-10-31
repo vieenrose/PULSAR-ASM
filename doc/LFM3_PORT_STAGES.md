@@ -1149,3 +1149,43 @@ kernels: Q8 GEMMs for the linears (existing batched H2 structure), a vectorized
 depthwise conv and attention, rope tables computed once, and weights kept as
 int8 on the GPU. The C file is the correctness oracle for that port, gated per stage
 as above.
+
+### 22. Encoder GEMM on the Nano, fp32 activations: 10 GMAC/s, 2.3x over the linears' budget (run #307)
+
+`pulsar_arm/asm/bench/bench_enc_gemm.cu` includes the shipped `lfm3_nanode.cu` with its
+`main` renamed, so it times the engine's kernels, not copies. T=50 positions (4 s clip),
+fp32 activations (the spec is fp32), min of 5 runs, Nano, nonzero outputs and a
+120 GMAC/s gate.
+
+| encoder linear | per-position `q8_partial<float>` | batched `q8_prefill_h2<float,ARM5,GRP2>` |
+|---|---|---|
+| in_proj 2304x768 | 6.2 GMAC/s | 4.8 |
+| out_proj 768x768 | 3.8 | 4.8 |
+| w1 1792x768 | 9.2 | 6.4 |
+| w2 768x1792 | 9.1 | 6.6 |
+| lin_out 768x4096 | 15.9 | 3.9 |
+| proj1 2048x768 | 10.7 | 6.4 |
+| proj2 2048x2048 | 15.8 | 3.9 |
+| **sum** | **10.4** | **4.6** |
+
+Both arms agree bit-for-bit on every shape (max rel 0), so the batched f32 arm is correct
+but slower.
+
+Two things this changes:
+1. **The linears alone need 1.45 GMAC per audio second** (116 MMAC per token x 12.5 tokens/s:
+   17 layers x ~6.3 MMAC + lin_out + projector). At 10.4 GMAC/s that is **0.14 s of GPU per
+   audio second**, against the 0.06 s budget: **2.3x short before the convolutions and
+   attention are counted.**
+2. **The fp32-activation path is not the answer.** The 30 GMAC/s the engine reached in
+   section 14 used half2 arithmetic (bf16 activations, fp16 products), which is faster but
+   not the spec's fp32 math. Using it for the encoder needs a tolerance gate and a
+   disclosed divergence, as the research brief said.
+
+Also found on the way: the batched f32 arm at GRP=8 is refused at launch ("too many
+resources", more than 255 registers per thread); GRP=2 is the largest that launches. Its
+first bench run looked like a plausible 800 GMAC/s, because a `cudaGetLastError` read had
+overwritten the launch error. The bench now checks the launch error directly.
+
+Decision for the user (not made here): either accept the half2 GEMM for the encoder with a
+tolerance gate and a disclosed divergence, or keep fp32 and find about 2.3x on the fp32 GEMM
+first.
