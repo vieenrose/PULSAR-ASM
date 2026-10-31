@@ -1271,6 +1271,10 @@ static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
 // acc interleaved by block parity, halving BOTH dependency depths. ARM=1 changes
 // the summation parenthesization, so the harness pairs it against ITS OWN T=1
 // launches (batch-correctness) and prints the ARM0-vs-ARM1 relative delta.
+// ARM=8 phase profile: summed SM cycles over warps (lane 0 of each warp adds).
+// [0] staging  [1] barrier after staging  [2] b-loops  [3] reductions
+// [4] end-of-t0 barrier  [5] whole kernel  [6] warps counted
+__device__ unsigned long long g_pf_prof[8];
 template <typename TX, int CT, bool H2, int ARM, int RB = 2, int GRP = 4>
 __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restrict__ s,
                            const TX* __restrict__ xall, float* __restrict__ part,
@@ -1285,9 +1289,12 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
   const int koff = chunk * KCHUNK, NT = blockDim.x, tid = threadIdx.x;
   const int lane = tid & 31, wid = tid >> 5, WPB = NT >> 5, GR = R / WPB, base = rowblk * R;
   const __half2 off = __floats2half2_rn(1152.f, 1152.f);
+  long long pf_t = (ARM == 8) ? clock64() : 0, pf_k0 = pf_t;
+  long long pf_acc[5] = {0, 0, 0, 0, 0};
+#define PF_MARK(i) do { if (ARM == 8) { const long long _n = clock64(); pf_acc[i] += _n - pf_t; pf_t = _n; } } while (0)
   for (int t0 = 0; t0 < T; t0 += CT) {
     int ct = T - t0; if (ct > CT) ct = CT;
-    if (H2) {
+    if (H2 && !(ARM == 7 && (GRP & 1))) {   // ARM7 ABL&1: skip x staging (timing only)
       for (int i = tid; i < ct * nb * 16; i += NT) {
         const int c = i / (nb * 16), rem = i % (nb * 16);
         const int b = rem / 16, k = rem % 16;
@@ -1305,10 +1312,13 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
           lfm_stage(xall[((size_t)tt) * K + koff + (size_t)b * 32 + j]);
       }
     }
+    PF_MARK(0);
     __syncthreads();
-    float acc5[GRP][CT];
+    PF_MARK(1);
+    constexpr int G5 = (ARM == 5) ? GRP : 1;   // ARM7 reuses GRP as a mask (may be 0)
+    float acc5[G5][CT];
 #pragma unroll
-    for (int gg = 0; gg < GRP; gg++)
+    for (int gg = 0; gg < G5; gg++)
 #pragma unroll
       for (int cc = 0; cc < CT; cc++) acc5[gg][cc] = 0.f;
     if (ARM == 5) {
@@ -1400,6 +1410,279 @@ __global__ void q8_prefill_h2(const int8_t* __restrict__ q, const float* __restr
 #pragma unroll
         for (int c = 0; c < CT; c++) {
           float v = (row < N) ? acc5[g][c] : 0.f;
+          for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+          if (lane == 0 && row < N && t0 + c < T)
+            part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
+        }
+      }
+      continue;
+    }
+    if (ARM == 10 && H2) {
+      // ARM9 row blocking (fewer shared loads per MAC) + software pipelining of
+      // ALL global loads (weights AND scales) one iteration ahead over a
+      // flattened (row-group, b) space, so the prefetch crosses row boundaries
+      // (at K=2048 a row has only nb/32 = 2 b-iterations per lane).
+      // ABL26 showed two co-binders: with only global loads removed (ABL18)
+      // shared loads hold it at ~35 GMAC/s; with only shared reads removed
+      // (ABL8) global latency holds it at ~38; with both removed it runs at
+      // 62-70. ARM2-6 and ARM9 each attacked one binder. This arm attacks both.
+      // Per (row,c): k-chain and ascending-b fmaf order are ARM0's -> bit-exact
+      // by construction; invalid lanes/rows skip compute (acc untouched),
+      // exactly as ARM0's loop bounds skip them.
+      constexpr int RBX = (GRP < 1) ? 1 : GRP;
+      const int nbj = (nb + 31) / 32;               // b-iterations per row-group
+      const int ngr = (GR + RBX - 1) / RBX;         // row-groups per warp
+      const int nit = ngr * nbj;
+      const size_t cs = (size_t)nb * 17;
+      uint32_t wn[RBX][8]; float sn[RBX];
+      auto load_it = [&](int it, uint32_t (&w)[RBX][8], float (&sv)[RBX]) {
+        const int g0 = (it / nbj) * RBX, b = (it % nbj) * 32 + lane;
+#pragma unroll
+        for (int rr = 0; rr < RBX; rr++) {
+          const int row = base + wid + (g0 + rr) * WPB;
+          if (g0 + rr < GR && row < N && b < nb) {
+            const int8_t* qp = q + (size_t)row * K + koff + (size_t)b * Q8_BLK;
+            const int4 a0 = *reinterpret_cast<const int4*>(qp);
+            const int4 a1 = *reinterpret_cast<const int4*>(qp + 16);
+            w[rr][0]=a0.x; w[rr][1]=a0.y; w[rr][2]=a0.z; w[rr][3]=a0.w;
+            w[rr][4]=a1.x; w[rr][5]=a1.y; w[rr][6]=a1.z; w[rr][7]=a1.w;
+            sv[rr] = s[(size_t)row * (K / Q8_BLK) + (size_t)chunk * nb + b];
+          } else {
+#pragma unroll
+            for (int k = 0; k < 8; k++) w[rr][k] = 0x80808080u;
+            sv[rr] = 0.f;
+          }
+        }
+      };
+      float accx[RBX][CT];
+#pragma unroll
+      for (int rr = 0; rr < RBX; rr++)
+#pragma unroll
+        for (int c = 0; c < CT; c++) accx[rr][c] = 0.f;
+      if (nit > 0) load_it(0, wn, sn);
+      for (int it = 0; it < nit; it++) {
+        uint32_t w[RBX][8]; float sv[RBX];
+#pragma unroll
+        for (int rr = 0; rr < RBX; rr++) {
+          sv[rr] = sn[rr];
+#pragma unroll
+          for (int k = 0; k < 8; k++) w[rr][k] = wn[rr][k];
+        }
+        if (it + 1 < nit) load_it(it + 1, wn, sn);   // issue next loads BEFORE compute
+        const int g0 = (it / nbj) * RBX, j = it % nbj, b = j * 32 + lane;
+        if (b < nb) {
+          __half2 h[RBX][CT];
+#pragma unroll
+          for (int rr = 0; rr < RBX; rr++)
+#pragma unroll
+            for (int c = 0; c < CT; c++) h[rr][c] = __floats2half2_rn(0.f, 0.f);
+          const __half2* xb = xh + (size_t)b * 17;
+#pragma unroll
+          for (int k = 0; k < 8; k++) {
+            __half2 cl[RBX], ch[RBX];
+#pragma unroll
+            for (int rr = 0; rr < RBX; rr++) {
+              const uint32_t u = w[rr][k] ^ 0x80808080u;
+              const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+              const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+              cl[rr] = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+              ch[rr] = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+            }
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              const __half2 x0 = xb[(size_t)c * cs + 2 * k];
+              const __half2 x1 = xb[(size_t)c * cs + 2 * k + 1];
+#pragma unroll
+              for (int rr = 0; rr < RBX; rr++) {
+                h[rr][c] = __hfma2(cl[rr], x0, h[rr][c]);
+                h[rr][c] = __hfma2(ch[rr], x1, h[rr][c]);
+              }
+            }
+          }
+#pragma unroll
+          for (int rr = 0; rr < RBX; rr++) {
+            const int row = base + wid + (g0 + rr) * WPB;
+            if (g0 + rr < GR && row < N) {
+#pragma unroll
+              for (int c = 0; c < CT; c++) {
+                const float2 f = __half22float2(h[rr][c]);
+                accx[rr][c] = __fmaf_rn(sv[rr], f.x + f.y, accx[rr][c]);
+              }
+            }
+          }
+        }
+        if (j == nbj - 1) {                          // row-group done: reduce + store
+#pragma unroll
+          for (int rr = 0; rr < RBX; rr++) {
+            const int row = base + wid + (g0 + rr) * WPB;
+            const bool ok = (g0 + rr < GR) && row < N;
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              float v = ok ? accx[rr][c] : 0.f;
+              for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+              if (lane == 0 && ok && t0 + c < T)
+                part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
+              accx[rr][c] = 0.f;
+            }
+          }
+        }
+      }
+      continue;
+    }
+    if (ARM == 9 && H2) {
+      // Row-blocked H2 (RB = GRP slot, rows per warp step). The single-SM
+      // ceiling for "one shared x load per HFMA2" is ~58 GMAC/s (754 MB of
+      // shared traffic for w1 at 128 B/clk), below the ~79 the realtime budget
+      // needs, so x must be reused from registers across rows. Weights for each
+      // of the RB rows are loaded once per b and converted once per k (shared
+      // across all CT positions); each x half2 read from shared feeds RB HFMA2.
+      // Per (row,c) the HFMA2 order is ARM0's (k = 0..7, lo then hi) -> bit-exact
+      // by construction. ARM3 (the previous row-blocked try) reconverted per
+      // byte and per position; that is what made it 4.5x slower.
+      constexpr int RB9 = (GRP < 1) ? 1 : GRP;
+      for (int g0 = 0; g0 < GR; g0 += RB9) {
+        float acc9[RB9][CT];
+        int rowv[RB9]; bool act[RB9];
+#pragma unroll
+        for (int rr = 0; rr < RB9; rr++) {
+          rowv[rr] = base + wid + (g0 + rr) * WPB;
+          act[rr] = (g0 + rr < GR) && rowv[rr] < N;
+#pragma unroll
+          for (int c = 0; c < CT; c++) acc9[rr][c] = 0.f;
+        }
+        for (int b = lane; b < nb; b += 32) {
+          uint32_t w[RB9][8];
+#pragma unroll
+          for (int rr = 0; rr < RB9; rr++) {
+            if (act[rr]) {
+              const int8_t* qp = q + (size_t)rowv[rr] * K + koff + (size_t)b * Q8_BLK;
+              const int4 a0 = *reinterpret_cast<const int4*>(qp);
+              const int4 a1 = *reinterpret_cast<const int4*>(qp + 16);
+              w[rr][0]=a0.x; w[rr][1]=a0.y; w[rr][2]=a0.z; w[rr][3]=a0.w;
+              w[rr][4]=a1.x; w[rr][5]=a1.y; w[rr][6]=a1.z; w[rr][7]=a1.w;
+            } else {
+#pragma unroll
+              for (int k = 0; k < 8; k++) w[rr][k] = 0x80808080u;   // decodes to 0
+            }
+          }
+          __half2 h[RB9][CT];
+#pragma unroll
+          for (int rr = 0; rr < RB9; rr++)
+#pragma unroll
+            for (int c = 0; c < CT; c++) h[rr][c] = __floats2half2_rn(0.f, 0.f);
+          const __half2* xb = xh + (size_t)b * 17;
+          const size_t cs = (size_t)nb * 17;
+#pragma unroll
+          for (int k = 0; k < 8; k++) {
+            __half2 cl[RB9], ch[RB9];
+#pragma unroll
+            for (int rr = 0; rr < RB9; rr++) {
+              const uint32_t u = w[rr][k] ^ 0x80808080u;
+              const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+              const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+              cl[rr] = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+              ch[rr] = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+            }
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              const __half2 x0 = xb[(size_t)c * cs + 2 * k];
+              const __half2 x1 = xb[(size_t)c * cs + 2 * k + 1];
+#pragma unroll
+              for (int rr = 0; rr < RB9; rr++) {
+                h[rr][c] = __hfma2(cl[rr], x0, h[rr][c]);
+                h[rr][c] = __hfma2(ch[rr], x1, h[rr][c]);
+              }
+            }
+          }
+#pragma unroll
+          for (int rr = 0; rr < RB9; rr++) {
+            if (!act[rr]) continue;
+            const float sb = s[(size_t)rowv[rr] * (K / Q8_BLK) + (size_t)chunk * nb + b];
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              const float2 f = __half22float2(h[rr][c]);
+              acc9[rr][c] = __fmaf_rn(sb, f.x + f.y, acc9[rr][c]);
+            }
+          }
+        }
+#pragma unroll
+        for (int rr = 0; rr < RB9; rr++) {
+#pragma unroll
+          for (int c = 0; c < CT; c++) {
+            float v = act[rr] ? acc9[rr][c] : 0.f;
+            for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+            if (lane == 0 && act[rr] && t0 + c < T)
+              part[(((size_t)(t0 + c)) * N + rowv[rr]) * nchunk + chunk] = v;
+          }
+        }
+      }
+      continue;
+    }
+    if (ARM == 7 && H2) {
+      // TIMING-ONLY ABLATION of ARM0 (outputs are wrong for ABL != 0 and are
+      // judged only by the nonzero/peak plausibility gate). GRP slot = mask:
+      //   1 skip x staging   2 no weight global loads (w from b)
+      //   4 no int8->half2 conversion   8 no shared x reads (x from a register)
+      //   16 no scale global load (sb = 1)
+      // ABL=0 is the control and must be bit-exact vs ARM0.
+      constexpr int ABL = GRP;
+      for (int g = 0; g < GR; g++) {
+        const int r = wid + g * WPB, row = base + r;
+        float acc7[CT];
+#pragma unroll
+        for (int c = 0; c < CT; c++) acc7[c] = 0.f;
+        if (row < N) {
+          const int8_t* qr = q + (size_t)row * K + koff;
+          const float* sr = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb;
+          // ABL&8 replacement x: DISTINCT per position c (and per lo/hi) so the
+          // CT chains cannot be merged by the compiler. The first version used
+          // one xreg for every c: identical chains -> CSE -> ~4x less HFMA2
+          // work, which inflated ABL8/ABL26 (run #301 correction).
+          __half2 xrc[CT][2];
+#pragma unroll
+          for (int c = 0; c < CT; c++) { xrc[c][0] = xh[lane + 3 * c]; xrc[c][1] = xh[lane + 3 * c + 1]; }
+          for (int b = lane; b < nb; b += 32) {
+            uint32_t w[8];
+            if (ABL & 2) {
+#pragma unroll
+              for (int k = 0; k < 8; k++) w[k] = 0x01020304u * (uint32_t)(b + k + row);
+            } else {
+              const int4 a0 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK);
+              const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
+              w[0]=a0.x; w[1]=a0.y; w[2]=a0.z; w[3]=a0.w; w[4]=a1.x; w[5]=a1.y; w[6]=a1.z; w[7]=a1.w;
+            }
+#pragma unroll
+            for (int c = 0; c < CT; c++) {
+              const __half2* xb2 = xh + ((size_t)c * nb + (size_t)b) * 17;
+              __half2 h2 = __floats2half2_rn(0.f, 0.f);
+#pragma unroll
+              for (int k = 0; k < 8; k++) {
+                __half2 cl, ch;
+                if (ABL & 4) {
+                  const uint32_t lo = w[k], hi = w[k] >> 1;
+                  cl = *reinterpret_cast<const __half2*>(&lo);
+                  ch = *reinterpret_cast<const __half2*>(&hi);
+                } else {
+                  const uint32_t u = w[k] ^ 0x80808080u;
+                  const uint32_t lo = __byte_perm(u, 0x64646464u, 0x4140);
+                  const uint32_t hi = __byte_perm(u, 0x64646464u, 0x4342);
+                  cl = __hsub2(*reinterpret_cast<const __half2*>(&lo), off);
+                  ch = __hsub2(*reinterpret_cast<const __half2*>(&hi), off);
+                }
+                const __half2 x0 = (ABL & 8) ? xrc[c][0] : xb2[2 * k];
+                const __half2 x1 = (ABL & 8) ? xrc[c][1] : xb2[2 * k + 1];
+                h2 = __hfma2(cl, x0, h2);
+                h2 = __hfma2(ch, x1, h2);
+              }
+              const float2 f = __half22float2(h2);
+              const float sb7 = (ABL & 16) ? 1.0f : sr[b];   // 16: no scale global load
+              acc7[c] = __fmaf_rn(sb7, f.x + f.y, acc7[c]);
+            }
+          }
+        }
+#pragma unroll
+        for (int c = 0; c < CT; c++) {
+          float v = (row < N) ? acc7[c] : 0.f;
           for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
           if (lane == 0 && row < N && t0 + c < T)
             part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
@@ -1740,17 +2023,26 @@ if (H2) {
           }
         }
       }
+      PF_MARK(2);
 #pragma unroll
       for (int c = 0; c < CT; c++) {
         float v = (row < N) ? acc[c][0] : 0.f;
-        if (ARM && row < N) v += acc[c][1];
+        if (ARM == 1 && row < N) v += acc[c][1];   // ARM8 must stay ARM0-exact
         for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
         if (lane == 0 && row < N && t0 + c < T)
           part[(((size_t)(t0 + c)) * N + row) * nchunk + chunk] = v;
       }
+      PF_MARK(3);
     }
     __syncthreads();
+    PF_MARK(4);
   }
+  if (ARM == 8 && lane == 0) {
+    for (int i = 0; i < 5; i++) atomicAdd(&g_pf_prof[i], (unsigned long long)pf_acc[i]);
+    atomicAdd(&g_pf_prof[5], (unsigned long long)(clock64() - pf_k0));
+    atomicAdd(&g_pf_prof[6], 1ull);
+  }
+#undef PF_MARK
 }
 
 
@@ -2020,6 +2312,41 @@ static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const fl
     if (ct == 2) PF(2, true, 6); else PF(4, true, 6);
     return;
   }
+  if (arm == 8 && h2) {
+    if (ct == 2) PF(2, true, 8); else PF(4, true, 8);
+    return;
+  }
+  if (arm == 10 && h2) {
+#define PF10(CT_, RB_) q8_prefill_h2<bf16, CT_, true, 10, 2, RB_><<<nblk, TPB, shm>>>(q, s, x, part, N, K, KC, R, nb, T)
+    static int rbx = -1;
+    if (rbx < 0) rbx = getenv("LFM_PF_RB9") ? atoi(getenv("LFM_PF_RB9")) : 2;
+    if (ct == 2) { if (rbx == 1) PF10(2,1); else if (rbx == 2) PF10(2,2); else { printf("LFM_PF_RB9=%d unsupported for ARM10 (1|2)\n", rbx); exit(2); } }
+    else         { if (rbx == 1) PF10(4,1); else if (rbx == 2) PF10(4,2); else { printf("LFM_PF_RB9=%d unsupported for ARM10 (1|2)\n", rbx); exit(2); } }
+#undef PF10
+    return;
+  }
+  if (arm == 9 && h2) {
+#define PF9(CT_, RB_) q8_prefill_h2<bf16, CT_, true, 9, 2, RB_><<<nblk, TPB, shm>>>(q, s, x, part, N, K, KC, R, nb, T)
+    static int rb9 = -1;
+    if (rb9 < 0) rb9 = getenv("LFM_PF_RB9") ? atoi(getenv("LFM_PF_RB9")) : 2;
+    if (ct == 2) { if (rb9 == 1) PF9(2,1); else if (rb9 == 2) PF9(2,2); else if (rb9 == 4) PF9(2,4); else { printf("LFM_PF_RB9=%d unsupported (1|2|4)\n", rb9); exit(2); } }
+    else         { if (rb9 == 1) PF9(4,1); else if (rb9 == 2) PF9(4,2); else if (rb9 == 4) PF9(4,4); else { printf("LFM_PF_RB9=%d unsupported (1|2|4)\n", rb9); exit(2); } }
+#undef PF9
+    return;
+  }
+  if (arm == 7 && h2) {
+    static int abl = -1;
+    if (abl < 0) abl = getenv("LFM_PF_ABL") ? atoi(getenv("LFM_PF_ABL")) : 0;
+#define PF7(M_) q8_prefill_h2<bf16, 4, true, 7, 2, M_><<<nblk, TPB, shm>>>(q, s, x, part, N, K, KC, R, nb, T)
+    switch (abl) {
+      case 0: PF7(0); break;  case 1: PF7(1); break;  case 2: PF7(2); break;
+      case 4: PF7(4); break;  case 8: PF7(8); break;  case 15: PF7(15); break;
+      case 16: PF7(16); break; case 18: PF7(18); break; case 26: PF7(26); break;
+      default: printf("LFM_PF_ABL=%d unsupported (0|1|2|4|8|15|16|18|26)\n", abl); exit(2);
+    }
+#undef PF7
+    return;
+  }
   if (arm >= 3) { arm = 0; }   // f32 path: these arms not instantiated
   if (h2) { if (ct == 2) { if (arm == 2) PF(2, true, 2); else if (arm) PF(2, true, 1); else PF(2, true, 0); }
             else if (ct == 4) { if (arm == 2) PF(4, true, 2); else if (arm) PF(4, true, 1); else PF(4, true, 0); }
@@ -2043,7 +2370,8 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
     pfCT = getenv("LFM_PF_CT") ? atoi(getenv("LFM_PF_CT")) : 2;
     pfARM = getenv("LFM_PF_ARM") ? atoi(getenv("LFM_PF_ARM")) : 0;
     if (pfCT != 2 && pfCT != 4 && pfCT != 6 && pfCT != 8) { printf("LFM_PF_CT=%d unsupported (2|4|6|8) -- using 2\n", pfCT); pfCT = 2; }
-    if (pfARM < 0 || pfARM > 6) { printf("LFM_PF_ARM=%d unsupported (0..6) -- using 0\n", pfARM); pfARM = 0; }
+    if (pfARM < 0 || pfARM > 10) { printf("LFM_PF_ARM=%d unsupported (0..10)\n", pfARM); exit(2); }
+    if (pfARM == 7 && pfCT != 4) { printf("LFM_PF_ARM=7 is instantiated for CT=4 only\n"); exit(2); }
     pfRPB = getenv("LFM_PF_RPB") ? atoi(getenv("LFM_PF_RPB")) : 4;
     if (pfRPB != 1 && pfRPB != 2 && pfRPB != 4 && pfRPB != 8) { printf("LFM_PF_RPB=%d unsupported (1|2|4|8) -- using 4\n", pfRPB); pfRPB = 4; }
     pfRB = getenv("LFM_PF_RB") ? atoi(getenv("LFM_PF_RB")) : 2;
@@ -2097,6 +2425,7 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   std::vector<float> a((size_t)T * N * nch);
   printf("cp-seq=%s\n", cudaGetErrorString(cudaMemcpy(a.data(), seq, a.size() * 4, cudaMemcpyDeviceToHost))); fflush(stdout);
   printf("seq[0]=%.9g (expect H2 ~-0.10976)\n", a[0]); fflush(stdout);
+  if (ARM == 8) { unsigned long long z[8] = {0}; cudaMemcpyToSymbol(g_pf_prof, z, sizeof z); }
   cudaEventRecord(ea);
   pf_launch(CT, ARM, h2, RB, e->dq, e->ds, (const bf16*)xd, bat,
             N, K, KC, R, nb, T, nblk, TPB, shm);
@@ -2104,6 +2433,61 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   cudaEventRecord(eb); cudaEventSynchronize(eb);
   printf("bat-sync=%s\n", cudaGetErrorString(cudaGetLastError())); fflush(stdout);
   float ms2 = 0; cudaEventElapsedTime(&ms2, ea, eb);
+  {
+    // Occupancy as the runtime computes it for exactly this launch config.
+    static int once = 0;
+    if (!once && h2) {
+      once = 1;
+      cudaDeviceProp dp; cudaGetDeviceProperties(&dp, 0);
+      int nb0 = 0, nb8 = 0;
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb0, q8_prefill_h2<bf16, 4, true, 0>, TPB, shm);
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb8, q8_prefill_h2<bf16, 4, true, 8>, TPB, shm);
+      cudaFuncAttributes fa; cudaFuncGetAttributes(&fa, q8_prefill_h2<bf16, 4, true, 0>);
+      printf("occupancy: SMs=%d regs/SM=%d shm/SM=%zu shm/block(max)=%zu maxThr/SM=%d | "
+             "ARM0 CT4 H2: regs=%d static_shm=%zu dyn_shm=%zu TPB=%d -> %d blocks/SM | ARM8 -> %d blocks/SM\n",
+             dp.multiProcessorCount, dp.regsPerMultiprocessor, dp.sharedMemPerMultiprocessor,
+             dp.sharedMemPerBlock, dp.maxThreadsPerMultiProcessor,
+             fa.numRegs, fa.sharedSizeBytes, shm, TPB, nb0, nb8);
+      fflush(stdout);
+    }
+  }
+  if (ARM == 8 && h2) {
+    unsigned long long pr[8] = {0};
+    cudaMemcpyFromSymbol(pr, g_pf_prof, sizeof pr);
+    const double tot = (double)pr[5], w = pr[6] ? (double)pr[6] : 1.0;
+    const char* nm[5] = {"staging", "barrier1", "b-loops", "reduce", "barrier2"};
+    printf("profile %s T=%d: %llu warps, avg %.0f cyc/warp (%.2f ms at 904 MHz)",
+           e->name.c_str(), T, pr[6], tot / w, tot / w / 904e3);
+    for (int i = 0; i < 5; i++) printf("  %s %.1f%%", nm[i], tot ? 100.0 * pr[i] / tot : 0.0);
+    printf("\n"); fflush(stdout);
+  }
+  // LFM_PF_REPS=n: steady-state timing. The single launch above can start at a
+  // low DVFS clock (sm_clock: first ~0.4 s of load averages 348 MHz vs 904
+  // steady; the harness idles the GPU for seconds of host compares between
+  // launches). Run n back-to-back launches into a scratch buffer and time the
+  // second half only. Outputs/bit-exactness still come from the single launch.
+  {
+    static int reps = -1;
+    if (reps < 0) { reps = getenv("LFM_PF_REPS") ? atoi(getenv("LFM_PF_REPS")) : 0; }
+    if (reps >= 2) {
+      float* scr = nullptr; cudaMalloc(&scr, (size_t)T * N * nch * 4);
+      for (int i = 0; i < reps / 2; i++)
+        pf_launch(CT, ARM, h2, RB, e->dq, e->ds, (const bf16*)xd, scr, N, K, KC, R, nb, T, nblk, TPB, shm);
+      cudaEventRecord(ea);
+      const int nt = reps - reps / 2;
+      for (int i = 0; i < nt; i++)
+        pf_launch(CT, ARM, h2, RB, e->dq, e->ds, (const bf16*)xd, scr, N, K, KC, R, nb, T, nblk, TPB, shm);
+      cudaEventRecord(eb); cudaEventSynchronize(eb);
+      cudaError_t we = cudaGetLastError();
+      float msw = 0; cudaEventElapsedTime(&msw, ea, eb); msw /= nt;
+      const double gw = (double)T * N * K / (msw * 1e-3) / 1e9;
+      printf("warm %s H2=%d CT=%d ARM=%d: %.3f ms/launch over %d (%.1f GMAC/s)%s%s\n",
+             e->name.c_str(), h2, CT, ARM, msw, nt, gw,
+             we ? " LAUNCH ERROR " : "", we ? cudaGetErrorString(we) : "");
+      fflush(stdout);
+      cudaFree(scr);
+    }
+  }
   std::vector<float> b(a.size(), -999.f);
   printf("cp-bat=%s\n", cudaGetErrorString(cudaMemcpy(b.data(), bat, b.size() * 4, cudaMemcpyDeviceToHost))); fflush(stdout);
   printf("bat[0]=%.9g\n", b[0]); fflush(stdout);
@@ -2111,7 +2495,10 @@ static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
     size_t nz = 0; for (size_t i = 0; i < a.size(); i++) nz += (a[i] != 0.f) || (b[i] != 0.f);
     if (nz == 0) { printf("PLAUSIBILITY FAIL: %s all-zero output (launch skipped or refused)\n", e->name.c_str()); fflush(stdout); return 1; }
     const double gmac = (double)T * N * K / (ms2 * 1e-3) / 1e9;
-    if (gmac > 236.0) { printf("PLAUSIBILITY FAIL: %s %.0f GMAC/s exceeds the 236 GFLOP/s peak\n", e->name.c_str(), gmac); fflush(stdout); return 1; }
+    // Ceiling MEASURED on this board (bench/peak_rates.cu): HFMA2 105.8 GMAC/s,
+    // FFMA 82 GFMA/s (datasheet 236/118 is not reachable: HFMA2 issues at ~2
+    // warp-instr/clk on the single GM20B SM). Anything above 120 is a bug.
+    if (gmac > 120.0) { printf("PLAUSIBILITY FAIL: %s %.0f GMAC/s exceeds the measured ~106 GMAC/s HFMA2 ceiling (gate 120)\n", e->name.c_str(), gmac); fflush(stdout); return 1; }
     printf("plausible: %s nonzero=%zu/%zu  bat %.1f GMAC/s\n", e->name.c_str(), nz, a.size(), gmac); fflush(stdout);
   }
   long bad = 0; for (size_t i = 0; i < a.size() && bad < 5; i++) if (memcmp(&a[i], &b[i], 4)) { bad++; if (bad == 1) printf("first diff at %zu: seq=%.9g bat=%.9g\n", i, a[i], b[i]); }

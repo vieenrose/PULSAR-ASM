@@ -940,3 +940,73 @@ bottleneck it removed is not the engine's.
 Verdict: refuted in the engine. The shipped structure (ARM0, CT=4) stays.
 The binder is still unidentified; this run removes "uncoalesced weight loads"
 from the candidate list for this kernel.
+
+### 17. Binder search, measured (runs #301-#302): two co-binders; corrected ceilings
+
+All numbers: T=24 (one ASR chunk), H2, warm steady-state (`LFM_PF_REPS=10`,
+second half of back-to-back launches), same session, nonzero outputs.
+
+**Board facts that change the ceilings.** The Nano GPU is **one** Maxwell SM
+(`multiProcessorCount=1`; the TX1 has two). `sm_clock.cu` (clock64 vs
+cudaEvent) shows ~904 MHz sustained under load, after a ~0.4 s DVFS ramp
+(first 390 ms averaged 348 MHz); warm vs cold harness timings agree within 2%,
+so earlier rates were not taken at low clock. The occupancy API gives the
+shipped-structure CT=4 H2 kernel **2 blocks/SM = 16 warps (25%)**.
+`bench/peak_rates.cu` measured ceilings: HFMA2 **105.8 GMAC/s** (45% of the
+236 datasheet; ~2 warp-HFMA2/clk), FFMA 82 GFMA/s, LDS.32 100.5 GB/s, and the
+engine's exact chain shape (4 chains x 16 deep HFMA2, operands in registers)
+**97 GMAC/s at 16 warps**. The plausibility gate is tightened from 236 to
+**120 GMAC/s** accordingly.
+
+**SASS of the b-loop (ARM0 CT=4):** 212 instructions per iteration (one 32-weight
+block x 4 positions per lane): 64 LDS, 64 HFMA2, 16 PRMT, 16 HADD2, 8 LOP, 8 F2F,
+3 LDG, rest overhead. Conversions are hoisted across positions. (Two parse
+traps: dual-issue pairs print with `{` and end in `}` not `;`.)
+
+**Phase profile (ARM=8, clock64 per warp, bit-exact vs ARM0):** b-loops 72-81%,
+reductions 11-20%, x staging ~7%, barriers <1%. Wave arithmetic on the
+per-warp cycle counts reproduces every measured time (w1: 30 blocks / 2
+resident x 1.10 ms = 16.5 vs 16.7 measured).
+
+**Ablations (ARM=7, timing-only, ABL=0 control bit-exact vs ARM0):**
+
+| removed | embed | w2 | w1 | conv |
+|---|---|---|---|---|
+| nothing (control) | 29.9 | 32.6 | 29.9 | 29.9 |
+| weight global loads (2) | 32.4 | 28.6 | 31.9 | 30.2 |
+| scale global load (16) | 35.0 | 33.5 | 34.4 | 32.5 |
+| all global loads (18) | 35.3 | 32.5 | 34.5 | 32.7 |
+| shared x reads (8) | 38.5 | 33.7 | 37.4 | 36.1 |
+| **global AND shared (26)** | **54.1** | **57.5** | **53.0** | **50.6** |
+
+Two co-binders: each memory class alone, removed, gains 15-28%; both removed,
+1.8x. That explains why every single-lever arm failed. Correction: the first
+ABL8/26 build used one register x for all positions, letting the compiler merge
+the CT chains; with distinct per-position x (SASS-verified 64 HFMA2) ABL26 is
+1.8x, not the 2.2x first measured. ABL=4 (no conversion) is confounded
+(raw bits reinterpreted as half) and ABL=1 (no staging) faults; neither is used.
+
+**Arms built against this (all bit-exact vs ARM0, max rel 0):**
+
+| arm | design | embed | w2 | w1 | conv |
+|---|---|---|---|---|---|
+| ARM0 CT=4 | shipped structure | 29.8 | 32.5 | 29.8 | 29.8 |
+| ARM9 RB=1 | k-outer loop order | 32.7 | 30.4 | 32.4 | 30.6 |
+| ARM9 RB=2/4 | row blocking (1/2, 1/4 shared loads per MAC) | 27.9/29.0 | 31.7/32.8 | 27.8/28.8 | 27.8/28.8 |
+| **ARM10 RB=2** | row blocking + all global loads prefetched one iteration ahead across row boundaries | **31.7** | **35.5** | **31.6** | **31.4** |
+
+ARM10 RB=2 is the best bit-exact arm: **+6-9%** over CT=4. Neither fix alone
+(row blocking, prefetch) reaches the ablation's 1.8x, and combined they recover
+about a tenth of it. Not adopted into the engine (test-only, like CT=4).
+
+**Realtime assessment.** The target needs ~79 GMAC/s. The practical HFMA2
+ceiling is ~106, the engine's chain shape tops out at 97 with no memory, and
+the conversions, reductions and staging that a real kernel cannot drop leave
+~54 GMAC/s even with every global and shared load removed (ABL26). So **79 is
+above anything this kernel family has shown, even with its memory traffic
+deleted**. Speech-in/text-out realtime on this board is not reachable by
+GEMM tuning alone; at the best bit-exact arm (~32-35 GMAC/s) the budget is
+~0.56x. Getting further would need a different formulation (fewer
+non-HFMA2 instructions per MAC, e.g. dp4a-free int8 tricks are unavailable
+on sm_53) or less work (smaller/quantized-activation audio path), which are
+scope decisions, not tuning.
