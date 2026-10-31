@@ -1130,3 +1130,22 @@ at naive C speed is far too slow, so the C path is for gating only.
 Known simplifications (must be fixed before the engine uses it): weights are
 dequantized to fp32 (420 MB resident), the conv loops are naive, and the
 attention is not batched across heads.
+
+### 21. The C encoder on the Nano (run #306)
+
+`lfm3_enc.c` built with `gcc -O2 -std=c99 -Wall -Wextra` on the Nano (aarch64,
+gcc 8.4) and run on the same blob and input (T=400, 50 tokens):
+
+* **Agreement with x86:** bit-identical at the downsampler, layers and encoder
+  output; projector rms rel 9.6e-8. The CPU port is portable at the bit level.
+* **Time: 157 s** for 400 mel frames (4 s of audio), against 6.9 s on this x86 host.
+  That is about 0.04 GMAC/s of useful work, against the ~1.9 GMAC per audio-second
+  the encoder needs in the target. The naive reference is therefore ~200x too slow
+  for realtime on the Nano, as expected: naive conv loops, per-call Q8 dequantization,
+  RoPE with `pow` per element, no batching across heads.
+
+So the encoder cannot run as this reference. The next work is the engine's own
+kernels: Q8 GEMMs for the linears (existing batched H2 structure), a vectorized
+depthwise conv and attention, rope tables computed once, and weights kept as
+int8 on the GPU. The C file is the correctness oracle for that port, gated per stage
+as above.
