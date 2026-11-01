@@ -1189,3 +1189,92 @@ overwritten the launch error. The bench now checks the launch error directly.
 Decision for the user (not made here): either accept the half2 GEMM for the encoder with a
 tolerance gate and a disclosed divergence, or keep fp32 and find about 2.3x on the fp32 GEMM
 first.
+
+### 23. ASR_RT measured on the shipped engine: 1.87x, and where the 1.87x lives (run #308)
+
+`.auto/lfm3/measure_rt.sh` builds fresh from the tree, feeds a 60 s-speech workload
+(NPREF = 12.5 x SEC audio-embedding tokens as prompt steps, NGEN = 4 tok/s of text
+tokens as generation steps -- the aggressive end of the measured 2.85-4.0 tok/s), and
+prints the decomposition. Board clean: 0 spinners, MemAvailable 3295 MB, GPU at 922 MHz.
+
+| item | ms for 60 s of speech | per audio second | share |
+|---|---|---|---|
+| prefill, 750 audio tokens at T=1 | 78 141 | 1.30 s | 70% |
+| decode, 240 text tokens | 30 862 | 0.51 s | 28% |
+| mel front end (S2 gate, 55 ms/s) | 3 300 | 0.055 s | 3% |
+| encoder | not wired | — | — |
+| **ASR_RT (engine GPU only)** | **112 302** | | **1.872** |
+
+With the encoder added at the best measured rate (section 24, batched half2,
+0.085-0.092 s/audio-s) ASR_RT is ~1.95; at the fp32 rate ~2.03. **Realtime is 1.9x away
+and it is two terms, not a tuning gap.**
+
+**Prefill (70%) is bandwidth-bound by construction at T=1.** 104.2 ms/token against the
+1651 MB of layer weights streamed per token = 15.9 GB/s, 92% of the 17.3 GB/s this board
+achieves for the backbone. The non-GEMV kernels are 0.54% of kernel time (handoff #115),
+and the serialized phase split (conv 70.0 ms + attn 79.8 ms + lm_head 3.9 per token
+against a 95 ms GEMV byte floor) is launch-latency, which CUDA graphs were measured null
+on this path (#118/#165-era). Nothing left to tune there: **the only prefill lever is
+amortizing the weight stream across positions, i.e. the batched kernel.** At the measured
+30-33 GMAC/s (CT=4 ARM0) the 18.4 GMAC/audio-s prefill becomes 0.56-0.61 s/audio-s =
+~35 s for this query, so ASR_RT goes 1.87 -> ~1.24 at 4 tok/s, ~1.09 at 2.85 tok/s.
+That integration is the handoff's open item 2: bit-exact batched prefill requires the
+`ffn.w2` x-layout change, which changes the goldens (run #165 root cause).
+
+**Decode is not the short-context band at ASR context.** 128.59 ms/token over positions
+750-990, against the 107-113 ms band quoted at 24-48 positions (+14%, positional, in
+line with the 98 -> 112 ms growth measured in #160). Any ASR_RT budget must use ~128 ms,
+not 112 ms.
+
+**Arithmetic for the target:** at 2.85 text tok/s (2.5 words/s) a 60 s query needs
+~35 s prefill + ~22 s decode + 3.3 s mel + ~5 s encoder = 65 s -> 1.09. Reaching <= 1.00
+therefore needs the batched prefill AND ~10% more (decode-side, or overlapping mel and
+the encoder of chunk n+1 with the prefill/decode of chunk n -- a streaming pipeline is
+the clean way, since all three stages are independent resources: CPU DSP, GPU GEMV,
+GPU attention).
+
+### 24. Encoder GEMM, real weights and real activations, with an fp64 referee (run #308)
+
+`pulsar_arm/asm/bench/bench_enc_gemm.cu` now has a `real` mode: the weights are the real
+encoder tensors from `lfm3-audio-2b-enc.lfm3q8` (layer 0 conv/FFN, downsampler `lin_out`,
+projector `mlp.model.1/3`), the activations are the real HF layer-0 input
+(`enc_ref/ref/hidden_00`, tiled to each shape's K where that shape's own activation was
+not dumped), and every arm is judged against an **fp64 referee** (48 rows x T per shape,
+per-32-block dequant, ascending block order). T=50, reps 5, min time, two runs (board
+drift ~20% shows in the absolute rates; the ranking is stable).
+
+| arm | kernel | GMAC/s | s GPU per audio second (1.45 GMAC) | rms rel vs fp64 |
+|---|---|---|---|---|
+| B fp32/pos | `q8_partial<float>` per position | 7.7-10.3 | 0.14-0.19 | **3.2e-5** |
+| A fp32/bat | `q8_prefill_h2<float,ARM5,GRP2>` | 4.1-4.4 | 0.33-0.36 | 3.2e-5 |
+| F bf16/pos | `q8_partial<bf16,H2=0>` = the shipped decode GEMV | 8.3-9.1 | 0.16-0.18 | 0.275 |
+| E h2/pos | `q8_partial<bf16,H2=1>` | 8.4-8.7 | 0.17 | 0.278 |
+| C h2/bat | `q8_prefill_h2<bf16,ARM0>` | 15.7-18.1 | 0.080-0.092 | 0.278 |
+| D h2/bat10 | `q8_prefill_h2<bf16,ARM10,RB2>` | 16.1-18.7 | 0.078-0.090 | 0.278 |
+
+The referee settles three things that the fp32-vs-half2 comparison alone could not:
+
+1. **The fp32 arms are right** (3.2e-5 rms vs fp64). The 800 GMAC/s and the "half2 is
+   2.3x off" stories from run #307 were both bench artifacts and are superseded.
+2. **The 0.28 rms deviation of every bf16-activation arm is the ACTIVATION rounding, not
+   the fp16 products.** Arm F (bf16 activations, fp32 FMA math, the shipped GEMV) deviates
+   by 0.275 and arms E/C/D (bf16 activations + fp16 products) by 0.278 -- a 3e-3
+   difference between them. Fed bf16-rounded inputs on the host, arm F matches fp64 to
+   7.7e-4 max / 1.6e-5 rms, so the kernels read bf16 correctly and the arithmetic is
+   clean. Per-cell the bf16 input rounding reaches rms 0.71 on `out_proj` (max rel 35):
+   the encoder's dot products cancel hard, so an 11-bit input rounding amplifies. This is
+   the same arithmetic every shipped backbone GEMV uses, and it is the same mechanism as
+   the Q8-vs-HF gap the S3 gate measures (2.6e-3 at enc_out, 1.8e-2 at proj_out, run #305).
+3. **fp16 products are effectively free in accuracy terms** relative to the engine's own
+   bf16-activation baseline: C/D are 1.9x faster than F for 3e-3 rms.
+
+Consequences for the encoder port (decision framed for the user, not taken here):
+- the encoder's linears cost 0.078-0.09 s/audio-s on the batched half2 arm -- 1.3-1.5x
+  over the 0.06 s budget, and the budget's own basis (the encoder's GMAC count) is an
+  estimate, so this is close enough to build and measure, not to keep tuning;
+- acceptance for the audio path must be end-to-end (speech in -> greedy text vs HF),
+  because a per-cell 3e-1 rel error is *normal* for bf16 activations on this data and no
+  bit-exactness gate can be the standard; the C reference (`lfm3_enc.c`) stays the
+  per-stage structural oracle;
+- the fp32 arms are the fallback if the user wants the encoder's arithmetic to match the
+  spec, at 2.0-2.4x the encoder cost.
