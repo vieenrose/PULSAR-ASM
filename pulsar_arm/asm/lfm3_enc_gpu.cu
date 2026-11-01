@@ -34,6 +34,12 @@
 static const int EHID = 768, EFFN = 1792, EPROJ = 2048, ENLAYER = 17;
 static const int ENH = 8, ENKV = 4, EHD = 96;
 static const float EEPS = 1e-5f, ETHETA = 1e6f;
+// LFM_ENC_PROBE=2: TIMING ABLATION ONLY -- the silu expf is replaced by the SFU
+// __expf and the conv kernels skip their silu. The outputs of that run are NOT valid
+// and the run prints a loud marker; it exists to price the expf, nothing else.
+static const int g_encprobe = getenv("LFM_ENC_PROBE") ? atoi(getenv("LFM_ENC_PROBE")) : 0;
+static const int g_convIn1 = getenv("LFM_ENC_CONVIN") ? atoi(getenv("LFM_ENC_CONVIN")) : 1;   // 1 shared, 0 flat
+__device__ int g_probe_d;                     // device copy (a host getenv init is not usable in device code)
 
 static int g_ench2 = 0;            // 0 = fp32 arms (the C-ref oracle path), 1 = batched half2
 
@@ -44,50 +50,119 @@ __global__ void k_f2bf(const float* __restrict__ in, bf16* __restrict__ out, siz
   if (i < n) out[i] = f2bf(in[i]);
 }
 
-// 3x3 stride-2 pad-1, 1 -> 256 channels, +bias, +silu. Out-of-range taps are
-// SKIPPED (the C reference's bounds check), not zero-padded: same arithmetic.
-__global__ void k_conv_in(const float* __restrict__ in, const float* __restrict__ w,
+// ---- 3x3 stride-2 pad-1 convs -------------------------------------------------
+// Both convs use a FLAT work-item grid (one item = 4 consecutive x outputs of one
+// (channel, row) pair) instead of a 3-D grid: with a 200-wide row and a 128-thread
+// block, the 3-D form left 78% of the lanes idle, and that -- not the expf, which an
+// ablation priced at ~10 ms -- was the cost. Out-of-range taps are SKIPPED (the C
+// reference's bounds check), not zero-padded: same arithmetic, same accumulation
+// order acc = b[o] + sum_i sum_j w[o,i,j] * x[iy][ix].
+template <int IN_CH>                       // IN_CH=1: conv_in (mel plane); 256: depthwise
+__global__ void k_conv3x3(const float* __restrict__ in, const float* __restrict__ w,
                           const float* __restrict__ b, float* __restrict__ out,
-                          int nH, int nW, int nHo, int nWo) {
-  const int o = blockIdx.y, x = blockIdx.x * blockDim.x + threadIdx.x;
-  if (x >= nWo) return;
-  const int y = blockIdx.z;
-  float acc = b[o];
+                          int nC, int nH, int nW, int nHo, int nWo, int silu) {
+  const int item = blockIdx.x * blockDim.x + threadIdx.x;
+  const int nxb = (nWo + 3) / 4;
+  const int o = item / (nHo * nxb);                       // channel
+  const int rem = item % (nHo * nxb);
+  const int y = rem / nxb, x0 = (rem % nxb) * 4;
+  if (o >= nC * nHo * nxb / (nHo * nxb) * nC + nC) return;   // (keeps the compiler honest)
+  if (item >= nC * nHo * nxb) return;
+  if (x0 >= nWo) return;
+  const float bo = b[o];
   const float* wr = w + (size_t)o * 9;
-  const float* xr = in + (size_t)y * 2 * nW;             // iy = 2y-1+i
+  const float* base = in + (size_t)(IN_CH == 1 ? 0 : o * nH * nW);
+  float acc[4] = { bo, bo, bo, bo };
   #pragma unroll
   for (int i = 0; i < 3; i++) {
-    const int iy = y * 2 + i - 1; if (iy < 0 || iy >= nH) continue;
+    const int iy = y * 2 + i - 1;
+    const bool rok = (iy >= 0 && iy < nH);
+    const float* xr = base + (size_t)(rok ? iy : 0) * nW;
+    float xv[9];
     #pragma unroll
-    for (int j = 0; j < 3; j++) {
-      const int ix = x * 2 + j - 1; if (ix < 0 || ix >= nW) continue;
-      acc = __fadd_rn(acc, __fmul_rn(wr[i * 3 + j], xr[(size_t)(iy - y * 2) * nW + ix]));
+    for (int j = 0; j < 9; j++) {
+      const int ix = x0 * 2 - 1 + j;
+      xv[j] = (rok && ix >= 0 && ix < nW) ? xr[ix] : 0.f;
+    }
+    #pragma unroll
+    for (int q = 0; q < 4; q++) {
+      if (x0 + q >= nWo) break;
+      #pragma unroll
+      for (int j = 0; j < 3; j++)
+        acc[q] = __fadd_rn(acc[q], __fmul_rn(wr[i * 3 + j], xv[2 * q + j]));
     }
   }
-  out[((size_t)o * nHo + y) * nWo + x] = __fdiv_rn(acc, __fadd_rn(1.f, expf(-acc)));   // silu
+  #pragma unroll
+  for (int q = 0; q < 4; q++) {
+    if (x0 + q >= nWo) break;
+    float a = acc[q];
+    if (silu && g_probe_d != 2) a = __fdiv_rn(a, __fadd_rn(1.f, expf(-a)));
+    out[((size_t)o * nHo + y) * nWo + x0 + q] = a;
+  }
 }
 
-// 3x3 stride-2 pad-1 depthwise (groups = C = 256), +bias, optional silu.
-__global__ void k_conv_dw(const float* __restrict__ in, const float* __restrict__ w,
-                          const float* __restrict__ b, float* __restrict__ out,
-                          int C, int nH, int nW, int nHo, int nWo, int silu) {
-  const int o = blockIdx.y, x = blockIdx.x * blockDim.x + threadIdx.x;
-  if (x >= nWo) return;
-  const int y = blockIdx.z;
-  float acc = b[o];
-  const float* wr = w + (size_t)o * 9;
-  const float* xr = in + (size_t)o * nH * nW + (size_t)(y * 2 - 1) * nW;
+// conv_in, shared-staged. The naive form re-reads the 9-tap mel window once per output
+// CHANNEL: all 256 channels share the same window, so the (small) mel plane was
+// generating ~256x its own traffic in L1/L2 -- 44 ms for 29.5 MMAC. One block owns a
+// (row, 128-output-x) tile for ALL 256 channels: the 3x258 window is loaded once, and
+// every thread walks 32 channels x 4 x-outputs. Same taps, same order, same expf.
+__global__ void k_conv_in_shared(const float* __restrict__ in, const float* __restrict__ w,
+                                 const float* __restrict__ b, float* __restrict__ out,
+                                 int nH, int nW, int nHo, int nWo) {
+  const int y = blockIdx.y;
+  const int xb = blockIdx.x * 128;
+  const int tid = threadIdx.x;                       // 256
+  __shared__ float sx[3][258 + 3];
   #pragma unroll
-  for (int i = 0; i < 3; i++) {
-    const int iy = y * 2 + i - 1; if (iy < 0 || iy >= nH) continue;
-    #pragma unroll
-    for (int j = 0; j < 3; j++) {
-      const int ix = x * 2 + j - 1; if (ix < 0 || ix >= nW) continue;
-      acc = __fadd_rn(acc, __fmul_rn(wr[i * 3 + j], xr[(size_t)i * nW + ix]));
+  for (int i = 0; i < 4; i++) {
+    const int idx = tid + i * 256;
+    if (idx < 3 * 258) {
+      const int r = idx / 258, c = idx % 258;
+      const int iy = y * 2 - 1 + r, ix = xb * 2 - 1 + c;
+      sx[r][c] = (iy >= 0 && iy < nH && ix >= 0 && ix < nW) ? in[(size_t)iy * nW + ix] : 0.f;
     }
   }
-  if (silu) acc = __fdiv_rn(acc, __fadd_rn(1.f, expf(-acc)));
-  out[((size_t)o * nHo + y) * nWo + x] = acc;
+  __syncthreads();
+  const int q = tid & 31, sl = tid >> 5;              // 32 x-items x 8 channel slots
+  const int x0 = xb + q * 4;
+  #pragma unroll 4
+  for (int oo = 0; oo < 32; oo++) {
+    const int o = sl * 32 + oo;
+    const float* wr = w + (size_t)o * 9;
+    float acc[4] = { b[o], b[o], b[o], b[o] };
+    #pragma unroll
+    for (int i = 0; i < 3; i++)
+      #pragma unroll
+      for (int jj = 0; jj < 4; jj++) {
+        const int x = x0 + jj; if (x >= nWo) break;
+        const int c0 = 2 * (x - xb);                  // window column of tap ix = 2x-1
+        #pragma unroll
+        for (int j = 0; j < 3; j++)
+          acc[jj] = __fadd_rn(acc[jj], __fmul_rn(wr[i * 3 + j], sx[i][c0 + j]));
+      }
+    #pragma unroll
+    for (int jj = 0; jj < 4; jj++) {
+      const int x = x0 + jj; if (x >= nWo) break;
+      float a = acc[jj];
+      if (g_probe_d != 2) a = __fdiv_rn(a, __fadd_rn(1.f, expf(-a)));
+      out[((size_t)o * nHo + y) * nWo + x] = a;
+    }
+  }
+}
+
+static void conv3x3(const float* in, const float* w, const float* b, float* out,
+                    int C, int nH, int nW, int nHo, int nWo, int silu, int in1) {
+  const int items = C * nHo * ((nWo + 3) / 4);
+  const int TPB = 256;
+  if (in1 && g_convIn1) {                             // shared-staged, 256 threads
+    const int TPB2 = 256;
+    dim3 g((nWo + 127) / 128, nHo);
+    k_conv_in_shared<<<g, TPB2>>>(in, w, b, out, nH, nW, nHo, nWo);
+  } else if (in1) {                                   // flat work-item grid (A/B arm)
+    k_conv3x3<1><<<(C * nHo * ((nWo + 3) / 4) + 255) / 256, 256>>>(in, w, b, out, C, nH, nW, nHo, nWo, silu);
+  } else {
+    k_conv3x3<256><<<(items + TPB - 1) / TPB, TPB>>>(in, w, b, out, C, nH, nW, nHo, nWo, silu);
+  }
 }
 
 // (C,H,W) -> (H*W, C) and back. One thread per element.
@@ -111,7 +186,7 @@ __global__ void k_bias_silu(float* __restrict__ y, const float* __restrict__ bia
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   float v = __fadd_rn(y[i], bias[i % O]);
-  if (silu) v = __fdiv_rn(v, __fadd_rn(1.f, expf(-v)));
+  if (silu && g_probe_d != 2) v = __fdiv_rn(v, __fadd_rn(1.f, expf(-v)));
   y[i] = v;
 }
 
@@ -128,7 +203,26 @@ __global__ void k_flatten(const float* __restrict__ phw, float* __restrict__ fla
 
 // Stage-level sync + error read: an async kernel fault surfaces late and points at
 // the wrong launch, so every stage is checked where it is issued (run #297's lesson).
+static cudaEvent_t g_seva, g_sevb;
+static const bool g_enctime = getenv("LFM_ENC_TIME") != nullptr;
+static const int g_reps = getenv("LFM_ENC_REPS") ? atoi(getenv("LFM_ENC_REPS")) : 1;
+// The Nano's GPU clock ramps over seconds (the backbone harness fights the same
+// thing with LFM_WARMMS), so a single pass per stage is not a measurement: stages are
+// run LFM_ENC_REPS times and the MIN per stage is kept, which is the same protocol the
+// backbone benches use.
+#include <map>
+#include <string>
+static std::map<std::string, double> g_best;
+static std::map<std::string, double> g_last;
 static void chk(const char* what) {
+  if (g_enctime) {                                      // per-stage: syncs, so read the split
+    cudaEventRecord(g_sevb); cudaEventSynchronize(g_sevb);
+    float ms = 0.f; cudaEventElapsedTime(&ms, g_seva, g_sevb);
+    std::string k(what);
+    if (!g_best.count(k) || ms < g_best[k]) g_best[k] = ms;
+    g_last[k] = ms;
+    cudaEventRecord(g_seva);
+  }
   cudaError_t e = cudaGetLastError();
   if (e) { printf("LAUNCH ERROR at %s: %s\n", what, cudaGetErrorString(e)); exit(1); }
   cudaDeviceSynchronize();
@@ -143,23 +237,58 @@ static void chk(const char* what) {
 // per thread, k ascending in one accumulator, which is the C reference's order.
 __global__ void k_sgemm_f32(const float* __restrict__ x, const float* __restrict__ w,
                             float* __restrict__ y, int T, int N, int K) {
-  __shared__ float tx[16][17], tw[16][17];
-  const int n0 = blockIdx.x * 16, t0 = blockIdx.y * 16;
-  const int ty = threadIdx.y, txi = threadIdx.x;
-  float acc = 0.f;
-  for (int k0 = 0; k0 < K; k0 += 16) {
-    const int t = t0 + ty;
-    tx[ty][txi] = (t < T) ? x[(size_t)t * K + k0 + txi] : 0.f;
-    const int n = n0 + ty;
-    tw[ty][txi] = (n < N) ? w[(size_t)n * K + k0 + txi] : 0.f;
-    __syncthreads();
+  // 64x64 output tile, 256 threads, 4x4 outputs per thread. Each output accumulates
+  // k ascending in ONE register, so the summation order is the C reference's and the
+  // gate value is unchanged by the tiling. Pads (67) are chosen for ~2-way shared
+  // conflicts: sx is [t][k] (warp-broadcast along k), sw is transposed [k][n] so the
+  // per-thread w reads are a contiguous span.
+  const int t0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+  __shared__ float sx[64][67];
+  __shared__ float sw[64][67];
+  const int ty = threadIdx.y, tx = threadIdx.x;
+  const int tid = ty * 16 + tx;
+  float acc[4][4];
+  #pragma unroll
+  for (int i = 0; i < 4; i++)
     #pragma unroll
-    for (int k = 0; k < 16; k++)
-      acc = __fmaf_rn(tx[ty][k], tw[txi][k], acc);
+    for (int j = 0; j < 4; j++) acc[i][j] = 0.f;
+  for (int k0 = 0; k0 < K; k0 += 64) {
+    const int kk = (k0 + 64 <= K) ? k0 : (K - 64);          // K is a multiple of 32; tail reload
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+      const int idx = tid + i * 256;
+      const int r = idx >> 6, c = idx & 63;
+      const int t = t0 + r, n = n0 + r;
+      sx[r][c] = (t < T) ? x[(size_t)t * K + kk + c] : 0.f;
+      sw[c][r] = (n < N) ? w[(size_t)n * K + kk + c] : 0.f;
+    }
     __syncthreads();
+    const int kstop = (k0 + 64 <= K) ? 64 : (K - k0);
+    #pragma unroll 4
+    for (int k = 0; k < kstop; k++) {
+      float xv[4], wv[4];
+      #pragma unroll
+      for (int i = 0; i < 4; i++) xv[i] = sx[ty * 4 + i][k];
+      #pragma unroll
+      for (int j = 0; j < 4; j++) wv[j] = sw[k][tx * 4 + j];
+      #pragma unroll
+      for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = __fmaf_rn(xv[i], wv[j], acc[i][j]);
+    }
+    __syncthreads();
+    if (k0 + 64 >= K) break;
   }
-  const int t = t0 + ty, n = n0 + txi;
-  if (t < T && n < N) y[(size_t)t * N + n] = acc;
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const int t = t0 + ty * 4 + i;
+    if (t >= T) continue;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int n = n0 + tx * 4 + j;
+      if (n < N) y[(size_t)t * N + n] = acc[i][j];
+    }
+  }
 }
 
 struct Gemm {
@@ -196,7 +325,7 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
 static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
   const int TPB = 256;
   if (g.wf) {                                        // f32-weight path (no half2 arm)
-    const dim3 grid((g.N + 15) / 16, (T + 15) / 16), block(16, 16);
+    const dim3 grid((g.N + 63) / 64, (T + 63) / 64), block(16, 16);
     k_sgemm_f32<<<grid, block>>>(x, g.wf, y, T, g.N, g.K);
     return;
   }
@@ -267,6 +396,8 @@ int main(int argc, char** argv) {
   const int Tt = EWo3;
   printf("Tm=%d -> EWo1=%d EWo2=%d tokens Tt=%d (expect ceil(Tm/8)); arms=%s\n",
          Tm, EWo1, EWo2, Tt, g_ench2 ? "batched half2" : "fp32");
+  if (g_encprobe == 2) { int one = 2; cudaMemcpyToSymbol(g_probe_d, &one, sizeof(int));
+    printf("*** PROBE RUN: silu disabled, OUTPUTS ARE NOT VALID (timing only) ***\n"); }
   fflush(stdout);
   const size_t n1 = (size_t)256 * EH1 * EWo1, n2 = (size_t)256 * EH2 * EWo2, n3 = (size_t)256 * EH3 * EWo3;
   float *feat, *x1, *x2, *x2b, *x3, *x3b, *perm, *flat, *ds, *xb = nullptr;
@@ -298,15 +429,16 @@ int main(int argc, char** argv) {
   }
 
   cudaEvent_t ev0, ev1; cudaEventCreate(&ev0); cudaEventCreate(&ev1);
-  cudaEventRecord(ev0);
+  cudaEventCreate(&g_seva); cudaEventCreate(&g_sevb);
+  cudaEventRecord(ev0); cudaEventRecord(g_seva);
+  const int nreps = g_enctime ? (g_reps < 1 ? 1 : g_reps) : 1;
+  for (int rep = 0; rep < nreps; rep++) {
 
   // 1) conv_in + silu
-  { dim3 g((EWo1 + 127) / 128, 256, EH1);
-    k_conv_in<<<g, 128>>>(feat, w_in->df, b_in->df, x1, 128, Tm, EH1, EWo1); }
+  conv3x3(feat, w_in->df, b_in->df, x1, 256, 128, Tm, EH1, EWo1, 1, 1);
   chk("conv_in");
   // 2) conv_mid (depthwise)
-  { dim3 g((EWo2 + 127) / 128, 256, EH2);
-    k_conv_dw<<<g, 128>>>(x1, w_mid->df, b_mid->df, x2, 256, EH1, EWo1, EH2, EWo2, 0); }
+  conv3x3(x1, w_mid->df, b_mid->df, x2, 256, EH1, EWo1, EH2, EWo2, 0, 0);
   chk("conv_mid");
   // 3) lin_mid as a GEMM over P2 = EH2*EWo2 positions, then silu
   { const int P2 = EH2 * EWo2;
@@ -322,8 +454,7 @@ int main(int argc, char** argv) {
   chk("lin_mid gemm");
   // 4) conv_end (depthwise) on the CHW view of x2b
   k_phw2chw<<<(unsigned)((n2 + 255) / 256), 256>>>(x2b, perm, 256, EH2 * EWo2);
-  { dim3 g((EWo3 + 127) / 128, 256, EH3);
-    k_conv_dw<<<g, 128>>>(perm, w_end->df, b_end->df, x3, 256, EH2, EWo2, EH3, EWo3, 0); }
+  conv3x3(perm, w_end->df, b_end->df, x3, 256, EH2, EWo2, EH3, EWo3, 0, 0);
   chk("conv_end");
   // 5) lin_end as a GEMM over P3 = EH3*EWo3 positions, then silu
   { const int P3 = EH3 * EWo3;
@@ -346,8 +477,12 @@ int main(int argc, char** argv) {
     k_bias_silu<<<(unsigned)((Tt * EHID + 255) / 256), 256>>>(ds, b_out->df, (size_t)Tt * EHID, EHID, 0); }
   chk("lin_out");
 
+  }
   cudaEventRecord(ev1); cudaEventSynchronize(ev1);
   float ms = 0; cudaEventElapsedTime(&ms, ev0, ev1);
+  ms /= nreps;
+  if (g_enctime) for (std::map<std::string,double>::iterator it = g_best.begin(); it != g_best.end(); ++it)
+    printf("  stage %-14s %8.2f ms (min of %d)\n", it->first.c_str(), it->second, nreps);
   cudaError_t e = cudaGetLastError();
   if (e) { printf("CUDA ERROR: %s\n", cudaGetErrorString(e)); return 1; }
   const double macs = 256.0 * 9 * EH1 * EWo1                    // conv_in

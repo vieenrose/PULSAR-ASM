@@ -1310,3 +1310,49 @@ Cost: **183.5-237.8 ms per 4 s clip = 0.046-0.059 s GPU per audio second** at 45
 (1.9-2.5 GMAC/s). The whole downsampler budget is being spent on `lin_mid`
 (210 of the 458 MMAC) in the untiled-rate SGEMM; the next step is register blocking
 there (a numerics-neutral change, so the 3.4e-5 gate stays valid), then the 17 layers.
+
+### 26. CORRECTION + downsampler optimized: 0.0158 s GPU per audio second (run #311)
+
+**Section 25's cost numbers were clock-ramp artifacts.** Single-pass per-stage timings
+on this board inherit the devfreq ramp (the backbone harness fights the same thing with
+`LFM_WARMMS`): the first stages of a fresh process run at 77-154 MHz. The same binary
+gave conv_mid at 3.81 ms in one run and 17.57 ms in the next. The encoder now runs
+`LFM_ENC_REPS=N` and keeps the **min per stage**, the protocol the backbone benches use.
+
+Paired A/B for the conv_in rewrite, both arms twice (`LFM_ENC_CONVIN=1/0`, min of 8):
+shared-tile 3.88 ms vs flat work-item grid 5.69 ms, in both orders -> shared ships.
+
+Full stage table, fp32 arms, Tm=400 -> Tt=50, min of 8:
+
+| stage | ms | MMAC | GMAC/s |
+|---|---|---|---|
+| lin_mid (f32 SGEMM, 256x256 over 3200 positions) | 17.44 | 210 | 12.0 |
+| lin_out (Q8 per-position arm, 768x4096) | 11.66 | 157 | 13.5 |
+| lin_end (f32 SGEMM) | 5.13 | 52 | 10.2 |
+| conv_in (shared-tile, 1->256 k3s2) | 3.85 | 29.5 | 7.7 |
+| chw2phw permute | 3.78 | — | — |
+| conv_end (depthwise) | 3.64 | 1.8 | 0.5 |
+| conv_mid (depthwise) | 2.05 | 7.4 | 3.6 |
+| flatten + combine | 0.68 | — | — |
+| **total** | **63.0** | **458** | **7.3** |
+
+**The downsampler costs 0.0158 s GPU per audio second (0.0146 on the half2 arms), not
+the 0.046-0.059 of section 25** -- 26% of the 0.06 s/audio-s encoder budget, and the
+gate is unchanged by the rewrites (`ds_out rms rel 3.449e-05 vs C, max abs 2.503e-06`
+in both the fp32 and half2 arms; the SGEMM tiling, the flat conv grid and the shared
+tile all preserve the C reference's summation order bit for bit).
+
+Two rewrites were needed to get there, both measured, neither a numerics change:
+1. the conv kernels' 3-D grid left 78% of the lanes idle on a 200-wide row (flat
+   work-item grid, 4 outputs per thread); an ablation priced the silu `expf` at ~10 ms
+   of the naive 63, so it was never the bottleneck;
+2. `conv_in` re-read the same 9-tap mel window once per output channel -- all 256
+   channels share it -- so staging the 3x258 tile in shared memory cut it 1.5x.
+
+What this means for the remaining S3 work: with the downsampler at 0.016, the 17 layers
+(1.4 GMAC per audio second) dominate. At the run #309 rates they cost 0.14-0.20 s/audio-s
+on the fp32 arms and 0.078-0.088 on the batched half2 arms, so the encoder lands at
+~0.10-0.11 s/audio-s -- 1.6-1.8x over the 0.06 budget. The layer loop is next:
+`in_proj -> B*X -> gated depthwise conv3 -> C*y -> out_proj`, the attention layers
+(prefill attention + head-norm + RoPE), and the FFN, gated per layer against
+`lfm3_enc.c`'s existing `layer_XX` dumps.
