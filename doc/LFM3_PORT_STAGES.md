@@ -1278,3 +1278,35 @@ Consequences for the encoder port (decision framed for the user, not taken here)
   per-stage structural oracle;
 - the fp32 arms are the fallback if the user wants the encoder's arithmetic to match the
   spec, at 2.0-2.4x the encoder cost.
+
+### 25. S3 downsampler ported to the GPU: 3.4e-5 vs the C spec, 0.046-0.059 s/audio-s (run #310)
+
+`pulsar_arm/asm/lfm3_enc_gpu.cu` includes `lfm3_nanode.cu` with its `main` renamed, so
+the loader, the Q8 GEMM arms and `k_combine_f` are the shipped code. Activations are
+fp32 (the spec's arithmetic), so `lfm3_enc.c` is a tight per-stage oracle. Gate
+`.auto/lfm3/checks_enc.sh` (comparator `.auto/lfm3/enc_ref/cmp_enc.py`, numpy runs on
+the Nano), fresh build, Tm=400 -> Tt=50 tokens:
+
+```
+ds_out   rms rel 3.449e-05 vs C   max abs 2.503e-06   rms 0.12701 both   OK
+ds_out   rms rel 2.338e-01 vs HF  max abs 1.211e-03   (reported, not gated: lin_out is Q8)
+ENC_GATE PASS (arms=fp32 T=50 stages=1)
+```
+
+Stage order is copied from `lfm3_enc.c` (`silu(conv_in)` -> depthwise `conv_mid` ->
+`silu(lin_mid)` -> depthwise `conv_end` -> `silu(lin_end)` -> `flatten(1,2)` ->
+`lin_out` + bias), with out-of-range conv taps skipped as the C reference skips them.
+The 3x3 convs are direct kernels (a 9-MAC stencil); the two 1x1 convs and `lin_out` run
+on GEMM paths.
+
+**The dtype census matters here:** `lin_mid`/`lin_end` are **f32** in the blob (the same
+table as Liquid's mmproj GGUF, cross-checked in section 13a), only `lin_out` is Q8. The
+first run therefore died with `unspecified launch failure` on null Q8 pointers -- the
+encoder needs an f32-weight GEMM as well as the Q8 arms, so `k_sgemm_f32`
+(16x16 tile, one output per thread, k ascending in a single accumulator = the C
+reference's order) was added and the site dispatches on the blob's dtype.
+
+Cost: **183.5-237.8 ms per 4 s clip = 0.046-0.059 s GPU per audio second** at 458 MMAC
+(1.9-2.5 GMAC/s). The whole downsampler budget is being spent on `lin_mid`
+(210 of the 458 MMAC) in the untiled-rate SGEMM; the next step is register blocking
+there (a numerics-neutral change, so the 3.4e-5 gate stays valid), then the 17 layers.

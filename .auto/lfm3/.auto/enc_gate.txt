@@ -1,0 +1,7 @@
+Tm=400 -> EWo1=200 EWo2=100 tokens Tt=50 (expect ceil(Tm/8)); arms=fp32
+  lin_mid N=256 K=256 T=3200 f32 weights
+downsampler 183.54 ms = 0.0459 s GPU per audio second (458 MMAC, 2.5 GMAC/s)
+dump ds_out       n=38400 nonzero=38400 max=1.7826
+FM3_ENC_GPU_DONE Tm=400 Tt=50
+  ds_out     rms rel 3.449e-05 vs C  max abs 2.503e-06  rms(GPU) 0.12701 rms(C) 0.12701  nonzero 38400/38400  OK
+ENC_GATE PASS (arms=fp32 T=50 stages=1)
