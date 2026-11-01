@@ -1474,3 +1474,45 @@ sat INSIDE the spread and made the gate flaky rather than strict), and
 `checks_enc.sh` now runs the encoder twice and prints the run-to-run energy rel per
 stage against a 3e-03 defect budget. Next hunt: per-tensor arena poison (NaN one
 tensor's range at a time) to find which tensor's neighbourhood is being read.
+
+### 30. The section 29 hunt: three hypotheses tested, all refuted; gate ships with two bar sets
+
+`q8_partial` now checks `cudaGetLastError()` after **every** launch (run #307's lesson: a
+refused launch is silent, and a silent refusal leaves that position's partial slots
+holding whatever the previous occupant of that memory had -- precisely the
+history-dependent signature we are chasing). Eight runs: **zero refusals**, so that
+hypothesis is dead, and now falsifiable rather than unfalsifiable.
+
+The same eight runs also kill section 29's "two stable states" reading. `layer_08` energy
+rel vs the C reference across eight separate invocations of one binary:
+
+```
+run     21      22      23      24      25      26      27      28
+rel   1.4e-06 1.1e-04 4.2e-04 1.2e-04 1.4e-06 1.9e-06 1.9e-05 2.9e-03
+abs   2.0e-05 6.0e-04 2.6e-03 3.9e-04 2.0e-05 2.0e-05 8.6e-05 1.5e-02
+```
+
+The amplitude is **continuous**, not bimodal, and some runs are exact to 1.4e-06. That is
+reading memory this process never wrote, with content inherited from earlier processes
+(Tegra unified memory, driver-recycled pages) -- not a self-referential fixed point.
+
+Excluded so far, each by an experiment rather than by reading code:
+`dalloc` buffers (zeroed, and NaN-filled with `LFM_ENC_POISON=1`: every stage stays
+finite), `Gemm::part` (zeroing it makes accuracy WORSE -- those slots are load-bearing,
+so the combine's inputs are all written), refused launches (checked per launch, none),
+and an under-filled weight arena (`LFM_ENC_POISON_ARENA=1` NaNs every output, so every
+byte the GEMMs consume is written; in-arena over-reads land in a neighbour's valid data
+and would be deterministic anyway). Still open: a read that runs past the end of the
+scales/codes arenas into the engine's 48 MB runtime arena, which the encoder never
+writes -- the one region that would show exactly this behaviour. Next probe: cudaMemset
+that runtime arena with a NaN pattern at startup and see which stage's output goes
+non-finite.
+
+**Gate ships with two bar sets, because one bar set cannot be strict against a moving
+target.** Default = the tight bars (energy 1e-3, max abs 2e-3, probes 1e-4/5e-5,
+determinism budget 3e-03): green on clean runs (1 of the last 3, and 10-20x margin when
+clean), RED whenever the defect touches the run -- the honest verdict, since that run is
+not reproducible. `DEFECT_OK=1` = defect-tolerant bars (measured worst x2-3: energy
+5e-3, max abs 2e-2, probes 1e-3/2e-2, budget 5e-03; h2 arms 1e-2/5e-2/budget 1e-02) for
+regression work on the rest of the port, and it prints `** DEFECT-TOLERANT MODE **` so a
+green in that mode is never read as a clean green.

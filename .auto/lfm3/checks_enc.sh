@@ -5,6 +5,12 @@
 #
 #   bash .auto/lfm3/checks_enc.sh              # fp32 arms: tight gate vs the C reference
 #   LFM_ENC_H2=1 bash .auto/lfm3/checks_enc.sh # batched half2 arms: tolerance gate only
+#   DEFECT_OK=1 bash .auto/lfm3/checks_enc.sh  # tolerate the OPEN run-to-run defect of
+#                        doc section 29 (bars = measured worst x2-3). The default bars
+#                        are the strict ones: they go RED on a run the defect touched,
+#                        which is the right verdict -- that run is not reproducible.
+#                        The mode is printed in the gate output; a green here is not a
+#                        green there.
 #
 # Two comparisons per stage, both printed:
 #   GPU vs C reference  -- the correctness gate. fp32 arms must be <= 1e-4 rms rel;
@@ -40,7 +46,7 @@ ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
    LFM_ENC_H2=$H2 LFM_ENC_PROBE_LAYER=2 timeout 900 ./lfm3_enc_gpu $BLOB input_128xT_f32.bin $Tm encgpu 2>&1 | grep -viE '^load |RSS|host at|blob:|device free'; \
    LFM_ENC_H2=$H2 LFM_ENC_PROBE_LAYER=2 timeout 900 ./lfm3_enc_gpu $BLOB input_128xT_f32.bin $Tm encgpu2 2>&1 | grep -viE '^load |RSS|host at|blob:|device free' | tail -2; \
    LFM_ENC_PROBE_LAYER=2 timeout 3600 ./lfm3_enc $BLOB input_128xT_f32.bin $Tm encC > /dev/null 2>&1; \
-   LFM_ENC_H2=$H2 python3 cmp_enc.py $TOK" 2>&1 | grep -vi setlocale | tee .auto/lfm3/.auto/enc_gate.txt
+   LFM_ENC_H2=$H2 LFM_ENC_DEFECT_OK=${DEFECT_OK:-0} python3 cmp_enc.py $TOK" 2>&1 | grep -vi setlocale | tee .auto/lfm3/.auto/enc_gate.txt
 GATE=$(grep -oE 'ENC_GATE (PASS|FAIL[^ ]*)' .auto/lfm3/.auto/enc_gate.txt | tail -1)
 echo "== GPU vs HF (reported on the host, not gated: the blob is part-Q8)"
 mkdir -p "$REF/gpu"

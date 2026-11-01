@@ -1,6 +1,6 @@
 Tm=400 -> EWo1=200 EWo2=100 tokens Tt=50 (expect ceil(Tm/8)); arms=fp32
   lin_mid N=256 K=256 T=3200 f32 weights
-ENCODER total 225.06 ms (min of 1) = 0.0563 s GPU per audio second; downsampler alone 458 MMAC, 2.0 GMAC/s at that rate
+ENCODER total 166.69 ms (min of 1) = 0.0417 s GPU per audio second; downsampler alone 458 MMAC, 2.7 GMAC/s at that rate
 dump ds_out       n=38400 nonzero=38400 max=1.7826
 dump layer_00     n=38400 nonzero=38400 max=1.6371
 dump layer_01     n=38400 nonzero=38400 max=1.6621
@@ -30,8 +30,8 @@ FM3_ENC_GPU_DONE Tm=400 Tt=50
 layers ported: 17 of 17
 FM3_ENC_GPU_DONE Tm=400 Tt=50
   ds_out     energy rel 8.400e-07  per-elem rms rel 3.449e-05  max abs 2.503e-06  rms(GPU) 0.12701 rms(C) 0.12701  nonzero 38400/38400  OK
-  enc_out    energy rel 1.080e-06  per-elem rms rel 7.130e-04  max abs 5.436e-05  rms(GPU) 0.52982 rms(C) 0.52982  nonzero 38400/38400  OK
-  proj_out   energy rel 5.014e-06  per-elem rms rel 5.993e-04  max abs 5.201e-06  rms(GPU) 0.05424 rms(C) 0.05424  nonzero 102400/102400  OK
+  enc_out    energy rel 7.236e-07  per-elem rms rel 6.474e-04  max abs 5.436e-05  rms(GPU) 0.52982 rms(C) 0.52982  nonzero 38400/38400  OK
+  proj_out   energy rel 3.977e-06  per-elem rms rel 3.470e-04  max abs 5.201e-06  rms(GPU) 0.05424 rms(C) 0.05424  nonzero 102400/102400  OK
   layer_00   energy rel 9.614e-07  per-elem rms rel 2.055e-04  max abs 2.384e-06  rms(GPU) 0.12758 rms(C) 0.12758  nonzero 38400/38400  OK
   layer_01   energy rel 9.679e-07  per-elem rms rel 1.887e-04  max abs 2.861e-06  rms(GPU) 0.13835 rms(C) 0.13835  nonzero 38400/38400  OK
   layer_02   energy rel 1.035e-06  per-elem rms rel 4.107e-04  max abs 2.980e-06  rms(GPU) 0.13788 rms(C) 0.13788  nonzero 38400/38400  OK
@@ -43,32 +43,27 @@ FM3_ENC_GPU_DONE Tm=400 Tt=50
   layer_08   energy rel 1.387e-06  per-elem rms rel 2.753e-04  max abs 2.003e-05  rms(GPU) 0.18469 rms(C) 0.18469  nonzero 38400/38400  OK
   layer_09   energy rel 1.436e-06  per-elem rms rel 2.530e-04  max abs 1.955e-05  rms(GPU) 0.20590 rms(C) 0.20590  nonzero 38400/38400  OK
   layer_10   energy rel 1.375e-06  per-elem rms rel 7.108e-04  max abs 2.003e-05  rms(GPU) 0.26118 rms(C) 0.26118  nonzero 38400/38400  OK
-  layer_11   energy rel 5.128e-06  per-elem rms rel 6.021e-04  max abs 1.895e-05  rms(GPU) 0.33118 rms(C) 0.33118  nonzero 38400/38400  OK
-  layer_12   energy rel 5.023e-06  per-elem rms rel 7.135e-04  max abs 2.222e-05  rms(GPU) 0.39703 rms(C) 0.39703  nonzero 38400/38400  OK
-  layer_13   energy rel 4.226e-06  per-elem rms rel 5.505e-03  max abs 9.918e-05  rms(GPU) 0.59738 rms(C) 0.59738  nonzero 38400/38400  OK
-  layer_14   energy rel 3.433e-06  per-elem rms rel 1.144e-02  max abs 9.727e-05  rms(GPU) 0.81825 rms(C) 0.81825  nonzero 38400/38400  OK
-  layer_15   energy rel 3.197e-06  per-elem rms rel 2.070e-03  max abs 9.727e-05  rms(GPU) 0.95261 rms(C) 0.95261  nonzero 38400/38400  OK
-  layer_16   energy rel 3.314e-06  per-elem rms rel 7.130e-04  max abs 9.537e-05  rms(GPU) 1.02315 rms(C) 1.02315  nonzero 38400/38400  OK
-  enc_out    run-to-run energy rel 1.389e-05  (max abs 8.47e-04)
-  proj_out   run-to-run energy rel 4.860e-05  (max abs 5.35e-05)
-  layer_00   run-to-run energy rel 2.355e-05  (max abs 8.30e-05)
-  layer_01   run-to-run energy rel 2.138e-05  (max abs 9.06e-05)
-  layer_02   run-to-run energy rel 2.304e-05  (max abs 1.28e-04)
-  layer_03   run-to-run energy rel 2.404e-05  (max abs 1.32e-04)
-  layer_04   run-to-run energy rel 2.345e-05  (max abs 1.34e-04)
-  layer_05   run-to-run energy rel 2.357e-05  (max abs 1.13e-04)
-  layer_06   run-to-run energy rel 2.680e-05  (max abs 1.26e-04)
-  layer_07   run-to-run energy rel 2.888e-05  (max abs 1.34e-04)
-  layer_08   run-to-run energy rel 2.819e-05  (max abs 1.80e-04)
-  layer_09   run-to-run energy rel 3.106e-05  (max abs 1.91e-04)
-  layer_10   run-to-run energy rel 3.165e-05  (max abs 2.21e-04)
-  layer_11   run-to-run energy rel 3.066e-05  (max abs 2.67e-04)
-  layer_12   run-to-run energy rel 3.404e-05  (max abs 3.70e-04)
-  layer_13   run-to-run energy rel 3.438e-05  (max abs 1.29e-03)
-  layer_14   run-to-run energy rel 4.148e-05  (max abs 1.32e-03)
-  layer_15   run-to-run energy rel 3.687e-05  (max abs 1.03e-03)
-  layer_16   run-to-run energy rel 3.652e-05  (max abs 9.35e-04)
-  run-to-run WORST energy rel 4.860e-05  (defect budget 3e-03: OK)
+  layer_11   energy rel 1.353e-06  per-elem rms rel 1.757e-04  max abs 1.621e-05  rms(GPU) 0.33118 rms(C) 0.33118  nonzero 38400/38400  OK
+  layer_12   energy rel 1.417e-06  per-elem rms rel 6.893e-04  max abs 1.526e-05  rms(GPU) 0.39703 rms(C) 0.39703  nonzero 38400/38400  OK
+  layer_13   energy rel 1.605e-06  per-elem rms rel 3.136e-03  max abs 9.918e-05  rms(GPU) 0.59738 rms(C) 0.59738  nonzero 38400/38400  OK
+  layer_14   energy rel 1.368e-06  per-elem rms rel 2.064e-03  max abs 9.727e-05  rms(GPU) 0.81825 rms(C) 0.81825  nonzero 38400/38400  OK
+  layer_15   energy rel 1.300e-06  per-elem rms rel 1.458e-03  max abs 9.727e-05  rms(GPU) 0.95261 rms(C) 0.95261  nonzero 38400/38400  OK
+  layer_16   energy rel 1.381e-06  per-elem rms rel 6.474e-04  max abs 9.537e-05  rms(GPU) 1.02315 rms(C) 1.02315  nonzero 38400/38400  OK
+  enc_out    run-to-run energy rel 1.261e-04  (max abs 9.27e-03)
+  proj_out   run-to-run energy rel 3.657e-04  (max abs 3.76e-04)
+  layer_05   run-to-run energy rel 2.646e-05  (max abs 1.06e-04)
+  layer_06   run-to-run energy rel 3.812e-04  (max abs 1.09e-03)
+  layer_07   run-to-run energy rel 3.948e-04  (max abs 1.21e-03)
+  layer_08   run-to-run energy rel 3.773e-04  (max abs 1.65e-03)
+  layer_09   run-to-run energy rel 3.911e-04  (max abs 1.92e-03)
+  layer_10   run-to-run energy rel 3.956e-04  (max abs 2.07e-03)
+  layer_11   run-to-run energy rel 3.419e-04  (max abs 2.30e-03)
+  layer_12   run-to-run energy rel 3.439e-04  (max abs 2.16e-03)
+  layer_13   run-to-run energy rel 3.510e-04  (max abs 8.13e-03)
+  layer_14   run-to-run energy rel 2.966e-04  (max abs 6.77e-03)
+  layer_15   run-to-run energy rel 2.827e-04  (max abs 6.05e-03)
+  layer_16   run-to-run energy rel 2.945e-04  (max abs 8.12e-03)
+  run-to-run WORST energy rel 3.956e-04  (defect budget 3e-03: OK)
   probe_q_02  energy rel 6.357e-07  per-elem rms rel 1.105e-04  max abs 5.722e-06  rms 0.9994 vs 0.9994  finite True  OK
   probe_k_02  energy rel 7.722e-07  per-elem rms rel 1.095e-04  max abs 4.411e-06  rms 1.0016 vs 1.0016  finite True  OK
   probe_v_02  energy rel 1.002e-06  per-elem rms rel 1.003e-04  max abs 1.863e-07  rms 0.0287 vs 0.0287  finite True  OK

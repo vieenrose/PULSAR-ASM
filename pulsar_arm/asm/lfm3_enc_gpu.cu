@@ -348,9 +348,17 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
     else { k_combine_f<<<(unsigned)((T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, g.nch); return; }
   }
   const size_t shm = (size_t)g.nb * 33 * 4;
-  for (int t = 0; t < T; t++)
+  for (int t = 0; t < T; t++) {
     q8_partial<float, true, false, 1, 0><<<g.nblk, TPB, shm>>>(g.q, g.s, x + (size_t)t * g.K,
         g.part + (size_t)t * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb);
+    // Read the error IMMEDIATELY (run #307's lesson): a refused launch leaves that
+    // position's partial slots holding whatever the previous occupant of that device
+    // memory had, which is exactly the self-referential, two-stable-state, history
+    // dependent signature of the section 29 defect. Silent here = unfalsifiable there.
+    const cudaError_t le = cudaGetLastError();
+    if (le) { printf("q8_partial launch REFUSED at N=%d K=%d KC=%d R=%d nb=%d nblk=%d shm=%zu t=%d: %s\n",
+                     g.N, g.K, g.KC, g.R, g.nb, g.nblk, shm, t, cudaGetErrorString(le)); exit(3); }
+  }
   chk("gemm fp32 loop");
   k_combine_f<<<(unsigned)((T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, g.nch);
   chk("gemm combine");
