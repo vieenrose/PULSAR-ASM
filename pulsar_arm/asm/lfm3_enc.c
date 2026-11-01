@@ -288,6 +288,16 @@ int main(int argc, char **argv) {
                 for (int hh = 0; hh < NKV; hh++) rmsnorm(k + ((size_t)t * NKV + hh) * HD, 1, HD, kn);
             }
             rope(q, k, Tt);
+            /* LFM_ENC_PROBE_LAYER=L: dump q/k/v after RoPE and the attention output, so a
+               GPU port can be localized to headnorm, RoPE, the scores, the softmax or the
+               PV accumulation. Off by default; it adds files, never changes numbers. */
+            const int pl = getenv("LFM_ENC_PROBE_LAYER") ? atoi(getenv("LFM_ENC_PROBE_LAYER")) : -1;
+            char pn[64];
+            if (pl == L) {
+                snprintf(pn, sizeof pn, "probe_q_%02d", L); DUMP(pn, q, (size_t)Tt * NH * HD);
+                snprintf(pn, sizeof pn, "probe_k_%02d", L); DUMP(pn, k, (size_t)Tt * NKV * HD);
+                snprintf(pn, sizeof pn, "probe_v_%02d", L); DUMP(pn, v, (size_t)Tt * NKV * HD);
+            }
             float *ao = malloc(sizeof(float) * (size_t)Tt * NH * HD);
             float *sc = malloc(sizeof(float) * (size_t)Tt);
             float scale = 1.0f / sqrtf((float)HD);
@@ -312,6 +322,7 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+            if (pl == L) { snprintf(pn, sizeof pn, "probe_ao_%02d", L); DUMP(pn, ao, (size_t)Tt * NH * HD); }
             linear(ao, Tt, NH * HD, Wo2, HID, NULL, out);
             free(q); free(k); free(v); free(ao); free(sc);
             free(Wq); free(Wk); free(Wv); free(Wo2); free(qn); free(kn);

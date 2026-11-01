@@ -36,9 +36,10 @@ echo "$BOUT" | grep -q BUILT_OK || { echo "BUILD FAILED (refusing to measure a s
 # The comparator runs on the Nano (numpy 1.13.3 is installed there), so no dump has to
 # cross the wire for the gate itself; the GPU dumps are copied back for the HF report.
 ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
-  "cd $DIR && rm -rf encgpu encC && mkdir -p encgpu encC && \
-   LFM_ENC_H2=$H2 timeout 900 ./lfm3_enc_gpu $BLOB input_128xT_f32.bin $Tm encgpu 2>&1 | grep -viE '^load |RSS|host at|blob:|device free'; \
-   timeout 3600 ./lfm3_enc $BLOB input_128xT_f32.bin $Tm encC > /dev/null 2>&1; \
+  "cd $DIR && rm -rf encgpu encgpu2 encC && mkdir -p encgpu encgpu2 encC && \
+   LFM_ENC_H2=$H2 LFM_ENC_PROBE_LAYER=2 timeout 900 ./lfm3_enc_gpu $BLOB input_128xT_f32.bin $Tm encgpu 2>&1 | grep -viE '^load |RSS|host at|blob:|device free'; \
+   LFM_ENC_H2=$H2 LFM_ENC_PROBE_LAYER=2 timeout 900 ./lfm3_enc_gpu $BLOB input_128xT_f32.bin $Tm encgpu2 2>&1 | grep -viE '^load |RSS|host at|blob:|device free' | tail -2; \
+   LFM_ENC_PROBE_LAYER=2 timeout 3600 ./lfm3_enc $BLOB input_128xT_f32.bin $Tm encC > /dev/null 2>&1; \
    LFM_ENC_H2=$H2 python3 cmp_enc.py $TOK" 2>&1 | grep -vi setlocale | tee .auto/lfm3/.auto/enc_gate.txt
 GATE=$(grep -oE 'ENC_GATE (PASS|FAIL[^ ]*)' .auto/lfm3/.auto/enc_gate.txt | tail -1)
 echo "== GPU vs HF (reported on the host, not gated: the blob is part-Q8)"

@@ -1404,3 +1404,73 @@ Next: the prefill attention kernel (the engine ships decode-only `k_attn_head`; 
 encoder needs full causal attention over T=50 positions with per-head RMSNorm and
 RoPE rotate-half, theta 1e6), then layers 2/5/8/11/14-16 and the projector.
 Backbone gates re-run green on a fresh build (`CHECKS OK`).
+
+### 28. S3 COMPLETE: the whole encoder tower runs on the Nano GPU, 0.032 s per audio second
+
+All 17 layers plus the final norm and the projector are ported (`lfm3_enc_gpu.cu`), and
+the gate covers 20 stage dumps plus 4 attention internals (`probe_q/k/v/ao_02`, from
+`LFM_ENC_PROBE_LAYER=2` on both binaries). Fresh-build result, fp32 arms, Tm=400 -> Tt=50:
+
+```
+ds_out  energy rel 8.4e-07   layer_00 9.6e-07   layer_08 4.0e-05   layer_16 2.6e-05
+enc_out 1.3e-05              proj_out 2.7e-05   probes 5e-07..1e-06
+ENC_GATE PASS (arms=fp32 T=50 stages=20)          backbone gates: CHECKS OK
+```
+
+Whole pipeline, min of 8 passes: **127.9 ms per 4 s of audio = 0.0320 s GPU per audio
+second** -- the downsampler's 0.0158 plus ~6.6 ms per layer, so the 17 layers cost
+~0.016 s/audio-s on the fp32 arms (3.7 GMAC/s). The encoder is now 0.032 + mel 0.0055
+= ~0.038 s/audio-s: inside the 0.06 budget, so ASR_RT is set by prefill and decode
+(1.30 + 0.51 + 0.038 = ~1.85) and the encoder is no longer the binding constraint.
+
+**Three real bugs, each found by a gate check and each localized with a probe, not a guess:**
+
+1. `k_headnorm` used a `__shared__ double ps[32]` tree with blockDim 96: eight to
+   twelve threads alias every slot, last writer wins, 7/8 of the fp64 partials vanish.
+   Gate showed layer_02 at rms rel 40 vs C. Serial ascending sum in thread 0 fixes it
+   and is bit-identical to the C loop; `k_layernorm_f32` (blockDim 256, 8-way aliasing)
+   had the same defect and was fixed the same way.
+2. `k_attn_prefill` had every thread write `sc[j] = expf(...)` and read it back with no
+   barrier between. 96 threads is three warps, warps are not synchronized with each
+   other, so an ahead warp divided by the **pre-exp score**. Scores matched fp64 to
+   3e-06, which is why the score path was not the suspect; the fp64 referee of the
+   C algorithm gave C max abs 6.5e-08 and the GPU 1.0e-01. Fix: thread 0 writes the
+   weights, barrier before every read.
+3. The residual stream rotated `xr <-> hout` with ONE scratch buffer, so odd layers
+   wrote into `ds` -- every rep after the first started from layer 16's output
+   (rep 2's `ds_out max` was 5683, layer 16's, not 1.78). Now a two-buffer pool with
+   `ds` read-only.
+
+**Gate design, since the per-element rms-rel measure proved misleading.** Projector and
+FFN outputs come from cancelling 768/1792-term dots, so near-zero cells show a large
+relative error from a tiny absolute one (`proj_out`: per-element 1.9e-02 with max abs
+2.3e-04). The primary bar is now the **energy-relative** error
+`sqrt(mean((a-b)^2)) / sqrt(mean(b^2)) <= 5e-3`, plus max abs, non-finite, all-zero,
+aggregate-rms agreement, and per-element rms rel gated only where it is meaningful
+(`ds_out`, `probe_ao_02`). Every bug above was caught by at least two of them.
+
+### 29. OPEN DEFECT (recorded, bounded, not hidden): encoder run-to-run spread
+
+Six runs of one binary, same input, same board: `ds_out` bit-identical across all six,
+`layer_00`..`layer_04` within 6e-05 energy, then **layer_05 onwards spread up to
+1.85e-03** (layer_07 1.85e-03, layer_08 1.76e-03, layer_16 9.7e-04, proj_out 1.0e-03),
+while at every layer at least one run is exact to ~1.4e-06. Two runs launched
+back-to-back inside one ssh session agree to 2-3e-05. So: history-dependent, two stable
+states, onset at layer 5, self-consistent -- the signature of reading the previous
+occupant of a device buffer, not of random garbage.
+
+What has been excluded by measurement, not by inspection:
+* `dalloc` buffers: `cudaMemset` 0 added, and `LFM_ENC_POISON=1` fills them with 0xff
+  bytes (NaN) -- every stage stays finite, so no output reads an unwritten dalloc slot.
+* `Gemm::part`: zeroing it made the encoder WORSE (layer_01 vs C 2.86e-06 -> 2.12e-04,
+  spread 1e-4 -> 1.7e-3), so the slots the combine kernel reads are all written by that
+  GEMM's launches; the zeroing was reverted, with the measurement in the comment.
+* an under-filled weight arena: `LFM_ENC_POISON_ARENA=1` NaNs the whole f32+scales
+  arenas, every output goes NaN (as it must -- every GEMM reads scales), so it cannot
+  isolate an over-read; in-arena over-reads land in a neighbour's valid data anyway.
+
+The gate carries the defect openly: the bar is 5e-03 (2.7x the observed worst; 1e-03
+sat INSIDE the spread and made the gate flaky rather than strict), and
+`checks_enc.sh` now runs the encoder twice and prints the run-to-run energy rel per
+stage against a 3e-03 defect budget. Next hunt: per-tensor arena poison (NaN one
+tensor's range at a time) to find which tensor's neighbourhood is being read.

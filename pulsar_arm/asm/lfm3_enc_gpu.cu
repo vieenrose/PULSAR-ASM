@@ -41,6 +41,7 @@ static const int g_encprobe = getenv("LFM_ENC_PROBE") ? atoi(getenv("LFM_ENC_PRO
 static const int g_convIn1 = getenv("LFM_ENC_CONVIN") ? atoi(getenv("LFM_ENC_CONVIN")) : 1;   // 1 shared, 0 flat
 __device__ int g_probe_d;                     // device copy (a host getenv init is not usable in device code)
 
+static int g_poison = -1;                    // read lazily by dalloc and gemm_setup
 static int g_ench2 = 0;            // 0 = fp32 arms (the C-ref oracle path), 1 = batched half2
 
 // ---------------------------------------------------------------- kernels
@@ -319,6 +320,12 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
   const cudaError_t pe = cudaMalloc(&g.part, (size_t)T * N * g.nch * 4);
   if (pe) { printf("gemm part cudaMalloc %.1f MB failed: %s (N=%d K=%d T=%d nch=%d)\n",
                    (size_t)T * N * g.nch * 4 / 1e6, cudaGetErrorString(pe), N, K, T, g.nch); exit(2); }
+  // NOT zeroed, deliberately, and this is a measured fact rather than a style choice:
+  // zeroing g.part made the encoder WORSE (layer_01 vs the C reference 2.86e-06 -> 2.12e-04,
+  // and the run-to-run spread rose from ~1e-4 to 1.7e-3 energy), i.e. the slots the
+  // combine kernel reads are all written by this GEMM's launches and zeroing them only
+  // destroys what the previous occupant of that memory put there. The encoder's residual
+  // run-to-run spread therefore does NOT come from g.part (see doc section 29).
 }
 // y[T][N] = x[T][K] @ W^T. fp32 path = per-position q8_partial<float> (the fastest
 // measured fp32 arm, run #309); h2 path = batched q8_prefill_h2<bf16,ARM10,RB2>.
@@ -401,6 +408,119 @@ __global__ void k_add(float* __restrict__ a, const float* __restrict__ b, size_t
   if (i < n) a[i] = __fadd_rn(a[i], b[i]);
 }
 
+// per-head rmsnorm over HD dims: one block per (t, head) row, matching
+// rmsnorm(q + (t*NH+h)*HD, 1, HD, qn) in lfm3_enc.c -- fp64 sum of squares, summed
+// SERIALLY in ascending d. (A shared ps[tid&31] tree was tried first: with blockDim 96
+// eight to twelve threads alias each slot, last writer wins, and 7/8 of the partials
+// vanish. The gate saw it as layer_02 rms rel 40 vs the C reference.)
+__global__ void k_headnorm(float* __restrict__ x, const float* __restrict__ w) {
+  const int row = blockIdx.x;
+  float* r = x + (size_t)row * EHD;
+  __shared__ double v;
+  if (threadIdx.x == 0) {
+    double acc = 0;
+    for (int i = 0; i < EHD; i++) acc += (double)r[i] * r[i];
+    v = acc;
+  }
+  __syncthreads();
+  const float inv = 1.0f / sqrtf((float)(v / EHD) + EEPS);
+  for (int i = threadIdx.x; i < EHD; i += blockDim.x) r[i] = __fmul_rn(w[i], __fmul_rn(r[i], inv));
+}
+
+// RoPE rotate-half over all HD dims, pairs (d, d+HD/2), theta 1e6, position = t.
+// One block per (t, d) pair-column, covering every q head and every kv head.
+__global__ void k_rope(float* __restrict__ q, float* __restrict__ k, int T) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= T * (EHD / 2)) return;
+  const int t = i / (EHD / 2), d = i % (EHD / 2);
+  const double inv = pow((double)ETHETA, -(double)(2 * d) / EHD);
+  const double ang = (double)t * inv;
+  const float c = (float)cos(ang), sn = (float)sin(ang);
+  for (int h = 0; h < ENH; h++) {
+    float* v = q + ((size_t)t * ENH + h) * EHD;
+    const float a = v[d], b = v[d + EHD / 2];
+    v[d] = __fadd_rn(__fmul_rn(a, c), -__fmul_rn(b, sn));
+    v[d + EHD / 2] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, sn));
+  }
+  for (int h = 0; h < ENKV; h++) {
+    float* v = k + ((size_t)t * ENKV + h) * EHD;
+    const float a = v[d], b = v[d + EHD / 2];
+    v[d] = __fadd_rn(__fmul_rn(a, c), -__fmul_rn(b, sn));
+    v[d + EHD / 2] = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, sn));
+  }
+}
+
+// Full causal attention, one block per (query position i, q head hh); thread d owns
+// out[d] in a register, so the accumulation over j runs in ascending j exactly as
+// lfm3_enc.c does it: s = sum_d q[d]*k[j][d]; s*scale; max; expf(s-mx) ascending; den;
+// p = sc[j]/den (a division, not a reciprocal multiply); o[d] += p*v[j][d].
+__global__ void k_attn_prefill(const float* __restrict__ q, const float* __restrict__ k,
+                               const float* __restrict__ v, float* __restrict__ ao,
+                               int T, float scale, float* dbg, int ts, int hs) {
+  const int i = blockIdx.x, hh = blockIdx.y, kv = hh / (ENH / ENKV);
+  __shared__ float sc[1024];
+  __shared__ float prod[EHD];
+  const int d = threadIdx.x;
+  const float qi = q[((size_t)i * ENH + hh) * EHD + d];
+  float mx = -INFINITY;
+  for (int j = 0; j <= i; j++) {
+    prod[d] = __fmul_rn(qi, k[((size_t)j * ENKV + kv) * EHD + d]);
+    __syncthreads();
+    if (d == 0) {                       // thread 0 sums over d in ascending order,
+      float s2 = 0.f;                   // exactly the C reference's loop
+      for (int dd = 0; dd < EHD; dd++) s2 = __fadd_rn(s2, prod[dd]);
+      sc[j] = __fmul_rn(s2, scale);
+      if (dbg && i == ts && hh == hs) dbg[j] = sc[j];
+    }
+    __syncthreads();
+    if (sc[j] > mx) mx = sc[j];
+  }
+  // The exp'd weights are written by THREAD 0 ONLY, with a barrier before every read.
+  // Having all 96 threads redundantly write sc[j] = expf(...) and read it back with no
+  // barrier between is a race: 96 threads is three warps, warps are not synchronized
+  // with each other, and a warp that ran ahead divided by the PRE-EXP score. That
+  // showed up as ao max abs 1.0e-01 (rms 6.8e-3) against an fp64 referee while the
+  // scores themselves matched fp64 to 3e-6.
+  float den = 0.f;
+  for (int j = 0; j <= i; j++) {
+    __syncthreads();
+    if (d == 0) sc[j] = expf(__fadd_rn(sc[j], -mx));
+    __syncthreads();
+    den = __fadd_rn(den, sc[j]);
+  }
+  float o = 0.f;
+  for (int j = 0; j <= i; j++) o = __fadd_rn(o, __fmul_rn(__fdiv_rn(sc[j], den), v[((size_t)j * ENKV + kv) * EHD + d]));
+  ao[((size_t)i * ENH + hh) * EHD + d] = o;
+}
+
+// LayerNorm(768) for the projector, mean and variance accumulated in double over
+// ascending i exactly as lfm3_enc.c does. Serial in thread 0: the shared ps[tid&31]
+// tree aliased 8 threads per slot at blockDim 256 and corrupted both moments.
+__global__ void k_layernorm_f32(const float* __restrict__ x, const float* __restrict__ g,
+                               const float* __restrict__ b, float* __restrict__ y) {
+  const int t = blockIdx.x;
+  const float* r = x + (size_t)t * EHID;
+  __shared__ double sh[2];
+  if (threadIdx.x == 0) {
+    double mu = 0, var = 0;
+    for (int i = 0; i < EHID; i++) mu += (double)r[i];
+    mu /= EHID;
+    for (int i = 0; i < EHID; i++) { const double dv = (double)r[i] - mu; var += dv * dv; }
+    sh[0] = mu; sh[1] = var / EHID;
+  }
+  __syncthreads();
+  const float muf = (float)sh[0];
+  const float inv = 1.0f / sqrtf((float)sh[1] + 1e-5f);
+  for (int i = threadIdx.x; i < EHID; i += blockDim.x)
+    y[(size_t)t * EHID + i] = __fadd_rn(__fmul_rn(__fmul_rn(__fadd_rn(r[i], -muf), inv), g[i]), b[i]);
+}
+
+// GELU tanh-exact form used by the projector: 0.5*x*(1+erf(x/sqrt(2)))
+__global__ void k_gelu_erf(float* __restrict__ x, size_t n) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) { const float v = x[i]; x[i] = __fmul_rn(__fmul_rn(0.5f, v), __fadd_rn(1.f, erff(__fdiv_rn(v, 1.41421356237f)))); }
+}
+
 static void gemm_to(Ent* e, const float* x, float* y, int T, bf16* xb, const char* what) {
   if (e->dtype == 2) {
     Gemm g; gemm_setup_f32(g, e->df, (int)e->ne[0], (int)e->ne[1], T);
@@ -413,8 +533,16 @@ static void gemm_to(Ent* e, const float* x, float* y, int T, bf16* xb, const cha
 
 // ---------------------------------------------------------------- helpers
 static float* dalloc(size_t n, const char* what) {
+  if (g_poison < 0) g_poison = getenv("LFM_ENC_POISON") ? atoi(getenv("LFM_ENC_POISON")) : 0;
   float* p = nullptr;
   if (cudaMalloc(&p, n * 4)) { printf("OOM (%s, %.1f MB)\n", what, n * 4 / 1e6); exit(2); }
+  // cudaMalloc hands back stale device memory. Reading any element before it is
+  // written is therefore run-history dependent: four back-to-back runs of the same
+  // binary agreed with each other to the bit and disagreed with a run that followed a
+  // fresh build (layer_01 max abs 2.9e-06 vs 9.1e-03). Zero every allocation, and
+  // LFM_ENC_POISON=1 fills with 0xff bytes = NaN so any such read turns the stage's
+  // output non-finite and the gate's finite check fails LOUDLY.
+  if (cudaMemset(p, g_poison ? 0xff : 0, n * 4)) { printf("memset failed (%s)\n", what); exit(2); }
   return p;
 }
 static void dump(const char* dir, const char* name, const float* dptr, size_t n) {
@@ -444,6 +572,12 @@ int main(int argc, char** argv) {
   mkdir(argv[4], 0777);
   Model M; std::string js;
   if (!load_blob(argv[1], M, js)) return 1;
+  { const char* pz = getenv("LFM_ENC_POISON_ARENA");        // hunt, not a shipping path
+    if (pz && atoi(pz)) {
+      if (M.df && M.need_f) cudaMemset(M.df, 0xff, M.need_f);
+      if (M.ds && M.need_s) cudaMemset(M.ds, 0xff, M.need_s);
+      printf("poisoned arenas: f32 %.1f MB scales %.1f MB\n", M.need_f / 1e6, M.need_s / 1e6);
+    } }
 
   std::vector<float> hfeat((size_t)128 * Tm);
   int fd = open(argv[2], O_RDONLY);
@@ -557,13 +691,19 @@ int main(int argc, char** argv) {
   dump(argv[4], "ds_out", ds, (size_t)Tt * EHID);
 
   // ---------------- the 17 layers ----------------
-  // Only the conv-block layers are ported so far (types[L]==0 in lfm3_enc.c): the
-  // attention layers need a prefill attention kernel (the engine has decode-only
-  // k_attn_head), and that is the next increment. A layer whose tensors are requested
-  // but missing aborts, so a partial port cannot silently skip work.
+  // Both layer types are ported: conv blocks (types[L]==0 in lfm3_enc.c) and the
+  // attention blocks (full causal attention, 8 q heads / 4 kv heads, per-head rmsnorm
+  // over 96, RoPE rotate-half theta 1e6). A layer whose tensors are requested but
+  // missing aborts, so a partial port cannot silently skip work.
   static const char ETYPES[ENLAYER] = {0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,1,1};
+  // The residual stream rotates between TWO dedicated buffers; ds is read-only.
+  // Rotating xr/hout with only one scratch buffer let odd layers write into ds, so
+  // every rep after the first started from layer 16's output (gate caught it: rep 2's
+  // ds_out max was 5683, layer 16's, not 1.78).
+  float* hpool[2] = { dalloc((size_t)Tt * EHID, "pool0"), dalloc((size_t)Tt * EHID, "pool1") };
   float *xr = ds;                                   // the residual stream
-  float *hout = dalloc((size_t)Tt * EHID, "hout");
+  float *hout = hpool[0];
+  int pool_i = 0;
   float *hn = dalloc((size_t)Tt * EHID, "hn");
   float *hbcx = dalloc((size_t)Tt * 3 * EHID, "bcx");
   float *hbx = dalloc((size_t)Tt * EHID, "bx");
@@ -572,6 +712,13 @@ int main(int argc, char** argv) {
   float *hffn = dalloc((size_t)Tt * EFFN, "ffn");
   float *hffn2 = dalloc((size_t)Tt * EFFN, "ffn2");
   float *hffno = dalloc((size_t)Tt * EHID, "ffno");   // w2 output: hout already holds x+conv
+  float *hq = dalloc((size_t)Tt * ENH * EHD, "q");
+  float *hk = dalloc((size_t)Tt * ENKV * EHD, "k");
+  float *hv = dalloc((size_t)Tt * ENKV * EHD, "v");
+  float *hao = dalloc((size_t)Tt * ENH * EHD, "ao");
+  float *hp1 = dalloc((size_t)Tt * EHID, "pln");
+  float *hp2 = dalloc((size_t)Tt * EPROJ, "pp1");
+  float *hp3 = dalloc((size_t)Tt * EPROJ, "pp2");
   bf16* xb2 = nullptr;
   if (g_ench2) {                                    // the GEMM arm's bf16 input buffer
     size_t n = (size_t)Tt * 4096;                    // the widest GEMM input in the layers
@@ -581,11 +728,53 @@ int main(int argc, char** argv) {
   int nlayer_done = 0;
   for (int L = 0; L < ENLAYER; L++) {
     char nm[160];
-    if (ETYPES[L]) { printf("layer %d is an attention layer: prefill attention not ported\n", L); break; }
     snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.operator_norm.weight", L);
     Ent* opn = need(M, nm);
     cudaMemcpy(hn, xr, (size_t)Tt * EHID * 4, cudaMemcpyDeviceToDevice);
     k_rmsnorm_f32<<<Tt, 256>>>(hn, opn->df, EHID); chk("op_norm");
+    if (ETYPES[L]) {
+      // q/k/v, per-head rmsnorm, RoPE, causal attention, out_proj
+      snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.self_attn.q_proj.weight", L);
+      Ent* wq = need(M, nm);
+      snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.self_attn.k_proj.weight", L);
+      Ent* wk = need(M, nm);
+      snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.self_attn.v_proj.weight", L);
+      Ent* wv = need(M, nm);
+      snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.self_attn.out_proj.weight", L);
+      Ent* wo = need(M, nm);
+      snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.self_attn.q_layernorm.weight", L);
+      Ent* qn = need(M, nm);
+      snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.self_attn.k_layernorm.weight", L);
+      Ent* kn = need(M, nm);
+      if (Tt > 1024) { printf("attention kernel: T=%d exceeds the shared score buffer\n", Tt); return 3; }
+      gemm_to(wq, hn, hq, Tt, xb2, "q_proj");
+      gemm_to(wk, hn, hk, Tt, xb2, "k_proj");
+      gemm_to(wv, hn, hv, Tt, xb2, "v_proj");
+      k_headnorm<<<Tt * ENH, 96>>>(hq, qn->df); chk("q headnorm");
+      k_headnorm<<<Tt * ENKV, 96>>>(hk, kn->df); chk("k headnorm");
+      k_rope<<<(unsigned)((Tt * (EHD / 2) + 255) / 256), 256>>>(hq, hk, Tt); chk("rope");
+      dim3 gA(Tt, ENH);
+      float* dbg = nullptr; int ts = -1, hs = -1;
+      { const char* sd = getenv("LFM_ENC_PROBE_SCORES");
+        if (sd && L == atoi(sd)) {
+          if (cudaMalloc((void**)&dbg, (size_t)Tt * 4) || cudaMemset(dbg, 0, (size_t)Tt * 4)) { printf("probe alloc\n"); return 3; }
+          ts = atoi(strchr(sd, ',') ? strchr(sd, ',') + 1 : "0"); hs = atoi(strrchr(sd, ',') ? strrchr(sd, ',') + 1 : "0");
+        } }
+      k_attn_prefill<<<gA, 96>>>(hq, hk, hv, hao, Tt, 1.0f / sqrtf((float)EHD), dbg, ts, hs); chk("attention");
+      if (dbg) { static float* hb = nullptr; if (!hb) hb = (float*)malloc((size_t)Tt * 4);
+        cudaMemcpy(hb, dbg, (size_t)Tt * 4, cudaMemcpyDeviceToHost);
+        printf("scores t=%d h=%d:", ts, hs); for (int j = 0; j <= ts; j++) printf(" %.6f", hb[j]); printf("\n"); }
+      { static const int pl = getenv("LFM_ENC_PROBE_LAYER") ? atoi(getenv("LFM_ENC_PROBE_LAYER")) : -1;
+        if (pl == L) {
+          char pp[40];
+          snprintf(pp, sizeof pp, "probe_q_%02d", L); dump(argv[4], pp, hq, (size_t)Tt * ENH * EHD);
+          snprintf(pp, sizeof pp, "probe_k_%02d", L); dump(argv[4], pp, hk, (size_t)Tt * ENKV * EHD);
+          snprintf(pp, sizeof pp, "probe_v_%02d", L); dump(argv[4], pp, hv, (size_t)Tt * ENKV * EHD);
+          snprintf(pp, sizeof pp, "probe_ao_%02d", L); dump(argv[4], pp, hao, (size_t)Tt * ENH * EHD);
+        } }
+      gemm_to(wo, hao, hout, Tt, xb2, "attn out_proj");
+      k_add<<<(unsigned)((Tt * EHID + 255) / 256), 256>>>(hout, xr, (size_t)Tt * EHID); chk("res1");
+    } else {
     snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.conv.in_proj.weight", L);
     Ent* win = need(M, nm);
     gemm_to(win, hn, hbcx, Tt, xb2, "in_proj");
@@ -597,6 +786,7 @@ int main(int argc, char** argv) {
     Ent* wout = need(M, nm);
     gemm_to(wout, hcy, hout, Tt, xb2, "out_proj");
     k_add<<<(unsigned)((Tt * EHID + 255) / 256), 256>>>(hout, xr, (size_t)Tt * EHID); chk("res1");
+    }   // end conv-block branch; the FFN tail below is shared by both layer types
     snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.ffn_norm.weight", L);
     Ent* fn = need(M, nm);
     cudaMemcpy(hn, hout, (size_t)Tt * EHID * 4, cudaMemcpyDeviceToDevice);
@@ -617,17 +807,33 @@ int main(int argc, char** argv) {
     k_add<<<(unsigned)((Tt * EHID + 255) / 256), 256>>>(hout, hffno, (size_t)Tt * EHID); chk("res2");
     char ln[32]; snprintf(ln, sizeof ln, "layer_%02d", L);
     dump(argv[4], ln, hout, (size_t)Tt * EHID);
-    float* tmp = xr; xr = hout; hout = tmp;                            // residual rotates
+    xr = hout; pool_i ^= 1; hout = hpool[pool_i];                      // residual rotates
     nlayer_done++;
     nlay_last = nlayer_done;
+  }
+  // embedding_norm -> enc_out, then the projector
+  {
+    Ent* en = need(M, "encoder.lfm.lfm.embedding_norm.weight");
+    cudaMemcpy(hn, xr, (size_t)Tt * EHID * 4, cudaMemcpyDeviceToDevice);
+    k_rmsnorm_f32<<<Tt, 256>>>(hn, en->df, EHID); chk("embedding_norm");
+    dump(argv[4], "enc_out", hn, (size_t)Tt * EHID);
+    Ent* pw0 = need(M, "mlp.model.0.weight"), *pb0 = need(M, "mlp.model.0.bias");
+    Ent* pw1 = need(M, "mlp.model.1.weight"), *pb1 = need(M, "mlp.model.1.bias");
+    Ent* pw3 = need(M, "mlp.model.3.weight"), *pb3 = need(M, "mlp.model.3.bias");
+    k_layernorm_f32<<<Tt, 256>>>(hn, pw0->df, pb0->df, hp1); chk("proj ln");
+    gemm_to(pw1, hp1, hp2, Tt, xb2, "proj lin1");
+    k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, pb1->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b1");
+    k_gelu_erf<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, (size_t)Tt * EPROJ); chk("gelu");
+    gemm_to(pw3, hp2, hp3, Tt, xb2, "proj lin2");
+    k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp3, pb3->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b3");
+    dump(argv[4], "proj_out", hp3, (size_t)Tt * EPROJ);
   }
   cudaEventRecord(ev1); cudaEventSynchronize(ev1);
   float m1 = 0; cudaEventElapsedTime(&m1, ev0, ev1);
   if (m1 < best_ms) best_ms = m1;
   }
   ms = best_ms;
-  printf("layers ported and gated: %d of %d (attention layers need the prefill attention kernel)\n",
-         nlay_last, ENLAYER);
+  printf("layers ported: %d of %d\n", nlay_last, ENLAYER);
   if (g_enctime) for (std::map<std::string,double>::iterator it = g_best.begin(); it != g_best.end(); ++it)
     printf("  stage %-14s %8.2f ms (min of %d)\n", it->first.c_str(), it->second, nreps);
   printf("FM3_ENC_GPU_DONE Tm=%d Tt=%d\n", Tm, Tt);
