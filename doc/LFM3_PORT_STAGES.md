@@ -1356,3 +1356,51 @@ on the fp32 arms and 0.078-0.088 on the batched half2 arms, so the encoder lands
 `in_proj -> B*X -> gated depthwise conv3 -> C*y -> out_proj`, the attention layers
 (prefill attention + head-norm + RoPE), and the FFN, gated per layer against
 `lfm3_enc.c`'s existing `layer_XX` dumps.
+
+### 27. S3 layer path: the conv block + FFN ported, gated on layers 0-1; the gate caught a dropped residual branch (run #312)
+
+The encoder's layer loop now runs on the GPU for the conv-block layers
+(`types[L]==0` in the C reference: in_proj -> B*X -> causal depthwise conv width 3 ->
+C*y -> out_proj -> residual -> ffn_norm -> w1/w3 -> silu*mul -> w2 -> residual), with
+`k_rmsnorm_f32` keeping the C reference's **fp64 sum-of-squares**, `k_bcx_split`,
+`k_conv3_causal` (its `t-2+k < 0` taps skipped, as the reference skips them) and
+`k_silu_mul`. Layers 0 and 1 gate against `lfm3_enc.c`'s existing `layer_XX` dumps:
+
+```
+ds_out     rms rel 3.449e-05 vs C   max abs 2.503e-06   rms 0.12701 both   OK
+layer_00   rms rel 2.055e-04 vs C   max abs 2.384e-06   rms 0.12758 both   OK
+layer_01   rms rel 1.887e-04 vs C   max abs 2.861e-06   rms 0.13835 both   OK
+ENC_GATE PASS (arms=fp32 T=50 stages=3)
+```
+
+Three things this increment established:
+
+1. **A real bug, caught by the gate on its first run.** The FFN's w2 output was written
+   into the same buffer that already held `x + conv`, so the conv branch silently
+   dropped out of the residual (`rms rel 24 vs C`, aggregate rms 0.1312 vs 0.1276). The
+   C reference accumulates `out = conv_out; out += x; out += ffn`, so the FFN needs its
+   own buffer. It is why the gate checks three independent things per stage: rms rel,
+   max abs, and the aggregate rms agreeing to 4 decimals -- all three flagged it.
+2. **Per-stage gates, with the reason written down.** `ds_out` is gated at 1e-4 rms
+   (only `lin_out` is Q8 there, so both sides run the same fp32 arithmetic). The
+   `layer_*` stages have five Q8 linears, and the C reference *dequantizes to float and
+   dots in ascending k* while the engine's Q8 arm dots the int8 codes per 32-code block
+   and scales after: two legitimate fp32 algorithms that differ by ~1e-3 on cancelling
+   768-term dots (run #309 measured exactly this). So `layer_*` is gated at rms rel
+   2e-2 AND max abs 1e-3 AND aggregate-rms agreement. Measured: 1.9-2.1e-4, 2.4-2.9e-6,
+   agreement in the 4th decimal.
+3. **Determinism verified** (3 repeats, max abs difference 0.000e+00), so a gate reading
+   is a property of the code, not of the run.
+
+Cost, min over 6 passes of the whole pipeline, Tm=400 -> Tt=50:
+**176.5 ms = 0.0441 s GPU per audio second** for the downsampler + 2 conv layers, i.e.
+~55 ms per conv layer. Extrapolated over 17 layers that is ~0.23-0.28 s/audio-s on the
+fp32 arms -- 4x over the 0.06 budget, and the batched half2 arm (16-18 GMAC/s on these
+shapes, run #309) is the path that brings it to ~0.10-0.12. Per-stage attribution inside
+the layer loop is not trustworthy yet (the dumps' host writes sit inside the timed
+windows), so only the total is quoted; the instrument needs the dumps moved out.
+
+Next: the prefill attention kernel (the engine ships decode-only `k_attn_head`; the
+encoder needs full causal attention over T=50 positions with per-head RMSNorm and
+RoPE rotate-half, theta 1e6), then layers 2/5/8/11/14-16 and the projector.
+Backbone gates re-run green on a fresh build (`CHECKS OK`).

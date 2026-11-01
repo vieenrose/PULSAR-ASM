@@ -1,7 +1,13 @@
 Tm=400 -> EWo1=200 EWo2=100 tokens Tt=50 (expect ceil(Tm/8)); arms=fp32
   lin_mid N=256 K=256 T=3200 f32 weights
-downsampler 155.10 ms = 0.0388 s GPU per audio second (458 MMAC, 3.0 GMAC/s)
+ENCODER total 180.38 ms (min of 1) = 0.0451 s GPU per audio second; downsampler alone 458 MMAC, 2.5 GMAC/s at that rate
 dump ds_out       n=38400 nonzero=38400 max=1.7826
+dump layer_00     n=38400 nonzero=38400 max=1.6371
+dump layer_01     n=38400 nonzero=38400 max=1.6621
+layer 2 is an attention layer: prefill attention not ported
+layers ported and gated: 2 of 17 (attention layers need the prefill attention kernel)
 FM3_ENC_GPU_DONE Tm=400 Tt=50
   ds_out     rms rel 3.449e-05 vs C  max abs 2.503e-06  rms(GPU) 0.12701 rms(C) 0.12701  nonzero 38400/38400  OK
-ENC_GATE PASS (arms=fp32 T=50 stages=1)
+  layer_00   rms rel 2.055e-04 vs C  max abs 2.384e-06  rms(GPU) 0.12758 rms(C) 0.12758  nonzero 38400/38400  OK
+  layer_01   rms rel 1.887e-04 vs C  max abs 2.861e-06  rms(GPU) 0.13835 rms(C) 0.13835  nonzero 38400/38400  OK
+ENC_GATE PASS (arms=fp32 T=50 stages=3)
