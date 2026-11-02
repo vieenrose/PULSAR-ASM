@@ -1,5 +1,3 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: OpenMDW-1.1
 #pragma once
-
-// InstanceNorm2d with fused mean/var, normalize, affine, PReLU
+void instancenorm2d_prelu(const float *x, float *y, int N, int C, int H, int W,
+                          const float *w, const float *b, const float *alpha, float eps);
