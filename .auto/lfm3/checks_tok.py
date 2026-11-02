@@ -4,6 +4,12 @@
 Builds fixtures (31 hand-written + 500 seeded fuzz, the same corpus mktok.py replays),
 dumps expected ids from the HF tokenizer, builds tok.bin, compiles the C driver and
 compares. Exit 0 iff every fixture is exact.
+
+Run it with the HF venv, not the system python:
+  /home/louis/venvs/lfm3/bin/python -I checks_tok.py
+The system python3.8 transformers cannot load this checkpoint's tokenizer
+(broken PIL, and the tokenizer registers through the remote-code processor),
+which presents as a gate failure and is not one.
 """
 import json
 import os
@@ -39,8 +45,17 @@ CORPUS = [
 
 
 def main():
-    from transformers import AutoTokenizer
-    hf = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    from transformers import AutoTokenizer, AutoProcessor
+    try:
+        hf = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    except Exception as e:
+        # transformers 5.x registers this checkpoint's tokenizer through the
+        # remote-code processor ("Tokenizer class TokenizersBackend does not exist"
+        # from a bare AutoTokenizer), and hf_asr_golden.py decodes through the
+        # processor's own tokenizer successfully -- use that, and say so.
+        print("  AutoTokenizer failed (%s); using AutoProcessor(...).tokenizer" % e)
+        hf = AutoProcessor.from_pretrained(MODEL, trust_remote_code=True,
+                                           local_files_only=True).tokenizer
     os.makedirs(FIX, exist_ok=True)
     rng = random.Random(1234)
     alpha = (list("abcXYZ019 .'\t\n\r\"!?-_/:;()[]{}#$%&*+=<>@~`|\\")

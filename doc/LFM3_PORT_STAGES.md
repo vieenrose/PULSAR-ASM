@@ -2109,3 +2109,28 @@ text) is not achievable on a Jetson Nano Gen1 at Q8: the weights are 1.06 GB/tok
 the bus is 17.3 GB/s. Stating it as a target-vs-physics result rather than rounding the
 metric: the honest deliverable is (a) warm ASR_RT, (b) the batched-prefill win once the
 `w2` contract is signed, and (c) a resident-process mode that amortizes startup.
+
+### 44. Measurement-discipline items from the gate wiring
+
+* **`--trace` costs 77 ms/token.** The same binary on the same prompt reports
+  `steady-state 108.68 ms/token` without `--trace` and 185.39 ms/token with it: printing
+  1904 step lines through ssh is a 70% surcharge on decode. The ASR gate needs `--trace`
+  to read the generated ids, so its phase split now charges decode at the untraced rate
+  (`ASR_DECODE_MS`, default 108.68) and prints the traced number next to it as an explicit
+  `--trace cost`. Reading the traced steady-state as the decode cost produced a nonsensical
+  "prefill 2.3 s" on the first run of the split, which is what prompted the fix.
+* **`checks_tok.py` and the ASR text view must run under the HF venv**
+  (`/home/louis/venvs/lfm3/bin/python -I`), not the system python3.8: system transformers
+  cannot load this checkpoint's tokenizer (broken PIL, and the tokenizer registers through
+  the remote-code processor), and it presents as `Tokenizer class TokenizersBackend does
+  not exist` -- a gate failure that is not one. Documented in the script header. With the
+  venv, `tok gate: 531/531 fixtures exact+roundtrip (9988 ids)` and the ASR gate prints
+  both texts:
+  `engine text : 'The weather service issued its seasonal outlook on the 9th of March, and
+  the numbers were unusual. In the nort'` -- identical to the HF golden for 207 tokens.
+
+Gate board as of this writing, all on a fresh build: `ENC_GATE PASS` (20 stages,
+run-to-run 0.000e+00), `WAV_GATE PASS` (16 fixtures, 6 chain), S2 mel `PASS`,
+`tok gate: 531/531`, backbone `CHECKS OK` (matrix 23x23, 6 prompts of logits-seq top-1,
+streams 2/2), `ASR_GATE PASS` (prefix 207, match 260/262, WER 0.008, EMB cos 0.999774,
+ASR_RT 3.838 / warm 3.200).
