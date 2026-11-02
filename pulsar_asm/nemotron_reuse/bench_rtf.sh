@@ -11,6 +11,11 @@ BLOB="${BLOB:-$DIR/tests/golden/reuse.blob}"
 # 3 GiB shared-memory GPU on Nano Gen1: 1 GiB+ arenas get over-committed and
 # fault ("launch timed out"). 640 MiB covers the encoder peak (~560 MiB).
 export REUSE_WS_MB="${REUSE_WS_MB:-640}"
+# On Nano Gen1 the async path dies with a Tegra poisoned-page MMU fault
+# (dmesg: "fake mmu fault ... type 15 (poisoned)") once the launch queue gets
+# deep; serialising launches avoids it. Launch overhead is ~0.1 s against a
+# ~225 s model, so this does not materially affect RTF.
+if [ -e /etc/nv_tegra_release ]; then export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"; fi
 BIN="${BIN:-$DIR/engine/reuse_nano_gpu}"
 REPS="${REPS:-5}"
 FIXTURES="${@:-$DIR/tests/golden/fixtures/mic_test2_8000.wav $DIR/tests/golden/fixtures/mic_test2_16000.wav}"

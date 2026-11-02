@@ -12,16 +12,19 @@ See [doc/NEMOTRON_REUSE_NANO_PLAN.md](../../doc/NEMOTRON_REUSE_NANO_PLAN.md) for
 
 ## Status
 - [x] Branch `nemotron-re-use-jetson-nano` created and pushed
-- [x] Port plan committed and pushed (S0 scaffolding started)
-- [ ] S0: Reference model + fixtures + dumps
-- [ ] S1: Weight blob conversion
-- [ ] S2: STFT front-end
-- [ ] S3: Encoder
-- [ ] S4: TFMamba tower (30 blocks, fused selective scan)
-- [ ] S5: Decoders + iSTFT
-- [ ] S6: Driver (full-clip + chunked modes)
-- [ ] S7: RTF benchmarking
-- [ ] S8: Gated optimizations
+- [x] Port plan (`doc/NEMOTRON_REUSE_NANO_PLAN.md`)
+- [x] S0: fixtures + fp32 PyTorch references (4 rates) + stage dumps
+- [x] S1: weight blob (`reuse.blob`, 1416 tensors)
+- [x] S2: STFT / iSTFT, DFT-GEMM, no cuFFT, non-power-of-two nfft
+- [x] S3: DenseEncoder (gated <= 6.8e-7)
+- [x] S4: 30x TFMamba - conv1d, selective scan, bidirectional, LayerNorm
+- [x] S5: magnitude + phase decoders, atan2 head, sweep mask, iSTFT
+- [x] S6: drivers (CPU `reuse_host.c`, GPU `reuse_host_gpu.c`) + RTF reporting
+- [x] S7: CUDA kernels; **verified on the Jetson Nano itself** (sm_53):
+      complex rel-rms 1.104e-06, waveform SNR 119.91 dB, gate PASS
+- [x] S8 (partial): out_proj tiled+fused gate -> tower 47.5 s -> 8.6 s on the
+      dev host; Nano RTF_model 43.98 at 8 kHz (not real time, see RTF below)
+- [ ] S8 (open): real-time (RTF < 1) is NOT achieved; see next steps
 
 ## Accuracy Gates
 Unlike other PULSAR-ASM ports, bit-exactness vs PyTorch is not required (exp/atan2/log1p). Gates:
@@ -64,26 +67,78 @@ noise of the same rms gives 99 dB, so the DFT-vs-FFT phase delta is coherent and
 lands in the direction the 30-block recurrent tower amplifies. Reaching 50 dB
 end-to-end requires reproducing the reference FFT's float32 rounding bit-for-bit.
 
-## RTF (measured on GTX 1070, naive kernels; Jetson Nano numbers pending)
+## RTF (RTF = processing wall time / audio duration; <1 = faster than real time)
 
-| fixture | audio | model | RTF_model | iSTFT (CPU) | RTF_total |
-|---|---|---|---|---|---|
-| 8 kHz | 5.10 s | 48.6 s | 9.53 | 1.02 s | 9.75 |
-| 16 kHz | 5.10 s | 98.1 s | 19.23 | 3.58 s | 19.94 |
+Jetson Nano Gen1 (tegra210, 1 SM / 128 cores @ 921 MHz, CUDA 10.2, L4T R32.5.1,
+`sm_53`, 8 kHz fixture, 5.100 s audio, `CUDA_LAUNCH_BLOCKING=1`):
 
-Phase breakdown at 8 kHz: encoder 0.86 s, 30x TFMamba 47.4 s (97.5%), decoders
-0.33 s. The Mamba tower dominates. A tiled GEMM for the projections was measured
-to give no speedup (48.6 -> 48.3 s), and skipping individual Mamba kernels
-(in_proj / conv / x_proj / dt_proj / scan / out_proj / concat) individually
-changed the block time by <1%, so the tower is **not** bound by any single
-kernel body; the block cost (1.576 s/block) is structural and the hot kernel is
-not yet identified. The profiler available for CUDA 10.2 does not support the
-dev-host GPU, so per-kernel attribution is still open.
+| phase | time | share |
+|---|---|---|
+| DenseEncoder | 43.50 s | 19% |
+| 30x TFMamba | 166.17 s | 74% |
+| decoders | 14.62 s | 7% |
+| heads | 0.01 s | 0% |
+| **model best** | **224.32 s** | **RTF_model 43.98** |
+| STFT (CPU) | 0.44 s | RTF 0.09 |
+| iSTFT (CPU) | 6.91 s | RTF 1.36 |
+| **total** | **231.23 s** | **RTF_total 45.34** |
 
-**Consequence for the Nano:** the Nano has 1 SM vs the 1070's 15, so RTF_model
-on the order of 100+ is expected for the current kernels. Real-time (RTF < 1)
-needs the kernel-level optimization pass in plan section 4, and the first step
-is working per-kernel profiling on the target.
+Gate on the device: complex spectrum rel-rms **1.104e-06**, waveform SNR
+**119.91 dB** -> PASS (identical to the dev host: same kernels, fp32).
+
+Dev host (GTX 1070, 15 SMs, `sm_61`), same code:
+
+| fixture | model | RTF_model | iSTFT (CPU) | RTF_total |
+|---|---|---|---|---|
+| 8 kHz | 9.73 s | 1.91 | 1.27 s | 2.13 |
+| 16 kHz | 19.9 s | 3.91 | 4.29 s | 4.71 |
+
+Nano is ~23x the 1070 model time (1 SM vs 15, 0.55x clock).
+
+## Per-kernel profile of the tower (dev host, `REUSE_KPROF=1`)
+
+Time between instrumentation marks, one Mamba scan direction
+(S=81, L=256, 8 kHz):
+
+| kernel | per call | note |
+|---|---|---|
+| in_proj | 0.0332 s | 5.4 GFlop -> 163 GFLOPS (already at tiled-GEMM rate) |
+| x_proj | 0.0214 s | |
+| conv1d (causal, depthwise) | 0.0064 s | |
+| dt_proj | 0.0048 s | |
+| selective scan | 0.0011 s | |
+| **out_proj + gate (tiled)** | **0.00060 s** | was 0.32 s as an SGEMV -> ~590x |
+| concat window | 0.138 s | includes the un-instrumented output_proj GEMV + LayerNorm |
+| residual windows | 0.141 / 0.147 s | frequency/output residual scatter |
+
+The original hotspot was **out_proj**: 0.31-0.33 s per direction, ~81% of a
+block. That is why skipping any single kernel moved the block time <1%, and
+why the earlier tiled-GEMM experiment (which left out_proj alone) showed no
+gain. Replacing it with a 32x32 shared-memory tiled kernel that fuses
+`y * silu(z)` into the A-tile load took the tower from 47.5 s to 8.6 s.
+
+Next targets, in order: the `in_proj` projection (tiled, register-blocked),
+the concat/residual transpose-scatter kernels (pure memory motion), and moving
+STFT/iSTFT to the GPU (iSTFT alone is RTF 1.36 on the Nano - it is the single
+largest non-model cost).
+
+## Nano-only blockers found (all fixed)
+1. **Arena unit bug.** `REUSE_WS_MB` was megabytes-of-*floats*, so the default
+   "512 MB" workspace was 2 GiB. On the Nano's shared-memory GPU a 2 GiB
+   `cudaMalloc` succeeds as an over-commit and then a kernel touching an
+   unbacked page gets a poisoned-page MMU fault, which CUDA reports as
+   `the launch timed out and was terminated` - indistinguishable from a
+   watchdog kill. MB now means bytes, with a halving probe and a clean
+   `workspace exhausted` error. Encoder peak is ~560 MiB, so the Nano scripts
+   default to `REUSE_WS_MB=640`.
+2. **Async launch queues fault on Nano.** With a 640 MiB arena and ~1.5 GiB
+   free, the async path dies with `nvgpu: fake mmu fault ... type 15
+   (poisoned)`; `CUDA_LAUNCH_BLOCKING=1` completes. Launch overhead is ~0.1 s
+   against a 225 s model, so the bench/gate scripts set it on Tegra. The async
+   path is an open issue.
+3. **Weight-name lifetime.** Freeing the host blob after the weight upload
+   broke lookups because the entry name strings pointed into it; names are now
+   copied at create time (this also fixed a latent use-after-free).
 
 ## Build
 
@@ -104,10 +159,20 @@ every downstream number is meaningless. Verify with
 `load_state_dict(..., strict=False)` reporting **0 missing / 0 unexpected**.
 
 ## Next steps
-1. Per-kernel profiling of the TFMamba tower on the target (nsight-compute on Nano).
-2. Optimize: fused Mamba direction kernel, chunked/decoupled-lookback scan for
-   parallelism over L, shared-memory tiled convolutions, fp32 compensated
-   reductions (already in InstanceNorm).
-3. Move STFT/iSTFT to the GPU (DFT-GEMM kernels exist on CPU; nfft is
-   non-power-of-two at 44.1/48 kHz).
-4. Measure RTF on the `ipho` Jetson Nano once device access is available.
+Ordered by expected RTF impact on the Nano:
+1. **iSTFT/STFT on the GPU.** iSTFT alone is RTF 1.36 on the Nano (CPU, 4x A57)
+   - larger than everything except the tower. The DFT-GEMM kernels already
+   exist on the CPU and handle nfft=1764/1920.
+2. **Encoder convolutions.** 43.5 s of Nano time (19%) in naive convs; tiled
+   shared-memory convolutions, and the dense-block concat in shared memory.
+3. **in_proj + the concat/residual scatters.** in_proj is 163 GFLOPS (at the
+   tiled-GEMM rate, so it needs register blocking + double buffering, not just
+   tiling); concat/resid are pure transposes (0.14 s windows each on the host).
+4. **Fusion / launch reduction.** 30 blocks x ~12 launches; CUDA graph capture
+   per block would cut launch overhead, which matters most on the Nano where
+   the async path is currently forced to serialize (blocker 2 above).
+5. fp16/half2 storage for weights (38.6 MB -> 19 MB) to cut memory traffic;
+   gate at SNR >= 30 dB + perceptual delta <= 0.02.
+6. 44.1 / 48 kHz: gates not run (GPU cost ~44x the 8 kHz model); the STFT
+   scales with the sample rate, so all rates run ~200 frames/s.
+7. Chunked/streaming mode for true streaming RTF (plan S6, not started).

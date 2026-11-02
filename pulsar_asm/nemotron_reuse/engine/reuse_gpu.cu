@@ -57,6 +57,7 @@ extern "C" int reuse_gpu_ok(reuse_gpu_t *g, const char *where)
 extern "C" void reuse_gpu_destroy(reuse_gpu_t *g)
 {
     if (!g) return;
+    if (g->ents) { for (int i2 = 0; i2 < g->n; i2++) free((void*)g->ents[i2].name); }
     if (g->base) cudaFree(g->base);
     if (g->ws) cudaFree(g->ws);
     free(g->ents);
@@ -105,7 +106,8 @@ extern "C" reuse_gpu_t *reuse_gpu_create(const reuse_blob_t *blob)
             fprintf(stderr, "upload failed for %s\n", blob->tensors[i].name);
             reuse_gpu_destroy(g); return NULL;
         }
-        g->ents[i].name = blob->tensors[i].name;
+        // own the name strings: the host blob is freed once weights are uploaded
+        g->ents[i].name = strdup(blob->tensors[i].name);
         g->ents[i].dptr = g->base + off;
         off += blob->tensors[i].nelem;
     }
@@ -118,13 +120,19 @@ extern "C" reuse_gpu_t *reuse_gpu_create(const reuse_blob_t *blob)
     g->ws = NULL;
     for (size_t mb = want_mb; mb >= 32 && !g->ws; mb >>= 1) {
         size_t cap = mb * 1024 * 1024 / sizeof(float);
-        if (cudaMalloc(&g->ws, cap * sizeof(float)) == cudaSuccess) {
-            g->ws_cap = cap;
-            if (mb != want_mb) fprintf(stderr, "workspace: %zu MiB (requested %zu MiB)\n", mb, want_mb);
-        } else {
-            cudaGetLastError();
-            g->ws = NULL;
+        if (cudaMalloc(&g->ws, cap * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError(); g->ws = NULL; continue;
         }
+        // Tegra backs pages lazily: a 640 MiB cudaMalloc "succeeds" and then a
+        // kernel touching an unbacked page produces a poisoned-page MMU fault
+        // reported as a launch timeout. Touch the arena now so the failure, if
+        // any, is a clean allocation failure at startup.
+        if (cudaMemset(g->ws, 0, cap * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError(); cudaFree(g->ws); g->ws = NULL; continue;
+        }
+        g->ws_cap = cap;
+        if (mb != want_mb) fprintf(stderr, "workspace: %zu MiB (requested %zu MiB)\n", mb, want_mb);
+        break;
     }
     if (!g->ws) { fprintf(stderr, "gpu workspace OOM (requested %zu MiB)\n", want_mb); reuse_gpu_destroy(g); return NULL; }
     return g;
