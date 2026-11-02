@@ -1891,3 +1891,66 @@ the allocator (1 s) and not the K=4096 fallback (0.6 s of launches). It is the d
 term in the encoder's wall and it is not explained. Next probe: time the sync itself at
 incremental queue depths, to separate "draining a deep launch queue" from "waking an idle
 Jetson GPU".
+
+### 39. ROOT CAUSE of the encoder/HF divergence: the encoder's attention is windowed at 32
+
+The open item from §36 (my three implementations agreeing with each other at cos 0.9997
+and drifting from HF in a position-growing way) is localized and largely fixed, with the
+checkpoint's own config as the evidence.
+
+`.auto/lfm3/enc_ref/probe30.py` compares, per stage and per position bucket, the numpy
+fp32 spec against HF's **canonical** encoder forward (provenance pinned: the dump equals
+`audio_encoder(feats, lengths)` and `get_audio_features(...)` both to `max_abs_diff 0.0`,
+`hf_meta.json`; HF weights fp32, sdpa).
+
+```
+ds_out, layer_00, layer_01 (mel -> downsample -> 2 conv layers -> 2 FFN blocks)
+      cos 1.000000 in EVERY position bucket 0-2 ... 300-374
+layer_02  = the FIRST ATTENTION LAYER:  input cos 1.000000, increment cos 0.971037,
+                                           output cos 0.996537 (200-299), 0.996428 (300-374)
+```
+
+So the divergence is *introduced by the attention block*, not inherited, not the mel, not
+the downsampler, not conv, not FFN, not RoPE-offset (killed in §36), not HF precision
+(killed: HF fp32 vs bf16 cos 0.99996).
+
+The config says why, and I had read the wrong config level:
+
+```
+encoder.sliding_window = 32
+encoder.lfm.layer_types = [conv, conv, full_attention, conv, conv, full_attention,
+                           conv, conv, full_attention, conv, conv, full_attention,
+                           conv, conv, full_attention, full_attention, full_attention]
+encoder.lfm.rope_parameters.rope_theta = 1000000.0
+```
+
+§25/§31's "layer_types are all full attention, no sliding" reading came from the top-level
+LM config (`lfm.layer_types` does contain `sliding_attention` with window 256, and
+`encoder.lfm.layer_types` does not) — and it made the spec full-causal everywhere. HF's
+encoder forward builds its mask with `create_sliding_window_causal_mask(...,
+sliding_window=enc.config.sliding_window)` = **32** (`probe30.py` lines 215-224 reproduce
+the call with checkpoint code, and `hf_meta.json` records
+`hf_encoder_sliding_window: 32`).
+
+Mechanism test, with a per-layer window schedule added to the probe
+(`--window-test 32 --window-layers 2,5,8,11,14,15`):
+
+| spec | first stage with cos(rows 200+) < 0.999 |
+|---|---|
+| full causal (as written) | **layer_02** 0.996537 / 0.996428, increment 0.971 |
+| W=32 on attention layers 2,5,8,11,14,15 | **layer_16** only — layers 02-15 all **1.000000** |
+
+W=192/256/512 were tested first and are null (0.9965, identical to full causal), which is
+why the window hypothesis looked dead; only the checkpoint's own value 32 works.
+
+**Remaining, open:** layer_16 (the last encoder layer) does not match under either
+treatment — full causal 0.7238, windowed at 32 0.6836, increment cos 0.214/0.161, with
+its input at 1.000000. So HF treats the last attention layer differently again, and the
+next probe is per-layer internals of layer 16 (q/k pre/post rotary via forward hooks,
+`.auto/lfm3/enc_ref/probe_rope.py`, which also records that the encoder's decoder layers
+live at `audio_encoder.lfm.layers`, class `Lfm2DecoderLayer`, rotary at `lfm.rotary_emb`,
+and no `q_norm` module on the layer).
+
+This is the mechanism behind the 126/262 transcript prefix in §37: the encoder's
+activations are exact through layer 15 at every position and start drifting at the first
+attention layer, growing to cos 0.877 by row 300+ at full length.

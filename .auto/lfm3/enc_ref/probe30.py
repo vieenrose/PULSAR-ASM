@@ -368,7 +368,8 @@ def spec_stages(E, feat, window):
         elif window is None:
             op = E.attn_block(h, i, cos, sin)
         else:
-            op = attn_block_windowed(E, h, i, cos, sin, window)
+            w = window.get(i) if isinstance(window, dict) else window
+            op = attn_block_windowed(E, h, i, cos, sin, w)
         x = x + op
         x = x + E.mlp(E.rms(x, E.W(p + "ffn_norm.weight")), i)
         stages["layer_%02d" % i] = x
@@ -404,7 +405,13 @@ def table_against_hf(stages, out_dir, proj):
                        }.get(in_file, lambda: stages["layer_%02d" % (int(in_file[7:9]) - 1)])())
             i_hf = np.load(os.path.join(out_dir, in_file))[0]
             e["in"] = [bstats(row_cos(i_mine, i_hf), lo, hi) for lo, hi in BUCKETS]
-            e["delta"] = [bstats(row_cos(o_mine - i_mine, o_hf - i_hf), lo, hi) for lo, hi in BUCKETS]
+            # The projector changes width ([T,768] -> [T,2048]), so "what this stage
+            # introduces" (out - in) is not defined there; skip it rather than crash.
+            if o_mine.shape == i_mine.shape == o_hf.shape == i_hf.shape:
+                e["delta"] = [bstats(row_cos(o_mine - i_mine, o_hf - i_hf), lo, hi)
+                              for lo, hi in BUCKETS]
+            else:
+                e["delta"] = None
         tab[name] = e
     return tab
 
@@ -437,6 +444,11 @@ def main():
     ap.add_argument("--skip-numpy", action="store_true", help="dump HF only")
     ap.add_argument("--skip-hf", action="store_true",
                     help="reuse the HF dumps already in --out (written by an earlier run)")
+    ap.add_argument("--window-layers", default=None,
+                    help="comma-separated attention layer indices to window; the rest stay "
+                         "full causal. With --window-test this tests a per-layer schedule, "
+                         "which is how the section 39 finding (HF windows the sliding "
+                         "layers at 32 and leaves the last layer full) is confirmed.")
     ap.add_argument("--window-test", type=int, default=32,
                     help="re-run the spec with a W-token attention window (0 = skip)")
     ap.add_argument("--no-window-test", dest="window_test", action="store_const", const=0)
@@ -533,7 +545,14 @@ def main():
     first_w = None
     if args.window_test:
         t0 = time.time()
-        st_w = spec_stages(E, feat, args.window_test)
+        if getattr(args, "window_layers", None):
+            wl = {int(x): args.window_test for x in args.window_layers.split(",")
+                  if x.strip() != ""}
+            print("[window schedule] %s at W=%d, the rest full causal"
+                  % (sorted(wl), args.window_test))
+            st_w = spec_stages(E, feat, wl)
+        else:
+            st_w = spec_stages(E, feat, args.window_test)
         proj_w = E.projector(st_w["enc_out"])
         print("\n[numpy] spec with a %d-token attention window ran %.1fs"
               % (args.window_test, time.time() - t0))
