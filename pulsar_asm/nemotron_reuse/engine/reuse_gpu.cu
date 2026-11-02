@@ -9,6 +9,11 @@
 #include <cstring>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <time.h>
+
+static double g_t_enc=0,g_t_blk=0,g_t_dec=0,g_t_head=0;
+extern "C" void reuse_gpu_get_times(double *enc,double *blk,double *dec,double *head){*enc=g_t_enc;*blk=g_t_blk;*dec=g_t_dec;*head=g_t_head;}
+static double gt_now(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+1e-9*ts.tv_nsec; }
 
 #define HID 64
 #define DEPTH 4
@@ -742,13 +747,15 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
     if (!xin || !enc || !blk) return 1;
     cudaMemset(xin, 0, (size_t)2*Tp*Fp*sizeof(float));
     k_build_input<<<(unsigned)(((long)T*F+255)/256), 256>>>(mag, pha, xin, T, F);
+    double t0 = gt_now();
     if (reuse_gpu_encoder(g, xin, enc, Tp, Fp)) return 1;
+    cudaDeviceSynchronize(); double t1 = gt_now(); g_t_enc = t1-t0;
     const int T2 = (Tp-1)/4 + 1, F2 = (Fp-3)/2 + 1;
     for (int i = 0; i < 30; i++) {
         if (reuse_gpu_tfmamba(g, i, enc, blk, T2, F2)) return 1;
         cudaMemcpyAsync(enc, blk, (size_t)HID*T2*F2*sizeof(float), cudaMemcpyDeviceToDevice);
     }
-    cudaDeviceSynchronize();
+    cudaDeviceSynchronize(); double t2 = gt_now(); g_t_blk = t2-t1;
     const int Tx = T2*4, Fx = F2*2;
     float *dm = (float*)dalloc((size_t)HID*Tx*Fx);
     float *dp = (float*)dalloc((size_t)HID*Tx*Fx);
@@ -758,7 +765,7 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
     if (!dm || !dp || !fa || !fr || !fi) return 1;
     if (reuse_gpu_decoder_pre(g, "mask_decoder", enc, dm, T2, F2)) return 1;
     if (reuse_gpu_decoder_pre(g, "phase_decoder", enc, dp, T2, F2)) return 1;
-    cudaDeviceSynchronize();
+    cudaDeviceSynchronize(); double t3 = gt_now(); g_t_dec = t3-t2;
     if (reuse_gpu_conv1x1_to1(g, dm, "mask_decoder.final_conv", fa, HID, Tx, Fx)) return 1;
     if (reuse_gpu_conv1x1_to1(g, dp, "phase_decoder.phase_conv_r", fr, HID, Tx, Fx)) return 1;
     if (reuse_gpu_conv1x1_to1(g, dp, "phase_decoder.phase_conv_i", fi, HID, Tx, Fx)) return 1;
@@ -766,6 +773,7 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
     // crop [Tx,Fx] -> [T,F] (amp)
     k_crop_ft<<<(unsigned)(((long)T*F+255)/256), 256>>>(fa, amp_out, T, F, Fx);
     k_sweep_mask<<<(unsigned)((T+255)/256), 256>>>(amp_out, T, F);
+    cudaDeviceSynchronize(); g_t_head = gt_now()-t3;
     cudaFree(dm); cudaFree(dp); cudaFree(fa); cudaFree(fr); cudaFree(fi);
     cudaFree(xin); cudaFree(enc); cudaFree(blk);
     return reuse_gpu_ok(g, "forward");

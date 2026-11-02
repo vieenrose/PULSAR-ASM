@@ -1,7 +1,33 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
+# RTF benchmark. RTF = processing wall time / input audio duration.
+#
+# Reports, per fixture: model-only RTF, STFT/iSTFT RTF, total RTF, and the
+# first-call (cold) latency. Locks the Nano to its max clocks when possible.
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
-echo "# RTF benchmark (scaffold)"
-echo "RTF_COMPUTE=0.00 RTF_E2E=0.00"
+BLOB="${BLOB:-$DIR/tests/golden/reuse.blob}"
+BIN="${BIN:-$DIR/engine/reuse_nano_gpu}"
+REPS="${REPS:-5}"
+FIXTURES="${@:-$DIR/tests/golden/fixtures/mic_test2_8000.wav $DIR/tests/golden/fixtures/mic_test2_16000.wav}"
+
+if [ ! -x "$BIN" ]; then echo "no binary at $BIN (run ./build_nano.sh)"; exit 1; fi
+
+# Jetson: request max clocks; ignore failures on non-Nano hosts.
+if command -v nvpmodel >/dev/null 2>&1; then nvpmodel -q 2>/dev/null | head -3 || true; fi
+if command -v jetson_clocks >/dev/null 2>&1; then jetson_clocks 2>/dev/null || true; fi
+
+for w in $FIXTURES; do
+  [ -f "$w" ] || { echo "skip missing $w"; continue; }
+  echo "=== $w ==="
+  # cold: single rep includes first-call latency
+  "$BIN" "$BLOB" "$w" /dev/null 1 2>&1 | sed 's/^/[cold] /'
+  # warm: REPS reps, best/worst reported by the driver
+  "$BIN" "$BLOB" "$w" /dev/null "$REPS" 2>&1 | sed 's/^/[warm] /'
+done
+
+echo
+echo "# RTF definition: RTF_model = model wall time / audio duration."
+echo "# RTF_total additionally counts the DFT-GEMM STFT/iSTFT (currently CPU)."
+echo "# RTF < 1.0 means faster than real time."

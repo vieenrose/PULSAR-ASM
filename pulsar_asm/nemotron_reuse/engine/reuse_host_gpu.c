@@ -100,6 +100,8 @@ int main(int argc, char **argv)
         fclose(fo);
     }
     double audio_s = (double)nf / sr;
+    double te, tb, td, th; reuse_gpu_get_times(&te, &tb, &td, &th);
+    printf("phases: encoder %.3f s | 30xTFMamba %.3f s | decoders %.3f s | heads %.3f s\n", te, tb, td, th);
     printf("=== RTF (model GPU, STFT/iSTFT CPU) ===\n");
     printf("audio      %.4f s\n", audio_s);
     printf("model best %.4f s   RTF_model %.4f\n", best, best/audio_s);
