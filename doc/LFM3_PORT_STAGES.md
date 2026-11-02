@@ -1626,3 +1626,48 @@ What is left for the realtime gate is now narrow and specific: feed `proj_out`'s
 into the backbone prefill as the audio-embedding prompt (an embedding-stream override at
 the audio positions), and run `.auto/lfm3/measure_rt.sh` on >= 60 s of real speech,
 which is the one input I do not have.
+
+### 33. First real speech on the board: a TTS fixture, and the encoder at real length
+
+`.auto/lfm3/mk_speech.py` synthesizes the gate's speech clip with **gTTS 2.5.4**
+(`lang=en, tld=com, slow=False`) from a transcript authored in that file, then ffmpeg's
+it to the exact contract `lfm3_wav` accepts (16 kHz, mono, `pcm_s16le`, no dithering
+mode beyond rectangular for reproducibility). The script **fails** if the decoded clip
+is under 60 s, so the realtime gate's precondition is enforced by the tool and not by
+eyeball. Computed at synthesis time: 129.720 s, 2,075,520 samples, rms 0.1098, sha256
+recorded in `speech/manifest.json` together with the verbatim transcript.
+
+**Provenance, stated with the fixture:** this is a synthetic voice, not a recording. It
+measures timing and greedy token-stream agreement on speech-shaped audio -- it does NOT
+certify speaker, accent, noise, channel, or disfluency robustness, and no doc claim
+should read that way. The transcript is authored (not corpus-sourced) precisely because
+the gate needs `transcript == exactly what was spoken`, which a corpus clip couples to a
+license and an alignment we do not have. Its text is deliberately numeric: decimals,
+percentages, ordinals, dates, thousands separators, units, so a transcript gate has
+something to get wrong.
+
+The chain on the Nano, on real speech:
+
+| stage | result |
+|---|---|
+| `lfm3_wav` | 2,075,520 samples, **BIT-EXACT vs numpy** (0 diffs) -- the 9-fixture gate is on synthesized signals; this is the real-speech confirmation |
+| `lfm3_mel` | **12,971 frames** for 129.720 s = 100.0 frames/s exactly, and 12971/8 = 1622 tokens = 12.5 tokens/audio-s, confirming run #303's rate on speech |
+| `lfm3_enc_gpu` (80 s sub-clip, 7999 frames -> Tt=1000) | all stages finite; rms ds_out 0.0257 -> layer_16 1.718 -> enc_out 0.849 -> **proj_out rms 0.0306, max 0.9157** |
+
+The encoder number **improves at realistic length**: 80 s costs 1430.64 ms (min of 3)
+= **0.0179 s GPU per audio second**, versus 0.0320 measured on the 4 s fixture. The
+difference is per-launch fixed cost: at Tt=50 the 33 launches per pass are amortized
+over 8x less work. So the encoder is **1.8% of realtime**, 3.3x inside the 0.06 budget,
+and ASR_RT decomposes (per audio second) as prefill 1.302 + decode 0.514 + mel 0.055 +
+encoder 0.018 = **1.889**, consistent with the 1.872 measured before the encoder was
+counted.
+
+Two facts this run surfaced, both recorded rather than patched around:
+
+* `lfm3_enc_gpu` caps `Tm` at **8192 mel frames = 81.9 s of audio** (`lfm3_enc_gpu.cu:582`),
+  so the 129.7 s fixture needs the cap raised (arena sizing, not an algorithmic limit)
+  before the full-clip gate can run. The 80 s sub-clip is a legitimate sub-fixture.
+* `lfm3_mel` emitted **7999** frames for an 80.000 s clip, not 8000 -- the HF
+  `pad_length`/`num_frames` rule, which `checks_mel.py` already pins as exact. Feeding
+  the encoder a Tm that doesn't match the file is caught ("input short"), and it caught
+  this on the first try.

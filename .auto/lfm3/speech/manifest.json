@@ -1,0 +1,31 @@
+{
+  "kind": "SYNTHETIC text-to-speech gate fixture, not a recording",
+  "tool": "gTTS 2.5.4",
+  "tts_params": {
+    "lang": "en",
+    "tld": "com",
+    "slow": false
+  },
+  "ffmpeg": "ffmpeg version 3.4.11-0ubuntu0.1 Copyright (c) 2000-2022 the FFmpeg developers",
+  "transcript_sha256": "719e54ba510d7ee1207dd3fa4bd79453ee5ec7b290d053c651b65e9a837c9404",
+  "words": 280,
+  "wav": "gate_60s_16k_mono.wav",
+  "mp3": "gate_60s.mp3",
+  "wav_sha256": "840083b5d2d17d74a3880de995686310dfc21d8cb73aea0deb786dbbf885bd52",
+  "mp3_sha256": "6188abc65fd1124cd92bb7298ba60f7b901780eceea567d26256f0ff1ee9d38b",
+  "rate": 16000,
+  "channels": 1,
+  "bits": 16,
+  "samples": 2075520,
+  "duration_s": 129.72,
+  "rms_f32": 0.10976732127611964,
+  "peak_f32": 0.701385498046875,
+  "prompt_tokens_at_12_5_per_s": 1622,
+  "gen_tokens_at_4_per_s": 519,
+  "transcript": "The weather service issued its seasonal outlook on the ninth of March, and the numbers were unusual. In the northern valleys, the average March temperature came in at 3.4 degrees Celsius, roughly 2.1 degrees below the thirty year mean, and snow cover reached 41 centimetres at the twelve hundred metre station, the deepest reading since 2014. Rainfall across the eastern plain totalled 118 millimetres for the month, about 76 percent of the normal figure, and the river gauge at Millbrook recorded a peak flow of 62 cubic metres per second on the twenty second, falling to 24 by the end of the month.\n\nFarmers responded quickly. Sowing on the heavy clay soils slipped by an average of 12 days, from the 18th of April to the 30th, and seed rates rose from 145 kilograms per hectare to 168, a 16 percent increase, because germination was expected to be uneven. Two growers in the Kesteven district reported that their pumps ran for 340 hours in March alone, nearly double the 180 hours logged a year earlier, and the co-operative ordered 9 additional sprinkler units at a cost of 2,350 pounds each.\n\nThe council's engineer cautioned against panic. Reservoir storage stood at 71 percent of capacity on the first of April, against 83 percent in the same week of 2023, and the supply model assumed a daily demand of 410 million litres, an increase of 6 percent. He estimated that voluntary restrictions would begin around the twentieth of June if rainfall stayed below 40 millimetres per month for three consecutive months, and he asked households to fit meters, because a leaking cistern wastes 250 litres a day, and nobody notices a cistern.",
+  "caveats": [
+    "synthetic voice: measures timing + greedy agreement on speech-shaped audio",
+    "does NOT certify speaker/accent/noise/channel robustness",
+    "16 kHz mono PCM16 is the exact contract lfm3_wav accepts"
+  ]
+}
