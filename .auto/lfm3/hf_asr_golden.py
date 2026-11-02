@@ -10,9 +10,18 @@ engine itself: this script runs the checkpoint's own audio path (transformers
     python .auto/lfm3/hf_asr_golden.py --regen     # run HF, write speech/hf_asr_golden.json
     python .auto/lfm3/hf_asr_golden.py --verify    # re-hash the fixture, re-run HF, compare
                                                    # against the committed golden; writes nothing
+    python .auto/lfm3/hf_asr_golden.py --dump-embeddings
+                                                   # run HF, write the audio embedding matrix to
+                                                   # speech/hf_audio_embeddings_<rows>x<dim>.f32 (raw fp32,
+                                                   # row-major, no header) and append its "embedding_matrix"
+                                                   # block to the existing golden json
 
 --verify (and every other mode) refuses to run when the fixture's sha256 differs
 from speech/manifest.json, so a golden can never be attached to a swapped clip.
+--dump-embeddings is the external reference for the engine's audio path: it dumps
+the exact matrix HF splices into the prompt at the audio placeholders, plus the
+per-row L2-norm distribution, so a proj_out disagreement can be read as a shape
+problem (a few heavy rows dominating a mean) and not only as a scale problem.
 
 HF entry points used (see speech/HF_ASR_GOLDEN_NOTES.md for the full list):
   AutoProcessor.from_pretrained(trust_remote_code=True)      -> Lfm3AudioProcessor
@@ -43,6 +52,12 @@ FIXTURE = os.path.join(SPEECH, "gate_60s_16k_mono.wav")
 MANIFEST = os.path.join(SPEECH, "manifest.json")
 GOLDEN = os.path.join(SPEECH, "hf_asr_golden.json")
 MODEL = "/home/louis/models/lfm3/LFM3-Audio-2B"
+# The embedding dump is named by its shape: the row count is data-derived (one row per
+# eight mel frames), so a shape change lands in a new file instead of overwriting a golden.
+EMBEDDINGS_STEM = "hf_audio_embeddings"
+# Out-of-band carrier: run_hf() returns a JSON-serialisable dict, the matrix rides in on
+# this key and main() pops it before the golden is composed.
+MATRIX_KEY = "_audio_matrix_f32"
 
 # The checkpoint files the golden is pinned to. A change to any of these (weights,
 # mel front end, chat template, sampling defaults) invalidates the golden.
@@ -162,6 +177,129 @@ def wer(ref: list[str], hyp: list[str]) -> dict:
     }
 
 
+def embeddings_path(rows: int, dim: int, out_dir: str = SPEECH) -> str:
+    return os.path.join(out_dir, "%s_%dx%d.f32" % (EMBEDDINGS_STEM, rows, dim))
+
+
+def matrix_payload(matrix) -> bytes:
+    """The bytes of the dump: explicit little-endian fp32, row-major C order, no header."""
+    import numpy as np
+
+    return np.ascontiguousarray(matrix, dtype="<f4").tobytes(order="C")
+
+
+def row_norm_stats(norms) -> dict:
+    """Per-row L2-norm distribution of an embedding matrix, in float64.
+
+    Percentiles use numpy's default (linear interpolation between the two bracketing
+    order statistics); the block records that so a comparison side can reproduce them.
+    """
+    import numpy as np
+
+    n = int(norms.shape[0])
+    p = np.percentile(norms, [10, 25, 50, 75, 90, 99], method="linear")
+    order = np.argsort(-norms, kind="stable")
+    top = order[:10]
+    total_sq = float(np.sum(norms * norms))
+    tail = [int(i) for i in top]
+    mean = float(np.mean(norms))
+    block = {
+        "rows": n,
+        "percentile_method": "numpy linear (default)",
+        "mean": mean,
+        "std": float(np.std(norms)),
+        "min": float(np.min(norms)),
+        "max": float(np.max(norms)),
+        "median": float(p[2]),
+        "p10": float(p[0]),
+        "p25": float(p[1]),
+        "p75": float(p[3]),
+        "p90": float(p[4]),
+        "p99": float(p[5]),
+        "argmin": int(np.argmin(norms)),
+        "argmax": int(np.argmax(norms)),
+        "first_rows": {str(i): float(norms[i]) for i in range(min(3, n))},
+        "last_rows": {str(i): float(norms[i]) for i in range(max(0, n - 5), n)},
+        "top10_rows": [{"index": int(i), "norm": float(norms[i])} for i in top],
+        # Tail-dominance reads: how much of the energy sits in the 10 heaviest rows, and what
+        # the mean looks like once they are out. mean/max alone cannot tell these apart.
+        "energy_share_top10": float(np.sum(norms[tail] ** 2) / total_sq) if total_sq else 0.0,
+        "mean_excluding_top10": float(np.mean(np.delete(norms, tail))) if n > 10 else 0.0,
+        "rows_above_4x_mean": int(np.sum(norms > 4.0 * mean)),
+        "max_over_mean": float(np.max(norms) / mean) if mean else 0.0,
+    }
+    return block
+
+
+def dump_embedding_matrix(matrix, fixture_sha: str, harness: dict, audio: dict) -> dict:
+    """Write the fp32 matrix (row-major, no header) and return its golden-json block.
+
+    The file is the deliverable; the block is what makes it checkable (sha256 + the norm
+    distribution), and carries the dtype/cast provenance a bit-level comparison needs.
+    """
+    import numpy as np
+
+    rows, dim = int(matrix.shape[0]), int(matrix.shape[1])
+    path = embeddings_path(rows, dim)
+    payload = matrix_payload(matrix)
+    if len(payload) != rows * dim * 4:
+        print(f"FATAL: embedding payload {len(payload)} bytes != {rows}x{dim}x4", file=sys.stderr)
+        sys.exit(2)
+    tmp = path + ".part"
+    with open(tmp, "wb") as fh:
+        fh.write(payload)
+    os.replace(tmp, path)
+    on_disk = sha256_file(path)
+    in_memory = hashlib.sha256(payload).hexdigest()
+    if on_disk != in_memory:
+        print(f"FATAL: {path} sha256 {on_disk} != in-memory {in_memory}", file=sys.stderr)
+        sys.exit(2)
+
+    # Norms are taken from the bytes that landed on disk, in float64 accumulation, so the stats
+    # in the golden describe the file a comparison side will read.
+    on_disk_matrix = np.frombuffer(payload, dtype="<f4").reshape(rows, dim)
+    norms = np.sqrt(np.sum(on_disk_matrix.astype(np.float64) ** 2, axis=1))
+    block = row_norm_stats(norms)
+    block = {
+        "kind": "HF audio embeddings for the committed fixture: the matrix HF splices into the "
+                "prompt at the %s placeholders (proj_out output of the audio encoder + projector)" % "<|audio|>",
+        "path": os.path.relpath(path, REPO),
+        "sha256": on_disk,
+        "nbytes": len(payload),
+        "shape": [rows, dim],
+        "dtype": "float32",
+        "layout": "row-major C order, little-endian, no header: byte offset (r*%d+c)*4" % dim,
+        "sha256_of_first_1kb": hashlib.sha256(payload[:1024]).hexdigest(),
+        "hf_entry_point": audio["hf_entry_point"],
+        "source_torch_dtype": harness["embedding_source_torch_dtype"],
+        "cast_applied": harness["embedding_cast_applied"],
+        "cast_note": harness["embedding_cast_note"],
+        "produced_on_device": harness["audio_encoder_device"],
+        "model_dtype": harness["model_dtype"],
+        "fixture_sha256": fixture_sha,
+        "matches_golden_shape": [rows, dim] == audio["hf_shape"],
+        "mean_row_l2_norm": audio["mean_row_l2_norm"],
+        "rows_below_1": int(np.sum(norms < 1.0)),
+        **block,
+    }
+    print("[embeddings] wrote %s: %s %dx%d sha256 %s" % (
+        os.path.relpath(path, REPO), block["dtype"], rows, dim, on_disk[:16] + "..."))
+    print("[embeddings] row L2 norms: mean %.6f min %.6f (row %d) max %.6f (row %d) median %.6f "
+          "p10 %.6f p25 %.6f p75 %.6f p90 %.6f p99 %.6f"
+          % (block["mean"], block["min"], block["argmin"], block["max"], block["argmax"], block["median"],
+             block["p10"], block["p25"], block["p75"], block["p90"], block["p99"]))
+    print("[embeddings] rows 0,1,2 = %.6f %.6f %.6f | last 5 = %s"
+          % (block["first_rows"]["0"], block["first_rows"]["1"], block["first_rows"]["2"],
+             " ".join("%.6f" % v for v in block["last_rows"].values())))
+    print("[embeddings] top-10 norm rows: %s"
+          % " ".join("%d:%.4f" % (t["index"], t["norm"]) for t in block["top10_rows"]))
+    print("[embeddings] tail: max/mean %.3f, top-10 rows hold %.2f%% of the energy, "
+          "mean without them %.6f, %d rows < 1.0, %d rows > 4x mean"
+          % (block["max_over_mean"], 100 * block["energy_share_top10"], block["mean_excluding_top10"],
+             block["rows_below_1"], block["rows_above_4x_mean"]))
+    return block
+
+
 def run_hf(device: str, max_new_tokens: int) -> dict:
     import numpy as np
     import soundfile as sf
@@ -229,6 +367,14 @@ def run_hf(device: str, max_new_tokens: int) -> dict:
         feature_seconds = time.time() - t_fe
         audio_feature_tokens = int(audio_features.shape[0])
         audio_feature_norm = float(audio_features.norm(dim=-1).mean())
+        # The same tensor, as one contiguous CPU block for the dump. `float()` is a no-op at the
+        # loader dtype used here (torch.float32); any real cast is recorded in the golden, never hidden.
+        embedding_source_dtype = str(audio_features.dtype)
+        embedding_cast = audio_features.dtype != torch.float32
+        embedding_cpu = audio_features.detach().to("cpu")
+        if embedding_cast:
+            embedding_cpu = embedding_cpu.float()
+        embedding_np = embedding_cpu.contiguous().numpy()
 
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
@@ -292,6 +438,16 @@ def run_hf(device: str, max_new_tokens: int) -> dict:
             "audio_encoder_device": "cpu",
             "audio_projector_device": "cpu",
             "model_dtype": str(model.dtype),
+            "embedding_source_torch_dtype": embedding_source_dtype,
+            "embedding_cast_applied": embedding_cast,
+            "embedding_cast_note": (
+                "no cast: the model loads at dtype=torch.float32 and get_audio_features returns that "
+                "dtype, so the saved bytes are the values HF splices into the prompt"
+                if not embedding_cast else
+                "cast to fp32 on save: get_audio_features returned %s; the saved bytes are the fp32 "
+                "widening of that tensor, not the tensor HF fed the backbone bit-for-bit"
+                % embedding_source_dtype
+            ),
             "matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
             "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
             "manual_seed": 0,
@@ -347,6 +503,8 @@ def run_hf(device: str, max_new_tokens: int) -> dict:
             "hf_audio_embedding_tokens_fed_to_backbone": audio_feature_tokens,
             "embedding_dim": int(audio_features.shape[1]),
             "mean_row_l2_norm": audio_feature_norm,
+            "hf_dtype": embedding_source_dtype,
+            "device": str(audio_features.device),
             "matches_placeholder_count": audio_feature_tokens == placeholder_tokens,
             "matches_frames_over_stride": audio_feature_tokens == feature_extractor.num_encoder_tokens(mel_frames),
             "engine_tokens_per_audio_second": ENGINE_TOKENS_PER_AUDIO_SECOND,
@@ -378,6 +536,9 @@ def run_hf(device: str, max_new_tokens: int) -> dict:
             "decoded_words": len(normalize_words(text)),
             "decoded_chars": len(text),
         },
+        # numpy float32 [tokens, dim]: the matrix itself, for --dump-embeddings. main() pops it,
+        # so it never reaches the json.
+        MATRIX_KEY: embedding_np,
     }
 
 
@@ -386,6 +547,9 @@ def main() -> int:
     ap.add_argument("--regen", action="store_true", help="write speech/hf_asr_golden.json")
     ap.add_argument("--verify", action="store_true",
                     help="re-hash the fixture, re-run HF, compare with the committed golden; never writes")
+    ap.add_argument("--dump-embeddings", action="store_true",
+                    help="run the audio path, write the fp32 embedding matrix next to the fixture and append "
+                         "its embedding_matrix block to the existing golden json")
     ap.add_argument("--device", default="cpu",
                     help="backbone device (default cpu); the audio encoder/projector stay on CPU")
     ap.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
@@ -395,7 +559,12 @@ def main() -> int:
     if args.regen and args.verify:
         print("FATAL: --regen and --verify are mutually exclusive", file=sys.stderr)
         return 2
-    mode = "regen" if args.regen else ("verify" if args.verify else "report")
+    if args.dump_embeddings and (args.regen or args.verify):
+        print("FATAL: --dump-embeddings writes the golden json; do not combine it with --regen/--verify",
+              file=sys.stderr)
+        return 2
+    mode = "dump" if args.dump_embeddings else ("regen" if args.regen else
+                                                ("verify" if args.verify else "report"))
 
     manifest = load_manifest()
     fixture_sha, _samples = check_fixture(manifest, mode)
@@ -407,6 +576,11 @@ def main() -> int:
         return 2
     if mode == "verify" and not os.path.exists(args.golden):
         print(f"FATAL: --verify needs an existing golden at {args.golden}", file=sys.stderr)
+        return 2
+    if mode == "dump" and not os.path.exists(args.golden):
+        # The dump annotates the golden; creating one here would attach an embedding block to a
+        # file nobody reviewed. Run --regen first.
+        print(f"FATAL: --dump-embeddings appends to an existing golden; none at {args.golden}", file=sys.stderr)
         return 2
 
     print(f"[{mode}] fixture {os.path.relpath(FIXTURE, REPO)} sha256 {fixture_sha} (matches manifest)")
@@ -420,6 +594,7 @@ def main() -> int:
     print(f"[{mode}] hashed {len(PINNED_FILES)} checkpoint files in {time.time() - t_sha:.1f}s "
           f"(model.safetensors {pinned['model.safetensors'][:16]}...)")
     result = run_hf(args.device, args.max_new_tokens)
+    embedding_matrix = result.pop(MATRIX_KEY, None)   # json carries no tensors; the dump writes it
 
     audio = result["audio_embeddings"]
     gen = result["decoding"]
@@ -515,6 +690,18 @@ def main() -> int:
              audio["hf_audio_embedding_tokens_fed_to_backbone"]),
             ("prompt tokens", want["prompt"]["prompt_tokens_total"], golden["prompt"]["prompt_tokens_total"]),
         ]
+        recorded = want.get("embedding_matrix")
+        if recorded and embedding_matrix is not None:
+            # The committed block names a matrix; re-running the audio path must reproduce those
+            # bytes exactly, and the file next to the golden must be the same bytes.
+            fresh = hashlib.sha256(matrix_payload(embedding_matrix)).hexdigest()
+            checks.append(("embedding matrix bytes", recorded["sha256"], fresh))
+            mat_path = os.path.join(REPO, recorded["path"])
+            if os.path.isfile(mat_path):
+                checks.append(("embedding matrix file", recorded["sha256"], sha256_file(mat_path)))
+            else:
+                print("  %-24s NOT CHECKED (%s absent; --dump-embeddings regenerates it)"
+                      % ("embedding matrix file", recorded["path"]))
         bad = 0
         for name, a, b in checks:
             ok = a == b
@@ -525,6 +712,39 @@ def main() -> int:
         print("[verify] %s" % ("PASS: HF reproduced the committed golden bit-for-bit" if not bad
                                else "FAIL: %d field(s) differ" % bad))
         return 0 if not bad else 1
+
+    if mode == "dump":
+        if embedding_matrix is None:
+            print("FATAL: --dump-embeddings got no matrix back from the audio path", file=sys.stderr)
+            return 2
+        block = dump_embedding_matrix(embedding_matrix, fixture_sha, result["harness"], audio)
+        with open(args.golden) as fh:
+            want = json.load(fh)
+        # The dump describes the same matrix the golden already characterises: refuse to append a
+        # block that disagrees with the shape and mean already on record.
+        checks = [
+            ("fixture sha256", want["fixture"]["sha256"], fixture_sha),
+            ("audio embedding shape", want["audio_embeddings"]["hf_shape"], audio["hf_shape"]),
+            ("mean_row_l2_norm", want["audio_embeddings"]["mean_row_l2_norm"], audio["mean_row_l2_norm"]),
+        ]
+        bad = 0
+        for name, a, b in checks:
+            ok = a == b if not isinstance(a, float) else abs(a - b) <= 1e-9 * max(1.0, abs(a))
+            bad += not ok
+            print("  %-24s %s" % (name, "OK" if ok else "DIFFERS"))
+            if not ok:
+                print("      golden: %s\n" % json.dumps(a)[:200], "      this run: %s" % json.dumps(b)[:200])
+        if bad:
+            print("[dump] FAIL: the matrix does not match the committed golden; the json was left alone "
+                  "(the .f32 file on disk is from this run and is not certified)", file=sys.stderr)
+            return 1
+        want["embedding_matrix"] = block
+        with open(args.golden, "w") as fh:
+            json.dump(want, fh, indent=1, ensure_ascii=False, sort_keys=False)
+            fh.write("\n")
+        print("[dump] appended embedding_matrix to %s (%d bytes)"
+              % (args.golden, os.path.getsize(args.golden)))
+        return 0
 
     if mode == "report":
         print("[report] no file written (use --regen)")

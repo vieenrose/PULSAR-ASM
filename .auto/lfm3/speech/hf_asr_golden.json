@@ -1161,5 +1161,100 @@
   "decoded_text_sha256": "cdeffe02c2d1e9cae6cae4e3cc174b522d1c61b0cf356fdb4e3203e9a4e7359d",
   "decoded_words": 191,
   "decoded_chars": 1102
+ },
+ "embedding_matrix": {
+  "kind": "HF audio embeddings for the committed fixture: the matrix HF splices into the prompt at the <|audio|> placeholders (proj_out output of the audio encoder + projector)",
+  "path": ".auto/lfm3/speech/hf_audio_embeddings_1622x2048.f32",
+  "sha256": "aa99fafefd1f6a86a85ad802d73fba911c9f7224741ccb8b17bd7af48ab2abc0",
+  "nbytes": 13287424,
+  "shape": [
+   1622,
+   2048
+  ],
+  "dtype": "float32",
+  "layout": "row-major C order, little-endian, no header: byte offset (r*2048+c)*4",
+  "sha256_of_first_1kb": "b39714e62f7b4e6224b2b9e1dc23c25f5e08c2b9301b72058452f058c0888b7e",
+  "hf_entry_point": "model.model.get_audio_features(input_features, feature_attention_mask)",
+  "source_torch_dtype": "torch.float32",
+  "cast_applied": false,
+  "cast_note": "no cast: the model loads at dtype=torch.float32 and get_audio_features returns that dtype, so the saved bytes are the values HF splices into the prompt",
+  "produced_on_device": "cpu",
+  "model_dtype": "torch.float32",
+  "fixture_sha256": "840083b5d2d17d74a3880de995686310dfc21d8cb73aea0deb786dbbf885bd52",
+  "matches_golden_shape": true,
+  "mean_row_l2_norm": 1.6028032302856445,
+  "rows_below_1": 0,
+  "rows": 1622,
+  "percentile_method": "numpy linear (default)",
+  "mean": 1.6028030909420106,
+  "std": 0.3350965506455381,
+  "min": 1.0818123783089295,
+  "max": 9.385890281784512,
+  "median": 1.5745677086677357,
+  "p10": 1.3094205394786465,
+  "p25": 1.434831658171872,
+  "p75": 1.7215630851794619,
+  "p90": 1.8943599372428297,
+  "p99": 2.3012610183961906,
+  "argmin": 282,
+  "argmax": 1,
+  "first_rows": {
+   "0": 7.2374757939004155,
+   "1": 9.385890281784512,
+   "2": 2.877501049404035
+  },
+  "last_rows": {
+   "1617": 1.1124854855304869,
+   "1618": 1.1674912268315765,
+   "1619": 1.2462216687193377,
+   "1620": 1.4738770748081367,
+   "1621": 1.9483490887002206
+  },
+  "top10_rows": [
+   {
+    "index": 1,
+    "norm": 9.385890281784512
+   },
+   {
+    "index": 0,
+    "norm": 7.2374757939004155
+   },
+   {
+    "index": 2,
+    "norm": 2.877501049404035
+   },
+   {
+    "index": 1436,
+    "norm": 2.762433857470715
+   },
+   {
+    "index": 784,
+    "norm": 2.680268346244599
+   },
+   {
+    "index": 667,
+    "norm": 2.621604467055108
+   },
+   {
+    "index": 526,
+    "norm": 2.6110171453836126
+   },
+   {
+    "index": 527,
+    "norm": 2.538751207965692
+   },
+   {
+    "index": 170,
+    "norm": 2.508083470376382
+   },
+   {
+    "index": 1330,
+    "norm": 2.5025471738802367
+   }
+  ],
+  "energy_share_top10": 0.04512735665385431,
+  "mean_excluding_top10": 1.5893430773663002,
+  "rows_above_4x_mean": 2,
+  "max_over_mean": 5.8559222494811705
  }
 }

@@ -134,6 +134,16 @@ __global__ void k_dequant_row(const int8_t* __restrict__ c, const float* __restr
   if (i < k) out[i] = f2bf(__fmul_rn((float)c[i], sc[i / Q8_BLK]));
 }
 
+// ASR path: one audio-embedding row (fp32, the encoder's proj_out, [N,2048]) into the
+// bf16 activation the layer loop reads. f2bf is the engine's single-rounding converter,
+// the same one k_dequant_row uses for token-table rows, so an audio row and a token row
+// enter the network with identical dtype discipline -- a row that arrived through a
+// different conversion would silently shift every downstream logit.
+__global__ void k_bf16_from_f32(const float* __restrict__ src, bf16* __restrict__ dst, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = f2bf(src[i]);
+}
+
 // The KV cache write as a kernel, so the position can come from device memory
 // under graph capture: a cudaMemcpy's destination is baked into the graph, so
 // pos*NKV*HD has to be computed on the device instead.
@@ -1181,6 +1191,15 @@ static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const fl
                       const bf16* x, float* part, int N, int K, int KC, int R,
                       int nb, int T, int nblk, int TPB, size_t shm);
 static int g_prefill_phase = 0;   // 1 while the prompt is being fed (S8 arm scope)
+
+// ASR path (--audio-emb FILE [--audio-at P]): the encoder's proj_out rows, uploaded as
+// fp32 [N,2048], replace the token-table embedding for prompt positions P..P+N-1. HF's
+// ASR prompt is exactly this shape (20 text tokens + 1622 identical audio placeholders
+// for the 129.7 s fixture), and the placeholder id carries no information, so the audio
+// rows -- not the ids -- are the prompt content at those positions.
+static float* g_aemb = nullptr;
+static int g_aemb_n = 0, g_aemb_at = 0;
+static long g_aemb_fed = 0;      // rows actually consumed, printed at the end as proof
 struct CapRec { std::string name; int N = 0, K = 0; std::vector<uint16_t> x, y; };
 static int g_cap_on = 0;
 static std::vector<CapRec> g_caps;
@@ -2857,6 +2876,7 @@ int main(int argc, char** argv) {
   }
   int steps = 8; bool trace = false;
   int lm_rows_override = 0, emb_mode_req = 0, probe_layer = 0, probe_step = 0;
+  const char* audio_emb_file = nullptr;   // --audio-emb (ASR path)
   const char* dump_logits = nullptr;
   const char* dump_logits_all = nullptr;   // every decode step, appended (gate: top-k vs HF)
   std::vector<int> prompt;
@@ -2878,6 +2898,8 @@ int main(int argc, char** argv) {
       char* s = argv[++i];
       while (*s) { prompt.push_back((int)strtol(s, &s, 10)); if (*s == ',') s++; }
     }
+    else if (!strcmp(argv[i], "--audio-emb") && i + 1 < argc) audio_emb_file = argv[++i];
+    else if (!strcmp(argv[i], "--audio-at") && i + 1 < argc) g_aemb_at = atoi(argv[++i]);
   }
   printf("prompt: %zu ids:", prompt.size());
   for (size_t i = 0; i < prompt.size() && i < 8; i++) printf(" %d", prompt[i]);
@@ -3011,6 +3033,26 @@ int main(int argc, char** argv) {
   if (emb_mode_req == 4) return prefill_h2batched(M);
   if (emb_mode_req == 5) g_cap_on = 1;   // capture during the normal run; gate runs at the end
   if (emb->ne[0] != VOCAB || emb->ne[1] != H) { printf("embed shape %dx%d\n", emb->ne[0], emb->ne[1]); return 1; }
+  if (audio_emb_file) {
+    // Row count comes from the file size, not from a flag: a count the caller typed
+    // by hand is one more thing that can silently disagree with the encoder's output.
+    FILE* af = fopen(audio_emb_file, "rb");
+    if (!af) { printf("--audio-emb: cannot open %s\n", audio_emb_file); return 2; }
+    fseek(af, 0, SEEK_END); long fsz = ftell(af); fseek(af, 0, SEEK_SET);
+    if (fsz <= 0 || fsz % ((long)H * 4)) { printf("--audio-emb: %s is %ld bytes, not a whole number of %d-float rows\n", audio_emb_file, fsz, H); return 2; }
+    g_aemb_n = (int)(fsz / ((long)H * 4));
+    std::vector<float> h((size_t)g_aemb_n * H);
+    if (fread(h.data(), 4, h.size(), af) != h.size()) { printf("--audio-emb: short read\n"); return 2; }
+    fclose(af);
+    for (size_t i = 0; i < h.size(); i++) if (!isfinite(h[i])) { printf("--audio-emb: non-finite at %zu\n", i); return 2; }
+    if (cudaMalloc(&g_aemb, h.size() * 4) != cudaSuccess) { printf("--audio-emb: OOM (%.1f MB)\n", h.size() * 4 / 1e6); return 1; }
+    if (cudaMemcpy(g_aemb, h.data(), h.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { printf("--audio-emb: copy failed\n"); return 1; }
+    // Proof the path is armed (the standing rule: prove the code path ran before
+    // believing any number from it). The fed rows are also verified below, per row.
+    printf("AUDIO-EMB armed: %s = %d rows x %d, overriding prompt positions %d..%d (%.1f MB)\n",
+           audio_emb_file, g_aemb_n, H, g_aemb_at, g_aemb_at + g_aemb_n - 1, h.size() * 4 / 1e6);
+    fflush(stdout);
+  }
   if (M.emb_mode >= 1) {
     if (!lm_host_init(M, M.hemb, argv[1])) return 1;
     if (lm_rows_override > 0 && (VOCAB % lm_rows_override) == 0) M.hemb.rows = lm_rows_override;
@@ -3091,7 +3133,17 @@ int main(int argc, char** argv) {
     if (g_graphs && M.gx) g_launch = M.stRun;   // embedding, layers, lm_head all on stRun
     cudaEventRecord(evA, g_launch);
     phBegin();
-    if (emb->dtype == 3) {
+    if (g_aemb && pos >= g_aemb_at && pos - g_aemb_at < g_aemb_n) {
+      // Audio position: the embedding comes from the encoder, not the token table.
+      k_bf16_from_f32<<<(H + 255) / 256, 256, 0, g_launch>>>(
+          g_aemb + (size_t)(pos - g_aemb_at) * H, (bf16*)M.x, H);
+      cudaError_t ae = cudaGetLastError();     // read it HERE: a later call would
+      if (ae != cudaSuccess) {                 // report a different kernel's refusal
+        printf("audio embedding launch failed at pos %d: %s\n", pos, cudaGetErrorString(ae));
+        return 1;
+      }
+      g_aemb_fed++;
+    } else if (emb->dtype == 3) {
       // bf16 payload: the row IS bf16, so it is a 4 KB copy -- no dequant.
       // Handing k_dequant_row a dtype-3 entry reads emb->ds, which is null
       // for this payload: the kernel faults on a null pointer and, because
@@ -3391,6 +3443,10 @@ int main(int argc, char** argv) {
   if (ng > 0)
     printf("steady-state %.2f ms/token -> %.2f tok/s over %d steps "
            "(GEMV-only budget was 127.7 ms)\n", tot / ng, 1000.0 * ng / tot, ng);
+  if (g_aemb_n)
+    printf("AUDIO-EMB fed %ld of %d rows (positions %d..%d); steady-state steps counted: %d\n",
+           g_aemb_fed, g_aemb_n, g_aemb_at, g_aemb_at + g_aemb_n - 1, ng);
+  fflush(stdout);
   {
     // Peak RSS, from the kernel's own counter. measure.sh needs it and the
     // Nano's login shell is dash (whose `time` has no -f) with no
