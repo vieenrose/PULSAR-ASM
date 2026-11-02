@@ -3,41 +3,52 @@
 #include "stft_dft.cuh"
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 
-static void build_hann(float *w, int n) {
-    for (int i = 0; i < n; i++) {
-        w[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / n));
-    }
-}
-
+// DFT-GEMM front end. Twiddles are precomputed once in double and the
+// accumulators are double: near the negative-real axis the sign of Im decides
+// the sign of atan2, so a single-precision accumulation flips whole bins by 2*pi.
 void reuse_stft_mag_pha(const float *x, int T, int n_fft, int hop_size, int win_size,
                         float *mag_out, float *pha_out, int F, int num_frames) {
-    float *w = (float *)malloc(n_fft * sizeof(float));
-    for (int i = 0; i < n_fft; i++) w[i] = 1.0f;
-    for (int i = 0; i < win_size; i++) {
-        w[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / win_size));
+    float *w = (float *)malloc((size_t)n_fft * sizeof(float));
+    for (int i = 0; i < n_fft; i++) {
+        w[i] = (i < win_size)
+             ? 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (float)win_size))
+             : 0.0f;
     }
-    int pad = n_fft / 2;
-    for (int t = 0; t < num_frames; t++) {
-        int start = t * hop_size - pad;
-        for (int k = 0; k < F; k++) {
-            float re = 0.0f, im = 0.0f;
-            for (int n = 0; n < n_fft; n++) {
-                int idx = start + n;
-                float val = 0.0f;
-                if (idx < 0) val = x[-idx - 1];
-                else if (idx >= T) val = x[2*T - 2 - idx];
-                else val = x[idx];
-                val *= w[n];
-                float ang = -2.0f * (float)M_PI * n * k / (float)n_fft;
-                re += val * cosf(ang);
-                im += val * sinf(ang);
-            }
-            int off = k * num_frames + t;
-            float mag = sqrtf(re*re + im*im);
-            mag_out[off] = log1pf(mag);
-            pha_out[off] = atan2f(im, re);
+    // twiddle[k][n] = exp(-2*pi*i*n*k/n_fft)
+    double *tw = (double *)malloc((size_t)F * n_fft * 2 * sizeof(double));
+    if (!tw) { free(w); return; }
+    const double pi = 3.14159265358979323846;
+    for (int k = 0; k < F; k++) {
+        double *tc = tw + (size_t)k * n_fft * 2;
+        for (int n = 0; n < n_fft; n++) {
+            double ang = -2.0 * pi * ((double)n * (double)k) / (double)n_fft;
+            tc[2*n]   = cos(ang);
+            tc[2*n+1] = sin(ang);
         }
     }
+    const int pad = n_fft / 2;
+    for (int t = 0; t < num_frames; t++) {
+        const int start = t * hop_size - pad;
+        for (int k = 0; k < F; k++) {
+            const double *tc = tw + (size_t)k * n_fft * 2;
+            double re = 0.0, im = 0.0;
+            for (int n = 0; n < n_fft; n++) {
+                int idx = start + n;
+                double val;
+                if (idx < 0)         val = x[-idx - 1];
+                else if (idx >= T)   val = x[2*T - 2 - idx];
+                else                 val = x[idx];
+                val *= w[n];
+                re += val * tc[2*n];
+                im += val * tc[2*n+1];
+            }
+            const int off = k * num_frames + t;
+            mag_out[off] = (float)log1p(sqrt(re*re + im*im));
+            pha_out[off] = (float)atan2(im, re);
+        }
+    }
+    free(tw);
     free(w);
 }

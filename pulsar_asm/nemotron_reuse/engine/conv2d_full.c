@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: OpenMDW-1.1
 #include <string.h>
 #include <math.h>
+#include <omp.h>
 
 void conv2d_general(const float *x, int N, int C_in, int H, int W,
                     const float *w, const float *b, int C_out,
@@ -10,6 +11,7 @@ void conv2d_general(const float *x, int N, int C_in, int H, int W,
                     float *y) {
     int H_out = (H + 2*padH - dilH*(kH-1) - 1)/strideH + 1;
     int W_out = (W + 2*padW - dilW*(kW-1) - 1)/strideW + 1;
+    #pragma omp parallel for collapse(3) schedule(static)
     for (int n = 0; n < N; n++) {
         for (int co = 0; co < C_out; co++) {
             for (int ho = 0; ho < H_out; ho++) {
