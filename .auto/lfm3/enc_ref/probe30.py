@@ -323,6 +323,10 @@ def hf_dump(feats, mask, out_dir, device):
 
 # --------------------------------------------------------------------------- our side
 
+WINMODE = "exc"   # set from --window-mode
+SINK = False          # set from --window-sink
+
+
 def attn_block_windowed(E, h, i, cos, sin, window):
     """enc_numpy.attn_block with a W-token window on the causal mask (W None = full causal).
     Same weights, same order, same RMSNorm/RoPE calls as the spec; the mask line is the
@@ -342,7 +346,13 @@ def attn_block_windowed(E, h, i, cos, sin, window):
     j_idx = np.arange(T)[None, :]
     allowed = (j_idx <= i_idx)
     if window is not None:
-        allowed = allowed & (j_idx > i_idx - window)
+        # 'exc' = the last W keys (j > i-W); 'inc' = HF's mask_context form
+        # (target - j <= window), i.e. W+1 keys. One key's difference, which is exactly
+        # the size of effect the last layer's residual needs explained (section 39).
+        allowed = allowed & ((j_idx >= i_idx - window) if WINMODE == "inc"
+                             else (j_idx > i_idx - window))
+        if SINK:
+            allowed = allowed | (j_idx == 0)     # attention sink: always attend to position 0
     for hq in range(8):
         kv = hq // 2
         sc = (q[:, hq, :] @ k[:, kv, :].T) * (E.HEAD ** -0.5)
@@ -444,6 +454,10 @@ def main():
     ap.add_argument("--skip-numpy", action="store_true", help="dump HF only")
     ap.add_argument("--skip-hf", action="store_true",
                     help="reuse the HF dumps already in --out (written by an earlier run)")
+    ap.add_argument("--window-mode", choices=["exc", "inc"], default="exc",
+                    help="exc: j > i-W (last W keys); inc: HF's j >= i-W (last W+1)")
+    ap.add_argument("--window-sink", action="store_true",
+                    help="always attend to position 0 (attention sink) in windowed layers")
     ap.add_argument("--window-layers", default=None,
                     help="comma-separated attention layer indices to window; the rest stay "
                          "full causal. With --window-test this tests a per-layer schedule, "
@@ -545,9 +559,24 @@ def main():
     first_w = None
     if args.window_test:
         t0 = time.time()
+        global WINMODE, SINK
+        WINMODE = getattr(args, "window_mode", "exc")
+        SINK = bool(getattr(args, "window_sink", False))
+        print("[window knobs] W=%d mode=%s sink=%s layers=%s"
+              % (args.window_test, WINMODE, SINK, args.window_layers))
         if getattr(args, "window_layers", None):
-            wl = {int(x): args.window_test for x in args.window_layers.split(",")
-                  if x.strip() != ""}
+            # Accept "2,5,8" (all at --window-test) or per-layer values "2:32,5:32,16:64"
+            # so one layer's window can be searched while the others are pinned.
+            wl = {}
+            for x in args.window_layers.split(","):
+                x = x.strip()
+                if not x:
+                    continue
+                if ":" in x:
+                    i, w = x.split(":")
+                    wl[int(i)] = int(w)
+                else:
+                    wl[int(x)] = args.window_test
             print("[window schedule] %s at W=%d, the rest full causal"
                   % (sorted(wl), args.window_test))
             st_w = spec_stages(E, feat, wl)

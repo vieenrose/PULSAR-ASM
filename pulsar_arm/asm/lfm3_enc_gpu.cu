@@ -43,6 +43,10 @@ __device__ int g_probe_d;                     // device copy (a host getenv init
 
 static int g_poison = -1;                    // read lazily by dalloc and gemm_setup
 static int g_ench2 = 0;            // 0 = fp32 arms (the C-ref oracle path), 1 = batched half2
+// encoder.sliding_window (section 39): 32 = HF's canonical encoder attention; 0 reproduces
+// the old full-causal spec for A/B. Read from LFM_ENC_WIN, printed at start-up so a
+// timing or gate run always records which mask it used.
+static int g_enc_win = 32;
 
 // ---------------------------------------------------------------- kernels
 // fp32 -> bf16 (the h2 arm's input conversion), the engine's own f2bf rounding
@@ -590,8 +594,13 @@ __global__ void k_rope(float* __restrict__ q, float* __restrict__ k, int T) {
 // barrier before thread 0 writes, barrier before anyone reads.
 __global__ void k_attn_prefill(const float* __restrict__ q, const float* __restrict__ k,
                                const float* __restrict__ v, float* __restrict__ ao,
-                               int T, float scale, float* dbg, int ts, int hs) {
+                               int T, float scale, float* dbg, int ts, int hs, int win) {
   const int i = blockIdx.x, hh = blockIdx.y, kv = hh / (ENH / ENKV);
+  // win = 32 for the encoder's sliding-window attention layers, 0 = full causal. The
+  // checkpoint's encoder sub-config says encoder.sliding_window = 32 and HF builds the
+  // mask with create_sliding_window_causal_mask(sliding_window=32); see the section 39
+  // note at the layer loop for the measurement and for why the LAST layer stays full.
+  const int jlo = (i >= win) ? (i - win + 1) : 0;
   __shared__ float prod[EHD];
   __shared__ float sc;
   const int d = threadIdx.x;
@@ -610,9 +619,9 @@ __global__ void k_attn_prefill(const float* __restrict__ q, const float* __restr
     __syncthreads(); \
   } while (0)
   float mx = -INFINITY;
-  for (int j = 0; j <= i; j++) { QKSCORE(j); if (sc > mx) mx = sc; }
+  for (int j = jlo; j <= i; j++) { QKSCORE(j); if (sc > mx) mx = sc; }
   float den = 0.f;
-  for (int j = 0; j <= i; j++) {
+  for (int j = jlo; j <= i; j++) {
     QKSCORE(j);
     __syncthreads();                      // the exp write below must not race a read
     if (d == 0) sc = expf(__fadd_rn(sc, -mx));
@@ -620,7 +629,7 @@ __global__ void k_attn_prefill(const float* __restrict__ q, const float* __restr
     den = __fadd_rn(den, sc);
   }
   float o = 0.f;
-  for (int j = 0; j <= i; j++) {
+  for (int j = jlo; j <= i; j++) {
     QKSCORE(j);
     __syncthreads();
     if (d == 0) sc = expf(__fadd_rn(sc, -mx));
@@ -727,6 +736,9 @@ static Ent* need(Model& M, const char* name) {
 int main(int argc, char** argv) {
   if (argc != 5) { printf("usage: %s <enc blob> <input.bin> <Tm> <outdir>\n", argv[0]); return 2; }
   g_ench2 = getenv("LFM_ENC_H2") ? atoi(getenv("LFM_ENC_H2")) : 0;
+  g_enc_win = getenv("LFM_ENC_WIN") ? atoi(getenv("LFM_ENC_WIN")) : 32;
+  printf("ENC-ATTN layers=2,5,8,11,14,15 window=%d; layer %d full causal (encoder.sliding_window)\n",
+         g_enc_win, (int)ENLAYER - 1); fflush(stdout);
   const int Tm = atoi(argv[3]);
   // The 8192 that used to sit here was a bring-up guard, not a structural limit: every
   // per-position buffer is a dynamic cudaMalloc (dalloc) and the downsampler's strides
@@ -934,7 +946,8 @@ int main(int argc, char** argv) {
           if (cudaMalloc((void**)&dbg, (size_t)Tt * 4) || cudaMemset(dbg, 0, (size_t)Tt * 4)) { printf("probe alloc\n"); return 3; }
           ts = atoi(strchr(sd, ',') ? strchr(sd, ',') + 1 : "0"); hs = atoi(strrchr(sd, ',') ? strrchr(sd, ',') + 1 : "0");
         } }
-      k_attn_prefill<<<gA, 96>>>(hq, hk, hv, hao, Tt, 1.0f / sqrtf((float)EHD), dbg, ts, hs); chk("attention");
+      k_attn_prefill<<<gA, 96>>>(hq, hk, hv, hao, Tt, 1.0f / sqrtf((float)EHD), dbg, ts, hs,
+                                 (L != ENLAYER - 1) ? g_enc_win : 0); chk("attention");
       if (dbg) { static float* hb = nullptr; if (!hb) hb = (float*)malloc((size_t)Tt * 4);
         cudaMemcpy(hb, dbg, (size_t)Tt * 4, cudaMemcpyDeviceToHost);
         printf("scores t=%d h=%d:", ts, hs); for (int j = 0; j <= ts; j++) printf(" %.6f", hb[j]); printf("\n"); }

@@ -9,7 +9,15 @@ from safetensors import safe_open
 MODEL = "/home/louis/models/lfm3/LFM3-Audio-2B/model.safetensors"
 REF = sys.argv[1] if len(sys.argv) > 1 else "/home/louis/PULSAR-ASM/.auto/lfm3/enc_ref/ref"
 EPS = 1e-5
-WIN = 32   # streaming-only (unused offline; see attn_block)
+# encoder.sliding_window, section 39. HF's ENCODER sub-config has sliding_window = 32 and
+# its forward builds the mask with create_sliding_window_causal_mask(sliding_window=32),
+# so the encoder's attention layers are windowed -- the "streaming-only" note here was
+# wrong, and is the reason the §22 gate (measured against dump_encoder.py's UNWINDOWED
+# mask-dict path, where full causal matched to 1.3e-7) stayed green while the end-to-end
+# ASR transcript diverged from HF at token 126. WINDOWED = the layers HF windows;
+# env LFM_ENC_WIN=0 reproduces the old full-causal spec for A/B.
+WIN = int(os.environ.get("LFM_ENC_WIN", "32"))
+WINDOWED = (2, 5, 8, 11, 14, 15)      # = attention layers minus the last (section 39)
 THETA = 1e6
 HEAD = 96
 
@@ -106,11 +114,15 @@ def attn_block(h, i, cos, sin):
     out = np.zeros((T, 8, HEAD), np.float32)
     i_idx = np.arange(T)[:, None]
     j_idx = np.arange(T)[None, :]
-    # OFFLINE forward: full causal. The checkpoint's encoder layer_types are all
-    # "full_attention", so HF's offline mask has no window (verified: the windowed
-    # variant misses by 1e-2 rms at layer 2, full causal matches to 1.3e-7). The 32-token
-    # window exists only in the streaming path (cache remaps layers to sliding_attention).
+    # Section 39: windowed causal (last WIN keys) for the layers HF windows, full causal
+    # for the last layer. The old comment claimed full causal everywhere and cited
+    # dump_encoder.py, which passes attention_mask={"full_attention": None, "conv": None}
+    # -- a mask DICT, i.e. HF's unwindowed path; the canonical forward (and the ASR
+    # golden) goes through create_sliding_window_causal_mask(sliding_window=32).
+    w = WIN if i in WINDOWED else 0
     allowed = (j_idx <= i_idx)
+    if w:
+        allowed = allowed & (j_idx > i_idx - w)
     for hq in range(8):
         kv = hq // 2                                          # GQA: 2 q heads per kv head
         sc = (q[:, hq, :] @ k[:, kv, :].T) * (HEAD ** -0.5)

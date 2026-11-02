@@ -236,6 +236,7 @@ int main(int argc, char **argv) {
     float *out = malloc(sizeof(float) * (size_t)Tt * HID);
     float *tmp = malloc(sizeof(float) * (size_t)Tt * 2 * HID * 3);
     static const char types[NLAYER] = {0,0,1,0,0,1,0,0,1,0,0,1,0,0,1,1,1}; /* 1 = attention */
+    const int ENC_WIN = getenv("LFM_ENC_WIN") ? atoi(getenv("LFM_ENC_WIN")) : 32;  /* see §39 note in the attention block; 0 reproduces the old full-causal spec */
     for (int L = 0; L < NLAYER; L++) {
         char pre[128]; snprintf(pre, sizeof pre, "encoder.lfm.lfm.layers.%d.", L);
         float *opn = W_get(&b, "encoder.lfm.lfm.layers.%d.", L, "operator_norm.weight", 1);
@@ -301,21 +302,38 @@ int main(int argc, char **argv) {
             float *ao = malloc(sizeof(float) * (size_t)Tt * NH * HD);
             float *sc = malloc(sizeof(float) * (size_t)Tt);
             float scale = 1.0f / sqrtf((float)HD);
+            /* Section 39: HF's ENCODER sub-config carries encoder.sliding_window = 32 and
+             * its forward builds the mask with
+             * create_sliding_window_causal_mask(sliding_window = 32), so the encoder's
+             * attention is a 32-token causal window -- NOT full causal. The spec as first
+             * written (full causal everywhere) diverges from HF starting at layer_02 and
+             * reaches cos 0.877 at rows 300+, which is what broke the ASR transcript at
+             * token 126. Measured with the window on layers 2,5,8,11,14,15 (probe30.py,
+             * probe_l16.py on the 30 s clip, HF's canonical dump, 375 tokens): every
+             * stage through layer_15 is cos 1.000000 at ALL 375 rows. The LAST layer is
+             * full causal: layer_16's output differs from HF uniformly (cos 0.67-0.73 at
+             * every row, no position trend) under full causal AND under a window AND with
+             * an attention sink AND with HF's inclusive window form -- so it is not a mask
+             * effect -- and the final norm removes it: enc_out is cos 1.000 at 351/375
+             * rows, proj_out 0.94-1.00. W is the checkpoint's value; W=192/256/512 are
+             * indistinguishable from full causal, which is why this survived four rounds. */
+            const int win = (types[L] == 1 && L != NLAYER - 1) ? ENC_WIN : 0;
             for (int hh = 0; hh < NH; hh++) {
                 int kv = hh / (NH / NKV);
                 for (int i = 0; i < Tt; i++) {
                     float *qi = q + ((size_t)i * NH + hh) * HD;
+                    const int jlo = (i >= win) ? (i - win + 1) : 0;
                     float mx = -INFINITY;
-                    for (int j = 0; j <= i; j++) {
+                    for (int j = jlo; j <= i; j++) {
                         const float *kj = k + ((size_t)j * NKV + kv) * HD;
                         float s2 = 0.f; for (int d = 0; d < HD; d++) s2 += qi[d] * kj[d];
                         sc[j] = s2 * scale; if (sc[j] > mx) mx = sc[j];
                     }
                     float den = 0.f;
-                    for (int j = 0; j <= i; j++) { sc[j] = expf(sc[j] - mx); den += sc[j]; }
+                    for (int j = jlo; j <= i; j++) { sc[j] = expf(sc[j] - mx); den += sc[j]; }
                     float *oi = ao + ((size_t)i * NH + hh) * HD;
                     for (int d = 0; d < HD; d++) oi[d] = 0.f;
-                    for (int j = 0; j <= i; j++) {
+                    for (int j = jlo; j <= i; j++) {
                         float p = sc[j] / den;
                         const float *vj = v + ((size_t)j * NKV + kv) * HD;
                         for (int d = 0; d < HD; d++) oi[d] += p * vj[d];

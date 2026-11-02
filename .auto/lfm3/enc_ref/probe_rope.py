@@ -92,13 +92,16 @@ for nm, m in enc.named_modules():
         rot = m; print("  rotary module: %s (%s)" % (nm, type(m).__name__)); break
 if rot is not None:
     handles.append(rot.register_forward_hook(hook('rot', cat_in_out)))
-feats = proc.feature_extractor([pcm], sampling_rate=sr, return_attention_mask=True,
-                               padding='max_length', return_tensors='pt')
-Tm = int(feats['num_frames'][0]); Tt = (Tm + 7) // 8
+# Lfm3AudioFeatureExtractor refuses padding/return_attention_mask kwargs (clips are
+# always right-padded to whole frames and feature_attention_mask is always returned).
+feats = proc.feature_extractor([pcm], sampling_rate=sr, return_tensors='pt')
+print("  FE keys: %s  input_features %s" % (sorted(feats.keys()),
+                                            tuple(feats['input_features'].shape)))
+Tm = int(feats['input_features'].shape[-1]); Tt = (Tm + 7) // 8
 print("mel frames %d -> tokens %d" % (Tm, Tt))
 with torch.no_grad():
-    hf = model.model.get_audio_features(feats['input_features'],
-                                        feats['attention_mask'], return_dict=True)
+    fam = feats.get('feature_attention_mask', feats.get('attention_mask'))
+    hf = model.model.get_audio_features(feats['input_features'], fam)
 for h in handles:
     h.remove()
 

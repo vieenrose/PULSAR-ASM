@@ -1954,3 +1954,59 @@ and no `q_norm` module on the layer).
 This is the mechanism behind the 126/262 transcript prefix in §37: the encoder's
 activations are exact through layer 15 at every position and start drifting at the first
 attention layer, growing to cos 0.877 by row 300+ at full length.
+
+### 40. The window fix shipped, and the prefix metric is retired as the quality bar
+
+Ported `encoder.sliding_window = 32` to all three implementations, with the same rule
+(the attention layers HF windows = `layer_types` attention minus the last layer, so
+2,5,8,11,14,15; layer 16 stays full causal):
+
+* `enc_numpy.py` (spec of record) — `WIN`/`WINDOWED`, env `LFM_ENC_WIN=0` reproduces the
+  old spec. Its own comment claimed "the 32-token window exists only in the streaming
+  path"; that claim is what let the bug survive, and §39's measurement kills it.
+* `lfm3_enc.c` — `jlo = i - win + 1` on the three softmax loops.
+* `lfm3_enc_gpu.cu` — `k_attn_prefill(..., int win)`, `g_enc_win` from `LFM_ENC_WIN`,
+  and a start-up proof line (`ENC-ATTN layers=2,5,8,11,14,15 window=32; layer 16 full
+  causal`) so no timing or gate number can be read without knowing which mask ran.
+
+`ENC_GATE PASS` (20 stages, run-to-run worst energy rel 0.000e+00) — the C reference and
+the CUDA encoder moved together, so this gate cannot detect a *shared* spec error, which
+is exactly how §39's bug stayed invisible: the §22 dumps come from
+`dump_encoder.py`, which passes `attention_mask={"full_attention": None, "conv": None}` —
+a mask **dict**, HF's unwindowed path — while the golden's real forward goes through
+`create_sliding_window_causal_mask(sliding_window=32)`. Two HF paths, two masks, one gate.
+
+Quality, measured on what the LM consumes (`proj_out` vs the embedding matrix HF fed the
+LM at the same positions, 1622 rows x 2048, the 129.7 s clip):
+
+| arm | mean per-row cos | energy rel | per-200-row cos |
+|---|---|---|---|
+| full causal (pre-fix spec) | **0.303** | 1.42 | 0.278-0.327, drifting |
+| W=32 on 2,5,8,11,14,15 | **0.892** | 0.454 | **0.888-0.899, flat** |
+
+and the transcript, with metrics that respond monotonically (added to `checks_asr.py`,
+gated at `ASR_MIN_EMB_COS=0.85`):
+
+```
+greedy prefix vs HF golden: 69 / 262 tokens          <- CHAOTIC, informational only
+stable metrics: all-position match 143/262 (54.6%), LCS 233, token-WER 0.111 (sub 29 ins 0 del 0)
+EMB vs HF golden: mean per-row cos 0.891976 (min 0.7076), energy rel 4.540e-01
+ASR_RT = 3.848  (prefill+decode 3.390, front end 0.458)
+```
+
+**Why the prefix went 126 -> 69 while the encoder got ~3x better.** Greedy decoding is
+chaotic in logit margins: one flipped token ends the prefix, so prefix length measures
+"where the first coin-flip landed", not quality. The divergence is at a numeral (index 69,
+engine id 22 vs HF id 20) in a numeric-dense stretch ("...at 3.4 degrees"), the classic
+near-tie region. LCS 233/262 (88.9% of content tokens agree) and token-WER 0.111 with
+**zero insertions and zero deletions** are the numbers that describe the transcript, and
+the LM-input cos is the upstream metric that predicts them. The gate now reports all of
+them, gates the emb-cos, and keeps the prefix printed for continuity.
+
+Encoder wall also dropped to 47 s from 80.7 s: the gate now runs with per-kernel syncs
+off by default (`LFM_ENC_SYNC`, §38) and `chk_final()` catches async faults.
+
+Open: layer_16's uniform cos 0.67-0.73 vs HF (every row, no position trend, unchanged by
+window/sink/window-form — so not a mask effect), removed by the final norm (`enc_out`
+1.000 at 351/375 rows). The 0.892 emb-cos plateau and the remaining ~0.11 WER are the
+size of what that leaves on the table.
