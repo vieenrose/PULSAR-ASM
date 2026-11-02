@@ -21,23 +21,23 @@ def stft_mag_pha(x, n_fft, hop_size, win_size, compress_factor='relu_log1p', cen
     W = np.exp(-2j * np.pi * n * k / n_fft)
     W_real = torch.from_numpy(W.real).float()
     W_imag = torch.from_numpy(W.imag).float()
-    mags = []
-    phas = []
     L = x.shape[-1]
     num_frames = 1 + (L - n_fft) // hop_size
+    frames = []
     for i in range(num_frames):
         start = i * hop_size
         frame = x[:, start:start + n_fft]
-        frame = frame * window.unsqueeze(0)
-        real = torch.matmul(frame, W_real)
-        imag = torch.matmul(frame, W_imag)
-        spec = torch.complex(real, imag)
-        mag = torch.abs(spec)
-        pha = torch.angle(spec)
-        mags.append(mag)
-        phas.append(pha)
-    mag = torch.stack(mags, dim=2)
-    pha = torch.stack(phas, dim=2)
+        frames.append(frame)
+    frames = torch.stack(frames, dim=1)  # [B, Fm, N]
+    frames = frames * window.unsqueeze(0).unsqueeze(0)
+    frames = frames.reshape(-1, n_fft)  # [B*Fm, N]
+    real = frames @ W_real
+    imag = frames @ W_imag
+    spec = torch.complex(real, imag)
+    mag = torch.abs(spec)
+    pha = torch.angle(spec)
+    mag = mag.reshape(B, num_frames, n_fft // 2 + 1).permute(0, 2, 1)
+    pha = pha.reshape(B, num_frames, n_fft // 2 + 1).permute(0, 2, 1)
     if compress_factor in ['log1p', 'relu_log1p', 'signed_log1p']:
         mag_c = torch.log1p(mag)
     else:
