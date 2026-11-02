@@ -1,0 +1,10 @@
+*.o
+*.so
+*.a
+engine/reuse_nano_cpu
+engine/reuse_nano_gpu
+engine/stft_dump
+engine/reuse_nano
+/tmp/
+__pycache__/
+*.pyc
