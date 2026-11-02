@@ -1,7 +1,7 @@
-ENC-ATTN layers=2,5,8,11,14,15 window=32; layer 16 full causal (encoder.sliding_window)
+ENC-ATTN layers=2,5,8,11,14,15,16 window=32 (encoder.sliding_window, all attention layers; section 42)
 Tm=400 -> EWo1=200 EWo2=100 tokens Tt=50 (expect ceil(Tm/8)); arms=fp32
   lin_mid N=256 K=256 T=3200 f32 weights
-ENCODER total 304.72 ms (min of 1) = 0.0762 s GPU per audio second; downsampler alone 458 MMAC, 1.5 GMAC/s at that rate
+ENCODER total 305.55 ms (min of 1) = 0.0764 s GPU per audio second; downsampler alone 458 MMAC, 1.5 GMAC/s at that rate
 dump ds_out       n=38400 nonzero=38400 max=1.7826
 dump layer_00     n=38400 nonzero=38400 max=1.6371
 dump layer_01     n=38400 nonzero=38400 max=1.6621
@@ -23,16 +23,16 @@ dump layer_12     n=38400 nonzero=38400 max=9.4529
 dump layer_13     n=38400 nonzero=38400 max=26.9504
 dump layer_14     n=38400 nonzero=38400 max=28.6872
 dump layer_15     n=38400 nonzero=38400 max=29.4874
-dump layer_16     n=38400 nonzero=38400 max=28.0078
-dump enc_out      n=38400 nonzero=38400 max=18.6273
-dump proj_out     n=102400 nonzero=102400 max=0.5274
+dump layer_16     n=38400 nonzero=38400 max=28.3672
+dump enc_out      n=38400 nonzero=38400 max=19.1175
+dump proj_out     n=102400 nonzero=102400 max=0.3089
 layers ported: 17 of 17
 FM3_ENC_GPU_DONE Tm=400 Tt=50
 layers ported: 17 of 17
 FM3_ENC_GPU_DONE Tm=400 Tt=50
   ds_out     energy rel 8.400e-07  per-elem rms rel 3.449e-05  max abs 2.503e-06  rms(GPU) 0.12701 rms(C) 0.12701  nonzero 38400/38400  OK
-  enc_out    energy rel 6.560e-07  per-elem rms rel 3.251e-04  max abs 4.959e-05  rms(GPU) 0.53487 rms(C) 0.53487  nonzero 38400/38400  OK
-  proj_out   energy rel 3.468e-06  per-elem rms rel 2.542e-04  max abs 4.351e-06  rms(GPU) 0.05348 rms(C) 0.05348  nonzero 102400/102400  OK
+  enc_out    energy rel 7.065e-07  per-elem rms rel 6.298e-04  max abs 5.436e-05  rms(GPU) 0.53018 rms(C) 0.53018  nonzero 38400/38400  OK
+  proj_out   energy rel 3.957e-06  per-elem rms rel 3.403e-04  max abs 5.201e-06  rms(GPU) 0.05440 rms(C) 0.05440  nonzero 102400/102400  OK
   layer_00   energy rel 9.614e-07  per-elem rms rel 2.055e-04  max abs 2.384e-06  rms(GPU) 0.12758 rms(C) 0.12758  nonzero 38400/38400  OK
   layer_01   energy rel 9.679e-07  per-elem rms rel 1.887e-04  max abs 2.861e-06  rms(GPU) 0.13835 rms(C) 0.13835  nonzero 38400/38400  OK
   layer_02   energy rel 1.033e-06  per-elem rms rel 4.098e-04  max abs 2.980e-06  rms(GPU) 0.13797 rms(C) 0.13797  nonzero 38400/38400  OK
@@ -49,7 +49,7 @@ FM3_ENC_GPU_DONE Tm=400 Tt=50
   layer_13   energy rel 1.590e-06  per-elem rms rel 3.109e-03  max abs 9.918e-05  rms(GPU) 0.59825 rms(C) 0.59825  nonzero 38400/38400  OK
   layer_14   energy rel 1.339e-06  per-elem rms rel 2.066e-03  max abs 9.727e-05  rms(GPU) 0.82254 rms(C) 0.82254  nonzero 38400/38400  OK
   layer_15   energy rel 1.268e-06  per-elem rms rel 1.476e-03  max abs 9.727e-05  rms(GPU) 0.96121 rms(C) 0.96121  nonzero 38400/38400  OK
-  layer_16   energy rel 1.332e-06  per-elem rms rel 3.251e-04  max abs 9.727e-05  rms(GPU) 0.96660 rms(C) 0.96660  nonzero 38400/38400  OK
+  layer_16   energy rel 1.347e-06  per-elem rms rel 6.298e-04  max abs 9.537e-05  rms(GPU) 1.03392 rms(C) 1.03392  nonzero 38400/38400  OK
   run-to-run WORST energy rel 0.000e+00  (defect budget 3e-03: OK)
   probe_q_02  energy rel 6.357e-07  per-elem rms rel 1.105e-04  max abs 5.722e-06  rms 0.9994 vs 0.9994  finite True  OK
   probe_k_02  energy rel 7.722e-07  per-elem rms rel 1.095e-04  max abs 4.411e-06  rms 1.0016 vs 1.0016  finite True  OK

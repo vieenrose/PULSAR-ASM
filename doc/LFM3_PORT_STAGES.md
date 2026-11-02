@@ -2037,3 +2037,46 @@ reasons, and both are stated rather than smoothed:
    syncs. The C-vs-CUDA gate is measured at T=50, so neither change is verified at
    Tt=1622. The 126 figure should be read as a historical observation from a superseded
    build, not as a current result. The current, reproducible pair is the table above.
+
+### 42. The rule is ALL attention layers: transcript 260/262 tokens, EMB cos 0.999774
+
+Section 39/40's "attention layers minus the last" exception was wrong, and the way it
+died is the lesson. Layer 16 was pinned to a single block (`probe_l16b.py`: operator_norm
+exact with `implied w vs stored w: corr 1.000000, max|diff| 0.00000`; `feed_forward` cos
+1.0000; `self_attn` cos 0.8483 on an exact input), then `probe_l16attn.py` swept 1792
+plausible conventions -- window {0,16,32,48,64,128,256} x {exclusive, inclusive} x
+{sink, no sink} x scale {1/sqrt(96), 1/96, 1, 1/sqrt(768)} x {qk-norm, none} x {rope, no
+rope} x {GQA hq//2, hq%4} x {max-subtract, raw} -- on HF's captured input, scoring
+against HF's captured output. The winner, out of 1792:
+
+```
+cos 1.000000 min 1.0000 rms 0.51026 | W=32 exc sink=False rsqrt qk rope=True div maxsub   <- HF rms 0.51026
+```
+
+W=32, the identical convention as layers 2-15. With all seven attention layers windowed,
+the numpy spec reproduces HF's `enc_out` AND `proj_out` at **cos 1.0000 at every one of
+the 375 rows**. The layer_16-vs-`hidden_17` 0.68 that motivated the exception is a
+capture artifact of `dump_encoder.py`'s last hidden file: that layer's attention is
+cos 1.000000 and its FFN cos 1.0000 individually, so the pair cannot sum to 0.68.
+
+Shipped in all three implementations (`enc_numpy.WINDOWED`, `lfm3_enc.c`
+`win = (types[L]==1) ? ENC_WIN : 0`, `k_attn_prefill(..., g_enc_win)`), proof line
+`ENC-ATTN layers=2,5,8,11,14,15,16 window=32 (all attention layers; section 42)`, and
+`ENC_GATE PASS` (20 stages, run-to-run 0.000e+00).
+
+End-to-end speech -> text on the 129.7 s fixture, same gate, same golden:
+
+| metric | pre-fix (W=0) | §40 (last full) | §42 (all windowed) |
+|---|---|---|---|
+| greedy prefix | 0 | 69 | **207** |
+| all-position match | 1/262 (0.4%) | 143/262 (54.6%) | **260/262 (99.2%)** |
+| LCS | 1 | 233 | **260** |
+| token-WER | 0.996 | 0.111 | **0.008** (2 subs, 0 ins, 0 del) |
+| EMB mean per-row cos | 0.303 | 0.892 | **0.999774** (min 0.9996, flat in all nine 200-row buckets) |
+| EMB energy rel | 1.42 | 0.454 | **0.0206** |
+
+The remaining difference is two substituted tokens starting at gen index 207
+(engine id 368 vs HF 5385, then the streams re-converge: LCS 260 of 262), which is a
+greedy near-tie in the LM's decode, not an encoder gap: the LM's input is cos 0.9998.
+`ASR_RT = 3.866` (prefill+decode 3.399, front end 0.466) is unchanged, as expected --
+this was an accuracy fix; the wall is the LM's prefill and is the `w2` decision.

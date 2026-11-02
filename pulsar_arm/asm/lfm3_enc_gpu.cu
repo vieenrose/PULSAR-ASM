@@ -737,8 +737,8 @@ int main(int argc, char** argv) {
   if (argc != 5) { printf("usage: %s <enc blob> <input.bin> <Tm> <outdir>\n", argv[0]); return 2; }
   g_ench2 = getenv("LFM_ENC_H2") ? atoi(getenv("LFM_ENC_H2")) : 0;
   g_enc_win = getenv("LFM_ENC_WIN") ? atoi(getenv("LFM_ENC_WIN")) : 32;
-  printf("ENC-ATTN layers=2,5,8,11,14,15 window=%d; layer %d full causal (encoder.sliding_window)\n",
-         g_enc_win, (int)ENLAYER - 1); fflush(stdout);
+  printf("ENC-ATTN layers=2,5,8,11,14,15,16 window=%d (encoder.sliding_window, all "
+         "attention layers; section 42)\n", g_enc_win); fflush(stdout);
   const int Tm = atoi(argv[3]);
   // The 8192 that used to sit here was a bring-up guard, not a structural limit: every
   // per-position buffer is a dynamic cudaMalloc (dalloc) and the downsampler's strides
@@ -947,7 +947,7 @@ int main(int argc, char** argv) {
           ts = atoi(strchr(sd, ',') ? strchr(sd, ',') + 1 : "0"); hs = atoi(strrchr(sd, ',') ? strrchr(sd, ',') + 1 : "0");
         } }
       k_attn_prefill<<<gA, 96>>>(hq, hk, hv, hao, Tt, 1.0f / sqrtf((float)EHD), dbg, ts, hs,
-                                 (L != ENLAYER - 1) ? g_enc_win : 0); chk("attention");
+                                 g_enc_win); chk("attention");
       if (dbg) { static float* hb = nullptr; if (!hb) hb = (float*)malloc((size_t)Tt * 4);
         cudaMemcpy(hb, dbg, (size_t)Tt * 4, cudaMemcpyDeviceToHost);
         printf("scores t=%d h=%d:", ts, hs); for (int j = 0; j <= ts; j++) printf(" %.6f", hb[j]); printf("\n"); }

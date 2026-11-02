@@ -317,7 +317,15 @@ int main(int argc, char **argv) {
              * effect -- and the final norm removes it: enc_out is cos 1.000 at 351/375
              * rows, proj_out 0.94-1.00. W is the checkpoint's value; W=192/256/512 are
              * indistinguishable from full causal, which is why this survived four rounds. */
-            const int win = (types[L] == 1 && L != NLAYER - 1) ? ENC_WIN : 0;
+            /* Section 42: every attention layer is windowed, including the last. The
+             * "minus the last layer" exception in section 39 came from comparing my
+             * layer_16 against dump_encoder.py's hidden_17 file (cos 0.68 at every row);
+             * a 1792-variant sweep of that layer's attention on HF's captured input
+             * picks W=32 with the same convention as the rest (cos 1.000000, min 1.0000,
+             * rms equal to HF's), its FFN is cos 1.0000, and with all seven attention
+             * layers windowed enc_out and proj_out both reach cos 1.0000 at all 375
+             * rows -- so hidden_17 is a capture artifact, not a defect. */
+            const int win = (types[L] == 1) ? ENC_WIN : 0;
             for (int hh = 0; hh < NH; hh++) {
                 int kv = hh / (NH / NKV);
                 for (int i = 0; i < Tt; i++) {

@@ -17,7 +17,14 @@ EPS = 1e-5
 # ASR transcript diverged from HF at token 126. WINDOWED = the layers HF windows;
 # env LFM_ENC_WIN=0 reproduces the old full-causal spec for A/B.
 WIN = int(os.environ.get("LFM_ENC_WIN", "32"))
-WINDOWED = (2, 5, 8, 11, 14, 15)      # = attention layers minus the last (section 39)
+WINDOWED = (2, 5, 8, 11, 14, 15, 16)   # ALL attention layers (section 42)
+# Section 42 corrects section 39's "attention layers minus the last": a 1792-variant
+# sweep of layer 16's attention against HF's own captured output picks W=32 with the
+# identical convention as the others (cos 1.000000, min 1.0000, rms 0.51026 = HF's), and
+# with all seven layers windowed the numpy spec reproduces HF's enc_out AND proj_out at
+# cos 1.0000 at EVERY one of the 375 rows. The layer_16-vs-hidden_17 0.68 that motivated
+# the exception is a capture artifact of dump_encoder.py's hidden_17 file, not a defect:
+# that layer's attention (cos 1.000000) and FFN (cos 1.0000) are individually exact.
 THETA = 1e6
 HEAD = 96
 
