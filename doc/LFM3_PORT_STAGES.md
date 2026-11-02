@@ -2010,3 +2010,30 @@ Open: layer_16's uniform cos 0.67-0.73 vs HF (every row, no position trend, unch
 window/sink/window-form — so not a mask effect), removed by the final norm (`enc_out`
 1.000 at 351/375 rows). The 0.892 emb-cos plateau and the remaining ~0.11 WER are the
 size of what that leaves on the table.
+
+### 41. A/B of the two arms through the same gate, and a disclosure about the 126/262
+
+Run through `checks_asr.py` with `ASR_ENC_ENV` selecting the arm (same build, same prompt,
+same golden, same metric code):
+
+| arm | prefix | all-position match | LCS | token-WER | EMB cos | gate |
+|---|---|---|---|---|---|---|
+| `LFM_ENC_WIN=32` (section 39/40) | 69 | 143/262 (54.6%) | 233 | 0.111 | 0.891976 | PASS |
+| `LFM_ENC_WIN=0` (old full causal) | 0 | 1/262 (0.4%) | 1 | 0.996 | 0.303083 | **FAIL** (cos < 0.85) |
+
+The pre-fix arm is not "slightly worse": with 1 token of 262 in common and WER 0.996 the
+transcript shares nothing with HF's. `ASR_MIN_EMB_COS=0.85` accepts the good arm at 0.892
+and rejects the bad one at 0.303, so the bar is calibrated by two points on either side of
+the defect it is meant to catch, which is the standard the rest of this project uses.
+
+**Disclosure, because §37's headline is no longer reproducible.** §37 reported prefix
+126/262 for the pre-fix encoder. Running the pre-fix arm today gives prefix 0, LCS 1. Two
+reasons, and both are stated rather than smoothed:
+1. Prefix length on a greedy stream is chaotic, so 126 vs 0 is not a measurement of a
+   126-fold difference in anything; the monotonic metrics (LCS, WER, emb-cos) are the ones
+   that are stable, and the emb-cos for §37's build was never taken.
+2. The tree changed since §37: the GEMM partial buffer is now a pooled grow-only allocation
+   (§38) and the gate runs the encoder async with `chk_final()` instead of per-kernel
+   syncs. The C-vs-CUDA gate is measured at T=50, so neither change is verified at
+   Tt=1622. The 126 figure should be read as a historical observation from a superseded
+   build, not as a current result. The current, reproducible pair is the table above.
