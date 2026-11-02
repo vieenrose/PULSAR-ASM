@@ -1,0 +1,9 @@
+{
+  "src": "/home/louis/NVIDIA-NemotronLabs-RE-USE/noisy_audio/mic_test2.wav",
+  "rates": [
+    8000,
+    16000,
+    44100,
+    48000
+  ]
+}
