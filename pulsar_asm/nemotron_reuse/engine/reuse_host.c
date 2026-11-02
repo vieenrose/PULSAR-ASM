@@ -21,3 +21,5 @@ int main(int argc, char **argv) {
     printf("stub: not yet implemented\n");
     return 0;
 }
+
+#include "stft_dft.cuh"
