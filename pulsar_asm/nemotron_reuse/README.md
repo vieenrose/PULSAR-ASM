@@ -29,3 +29,11 @@ Unlike other PULSAR-ASM ports, bit-exactness vs PyTorch is not required (exp/ata
 2. Waveform SNR ≥ 50 dB (fp32), ≥ 30 dB + perceptual delta ≤ 0.02 (half2/fp16)
 3. Complex-spectrum comparison for phase (not raw atan2)
 4. Sweep-artifact mask matches reference
+
+## Implementation status
+- S0: Done (fixtures, references, blob)
+- S1: Done (blob format)
+- S2: Done (DFT-GEMM STFT/iSTFT, matches torch)
+- S3-S5: In progress (kernels + model structure; full forward pass being wired)
+- S6: Driver loads blob/wav, runs pipeline
+- S7-S8: Pending
