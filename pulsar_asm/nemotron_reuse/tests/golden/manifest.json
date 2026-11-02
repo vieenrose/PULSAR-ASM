@@ -15,6 +15,14 @@
     "bytes": 163244,
     "sha256": "240870801ff71a2a"
    },
+   "in_mag.raw": {
+    "bytes": 1310964,
+    "sha256": "245292b8d783e88d"
+   },
+   "in_pha.raw": {
+    "bytes": 1310964,
+    "sha256": "4f425e39726830f2"
+   },
    "pha.raw": {
     "bytes": 1310964,
     "sha256": "9a30f47252821296"
@@ -40,6 +48,14 @@
    "enhanced.wav": {
     "bytes": 449862,
     "sha256": "11092dad3f865a42"
+   },
+   "in_mag.raw": {
+    "bytes": 3613236,
+    "sha256": "e4d3c4d4ea3b98cd"
+   },
+   "in_pha.raw": {
+    "bytes": 3613236,
+    "sha256": "33384b72e1b05a37"
    },
    "pha.raw": {
     "bytes": 3613236,
@@ -67,6 +83,14 @@
     "bytes": 489642,
     "sha256": "5378c74179dc8948"
    },
+   "in_mag.raw": {
+    "bytes": 3920880,
+    "sha256": "ae7c8209f1932276"
+   },
+   "in_pha.raw": {
+    "bytes": 3920880,
+    "sha256": "af75d260face8a4c"
+   },
    "pha.raw": {
     "bytes": 3920880,
     "sha256": "248da7a2b6e2b592"
@@ -93,6 +117,14 @@
     "bytes": 81644,
     "sha256": "ff7a87aa768c36ca"
    },
+   "in_mag.raw": {
+    "bytes": 657524,
+    "sha256": "863b9c443501eb5b"
+   },
+   "in_pha.raw": {
+    "bytes": 657524,
+    "sha256": "c1883db739d35ee4"
+   },
    "pha.raw": {
     "bytes": 657524,
     "sha256": "4f26cf5ce26ecac8"
@@ -104,5 +136,5 @@
   "win": 320
  },
  "_blob_sha256": "dab6bd9c3c6344c58c2d9f2ac68664b362ce844fba9479c422e314874d3a60b8",
- "_note": "Regenerated with a mamba_ssm shim whose parameter names match model.safetensors exactly (load_state_dict reports 0 missing / 0 unexpected). Earlier references in this directory were produced by a shim that nested Mamba params under .mixer, leaving all 30 towers randomly initialized."
+ "_note": "Regenerated with a mamba_ssm shim whose parameter names match model.safetensors exactly (load_state_dict reports 0 missing / 0 unexpected). Earlier references in this directory were produced by a shim that nested Mamba params under .mixer, leaving all 30 towers randomly initialized. in_mag.raw/in_pha.raw are the PyTorch STFT outputs; the model gate must be fed these (not the engine STFT) so the model and iSTFT are measured independently of STFT conditioning."
 }

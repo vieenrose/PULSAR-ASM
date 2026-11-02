@@ -52,8 +52,14 @@ int main(int argc, char **argv)
     const char *mfp = getenv("REUSE_MAG"), *pfp = getenv("REUSE_PHA");
     double t_stft = 0;
     if (mfp && pfp) {
-        FILE *f = fopen(mfp, "rb"); fread(h_mag, sizeof(float), nsp, f); fclose(f);
-        f = fopen(pfp, "rb"); fread(h_pha, sizeof(float), nsp, f); fclose(f);
+        FILE *f = fopen(mfp, "rb");
+        if (!f) { printf("cannot open %s\n", mfp); return 1; }
+        if (fread(h_mag, sizeof(float), nsp, f) != nsp) { printf("short read %s\n", mfp); return 1; }
+        fclose(f);
+        f = fopen(pfp, "rb");
+        if (!f) { printf("cannot open %s\n", pfp); return 1; }
+        if (fread(h_pha, sizeof(float), nsp, f) != nsp) { printf("short read %s\n", pfp); return 1; }
+        fclose(f);
         printf("using reference STFT\n");
     } else {
         double t0 = now_s();
