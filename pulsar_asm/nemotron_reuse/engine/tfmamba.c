@@ -15,6 +15,14 @@
 #define DTRANK 4
 #define XP (DTRANK + 2*DSTATE)
 
+#ifdef REUSE_DOUBLE_ACC
+typedef double acc_t;
+#define ACC(x) (double)(x)
+#else
+typedef float acc_t;
+#define ACC(x) (x)
+#endif
+
 static int g_rev = 0;
 static const char *g_pfx = "";
 static char xbuf[64];
@@ -72,8 +80,8 @@ static void mamba_dir(const reuse_blob_t *blob, const char *pfx,
             float *zo = z  + ((size_t)s * L + t) * DINNER;
             for (int o = 0; o < 2*DINNER; o++) {
                 const float *wr = W_in + (size_t)o * HID;
-                float acc = 0.0f;
-                for (int c = 0; c < HID; c++) acc += xi[c] * wr[c];
+                acc_t acc = (acc_t)0.0;
+                for (int c = 0; c < HID; c++) acc += ACC(xi[c]) * ACC(wr[c]);
                 if (o < DINNER) xo[o] = acc; else zo[o - DINNER] = acc;
             }
         }
@@ -86,13 +94,13 @@ static void mamba_dir(const reuse_blob_t *blob, const char *pfx,
         for (int c = 0; c < DINNER; c++) {
             const float *wc = W_conv + (size_t)c * DCONV;
             for (int t = 0; t < L; t++) {
-                float acc = B_conv[c];
+                acc_t acc = ACC(B_conv[c]);
                 for (int k = 0; k < DCONV; k++) {
                     int tt = t - (DCONV - 1) + k;
                     if (tt < 0) continue;
-                    acc += x0[((size_t)s * L + tt) * DINNER + c] * wc[k];
+                    acc += ACC(x0[((size_t)s * L + tt) * DINNER + c]) * ACC(wc[k]);
                 }
-                xc[((size_t)s * L + t) * DINNER + c] = silu(acc);
+                xc[((size_t)s * L + t) * DINNER + c] = silu((float)acc);
             }
         }
     }
@@ -105,8 +113,8 @@ static void mamba_dir(const reuse_blob_t *blob, const char *pfx,
             float *yo = xdbl + ((size_t)s * L + t) * XP;
             for (int o = 0; o < XP; o++) {
                 const float *wr = W_xp + (size_t)o * DINNER;
-                float acc = 0.0f;
-                for (int c = 0; c < DINNER; c++) acc += xi[c] * wr[c];
+                acc_t acc = (acc_t)0.0;
+                for (int c = 0; c < DINNER; c++) acc += ACC(xi[c]) * ACC(wr[c]);
                 yo[o] = acc;
             }
         }
@@ -119,8 +127,8 @@ static void mamba_dir(const reuse_blob_t *blob, const char *pfx,
             float *yo = dtt + ((size_t)s * L + t) * DINNER;
             for (int o = 0; o < DINNER; o++) {
                 const float *wr = W_dt + (size_t)o * DTRANK;
-                float acc = B_dt[o];
-                for (int c = 0; c < DTRANK; c++) acc += di[c] * wr[c];
+                acc_t acc = ACC(B_dt[o]);
+                for (int c = 0; c < DTRANK; c++) acc += ACC(di[c]) * ACC(wr[c]);
                 yo[o] = softplus_f(acc);
             }
         }
@@ -131,8 +139,8 @@ static void mamba_dir(const reuse_blob_t *blob, const char *pfx,
     #pragma omp parallel for schedule(static)
     for (int s = 0; s < S; s++) {
         for (int c = 0; c < DINNER; c++) {
-            float h[DSTATE];
-            for (int n = 0; n < DSTATE; n++) h[n] = 0.0f;
+            acc_t h[DSTATE];
+            for (int n = 0; n < DSTATE; n++) h[n] = (acc_t)0.0;
             const float *Ac = A + (size_t)c * DSTATE;
             for (int ii = 0; ii < L; ii++) {
                 // After the causal conv, x0/xc/dtt/xdbl all live on the scan
@@ -142,12 +150,13 @@ static void mamba_dir(const reuse_blob_t *blob, const char *pfx,
                 const float ut = xc[sl * DINNER + c];
                 const float *Bt = xdbl + sl * XP + DTRANK;
                 const float *Ct = Bt + DSTATE;
-                float acc = 0.0f;
+                acc_t acc = (acc_t)0.0;
                 for (int n = 0; n < DSTATE; n++) {
-                    h[n] = expf(d * Ac[n]) * h[n] + d * Bt[n] * ut;
-                    acc += h[n] * Ct[n];
+                    h[n] = (acc_t)exp((double)d * (double)Ac[n]) * h[n]
+                         + (acc_t)((double)d * (double)Bt[n] * (double)ut);
+                    acc += h[n] * ACC(Ct[n]);
                 }
-                y[sl * DINNER + c] = acc + ut * Dv[c];
+                y[sl * DINNER + c] = (float)(acc + ACC(ut) * ACC(Dv[c]));
             }
         }
     }
@@ -162,8 +171,8 @@ static void mamba_dir(const reuse_blob_t *blob, const char *pfx,
             float *oo = out + ((size_t)s * L + t) * HID;
             for (int o = 0; o < HID; o++) {
                 const float *wr = W_out + (size_t)o * DINNER;
-                float acc = 0.0f;
-                for (int c = 0; c < DINNER; c++) acc += yi[c] * wr[c];
+                acc_t acc = (acc_t)0.0;
+                for (int c = 0; c < DINNER; c++) acc += ACC(yi[c]) * ACC(wr[c]);
                 oo[o] = acc;
             }
         }
@@ -210,17 +219,17 @@ static void mamba_block(const reuse_blob_t *blob, const char *pfx,
         float tmp[HID];
         for (int o = 0; o < HID; o++) {
             const float *wr = W_op + (size_t)o * 2*HID;
-            float acc = B_op[o];
+            acc_t acc = ACC(B_op[o]);
             for (int c = 0; c < 2*HID; c++) acc += cat[i*2*HID + c] * wr[c];
             tmp[o] = acc;
         }
-        float mean = 0.0f;
-        for (int o = 0; o < HID; o++) mean += tmp[o];
+        acc_t mean = (acc_t)0.0;
+        for (int o = 0; o < HID; o++) mean += ACC(tmp[o]);
         mean /= HID;
-        float var = 0.0f;
-        for (int o = 0; o < HID; o++) { float d = tmp[o]-mean; var += d*d; }
+        acc_t var = (acc_t)0.0;
+        for (int o = 0; o < HID; o++) { acc_t d = ACC(tmp[o]) - mean; var += d*d; }
         var /= HID;
-        const float inv = 1.0f / sqrtf(var + 1e-5f);
+        const float inv = (float)(1.0 / sqrt(var + (acc_t)1e-5));
         for (int o = 0; o < HID; o++) out[i*HID + o] = (tmp[o]-mean)*inv*LW[o] + LB[o];
     }
     free(fw); free(bw); free(cat);

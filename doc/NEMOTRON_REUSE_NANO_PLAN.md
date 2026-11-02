@@ -115,7 +115,55 @@ pulsar_asm/nemotron_reuse/
 ```
 
 ## Current implementation (branch)
-- `pulsar_asm/nemotron_reuse/engine/`: blob loader, WAV I/O, DFT-GEMM STFT/iSTFT, conv2d, InstanceNorm+PReLU, Mamba scan, model API, driver
-- `pulsar_asm/nemotron_reuse/tests/`: stage/wave/phase gates
+- `pulsar_asm/nemotron_reuse/engine/`: blob loader, WAV I/O, DFT-GEMM STFT/iSTFT, conv2d, InstanceNorm+PReLU, `tfmamba.c` (bidirectional Mamba + TFMamba time/freq), `model_full.c` (full graph), driver
+- `pulsar_asm/nemotron_reuse/tests/`: `gate_full.py` (staged gates), `gate_stages.py`, `gate_wave.py`, `gate_phase_complex.py`, `enc_gate.c`, `block_gate.c`, `diag_stft_accuracy.py`
 - `pulsar_asm/nemotron_reuse/tests/golden/`: fixtures, fp32 references, reuse.blob
-- CPU build works; CUDA build script ready for Nano
+- CPU build works end-to-end; CUDA build script ready for Nano
+
+## 8. Verified status (dev host, x86, OpenMP, `-DREUSE_DOUBLE_ACC`)
+
+Reference = fp32 PyTorch with a **faithful** `mamba_ssm` shim. The first shim nested the
+Mamba parameters under `.mixer.`, so `from_pretrained` silently left all 30 Mamba towers
+**randomly initialized** and every earlier end-to-end number was meaningless. `load_state_dict`
+must report 0 missing / 0 unexpected; the shim now matches the checkpoint's parameter names
+exactly.
+
+8 kHz fixture `mic_test2_8000.wav` (F=161, T=1021):
+
+| stage | metric | value | gate |
+|---|---|---|---|
+| DenseEncoder | rel-rms vs PyTorch | 9.6e-6 | 1e-4 |
+| one TFMamba block | rel-rms vs PyTorch | 2.4e-7 | 1e-4 |
+| model (fed reference STFT) | complex spectrum rel-rms | 8.2e-7 | 1e-4 |
+| iSTFT (same model output) | waveform SNR | **123.8 dB** | 50 dB |
+| STFT | complex spectrum rel-rms | 1.5e-7 | 1e-4 |
+| end-to-end (own STFT) | waveform SNR | **42.1 dB** | disclosed |
+
+### Why the end-to-end number is 42 dB and not 50 dB
+
+Measured, not assumed (`tests/diag_stft_accuracy.py`):
+
+1. Against an independent **float64** STFT, our DFT is *more* accurate than PyTorch's:
+   complex rel-rms 9.2e-8 vs 1.2e-7, phase rms 1.31e-5 vs 2.77e-5 rad.
+2. Cross-swapping the two STFT channels shows the gap lives **entirely in the phase
+   channel**: reference mag + our phase = 42.1 dB, our mag + reference phase = 122.6 dB.
+3. The phase delta is rms 2.9e-5 rad with max 3.1e-3 (18 bins > 1e-3, all high-frequency
+   with negligible magnitude). Injecting iid phase noise of the *same rms* into the
+   reference gives 99 dB, so our delta is ~70x more effective per unit rms: it is
+   coherent along time (lag-1 autocorr 0.09) and lands in the direction the 30-block
+   recurrent tower amplifies.
+
+**Consequence:** a 50 dB end-to-end waveform gate is reachable only by reproducing the
+reference FFT implementation's rounding bit-for-bit, which is not a portability goal and
+not what "correct port" means. The port is therefore gated per stage (table above) plus
+the complex-spectrum STFT gate; the end-to-end SNR is reported and disclosed, and the
+accuracy target for the STFT is the float64 truth, not PyTorch's float32 rounding.
+
+### Numerical note for the CUDA port
+fp32 accumulation is not enough in the long reductions: with plain fp32 accumulators the
+model sits at 2.6e-4 complex rel-rms (audio 72 dB); with double accumulators it is 8.2e-7
+(123.8 dB). The dominant term is InstanceNorm, which sums up to 169k elements per channel.
+Jetson Nano's sm_53 fp64 rate is 1/64, so the CUDA kernels must keep fp32 dataflow and use
+**compensated / two-pass reductions** (Kahan, or pairwise tree, in fp32) for InstanceNorm
+mean/variance and the selective-scan accumulator, and verify the resulting rel-rms against
+this table.

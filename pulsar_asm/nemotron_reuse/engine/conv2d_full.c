@@ -4,6 +4,12 @@
 #include <math.h>
 #include <omp.h>
 
+#ifdef REUSE_DOUBLE_ACC
+typedef double acc_t;
+#else
+typedef float acc_t;
+#endif
+
 void conv2d_general(const float *x, int N, int C_in, int H, int W,
                     const float *w, const float *b, int C_out,
                     int kH, int kW, int padH, int padW, int dilH, int dilW,
@@ -16,7 +22,7 @@ void conv2d_general(const float *x, int N, int C_in, int H, int W,
         for (int co = 0; co < C_out; co++) {
             for (int ho = 0; ho < H_out; ho++) {
                 for (int wo = 0; wo < W_out; wo++) {
-                    float acc = b ? b[co] : 0.0f;
+                    acc_t acc = b ? (acc_t)b[co] : (acc_t)0.0;
                     for (int ci = 0; ci < C_in; ci++) {
                         for (int kh = 0; kh < kH; kh++) {
                             for (int kw = 0; kw < kW; kw++) {
