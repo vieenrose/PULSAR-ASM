@@ -370,11 +370,31 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
 // ---------------------------------------------------------------- layer kernels
 // All of these copy lfm3_enc.c's arithmetic, including its fp64 sum-of-squares in
 // rmsnorm (the C reference accumulates the variance in double, so the GPU does too).
+// RMSNorm over one row, in place. THE BARRIER BELOW IS LOAD-BEARING.
+// Every thread computes the whole-row fp64 sum of squares itself (ascending i, the C
+// reference's order), and then all threads write the row back IN PLACE. Without a
+// barrier between the sum phase and the write phase, an ahead warp scales r[i] while a
+// lagging warp is still inside its sum loop, so the lagging warp's sum of squares is
+// built from a mix of pre-scale and post-scale values, its `inv` is wrong, and the row
+// ends up with elements scaled by several different inversions. blockDim is 256 = 8
+// warps, D is 768, so the sum loop is long enough for the interleaving to happen.
+// That is the root cause of the encoder's run-to-run nonreproducibility that ran
+// through six runs of the defect hunt: the same binary, same input, disagreed with
+// itself at Tt=1000 by max abs 2.2e-01 in layer_00 (a CONV block, which is why the
+// attention-race fix of run #313 did not touch it), in a sparse row pattern (rows
+// 40,44,68,72-78,96,... of 1000) across all 768 channels, with rows 0-39 bit-identical
+// -- collision-dependent, hence sparse, hence amplitude continuous, not bimodal, in the
+// 1.4e-06 .. 2.9e-03 range the 4 s fixture showed, and rarer at Tt=50 simply because
+// 50 blocks collide less often than 1000. ds_out was always bit-identical because the
+// downsampler has no in-place norm.
+// k_headnorm (96 threads) and k_layernorm_f32 (256 threads) do not have this bug: the
+// former has its barrier, the latter writes to a separate output so x is read-only.
 __global__ void k_rmsnorm_f32(float* __restrict__ x, const float* __restrict__ w, int D) {
   const int t = blockIdx.x;
   float* r = x + (size_t)t * D;
   double v = 0;
   for (int i = 0; i < D; i++) v += (double)r[i] * r[i];
+  __syncthreads();                      // nobody writes until every warp has summed
   const float inv = 1.0f / sqrtf((float)(v / D) + EEPS);
   for (int i = threadIdx.x; i < D; i += blockDim.x) r[i] = __fmul_rn(w[i], __fmul_rn(r[i], inv));
 }
@@ -465,42 +485,64 @@ __global__ void k_rope(float* __restrict__ q, float* __restrict__ k, int T) {
 // out[d] in a register, so the accumulation over j runs in ascending j exactly as
 // lfm3_enc.c does it: s = sum_d q[d]*k[j][d]; s*scale; max; expf(s-mx) ascending; den;
 // p = sc[j]/den (a division, not a reciprocal multiply); o[d] += p*v[j][d].
+// T-any-length prefill attention. There is deliberately NO score buffer: the scores
+// are recomputed from q/k on each of the three passes (max, denominator, weighted sum).
+// The earlier version staged sc[1024] in shared, which capped Tt at 1024 audio tokens
+// = 81.9 s of speech (the encoder refused the 129.7 s gate fixture at Tt=1622). Scoring
+// is deterministic, so the recomputed value is the SAME bits as the staged one, and
+// every loop keeps the C reference's ascending-j order and the same per-pass sequence
+// (thread 0 reduces the 96 products ascending, barrier, everyone reads). Measured
+// cost of the recompute: see the 80 s / 129.7 s rows in the port doc (the QK dot runs
+// 3x instead of 1x); the encoder stays well inside its realtime budget.
+//
+// The exp'd weight is written by THREAD 0 ONLY, with a barrier before every read and
+// before the next write. Having all 96 threads redundantly write the value and read it
+// back with no barrier is a race: 96 threads is three warps, warps are not synchronized
+// with each other, and a warp that ran ahead divided by the PRE-EXP score. That showed
+// up as ao max abs 1.0e-01 (rms 6.8e-3) against an fp64 referee while the scores
+// themselves matched fp64 to 3e-6. With one shared slot the same discipline is now
+// load-bearing for every j, so the barriers are written to be obviously correct:
+// barrier before thread 0 writes, barrier before anyone reads.
 __global__ void k_attn_prefill(const float* __restrict__ q, const float* __restrict__ k,
                                const float* __restrict__ v, float* __restrict__ ao,
                                int T, float scale, float* dbg, int ts, int hs) {
   const int i = blockIdx.x, hh = blockIdx.y, kv = hh / (ENH / ENKV);
-  __shared__ float sc[1024];
   __shared__ float prod[EHD];
+  __shared__ float sc;
   const int d = threadIdx.x;
   const float qi = q[((size_t)i * ENH + hh) * EHD + d];
+  // one score, in the C reference's order: 96 products, summed ascending by thread 0,
+  // then scaled. dbg captures pass A's scores for the probe layer.
+ #define QKSCORE(j) do { \
+    prod[d] = __fmul_rn(qi, k[((size_t)(j) * ENKV + kv) * EHD + d]); \
+    __syncthreads(); \
+    if (d == 0) { \
+      float s2 = 0.f; \
+      for (int dd = 0; dd < EHD; dd++) s2 = __fadd_rn(s2, prod[dd]); \
+      sc = __fmul_rn(s2, scale); \
+      if (dbg && i == ts && hh == hs) dbg[j] = sc; \
+    } \
+    __syncthreads(); \
+  } while (0)
   float mx = -INFINITY;
-  for (int j = 0; j <= i; j++) {
-    prod[d] = __fmul_rn(qi, k[((size_t)j * ENKV + kv) * EHD + d]);
-    __syncthreads();
-    if (d == 0) {                       // thread 0 sums over d in ascending order,
-      float s2 = 0.f;                   // exactly the C reference's loop
-      for (int dd = 0; dd < EHD; dd++) s2 = __fadd_rn(s2, prod[dd]);
-      sc[j] = __fmul_rn(s2, scale);
-      if (dbg && i == ts && hh == hs) dbg[j] = sc[j];
-    }
-    __syncthreads();
-    if (sc[j] > mx) mx = sc[j];
-  }
-  // The exp'd weights are written by THREAD 0 ONLY, with a barrier before every read.
-  // Having all 96 threads redundantly write sc[j] = expf(...) and read it back with no
-  // barrier between is a race: 96 threads is three warps, warps are not synchronized
-  // with each other, and a warp that ran ahead divided by the PRE-EXP score. That
-  // showed up as ao max abs 1.0e-01 (rms 6.8e-3) against an fp64 referee while the
-  // scores themselves matched fp64 to 3e-6.
+  for (int j = 0; j <= i; j++) { QKSCORE(j); if (sc > mx) mx = sc; }
   float den = 0.f;
   for (int j = 0; j <= i; j++) {
+    QKSCORE(j);
+    __syncthreads();                      // the exp write below must not race a read
+    if (d == 0) sc = expf(__fadd_rn(sc, -mx));
     __syncthreads();
-    if (d == 0) sc[j] = expf(__fadd_rn(sc[j], -mx));
-    __syncthreads();
-    den = __fadd_rn(den, sc[j]);
+    den = __fadd_rn(den, sc);
   }
   float o = 0.f;
-  for (int j = 0; j <= i; j++) o = __fadd_rn(o, __fmul_rn(__fdiv_rn(sc[j], den), v[((size_t)j * ENKV + kv) * EHD + d]));
+  for (int j = 0; j <= i; j++) {
+    QKSCORE(j);
+    __syncthreads();
+    if (d == 0) sc = expf(__fadd_rn(sc, -mx));
+    __syncthreads();
+    o = __fadd_rn(o, __fmul_rn(__fdiv_rn(sc, den), v[((size_t)j * ENKV + kv) * EHD + d]));
+  }
+#undef QKSCORE
   ao[((size_t)i * ENH + hh) * EHD + d] = o;
 }
 
@@ -579,7 +621,14 @@ int main(int argc, char** argv) {
   if (argc != 5) { printf("usage: %s <enc blob> <input.bin> <Tm> <outdir>\n", argv[0]); return 2; }
   g_ench2 = getenv("LFM_ENC_H2") ? atoi(getenv("LFM_ENC_H2")) : 0;
   const int Tm = atoi(argv[3]);
-  if (Tm < 8 || Tm > 8192) { printf("Tm out of range: %d\n", Tm); return 2; }
+  // The 8192 that used to sit here was a bring-up guard, not a structural limit: every
+  // per-position buffer is a dynamic cudaMalloc (dalloc) and the downsampler's strides
+  // are computed from Tm, so the real constraint is device memory, which the loader's
+  // free/need gate below measures. 32768 mel frames = 327.7 s at the 100 frames/s mel
+  // rate = 4096 audio tokens; the footprint scales linearly at ~52 KB/token, so that
+  // needs ~215 MB of activation buffers on top of the 130 MB blob -- inside the ~1.9 GB
+  // this board leaves free, and the gate below refuses before any kernel runs if not.
+  if (Tm < 8 || Tm > 32768) { printf("Tm out of range: %d (8..32768 mel frames = 0.08..327.7 s)\n", Tm); return 2; }
   mkdir(argv[4], 0777);
   Model M; std::string js;
   if (!load_blob(argv[1], M, js)) return 1;
@@ -762,7 +811,6 @@ int main(int argc, char** argv) {
       Ent* qn = need(M, nm);
       snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.self_attn.k_layernorm.weight", L);
       Ent* kn = need(M, nm);
-      if (Tt > 1024) { printf("attention kernel: T=%d exceeds the shared score buffer\n", Tt); return 3; }
       gemm_to(wq, hn, hq, Tt, xb2, "q_proj");
       gemm_to(wk, hn, hk, Tt, xb2, "k_proj");
       gemm_to(wv, hn, hv, Tt, xb2, "v_proj");

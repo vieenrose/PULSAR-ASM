@@ -1,6 +1,6 @@
 Tm=400 -> EWo1=200 EWo2=100 tokens Tt=50 (expect ceil(Tm/8)); arms=fp32
   lin_mid N=256 K=256 T=3200 f32 weights
-ENCODER total 166.69 ms (min of 1) = 0.0417 s GPU per audio second; downsampler alone 458 MMAC, 2.7 GMAC/s at that rate
+ENCODER total 308.10 ms (min of 1) = 0.0770 s GPU per audio second; downsampler alone 458 MMAC, 1.5 GMAC/s at that rate
 dump ds_out       n=38400 nonzero=38400 max=1.7826
 dump layer_00     n=38400 nonzero=38400 max=1.6371
 dump layer_01     n=38400 nonzero=38400 max=1.6621
@@ -49,21 +49,7 @@ FM3_ENC_GPU_DONE Tm=400 Tt=50
   layer_14   energy rel 1.368e-06  per-elem rms rel 2.064e-03  max abs 9.727e-05  rms(GPU) 0.81825 rms(C) 0.81825  nonzero 38400/38400  OK
   layer_15   energy rel 1.300e-06  per-elem rms rel 1.458e-03  max abs 9.727e-05  rms(GPU) 0.95261 rms(C) 0.95261  nonzero 38400/38400  OK
   layer_16   energy rel 1.381e-06  per-elem rms rel 6.474e-04  max abs 9.537e-05  rms(GPU) 1.02315 rms(C) 1.02315  nonzero 38400/38400  OK
-  enc_out    run-to-run energy rel 1.261e-04  (max abs 9.27e-03)
-  proj_out   run-to-run energy rel 3.657e-04  (max abs 3.76e-04)
-  layer_05   run-to-run energy rel 2.646e-05  (max abs 1.06e-04)
-  layer_06   run-to-run energy rel 3.812e-04  (max abs 1.09e-03)
-  layer_07   run-to-run energy rel 3.948e-04  (max abs 1.21e-03)
-  layer_08   run-to-run energy rel 3.773e-04  (max abs 1.65e-03)
-  layer_09   run-to-run energy rel 3.911e-04  (max abs 1.92e-03)
-  layer_10   run-to-run energy rel 3.956e-04  (max abs 2.07e-03)
-  layer_11   run-to-run energy rel 3.419e-04  (max abs 2.30e-03)
-  layer_12   run-to-run energy rel 3.439e-04  (max abs 2.16e-03)
-  layer_13   run-to-run energy rel 3.510e-04  (max abs 8.13e-03)
-  layer_14   run-to-run energy rel 2.966e-04  (max abs 6.77e-03)
-  layer_15   run-to-run energy rel 2.827e-04  (max abs 6.05e-03)
-  layer_16   run-to-run energy rel 2.945e-04  (max abs 8.12e-03)
-  run-to-run WORST energy rel 3.956e-04  (defect budget 3e-03: OK)
+  run-to-run WORST energy rel 0.000e+00  (defect budget 3e-03: OK)
   probe_q_02  energy rel 6.357e-07  per-elem rms rel 1.105e-04  max abs 5.722e-06  rms 0.9994 vs 0.9994  finite True  OK
   probe_k_02  energy rel 7.722e-07  per-elem rms rel 1.095e-04  max abs 4.411e-06  rms 1.0016 vs 1.0016  finite True  OK
   probe_v_02  energy rel 1.002e-06  per-elem rms rel 1.003e-04  max abs 1.863e-07  rms 0.0287 vs 0.0287  finite True  OK

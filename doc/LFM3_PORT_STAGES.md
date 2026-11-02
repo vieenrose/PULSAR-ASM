@@ -1671,3 +1671,79 @@ Two facts this run surfaced, both recorded rather than patched around:
   `pad_length`/`num_frames` rule, which `checks_mel.py` already pins as exact. Feeding
   the encoder a Tm that doesn't match the file is caught ("input short"), and it caught
   this on the first try.
+
+### 34. The run-to-run defect, root-caused and fixed: a missing barrier in `k_rmsnorm_f32`
+
+Six runs of hunting (§29, §30, §31) ended at line 373 of `lfm3_enc_gpu.cu`:
+
+```cuda
+__global__ void k_rmsnorm_f32(float* x, const float* w, int D) {
+  float* r = x + blockIdx.x * D;
+  double v = 0;
+  for (int i = 0; i < D; i++) v += (double)r[i] * r[i];   // every thread reads the WHOLE row
+  /* <-- NO BARRIER */
+  const float inv = 1.0f / sqrtf((float)(v / D) + EEPS);
+  for (int i = threadIdx.x; i < D; i += blockDim.x) r[i] = w[i]*r[i]*inv;   // writes IN PLACE
+}
+```
+
+Every thread builds its own fp64 sum of squares over the row, then all threads write the
+row back **in place**, with nothing between the two phases. An ahead warp scales `r[i]`
+while a lagging warp is still inside its sum loop; the lagging warp's sum is then built
+from a mix of pre-scale and post-scale values, its `inv` is wrong, and the row ends up
+with elements scaled by several different inversions. Launch is `<<<Tt, 256>>>` = 8
+warps, D = 768, so the sum loop is long enough to collide. It is used at three sites:
+per-layer `ffn_norm`, `op_norm`, and the tower-final `embedding_norm` -- all in place on
+`hn`. Layer 0 is a **conv** block, which is why run #313's attention-race fix never
+touched it; `k_headnorm` (96 threads) has its barrier and `k_layernorm_f32` writes to a
+separate output, so neither has the bug.
+
+The control that proved it, same binary, same input, three runs, Tt=1000:
+
+```
+ds_out    identical        (the downsampler has no in-place norm)
+layer_00  max 2.202e-01    814 of 1000 rows, rows 40,44,68,72-78,96,... ALL 768 channels
+layer_16  max 2.943e+01    rows 0-39 bit-identical, then sparse
+```
+
+Sparse rows = collision-dependent, which is exactly why the amplitude looked
+*continuous* (1.4e-06 .. 2.9e-03) rather than bimodal, why it was rarer at Tt=50 (50
+blocks collide less often than 1000), and why "reps 1-3 agree with each other and with
+C" while rep 0 did not. Zeroing/poisoning, launch refusals, `Gemm::part` and the loader
+were all cleared earlier because the mechanism was never stale memory.
+
+**After the barrier**: 3 runs of the same binary at Tt=1000, 20 stage dumps, **all bit-
+identical**; `ENC_GATE PASS` with run-to-run worst energy rel **0.000e+00**, and accuracy
+*improved* -- layer_08 energy rel 1.387e-06 where §28 recorded 4.0e-05 (29x), layer_16
+1.381e-06 vs 2.6e-05. The gate was absorbing the race into its bars.
+
+Two enabling changes, both gated by the same runs:
+
+* **`Tm` cap 8192 -> 32768** (`= 327.7 s` of audio). The old cap was a bring-up guard,
+  not a structural limit: every per-position buffer is a dynamic `cudaMalloc`, and the
+  loader's free/need gate refuses before any kernel runs if memory is short.
+* **`k_attn_prefill` no longer stages scores**: it recomputes them from q/k on each of
+  the three passes (max, denominator, weighted sum) and keeps one shared slot, so there
+  is no 1024-token score buffer. This is what let the full clip run at Tt=1622; the
+  full-clip control is 3 runs, 20 dumps, all bit-identical. Cost is 3 QK passes instead
+  of 1; the encoder measured 0.0132-0.0147 s GPU per audio second on the 129.7 s clip.
+
+### 35. External check on the audio embeddings, and a gap I am not going to average away
+
+The HF golden for the fixture records `audio_embeddings.hf_shape = [1622, 2048]` and
+`mean_row_l2_norm = 1.60280`. The engine's `proj_out` for the same clip:
+
+```
+ENGINE  mean row L2 1.2791   (min 0.911, max 9.398)   -> engine/HF = 0.7981
+```
+
+A 20% norm deficit is far too large to read as Q8 noise, and it sits next to two
+observations that do not line up with it: the 4 s fixture's aggregate rms matched HF to
+0.3% (0.05424 vs 0.05406), and the gate against the C reference is at energy rel 1e-06
+across all 20 stages -- so this is not the GPU drifting from its own reference, it is the
+Q8 path (or the tail/padding rows of a long clip) differing from HF's fp-bf16 reference.
+The HF comparison stays "reported, not gated" for exactly this reason (§305 disclosed the
+Q8 gap the same way), and the row-norm mean is dominated by a few large rows (max 9.4 vs
+mean 1.28), so a distribution comparison is required before this number means anything.
+The data needed is HF's full `[1622, 2048]` embedding matrix, which the golden did not
+save; it is 13 MB and is the next thing to collect.
