@@ -1847,3 +1847,47 @@ Kept from this round as instrumentation, all env-gated and inert by default:
 breakdown), `LFM_ENC_SYNC=1` (per-kernel syncs, what the accuracy gate uses), the pooled
 grow-only partial buffer, and `chk_final()` -- one process-wide sync so an async fault is
 still always caught when per-kernel syncs are off.
+
+### 38. The batched fp32 arm is faster and WRONG; it stays off, and the 40 s sync is open
+
+`LFM_ENC_BAT32=1` (batched `q8_prefill_h2<float,CT4,ARM5,RB2,GRP2>` replacing the
+per-position `q8_partial` loop) on the 129.7 s clip:
+
+```
+BAT32=0 SYNC=0  wall 69.0 s      BAT32=1 SYNC=0  wall 51.5 s
+BAT32=0 SYNC=1  wall 73.2 s      BAT32=1 SYNC=1  wall 51.9 s
+phase split with BAT32=1:  blob 5.7 | mel 0.05 | 17 layers 4.95 | proj 0.00 | final sync 40.2
+```
+
+The launch-count diagnosis is confirmed by the phase split: the layer loop went
+**61.5 s -> 4.95 s** (12x) when the per-position launches went away.
+
+But the arm **fails the accuracy gate**, and the gate is the acceptance bar, not timing:
+
+```
+layer_01   energy rel 6.310e-01  max abs 1.365e+00  rms(GPU) 0.12701 vs rms(C) 0.13835  FAIL
+probe_q_02 energy rel 1.000e+00  rms 0.0000 vs 0.9994  FAIL          (q_proj output all zeros)
+ENC_GATE FAIL (arms=fp32 T=50 stages=3)     <- bailed at layer_01 on the all-zero check
+```
+
+So run #307/309's "bit-identical batched fp32" result **does not transfer** to this call
+configuration: the arm's launch contract (R/RB/GRP/grid/shared, and the `KC` it was
+sized for) is coupled to the bench harness that validated it, and my 25-line port got it
+wrong -- the signature is a GEMM whose whole output is zeros, which the plausibility
+check catches immediately. `LFM_ENC_BAT32` therefore **defaults to 0**; the encoder ships
+on the per-position arm at 69 s wall. Re-verified after the change: `ENC_GATE PASS`
+(20 stages, run-to-run 0.000e+00) and backbone `CHECKS OK`.
+
+Also corrected while doing this: `gemm_setup` sized `KC` from an `h2` argument that
+`gemm_run` ignores (the arm is chosen from `LFM_ENC_H2`), so the downsampler's `K=4096`
+`lin_out` kept `KC=4096` (nb=128) and its batched launch was refused for 67 KB of shared,
+silently falling back to 1622 per-position launches. The bound now follows the arm that
+will actually run.
+
+Open, and honestly labelled: with per-kernel syncs off, a single
+`cudaDeviceSynchronize()` at the end of the pass costs ~40 s in all four matrix cells,
+against 1.57 s of event-timed GPU work. It is not GPU work, not the dumps (3.9 s), not
+the allocator (1 s) and not the K=4096 fallback (0.6 s of launches). It is the dominant
+term in the encoder's wall and it is not explained. Next probe: time the sync itself at
+incremental queue depths, to separate "draining a deep launch queue" from "waking an idle
+Jetson GPU".

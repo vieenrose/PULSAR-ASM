@@ -311,6 +311,15 @@ __global__ void k_sgemm_f32(const float* __restrict__ x, const float* __restrict
   }
 }
 
+// LFM_ENC_BAT32=1: use the batched fp32 GEMV arm. Read ONCE and shared by gemm_setup and
+// gemm_run: setup picks KC against the arm's shared-memory budget (it stages CT
+// positions), and run launches it. Reading the env in both places independently produced
+// a real bug -- setup sized KC for the per-position arm, so the downsampler's K=4096
+// lin_out asked the batched launch for 67 KB of shared, was refused, and silently fell
+// back to 1622 per-position launches.
+static int g_bat32 = -2;
+static void bat32_init() { if (g_bat32 == -2) g_bat32 = getenv("LFM_ENC_BAT32") ? atoi(getenv("LFM_ENC_BAT32")) : 0; }
+
 struct Gemm {
   const int8_t* q; const float* s; const float* wf;   // wf != null = f32 weights
   int N, K, KC, nb, nch, R, nblk, nblk256;
@@ -341,13 +350,26 @@ static void gemm_setup_f32(Gemm& g, const float* wf, int N, int K, int T) {
   g.part = nullptr; g.pooled = false;                // the SGEMM writes y directly
   if (K % Q8_BLK) { printf("f32 GEMM needs K a multiple of 32 (K=%d)\n", K); exit(2); }
 }
-static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, int T, int h2, int CT) {
+static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, int T, int h2, int CT, int bat = 0) {
   g.q = q; g.s = s; g.N = N; g.K = K; g.wf = nullptr;
   if (!q) { printf("gemm_setup: Q8 weights requested but q is null\n"); exit(2); }
+  bat32_init();
+  // Size KC against the arm that will ACTUALLY run. gemm_run chooses h2-vs-fp32 from
+  // LFM_ENC_H2 (and the batched fp32 arm from LFM_ENC_BAT32) at launch time, and several
+  // call sites pass h2=1 meaning "the h2 sizing", so gating the bound on the h2 argument
+  // let the downsampler's K=4096 lin_out keep KC=4096 (nb=128) and then get a batched
+  // launch refused for 67 KB of shared -- silently falling back to 1622 per-position
+  // launches. When the batched arm is enabled, respect its budget regardless of h2 (the
+  // h2 arm needs less shared, so a KC chosen this way is valid for both).
+  const int bat_eff = bat || g_bat32;
   int KC = K;
   while (KC > 32) {
     const int nbtry = KC / Q8_BLK;
-    const size_t need = h2 ? (size_t)CT * nbtry * 17 * 4 : (size_t)CT * nbtry * 33 * 4;
+    // The batched fp32 arm stages CT positions, so its shared footprint carries the CT
+    // factor -- KC has to be chosen against THAT bound, not the per-position one, or a
+    // K as wide as the downsampler's lin_out (K=4096, nb=128) asks for 67 KB of shared
+    // and the launch is refused.
+    const size_t need = (h2 ? (size_t)CT * nbtry * 17 : (bat_eff ? (size_t)CT * nbtry * 33 : (size_t)nbtry * 33)) * 4;
     if (need <= 49152 && K % KC == 0) break;
     KC /= 2;
   }
@@ -388,6 +410,32 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
     else { k_combine_f<<<(unsigned)((T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, g.nch); return; }
   }
   const size_t shm = (size_t)g.nb * 33 * 4;
+  // LFM_ENC_BAT32=1: the batched fp32 arm. q8_partial is launched ONCE PER POSITION in
+  // the loop below, which at Tt=1622 and ~100 Q8 GEMMs per pass is ~162k launches -- the
+  // encoder's dominant wall cost (61.5 s of host time against 1.68 s of GPU time, §37).
+  // q8_prefill_h2<float, CT=4, H2=false, ARM=5, RB=2, GRP=2> was measured bit-identical
+  // to this per-position arm on the real encoder activations in run #309 at 4.6 vs
+  // 10.4 GMAC/s: GPU time roughly doubles, host launches drop 4x, and it is the same
+  // arithmetic order, so the accuracy gate must stay green -- that is the acceptance bar
+  // for this arm, not a timing number. Falls back to the loop below if the launch is
+  // refused (shared budget, R not dividing the shape), so the shipping path never
+  // depends on it succeeding.
+  if (g_bat32 && T > 4) {
+    const int RB = 2, GRP = 2, Rb = 64;                       // (256/32)/RB = 4 rows per warp -> R=64
+    const size_t shmB = (size_t)4 * g.nb * 33 * 4;
+    const int nblkB = ((g.N + Rb - 1) / Rb) * g.nch;
+    q8_prefill_h2<float, 4, false, 5, RB, GRP><<<nblkB, TPB, shmB>>>(
+        g.q, g.s, x, g.part, g.N, g.K, g.KC, Rb, g.nb, T);
+    const cudaError_t be = cudaGetLastError();
+    if (be == cudaSuccess) {
+      k_combine_f<<<(unsigned)((T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, g.nch);
+      const cudaError_t ce = cudaGetLastError();
+      if (ce) { printf("combine (bat32) refused: %s\n", cudaGetErrorString(ce)); exit(3); }
+      return;
+    }
+    printf("bat32 launch refused at N=%d K=%d KC=%d nb=%d nch=%d shm=%zu: %s -- per-position loop\n",
+           g.N, g.K, g.KC, g.nb, g.nch, shmB, cudaGetErrorString(be));
+  }
   for (int t = 0; t < T; t++) {
     q8_partial<float, true, false, 1, 0><<<g.nblk, TPB, shm>>>(g.q, g.s, x + (size_t)t * g.K,
         g.part + (size_t)t * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb);
@@ -950,6 +998,7 @@ int main(int argc, char** argv) {
     k_layernorm_f32<<<Tt, 256>>>(hn, pw0->df, pb0->df, hp1); chk("proj ln");
     gemm_to(pw1, hp1, hp2, Tt, xb2, "proj lin1");
     k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, pb1->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b1");
+    wallmark("proj ln + gemms");
     k_gelu_erf<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, (size_t)Tt * EPROJ); chk("gelu");
     gemm_to(pw3, hp2, hp3, Tt, xb2, "proj lin2");
     k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp3, pb3->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b3");
