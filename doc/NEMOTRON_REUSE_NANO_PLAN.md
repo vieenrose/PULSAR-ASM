@@ -113,3 +113,9 @@ pulsar_asm/nemotron_reuse/
   tests/      gate_stages.py, gate_wave.py, golden/ (SHA-pinned fixtures + reference outputs)
   bench_rtf.sh, build_nano.sh, README.md (results table)
 ```
+
+## Current implementation (branch)
+- `pulsar_asm/nemotron_reuse/engine/`: blob loader, WAV I/O, DFT-GEMM STFT/iSTFT, conv2d, InstanceNorm+PReLU, Mamba scan, model API, driver
+- `pulsar_asm/nemotron_reuse/tests/`: stage/wave/phase gates
+- `pulsar_asm/nemotron_reuse/tests/golden/`: fixtures, fp32 references, reuse.blob
+- CPU build works; CUDA build script ready for Nano
