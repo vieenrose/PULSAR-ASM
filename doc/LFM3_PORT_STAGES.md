@@ -2134,3 +2134,46 @@ run-to-run 0.000e+00), `WAV_GATE PASS` (16 fixtures, 6 chain), S2 mel `PASS`,
 `tok gate: 531/531`, backbone `CHECKS OK` (matrix 23x23, 6 prompts of logits-seq top-1,
 streams 2/2), `ASR_GATE PASS` (prefix 207, match 260/262, WER 0.008, EMB cos 0.999774,
 ASR_RT 3.838 / warm 3.200).
+
+### 45. RETRACTION: "decode dominates ASR_RT" was an arithmetic error, and realtime is reachable
+
+Row 322 / section 43 reported `decode 207 s (1.60) > prefill 151 s (1.16)` and concluded
+that `ASR_RT <= 1.00` is not reachable on this board at Q8. **Both are wrong**, and the
+error is the kind this project has a rule against: I multiplied all 1904 steps by the
+decode rate and labelled the product "decode".
+
+In this engine a prompt step and a decode step cost the same thing (T=1 GEMVs per
+position, `GEMV-only budget 127.7 ms`, 92% of the 17.3 GB/s ceiling), so the split is by
+**step count**. Measured with graphs off and **`--trace` off**, the same binary on the
+same prompt on the same board:
+
+```
+GRAPH=1  steady-state 109.01 ms/token   wall 291.12 s
+GRAPH=0  steady-state 108.27 ms/token   wall 288.44 s        <- graphs cost nothing here
+traced   (the gate's run)                wall 441 s            <- --trace surcharge ~150 s
+```
+
+Corrected decomposition of the 129.7 s clip, engine untraced:
+
+| phase | s | /audio-s |
+|---|---|---|
+| prefill = 1642 prompt ids x 108.27 ms | 178 s | **1.37** |
+| decode = 262 generated tokens x 108.27 ms | 28 s | **0.22** |
+| engine one-time startup | 82 s | 0.63 |
+| front end (wav 3.9 + mel 8.5 + encoder 47.6) | 60 s | 0.47 |
+| **ASR_RT_TIMED** | **348 s** | **2.69** |
+
+So `ASR_RT` as the gate printed it (3.838) was inflated by `--trace` by ~1.14, decode is
+**0.22 not 1.60**, prefill is the real target at **1.37**, and the roofline conclusion
+flips: with batched prefill (`w2`, the ARM5/CT=4 arm measured at 4x fewer launches) the
+prefill term goes toward ~0.35, a resident process removes the 0.63 startup, decode sits
+at 0.22 near the ceiling, and the front end is 0.47 -- **floor ~1.0-1.1, i.e. the
+realtime bar is reachable, not out of reach.**
+
+Two traps, both now closed in the gate: (1) `ASR_RT` must not be timed from a `--trace`
+run -- `checks_asr.py` now does one untraced timed run and keeps the traced run only to
+read the ids, printing the surcharge; (2) graphs are not the lever anyone would guess
+from the backbone's TTFT work (109.01 vs 108.27 ms/token on this workload).
+
+The `w2` sign-off is therefore the decision that matters for realtime, and a resident
+process is worth 0.63.

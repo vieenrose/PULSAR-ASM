@@ -212,27 +212,50 @@ def main():
     # separately with a 20-id prompt and --steps 24, which took 85.3 s wall against
     # 2.6 s of steps -- the step loop is n_steps x steady-state, and whatever is left
     # inside t_eng is the prompt prefill.
-    ss = re.search(r"steady-state ([\d.]+) ms/token.*?over (\d+) steps", eng)
+    # Timing must not come from the traced run. The gate needs --trace to read the
+    # generated ids, and printing 1904 step lines costs ~79 ms/token: the same binary and
+    # prompt on the same board takes 288.4 s without --trace and 441 s with it. So the
+    # engine is re-run WITHOUT --trace purely to time it, and that wall is what ASR_RT
+    # charges. (Section 43's original decomposition multiplied all 1904 steps by the
+    # decode rate and called the product "decode"; in this engine a prompt step and a
+    # decode step cost the same 108 ms, so the split is by step COUNT, not by a decode
+    # rate -- see the retraction in doc section 45.)
+    t_eng_timed = t_eng
+    t0 = time.time()
+    timed = ssh("cd %s && PQ1_GRAPH=0 ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 "
+                "--audio-emb asrgate/proj_out.bin --audio-at 15 --prompt %s --steps %d 2>&1"
+                % (NDIR, ids, steps), timeout=5400)
+    t_eng_timed = time.time() - t0
+    tm = re.search(r"steady-state ([\d.]+) ms/token", timed)
+    if tm:
+        print("  engine untraced (timed run): %.1f s at %s ms/token (traced run was %.1f s "
+              "-> --trace surcharge %.1f s)" %
+              (t_eng_timed, tm.group(1), t_eng, t_eng - t_eng_timed))
+    ss = re.search(r"steady-state ([\d.]+) ms/token.*?over (\d+) steps", timed if tm else eng)
     print("== ASR_RT ==")
     if ss:
-        ms_traced, n_st = float(ss.group(1)), int(ss.group(2))
+        ms_tok, n_st = float(ss.group(1)), int(ss.group(2))
         # The engine run in this gate uses --trace, and printing 1904 step lines over ssh
         # costs real time: the same binary/probe prints 108.68 ms/token untraced (doc
         # section 43) vs 185 ms/token traced. Decoding is therefore charged at the
         # UNTRACED rate (ASR_DECODE_MS, measured on a clean board) and the traced number
         # is printed alongside so nobody reads the inflated one as the decode cost.
-        ms_tok = float(os.environ.get("ASR_DECODE_MS", "108.68"))
-        decode_s = ms_tok * n_st / 1000.0
-        startup_s = float(os.environ.get("ASR_STARTUP_S", "82.7"))
-        pre_s = t_eng - decode_s - startup_s
-        print("  decode  %6.1f s (%.2f) = %d steps x %.2f ms (untraced; this run traced "
-              "%.2f ms/token = %.1f s of --trace cost)"
-              % (decode_s, decode_s / audio_sec, n_st, ms_tok, ms_traced,
-                 (ms_traced - ms_tok) * n_st / 1000.0))
+        # A prompt step and a decode step cost the same 108 ms in this engine (T=1 GEMVs
+        # per position, GEMV-only budget 127.7 ms, 92% of the 17.3 GB/s ceiling), so the
+        # split is by step count: n_prompt steps of prefill, len(want) of decode.
+        n_gen = min(len(gen), len(want))
+        pre_s = ms_tok * n_prompt / 1000.0
+        decode_s = ms_tok * n_gen / 1000.0
+        startup_s = float(os.environ.get("ASR_STARTUP_S", "82.0"))
+        print("  prefill %6.1f s (%.2f) = %d prompt ids x %.2f ms" %
+              (pre_s, pre_s / audio_sec, n_prompt, ms_tok))
+        print("  decode  %6.1f s (%.2f) = %d generated tokens x %.2f ms" %
+              (decode_s, decode_s / audio_sec, n_gen, ms_tok))
         print("  startup %6.1f s (%.2f) = one-time blob load (ASR_STARTUP_S to override)"
               % (startup_s, startup_s / audio_sec))
-        print("  prefill %6.1f s (%.2f) = remainder of the engine wall over %d prompt ids"
-              % (pre_s, pre_s / audio_sec, n_prompt))
+        tot = t_wav + t_mel + t_enc + t_eng_timed
+        print("  TOTAL with the untraced engine wall = %.1f s -> ASR_RT_TIMED = %.3f"
+              % (tot, tot / audio_sec))
         print("  warm ASR_RT excluding the one-time startup = %.3f" % ((tot - startup_s) / audio_sec))
     print("  wav %.1f + mel %.1f + encoder %.1f + engine %.1f = %.1f s for %.1f s of audio"
           % (t_wav, t_mel, t_enc, t_eng, tot, audio_sec))
