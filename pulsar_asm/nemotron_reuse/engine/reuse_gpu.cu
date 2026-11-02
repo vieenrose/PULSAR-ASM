@@ -110,11 +110,23 @@ extern "C" reuse_gpu_t *reuse_gpu_create(const reuse_blob_t *blob)
         off += blob->tensors[i].nelem;
     }
     qsort(g->ents, (size_t)g->n, sizeof(entry), cmp_str);
-    const char *envws = getenv("REUSE_WS_MB");
-    g->ws_cap = (size_t)(envws ? atoi(envws) : 512) * 1024 * 1024;
-    if (cudaMalloc(&g->ws, g->ws_cap * sizeof(float)) != cudaSuccess) {
-        fprintf(stderr, "gpu workspace OOM\n"); reuse_gpu_destroy(g); return NULL;
+    // REUSE_WS_MB is megabytes of BYTES (this used to be 512 *Mi* floats, i.e.
+    // 2 GiB, which the Nano's 3 GiB shared-memory GPU only over-commits: the
+    // pages fault when a kernel touches them, and Tegra reports that as
+    // "the launch timed out and was terminated").
+    size_t want_mb = (size_t)(getenv("REUSE_WS_MB") ? atoi(getenv("REUSE_WS_MB")) : 1024);
+    g->ws = NULL;
+    for (size_t mb = want_mb; mb >= 32 && !g->ws; mb >>= 1) {
+        size_t cap = mb * 1024 * 1024 / sizeof(float);
+        if (cudaMalloc(&g->ws, cap * sizeof(float)) == cudaSuccess) {
+            g->ws_cap = cap;
+            if (mb != want_mb) fprintf(stderr, "workspace: %zu MiB (requested %zu MiB)\n", mb, want_mb);
+        } else {
+            cudaGetLastError();
+            g->ws = NULL;
+        }
     }
+    if (!g->ws) { fprintf(stderr, "gpu workspace OOM (requested %zu MiB)\n", want_mb); reuse_gpu_destroy(g); return NULL; }
     return g;
 }
 
@@ -169,10 +181,10 @@ __device__ __forceinline__ float dsoftplus(float v) { return v > 20.0f ? v : log
 
 // y[co, i] = b[co] + sum_ci w[co,ci] * x[ci, i]
 __global__ void k_conv1x1(const float *x, const float *w, const float *b,
-                          float *y, int C_in, int C_out, long HW)
+                          float *y, int C_in, int C_out, long HW, int co0)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    int co = blockIdx.y;
+    int co = co0 + blockIdx.y;
     if (i >= HW) return;
     float acc = b ? b[co] : 0.0f;
     for (int ci = 0; ci < C_in; ci++)
@@ -184,11 +196,11 @@ __global__ void k_conv1x1(const float *x, const float *w, const float *b,
 __global__ void k_conv2d(const float *x, const float *w, const float *b,
                          int C_in, int H, int W, int C_out, int kH, int kW,
                          int padH, int padW, int dilH, int dilW, int strideH, int strideW,
-                         float *y)
+                         float *y, int co0)
 {
     int ho = blockIdx.x * blockDim.x + threadIdx.x;
     int wo = blockIdx.y * blockDim.y + threadIdx.y;
-    int co = blockIdx.z;
+    int co = co0 + blockIdx.z;
     int H_out = (H + 2*padH - dilH*(kH-1) - 1)/strideH + 1;
     int W_out = (W + 2*padW - dilW*(kW-1) - 1)/strideW + 1;
     if (ho >= H_out || wo >= W_out) return;
@@ -547,11 +559,41 @@ __global__ void k_sweep_mask(float *amp, int T, int F)
 
 // ================================================================= helpers
 
+
+// Jetson's GPU watchdog kills a CUDA channel that stays continuously busy
+// beyond ~10 s. REUSE_SYNC_EVERY=N issues a device sync every N launches so a
+// long stream of kernels can be punctuated on Nano; 0 = never (dev hosts).
+static int launch_kick(void)
+{
+    static int n = -1, every = 0;
+    if (n < 0) { const char *e = getenv("REUSE_SYNC_EVERY"); every = e ? atoi(e) : 0; n = 0; }
+    if (every <= 0) return 0;
+    if (++n >= every) { n = 0; return cudaDeviceSynchronize(); }
+    return 0;
+}
+
+static int conv_chunk(void)
+{
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("REUSE_CONV_CHUNK"); c = e ? atoi(e) : 8; if (c <= 0) c = 1 << 30; }
+    return c;
+}
+
 static int launch_conv1x1(reuse_gpu_t *g, const float *x, const float *w, const float *b,
                           float *y, int C_in, int C_out, long HW)
 {
-    dim3 blk(128), grd((unsigned)((HW + 127) / 128), (unsigned)C_out);
-    k_conv1x1<<<grd, blk>>>(x, w, b, y, C_in, C_out, HW);
+    // Chunk over output channels: Jetson's GPU watchdog kills any single
+    // launch that runs too long, so bound the work per launch.
+    const int CH = conv_chunk();
+    if (getenv("REUSE_TRACE_CONV"))
+        fprintf(stderr, "[conv1x1] C_in=%d C_out=%d HW=%ld chunk=%d\n", C_in, C_out, HW, CH);
+    for (int co0 = 0; co0 < C_out; co0 += CH) {
+        int n = (C_out - co0 < CH) ? C_out - co0 : CH;
+        dim3 blk(128), grd((unsigned)((HW + 127) / 128), (unsigned)n);
+        // the kernel adds co0 itself, so pass the un-offset pointers
+        k_conv1x1<<<grd, blk>>>(x, w, b, y, C_in, C_out, HW, co0);
+        launch_kick();
+    }
     return reuse_gpu_ok(g, "conv1x1");
 }
 
@@ -563,8 +605,19 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
     int H_out = (H + 2*padH - dilH*(kH-1) - 1)/strideH + 1;
     int W_out = (W + 2*padW - dilW*(kW-1) - 1)/strideW + 1;
     dim3 blk(16, 16);
-    dim3 grd((unsigned)((H_out + 15) / 16), (unsigned)((W_out + 15) / 16), (unsigned)C_out);
-    k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y);
+    const int CH = conv_chunk();
+    if (getenv("REUSE_TRACE_CONV"))
+        fprintf(stderr, "[conv2d] C_in=%d H=%d W=%d C_out=%d kH=%d kW=%d padH=%d padW=%d dilH=%d dilW=%d sH=%d sW=%d -> H_out=%d W_out=%d chunk=%d\n",
+                C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, H_out, W_out, CH);
+    for (int co0 = 0; co0 < C_out; co0 += CH) {
+        int n = (C_out - co0 < CH) ? C_out - co0 : CH;
+        dim3 grd((unsigned)((H_out + 15) / 16), (unsigned)((W_out + 15) / 16), (unsigned)n);
+        // the kernel adds co0 itself, so pass the un-offset pointers
+        k_conv2d<<<grd, blk>>>(x, w, b,
+                               C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW,
+                               y, co0);
+        launch_kick();
+    }
     return reuse_gpu_ok(g, "conv2d");
 }
 
@@ -637,6 +690,7 @@ extern "C" int reuse_gpu_encoder(reuse_gpu_t *g, const float *xin, float *enc, i
     float *x1  = wallc(g, (size_t)HID*Tp*Fp);
     float *x1n = wallc(g, (size_t)HID*Tp*Fp);
     float *xdb = wallc(g, (size_t)HID*Tp*Fp);
+    if (g->bad) return 1;
     float *x2  = wallc(g, (size_t)HID*T2*F2);
     if (!x1 || !x1n || !xdb || !x2) return 1;
 
@@ -845,6 +899,8 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
     if (!xin || !enc || !blk) return 1;
     cudaMemset(xin, 0, (size_t)2*Tp*Fp*sizeof(float));
     k_build_input<<<(unsigned)(((long)T*F+255)/256), 256>>>(mag, pha, xin, T, F);
+    if (getenv("REUSE_MEM")) { size_t fr=0,to=0; cudaMemGetInfo(&fr,&to);
+        fprintf(stderr, "[mem] forward entry: free %zu MiB / %zu MiB\n", fr>>20, to>>20); }
     double t0 = gt_now();
     if (reuse_gpu_encoder(g, xin, enc, Tp, Fp)) return 1;
     cudaDeviceSynchronize(); double t1 = gt_now(); g_t_enc = t1-t0;
@@ -854,6 +910,8 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
         cudaMemcpyAsync(enc, blk, (size_t)HID*T2*F2*sizeof(float), cudaMemcpyDeviceToDevice);
     }
     cudaDeviceSynchronize(); double t2 = gt_now(); g_t_blk = t2-t1;
+    if (getenv("REUSE_MEM")) { size_t fr=0,to=0; cudaMemGetInfo(&fr,&to);
+        fprintf(stderr, "[mem] after 30 blocks: free %zu MiB / %zu MiB\n", fr>>20, to>>20); }
     const int Tx = T2*4, Fx = F2*2;
     float *dm = (float*)dalloc((size_t)HID*Tx*Fx);
     float *dp = (float*)dalloc((size_t)HID*Tx*Fx);

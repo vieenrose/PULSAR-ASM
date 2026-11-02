@@ -39,6 +39,13 @@ int main(int argc, char **argv)
 
     reuse_gpu_t *g = reuse_gpu_create(&blob);
     if (!g) return 1;
+    // The weights now live on the GPU; on the Nano's 3 GiB shared-memory
+    // device every host allocation matters, so drop the 38 MiB blob copy.
+    reuse_blob_free(&blob);
+    if (getenv("REUSE_MEM")) {
+        size_t fr=0, to=0; cudaMemGetInfo(&fr,&to);
+        printf("[mem] free %zu MiB / total %zu MiB\n", fr>>20, to>>20); fflush(stdout);
+    }
 
     float *d_mag, *d_pha, *d_amp, *d_phaout;
     size_t nsp = (size_t)F*T;

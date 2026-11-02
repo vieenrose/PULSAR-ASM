@@ -8,6 +8,9 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BLOB="${BLOB:-$DIR/tests/golden/reuse.blob}"
+# 3 GiB shared-memory GPU on Nano Gen1: 1 GiB+ arenas get over-committed and
+# fault ("launch timed out"). 640 MiB covers the encoder peak (~560 MiB).
+export REUSE_WS_MB="${REUSE_WS_MB:-640}"
 BIN="${BIN:-$DIR/engine/reuse_nano_gpu}"
 REPS="${REPS:-5}"
 FIXTURES="${@:-$DIR/tests/golden/fixtures/mic_test2_8000.wav $DIR/tests/golden/fixtures/mic_test2_16000.wav}"

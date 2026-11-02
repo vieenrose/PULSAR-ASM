@@ -8,3 +8,4 @@ engine/reuse_nano
 /tmp/
 __pycache__/
 *.pyc
+engine/*.o
