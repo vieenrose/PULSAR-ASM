@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 int reuse_blob_load(const char *path, reuse_blob_t *blob) {
     memset(blob, 0, sizeof(*blob));
@@ -17,13 +18,10 @@ int reuse_blob_load(const char *path, reuse_blob_t *blob) {
     blob->header_json = (char *)malloc(hlen + 1);
     if (fread(blob->header_json, 1, hlen, f) != hlen) { fclose(f); return -5; }
     blob->header_json[hlen] = 0;
-    // count tensors by scanning? easier to read until eof by reading sequentially
-    // but we don't know count; read all
     long start = ftell(f);
     fseek(f, 0, SEEK_END);
     long end = ftell(f);
     fseek(f, start, SEEK_SET);
-    // naive: count by iterating
     int count = 0;
     long pos = start;
     while (pos < end) {
