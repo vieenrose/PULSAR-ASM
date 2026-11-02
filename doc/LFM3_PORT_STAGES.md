@@ -1574,3 +1574,54 @@ scheduling-dependent read.
 
 Until then the gate's strict bars stay as they are, and a run the defect touched is
 reported RED on purpose: a result that is not reproducible is not a measurement.
+
+### 32. WAV in, audio embeddings out: the front end is closed, and every link is gated
+
+`pulsar_arm/asm/lfm3_wav.c` is the runtime's only container parser, and it is the last
+piece between "a recording" and "the mel file the encoder already takes":
+
+```
+lfm3_wav in.wav out.f32 | lfm3_mel mel.bin out.f32 mel.f32 | lfm3_enc_gpu blob mel.f32 400 dir
+```
+
+Accepted forms: 16 kHz, mono or stereo (`(l+r)*0.5f`), PCM 16-bit, IEEE float32, and
+WAVE_FORMAT_EXTENSIBLE for both, chunks in any order with junk chunks and odd sizes
+honoured. Everything else is REFUSED with a reason: other rates, 24-bit, 3 channels,
+truncated data, non-RIFF, an extensible header whose SubFormat is PCM24. No resampling,
+no channel guessing, no "assume 16 kHz" -- a resampler inside a gated path is DSP nobody
+has validated, and the failure mode of guessing here is a transcript that is subtly
+wrong while every front-end gate stays green.
+
+`.auto/lfm3/checks_wav.py` gates it two ways, and the second is the reason the first
+matters:
+
+```
+  pcm16_mono/stereo, f32_mono/stereo, ext_pcm16, ext_f32, chunks_junk (lying RIFF size,
+  LIST+fact before fmt, odd-size pad byte), pcm16_extremes (-32768/32767), empty
+      -> BIT-EXACT vs numpy, 0 cells differ, 9 fixtures
+  rate_44k, rate_8k, pcm24, three_ch, truncated, ext_pcm24, not_riff
+      -> REFUSED with rc != 0, 7 fixtures
+  WAV -> lfm3_wav -> lfm3_mel -> mel.f32  vs the CACHED HF mel, 6 fixtures:
+      chirp T=99 live max 6.26e-06 | clicks 5.96e-08 | dc 4.77e-07 | len1 0.0
+      len159 1.19e-07 | len15999 5.96e-07                     (S2 bar is 1e-05)
+WAV_GATE PASS (16 fixtures, 6 chain)
+```
+
+The chain fixtures reuse the mel gate's own PCM signals, so no new audio enters the
+suite, and they exercise the reader *through* the validated mel stage: a WAV bug shows
+up as mel drift against HF, not as a green parser.
+
+`lfm3_mel.c` writes channel-major `[128][frames]`, which is exactly the `[128][Tm]`
+layout the encoder reads, so the three stages concatenate with no transpose. End to end
+on a synthesized 4 s chirp (400 frames -> Tt=50 tokens, the 12.5 tokens/s law):
+
+```
+lfm3_wav: 64240 samples | MEL frames=400 mels=128 | layers ported: 17 of 17
+WAV -> proj_out: 102400 cells, finite True, rms 0.0567, max 1.1620 (ds_out rms 0.0229)
+ENCODER total 232 ms = 0.058 s/audio-s cold single pass (warm min-of-8: 0.0320)
+```
+
+What is left for the realtime gate is now narrow and specific: feed `proj_out`'s rows
+into the backbone prefill as the audio-embedding prompt (an embedding-stream override at
+the audio positions), and run `.auto/lfm3/measure_rt.sh` on >= 60 s of real speech,
+which is the one input I do not have.

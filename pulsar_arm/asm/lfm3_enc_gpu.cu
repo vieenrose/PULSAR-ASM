@@ -320,6 +320,9 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
   const cudaError_t pe = cudaMalloc(&g.part, (size_t)T * N * g.nch * 4);
   if (pe) { printf("gemm part cudaMalloc %.1f MB failed: %s (N=%d K=%d T=%d nch=%d)\n",
                    (size_t)T * N * g.nch * 4 / 1e6, cudaGetErrorString(pe), N, K, T, g.nch); exit(2); }
+  if (cudaMemset(g.part, g_poison ? 0xff : 0, (size_t)T * N * g.nch * 4)) { printf("memset part\n"); exit(2); }
+  // (re-tested 2026-08 with the per-launch refusal check in place; the first pass of
+  //  this experiment predated that check, so a refused launch was invisible in it.)
   // NOT zeroed, deliberately, and this is a measured fact rather than a style choice:
   // zeroing g.part made the encoder WORSE (layer_01 vs the C reference 2.86e-06 -> 2.12e-04,
   // and the run-to-run spread rose from ~1e-4 to 1.7e-3 energy), i.e. the slots the
