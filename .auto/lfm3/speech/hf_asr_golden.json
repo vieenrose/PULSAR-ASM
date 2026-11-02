@@ -1256,5 +1256,1411 @@
   "mean_excluding_top10": 1.5893430773663002,
   "rows_above_4x_mean": 2,
   "max_over_mean": 5.8559222494811705
+ },
+ "tower_fp32_test": {
+  "kind": "test of the hypothesis 'HF runs the audio tower in bf16 and ITS rounding grows with position, so HF - not our encoder - is the outlier in the proj_out position-decay comparison'",
+  "date": "2026-11-02",
+  "produced_by": "transformers 5.21.0, torch 2.6.0+cu124, python 3.11.15; arms fp32@cuda,bf16@cuda,fp32@cpu",
+  "script": ".auto/lfm3/hf_asr_tower_fp32.py",
+  "hf_entry_point": "model.model.get_audio_features(input_features, feature_attention_mask)",
+  "model": {
+   "path": "/home/louis/models/lfm3/LFM3-Audio-2B",
+   "dtype_at_load": "torch.float32",
+   "audio_tower_dtype_after_load": "torch.float32",
+   "cast": "from_pretrained(dtype=torch.float32) is the loader (the checkpoint stores BF16 for all 539 tensors, so this is the bf16 -> fp32 widening); each arm then casts the encoder + projector explicitly with .to(dtype=...), and tower_dtype_audit asserts the result"
+  },
+  "fixture": {
+   "path": ".auto/lfm3/speech/gate_60s_16k_mono.wav",
+   "sha256": "840083b5d2d17d74a3880de995686310dfc21d8cb73aea0deb786dbbf885bd52",
+   "manifest": ".auto/lfm3/speech/manifest.json",
+   "manifest_sha256": "f3fc54729ccf2e21787256e44f62465e55c5a8b40ee962da4f54cf8e63d8fccb",
+   "samples": 2075520,
+   "duration_s": 129.72,
+   "mel_frames_full": [
+    1,
+    128,
+    12971
+   ],
+   "clip30_samples": 480000,
+   "clip30_seconds": 30.0,
+   "mel_frames_30s": [
+    1,
+    128,
+    2999
+   ],
+   "c_ref_rows_are_first_30_seconds": true
+  },
+  "premise": {
+   "committed_matrix": ".auto/lfm3/speech/hf_audio_embeddings_1622x2048.f32",
+   "committed_matrix_sha256": "aa99fafefd1f6a86a85ad802d73fba911c9f7224741ccb8b17bd7af48ab2abc0",
+   "committed_matrix_source_torch_dtype": "torch.float32",
+   "committed_matrix_cast_applied": false,
+   "committed_matrix_cast_note": "no cast: the model loads at dtype=torch.float32 and get_audio_features returns that dtype, so the saved bytes are the values HF splices into the prompt",
+   "committed_matrix_model_dtype": "torch.float32",
+   "committed_matrix_produced_on_device": "cpu",
+   "note": "the committed golden matrix is recorded by the golden itself as a torch.float32 run with cast_applied=false, produced on CPU: it is HF-fp32, not the bf16 side the hypothesis needs. The bf16 arm here is run explicitly, so 'fp32 vs the golden' reads as HF-fp32(GPU) vs HF-fp32(CPU) (a device check) and the dtype question is answered by the fp32-vs-bf16 pair against the C reference."
+  },
+  "harness": {
+   "python": "3.11.15",
+   "torch": "2.6.0+cu124",
+   "transformers": "5.21.0",
+   "numpy": "2.4.6",
+   "cuda_visible_devices": "<unset>",
+   "cuda_device_count": 2,
+   "cuda_devices": [
+    {
+     "index": 0,
+     "name": "NVIDIA Graphics Device",
+     "capability": "8.6",
+     "total_memory_gb": 6.23
+    },
+    {
+     "index": 1,
+     "name": "NVIDIA GeForce GTX 1070",
+     "capability": "6.1",
+     "total_memory_gb": 8.5
+    }
+   ],
+   "arms_requested": [
+    "fp32@cuda",
+    "bf16@cuda",
+    "fp32@cpu"
+   ],
+   "arm_runtime_s": {
+    "fp32@cuda": {
+     "full": 0.542,
+     "30s": 0.043
+    },
+    "bf16@cuda": {
+     "full": 0.252,
+     "30s": 0.027
+    },
+    "fp32@cpu": {
+     "full": 2.113,
+     "30s": 0.449
+    }
+   },
+   "arm_dtype_audit": {
+    "fp32@cuda": {
+     "asserted_dtype": "torch.float32",
+     "tensors_checked": 178,
+     "tensor_elements": 115278240,
+     "tensor_bytes": 461112960,
+     "tensors_off_dtype": [],
+     "audio_encoder": {
+      "module": "model.model.audio_encoder",
+      "asserted_dtype": "torch.float32",
+      "tensors_checked": 172,
+      "tensors_off_dtype": [],
+      "tensor_elements": 109505440,
+      "tensor_bytes": 438021760,
+      "probe_weight_dtype": "torch.float32",
+      "probe_weight_element_size": 4
+     },
+     "audio_projector": {
+      "module": "model.model.audio_projector",
+      "asserted_dtype": "torch.float32",
+      "tensors_checked": 6,
+      "tensors_off_dtype": [],
+      "tensor_elements": 5772800,
+      "tensor_bytes": 23091200,
+      "probe_weight_dtype": "n/a",
+      "probe_weight_element_size": null
+     }
+    },
+    "bf16@cuda": {
+     "asserted_dtype": "torch.bfloat16",
+     "tensors_checked": 178,
+     "tensor_elements": 115278240,
+     "tensor_bytes": 230556480,
+     "tensors_off_dtype": [],
+     "audio_encoder": {
+      "module": "model.model.audio_encoder",
+      "asserted_dtype": "torch.bfloat16",
+      "tensors_checked": 172,
+      "tensors_off_dtype": [],
+      "tensor_elements": 109505440,
+      "tensor_bytes": 219010880,
+      "probe_weight_dtype": "torch.bfloat16",
+      "probe_weight_element_size": 2
+     },
+     "audio_projector": {
+      "module": "model.model.audio_projector",
+      "asserted_dtype": "torch.bfloat16",
+      "tensors_checked": 6,
+      "tensors_off_dtype": [],
+      "tensor_elements": 5772800,
+      "tensor_bytes": 11545600,
+      "probe_weight_dtype": "n/a",
+      "probe_weight_element_size": null
+     }
+    },
+    "fp32@cpu": {
+     "asserted_dtype": "torch.float32",
+     "tensors_checked": 178,
+     "tensor_elements": 115278240,
+     "tensor_bytes": 461112960,
+     "tensors_off_dtype": [],
+     "audio_encoder": {
+      "module": "model.model.audio_encoder",
+      "asserted_dtype": "torch.float32",
+      "tensors_checked": 172,
+      "tensors_off_dtype": [],
+      "tensor_elements": 109505440,
+      "tensor_bytes": 438021760,
+      "probe_weight_dtype": "torch.float32",
+      "probe_weight_element_size": 4
+     },
+     "audio_projector": {
+      "module": "model.model.audio_projector",
+      "asserted_dtype": "torch.float32",
+      "tensors_checked": 6,
+      "tensors_off_dtype": [],
+      "tensor_elements": 5772800,
+      "tensor_bytes": 23091200,
+      "probe_weight_dtype": "n/a",
+      "probe_weight_element_size": null
+     }
+    }
+   },
+   "arm_activation_dtypes": {
+    "fp32@cuda": {
+     "input_dtypes": {
+      "torch.float32": 398,
+      "torch.int64": 4
+     },
+     "output_dtypes": {
+      "torch.float32": 434,
+      "torch.int64": 2
+     },
+     "floating_dtypes_seen": [
+      "torch.float32"
+     ],
+     "dtypes_seen_off_the_requested_one": [],
+     "module_input_dtypes": {
+      "Conv1d": [
+       "torch.float32"
+      ],
+      "Conv2d": [
+       "torch.float32"
+      ],
+      "GELU": [
+       "torch.float32"
+      ],
+      "LayerNorm": [
+       "torch.float32"
+      ],
+      "Lfm2DecoderLayer": [
+       "torch.float32"
+      ],
+      "Lfm2MLP": [
+       "torch.float32"
+      ],
+      "Lfm2RMSNorm": [
+       "torch.float32"
+      ],
+      "Lfm2RotaryEmbedding": [
+       "torch.float32"
+      ],
+      "Lfm3AudioDownsampler": [
+       "torch.float32",
+       "torch.int64"
+      ],
+      "Lfm3AudioEncoder": [
+       "torch.float32",
+       "torch.int64"
+      ],
+      "Lfm3AudioProjector": [
+       "torch.float32"
+      ],
+      "Linear": [
+       "torch.float32"
+      ],
+      "SiLU": [
+       "torch.float32"
+      ]
+     }
+    },
+    "bf16@cuda": {
+     "input_dtypes": {
+      "torch.bfloat16": 398,
+      "torch.int64": 4
+     },
+     "output_dtypes": {
+      "torch.bfloat16": 434,
+      "torch.int64": 2
+     },
+     "floating_dtypes_seen": [
+      "torch.bfloat16"
+     ],
+     "dtypes_seen_off_the_requested_one": [],
+     "module_input_dtypes": {
+      "Conv1d": [
+       "torch.bfloat16"
+      ],
+      "Conv2d": [
+       "torch.bfloat16"
+      ],
+      "GELU": [
+       "torch.bfloat16"
+      ],
+      "LayerNorm": [
+       "torch.bfloat16"
+      ],
+      "Lfm2DecoderLayer": [
+       "torch.bfloat16"
+      ],
+      "Lfm2MLP": [
+       "torch.bfloat16"
+      ],
+      "Lfm2RMSNorm": [
+       "torch.bfloat16"
+      ],
+      "Lfm2RotaryEmbedding": [
+       "torch.bfloat16"
+      ],
+      "Lfm3AudioDownsampler": [
+       "torch.bfloat16",
+       "torch.int64"
+      ],
+      "Lfm3AudioEncoder": [
+       "torch.bfloat16",
+       "torch.int64"
+      ],
+      "Lfm3AudioProjector": [
+       "torch.bfloat16"
+      ],
+      "Linear": [
+       "torch.bfloat16"
+      ],
+      "SiLU": [
+       "torch.bfloat16"
+      ]
+     }
+    },
+    "fp32@cpu": {
+     "input_dtypes": {
+      "torch.float32": 398,
+      "torch.int64": 4
+     },
+     "output_dtypes": {
+      "torch.float32": 434,
+      "torch.int64": 2
+     },
+     "floating_dtypes_seen": [
+      "torch.float32"
+     ],
+     "dtypes_seen_off_the_requested_one": [],
+     "module_input_dtypes": {
+      "Conv1d": [
+       "torch.float32"
+      ],
+      "Conv2d": [
+       "torch.float32"
+      ],
+      "GELU": [
+       "torch.float32"
+      ],
+      "LayerNorm": [
+       "torch.float32"
+      ],
+      "Lfm2DecoderLayer": [
+       "torch.float32"
+      ],
+      "Lfm2MLP": [
+       "torch.float32"
+      ],
+      "Lfm2RMSNorm": [
+       "torch.float32"
+      ],
+      "Lfm2RotaryEmbedding": [
+       "torch.float32"
+      ],
+      "Lfm3AudioDownsampler": [
+       "torch.float32",
+       "torch.int64"
+      ],
+      "Lfm3AudioEncoder": [
+       "torch.float32",
+       "torch.int64"
+      ],
+      "Lfm3AudioProjector": [
+       "torch.float32"
+      ],
+      "Linear": [
+       "torch.float32"
+      ],
+      "SiLU": [
+       "torch.float32"
+      ]
+     }
+    }
+   },
+   "arm_input_dtypes": {
+    "fp32@cuda": {
+     "full": {
+      "input_features": "torch.float32",
+      "feature_attention_mask": "torch.int64",
+      "device": "cuda:0"
+     },
+     "30s": {
+      "input_features": "torch.float32",
+      "feature_attention_mask": "torch.int64",
+      "device": "cuda:0"
+     }
+    },
+    "bf16@cuda": {
+     "full": {
+      "input_features": "torch.bfloat16",
+      "feature_attention_mask": "torch.int64",
+      "device": "cuda:0"
+     },
+     "30s": {
+      "input_features": "torch.bfloat16",
+      "feature_attention_mask": "torch.int64",
+      "device": "cuda:0"
+     }
+    },
+    "fp32@cpu": {
+     "full": {
+      "input_features": "torch.float32",
+      "feature_attention_mask": "torch.int64",
+      "device": "cpu"
+     },
+     "30s": {
+      "input_features": "torch.float32",
+      "feature_attention_mask": "torch.int64",
+      "device": "cpu"
+     }
+    }
+   },
+   "arm_output_dtypes": {
+    "fp32@cuda": {
+     "full": "torch.float32",
+     "30s": "torch.float32"
+    },
+    "bf16@cuda": {
+     "full": "torch.bfloat16",
+     "30s": "torch.bfloat16"
+    },
+    "fp32@cpu": {
+     "full": "torch.float32",
+     "30s": "torch.float32"
+    }
+   },
+   "tf32_flags_at_run": {
+    "fp32@cuda": {
+     "cudnn_allow_tf32": false,
+     "matmul_allow_tf32": false,
+     "allow_tf32_flag": false
+    },
+    "bf16@cuda": {
+     "cudnn_allow_tf32": false,
+     "matmul_allow_tf32": false,
+     "allow_tf32_flag": false
+    },
+    "fp32@cpu": {
+     "cudnn_allow_tf32": false,
+     "matmul_allow_tf32": false,
+     "allow_tf32_flag": false
+    }
+   },
+   "feature_extraction": {
+    "full": {
+     "seconds": 0.08,
+     "samples": 2075520,
+     "audio_seconds": 129.72,
+     "input_features_shape": [
+      1,
+      128,
+      12971
+     ],
+     "input_features_dtype": "torch.float32",
+     "feature_attention_mask_ones": 12971
+    },
+    "30s": {
+     "seconds": 0.0,
+     "samples": 480000,
+     "audio_seconds": 30.0,
+     "input_features_shape": [
+      1,
+      128,
+      2999
+     ],
+     "input_features_dtype": "torch.float32",
+     "feature_attention_mask_ones": 2999
+    }
+   },
+   "load_seconds": 1.05,
+   "wall_seconds": 6.42,
+   "max_rss_gb": 12.33,
+   "model_dtype_at_load": "torch.float32",
+   "audio_tower_dtype_after_load": "torch.float32",
+   "audio_tower_cast": "from_pretrained(dtype=torch.float32) is the loader (the checkpoint stores BF16 for all 539 tensors, so this is the bf16 -> fp32 widening); each arm then casts the encoder + projector explicitly with .to(dtype=...), and tower_dtype_audit asserts the result",
+   "bf16_control_weight_provenance": {
+    "parameters_checked": 176,
+    "buffers_excluded": 2,
+    "buffers_not_bf16_representable": [
+     "Lfm3AudioEncoder.lfm.rotary_emb.inv_freq",
+     "Lfm3AudioEncoder.lfm.rotary_emb.original_inv_freq"
+    ],
+    "max_abs_bf16_roundtrip_error": 0.0,
+    "worst_tensor": "",
+    "bf16_control_uses_the_checkpoint_bytes": true
+   }
+  },
+  "arms": {
+   "bf16@cuda/30s": {
+    "label": "bf16@cuda/30s",
+    "shape": [
+     375,
+     2048
+    ],
+    "dtype": "float32 (every dump is widened from the arm's compute dtype on save)",
+    "sha256_f32_bytes": "83b80ce74a7125955830c94ffa27b45946269879e4b4499d584bbe2239bd83ff",
+    "all_finite": true,
+    "mean_row_l2_norm": 1.6527103491477702,
+    "min_row_l2_norm": 1.0794322598258077,
+    "max_row_l2_norm": 9.340623370969968,
+    "first_rows_l2_norm": [
+     7.263093476858385,
+     9.340623370969968,
+     2.870475770110418
+    ],
+    "last_rows_l2_norm": [
+     1.3978211913323166,
+     1.5884700697044094,
+     1.9406455795925202
+    ],
+    "tower_precision": "bf16",
+    "device": "cuda",
+    "runtime_s": 0.027,
+    "output_dtype": "torch.bfloat16",
+    "weights_fp32_asserted": true,
+    "tensors_checked": 178
+   },
+   "bf16@cuda/full": {
+    "label": "bf16@cuda/full",
+    "shape": [
+     1622,
+     2048
+    ],
+    "dtype": "float32 (every dump is widened from the arm's compute dtype on save)",
+    "sha256_f32_bytes": "041c4cfc07fc5d3c2092e62ea922a0e09bec78bbb49baf08a4614bafe6c1d8fb",
+    "all_finite": true,
+    "mean_row_l2_norm": 1.6032690029268963,
+    "min_row_l2_norm": 1.0786381393978741,
+    "max_row_l2_norm": 9.486199988870439,
+    "first_rows_l2_norm": [
+     7.255018956921543,
+     9.486199988870439,
+     2.892416779953857
+    ],
+    "last_rows_l2_norm": [
+     1.2417326995006002,
+     1.4875893622752674,
+     1.9629923060859549
+    ],
+    "tower_precision": "bf16",
+    "device": "cuda",
+    "runtime_s": 0.252,
+    "output_dtype": "torch.bfloat16",
+    "weights_fp32_asserted": true,
+    "tensors_checked": 178
+   },
+   "fp32@cpu/30s": {
+    "label": "fp32@cpu/30s",
+    "shape": [
+     375,
+     2048
+    ],
+    "dtype": "float32 (every dump is widened from the arm's compute dtype on save)",
+    "sha256_f32_bytes": "31ce95c9293bee4f7c455673ed1a84dbc21e1f47f42be3a1325295c1300b1c31",
+    "all_finite": true,
+    "mean_row_l2_norm": 1.6523742850209662,
+    "min_row_l2_norm": 1.0817508897727204,
+    "max_row_l2_norm": 9.38579366968073,
+    "first_rows_l2_norm": [
+     7.237475583471119,
+     9.38579366968073,
+     2.877496601688128
+    ],
+    "last_rows_l2_norm": [
+     1.3976429510949115,
+     1.5833201300303013,
+     1.9515061946070724
+    ],
+    "tower_precision": "fp32",
+    "device": "cpu",
+    "runtime_s": 0.449,
+    "output_dtype": "torch.float32",
+    "weights_fp32_asserted": true,
+    "tensors_checked": 178
+   },
+   "fp32@cpu/full": {
+    "label": "fp32@cpu/full",
+    "shape": [
+     1622,
+     2048
+    ],
+    "dtype": "float32 (every dump is widened from the arm's compute dtype on save)",
+    "sha256_f32_bytes": "1991eb40f5f7403c09120bd9619ad81d7532f5dc6e39a207148c91e8e83dbb4d",
+    "all_finite": true,
+    "mean_row_l2_norm": 1.6028359354096495,
+    "min_row_l2_norm": 1.0817509788303155,
+    "max_row_l2_norm": 9.385792099904123,
+    "first_rows_l2_norm": [
+     7.2374757939004155,
+     9.385792099904123,
+     2.8774962357604874
+    ],
+    "last_rows_l2_norm": [
+     1.246404167673769,
+     1.4740052964959292,
+     1.9486508832770608
+    ],
+    "tower_precision": "fp32",
+    "device": "cpu",
+    "runtime_s": 2.113,
+    "output_dtype": "torch.float32",
+    "weights_fp32_asserted": true,
+    "tensors_checked": 178
+   },
+   "fp32@cuda/30s": {
+    "label": "fp32@cuda/30s",
+    "shape": [
+     375,
+     2048
+    ],
+    "dtype": "float32 (every dump is widened from the arm's compute dtype on save)",
+    "sha256_f32_bytes": "eaa5ddebeba65309be52efbb1b3020f3ea791a6ec67c0fb27230cfac3808a15c",
+    "all_finite": true,
+    "mean_row_l2_norm": 1.6523461627894636,
+    "min_row_l2_norm": 1.0818123994478108,
+    "max_row_l2_norm": 9.385895721669568,
+    "first_rows_l2_norm": [
+     7.237474421042902,
+     9.385895721669568,
+     2.8775014627412934
+    ],
+    "last_rows_l2_norm": [
+     1.3974183534133728,
+     1.5831759696184118,
+     1.951563281179711
+    ],
+    "tower_precision": "fp32",
+    "device": "cuda",
+    "runtime_s": 0.043,
+    "output_dtype": "torch.float32",
+    "weights_fp32_asserted": true,
+    "tensors_checked": 178
+   },
+   "fp32@cuda/full": {
+    "label": "fp32@cuda/full",
+    "shape": [
+     1622,
+     2048
+    ],
+    "dtype": "float32 (every dump is widened from the arm's compute dtype on save)",
+    "sha256_f32_bytes": "b03b229d677695c89a2f6ab724c7986d9bd33eaeb88787fea35a7a35115eabf8",
+    "all_finite": true,
+    "mean_row_l2_norm": 1.602802977832785,
+    "min_row_l2_norm": 1.0818122190943114,
+    "max_row_l2_norm": 9.385894239644983,
+    "first_rows_l2_norm": [
+     7.237472967106097,
+     9.385894239644983,
+     2.8775011468703227
+    ],
+    "last_rows_l2_norm": [
+     1.2462218820563242,
+     1.47387710612032,
+     1.9483494986584868
+    ],
+    "tower_precision": "fp32",
+    "device": "cuda",
+    "runtime_s": 0.542,
+    "output_dtype": "torch.float32",
+    "weights_fp32_asserted": true,
+    "tensors_checked": 178
+   }
+  },
+  "c_reference": {
+   "source": "/tmp/lfm3fp32/proj_out",
+   "sha256": "dfb90c9c1af7eec8f6adef966768ad37213e7a73edf1d4e7e604d830d5b76800",
+   "nbytes": 3072000,
+   "shape": [
+    375,
+    2048
+   ],
+   "layout": "raw f32, row-major, no header; rows 0..374 of the fixture = its first 30.000 s",
+   "mean_row_l2_norm": 1.4725868913502997,
+   "min_row_l2_norm": 1.0581059603088314,
+   "max_row_l2_norm": 9.39840207182458
+  },
+  "comparisons": {
+   "fp32@cuda_vs_golden_matrix_full": {
+    "label": "fp32@cuda_vs_golden_matrix_full",
+    "a": "fp32@cuda",
+    "b": "golden_matrix_full",
+    "rows_compared": 1622,
+    "cos_mean": 0.9999999999952325,
+    "cos_min": 0.9999999998809569,
+    "cos_mean_rows_200_374": 0.9999999999954556,
+    "cos_min_rows_200_374": 0.9999999999899465,
+    "mean_row_l2_norm_a": 1.602802977832785,
+    "mean_row_l2_norm_b": 1.6028030909420106,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999999999993889,
+      "cos_min": 0.9999999999987924,
+      "cos_median": 0.9999999999996808,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.500289451207134,
+      "mean_row_l2_norm_b": 6.500289041696321
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9999999999964656,
+      "cos_min": 0.9999999999952148,
+      "cos_median": 0.9999999999965287,
+      "argmin_row": 15,
+      "mean_row_l2_norm_a": 1.827269563516017,
+      "mean_row_l2_norm_b": 1.8272701154072213
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9999999999945295,
+      "cos_min": 0.999999999943452,
+      "cos_median": 0.9999999999958537,
+      "argmin_row": 58,
+      "mean_row_l2_norm_a": 1.6432355719566147,
+      "mean_row_l2_norm_b": 1.64323589397912
+     },
+     "100-1621": {
+      "rows": 1522,
+      "cos_mean": 0.999999999995246,
+      "cos_min": 0.9999999998809569,
+      "cos_median": 0.9999999999956031,
+      "argmin_row": 396,
+      "mean_row_l2_norm_a": 1.5883962545093921,
+      "mean_row_l2_norm_b": 1.5883963526157503
+     }
+    }
+   },
+   "bf16@cuda_vs_golden_matrix_full": {
+    "label": "bf16@cuda_vs_golden_matrix_full",
+    "a": "bf16@cuda",
+    "b": "golden_matrix_full",
+    "rows_compared": 1622,
+    "cos_mean": 0.9999538030153072,
+    "cos_min": 0.9953583662859786,
+    "cos_mean_rows_200_374": 0.9999617700161642,
+    "cos_min_rows_200_374": 0.9994869560628629,
+    "mean_row_l2_norm_a": 1.6032690029268963,
+    "mean_row_l2_norm_b": 1.6028030909420106,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999911369000628,
+      "cos_min": 0.9999854517585165,
+      "cos_median": 0.9999932474478538,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.54454524191528,
+      "mean_row_l2_norm_b": 6.500289041696321
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9999683059037109,
+      "cos_min": 0.9999449877006032,
+      "cos_median": 0.9999693847761721,
+      "argmin_row": 18,
+      "mean_row_l2_norm_a": 1.8265173609156866,
+      "mean_row_l2_norm_b": 1.8272701154072213
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9999604836185931,
+      "cos_min": 0.9997222551262613,
+      "cos_median": 0.9999681013124005,
+      "argmin_row": 58,
+      "mean_row_l2_norm_a": 1.6436245676818144,
+      "mean_row_l2_norm_b": 1.64323589397912
+     },
+     "100-1621": {
+      "rows": 1522,
+      "cos_mean": 0.9999532111484839,
+      "cos_min": 0.9953583662859786,
+      "cos_median": 0.9999669250876988,
+      "argmin_row": 947,
+      "mean_row_l2_norm_a": 1.588794371667762,
+      "mean_row_l2_norm_b": 1.5883963526157503
+     }
+    }
+   },
+   "fp32@cpu_vs_golden_matrix_full": {
+    "label": "fp32@cpu_vs_golden_matrix_full",
+    "a": "fp32@cpu",
+    "b": "golden_matrix_full",
+    "rows_compared": 1622,
+    "cos_mean": 0.9999999199729911,
+    "cos_min": 0.9999990195272357,
+    "cos_mean_rows_200_374": 0.999999922094161,
+    "cos_min_rows_200_374": 0.9999993057698429,
+    "mean_row_l2_norm_a": 1.6028359354096495,
+    "mean_row_l2_norm_b": 1.6028030909420106,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999999999519534,
+      "cos_min": 0.9999999998797359,
+      "cos_median": 0.9999999999761243,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.500254709855009,
+      "mean_row_l2_norm_b": 6.500289041696321
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9999999365956723,
+      "cos_min": 0.9999997763696299,
+      "cos_median": 0.9999999465235432,
+      "argmin_row": 16,
+      "mean_row_l2_norm_a": 1.8273131892451002,
+      "mean_row_l2_norm_b": 1.8272701154072213
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9999999152361672,
+      "cos_min": 0.999999647989529,
+      "cos_median": 0.9999999454383846,
+      "argmin_row": 82,
+      "mean_row_l2_norm_a": 1.6432639948474845,
+      "mean_row_l2_norm_b": 1.64323589397912
+     },
+     "100-1621": {
+      "rows": 1522,
+      "cos_mean": 0.9999999198646229,
+      "cos_min": 0.9999990195272357,
+      "cos_median": 0.999999937119546,
+      "argmin_row": 465,
+      "mean_row_l2_norm_a": 1.5884294547342468,
+      "mean_row_l2_norm_b": 1.5883963526157503
+     }
+    }
+   },
+   "fp32@cuda_30s_vs_own_full_rows_0_374": {
+    "label": "fp32@cuda_30s_vs_own_full_rows_0_374",
+    "a": "fp32@cuda_30s",
+    "b": "own_full_rows_0_374",
+    "rows_compared": 375,
+    "cos_mean": 0.9977869384971916,
+    "cos_min": 0.17010193678742,
+    "cos_mean_rows_200_374": 0.9952577253521268,
+    "cos_min_rows_200_374": 0.17010193678742,
+    "mean_row_l2_norm_a": 1.6523461627894636,
+    "mean_row_l2_norm_b": 1.6507803007740178,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.999999999999701,
+      "cos_min": 0.9999999999994107,
+      "cos_median": 0.9999999999998324,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.5002905351512545,
+      "mean_row_l2_norm_b": 6.500289451207134
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9999999999991763,
+      "cos_min": 0.9999999999990293,
+      "cos_median": 0.9999999999991833,
+      "argmin_row": 17,
+      "mean_row_l2_norm_a": 1.827269712200587,
+      "mean_row_l2_norm_b": 1.827269563516017
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9999999999990925,
+      "cos_min": 0.9999999999975,
+      "cos_median": 0.9999999999991149,
+      "argmin_row": 58,
+      "mean_row_l2_norm_a": 1.6432356271165398,
+      "mean_row_l2_norm_b": 1.6432355719566147
+     },
+     "100-199": {
+      "rows": 100,
+      "cos_mean": 0.9999999999991208,
+      "cos_min": 0.9999999999985247,
+      "cos_median": 0.999999999999136,
+      "argmin_row": 199,
+      "mean_row_l2_norm_a": 1.596817320926947,
+      "mean_row_l2_norm_b": 1.5968172563505403
+     },
+     "200-299": {
+      "rows": 100,
+      "cos_mean": 0.999999999999015,
+      "cos_min": 0.9999999999907739,
+      "cos_median": 0.9999999999990963,
+      "argmin_row": 287,
+      "mean_row_l2_norm_a": 1.5715519298100935,
+      "mean_row_l2_norm_b": 1.571552099191368
+     },
+     "300-374": {
+      "rows": 75,
+      "cos_mean": 0.9889346924896091,
+      "cos_min": 0.17010193678742,
+      "cos_median": 0.9999999999990998,
+      "argmin_row": 374,
+      "mean_row_l2_norm_a": 1.6078072667343177,
+      "mean_row_l2_norm_b": 1.5999779540611139
+     }
+    }
+   },
+   "bf16@cuda_30s_vs_own_full_rows_0_374": {
+    "label": "bf16@cuda_30s_vs_own_full_rows_0_374",
+    "a": "bf16@cuda_30s",
+    "b": "own_full_rows_0_374",
+    "rows_compared": 375,
+    "cos_mean": 0.9977437290666324,
+    "cos_min": 0.17133022710969326,
+    "cos_mean_rows_200_374": 0.9952201780816275,
+    "cos_min_rows_200_374": 0.17133022710969326,
+    "mean_row_l2_norm_a": 1.6527103491477702,
+    "mean_row_l2_norm_b": 1.6517257476554539,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999838607938697,
+      "cos_min": 0.9999737001834824,
+      "cos_median": 0.9999863712260464,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.491397539312923,
+      "mean_row_l2_norm_b": 6.54454524191528
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9999500593524735,
+      "cos_min": 0.9999126960450284,
+      "cos_median": 0.9999569978023306,
+      "argmin_row": 18,
+      "mean_row_l2_norm_a": 1.8282525990397858,
+      "mean_row_l2_norm_b": 1.8265173609156866
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.999947163877099,
+      "cos_min": 0.9992706141042875,
+      "cos_median": 0.9999593913466976,
+      "argmin_row": 58,
+      "mean_row_l2_norm_a": 1.6427071558200015,
+      "mean_row_l2_norm_b": 1.6436245676818144
+     },
+     "100-199": {
+      "rows": 100,
+      "cos_mean": 0.9999548863868541,
+      "cos_min": 0.9998970098107163,
+      "cos_median": 0.9999563455647433,
+      "argmin_row": 193,
+      "mean_row_l2_norm_a": 1.596574987160567,
+      "mean_row_l2_norm_b": 1.5963121548312476
+     },
+     "200-299": {
+      "rows": 100,
+      "cos_mean": 0.9999529772527702,
+      "cos_min": 0.9996655983322201,
+      "cos_median": 0.9999614575918041,
+      "argmin_row": 287,
+      "mean_row_l2_norm_a": 1.5739949694450381,
+      "mean_row_l2_norm_b": 1.5735337199036956
+     },
+     "300-374": {
+      "rows": 75,
+      "cos_mean": 0.9889097791867704,
+      "cos_min": 0.17133022710969326,
+      "cos_median": 0.9999598788239175,
+      "argmin_row": 374,
+      "mean_row_l2_norm_a": 1.6073704074589095,
+      "mean_row_l2_norm_b": 1.6007370510427912
+     }
+    }
+   },
+   "fp32@cpu_30s_vs_own_full_rows_0_374": {
+    "label": "fp32@cpu_30s_vs_own_full_rows_0_374",
+    "a": "fp32@cpu_30s",
+    "b": "own_full_rows_0_374",
+    "rows_compared": 375,
+    "cos_mean": 0.99778725999428,
+    "cos_min": 0.17022249796352154,
+    "cos_mean_rows_200_374": 0.9952584142737779,
+    "cos_min_rows_200_374": 0.17022249796352154,
+    "mean_row_l2_norm_a": 1.6523742850209662,
+    "mean_row_l2_norm_b": 1.6508083084669152,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999999999999498,
+      "cos_min": 0.9999999999998958,
+      "cos_median": 0.9999999999999745,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.50025528494666,
+      "mean_row_l2_norm_b": 6.500254709855009
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9999999999997455,
+      "cos_min": 0.999999999999634,
+      "cos_median": 0.9999999999997478,
+      "argmin_row": 18,
+      "mean_row_l2_norm_a": 1.8273132562232897,
+      "mean_row_l2_norm_b": 1.8273131892451002
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9999999999997158,
+      "cos_min": 0.9999999999995334,
+      "cos_median": 0.9999999999997182,
+      "argmin_row": 38,
+      "mean_row_l2_norm_a": 1.6432639952275883,
+      "mean_row_l2_norm_b": 1.6432639948474845
+     },
+     "100-199": {
+      "rows": 100,
+      "cos_mean": 0.9999999999997108,
+      "cos_min": 0.9999999999994952,
+      "cos_median": 0.9999999999997161,
+      "argmin_row": 188,
+      "mean_row_l2_norm_a": 1.5968274535609688,
+      "mean_row_l2_norm_b": 1.5968274779833391
+     },
+     "200-299": {
+      "rows": 100,
+      "cos_mean": 0.9999999999996894,
+      "cos_min": 0.9999999999984732,
+      "cos_median": 0.9999999999997178,
+      "argmin_row": 287,
+      "mean_row_l2_norm_a": 1.5715806123551699,
+      "mean_row_l2_norm_b": 1.5715806071367557
+     },
+     "300-374": {
+      "rows": 75,
+      "cos_mean": 0.9889362999725626,
+      "cos_min": 0.17022249796352154,
+      "cos_median": 0.9999999999997233,
+      "argmin_row": 374,
+      "mean_row_l2_norm_a": 1.6078572026854634,
+      "mean_row_l2_norm_b": 1.6000273337887412
+     }
+    }
+   },
+   "c_ref_vs_fp32@cuda_30s": {
+    "label": "c_ref_vs_fp32@cuda_30s",
+    "a": "c_ref",
+    "b": "fp32@cuda_30s",
+    "rows_compared": 375,
+    "cos_mean": 0.9319838772547638,
+    "cos_min": 0.7480158220985844,
+    "cos_mean_rows_200_374": 0.899910913139908,
+    "cos_min_rows_200_374": 0.7480158220985844,
+    "mean_row_l2_norm_a": 1.4725868913502997,
+    "mean_row_l2_norm_b": 1.6523461627894636,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999581455331915,
+      "cos_min": 0.999930107341772,
+      "cos_median": 0.9999652038967352,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.505340369362663,
+      "mean_row_l2_norm_b": 6.5002905351512545
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9998048918949711,
+      "cos_min": 0.9997541790975858,
+      "cos_median": 0.9997968596426461,
+      "argmin_row": 15,
+      "mean_row_l2_norm_a": 1.8282238206611423,
+      "mean_row_l2_norm_b": 1.827269712200587
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9753373042040541,
+      "cos_min": 0.8933968181500058,
+      "cos_median": 0.9789328352861036,
+      "argmin_row": 71,
+      "mean_row_l2_norm_a": 1.5954237684991326,
+      "mean_row_l2_norm_b": 1.6432356271165398
+     },
+     "100-199": {
+      "rows": 100,
+      "cos_mean": 0.9396153464822321,
+      "cos_min": 0.8079556591324747,
+      "cos_median": 0.9498203309217468,
+      "argmin_row": 168,
+      "mean_row_l2_norm_a": 1.4310671636146544,
+      "mean_row_l2_norm_b": 1.596817320926947
+     },
+     "200-299": {
+      "rows": 100,
+      "cos_mean": 0.9097788017437712,
+      "cos_min": 0.7480158220985844,
+      "cos_median": 0.9257156457276676,
+      "argmin_row": 287,
+      "mean_row_l2_norm_a": 1.3434574038639413,
+      "mean_row_l2_norm_b": 1.5715519298100935
+     },
+     "300-374": {
+      "rows": 75,
+      "cos_mean": 0.8867537283347574,
+      "cos_min": 0.7525047871683963,
+      "cos_median": 0.8987870591387705,
+      "argmin_row": 317,
+      "mean_row_l2_norm_a": 1.2840679988944383,
+      "mean_row_l2_norm_b": 1.6078072667343177
+     }
+    }
+   },
+   "c_ref_vs_bf16@cuda_30s": {
+    "label": "c_ref_vs_bf16@cuda_30s",
+    "a": "c_ref",
+    "b": "bf16@cuda_30s",
+    "rows_compared": 375,
+    "cos_mean": 0.931877609368836,
+    "cos_min": 0.7177494386182379,
+    "cos_mean_rows_200_374": 0.8996713491824253,
+    "cos_min_rows_200_374": 0.7177494386182379,
+    "mean_row_l2_norm_a": 1.4725868913502997,
+    "mean_row_l2_norm_b": 1.6527103491477702,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999524617789867,
+      "cos_min": 0.9999191646844598,
+      "cos_median": 0.9999595390037052,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.505340369362663,
+      "mean_row_l2_norm_b": 6.491397539312923
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.999766575856553,
+      "cos_min": 0.9997160218136203,
+      "cos_median": 0.9997613959911482,
+      "argmin_row": 14,
+      "mean_row_l2_norm_a": 1.8282238206611423,
+      "mean_row_l2_norm_b": 1.8282525990397858
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9752784500292204,
+      "cos_min": 0.8932179091559465,
+      "cos_median": 0.9787354421725665,
+      "argmin_row": 71,
+      "mean_row_l2_norm_a": 1.5954237684991326,
+      "mean_row_l2_norm_b": 1.6427071558200015
+     },
+     "100-199": {
+      "rows": 100,
+      "cos_mean": 0.939689641033257,
+      "cos_min": 0.8073933065470422,
+      "cos_median": 0.9499490410525734,
+      "argmin_row": 168,
+      "mean_row_l2_norm_a": 1.4310671636146544,
+      "mean_row_l2_norm_b": 1.596574987160567
+     },
+     "200-299": {
+      "rows": 100,
+      "cos_mean": 0.9093745886021197,
+      "cos_min": 0.7177494386182379,
+      "cos_median": 0.9250445656922237,
+      "argmin_row": 287,
+      "mean_row_l2_norm_a": 1.3434574038639413,
+      "mean_row_l2_norm_b": 1.5739949694450381
+     },
+     "300-374": {
+      "rows": 75,
+      "cos_mean": 0.8867336966228327,
+      "cos_min": 0.7521344081865109,
+      "cos_median": 0.8995837571957731,
+      "argmin_row": 317,
+      "mean_row_l2_norm_a": 1.2840679988944383,
+      "mean_row_l2_norm_b": 1.6073704074589095
+     }
+    }
+   },
+   "c_ref_vs_fp32@cpu_30s": {
+    "label": "c_ref_vs_fp32@cpu_30s",
+    "a": "c_ref",
+    "b": "fp32@cpu_30s",
+    "rows_compared": 375,
+    "cos_mean": 0.9319645249569362,
+    "cos_min": 0.7477802456015126,
+    "cos_mean_rows_200_374": 0.8998901986102091,
+    "cos_min_rows_200_374": 0.7477802456015126,
+    "mean_row_l2_norm_a": 1.4725868913502997,
+    "mean_row_l2_norm_b": 1.6523742850209662,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999581469009545,
+      "cos_min": 0.9999301071054403,
+      "cos_median": 0.9999652040628034,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.505340369362663,
+      "mean_row_l2_norm_b": 6.50025528494666
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9998050847521163,
+      "cos_min": 0.9997544347393198,
+      "cos_median": 0.9997968401355003,
+      "argmin_row": 15,
+      "mean_row_l2_norm_a": 1.8282238206611423,
+      "mean_row_l2_norm_b": 1.8273132562232897
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9753170957694515,
+      "cos_min": 0.8934580834134263,
+      "cos_median": 0.9789114609452592,
+      "argmin_row": 71,
+      "mean_row_l2_norm_a": 1.5954237684991326,
+      "mean_row_l2_norm_b": 1.6432639952275883
+     },
+     "100-199": {
+      "rows": 100,
+      "cos_mean": 0.9395949557003687,
+      "cos_min": 0.8079436802365944,
+      "cos_median": 0.949771588389543,
+      "argmin_row": 168,
+      "mean_row_l2_norm_a": 1.4310671636146544,
+      "mean_row_l2_norm_b": 1.5968274535609688
+     },
+     "200-299": {
+      "rows": 100,
+      "cos_mean": 0.9097558819283882,
+      "cos_min": 0.7477802456015126,
+      "cos_median": 0.9257227305896126,
+      "argmin_row": 287,
+      "mean_row_l2_norm_a": 1.3434574038639413,
+      "mean_row_l2_norm_b": 1.5715806123551699
+     },
+     "300-374": {
+      "rows": 75,
+      "cos_mean": 0.8867359541859704,
+      "cos_min": 0.7524833834851427,
+      "cos_median": 0.8987851149176848,
+      "argmin_row": 317,
+      "mean_row_l2_norm_a": 1.2840679988944383,
+      "mean_row_l2_norm_b": 1.6078572026854634
+     }
+    }
+   },
+   "c_ref_vs_golden_matrix_rows_0_374": {
+    "label": "c_ref_vs_golden_matrix_rows_0_374",
+    "a": "c_ref",
+    "b": "golden_matrix_rows_0_374",
+    "rows_compared": 375,
+    "cos_mean": 0.930098471893372,
+    "cos_min": 0.1893699313917772,
+    "cos_mean_rows_200_374": 0.8958708109406756,
+    "cos_min_rows_200_374": 0.1893699313917772,
+    "mean_row_l2_norm_a": 1.4725868913502997,
+    "mean_row_l2_norm_b": 1.6507804681172356,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999581454843623,
+      "cos_min": 0.9999301076535954,
+      "cos_median": 0.9999652040542685,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.505340369362663,
+      "mean_row_l2_norm_b": 6.500289041696321
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9998048914608203,
+      "cos_min": 0.9997541808580344,
+      "cos_median": 0.999796859184864,
+      "argmin_row": 15,
+      "mean_row_l2_norm_a": 1.8282238206611423,
+      "mean_row_l2_norm_b": 1.8272701154072213
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9753372466019066,
+      "cos_min": 0.893396809289291,
+      "cos_median": 0.978932774097714,
+      "argmin_row": 71,
+      "mean_row_l2_norm_a": 1.5954237684991326,
+      "mean_row_l2_norm_b": 1.64323589397912
+     },
+     "100-199": {
+      "rows": 100,
+      "cos_mean": 0.9396153008109781,
+      "cos_min": 0.8079554797448254,
+      "cos_median": 0.9498201368305684,
+      "argmin_row": 168,
+      "mean_row_l2_norm_a": 1.4310671636146544,
+      "mean_row_l2_norm_b": 1.5968173088151998
+     },
+     "200-299": {
+      "rows": 100,
+      "cos_mean": 0.9097787410391007,
+      "cos_min": 0.7480151354604918,
+      "cos_median": 0.9257156870541545,
+      "argmin_row": 287,
+      "mean_row_l2_norm_a": 1.3434574038639413,
+      "mean_row_l2_norm_b": 1.571552188593136
+     },
+     "300-374": {
+      "rows": 75,
+      "cos_mean": 0.8773269041427754,
+      "cos_min": 0.1893699313917772,
+      "cos_median": 0.8987869588343874,
+      "argmin_row": 374,
+      "mean_row_l2_norm_a": 1.2840679988944383,
+      "mean_row_l2_norm_b": 1.5999781463514695
+     }
+    }
+   },
+   "fp32@cuda_vs_bf16@cuda_30s": {
+    "label": "fp32@cuda_vs_bf16@cuda_30s",
+    "a": "fp32@cuda",
+    "b": "bf16@cuda_30s",
+    "rows_compared": 375,
+    "cos_mean": 0.9999568066337216,
+    "cos_min": 0.9984536033718198,
+    "cos_mean_rows_200_374": 0.9999558527932966,
+    "cos_min_rows_200_374": 0.9984536033718198,
+    "mean_row_l2_norm_a": 1.6523461627894636,
+    "mean_row_l2_norm_b": 1.6527103491477702,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999915253616217,
+      "cos_min": 0.9999851030136836,
+      "cos_median": 0.9999943307534996,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.5002905351512545,
+      "mean_row_l2_norm_b": 6.491397539312923
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.9999618407672062,
+      "cos_min": 0.9999335812912541,
+      "cos_median": 0.9999678815541513,
+      "argmin_row": 17,
+      "mean_row_l2_norm_a": 1.827269712200587,
+      "mean_row_l2_norm_b": 1.8282525990397858
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9999626199550835,
+      "cos_min": 0.9998466020442864,
+      "cos_median": 0.9999676291906797,
+      "argmin_row": 58,
+      "mean_row_l2_norm_a": 1.6432356271165398,
+      "mean_row_l2_norm_b": 1.6427071558200015
+     },
+     "100-199": {
+      "rows": 100,
+      "cos_mean": 0.9999519356247242,
+      "cos_min": 0.9991333528313255,
+      "cos_median": 0.9999649407726083,
+      "argmin_row": 162,
+      "mean_row_l2_norm_a": 1.596817320926947,
+      "mean_row_l2_norm_b": 1.596574987160567
+     },
+     "200-299": {
+      "rows": 100,
+      "cos_mean": 0.9999479307913174,
+      "cos_min": 0.9984536033718198,
+      "cos_median": 0.999967113194328,
+      "argmin_row": 287,
+      "mean_row_l2_norm_a": 1.5715519298100935,
+      "mean_row_l2_norm_b": 1.5739949694450381
+     },
+     "300-374": {
+      "rows": 75,
+      "cos_mean": 0.9999664154626021,
+      "cos_min": 0.9999311139856649,
+      "cos_median": 0.999968131319188,
+      "argmin_row": 337,
+      "mean_row_l2_norm_a": 1.6078072667343177,
+      "mean_row_l2_norm_b": 1.6073704074589095
+     }
+    }
+   },
+   "fp32@cuda_vs_bf16@cuda_full": {
+    "label": "fp32@cuda_vs_bf16@cuda_full",
+    "a": "fp32@cuda",
+    "b": "bf16@cuda_full",
+    "rows_compared": 1622,
+    "cos_mean": 0.9999538019732513,
+    "cos_min": 0.9953581910102481,
+    "cos_mean_rows_200_374": 0.9999617696135468,
+    "cos_min_rows_200_374": 0.9994870437174742,
+    "mean_row_l2_norm_a": 1.602802977832785,
+    "mean_row_l2_norm_b": 1.6032690029268963,
+    "buckets": {
+     "0-2": {
+      "rows": 3,
+      "cos_mean": 0.9999911367562985,
+      "cos_min": 0.999985451978595,
+      "cos_median": 0.9999932471704199,
+      "argmin_row": 2,
+      "mean_row_l2_norm_a": 6.500289451207134,
+      "mean_row_l2_norm_b": 6.54454524191528
+     },
+     "3-20": {
+      "rows": 18,
+      "cos_mean": 0.999968306484794,
+      "cos_min": 0.9999449898925161,
+      "cos_median": 0.9999693878877529,
+      "argmin_row": 18,
+      "mean_row_l2_norm_a": 1.827269563516017,
+      "mean_row_l2_norm_b": 1.8265173609156866
+     },
+     "21-99": {
+      "rows": 79,
+      "cos_mean": 0.9999604788597781,
+      "cos_min": 0.9997220321596879,
+      "cos_median": 0.9999681019485627,
+      "argmin_row": 58,
+      "mean_row_l2_norm_a": 1.6432355719566147,
+      "mean_row_l2_norm_b": 1.6436245676818144
+     },
+     "100-1621": {
+      "rows": 1522,
+      "cos_mean": 0.999953210278381,
+      "cos_min": 0.9953581910102481,
+      "cos_median": 0.9999669229957302,
+      "argmin_row": 947,
+      "mean_row_l2_norm_a": 1.5883962545093921,
+      "mean_row_l2_norm_b": 1.588794371667762
+     }
+    }
+   }
+  },
+  "verdict": {
+   "name": "REFUTED",
+   "line": "REFUTED: HF-fp32 is indistinguishable from HF-bf16 (cos 0.99995585 at rows 200+), so the tower dtype is not the cause and the position-growing gap is ours - cos(C, HF-fp32) 0.899911, cos(C, HF-bf16) 0.899671",
+   "rule": {
+    "confirmed": "mean cos(C, HF-fp32) over rows 200-374 >= mean cos(C, HF-bf16) over the same rows + 0.02  (then HF's bf16 tower is the outlier)",
+    "refuted": "mean cos(HF-fp32, HF-bf16) over rows 200-374 >= 0.9999 and the confirm test fails (then the gap is ours)",
+    "primary_pair": {
+     "fp32": "fp32@cuda",
+     "bf16": "bf16@cuda"
+    }
+   },
+   "inputs": {
+    "cos_c_vs_hf_fp32_tail": 0.899910913139908,
+    "cos_c_vs_hf_bf16_tail": 0.8996713491824253,
+    "cos_hf_fp32_vs_hf_bf16_tail": 0.9999558527932966,
+    "delta_c_fp32_minus_bf16": 0.00023956395748270243
+   }
+  }
  }
 }
