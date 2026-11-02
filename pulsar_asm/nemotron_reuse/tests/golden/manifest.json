@@ -1,0 +1,108 @@
+{
+ "16000": {
+  "F": 321,
+  "T": 1021,
+  "files": {
+   "amp.raw": {
+    "bytes": 1310964,
+    "sha256": "80953cef5c80f839"
+   },
+   "audio.f32": {
+    "bytes": 326400,
+    "sha256": "a44f5b93eca9dc51"
+   },
+   "enhanced.wav": {
+    "bytes": 163244,
+    "sha256": "240870801ff71a2a"
+   },
+   "pha.raw": {
+    "bytes": 1310964,
+    "sha256": "9a30f47252821296"
+   }
+  },
+  "hop": 80,
+  "n_samples": 81600,
+  "nfft": 640,
+  "win": 640
+ },
+ "44100": {
+  "F": 883,
+  "T": 1023,
+  "files": {
+   "amp.raw": {
+    "bytes": 3613236,
+    "sha256": "09638ec67863bb75"
+   },
+   "audio.f32": {
+    "bytes": 899636,
+    "sha256": "f887726a60aa882a"
+   },
+   "enhanced.wav": {
+    "bytes": 449862,
+    "sha256": "11092dad3f865a42"
+   },
+   "pha.raw": {
+    "bytes": 3613236,
+    "sha256": "23081c5f3e07c4f8"
+   }
+  },
+  "hop": 220,
+  "n_samples": 224909,
+  "nfft": 1764,
+  "win": 1764
+ },
+ "48000": {
+  "F": 961,
+  "T": 1020,
+  "files": {
+   "amp.raw": {
+    "bytes": 3920880,
+    "sha256": "b75a8f7e839167ba"
+   },
+   "audio.f32": {
+    "bytes": 979196,
+    "sha256": "e57bc3687b59f0ac"
+   },
+   "enhanced.wav": {
+    "bytes": 489642,
+    "sha256": "5378c74179dc8948"
+   },
+   "pha.raw": {
+    "bytes": 3920880,
+    "sha256": "248da7a2b6e2b592"
+   }
+  },
+  "hop": 240,
+  "n_samples": 244799,
+  "nfft": 1920,
+  "win": 1920
+ },
+ "8000": {
+  "F": 161,
+  "T": 1021,
+  "files": {
+   "amp.raw": {
+    "bytes": 657524,
+    "sha256": "2b9af888be0d96b4"
+   },
+   "audio.f32": {
+    "bytes": 163200,
+    "sha256": "ed2a2e9c8b5a6c48"
+   },
+   "enhanced.wav": {
+    "bytes": 81644,
+    "sha256": "ff7a87aa768c36ca"
+   },
+   "pha.raw": {
+    "bytes": 657524,
+    "sha256": "4f26cf5ce26ecac8"
+   }
+  },
+  "hop": 40,
+  "n_samples": 40800,
+  "nfft": 320,
+  "win": 320
+ },
+ "_blob_sha256": "dab6bd9c3c6344c58c2d9f2ac68664b362ce844fba9479c422e314874d3a60b8",
+ "_note": "Regenerated with a mamba_ssm shim whose parameter names match model.safetensors exactly (load_state_dict reports 0 missing / 0 unexpected). Earlier references in this directory were produced by a shim that nested Mamba params under .mixer, leaving all 30 towers randomly initialized."
+}
