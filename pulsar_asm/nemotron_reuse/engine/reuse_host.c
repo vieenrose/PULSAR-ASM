@@ -45,7 +45,9 @@ int main(int argc, char **argv) {
     reuse_stft_mag_pha(wav, nf, nfft, hop, wsize, mag, pha, F, num_frames);
     float *mag_o = (float*)malloc((size_t)F*num_frames*sizeof(float));
     float *pha_o = (float*)malloc((size_t)F*num_frames*sizeof(float));
-    reuse_forward(&blob, mag, pha, 1, F, num_frames, mag_o, pha_o);
+    // pass through
+    memcpy(mag_o, mag, (size_t)F*num_frames*sizeof(float));
+    memcpy(pha_o, pha, (size_t)F*num_frames*sizeof(float));
     float *out = (float*)calloc((size_t)nf, sizeof(float));
     reuse_istft(mag_o, pha_o, F, num_frames, nfft, hop, wsize, out, nf);
     FILE *fo = fopen(argv[3], "wb");
