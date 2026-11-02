@@ -27,15 +27,15 @@ def stft_mag_pha(x, n_fft, hop_size, win_size, compress_factor='relu_log1p', cen
     phas = []
     for i in range(num_frames):
         start = i * hop_size
-        frame = x[:, start:start + n_fft]
+        frame = x[:, start:start + n_fft]  # [B, n_fft]
         frame = frame * window.unsqueeze(0)
-        real = frame @ W_real
+        real = frame @ W_real  # [B, n_fft]
         imag = frame @ W_imag
         spec = torch.complex(real, imag)
         mag = torch.abs(spec)
         pha = torch.angle(spec)
-        mags.append(mag)
-        phas.append(pha)
+        mags.append(mag[:, :n_fft // 2 + 1])
+        phas.append(pha[:, :n_fft // 2 + 1])
     mag = torch.stack(mags, dim=2)
     pha = torch.stack(phas, dim=2)
     if compress_factor in ['log1p', 'relu_log1p', 'signed_log1p']:
