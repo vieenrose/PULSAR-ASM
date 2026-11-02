@@ -173,3 +173,8 @@ and working:
 
 See [doc/OTHER_ENGINES.md](doc/OTHER_ENGINES.md) and
 [pulsar_arm/bonsai2/README.md](pulsar_arm/bonsai2/README.md).
+
+
+## NemotronLabs RE-USE (Jetson Nano Gen1)
+
+Branch [`nemotron-re-use-jetson-nano`](https://github.com/vieenrose/PULSAR-ASM/tree/nemotron-re-use-jetson-nano) ports [NVIDIA NemotronLabs RE-USE](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE) (9.6M-param Mamba-based speech enhancement) to the Jetson Nano Gen1 with CUDA acceleration. Target RTF < 1.0 at 8/16 kHz. See [`pulsar_asm/nemotron_reuse/README.md`](pulsar_asm/nemotron_reuse/README.md) and [`doc/NEMOTRON_REUSE_NANO_PLAN.md`](doc/NEMOTRON_REUSE_NANO_PLAN.md).
