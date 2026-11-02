@@ -1516,3 +1516,61 @@ not reproducible. `DEFECT_OK=1` = defect-tolerant bars (measured worst x2-3: ene
 5e-3, max abs 2e-2, probes 1e-3/2e-2, budget 5e-03; h2 arms 1e-2/5e-2/budget 1e-02) for
 regression work on the rest of the port, and it prints `** DEFECT-TOLERANT MODE **` so a
 green in that mode is never read as a clean green.
+
+### 31. The defect gets a location and a mechanism class; the warm-up-rep "fix" fails
+
+`LFM_ENC_DUMP_REP=1` writes one dump directory per timed rep, which turns one process
+into a determinism experiment on its own. Four reps of the same pipeline, same process:
+
+```
+layer_00  rep-to-rep max abs vs rep0: 0, 6.47e-05, 6.47e-05, 6.47e-05
+layer_03                                       0, 6.79e-05, ...
+layer_08                                       0, 8.59e-04, 1.97e-02, 8.59e-04
+```
+
+**Rep 0 is not the same computation as reps 1-3**, and reps 1-3 match the C reference
+exactly (`layer_00` max abs 2.38e-06, energy rel 9.61e-07). The differing elements are
+2299 of 38400 in `layer_00`, and they are *all of rows t=35,36,37, every one of the 768
+channels, uniform in c mod 32 and mod 256* -- a whole-input-row perturbation, not a
+channel- or block-indexed one. That localizes the first-order site: some input row of
+layer 0's path (op_norm output `hn`, in_proj input, `hbx`/`hcg`, `hcy`, `hffn` -- the
+per-position chain) is read at positions 35-37 with content this pass did not write.
+`ds_out` and the downsampler are bit-identical everywhere, so it is not in the
+downsampler.
+
+So the mechanism class is settled: **a read of device memory this pass never wrote**, in
+the layer path, amplified by a 17-layer stack (1 ulp at layer 0's input becomes 1e-3
+energy rel at layer 8). Every candidate buffer I could name has been excluded by
+experiment: `dalloc` (zeroed, and NaN-filled -> all stages finite), `Gemm::part` (zeroing
+it makes accuracy WORSE, and `q8_partial`'s guards are complete -- every q/s read sits
+inside `if (row < N)`, `sh[]` is written only under `lane == 0 && row < N`, and the
+write-back is guarded by `tid < R && base + tid < N`, so partial blocks read nothing),
+refused launches (checked per launch, zero in eight runs), and under-filled arenas (the
+loader CRC-verifies every tensor's file bytes and aborts on any cudaMemcpy failure, so
+what the GEMMs consume is what the file said).
+
+**The warm-up pass is not the fix.** `LFM_ENC_REPS=2` across six processes still spreads:
+
+```
+ds_out    cross-run max abs 0.00e+00
+layer_00  cross-run max abs 0.00e+00
+layer_03  cross-run max abs 1.84e-03  energy 5.16e-04
+layer_16  cross-run max abs 1.12e-01  energy 2.62e-03
+proj_out  cross-run max abs 3.54e-03  energy 2.97e-03
+```
+
+Reps 1-3 agree inside a process because they read what rep 0 wrote; across processes the
+steady state moves too, so the stale content comes from outside the encoder's own buffer
+cycle. Layers 0-2 are reproducible (0.00e+00) and the amplification starts at layer 3.
+
+Open next probes, in the order that cheapest rules most out: (1) NaN-fill the device
+pages the *loader* leaves behind (the loader's host-side `buf` is reused across 176
+tensors, so the pages past the last copy are the frontier the encoder's `dalloc` calls
+get); (2) allocate the layer-path buffers once, outside the reps loop, and zero them
+there -- if the spread collapses, the site is one of them and the per-rep `cudaMalloc`
+frontier is the amplifier; (3) single-position bisect: run with T=36 vs T=38 and see
+whether the deviating rows move with T, which distinguishes a fixed-index bug from a
+scheduling-dependent read.
+
+Until then the gate's strict bars stay as they are, and a run the defect touched is
+reported RED on purpose: a result that is not reproducible is not a measurement.

@@ -694,9 +694,14 @@ int main(int argc, char** argv) {
                     + (double)EHID * 4096 * Tt;                // lin_out
   printf("ENCODER total %.2f ms (min of %d) = %.4f s GPU per audio second; downsampler alone %.0f MMAC, %.1f GMAC/s at that rate\n",
          ms, nreps, ms / 1000.0 / (Tm / 100.0), macs / 1e6, macs / (ms * 1e-3) / 1e9);
+  char odir[600]; snprintf(odir, sizeof odir, "%s", argv[4]);
+  const int dumprep = getenv("LFM_ENC_DUMP_REP") ? atoi(getenv("LFM_ENC_DUMP_REP")) : 0;
+  char repdir[640];
   for (int rep = 0; rep < nreps; rep++) {
+  if (dumprep) { snprintf(repdir, sizeof repdir, "%s_r%d", odir, rep); mkdir(repdir, 0755); }
+  const char* OD = dumprep ? repdir : odir;
   cudaEventRecord(ev0);
-  dump(argv[4], "ds_out", ds, (size_t)Tt * EHID);
+  dump(OD, "ds_out", ds, (size_t)Tt * EHID);
 
   // ---------------- the 17 layers ----------------
   // Both layer types are ported: conv blocks (types[L]==0 in lfm3_enc.c) and the
@@ -775,10 +780,10 @@ int main(int argc, char** argv) {
       { static const int pl = getenv("LFM_ENC_PROBE_LAYER") ? atoi(getenv("LFM_ENC_PROBE_LAYER")) : -1;
         if (pl == L) {
           char pp[40];
-          snprintf(pp, sizeof pp, "probe_q_%02d", L); dump(argv[4], pp, hq, (size_t)Tt * ENH * EHD);
-          snprintf(pp, sizeof pp, "probe_k_%02d", L); dump(argv[4], pp, hk, (size_t)Tt * ENKV * EHD);
-          snprintf(pp, sizeof pp, "probe_v_%02d", L); dump(argv[4], pp, hv, (size_t)Tt * ENKV * EHD);
-          snprintf(pp, sizeof pp, "probe_ao_%02d", L); dump(argv[4], pp, hao, (size_t)Tt * ENH * EHD);
+          snprintf(pp, sizeof pp, "probe_q_%02d", L); dump(OD, pp, hq, (size_t)Tt * ENH * EHD);
+          snprintf(pp, sizeof pp, "probe_k_%02d", L); dump(OD, pp, hk, (size_t)Tt * ENKV * EHD);
+          snprintf(pp, sizeof pp, "probe_v_%02d", L); dump(OD, pp, hv, (size_t)Tt * ENKV * EHD);
+          snprintf(pp, sizeof pp, "probe_ao_%02d", L); dump(OD, pp, hao, (size_t)Tt * ENH * EHD);
         } }
       gemm_to(wo, hao, hout, Tt, xb2, "attn out_proj");
       k_add<<<(unsigned)((Tt * EHID + 255) / 256), 256>>>(hout, xr, (size_t)Tt * EHID); chk("res1");
@@ -814,7 +819,7 @@ int main(int argc, char** argv) {
     gemm_to(w2, hffn, hffno, Tt, xb2, "ffn w2");
     k_add<<<(unsigned)((Tt * EHID + 255) / 256), 256>>>(hout, hffno, (size_t)Tt * EHID); chk("res2");
     char ln[32]; snprintf(ln, sizeof ln, "layer_%02d", L);
-    dump(argv[4], ln, hout, (size_t)Tt * EHID);
+    dump(OD, ln, hout, (size_t)Tt * EHID);
     xr = hout; pool_i ^= 1; hout = hpool[pool_i];                      // residual rotates
     nlayer_done++;
     nlay_last = nlayer_done;
@@ -824,7 +829,7 @@ int main(int argc, char** argv) {
     Ent* en = need(M, "encoder.lfm.lfm.embedding_norm.weight");
     cudaMemcpy(hn, xr, (size_t)Tt * EHID * 4, cudaMemcpyDeviceToDevice);
     k_rmsnorm_f32<<<Tt, 256>>>(hn, en->df, EHID); chk("embedding_norm");
-    dump(argv[4], "enc_out", hn, (size_t)Tt * EHID);
+    dump(OD, "enc_out", hn, (size_t)Tt * EHID);
     Ent* pw0 = need(M, "mlp.model.0.weight"), *pb0 = need(M, "mlp.model.0.bias");
     Ent* pw1 = need(M, "mlp.model.1.weight"), *pb1 = need(M, "mlp.model.1.bias");
     Ent* pw3 = need(M, "mlp.model.3.weight"), *pb3 = need(M, "mlp.model.3.bias");
@@ -834,7 +839,7 @@ int main(int argc, char** argv) {
     k_gelu_erf<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, (size_t)Tt * EPROJ); chk("gelu");
     gemm_to(pw3, hp2, hp3, Tt, xb2, "proj lin2");
     k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp3, pb3->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b3");
-    dump(argv[4], "proj_out", hp3, (size_t)Tt * EPROJ);
+    dump(OD, "proj_out", hp3, (size_t)Tt * EPROJ);
   }
   cudaEventRecord(ev1); cudaEventSynchronize(ev1);
   float m1 = 0; cudaEventElapsedTime(&m1, ev0, ev1);
