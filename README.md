@@ -1,4 +1,4 @@
-# PULSAR-ASM: porting LFM3-Audio-2B to a Jetson Nano
+# PULSAR-ASM: Multi-model ports to embedded/edge (Jetson Nano, Raspberry Pi)
 
 **LiquidAI's LFM3-Audio-2B** is a 2 B-parameter speech model: a log-mel front end, a
 17-layer LFM2 audio encoder, a 24-layer LFM3 text backbone (mixed short-conv and
