@@ -215,6 +215,7 @@ static const int g_reps = getenv("LFM_ENC_REPS") ? atoi(getenv("LFM_ENC_REPS")) 
 #include <string>
 static std::map<std::string, double> g_best;
 static std::map<std::string, double> g_last;
+static int g_sync = -2;   // LFM_ENC_SYNC=1 restores per-kernel device syncs (the gate path)
 static void chk(const char* what) {
   if (g_enctime) {                                      // per-stage: syncs, so read the split
     cudaEventRecord(g_sevb); cudaEventSynchronize(g_sevb);
@@ -226,9 +227,27 @@ static void chk(const char* what) {
   }
   cudaError_t e = cudaGetLastError();
   if (e) { printf("LAUNCH ERROR at %s: %s\n", what, cudaGetErrorString(e)); exit(1); }
+  // The per-kernel cudaDeviceSynchronize is a DEBUG feature and it was the encoder's
+  // dominant cost: with ~200 chk() sites per pass, the 129.7 s clip's layer loop took
+  // 67.5 s of process wall against 1.63 s of GPU time (measured; pooling the partial
+  // buffer changed it by 1 s, so it is not the allocator). Each sync forces the Jetson
+  // GPU through an idle<->busy transition, which is exactly the devfreq cost this project
+  // measures elsewhere and hides behind min-of-N. Launch refusals are still caught here,
+  // cheaply, by cudaGetLastError(); async EXEC faults are caught by the single sync at
+  // the end of main (chk_final). The gate sets LFM_ENC_SYNC=1 to keep per-stage syncs.
+  if (g_sync == -2) g_sync = getenv("LFM_ENC_SYNC") ? atoi(getenv("LFM_ENC_SYNC")) : 0;
+  if (g_sync) {
+    cudaDeviceSynchronize();
+    e = cudaGetLastError();
+    if (e) { printf("EXEC ERROR at %s: %s\n", what, cudaGetErrorString(e)); exit(1); }
+  }
+}
+// One sync for the whole process: an async fault that no cudaGetLastError() at launch
+// time could see has to be caught before any number this tool prints is believed.
+static void chk_final(const char* what) {
   cudaDeviceSynchronize();
-  e = cudaGetLastError();
-  if (e) { printf("EXEC ERROR at %s: %s\n", what, cudaGetErrorString(e)); exit(1); }
+  cudaError_t e = cudaGetLastError();
+  if (e) { printf("EXEC ERROR (final, at %s): %s\n", what, cudaGetErrorString(e)); exit(1); }
 }
 
 // ---------------------------------------------------------------- GEMM
@@ -296,11 +315,30 @@ struct Gemm {
   const int8_t* q; const float* s; const float* wf;   // wf != null = f32 weights
   int N, K, KC, nb, nch, R, nblk, nblk256;
   float* part;                      // [T][N][nch] partials
+  bool pooled;                      // part came from the process-wide pool
 };
+// The partial buffer is allocated ONCE and reused, grow-only. Per-GEMM
+// cudaMalloc/cudaMemset/cudaFree of an 11 MB buffer, ~100 times per pass, was measured
+// at 68.5 s of the encoder's 75.1 s process wall for a 129.7 s clip, against 1.63 s of
+// GPU time: on Tegra the allocations are nvmap operations, so the layer loop was paying
+// tens of seconds of allocator work that never shows up in a kernel timer. This is the
+// same thing the backbone already does with M.part.
+static float* g_part_buf = nullptr;
+static size_t g_part_cap = 0;
+static float* part_get(size_t nfloats) {
+  if (nfloats <= g_part_cap) return g_part_buf;
+  if (g_part_buf) { cudaFree(g_part_buf); g_part_buf = nullptr; g_part_cap = 0; }
+  if (cudaMalloc(&g_part_buf, nfloats * 4)) {
+    printf("gemm part cudaMalloc %.1f MB failed\n", nfloats * 4 / 1e6); exit(2);
+  }
+  g_part_cap = nfloats;
+  return g_part_buf;
+}
+static void gemm_release(Gemm& g) { if (g.part && !g.pooled) cudaFree(g.part); g.part = nullptr; }
 static void gemm_setup_f32(Gemm& g, const float* wf, int N, int K, int T) {
   g.q = nullptr; g.s = nullptr; g.wf = wf; g.N = N; g.K = K;
   g.KC = K; g.nb = K / Q8_BLK; g.nch = 1; g.R = 256; g.nblk = 0; g.nblk256 = 0;
-  g.part = nullptr;                                  // the SGEMM writes y directly
+  g.part = nullptr; g.pooled = false;                // the SGEMM writes y directly
   if (K % Q8_BLK) { printf("f32 GEMM needs K a multiple of 32 (K=%d)\n", K); exit(2); }
 }
 static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, int T, int h2, int CT) {
@@ -317,18 +355,17 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
   g.R = 256;                        // the fp32 per-position arm
   g.nblk = ((N + g.R - 1) / g.R) * g.nch;
   g.nblk256 = g.nblk;               // the batched h2 arm also runs R=256
-  const cudaError_t pe = cudaMalloc(&g.part, (size_t)T * N * g.nch * 4);
-  if (pe) { printf("gemm part cudaMalloc %.1f MB failed: %s (N=%d K=%d T=%d nch=%d)\n",
-                   (size_t)T * N * g.nch * 4 / 1e6, cudaGetErrorString(pe), N, K, T, g.nch); exit(2); }
-  if (cudaMemset(g.part, g_poison ? 0xff : 0, (size_t)T * N * g.nch * 4)) { printf("memset part\n"); exit(2); }
-  // (re-tested 2026-08 with the per-launch refusal check in place; the first pass of
-  //  this experiment predated that check, so a refused launch was invisible in it.)
-  // NOT zeroed, deliberately, and this is a measured fact rather than a style choice:
+  const size_t need_f = (size_t)T * N * g.nch;
+  g.part = part_get(need_f); g.pooled = true;
+  if (g_poison && cudaMemset(g.part, 0xff, need_f * 4)) { printf("memset part\n"); exit(2); }
+  // NOT zeroed on the shipping path, deliberately, and this is a measured fact rather
+  // than a style choice:
   // zeroing g.part made the encoder WORSE (layer_01 vs the C reference 2.86e-06 -> 2.12e-04,
   // and the run-to-run spread rose from ~1e-4 to 1.7e-3 energy), i.e. the slots the
   // combine kernel reads are all written by this GEMM's launches and zeroing them only
   // destroys what the previous occupant of that memory put there. The encoder's residual
-  // run-to-run spread therefore does NOT come from g.part (see doc section 29).
+  // run-to-run spread therefore does NOT come from g.part (see doc section 29); the
+  // run-to-run spread itself was fixed in section 34 (the k_rmsnorm_f32 barrier).
 }
 // y[T][N] = x[T][K] @ W^T. fp32 path = per-position q8_partial<float> (the fastest
 // measured fp32 arm, run #309); h2 path = batched q8_prefill_h2<bf16,ARM10,RB2>.
@@ -598,7 +635,29 @@ static float* dalloc(size_t n, const char* what) {
   if (cudaMemset(p, g_poison ? 0xff : 0, n * 4)) { printf("memset failed (%s)\n", what); exit(2); }
   return p;
 }
+static int g_nodump = -2;
+// Wall-clock breakdown for the ASR path. The encoder's GPU time is 0.013 s per audio
+// second but its process wall time is ~0.6 s per audio second, and ASR_RT is charged
+// with the wall time, so the difference (blob load, CRC, uploads, teardown) has to be
+// attributable to a phase or it cannot be optimized. LFM_ENC_WALL=1 prints each phase.
+static double g_tw_prev = 0, g_tw_all = 0; static int g_tw_on = -2;
+static void wallmark(const char* what) {
+  if (g_tw_on == -2) g_tw_on = getenv("LFM_ENC_WALL") ? atoi(getenv("LFM_ENC_WALL")) : 0;
+  if (!g_tw_on) return;
+  struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+  const double now = t.tv_sec + 1e-9 * t.tv_nsec;
+  printf("WALL %-22s %7.2f s (since start %7.2f s)\n", what, now - g_tw_prev, now - g_tw_all);
+  fflush(stdout);
+  g_tw_prev = now;
+}
 static void dump(const char* dir, const char* name, const float* dptr, size_t n) {
+  // LFM_ENC_NODUMP=1 is the shipping path: the 20 stage dumps are the GATE's
+  // instrumentation (~100 MB of device-to-host copies and file writes on a 4 GB Tegra
+  // with eMMC), and leaving them in an ASR_RT measurement charges the gate's cost to the
+  // product. The dump's non-zero plausibility check is also skipped, so this is for
+  // timing runs only -- a gate run must never set it.
+  if (g_nodump == -2) g_nodump = getenv("LFM_ENC_NODUMP") ? atoi(getenv("LFM_ENC_NODUMP")) : 0;
+  if (g_nodump) return;
   std::vector<float> h(n);
   cudaMemcpy(h.data(), dptr, n * 4, cudaMemcpyDeviceToHost);
   char path[512]; snprintf(path, sizeof path, "%s/%s.bin", dir, name);
@@ -630,8 +689,10 @@ int main(int argc, char** argv) {
   // this board leaves free, and the gate below refuses before any kernel runs if not.
   if (Tm < 8 || Tm > 32768) { printf("Tm out of range: %d (8..32768 mel frames = 0.08..327.7 s)\n", Tm); return 2; }
   mkdir(argv[4], 0777);
+  { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g_tw_all = g_tw_prev = t.tv_sec + 1e-9 * t.tv_nsec; }
   Model M; std::string js;
   if (!load_blob(argv[1], M, js)) return 1;
+  wallmark("blob read+CRC+upload");
   { const char* pz = getenv("LFM_ENC_POISON_ARENA");        // hunt, not a shipping path
     if (pz && atoi(pz)) {
       if (M.df && M.need_f) cudaMemset(M.df, 0xff, M.need_f);
@@ -645,6 +706,7 @@ int main(int argc, char** argv) {
   if (read(fd, &hfeat[0], hfeat.size() * 4) != (ssize_t)(hfeat.size() * 4)) { printf("input short\n"); return 2; }
   close(fd);
   for (size_t i = 0; i < hfeat.size(); i++) if (!isfinite(hfeat[i])) { printf("input non-finite at %zu\n", i); return 2; }
+  wallmark("mel read+validated");
 
   const int EH1 = 64, EWo1 = (Tm + 2 - 3) / 2 + 1;
   const int EH2 = 32, EWo2 = (EWo1 + 2 - 3) / 2 + 1;
@@ -706,7 +768,7 @@ int main(int argc, char** argv) {
     else gemm_setup(g, w_lmid->dq, w_lmid->ds, 256, 256, P2, 1, 4);
     printf("  lin_mid N=%d K=%d T=%d %s weights\n", g.N, g.K, P2, g.wf ? "f32" : "Q8");
     gemm_run(g, perm, x2b, P2, g_ench2 ? (bf16*)xb : nullptr);
-    cudaFree(g.part);
+    gemm_release(g);
     k_bias_silu<<<(unsigned)((n2 + 255) / 256), 256>>>(x2b, b_lmid->df, n2, 256, 1); }
   chk("lin_mid gemm");
   // 4) conv_end (depthwise) on the CHW view of x2b
@@ -720,7 +782,7 @@ int main(int argc, char** argv) {
     if (w_lend->dtype == 2) gemm_setup_f32(g, w_lend->df, 256, 256, P3);
     else gemm_setup(g, w_lend->dq, w_lend->ds, 256, 256, P3, 1, 4);
     gemm_run(g, x2b, x3b, P3, g_ench2 ? (bf16*)xb : nullptr);
-    cudaFree(g.part);
+    gemm_release(g);
     k_bias_silu<<<(unsigned)((n3 + 255) / 256), 256>>>(x3b, b_lend->df, n3, 256, 1); }
   chk("lin_end gemm");
   // 6) flatten(1,2) -> (Tt, 4096)
@@ -730,7 +792,7 @@ int main(int argc, char** argv) {
   { Gemm g; if (w_out->dtype != 1) { printf("lin_out must be Q8\n"); return 2; }
     gemm_setup(g, w_out->dq, w_out->ds, EHID, 4096, Tt, 1, 4);
     gemm_run(g, flat, ds, Tt, g_ench2 ? (bf16*)xb : nullptr);
-    cudaFree(g.part);
+    gemm_release(g);
     k_bias_silu<<<(unsigned)((Tt * EHID + 255) / 256), 256>>>(ds, b_out->df, (size_t)Tt * EHID, EHID, 0); }
   chk("lin_out");
 
@@ -791,7 +853,7 @@ int main(int argc, char** argv) {
     if (cudaMalloc(&xb2, n * 2)) { printf("OOM xb2\n"); return 2; }
   }
   int nlayer_done = 0;
-  for (int L = 0; L < ENLAYER; L++) {
+    for (int L = 0; L < ENLAYER; L++) {
     char nm[160];
     snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.operator_norm.weight", L);
     Ent* opn = need(M, nm);
@@ -884,6 +946,7 @@ int main(int argc, char** argv) {
     Ent* pw0 = need(M, "mlp.model.0.weight"), *pb0 = need(M, "mlp.model.0.bias");
     Ent* pw1 = need(M, "mlp.model.1.weight"), *pb1 = need(M, "mlp.model.1.bias");
     Ent* pw3 = need(M, "mlp.model.3.weight"), *pb3 = need(M, "mlp.model.3.bias");
+    wallmark("17 layers");
     k_layernorm_f32<<<Tt, 256>>>(hn, pw0->df, pb0->df, hp1); chk("proj ln");
     gemm_to(pw1, hp1, hp2, Tt, xb2, "proj lin1");
     k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, pb1->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b1");
@@ -901,5 +964,8 @@ int main(int argc, char** argv) {
   if (g_enctime) for (std::map<std::string,double>::iterator it = g_best.begin(); it != g_best.end(); ++it)
     printf("  stage %-14s %8.2f ms (min of %d)\n", it->first.c_str(), it->second, nreps);
   printf("FM3_ENC_GPU_DONE Tm=%d Tt=%d\n", Tm, Tt);
+  chk_final("end of pass");
+  fflush(stdout);
+  wallmark("layers+projector+dumps");
   return 0;
 }

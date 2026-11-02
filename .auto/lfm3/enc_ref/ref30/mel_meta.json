@@ -1,0 +1,17 @@
+{
+ "fixture_sha256": "840083b5d2d17d74a3880de995686310dfc21d8cb73aea0deb786dbbf885bd52",
+ "clip_samples": 480000,
+ "clip_seconds": 30.0,
+ "mel_shape": [
+  1,
+  128,
+  2999
+ ],
+ "mel_frames": 2999,
+ "mel_dtype": "torch.float32",
+ "feature_extractor": "Lfm3AudioFeatureExtractor",
+ "feature_attention_mask_ones": 2999,
+ "num_frames_formula": 2999,
+ "num_encoder_tokens_formula": 375,
+ "mel_seconds": 0.1
+}

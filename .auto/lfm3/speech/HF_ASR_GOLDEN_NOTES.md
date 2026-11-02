@@ -91,6 +91,110 @@ the fp32 numpy reference at `Tm=2999` vs HF: if an independent fp32 implementati
 the same 0.92, then HF's bf16 tower is the outlier and the encoder's acceptance gate is
 end-to-end (speech in -> greedy text vs this golden), not embedding-level.
 
+**Status of this hypothesis: tested and REFUTED on 2026-11-02 — see "The fp32 tower test"
+below. Read that section before spending anything more on the bf16 theory.**
+
+## The fp32 tower test (2026-11-02): the bf16 hypothesis is REFUTED
+
+Run by `.auto/lfm3/hf_asr_tower_fp32.py` (`--verify --write-json`); the numbers below are the
+json's `tower_fp32_test` block. HF's own audio tower — `model.model.get_audio_features
+(input_features, feature_attention_mask)`, the golden's entry point — was run on the committed
+fixture on the host GPU, and the fp32 dtype was **asserted at run time**, not assumed: all 178
+tensors of `model.model.audio_encoder` + `model.model.audio_projector` (461,112,960 bytes) are
+`torch.float32`, forward hooks over every module in the tower saw only `torch.float32` inputs and
+outputs, and `get_audio_features` returned `torch.float32`. Loader: `from_pretrained(dtype=torch
+.float32)` (the golden's loader) plus an explicit `.to(device, dtype=torch.float32)` on the two
+tower submodules. TF32 pinned off (`cudnn/matmul.allow_tf32 = False`), so the fp32 arms are fp32.
+torch 2.6.0+cu124, transformers 5.21.0, device `cuda:0` ("NVIDIA Graphics Device", sm_86; GPU idle,
+0 % util, no compute processes). fp32@cuda full clip 0.542 s, bf16@cuda 0.252 s, fp32@cpu full
+2.113 s warm / 14.6 s cold.
+
+### First: the committed golden matrix is not bf16
+
+`hf_audio_embeddings_1622x2048.f32` records its own provenance: `source_torch_dtype =
+torch.float32`, `cast_applied = false`, `model_dtype = torch.float32`, `produced_on_device = cpu`
+— HF's `from_pretrained(dtype=torch.float32)` path. The comparison the hypothesis needs
+(HF-bf16 vs HF-fp32) therefore cannot be made against that file; a fresh bf16 arm had to be run.
+
+| arm (full fixture, 1622 x 2048) | vs the committed golden: per-row cos | mean row L2 |
+|---|---|---|
+| **HF fp32 @ cuda** | mean **1.000000**, min **1.000000** (0-2, 3-20, 21-99, 100-1621 all 1.000000) | 1.602803 (golden 1.602803) |
+| HF bf16 @ cuda (new control arm) | mean 0.999954, min 0.995358 (worst row 947) | 1.603269 |
+| HF fp32 @ cpu (device check) | mean 1.000000, min 0.999999 | 1.602836 |
+
+So the fp32 rerun reproduces the committed matrix **exactly** (cos = 1.0 at every position, mean
+row L2 equal to 6 decimals): the golden was already fp32. The genuine bf16 arm differs from it by
+5e-5 mean / 4.6e-3 worst, and that gap does **not** grow with position (rows 200-374: 0.999962).
+The bf16 control's weights are the checkpoint's own bf16 bytes — 176 tower parameters, max
+bf16 round-trip error 0.0; the 2 excluded tensors are the computed rotary `inv_freq` buffers.
+
+### The decisive number: the C reference (30 s sub-clip, 375 rows) vs each arm
+
+`picard@100.84.151.116:/home/picard/lfm3/c30/proj_out`, sha256
+`dfb90c9c1af7eec8f6adef966768ad37213e7a73edf1d4e7e604d830d5b76800`, 375 x 2048 raw f32 = the
+fixture's first 30.000 s (480,000 samples -> 2999 mel frames -> ceil(2999/8) = 375 tokens, the
+checkpoint's own formulas; a shift scan k = -2..+2 peaks at k = 0 with 0.66/0.59 neighbours).
+Per-row cosine mean (min), and mean row L2 per side:
+
+| rows | cos(C, **HF fp32**) | cos(C, HF bf16) | cos(C, golden file) | L2 C | L2 HF fp32 |
+|---|---|---|---|---|---|
+| 0-2 | 0.999958 (0.999930) | 0.999952 (0.999919) | 0.999958 (0.999930) | 6.5053 | 6.5003 |
+| 3-20 | 0.999805 (0.999754) | 0.999767 (0.999716) | 0.999805 (0.999754) | 1.8282 | 1.8273 |
+| 21-99 | 0.975337 (0.893397) | 0.975278 (0.893218) | 0.975337 (0.893397) | 1.5954 | 1.6432 |
+| 100-199 | 0.939615 (0.807956) | 0.939690 (0.807393) | 0.939615 (0.807955) | 1.4311 | 1.5968 |
+| 200-299 | 0.909779 (0.748016) | 0.909375 (0.717749) | 0.909779 (0.748015) | 1.3435 | 1.5716 |
+| 300-374 | 0.886754 (0.752505) | 0.886734 (0.752134) | 0.877327 (0.189370) | 1.2841 | 1.6078 |
+| all 375 | 0.931984 (min 0.748016) | 0.931878 (min 0.717749) | 0.930098 (min 0.189370) | 1.4726 | 1.6523 |
+
+**VERDICT (one line): REFUTED — HF-fp32 is indistinguishable from HF-bf16 (cos 0.99995585 at rows
+200+), so HF's tower precision is not the outlier - the position-growing gap is not a rounding
+artifact on HF's side (cos(C, HF-fp32) 0.899911, cos(C, HF-bf16) 0.899671, delta +0.00024).**
+Rule, recorded in the json: CONFIRMED needs cos(C, fp32) >= cos(C, bf16) + 0.02 at rows 200-374;
+REFUTED is cos(fp32, bf16) >= 0.9999 there and the confirm test failing. Both arms ran on the same
+device, same mel frames, same fixture bytes (sha256 `840083b5...`, matches the manifest). The json
+also records what the test does *not* establish: all three HF arms sit on one side of the gap, so
+naming the deviating side needs an independent arbiter, not more precision on either side.
+
+### What the numbers point at
+
+* It is not HF's precision: fp32 == bf16 == the golden to 5e-5, and the C gap is identical for all
+  three. Rounding is out; what is left is a math-level difference between HF's tower and our
+  spec re-derivation, and it accumulates with position.
+* The signature is a **growing attenuation in our proj_out**: our mean row L2 falls with position
+  (1.5954 -> 1.4311 -> 1.3435 -> 1.2841 over buckets 21-99 / 100-199 / 200-299 / 300-374, a 20 %
+  drop) while HF's is flat (1.6432 -> 1.5968 -> 1.5716 -> 1.6078). This is the same shape as the
+  engine's 1.2791 mean row L2 in the table above vs HF's 1.6028, now resolved per row. Rows 0-20
+  agree to 5e-4, so whatever causes it accumulates over position — the encoder's own attention/conv
+  state as the sequence grows (the encoder is a 17-layer causal LFM with sliding window 32), not
+  the projector and not the mel front end, which are position-independent.
+* The `rows 300+` min in the table above is a **sub-clip boundary row**, not evidence. HF's own 30 s
+  run equals rows 0..374 of its own full run at cos 1.000000 for rows 0-299, and 0.988935 (min
+  0.170102) for rows 300-374: row 374 is a partial stride-8 window at the clip edge. Compare a
+  sub-clip reference against a sub-clip HF run (as this table does), never against the full-clip
+  file's last rows — that is where the 0.189370 in `c_ref_vs_golden_matrix_rows_0_374` comes from.
+* Consequence for the acceptance gate: embedding-level agreement is the wrong bar for long clips.
+  The encoder's gate stays end-to-end (speech in -> greedy text vs this golden); the embedding
+  comparison is a diagnostic, and the open item is now our encoder's position-growing norm/energy
+  decay, measured against HF's fp32 matrix (sha256 `b03b229d677695c8...` for the fp32@cuda arm,
+  which is bit-equal to the committed file).
+
+### What this changes in the record (and what it does not)
+
+`doc/LFM3_PORT_STAGES.md` §36 (commit `b96fde5`, "the embedding gap is HF's bf16 tower, not the
+encoder") argued from three-way agreement — our Q8 C, our unquantized fp32 numpy spec, both
+0.877x vs HF at rows 300-375 — that the effect must sit on HF's side, and named the mechanism as
+"HF's tower is bf16, and bf16 rounding accumulates exactly the way this curve does". **That
+mechanism is now measured out.** The curve is unchanged when HF's tower runs in fp32, so it is not
+bf16 rounding, and the §36 numbers reproduce exactly in this table (rows 300-374: 0.8773 against
+the committed file, 0.8868 against HF's own 30 s run). What survives §36 is the observation, not
+the attribution: our two implementations agree with each other to 0.9997 at every position, and
+depart from HF identically — which is consistent with "HF deviates" and equally with "the shared
+§22 spec re-derivation deviates", since both of ours come from that same re-derivation. Naming the
+deviating side needs a new arbiter, not more precision on either side. The transcript gate
+(`WAV -> text` vs this golden) is the one that does not depend on settling it, which is the
+consequence §36 already drew.
+
+
 ## What this golden does NOT certify
 
 The fixture is a **gTTS-synthesized voice** (see `manifest.json`): it measures timing and

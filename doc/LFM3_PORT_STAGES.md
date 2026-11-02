@@ -1785,3 +1785,65 @@ Consequences, stated as decisions:
 * The remaining external arbiter for the audio path is the transcript: `WAV -> text`
   against `speech/hf_asr_golden.json`, which the `--audio-emb` prefill override now makes
   runnable.
+
+### 37. First end-to-end speech->text, and the encoder's wall is launch-bound
+
+`.auto/lfm3/checks_asr.py` runs the whole chain from a fresh build on the Nano and grades
+the greedy token stream against the HF golden (never the authored transcript -- HF's own
+WER on this fixture is 36%, so grading against it would measure HF):
+
+```
+wav 3.1s | mel 7.8s -> 12971 frames | encoder -> proj_out rows 1622 (HF's law: 1622)
+AUDIO-EMB armed: 1622 rows x 2048, overriding prompt positions 15..1636 (13.3 MB)
+AUDIO-EMB fed 1622 of 1622 rows
+greedy prefix vs HF golden: 126 / 262 tokens
+  first divergence at index 126: engine id 20, HF id 22   (inside a numeral: "...at 3.4 degrees")
+  engine text : 'The weather service issued its seasonal outlook on the 9th of March, and
+                 the numbers were unusual. In the nort'
+  HF golden   : 'The weather service issued its seasonal outlook on the 9th of March, and
+                 the numbers were unusual. In the nort'
+ASR_RT = 3.866   (prefill+decode 3.160, front end 0.706)
+```
+
+126 identical tokens is a coherent ~90-word transcription, and the divergence is at a
+numeral, which is the hardest class of token in the fixture by design. The gate's bar is
+deliberately a floor (prefix >= 20, plus rows/Tm/proof-line checks): a bar invented before
+the first measurement is a guess with a gate attached. The prompt ids come from
+`.auto/lfm3/asr_prompt_ids.py`, which rebuilds HF's prompt from the golden's head+tail
+splice, checks the sha256, and *expands the single `<|audio|>` placeholder into 1622
+copies* of `audio_token_id=125031` -- the count, contiguity and position checks are all
+enforced, because an id list one token off shifts every audio embedding.
+
+`ASR_RT 3.866` is 2x my §33 decomposition (1.889), and the difference is **wall-clock vs
+kernel time in the encoder**. With `LFM_ENC_WALL=1`:
+
+```
+WALL blob read+CRC+upload      5.75 s
+WALL mel read+validated        0.05 s
+WALL 17 layers                61.52 s        <--  ENCODER total GPU = 1.68 s
+WALL layers+projector+dumps     1.11 s
+```
+
+Two hypotheses tested and rejected, then the answer:
+* **gate dumps** (103 MB of device-to-host + eMMC writes): 80.4 -> 76.5 s, i.e. 3.9 s.
+* **allocator churn** (per-GEMM `cudaMalloc`/`cudaMemset`/`cudaFree` of an 11 MB partial
+  buffer, ~100 per pass): pooling it into a grow-only pool changed the layer loop by 1 s.
+* **per-kernel `cudaDeviceSynchronize()`** in `chk()` (~200 sites): gating it behind
+  `LFM_ENC_SYNC=1` took 67.5 -> 61.5 s. Real, small.
+* **the remaining 61.5 s is launch count**: `gemm_run`'s fp32 path is
+  `for (t = 0; t < T; t++) q8_partial<float><<<...>>>` -- **one launch per position per
+  GEMM**. At Tt=1622 and ~100 Q8 GEMMs per pass that is ~162,000 launches, each with its
+  immediate `cudaGetLastError()` check: 0.38 ms each, host-side, and invisible to every
+  GPU timer in the project. The 4 s fixture (Tt=50) hides it: 5,000 launches.
+
+The fix is already validated: run #307 measured the batched fp32 arm
+`q8_prefill_h2<float, CT=4, ARM5, GRP=2>` as **bit-identical** to the per-position arm at
+4.6 vs 10.4 GMAC/s. It cuts launches 4x (162k -> 40k): GPU 1.68 -> ~3.7 s, host 61 -> ~15 s,
+encoder wall ~22 s = 0.17 s per audio second, and ASR_RT 3.87 -> ~3.3. The half2 arm is
+not the answer (it changes numerics and §29 showed it is not faster).
+
+Kept from this round as instrumentation, all env-gated and inert by default:
+`LFM_ENC_NODUMP=1` (shipping path, skips the gate's dumps), `LFM_ENC_WALL=1` (phase
+breakdown), `LFM_ENC_SYNC=1` (per-kernel syncs, what the accuracy gate uses), the pooled
+grow-only partial buffer, and `chk_final()` -- one process-wide sync so an async fault is
+still always caught when per-kernel syncs are off.
