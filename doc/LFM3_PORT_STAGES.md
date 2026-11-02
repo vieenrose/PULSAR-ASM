@@ -2195,3 +2195,21 @@ x-layout item -- the engine reads `x + row*K` (position-first) for `ffn.w2` (N=2
 K=7680) while the other nine GEMVs prefer layer-first, and the earlier layer-first
 attempt produced "top-1 matched by tie luck, top-5 garbage" (lines 1276-1286). That is
 why it is a contract decision and not a flag.
+
+### 47. ASR_RT as the gate now reports it
+
+```
+prefill  178.8 s (1.38) = 1642 prompt ids x 108.87 ms
+decode    28.5 s (0.22) = 262 generated tokens x 108.87 ms
+startup   82.0 s (0.63) = one-time blob load
+wav 4.0 + mel 8.6 + encoder 47.3 + engine 291.5 (untraced; traced run was 441.3) = 351.3 s
+ASR_RT_TIMED = 2.708        warm ASR_RT excluding the one-time startup = 2.076
+```
+
+accuracy on the same run is unchanged: prefix 207, all-position match 260/262,
+token-WER 0.008, EMB cos 0.999774, `ASR_GATE PASS`.
+
+Distance to the bar, term by term: prefill 1.38 -> ~0.35 with true CT=4 batching (the `w2`
+item), startup 0.63 -> ~0 in a resident process, decode 0.22 is at the ceiling, front end
+0.46 is mel 0.066 + encoder 0.365 (GPU 0.0125) + wav 0.031 + process launches. Floor
+~1.0-1.1, so `ASR_RT <= 1.00` is at the edge of reachability, not out of it.

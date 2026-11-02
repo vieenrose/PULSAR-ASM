@@ -257,8 +257,9 @@ def main():
         print("  TOTAL with the untraced engine wall = %.1f s -> ASR_RT_TIMED = %.3f"
               % (tot, tot / audio_sec))
         print("  warm ASR_RT excluding the one-time startup = %.3f" % ((tot - startup_s) / audio_sec))
-    print("  wav %.1f + mel %.1f + encoder %.1f + engine %.1f = %.1f s for %.1f s of audio"
-          % (t_wav, t_mel, t_enc, t_eng, tot, audio_sec))
+    print("  wav %.1f + mel %.1f + encoder %.1f + engine %.1f (untraced; traced run was "
+          "%.1f) = %.1f s for %.1f s of audio"
+          % (t_wav, t_mel, t_enc, t_eng_timed, t_eng, tot, audio_sec))
     print("  ASR_RT = %.3f  (prefill+decode %.3f, front end %.3f)"
           % (tot / audio_sec, t_eng / audio_sec, (t_wav + t_mel + t_enc) / audio_sec))
     ok = pref >= MIN_PREFIX
