@@ -8,4 +8,4 @@ if ! command -v nvcc >/dev/null 2>&1; then
   echo "nvcc not found"
   exit 1
 fi
-nvcc -O3 -arch=sm_53 -std=c++11 -lineinfo reuse.cu reuse_host.c blob.c wav_io.c -lm -o reuse_nano 2>&1 | tail -60
+nvcc -O3 -arch=sm_53 -std=c++11 -lineinfo reuse.cu stft_dft.cu conv2d_dft.cu instancenorm.cu mamba_scan.cu reuse_host.c blob.c wav_io.c -lm -o reuse_nano 2>&1 | tail -80
