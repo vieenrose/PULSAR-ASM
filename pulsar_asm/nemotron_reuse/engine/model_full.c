@@ -98,3 +98,9 @@ void reuse_forward(const reuse_blob_t *blob, const float *mag_in, const float *p
     memcpy(out_pha, pha_in, (size_t)B*F_in*T_in*sizeof(float));
     free(xm);
 }
+
+// Minimal TFMamba block implementation
+static void mamba_block_forward(const reuse_blob_t *blob, float *x, int B, int T, int F, int hid, int block_idx) {
+    // x is [B,C,T,F] layout not quite - will handle in reshape
+    (void)blob; (void)x; (void)B; (void)T; (void)F; (void)hid; (void)block_idx;
+}
