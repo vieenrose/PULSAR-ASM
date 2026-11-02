@@ -42,12 +42,35 @@ int main(int argc, char **argv) {
     printf("nfft=%d hop=%d F=%d num_frames=%d\n", nfft, hop, F, num_frames);
     float *mag = (float*)malloc((size_t)F*num_frames*sizeof(float));
     float *pha = (float*)malloc((size_t)F*num_frames*sizeof(float));
-    reuse_stft_mag_pha(wav, nf, nfft, hop, wsize, mag, pha, F, num_frames);
+    const char *mfp = getenv("REUSE_MAG"), *pfp = getenv("REUSE_PHA");
+    if (mfp && pfp) {
+        FILE *f = fopen(mfp, "rb");
+        if (fread(mag, sizeof(float), (size_t)F*num_frames, f) != (size_t)F*num_frames) { printf("mag short\n"); return 1; }
+        fclose(f);
+        f = fopen(pfp, "rb");
+        if (fread(pha, sizeof(float), (size_t)F*num_frames, f) != (size_t)F*num_frames) { printf("pha short\n"); return 1; }
+        fclose(f);
+        printf("stft loaded from %s\n", mfp);
+    } else {
+        reuse_stft_mag_pha(wav, nf, nfft, hop, wsize, mag, pha, F, num_frames);
+    }
+    const char *dip = getenv("REUSE_DUMP_INPHA");
+    if (dip) { FILE *f = fopen(dip, "wb"); fwrite(pha, sizeof(float), (size_t)F*num_frames, f); fclose(f); }
+    const char *dim = getenv("REUSE_DUMP_INMAG");
+    if (dim) { FILE *f = fopen(dim, "wb"); fwrite(mag, sizeof(float), (size_t)F*num_frames, f); fclose(f); }
     float *mag_o = (float*)malloc((size_t)F*num_frames*sizeof(float));
     float *pha_o = (float*)malloc((size_t)F*num_frames*sizeof(float));
-    // pass through
-    memcpy(mag_o, mag, (size_t)F*num_frames*sizeof(float));
-    memcpy(pha_o, pha, (size_t)F*num_frames*sizeof(float));
+    int full = (argc >= 5 && strcmp(argv[4], "full") == 0);
+    if (full) {
+        reuse_forward(&blob, mag, pha, 1, F, num_frames, mag_o, pha_o);
+    } else {
+        memcpy(mag_o, mag, (size_t)F*num_frames*sizeof(float));
+        memcpy(pha_o, pha, (size_t)F*num_frames*sizeof(float));
+    }
+    const char *dap = getenv("REUSE_DUMP_AMP");
+    if (dap) { FILE *f = fopen(dap, "wb"); fwrite(mag_o, sizeof(float), (size_t)F*num_frames, f); fclose(f); }
+    const char *dpp = getenv("REUSE_DUMP_PHA");
+    if (dpp) { FILE *f = fopen(dpp, "wb"); fwrite(pha_o, sizeof(float), (size_t)F*num_frames, f); fclose(f); }
     float *out = (float*)calloc((size_t)nf, sizeof(float));
     reuse_istft(mag_o, pha_o, F, num_frames, nfft, hop, wsize, out, nf);
     FILE *fo = fopen(argv[3], "wb");
@@ -55,6 +78,8 @@ int main(int argc, char **argv) {
         for (int i=0;i<nf;i++) { short s = (short)fmaxf(-32768.0f, fminf(32767.0f, out[i]*32768.0f)); fwrite(&s,2,1,fo); }
         fclose(fo);
     }
+    const char *drw = getenv("REUSE_DUMP_AUDIO");
+    if (drw) { FILE *f = fopen(drw, "wb"); fwrite(out, sizeof(float), (size_t)nf, f); fclose(f); }
     free(mag); free(pha); free(mag_o); free(pha_o); free(wav); free(out);
     reuse_blob_free(&blob);
     return 0;

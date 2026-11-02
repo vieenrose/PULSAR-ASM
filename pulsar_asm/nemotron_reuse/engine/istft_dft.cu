@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <omp.h>
 
 static void build_hann(float *w, int n) {
     for (int i = 0; i < n; i++) {
@@ -22,23 +23,27 @@ void reuse_istft(const float *mag, const float *pha, int F, int num_frames,
     int pad = n_fft / 2;
     memset(out, 0, out_len * sizeof(float));
     float *window_sum = (float *)calloc(out_len, sizeof(float));
+    #pragma omp parallel for schedule(static)
     for (int t = 0; t < num_frames; t++) {
         // inverse DFT
         float frame[4096];
         memset(frame, 0, n_fft * sizeof(float));
+        // Real-valued inverse DFT from the one-sided spectrum: interior bins
+        // carry the conjugate pair and must be counted twice.
         for (int n = 0; n < n_fft; n++) {
-            float re = 0.0f;
+            double re = 0.0;
             for (int k = 0; k < F; k++) {
                 int off = k * num_frames + t;
-                float magv = expf(mag[off]) - 1.0f; // log1p inverse for relu_log1p
-                if (magv < 0.0f) magv = 0.0f;
-                float phav = pha[off];
-                float cv = magv * cosf(phav);
-                float sv = magv * sinf(phav);
-                float ang = 2.0f * (float)M_PI * n * k / (float)n_fft;
-                re += cv * cosf(ang) - sv * sinf(ang);
+                double magv = exp((double)mag[off]) - 1.0; // relu_log1p inverse
+                if (magv < 0.0) magv = 0.0;
+                double phav = (double)pha[off];
+                double cv = magv * cos(phav);
+                double sv = magv * sin(phav);
+                double ang = 2.0 * M_PI * n * k / (double)n_fft;
+                double m = (k == 0 || 2*k == n_fft) ? 1.0 : 2.0;
+                re += m * (cv * cos(ang) - sv * sin(ang));
             }
-            frame[n] = re / (float)n_fft;
+            frame[n] = (float)(re / (double)n_fft);
         }
         int start = t * hop_size - pad;
         for (int n = 0; n < n_fft && n < win_size; n++) {
