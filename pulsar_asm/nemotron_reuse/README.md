@@ -47,3 +47,9 @@ Unlike other PULSAR-ASM ports, bit-exactness vs PyTorch is not required (exp/ata
 - Engine builds and runs on CPU: STFT → (model pass-through) → iSTFT
 - CUDA build script ready for Nano
 - Full model forward pass in progress
+
+## Next steps
+- Implement full model forward pass (encoder, 30×TFMamba, decoders)
+- Wire iSTFT round-trip to match reference
+- Port kernels to CUDA (sm_53)
+- Benchmark RTF on Nano
