@@ -42,3 +42,8 @@ Unlike other PULSAR-ASM ports, bit-exactness vs PyTorch is not required (exp/ata
 - Full pipeline wired: blob → STFT → encoder (dense conv + IN+PReLU + stride conv) → forward → iSTFT
 - CPU engine compiles and runs; outputs generated
 - CUDA build script ready for Nano deployment
+
+## Status (current)
+- Engine builds and runs on CPU: STFT → (model pass-through) → iSTFT
+- CUDA build script ready for Nano
+- Full model forward pass in progress
