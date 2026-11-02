@@ -67,6 +67,7 @@ def complex_rel_rms(mag_r, pha_r, mag_c, pha_c):
 
 
 def main():
+    ran = []
     ap = argparse.ArgumentParser()
     ap.add_argument('--ref', required=True, help='dir with in_mag/in_pha/amp/pha/audio.f32 from ref_full.py')
     ap.add_argument('--c', required=True, help='dir with c_inmag/c_inpha/c_amp/c_pha/c_audio.f32')
@@ -94,6 +95,7 @@ def main():
               % (cr, mode, STAGE_GATE, np.sqrt((d ** 2).mean()), d.max()))
         if mode == 'gate' and cr > STAGE_GATE:
             fails.append('STFT complex rel_rms %.2e > %.0e' % (cr, STAGE_GATE))
+        ran.append('stft')
     else:
         print('[STFT ] skipped (missing input dumps)')
 
@@ -118,6 +120,7 @@ def main():
               % (va, np.sqrt((d ** 2).mean()), d.max()))
         if a.mode == 'model' and vz > STAGE_GATE:
             fails.append('model complex rel_rms %.2e > %.0e' % (vz, STAGE_GATE))
+        ran.append('model')
     else:
         print('[MODEL] skipped (missing amp/pha dumps)')
 
@@ -132,6 +135,7 @@ def main():
         if not gated and s < SNR_GATE:
             print('        NOTE: to separate iSTFT accuracy from STFT conditioning, rerun the')
             print('        engine with REUSE_MAG/REUSE_PHA pointed at the reference STFT.')
+        ran.append('audio')
     else:
         print('[AUDIO] skipped (missing audio)')
 
@@ -140,7 +144,10 @@ def main():
         for f in fails:
             print('  -', f)
         return 1
-    print('GATE PASS')
+    if not ran:
+        print('GATE FAIL: no checks performed (missing dumps - the run did not produce output)')
+        return 1
+    print('GATE PASS (%d checks: %s)' % (len(ran), '+'.join(ran)))
     return 0
 
 

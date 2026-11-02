@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <time.h>
 
@@ -15,7 +16,9 @@ static double g_t_enc=0,g_t_blk=0,g_t_dec=0,g_t_head=0;
 extern "C" void reuse_gpu_get_times(double *enc,double *blk,double *dec,double *head){*enc=g_t_enc;*blk=g_t_blk;*dec=g_t_dec;*head=g_t_head;}
 static double gt_now(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+1e-9*ts.tv_nsec; }
 
+
 #define HID 64
+#define GT 32
 #define DEPTH 4
 #define DINNER 256
 #define DSTATE 16
@@ -58,6 +61,31 @@ extern "C" void reuse_gpu_destroy(reuse_gpu_t *g)
     if (g->ws) cudaFree(g->ws);
     free(g->ents);
     free(g);
+}
+
+static int g_kprof = -1;
+static double g_kp[512]; static const char *g_kpn[512]; static int g_kpc;
+static void kp_mark(const char *name, double *last)
+{
+    if (g_kprof < 0) g_kprof = getenv("REUSE_KPROF") ? 1 : 0;
+    if (!g_kprof) return;
+    cudaDeviceSynchronize();
+    double t = gt_now();
+    if (g_kpc < 512) { g_kpn[g_kpc] = name; g_kp[g_kpc] = t - *last; g_kpc++; }
+    *last = t;
+}
+extern "C" void reuse_gpu_print_kprof(void)
+{
+    if (!g_kprof || !g_kpc) return;
+    double tot = 0;
+    for (int i = 0; i < g_kpc; i++) tot += g_kp[i];
+    fprintf(stderr, "--- per-kernel (accumulated over the run, %d marks, total %.3f s) ---\n", g_kpc, tot);
+    for (int i = 0; i < g_kpc; i++) {
+        if (!g_kpn[i]) continue;
+        double sum = g_kp[i]; int cnt = 1;
+        for (int j = i+1; j < g_kpc; j++) if (g_kpn[j] && strcmp(g_kpn[j], g_kpn[i]) == 0) { sum += g_kp[j]; cnt++; g_kpn[j] = 0; }
+        fprintf(stderr, "  %-18s %8.4f s  %5.1f%%   n=%d  avg %7.5f s\n", g_kpn[i], sum, 100.0*sum/tot, cnt, sum/cnt);
+    }
 }
 
 extern "C" reuse_gpu_t *reuse_gpu_create(const reuse_blob_t *blob)
@@ -338,6 +366,48 @@ __global__ void k_gate_outproj(const float *y, const float *z, const float *W,
     out[st * HID + o] = acc;
 }
 
+
+__global__ void k_out_proj_tiled(const float *y, const float *z, const float *W, float *out,
+                                 int SL)
+{
+    // out[m][o] = sum_k ( y[m][k] * silu(z[m][k]) ) * W[o][k]      (K = DINNER, N = HID)
+    __shared__ float As[GT][GT+4];      // [m][k] = gated y
+    __shared__ float Bs[GT][GT+4];      // [o][k]
+    const int n0 = blockIdx.x * GT, m0 = blockIdx.y * GT;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * GT/2 + tx;                    // block is (16,16) = 256 threads
+    float acc[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) acc[i] = 0.f;
+    for (int k0 = 0; k0 < DINNER; k0 += GT) {
+#pragma unroll
+        for (int t = tid; t < GT*GT; t += 256) {
+            int r = t / GT, c = t % GT;
+            int am = m0 + r, ak = k0 + c;
+            if (am < SL) {
+                long o_ = (long)am*DINNER + ak;
+                As[r][c] = y[o_] * dsilu(z[o_]);
+            } else As[r][c] = 0.f;
+            int bn = n0 + r;
+            Bs[r][c] = (bn < HID) ? W[(long)bn*DINNER + ak] : 0.f;
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int k = 0; k < GT; k++) {
+            float a0 = As[ty*2][k], a1 = As[ty*2+1][k];
+            float b0 = Bs[tx*2][k], b1 = Bs[tx*2+1][k];
+            // acc[i]: m = ty*2 + (i&1), o = tx*2 + (i>>1)   (matches the epilogue)
+            acc[0] += a0*b0; acc[1] += a1*b0; acc[2] += a0*b1; acc[3] += a1*b1;
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int o = n0 + tx*2 + (i >> 1), m = m0 + ty*2 + (i & 1);
+        if (o < HID && m < SL) out[(long)m*HID + o] = acc[i];
+    }
+}
+
 __global__ void k_concat(const float *fw, const float *bw, const float *x,
                          float *cat, int S, int L)
 {
@@ -613,20 +683,38 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     float *y    = wallc(g, (size_t)SL*DINNER);
     if (!x0 || !z || !xc || !xdbl || !dtt || !y) return 1;
     dim3 b1(256);
+    static double klast = 0;
+    if (g_kprof < 0) g_kprof = getenv("REUSE_KPROF") ? 1 : 0;
+    if (g_kprof) { cudaDeviceSynchronize(); klast = gt_now(); }
     int dbg = getenv("GPU_DEBUG") && strncmp(pfx, "TSMamba.0.time_mamba.", 19) == 0;
     char dt[8]; snprintf(dt, sizeof(dt), "%s_", rev ? "bw" : "fw");
         #define GDBG(tag, ptr, n) do { if (dbg) { char t_[32]; snprintf(t_, sizeof(t_), "%s%s", dt, tag); gdump(t_, ptr, n); } } while (0)
     k_in_proj<<<dim3((unsigned)((SL+255)/256), 2*DINNER), b1>>>(x, W_in, x0, z, S, L, rev);
+    kp_mark("in_proj", &klast);
     GDBG("x0", x0, (size_t)SL*DINNER); GDBG("z", z, (size_t)SL*DINNER);
     k_conv_causal<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(x0, W_c, B_c, xc, S, L);
+    kp_mark("conv", &klast);
     GDBG("gxact", xc, (size_t)SL*DINNER);
     k_x_proj<<<dim3((unsigned)((SL+255)/256), XP), b1>>>(xc, W_xp, xdbl, SL);
+    kp_mark("x_proj", &klast);
     GDBG("gxdbl", xdbl, (size_t)SL*XP);
     k_dt_proj<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(xdbl, W_dt, B_dt, dtt, SL);
+    kp_mark("dt_proj", &klast);
     GDBG("gdt", dtt, (size_t)SL*DINNER);
     k_scan<<<dim3((unsigned)S, DINNER/32), 32>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
+    kp_mark("scan", &klast);
     GDBG("gscan", y, (size_t)SL*DINNER);
-    k_gate_outproj<<<dim3((unsigned)((SL+255)/256), HID), b1>>>(y, z, W_op, out, SL);
+    {
+        static int tiled = -1;
+        if (tiled < 0) tiled = getenv("REUSE_NAIVE_OP") ? 0 : 1;
+        if (tiled) {
+            dim3 g((HID+GT-1)/GT, (unsigned)((SL+GT-1)/GT));
+            k_out_proj_tiled<<<g, dim3(GT/2, GT/2)>>>(y, z, W_op, out, (int)SL);
+        } else {
+            k_gate_outproj<<<dim3((unsigned)((SL+255)/256), HID), b1>>>(y, z, W_op, out, SL);
+        }
+    }
+    kp_mark("gate_outproj", &klast);
     GDBG("gout", out, (size_t)SL*HID);
     return reuse_gpu_ok(g, "mamba_dir");
 }
@@ -635,6 +723,9 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
                            int S, int L)
 {
     long SL = (long)S * L;
+    static double klast = 0;
+    if (g_kprof < 0) g_kprof = getenv("REUSE_KPROF") ? 1 : 0;
+    if (g_kprof) { cudaDeviceSynchronize(); klast = gt_now(); }
     float *fw  = wallc(g, (size_t)SL*HID);
     float *bw  = wallc(g, (size_t)SL*HID);
     float *cat = wallc(g, (size_t)SL*2*HID);
@@ -645,6 +736,7 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
     snprintf(p, sizeof(p), "%s.backward_blocks", pfx);
     if (mamba_dir_gpu(g, p, x, bw, S, L, 1)) return 1;
     k_concat<<<(unsigned)((SL+255)/256), 256>>>(fw, bw, x, cat, S, L);
+        kp_mark("concat", &klast);
     char key[256];
     snprintf(key, sizeof(key), "%s.output_proj.weight", pfx); const float *W = reuse_gpu_w(g, key);
     snprintf(key, sizeof(key), "%s.output_proj.bias",   pfx); const float *B = reuse_gpu_w(g, key);
@@ -657,6 +749,10 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
 
 extern "C" int reuse_gpu_tfmamba(reuse_gpu_t *g, int idx, const float *x, float *y, int T, int F)
 {
+    static double klast = 0;
+    if (g_kprof < 0) g_kprof = getenv("REUSE_KPROF") ? 1 : 0;
+    if (g_kprof) { cudaDeviceSynchronize(); klast = gt_now(); }
+
     g->ws_off = 0;
     const int S_t = F, S_f = T;
     float *xt = wallc(g, (size_t)F*T*HID);
@@ -669,9 +765,11 @@ extern "C" int reuse_gpu_tfmamba(reuse_gpu_t *g, int idx, const float *x, float 
     snprintf(p, sizeof(p), "TSMamba.%d.time_mamba", idx);
     if (mamba_block_gpu(g, p, xt, yt, S_t, T)) return 1;
     k_resid_scatter_freq<<<(unsigned)(((long)F*T*HID+255)/256), 256>>>(yt, x, y, xf, T, F);
+        kp_mark("resid_freq", &klast);
     snprintf(p, sizeof(p), "TSMamba.%d.freq_mamba", idx);
     if (mamba_block_gpu(g, p, xf, yf, S_f, F)) return 1;
     k_resid_scatter_out<<<(unsigned)(((long)F*T*HID+255)/256), 256>>>(yf, xf, y, T, F);
+        kp_mark("resid_out", &klast);
     return reuse_gpu_ok(g, "tfmamba");
 }
 

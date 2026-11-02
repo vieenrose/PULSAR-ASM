@@ -106,6 +106,7 @@ int main(int argc, char **argv)
         fclose(fo);
     }
     double audio_s = (double)nf / sr;
+    reuse_gpu_print_kprof();
     double te, tb, td, th; reuse_gpu_get_times(&te, &tb, &td, &th);
     printf("phases: encoder %.3f s | 30xTFMamba %.3f s | decoders %.3f s | heads %.3f s\n", te, tb, td, th);
     printf("=== RTF (model GPU, STFT/iSTFT CPU) ===\n");

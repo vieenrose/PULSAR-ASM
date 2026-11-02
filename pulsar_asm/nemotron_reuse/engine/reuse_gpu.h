@@ -14,6 +14,7 @@ typedef struct reuse_gpu_s reuse_gpu_t;
 reuse_gpu_t *reuse_gpu_create(const reuse_blob_t *blob);
 void         reuse_gpu_destroy(reuse_gpu_t *g);
 void         reuse_gpu_set_skips(void);
+void         reuse_gpu_print_kprof(void);
 void         reuse_gpu_get_times(double *enc, double *blk, double *dec, double *head);
 const float *reuse_gpu_w(reuse_gpu_t *g, const char *name);   // device pointer
 int          reuse_gpu_ok(reuse_gpu_t *g, const char *where); // print+report CUDA errors
