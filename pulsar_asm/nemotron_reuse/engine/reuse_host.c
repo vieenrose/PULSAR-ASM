@@ -59,3 +59,4 @@ int main(int argc, char **argv) {
     reuse_blob_free(&blob);
     return 0;
 }
+#include "model.h"
