@@ -2177,3 +2177,21 @@ from the backbone's TTFT work (109.01 vs 108.27 ms/token on this workload).
 
 The `w2` sign-off is therefore the decision that matters for realtime, and a resident
 process is worth 0.63.
+
+### 46. `LFM_PF_USE=1` is refuted as the ASR prefill lever (measured, not argued)
+
+The engine's existing batched ARM=5 prefill arm (validated bit-exact for T=1 on prompt A
+in run #298, 153/153) was measured on the ASR prompt, graphs off, same board:
+
+```
+PF_USE=0  wall 449.5 s   1906 step lines parsed
+PF_USE=1  TIMED OUT at 1200 s, 56 steps completed   (3% of the run)
+```
+
+So the arm that wins on the 20-id prompt A (where per-launch host overhead dominates)
+loses catastrophically at 1642 prompt ids. It stays opt-in and off. The prefill term
+(1.37 of ASR_RT) needs the real thing: **CT=4 positions per GEMV**, which is the `w2`
+x-layout item -- the engine reads `x + row*K` (position-first) for `ffn.w2` (N=2048,
+K=7680) while the other nine GEMVs prefer layer-first, and the earlier layer-first
+attempt produced "top-1 matched by tie luck, top-5 garbage" (lines 1276-1286). That is
+why it is a contract decision and not a flag.
