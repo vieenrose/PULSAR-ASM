@@ -37,3 +37,8 @@ Unlike other PULSAR-ASM ports, bit-exactness vs PyTorch is not required (exp/ata
 - S3-S5: In progress (kernels + model structure; full forward pass being wired)
 - S6: Driver loads blob/wav, runs pipeline
 - S7-S8: Pending
+
+## Recent progress
+- Full pipeline wired: blob → STFT → encoder (dense conv + IN+PReLU + stride conv) → forward → iSTFT
+- CPU engine compiles and runs; outputs generated
+- CUDA build script ready for Nano deployment
