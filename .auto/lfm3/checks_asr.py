@@ -200,7 +200,26 @@ def main():
         print("  (tokenizer unavailable for the text view: %s)" % e)
 
     tot = t_wav + t_mel + t_enc + t_eng
+    # Phase decomposition, because "ASR_RT = 3.87" as one number hides that most of it is
+    # not the speech pipeline. Measured on this board (see the doc, section 43): the
+    # engine's one-time startup (1.946 GB blob read + upload + setup) is 82.7 s -- timed
+    # separately with a 20-id prompt and --steps 24, which took 85.3 s wall against
+    # 2.6 s of steps -- the step loop is n_steps x steady-state, and whatever is left
+    # inside t_eng is the prompt prefill.
+    ss = re.search(r"steady-state ([\d.]+) ms/token.*?over (\d+) steps", eng)
     print("== ASR_RT ==")
+    if ss:
+        ms_tok, n_st = float(ss.group(1)), int(ss.group(2))
+        decode_s = ms_tok * n_st / 1000.0
+        startup_s = float(os.environ.get("ASR_STARTUP_S", "82.7"))
+        pre_s = t_eng - decode_s - startup_s
+        print("  decode  %6.1f s (%.2f) = %d steps x %.2f ms" %
+              (decode_s, decode_s / audio_sec, n_st, ms_tok))
+        print("  startup %6.1f s (%.2f) = one-time blob load (ASR_STARTUP_S to override)"
+              % (startup_s, startup_s / audio_sec))
+        print("  prefill %6.1f s (%.2f) = remainder of the engine wall over %d prompt ids"
+              % (pre_s, pre_s / audio_sec, n_prompt))
+        print("  warm ASR_RT excluding the one-time startup = %.3f" % ((tot - startup_s) / audio_sec))
     print("  wav %.1f + mel %.1f + encoder %.1f + engine %.1f = %.1f s for %.1f s of audio"
           % (t_wav, t_mel, t_enc, t_eng, tot, audio_sec))
     print("  ASR_RT = %.3f  (prefill+decode %.3f, front end %.3f)"

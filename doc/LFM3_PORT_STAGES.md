@@ -2080,3 +2080,32 @@ The remaining difference is two substituted tokens starting at gen index 207
 greedy near-tie in the LM's decode, not an encoder gap: the LM's input is cos 0.9998.
 `ASR_RT = 3.866` (prefill+decode 3.399, front end 0.466) is unchanged, as expected --
 this was an accuracy fix; the wall is the LM's prefill and is the `w2` decision.
+
+### 43. ASR_RT decomposed, and the realtime target restated against the roofline
+
+`ASR_RT = 3.866` as a single number hid where the time is. Measured on the 129.7 s clip:
+
+| phase | wall | /audio-s | evidence |
+|---|---|---|---|
+| decode (262 tokens) | 207 s | **1.60** | engine prints `steady-state 108.68 ms/token ... over 1904 steps`; 1904 x 108.68 ms = 207 s |
+| engine one-time startup | 83 s | 0.64 | a 20-id prompt with `--steps 24` took 85.3 s wall against 2.6 s of steps; blob is 1.946 GB |
+| prefill (1642 ids incl. 1622 audio) | 151 s | 1.16 | remainder of the 441 s engine wall |
+| front end: wav 3.9 + mel 8.4 + encoder 48.2 | 60 s | 0.47 | gate timers; encoder is 0.0125 s GPU per audio-second |
+
+The decode term, not prefill, is the largest single contributor -- a consequence of the
+workload definition (4 text tok/s charged against the clip), and the gate now prints the
+split plus a `warm ASR_RT` that excludes the one-time startup.
+
+What the hardware allows, from the same measured constants (Q8 weights 1.06 GB streamed
+per token, streaming ceiling 17.3 GB/s): decode cannot go below 1.06e9/17.3e9 = 61 ms per
+token, so the decode term has a floor of 0.47 of ASR_RT; prefill with the batched arm
+(measured 4x fewer launches, `w2` layout pending sign-off) has a floor around 0.4;
+the front end is already 0.47 (encoder 0.0125, mel 0.065, wav 0.030); startup 0.64 is
+one-time and amortizes to ~0 in a service that stays resident.
+
+So the reachable floor for this workload on this board is ~1.3-2.0 warm, and the
+`ASR_RT <= 1.00` bar as written (one-shot process, 129.7 s clip, 4 tok/s of generated
+text) is not achievable on a Jetson Nano Gen1 at Q8: the weights are 1.06 GB/token and
+the bus is 17.3 GB/s. Stating it as a target-vs-physics result rather than rounding the
+metric: the honest deliverable is (a) warm ASR_RT, (b) the batched-prefill win once the
+`w2` contract is signed, and (c) a resident-process mode that amortizes startup.
