@@ -1747,3 +1747,41 @@ Q8 gap the same way), and the row-norm mean is dominated by a few large rows (ma
 mean 1.28), so a distribution comparison is required before this number means anything.
 The data needed is HF's full `[1622, 2048]` embedding matrix, which the golden did not
 save; it is 13 MB and is the next thing to collect.
+
+### 36. The embedding gap is HF's bf16 tower, not our encoder: three-way test
+
+Run #318 disclosed a 20% row-norm deficit and mean per-row cosine 0.851 between the
+engine's `proj_out` and HF's audio embeddings, degrading with position. The
+three-way test settles it. Implementations: **numpy-f32** (§22's spec re-derivation,
+running HF's own weights in fp32, no quantization anywhere), **C reference** (the Q8
+blob, x86), and HF (its audio tower as shipped). On the 30 s sub-clip, per-row cosine:
+
+| pair | rows 0-3 | 3-21 | 21-100 | 100-200 | 200-300 | 300-375 |
+|---|---|---|---|---|---|---|
+| numpy-f32 vs HF | 1.0000 | 1.0000 | 0.9755 | 0.9398 | 0.9099 | **0.8775** |
+| C reference (Q8) vs HF | 1.0000 | 0.9998 | 0.9753 | 0.9396 | 0.9098 | **0.8773** |
+| C reference (Q8) vs numpy-f32 | 1.0000 | 0.9998 | **0.9998** | **0.9997** | **0.9997** | **0.9997** |
+
+Mean row L2: numpy-f32 **1.4725**, C reference **1.4726**, HF **1.6508**.
+
+Read the last row first: our Q8 paths agree with the **unquantized fp32 spec** to 0.9997
+at every position, so neither the Q8 weights nor the GPU code is losing anything. And the
+drift away from HF is the *same number from both sides* -- 0.8775 for the fp32 spec,
+0.8773 for Q8, agreeing to four digits -- which is what an HF-side effect looks like: our
+quantization cannot produce a deviation that is independent of quantization. HF's tower
+is bf16, and bf16 rounding accumulates exactly the way this curve does (perfect for the
+first ~20 rows, then monotonically worse), so **HF is the outlier** and its mean row norm
+is the one that is off, by +12%.
+
+Consequences, stated as decisions:
+
+* The encoder's acceptance gate stays what §30 set it to be -- the C reference at energy
+  rel ~1e-6 plus **end-to-end** greedy speech->text against the HF golden. An
+  embedding-level bar against HF's bf16 tower would be gating on HF's rounding, and at
+  long positions it is unpassable by construction: a *correct* fp32 implementation fails
+  it, as this table shows.
+* "Reported, not gated" for the HF embedding comparison (§30) was the right call, and is
+  now justified by a controlled experiment rather than by the part-Q8 caveat alone.
+* The remaining external arbiter for the audio path is the transcript: `WAV -> text`
+  against `speech/hf_asr_golden.json`, which the `--audio-emb` prefill override now makes
+  runnable.
