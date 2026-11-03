@@ -334,6 +334,29 @@ __global__ void k_combine_bf(const float* __restrict__ part, bf16* __restrict__ 
   for (int c = 0; c < nchunk; c++) acc = __fadd_rn(acc, part[(size_t)r * nchunk + c]);
   out[r] = f2bf(acc);
 }
+
+// The T-wide twin of k_combine_bf: one block-row per (position, output row), reading
+// the POSITION-FIRST partial layout the batched GEMM writes (row of position t, output
+// row r, at part + (t*N + r)*nchunk).
+//
+// k_combine_bf itself has NO T dimension: a single launch over a T-position partial
+// buffer writes position 0 and leaves t>=1 as unwritten memory -- the defect
+// --prefill-chunk caught on its very first run (run log row 332: every shape mismatched
+// at t>=1, unmatched cells holding 0x0000/0x7fff/0xffff). The accumulation is the same
+// __fadd_rn chain over the same nchunk partials, so this is bit-identical to calling
+// k_combine_bf once per position -- and --prefill-chunk exploits that: the batched side
+// uses THIS kernel, the per-position side uses k_combine_bf, so a pass is two
+// independent code paths agreeing bit-for-bit, not one path checked against itself.
+__global__ void k_combine_bf_T(const float* __restrict__ part, bf16* __restrict__ out,
+                               int N, int nchunk, int T) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  const int t = blockIdx.y;
+  if (r >= N || t >= T) return;
+  const size_t base = (size_t)t * N * nchunk;
+  float acc = 0.f;
+  for (int c = 0; c < nchunk; c++) acc = __fadd_rn(acc, part[base + (size_t)r * nchunk + c]);
+  out[(size_t)t * N + r] = f2bf(acc);
+}
 __global__ void k_combine_f(const float* __restrict__ part, float* __restrict__ out,
                             int N, int nchunk) {
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2374,15 +2397,11 @@ static int prefill_chunk_test(Model& M, int Tn) {
     cudaMalloc(&yB, (size_t)Tn * N * 2);       cudaMalloc(&y1, (size_t)Tn * N * 2);
     struct timespec t0, t1; cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t0);
     pf_launch(CT, 5, 1, RPB, e->dq, e->ds, xb2, pB, N, K, KC, R, nb, Tn, nblk, TPBC, shm);
-    // k_combine_bf has NO T dimension: it combines N rows x nch partials, i.e. ONE
-    // position. Launching it once over a T-position partial buffer writes position 0 and
-    // leaves t>=1 as unwritten memory -- which is exactly what this selftest first
-    // reported (first diff at t=1 row=0 on every shape, unmatched cells holding
-    // 0x0000/0x7fff/0xffff). Combining per position is cheap (N*2 bytes each) and keeps
-    // the comparison honest; a real T-wide prefill will want a T-aware combine kernel,
-    // which is a one-line change to this kernel's grid, and this line is the reminder.
-    for (int t = 0; t < Tn; t++)
-      k_combine_bf<<<(N + 255) / 256, 256, 0, g_launch>>>(pB + (size_t)t * N * nch, yB + (size_t)t * N, N, nch);
+    // T-aware combine (k_combine_bf_T, see its comment): the batched side combines all
+    // T positions in ONE launch, the per-position side below uses k_combine_bf T times,
+    // so a BIT-EXACT verdict compares two independent combine paths.
+    dim3 gbat((N + 255) / 256, Tn);
+    k_combine_bf_T<<<gbat, 256, 0, g_launch>>>(pB, yB, N, nch, Tn);
     cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t1);
     const double msbat = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
     cudaError_t le = cudaGetLastError();
