@@ -866,6 +866,69 @@ __global__ void k_gate_outproj(const float *y, const float *z, const float *W,
 // loads. This variant owns 64 rows x all HID=64 outputs per block with a 4x4
 // accumulator per thread (8 loads per 16 FMAs), stages W in shared with
 // float4 loads, and writes the result back as float4.
+// 8x8 register tile: 64 accumulators per thread, so the k-loop issues 16 shared
+// loads per 64 FMAs (4 FMA/load) against k_out_proj_r's 8 loads per 16 FMAs.
+// The weight tile is stored K-major (WsT[k][co]) so a warp's 8 column groups read
+// 32 contiguous floats; with the co-major layout the 8 lanes sit 8 rows apart and
+// 8*row_stride is always even, so no padding could have made that read
+// conflict-free. Tile is 256 rows x 64 cols, blockDim (8,32), K chunked by 16.
+__global__ void k_out_proj_r8(const float *y, const float *z, const float *W,
+                              float *out, int SL)
+{
+    const int KC = 16, MT = 256;
+    __shared__ __align__(16) float As[MT][KC+4];
+    __shared__ __align__(16) float WsT[KC][HID+4];
+    const long m0 = (long)blockIdx.x * MT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (8,32)
+    const int tid = ty*8 + tx;
+    float acc[8][8];
+#pragma unroll
+    for (int a = 0; a < 8; a++)
+#pragma unroll
+        for (int b = 0; b < 8; b++) acc[a][b] = 0.f;
+    for (int k0 = 0; k0 < DINNER; k0 += KC) {
+        for (int i = tid; i < MT*(KC/4); i += 256) {              /* 4 float4/thread */
+            const int r = i / (KC/4), q = 4*(i - r*(KC/4));
+            const long o_ = (m0 + r)*DINNER + k0 + q;
+            float4 v = make_float4(0.f,0.f,0.f,0.f);
+            if (m0 + r < SL) {
+                const float4 yy = *(const float4*)(y + o_);
+                const float4 zz = *(const float4*)(z + o_);
+                v.x = yy.x * dsilu(zz.x); v.y = yy.y * dsilu(zz.y);
+                v.z = yy.z * dsilu(zz.z); v.w = yy.w * dsilu(zz.w);
+            }
+            *(float4*)&As[r][q] = v;
+        }
+        for (int i = tid; i < KC*(HID/4); i += 256) {             /* transpose W tile */
+            const int co = i / (KC/4), q = 4*(i - co*(KC/4));
+            const float4 wv = *(const float4*)(W + (long)co*DINNER + k0 + q);
+            WsT[q+0][co] = wv.x; WsT[q+1][co] = wv.y;
+            WsT[q+2][co] = wv.z; WsT[q+3][co] = wv.w;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KC; k++) {
+            float a[8], w[8];
+#pragma unroll
+            for (int a4 = 0; a4 < 8; a4++) a[a4] = As[ty*8 + a4][k];
+#pragma unroll
+            for (int b4 = 0; b4 < 8; b4++) w[b4] = WsT[k][tx*8 + b4];
+#pragma unroll
+            for (int a4 = 0; a4 < 8; a4++)
+#pragma unroll
+                for (int b4 = 0; b4 < 8; b4++) acc[a4][b4] = fmaf(a[a4], w[b4], acc[a4][b4]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int a4 = 0; a4 < 8; a4++) {
+        const long m = m0 + ty*8 + a4;
+        if (m >= SL) continue;
+        *(float4*)(out + m*HID + tx*8)     = make_float4(acc[a4][0], acc[a4][1], acc[a4][2], acc[a4][3]);
+        *(float4*)(out + m*HID + tx*8 + 4) = make_float4(acc[a4][4], acc[a4][5], acc[a4][6], acc[a4][7]);
+    }
+}
+
 __global__ void k_out_proj_r(const float *y, const float *z, const float *W,
                              float *out, int SL)
 {
@@ -2916,10 +2979,11 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     GDBG("gscan", y, (size_t)SL*DINNER);
     {
         static int tiled = -1;
-        if (tiled < 0) tiled = getenv("REUSE_OP") ? atoi(getenv("REUSE_OP")) : (getenv("REUSE_NAIVE_OP") ? 0 : 2);
+        if (tiled < 0) tiled = getenv("REUSE_OP") ? atoi(getenv("REUSE_OP")) : (getenv("REUSE_NAIVE_OP") ? 0 : 3);
         if (tiled) {
             dim3 g((HID+GT-1)/GT, (unsigned)((SL+GT-1)/GT));
-            if (tiled == 2) k_out_proj_r<<<(unsigned)((SL+63)/64), dim3(16,16), 0, st>>>(y, z, W_op, out, (int)SL);
+            if      (tiled == 3) k_out_proj_r8<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, out, (int)SL);
+            else if (tiled == 2) k_out_proj_r<<<(unsigned)((SL+63)/64), dim3(16,16), 0, st>>>(y, z, W_op, out, (int)SL);
             else            k_out_proj_tiled<<<g, dim3(GT/2, GT/2), 0, st>>>(y, z, W_op, out, (int)SL);
         } else {
             if (!getenv("REUSE_SKIP_GATEOP"))
