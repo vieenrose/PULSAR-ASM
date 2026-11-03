@@ -1867,12 +1867,45 @@ __global__ void k_sp_up(const float *x, const float *Ww, const float *b, float *
     y[((long)c*H + h)*(long)(W*r) + (long)w*r + a] = acc;
 }
 
+/* x[C][H][W] -> y[C][W][H]. The naive version reads coalesced in w and writes
+   with a stride of H floats (32 sectors per warp store), which is why 12 of
+   these per forward cost 4 ms for ~100 MB of traffic. Tiled through a padded
+   32x32 shared tile: both phases become coalesced and conflict-free (the lane
+   index advances by 1 in the load, and the store reads tile[x][k] at banks
+   x+33k mod 32 = x+k). */
+__global__ void k_transpose_t(const float *__restrict__ x, float *__restrict__ y, int C, int H, int W)
+{
+    __shared__ float tile[32][33];
+    const int c = blockIdx.z;
+    const float *xc = x + (long)c*H*W;
+    float *yc = y + (long)c*H*W;                     /* y is [C][W][H] */
+    const int h0 = blockIdx.y*32, w0 = blockIdx.x*32;
+    for (int k = threadIdx.y; k < 32; k += 8) {
+        const int h = h0 + k, w = w0 + threadIdx.x;
+        tile[k][threadIdx.x] = (h < H && w < W) ? xc[(long)h*W + w] : 0.0f;
+    }
+    __syncthreads();
+    for (int k = threadIdx.y; k < 32; k += 8) {
+        const int w = w0 + k, h = h0 + threadIdx.x;
+        if (w < W && h < H) yc[(long)w*H + h] = tile[threadIdx.x][k];
+    }
+}
+
+
 __global__ void k_transpose(const float *x, float *y, int C, int H, int W)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long)C*H*W) return;
     int w = (int)(i % W), h = (int)((i / W) % H), c = (int)(i / ((long)H*W));
     y[((long)c*W + w)*(long)H + h] = x[i];
+}
+
+static void launch_transpose(int C, int H, int W, const float *x, float *y)
+{
+    static int t = -1;
+    if (t < 0) t = getenv("REUSE_TRANSPOSE") ? atoi(getenv("REUSE_TRANSPOSE")) : 1;
+    if (t) k_transpose_t<<<dim3((unsigned)((W+31)/32), (unsigned)((H+31)/32), (unsigned)C), dim3(32,8)>>>(x, y, C, H, W);
+    else   k_transpose<<<(unsigned)(((long)C*H*W+255)/256), 256>>>(x, y, C, H, W);
 }
 
 // out_mag[f*T+t] = src[t*Fx+f]   (decoder output [Tx,Fx] -> [F,T] crop)
@@ -3352,7 +3385,7 @@ extern "C" int reuse_gpu_decoder_pre(reuse_gpu_t *g, const char *prefix, const f
     const int Tt = F*2, Ft = T;
     float *sw = wallc(g, (size_t)HID*Tt*Ft);
     if (!sw) return 1;
-    k_transpose<<<(unsigned)(((long)HID*T*F*2+255)/256), 256>>>(u1n, sw, HID, T, F*2);
+    launch_transpose(HID, T, F*2, u1n, sw);
     gdump("d_sw", sw, (size_t)HID*Tt*Ft);
     float *u2  = wallc(g, (size_t)HID*Tt*(size_t)(Ft*4));
     float *u2n = wallc(g, (size_t)HID*Tt*(size_t)(Ft*4));
@@ -3366,7 +3399,7 @@ extern "C" int reuse_gpu_decoder_pre(reuse_gpu_t *g, const char *prefix, const f
         snprintf(ak, sizeof(ak), "%s.up_conv2.2.weight", prefix);
         inorm(g, u2, u2n, 1, HID, Tt, Ft*4, nk, ak);
     }
-    k_transpose<<<(unsigned)(((long)HID*Tt*Ft*4+255)/256), 256>>>(u2n, y, HID, Tt, Ft*4);
+    launch_transpose(HID, Tt, Ft*4, u2n, y);
     gdump("d_pre", y, (size_t)HID*Tt*(size_t)(Ft*4));
     return g->bad;
 }
