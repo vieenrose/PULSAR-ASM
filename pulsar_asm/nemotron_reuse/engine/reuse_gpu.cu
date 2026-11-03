@@ -2592,6 +2592,21 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         static int bigenv = -1;
         if (bigenv < 0) { const char *e = getenv("REUSE_CONV_TILE"); bigenv = e ? atoi(e) : 645; }
         int big = tileuse ? tileuse : bigenv;
+        // Maxwell (sm_53, the Jetson Nano) cannot launch the 64-accumulator
+        // tiles: ptxas hands back a kernel whose per-thread register demand
+        // exceeds the 255/thread limit, so the launch fails with "too many
+        // resources requested" - it compiles for sm_53 fine, so the compile
+        // gate cannot see it. The 32-accumulator code 82 is the Maxwell
+        // fallback (it is what the Nano ran before the 64-acc tiles existed).
+        if (big >= 644 && big <= 646) {
+            static int maxw = -1;
+            if (maxw < 0) {
+                cudaDeviceProp dp;
+                maxw = (cudaGetDeviceProperties(&dp, 0) == cudaSuccess && dp.major < 6) ? 1 : 0;
+                if (getenv("REUSE_FORCE_MAXWELL_TILES")) maxw = 1;
+            }
+            if (maxw) big = 82;
+        }
         // 64-accumulator shapes: codes 644 (8co x 2col x 4row), 645 (8x4x2),
         // 646 (16x2x2). Each output amortises its 9 weight loads over
         // rows*cols positions and the warp-uniform weight loads are ~50% of
