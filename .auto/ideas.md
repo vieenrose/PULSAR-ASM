@@ -113,3 +113,12 @@ these kernels, so traffic/ILP wins there do not transfer 1:1.
 CONSEQUENCE: the scored metric is the dev host - keep optimising the dev host; do not tune
 for the Nano (fewer registers / less shared memory helps the Nano and hurts the dev host).
 Expect ~10-15% Nano transfer for a dev-host tower win.
+
+## Nano validation #3 (dev host rtf_total 0.1072 / rtf_model 0.0986)
+Nano 8 kHz: RTF_total 3.2882 = model 3.2708 + istft 0.0175 (run_bench feeds the ref STFT).
+Phases: encoder 3.445 | tower 11.811 | decoders 1.399 | heads 0.012.  16 kHz: RTF_model 6.3683.
+Trajectory: model 3.4949 (#31 era, dev 0.1199) -> 3.4543 (#33 era, dev 0.1080) -> 3.2708 (now).
+Transfer ratio for the last 5 keeps: dev -10.6%, Nano -6.4% => ~60% (the previous window was
+12%: that window's keeps were pure GEMM register blocking, this one added dt_proj+scan fusion
+and the tiled gather, i.e. memory-pattern wins transfer, FMA-ratio wins do not).
+Cumulative vs the 44.34 RTF_model baseline: 13.6x.

@@ -2235,15 +2235,14 @@ __global__ void k_conv2d_r5(const float *x, const float *w, const float *b,
 // global traffic 1.7x (the tile is half as tall), raises FMA per global load
 // 7 -> 22 and FMA per shared load 2 -> 6, and keeps registers at 32
 // accumulators + ~12.
-template<int R, int PCO, int NCB>
+template<int R, int PCO, int NCB, int NRA = 32/(PCO*NCB)>
 __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
                             int C_in, int H, int W, int padH, int padW, int dilH,
                             float *y, int co0)
 {
     const int TW = 16*NCB, LS = TW+4;
-    const int NRA = 32/(PCO*NCB);
     __shared__ __align__(16) float S[R][LS];
-    const int w0 = blockIdx.x*TW, h0 = blockIdx.y*32;
+    const int w0 = blockIdx.x*TW, h0 = blockIdx.y*(16*NRA);
     const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
     const int tid = ty*16 + tx;
     float acc[PCO][NRA][NCB];
@@ -2514,6 +2513,11 @@ static int launch_conv1x1(reuse_gpu_t *g, const float *x, const float *w, const 
             else if (regtile && dilH == 2) { k_conv2d_r9<R2,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
             else if (regtile && dilH == 4) { k_conv2d_r9<R4,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
             else if (regtile && dilH == 8) { k_conv2d_r9<R8,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); }
+#define R64LAUNCH(PC_,NC_,NR_,R1,R2,R4,R8) \
+            if      (regtile && dilH == 1) { k_conv2d_r8<R1,PC_,NC_,NR_><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
+            else if (regtile && dilH == 2) { k_conv2d_r8<R2,PC_,NC_,NR_><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
+            else if (regtile && dilH == 4) { k_conv2d_r8<R4,PC_,NC_,NR_><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
+            else if (regtile && dilH == 8) { k_conv2d_r8<R8,PC_,NC_,NR_><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); }
 #define R8LAUNCH(R1,R2,R4,R8) \
             if      (regtile && dilH == 1) { if (pco==4) k_conv2d_r8<R1,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R1,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R1,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
             else if (regtile && dilH == 2) { if (pco==4) k_conv2d_r8<R2,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R2,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R2,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
@@ -2541,14 +2545,31 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         const bool regtile = !getenv("REUSE_NAIVE_CONV2D") && kH == 3 && kW == 3 &&
                              dilW == 1 && strideH == 1 && strideW == 1 && padW == 1 && padH == dilH;
         static int big = -1;
-        if (big < 0) { const char *e = getenv("REUSE_CONV_TILE"); big = e ? atoi(e) : 82; }
-        if (big >= 81 && big <= 92 && n % (big == 81 ? 4 : (big == 82 || big == 92 ? 8 : 16)) == 0) {
-            const int pco = (big == 81) ? 4 : (big == 82 || big == 92 ? 8 : 16), ncb = (big == 81) ? 4 : 2;
+        if (big < 0) { const char *e = getenv("REUSE_CONV_TILE"); big = e ? atoi(e) : 645; }
+        // 64-accumulator shapes: codes 644 (8co x 2col x 4row), 645 (8x4x2),
+        // 646 (16x2x2). Each output amortises its 9 weight loads over
+        // rows*cols positions and the warp-uniform weight loads are ~50% of
+        // this kernel's issue slots, so doubling rows*cols (4 -> 8) is the
+        // lever that moved the conv off 0.9 TFLOPS. trh MUST stay 16*NRA to
+        // match the kernel's h0, and each branch needs the naive k_conv2d
+        // fallback for dilH outside {1,2,4,8} (the encoder's dil 16/32
+        // layers) - omitting it leaves those convs unlaunched.
+        int pco = 0, ncb = 2, nra = 2;
+        if (big == 644) { pco = 8; ncb = 2; nra = 4; }
+        else if (big == 645) { pco = 8; ncb = 4; nra = 2; }
+        else if (big == 646) { pco = 16; ncb = 2; nra = 2; }
+        const bool r6 = (pco != 0);
+        if (!r6) { pco = (big == 81) ? 4 : (big == 82 || big == 92 ? 8 : 16); ncb = (big == 81) ? 4 : 2; nra = 32/(pco*ncb); }
+        const int trh = r6 ? 16*nra : ((big == 83) ? 16 : 32);
+        if (((big >= 81 && big <= 92) || r6) && n % pco == 0) {
             const bool r9 = (big == 92);
-            const int trh = (big == 83) ? 16 : 32;
+            (void)nra;
             const dim3 grdb((unsigned)((W_out + 16*ncb - 1) / (16*ncb)), (unsigned)((H_out + trh - 1) / trh), (unsigned)(n/pco));
             const dim3 blkb(16, 16);
-            if (r9) { R9LAUNCH(34,36,40,48)
+            if (big == 644) { R64LAUNCH(8,2,4,66,68,72,80) else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0); }
+            else if (big == 645) { R64LAUNCH(8,4,2,34,36,40,48) else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0); }
+            else if (big == 646) { R64LAUNCH(16,2,2,34,36,40,48) else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0); }
+            else if (r9) { R9LAUNCH(34,36,40,48)
                       else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0); }
             else    { R8LAUNCH(34,36,40,48)
                       else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0); }
