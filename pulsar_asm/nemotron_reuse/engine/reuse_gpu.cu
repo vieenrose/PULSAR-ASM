@@ -688,6 +688,100 @@ __global__ void k_outproj_ln_f(const float *cat, const float *W, const float *B,
     out[(long)row*HID + o] = (v - mean) * inv * LW[o] + LB[o];
 }
 
+// output_proj (128 -> 64) + LayerNorm as a register-tiled GEMM.
+//
+// The one-block-per-row version had every one of the SL blocks read the whole
+// 32 KB output_proj.weight, and thread o read W[o*128 + c] with a 128-float
+// stride: 32 sectors per warp load (8x sector amplification), ~663 MB of L2
+// traffic per launch. Ablation put it at 0.295 s per forward - 27% of the
+// tower - and it was NOT compute bound (replacing the Kahan reductions with
+// warp shuffles bought nothing). Here a block owns 32 rows x all 64 outputs,
+// stages A and W tiles in shared per 32-wide K chunk, and each thread keeps a
+// 4x4 accumulator, so every weight element is read once per block (21 MB)
+// instead of once per row. The LayerNorm rides the same registers: a thread's
+// 4 rows reduce across the 16-lane tx group with shuffles.
+__global__ void k_outproj_ln_g(const float *cat, const float *W, const float *B,
+                               const float *LW, const float *LB, float *out, long SL)
+{
+    const int KC = 32;
+    __shared__ float As[32][KC+1], Ws[64][KC+1];
+    const int tx = threadIdx.x, ty = threadIdx.y;          // 16 x 8
+    const int tid = ty*16 + tx;
+    const long rb = (long)blockIdx.x * 32;          // block's first row
+    const long r0 = rb + ty*4;                      // this thread's first row
+    const int c0 = tx*4;
+    // stage the first K chunk
+    for (int i = tid; i < 32*KC; i += 128) {
+        int r = i >> 5, k = i & (KC-1);
+        As[r][k] = (rb + r < SL) ? cat[(rb + r)*2*HID + k] : 0.f;
+    }
+    for (int i = tid; i < 64*KC; i += 128) {
+        int o = i >> 5, k = i & (KC-1);
+        Ws[o][k] = W[(long)o*2*HID + k];
+    }
+    float acc[4][4];
+#pragma unroll
+    for (int a = 0; a < 4; a++)
+#pragma unroll
+        for (int b = 0; b < 4; b++) acc[a][b] = B[c0 + b];
+    __syncthreads();
+    // Single-buffered tiles, so the pipeline is compute -> barrier -> prefetch
+    // -> barrier. Prefetching into the tile the compute loop is still reading
+    // is a race: it produced a rel-rms of 2.6 that only showed up on some
+    // schedules, which is exactly what the accuracy gate is for.
+    for (int k0 = 0; k0 < 2*HID; k0 += KC) {
+#pragma unroll
+        for (int k = 0; k < KC; k++) {
+            float a[4], w[4];
+#pragma unroll
+            for (int a4 = 0; a4 < 4; a4++) a[a4] = As[ty*4 + a4][k];
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++) w[b4] = Ws[c0 + b4][k];
+#pragma unroll
+            for (int a4 = 0; a4 < 4; a4++)
+#pragma unroll
+                for (int b4 = 0; b4 < 4; b4++) acc[a4][b4] = fmaf(a[a4], w[b4], acc[a4][b4]);
+        }
+        if (k0 + KC < 2*HID) {
+            __syncthreads();
+            for (int i = tid; i < 32*KC; i += 128) {
+                int r = i >> 5, k = i & (KC-1);
+                As[r][k] = (rb + r < SL) ? cat[(rb + r)*2*HID + k0 + KC + k] : 0.f;
+            }
+            for (int i = tid; i < 64*KC; i += 128) {
+                int o = i >> 5, k = i & (KC-1);
+                Ws[o][k] = W[(long)o*2*HID + k0 + KC + k];
+            }
+            __syncthreads();
+        }
+    }
+    // LayerNorm over the 64 outputs of each row: the row is spread over the 16
+    // threads with the same ty, which never straddle a warp boundary.
+    float mean[4], inv[4];
+#pragma unroll
+    for (int a4 = 0; a4 < 4; a4++) {
+        float s = acc[a4][0] + acc[a4][1] + acc[a4][2] + acc[a4][3];
+        float q = acc[a4][0]*acc[a4][0] + acc[a4][1]*acc[a4][1]
+                + acc[a4][2]*acc[a4][2] + acc[a4][3]*acc[a4][3];
+#pragma unroll
+        for (int d = 1; d < 16; d <<= 1) {
+            s += __shfl_xor_sync(0xffffffffu, s, d);
+            q += __shfl_xor_sync(0xffffffffu, q, d);
+        }
+        mean[a4] = s * (1.0f/HID);
+        inv[a4]  = rsqrtf(fmaxf(q * (1.0f/HID) - mean[a4]*mean[a4], 0.0f) + 1e-5f);
+    }
+#pragma unroll
+    for (int a4 = 0; a4 < 4; a4++) {
+        long r = r0 + a4;
+        if (r >= SL) continue;
+        float *dst = out + r*HID;
+#pragma unroll
+        for (int b4 = 0; b4 < 4; b4++)
+            dst[c0 + b4] = (acc[a4][b4] - mean[a4]) * inv[a4] * LW[c0 + b4] + LB[c0 + b4];
+    }
+}
+
 // [HID,T,F] -> [F,T,HID]
 __global__ void k_gather_time(const float *x, float *xt, int T, int F)
 {
@@ -1361,7 +1455,7 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
     } else if (getenv("REUSE_NAIVE_OUTPROJ")) {
         k_outproj_ln<<<(unsigned)SL, HID>>>(cat, W, B, LW, LB, out, SL);
     } else {
-        k_outproj_ln_f<<<(unsigned)((SL+3)/4), dim3(64,4)>>>(cat, W, B, LW, LB, out, SL);
+        k_outproj_ln_g<<<(unsigned)((SL+31)/32), dim3(16,8)>>>(cat, W, B, LW, LB, out, SL);
     }
     return reuse_gpu_ok(g, "mamba_block");
 }
