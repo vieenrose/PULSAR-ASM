@@ -1552,6 +1552,66 @@ __global__ void k_wtrans_sp(const float *w, float *wT, int CO)
     wT[((long)ci*CO + co)*3 + t] = w[i];
 }
 
+template<int RW, int RC, int TW, int NC>
+__global__ void k_sp_up8t(const float *x, const float *wT, const float *b, float *y,
+                          int H, int W, int r, int CO)
+{
+    const int TXN = TW/RW, TBY = NC/RC, NT = TXN*TBY;
+    const int w0 = blockIdx.x*TW;
+    const int h = blockIdx.y;
+    const int co0 = blockIdx.z*NC;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty*TXN + tx;
+    __shared__ __align__(16) float xs[TW+8];
+    __shared__ __align__(16) float ws[NC*3 + 4];
+    const int wl = tx*RW, cl = ty*RC;
+    float acc[RC][RW];
+#pragma unroll
+    for (int j = 0; j < RC; j++)
+#pragma unroll
+        for (int i = 0; i < RW; i++) acc[j][i] = b[co0 + cl + j];
+    const long hw = (long)h*W;
+    for (int ci = 0; ci < HID; ci++) {
+        const float *xv = x + (long)ci*H*W + hw;
+        for (int i = tid; i < (TW+3)/4 + 1; i += NT) {
+            const int q = 4*i;
+            float4 v = make_float4(0.f,0.f,0.f,0.f);
+            /* xs[i] = x[w0-1+i] (zero outside the row), so lane t sources w0-1+q+t */
+            const int s0 = w0 - 1 + q;
+            if (q+0 < TW+3) v.x = (s0+0 >= 0 && s0+0 < W) ? xv[s0+0] : 0.f;
+            if (q+1 < TW+3) v.y = (s0+1 >= 0 && s0+1 < W) ? xv[s0+1] : 0.f;
+            if (q+2 < TW+3) v.z = (s0+2 >= 0 && s0+2 < W) ? xv[s0+2] : 0.f;
+            if (q+3 < TW+3) v.w = (s0+3 >= 0 && s0+3 < W) ? xv[s0+3] : 0.f;
+            *(float4*)&xs[q] = v;
+        }
+        { const float4 *wp = (const float4*)(wT + ((long)ci*CO + co0)*3);
+          for (int i = tid; i < NC*3/4; i += NT) *(float4*)&ws[4*i] = wp[i]; }
+        __syncthreads();
+        const float4 a0 = *(const float4*)&xs[wl];
+        const float4 a1 = *(const float4*)&xs[wl+4];
+        const float4 a2 = *(const float4*)&xs[wl+8];
+        const float xv2[16] = { a0.x,a0.y,a0.z,a0.w, a1.x,a1.y,a1.z,a1.w, a2.x,a2.y,a2.z,a2.w, 0,0,0,0 };
+#pragma unroll
+        for (int j = 0; j < RC; j++) {
+            const float c0 = ws[3*(cl+j)], c1 = ws[3*(cl+j)+1], c2 = ws[3*(cl+j)+2];
+#pragma unroll
+            for (int i = 0; i < RW; i++) {
+                acc[j][i] = fmaf(xv2[i],   c0, acc[j][i]);
+                acc[j][i] = fmaf(xv2[i+1], c1, acc[j][i]);
+                acc[j][i] = fmaf(xv2[i+2], c2, acc[j][i]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < RC; j++) {
+        const int cj = (co0 + cl + j) % HID, aj = (co0 + cl + j) / HID;
+        float *yp = y + ((long)cj*H + h)*(long)(W*r) + (long)(w0+wl)*r + aj;
+#pragma unroll
+        for (int i = 0; i < RW; i++) if (w0 + wl + i < W) yp[i*r] = acc[j][i];
+    }
+}
+
 template<int NC>
 __global__ void k_sp_up8w(const float *x, const float *wT, const float *b, float *y,
                           int H, int W, int r, int CO)
@@ -2811,7 +2871,32 @@ static int sp_up(reuse_gpu_t *g, const char *prefix, const float *x, int H, int 
     dim3 grd((unsigned)((W + 15)/16), (unsigned)((H + 15)/16), (unsigned)(HID*r));
     {
         static int t8 = -1;
-        if (t8 < 0) t8 = getenv("REUSE_SPUP") ? atoi(getenv("REUSE_SPUP")) : 3;
+        if (t8 < 0) t8 = getenv("REUSE_SPUP") ? atoi(getenv("REUSE_SPUP")) : 4;   /* 4 = block-tiled (default), 3 = k_sp_up8w, 1 = k_sp_up8, 0 = naive */
+        if (t8 == 4) {
+            const int CO = 64*r;
+            static int RW_ = 0, RC_ = 0, TW_ = 0, NC_ = 0;
+            if (RW_ == 0) {
+                const char *e = getenv("REUSE_SPUP_T"); int a=0,b=0,c=0,d=0;
+                RW_ = 4; RC_ = 8; TW_ = 32; NC_ = 64;      /* sweep winner: (8,8) threads,
+                                                              32 w x 64 co per block, i.e. the
+                                                              input strip is read once per 64
+                                                              output channels instead of per 8 */
+                if (e) sscanf(e, "%d,%d,%d,%d", &a,&b,&c,&d);
+                if (a) { RW_ = a; RC_ = b; TW_ = c; NC_ = d; }
+            }
+            float *wT = wallc(g, (size_t)CO*HID*3);
+            if (!wT) return 1;
+            k_wtrans_sp<<<(unsigned)((CO*HID*3+255)/256), 256>>>(w, wT, CO);
+            #define SPT(RWv,RCv,TWv,NCv) do { if (RW_==RWv && RC_==RCv && TW_==TWv && NC_==NCv) \
+                k_sp_up8t<RWv,RCv,TWv,NCv><<<dim3((unsigned)((W+TWv-1)/TWv),(unsigned)H,(unsigned)(CO/NCv)), dim3(TWv/RWv,NCv/RCv)>>>(x,wT,b,y,H,W,r,CO); } while(0)
+            SPT(8,8,32,64); SPT(8,8,64,64); SPT(4,8,32,32); SPT(8,4,32,32);
+            SPT(4,4,32,32); SPT(8,8,32,32); SPT(4,8,16,32); SPT(8,16,64,64);
+            SPT(4,8,32,64); SPT(8,16,32,64); SPT(8,8,16,64); SPT(8,8,32,128);
+            SPT(4,8,64,64); SPT(4,8,32,128); SPT(4,8,64,128); SPT(4,16,32,64);
+            SPT(4,4,32,64); SPT(2,8,32,64); SPT(4,8,16,64); SPT(8,8,64,128);
+            #undef SPT
+            return g->bad;
+        }
         if (t8 == 3) {
             const int CO = 64*r;
             float *wT = wallc(g, (size_t)CO*HID*3);
