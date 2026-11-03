@@ -333,9 +333,14 @@ __global__ void k_in_proj_r(const float *x, const float *W, float *x0, float *z,
             if (m >= SL) { Xs[r][c] = 0.f; continue; }
             Xs[r][c] = x[((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + c];
         }
-        for (int i = tid; i < NT*KC; i += 256) {
-            int r = i / KC, c = i % KC;
-            Ws[r][c] = W[(long)(n0+r)*HID + k0 + c];
+        {
+            const int RS = (KC+4)/4;     // padded row stride in float4 units
+            for (int i = tid; i < NT*RS; i += 256) {
+                const int r = i / RS, q = 4*(i - r*RS);
+                if (q >= KC) continue;   // the 4 pad columns stay untouched
+                // HID (256) and n0 (x64) make this 16B aligned by construction
+                ((float4*)&Ws[0][0])[i] = *(const float4*)(W + (long)(n0+r)*HID + k0 + q);
+            }
         }
         __syncthreads();
 #pragma unroll
@@ -390,7 +395,7 @@ __global__ void k_in_conv_r(const float *x, const float *W, float *z, float *xc,
     // axis on ty, "the group above" for even ty sits in the previous warp and
     // shfl_up(16) silently returns the caller's own value (rel-rms 0.57).
     const int NT = 64, R = FUSE_MT + 3, RA = 5;
-    __shared__ float Xs[R][KC+4], Ws[NT][KC+4], Hl[3][NT+1];
+    __shared__ __align__(16) float Xs[R][KC+4], Ws[NT][KC+4], Hl[3][NT+1];
     const long SL = (long)S * L;
     const long m0 = (long)blockIdx.x * FUSE_MT;
     const int n0 = blockIdx.y * NT;
@@ -413,16 +418,33 @@ __global__ void k_in_conv_r(const float *x, const float *W, float *z, float *xc,
         for (int b = 0; b < 4; b++) acc[a][b] = 0.f;
     float hacc = 0.f;
     for (int k0 = 0; k0 < HID; k0 += KC) {
-        for (int i = tid; i < R*KC; i += 256) {
-            int r = i / KC, c = i % KC;
-            long m = m0 - 3 + r;
-            int sm = (int)(m / L), tm = (int)(m % L);
-            if (m < 0 || m >= SL) { Xs[r][c] = 0.f; continue; }
-            Xs[r][c] = x[((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + c];
+        // One index computation (incl. the 64-bit m/L divide) per 4 elements;
+        // the divide itself is untouched, only computed 4x less often (see the
+        // note above on not touching its scheduling). RS is in float4 units of
+        // the PADDED row stride (KC+4), not KC: indexing by KC/4 writes rows
+        // compactly while the GEMM reads them at the padded stride, i.e. reads
+        // uninitialised shared memory (measured: all-NaN model output).
+        {
+            const int RS = (KC+4)/4;
+            for (int i = tid; i < R*RS; i += 256) {
+                const int r = i / RS, q = 4*(i - r*RS);
+                const long m = m0 - 3 + r;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (q < KC && m >= 0 && m < SL) {
+                    const int sm = (int)(m / L), tm = (int)(m % L);
+                    v = *(const float4*)(x + ((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + q);
+                }
+                ((float4*)&Xs[0][0])[i] = v;
+            }
         }
-        for (int i = tid; i < NT*KC; i += 256) {
-            int r = i / KC, c = i % KC;
-            Ws[r][c] = W[(long)(n0+r)*HID + k0 + c];
+        {
+            const int RS = (KC+4)/4;     // padded row stride in float4 units
+            for (int i = tid; i < NT*RS; i += 256) {
+                const int r = i / RS, q = 4*(i - r*RS);
+                if (q >= KC) continue;   // the 4 pad columns stay untouched
+                // HID (256) and n0 (x64) make this 16B aligned by construction
+                ((float4*)&Ws[0][0])[i] = *(const float4*)(W + (long)(n0+r)*HID + k0 + q);
+            }
         }
         __syncthreads();
 #pragma unroll
@@ -1056,7 +1078,7 @@ __global__ void k_in_conv_r2(const float *x, const float *W, float *z, float *xc
                              int S, int L, int rev)
 {
     const int NT = 64, R = FUSE_MT2 + 3, RA = 8;
-    __shared__ float Xs[R][KC+4], Ws[NT][KC+4], Hl[3][NT+1];
+    __shared__ __align__(16) float Xs[R][KC+4], Ws[NT][KC+4], Hl[3][NT+1];
     const long SL = (long)S * L;
     const long m0 = (long)blockIdx.x * FUSE_MT2;
     const int n0 = blockIdx.y * NT;
@@ -1071,16 +1093,33 @@ __global__ void k_in_conv_r2(const float *x, const float *W, float *z, float *xc
         for (int b = 0; b < 4; b++) acc[a][b] = 0.f;
     float hacc = 0.f;
     for (int k0 = 0; k0 < HID; k0 += KC) {
-        for (int i = tid; i < R*KC; i += 256) {
-            int r = i / KC, c = i % KC;
-            long m = m0 - 3 + r;
-            int sm = (int)(m / L), tm = (int)(m % L);
-            if (m < 0 || m >= SL) { Xs[r][c] = 0.f; continue; }
-            Xs[r][c] = x[((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + c];
+        // One index computation (incl. the 64-bit m/L divide) per 4 elements;
+        // the divide itself is untouched, only computed 4x less often (see the
+        // note above on not touching its scheduling). RS is in float4 units of
+        // the PADDED row stride (KC+4), not KC: indexing by KC/4 writes rows
+        // compactly while the GEMM reads them at the padded stride, i.e. reads
+        // uninitialised shared memory (measured: all-NaN model output).
+        {
+            const int RS = (KC+4)/4;
+            for (int i = tid; i < R*RS; i += 256) {
+                const int r = i / RS, q = 4*(i - r*RS);
+                const long m = m0 - 3 + r;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (q < KC && m >= 0 && m < SL) {
+                    const int sm = (int)(m / L), tm = (int)(m % L);
+                    v = *(const float4*)(x + ((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + q);
+                }
+                ((float4*)&Xs[0][0])[i] = v;
+            }
         }
-        for (int i = tid; i < NT*KC; i += 256) {
-            int r = i / KC, c = i % KC;
-            Ws[r][c] = W[(long)(n0+r)*HID + k0 + c];
+        {
+            const int RS = (KC+4)/4;     // padded row stride in float4 units
+            for (int i = tid; i < NT*RS; i += 256) {
+                const int r = i / RS, q = 4*(i - r*RS);
+                if (q >= KC) continue;   // the 4 pad columns stay untouched
+                // HID (256) and n0 (x64) make this 16B aligned by construction
+                ((float4*)&Ws[0][0])[i] = *(const float4*)(W + (long)(n0+r)*HID + k0 + q);
+            }
         }
         __syncthreads();
 #pragma unroll
