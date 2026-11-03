@@ -221,6 +221,105 @@ __global__ void k_conv1x1(const float *x, const float *w, const float *b,
 }
 
 // Direct 2D conv; covers 3x3 dilated and (1,3) strided.
+// Tiled kernel for the encoder's strided patchify conv (kH=1, kW=3, dilW=1,
+// strideW=2, padW=0, strideH>=1): C_in=64, 1023x163 -> 256x81, C_out=64. The
+// naive k_conv2d gives each thread one (row, col, channel) and one output
+// channel per z-block, so per thread it issues 192 dependent scalar loads
+// against 192 FMAs (1 FMA/load) and all 64 z-blocks re-read the input.
+// Here a block owns TR output rows x TC output cols x PCO channels, stages each
+// ci's input strip and the PCOx3 weights in shared memory, and each thread
+// computes RW consecutive output columns for all PCO channels: per ci that is
+// ceil((RW*strideW+kW-1)/4) float4 window loads plus PCO*3 warp-uniform weight
+// loads against RW*PCO*3 FMAs (3.8 FMA/load at PCO=16, RW=4), and the input is
+// re-read C_out/PCO times instead of C_out.
+// The per-output accumulation walks ci ascending and kw ascending, exactly like
+// the naive loop, so results are bit-identical.
+template<int TR, int TC, int PCO, int RW, int SW>
+__global__ void k_conv2d_st(const float *__restrict__ x, const float *__restrict__ w,
+                            const float *b, int C_in, int H, int W,
+                            int padW, int strideH,
+                            float *y, int co0, int H_out, int W_out)
+{
+    const int TW = ((TC*SW + 2) + 3) / 4 * 4;      /* staged input width, float4 padded */
+    const int TXN = TC/RW, NT = TXN*TR;
+    __shared__ __align__(16) float xs[TR][TW + 4];
+    __shared__ __align__(16) float ws[PCO*4];
+    const int ho0 = blockIdx.y*TR;
+    const int wo0 = blockIdx.x*TC;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty*TXN + tx;
+    const int co = co0 + blockIdx.z*PCO;
+    const int wl = tx*RW;                                /* local output column group */
+    const int wa = wo0*SW - padW;                   /* first input column of the tile */
+    float acc[PCO][RW];
+#pragma unroll
+    for (int j = 0; j < PCO; j++)
+#pragma unroll
+        for (int i = 0; i < RW; i++) acc[j][i] = b ? b[co + j] : 0.0f;
+    const int NG = TR*TW/4;                              /* float4 groups to stage */
+    for (int ci = 0; ci < C_in; ci++) {
+        const float *xv = x + (long)ci*H*W;
+        for (int i = tid; i < NG; i += NT) {
+            const int r = i / (TW/4), q = 4*(i - r*(TW/4));
+            float4 v = make_float4(0.f,0.f,0.f,0.f);
+            const int hi = (ho0 + r)*strideH;
+            if (hi < H) {
+                const float *xr = xv + (long)hi*W;
+                const int sw = wa + q;
+                if (sw+0 >= 0 && sw+0 < W) v.x = xr[sw+0];
+                if (sw+1 >= 0 && sw+1 < W) v.y = xr[sw+1];
+                if (sw+2 >= 0 && sw+2 < W) v.z = xr[sw+2];
+                if (sw+3 >= 0 && sw+3 < W) v.w = xr[sw+3];
+            }
+            *(float4*)&xs[r][q] = v;
+        }
+        {
+            const float *wv = w + (long)co*C_in*3 + (long)ci*3;   /* w[co][ci][0..2] */
+            for (int i = tid; i < PCO; i += NT) {
+                const float4 t = make_float4(wv[(long)i*C_in*3 + 0], wv[(long)i*C_in*3 + 1],
+                                             wv[(long)i*C_in*3 + 2], 0.f);
+                *(float4*)&ws[4*i] = t;
+            }
+        }
+        __syncthreads();
+        const int lb = wl*SW;                        /* local window base in xs row */
+        const int NW = (RW*SW + 2)/4 + 1;
+        float xv_[RW*SW + 4];
+        {   /* the thread owns output row ty (blockDim.y = TR), not all TR rows */
+            const int r = ty;
+#pragma unroll
+            for (int q = 0; q < NW; q++) {
+                const float4 t = *(const float4*)&xs[r][lb + 4*q];
+                xv_[4*q+0] = t.x; xv_[4*q+1] = t.y; xv_[4*q+2] = t.z; xv_[4*q+3] = t.w;
+            }
+#pragma unroll
+            for (int j = 0; j < PCO; j++) {
+                const float c0 = ws[4*j+0], c1 = ws[4*j+1], c2 = ws[4*j+2];
+#pragma unroll
+                for (int i = 0; i < RW; i++) {
+                    const int o = i*SW;
+                    acc[j][i] = fmaf(xv_[o+0], c0, acc[j][i]);
+                    acc[j][i] = fmaf(xv_[o+1], c1, acc[j][i]);
+                    acc[j][i] = fmaf(xv_[o+2], c2, acc[j][i]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < PCO; j++) {
+        float *yp = y + (long)(co + j)*H_out*W_out;
+        {
+            const int ho = ho0 + ty;
+            if (ho >= H_out) continue;
+            float *yr = yp + (long)ho*W_out + (wo0 + wl);   /* output is dense in W_out */
+#pragma unroll
+            for (int i = 0; i < RW; i++)
+                if (wo0 + wl + i < W_out) yr[i] = acc[j][i];
+        }
+    }
+}
+
 __global__ void k_conv2d(const float *x, const float *w, const float *b,
                          int C_in, int H, int W, int C_out, int kH, int kW,
                          int padH, int padW, int dilH, int dilW, int strideH, int strideW,
@@ -2748,6 +2847,36 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         // match the kernel's h0, and each branch needs the naive k_conv2d
         // fallback for dilH outside {1,2,4,8} (the encoder's dil 16/32
         // layers) - omitting it leaves those convs unlaunched.
+        {
+            static int stmode = -1;
+            if (stmode < 0) stmode = getenv("REUSE_CONV_ST_OFF") ? 0 : 1;
+            static int TR_ = 0, TC_, PCO_, RW_;
+            if (TR_ == 0) {
+                const char *e = getenv("REUSE_CONV_ST"); int a=0,b=0,c=0,d=0;
+                TR_ = 16; TC_ = 16; PCO_ = 16; RW_ = 4;   /* sweep winner: (4,16) threads,
+                                                             16 rows x 16 cols x 16 channels,
+                                                             4 output cols per thread = 64 accs */
+                if (e && sscanf(e, "%d,%d,%d,%d", &a,&b,&c,&d) == 4) { TR_ = a; TC_ = b; PCO_ = c; RW_ = d; }
+            }
+            const bool ok = stmode && kH == 1 && kW == 3 && dilH == 1 && dilW == 1 &&
+                            strideH >= 1 && (strideW == 1 || strideW == 2) &&
+                            padW >= 0 && padW <= 1 && padH == 0 &&
+                            n % PCO_ == 0 && (TC_ % RW_) == 0 && PCO_ <= n;
+            if (ok) {
+                #define CST(TRv,TCv,PCOv,RWv) do { if (TR_==TRv && TC_==TCv && PCO_==PCOv && RW_==RWv) { \
+                    if ((TCv/RWv)*TRv > 1024 || (TCv/RWv)*TRv < 16) break; \
+                    if (strideW == 2) k_conv2d_st<TRv,TCv,PCOv,RWv,2><<<dim3((unsigned)((W_out+TCv-1)/TCv),(unsigned)((H_out+TRv-1)/TRv),(unsigned)(n/PCOv)), dim3(TCv/RWv,TRv)>>>( \
+                            x, w, b, C_in, H, W, padW, strideH, y, co0, H_out, W_out); \
+                    else k_conv2d_st<TRv,TCv,PCOv,RWv,1><<<dim3((unsigned)((W_out+TCv-1)/TCv),(unsigned)((H_out+TRv-1)/TRv),(unsigned)(n/PCOv)), dim3(TCv/RWv,TRv)>>>( \
+                            x, w, b, C_in, H, W, padW, strideH, y, co0, H_out, W_out); } } while(0)
+                CST(8,32,16,4); CST(4,32,16,4); CST(8,32,8,4); CST(16,32,16,4);
+                CST(8,16,16,4); CST(8,32,32,2); CST(8,64,16,8); CST(4,16,16,4);
+                CST(8,32,16,8); CST(16,16,16,4); CST(8,32,64,1); CST(32,16,16,4);
+                #undef CST
+                launch_kick();
+                continue;
+            }
+        }
         int pco = 0, ncb = 2, nra = 2;
         if (big == 644) { pco = 8; ncb = 2; nra = 4; }
         else if (big == 645) { pco = 8; ncb = 4; nra = 2; }

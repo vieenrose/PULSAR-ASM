@@ -1,142 +1,70 @@
 # Ideas backlog — RE-USE RTF
 
-Ordered by expected payoff. Verify each with the single-block harness
-(`tests/gpu_block_bench.c`, ~2 s/block) before a full measure.
+Dev host best: rtf_total 0.0917 (rtf_model 0.0877, enc 0.082 | tower 0.328 | dec 0.035 | heads 0.001).
+Nano (deployment target): RTF_model 3.2384 @ 8 kHz, 6.3285 @ 16 kHz = 13.7x vs baseline.
 
-## Tower (97% of model time)
-1. **Register-blocked GEMM + double buffering for `in_proj`/`x_proj`.**
-   in_proj is 5.4 GFlop at 163 GFLOPS; a plain 32x32 tile gave no gain, so it
-   needs >=4 accumulators/thread (8x8 per thread), `__ldg`, and cp.async-free
-   double buffering (CUDA 10.2, sm_53 safe). Target 400+ GFLOPS.
-2. **Fuse a whole scan direction**: in_proj -> causal depthwise conv1d ->
-   x_proj -> dt_proj -> scan -> gated out_proj in one kernel per
-   (s, channel-tile), keeping the L=256 chain in registers/shared.
-   Current: 6 launches + 6 full round-trips of SL*DINNER floats (~21 MB each at
-   8 kHz). Massive traffic + launch-count win; launch count matters on the Nano.
-3. **`k_scan` uses 32-thread blocks** (grid (S, DINNER/32), 1 warp/block ->
-   648 warps for the whole tensor: latency-bound). Make blocks 256 threads
-   (8 channels each), unroll over L, and consider a chunked/decoupled-lookback
-   scan to parallelise over L (L=256 is a serial chain today).
-4. **Concat + output_proj GEMV + LayerNorm fusion.** Three passes over
-   SL*2*HID floats; each row is independent (2*HID = 128 per row) -> one block
-   per row, keep the row in shared memory, do the LN in the same block.
-5. **Residual scatter transposes** (`k_resid_scatter_freq/_out`, 0.14 s
-   windows each): they exist because TFMamba needs both [C,T,F] and [T,F,C]
-   layouts. Produce/consume one layout consistently, or use a shared-memory
-   tiled transpose (32x32, padded) instead of the per-element div/mod version.
-6. **Two streams for the time/freq branches** (independent within a block):
-   helps the dev host; on the Nano (serialised) fusion matters more.
-7. **CUDA graphs / launch reduction for the 30-block loop.** On the Nano,
-   launches are serialised by CUDA_LAUNCH_BLOCKING; per-launch savings scale
-   directly into Nano RTF.
+Per-forward kernel table (nsys→sqlite, /tmp/p50.sqlite pattern; nsys report scripts
+are missing in this install, query the sqlite directly with python3):
+  in_conv (fused in_proj+causal conv) 140 ms  60 launches  — closed
+  scan (fused dt_proj+scan)           103 ms  60 launches  — closed
+  out_proj (8x8, #50)                  74 ms  60 launches  — closed
+  convs (r8, 64 acc)                   72 ms               — closed
+  x_proj                               35 ms               — 4 TFLOPS, near peak
+  strided 1x3 patchify conv (naive)   4.7 ms   1 launch    — OPEN, see #1
+  inorm_prelu                          10.5 ms 18 launches — at floor (#54)
+  concat_f                             10.5 ms 60 launches — 91 GB/s, ~1.7x off
+  outproj_ln_g                         9.6 ms  60 launches — 4x4, occupancy swept (#46)
+  sp_up (tiled, #52)                    9.3→~6 ms
+  resid scatters (tiled)                9.6 ms
+  k_transpose                           4.0 ms  12 launches
 
-## Memory / weights
-8. **Store projection weights pre-transposed in the blob** so B-tiles load
-   coalesced (blob layout is ours; regenerate with tools/mkblob.py). Removes
-   the strided W reads in every projection.
-9. **fp16 weight storage** (38.6 MB -> 19 MB) for bandwidth-bound kernels.
-   Needs its own gate (SNR >= 30 dB + perceptual delta <= 0.02) and must not
-   touch the fp32 gate path. Maxwell has no fp16 throughput advantage, so this
-   only pays if a kernel is bandwidth-bound — measure first.
+## OPEN items (all small now)
+1. **Strided 1x3 patchify conv** (encoder, C_in=64, H=1023,W=163 → 256x81, sH=4 sW=2,
+   kH=1 kW=3, padW=0): naive k_conv2d, 4.7 ms for 0.5 GFlop = 109 GFLOPS. Each thread
+   does 192 FMAs against 192 dependent scalar loads (1 FMA/load) → LSU/issue bound.
+   TRIED AND NEUTRAL: 8/16/32 co per thread (weights become 96 broadcast loads per 96
+   FMAs), and hoisting the per-tap bounds checks into an interior fast path.
+   TO DO: full register+shared tiling — stage the (TR rows x 2TC+2 w) input strip and the
+   PCOx3 weights per ci in shared; per thread RW output cols x PCO co with float4 window
+   loads (target >=4 FMA/load). Floor = 42 MB read + 5 MB write = 0.3 ms; PCO=8 realistic
+   ~2 ms => -2.5..-4 ms = -0.5% of rtf_total. Gate: bit-identical if the tap order per
+   output is preserved.
+2. **Decoder mag/phase branches on 2 CUDA streams** (~0.3%): reuse_gpu_decoder_pre
+   resets the arena at entry (g->ws_off = 0), so the two branches must be called with the
+   reset hoisted out (allocate both branches' temporaries in one arena pass). Needs a
+   cudaStream_t threaded through decoder_pre -> launch_conv2d/inorm/sp_up (the #26 pattern).
+   dec_s is 0.035 s, so the ceiling is small; do it last.
+3. **Encoder skip-concat copies** (~0.2% + ~250 MB of Nano arena): dense_block_gpu does
+   10 cudaMemcpyAsync per forward (skip=x_in, 2 per layer, out=cur). `skip = x_in` and
+   `out = cur` are removable (init skip=x_in; last inorm writes out directly); the
+   per-layer `[cur, skip]` concat needs contiguity, so removing it requires the conv to
+   read two source pointers (a per-ci pointer select: ci < C1 ? x1 : x2 + (ci-C1)*H*W).
+4. **concat_f** 10.5 ms at 91 GB/s (58% of the 158 GB/s ceiling): tile-shape sweeps only.
+5. **k_transpose** 4.0 ms / 12 launches in the decoders: tile it like #36's gather.
 
-## Front/end
-10. **GPU STFT** (DFT-GEMM, same shape as the GPU iSTFT): CPU 0.081 s at 8 kHz
-    (RTF 0.016), 0.36 s at 16 kHz. Small on the dev host, 0.44 s on the Nano.
-11. **Fuse build_input** (mag/pha -> xin) into the STFT epilogue.
+## CLOSED chapters — do not retry (measured, with numbers in the experiment log)
+- in_conv (140 ms): accumulator-shape sweep 5x4 (2.2 FMA/load) is OPTIMAL; 4x8 +8%,
+  8x8 +23%, 256-row tile +48%; launch_bounds (256,3) taken in #45; KC sweep done (#18).
+  It is latency-bound, not LSU-bound (the opposite of out_proj).
+- convs (72 ms, r8 64-acc): issue-bound. Bank-conflict skew +50-74% (#48), float4 shared
+  loads neutral (#21), hoisted loads neutral (#30), launch_bounds spills (#39/#46),
+  Winograd adds instructions to an issue-bound kernel — skip.
+- out_proj (74 ms): 4x4 -> 8x8 gave -4% (#50). K-split (#41), more warps (#41),
+  fusion into the scan with atomics (#34), launch_bounds (#46) all neutral/worse.
+- scan (103 ms): prefetch (#25), unroll sweep (#32), fused out_proj (#34), launch_bounds
+  (#46), register->shared decay (#38 taken). L=256 serial chain at its floor.
+- InstanceNorm: thread count 128/256/512/1024 neutral, and fusing sum+sumsq into one
+  read pass is neutral (the 2nd read is L2-served), so the 3-pass structure costs nothing.
+- STFT/iSTFT/heads: 0.002+0.002+0.001 s, i.e. 0.4% of the metric. GPU STFT is
+  bit-identical on sm_53 and sm_61; on the Nano use REUSE_CPU_STFT=1 (0.091 vs 0.100 s).
 
-## Structural (bigger swings, more risk)
-12. **Persistent kernel** for the whole tower (one block per SM, work queue of
-    (block, direction, channel-tile) items): removes ~3600 launches.
-13. **Compensated fp32 (two-float) accumulation** to replace double in
-    InstanceNorm / iDFT hot loops: on the Nano fp64 is 1/64 rate, so the iSTFT
-    and InstanceNorm double accumulators are expensive there. Verify gates.
-14. Workspace: the arena resets per stage; check peak usage to enable a smaller
-    Nano arena (16 kHz needs 1.1 GiB today, which limits what else fits).
-
-## Measured: multi-stream / multi-process scaling (dev host, 8 kHz, 2 reps)
-Per-stream RTF_total: 1 stream 0.439 | 2 streams 0.932 | 4 streams 1.860 | 8 streams ~2.7 (2/8 OOM at 640 MB arena each).
-Aggregate RTF (wall/total audio): 0.439 / 0.962 / 0.953 / 0.76 -> the GPU saturates at ~1 stream;
-extra processes only add CUDA context switches. RTF<1 is reachable at 2 concurrent streams, not 4+.
-15. **Batch>1 (8 clips in one process, batch dim in the GEMMs/scan).** The ONLY form of "8 parallel"
-    that buys throughput: 8x work per launch, weights + launch overhead amortised, GEMM M dim 8x taller.
-    Highest-value Nano item (launches are serialised by CUDA_LAUNCH_BLOCKING there). Needs batch>1
-    threaded through the model graph (cfg says batch=1 today).
-16. **GPU STFT is written and validated in isolation** (`reuse_gpu_stft` in reuse_gpu.cu +
-    k_stft_prep/k_stft_dft/k_stft_head, opt-in REUSE_GPU_STFT, driver wired): 0.080 -> 0.010 s
-    (RTF 0.0157 -> 0.0020, ~3.5% of rtf_total; ~0.43 s on the Nano). Bit-identical to the CPU
-    reference (max|d|=0 on the real fixture) when run standalone. BLOCKED: in-app, 999/164381 mag
-    bins and 504 phase bins differ (max 1.04 / 3.14 = pi flips) and end-to-end SNR vs the CPU-STFT
-    run is 26.4 dB (deterministic, rep-independent, malloc-probe ruled out allocation). Next debug:
-    compare k_stft_dft's re/im in-app (dump dre/dim), check the tile grid (64,11) coverage vs the
-    isolated harness, and print wsize (app: nfft=320 hop=40 wsize=320 F=161 T=1021 nf=40800).
-
-## ACCURACY-MARGIN RISK (found in #18)
-The model's complex-spectrum rel-rms vs PyTorch sits within a factor ~1 of the 1e-4
-gate. Hoisting an integer `m / L` divide out of k_in_conv_r's tile-load loop (a pure
-scheduling/register-allocation change, ~3% faster) moved rel-rms to exactly 1.80e-04
-and FAILED the gate at 8 kHz. So:
-  - any change that perturbs instruction scheduling / FMA contraction can tip the gate;
-  - measure rel-rms (not just PASS/FAIL) when touching hot loops;
-  - buying margin: Kahan (two-float) accumulation in the fused in_proj GEMM's 64-term
-    K reduction, and/or in k_outproj_ln_g's 128-term dot product, would create headroom
-    for future scheduling optimisations. Verify the gate improves measurably first.
-## Manual gate protocol (checks.sh is authoritative; my ad-hoc loop is not)
-- checks.sh runs engine/reuse_nano_gpu, which ONLY measure.sh builds. Rebuild it yourself
-  with measure.sh's exact command before ad-hoc gate runs.
-- 16 kHz needs REUSE_WS_MB=1280 (1024 exhausts the arena and yields rel_rms ~0.48, a fake
-  model-accuracy failure).
-- Also pass REUSE_DUMP_AUDIO, else the waveform check compares a stale file (fake SNR fail).
-
-## Nano validation (measured 2026-11-03, at rtf_total 0.1199 dev host)
-Nano (tegra210, 1 SM, CUDA_LAUNCH_BLOCKING=1, REUSE_WS_MB=640, 8 kHz fixture, GPU iSTFT on):
-  RTF_total 3.5291 = model 3.4949 + stft(cpu) 0.0167 + istft(gpu) 0.0175.
-  Baseline was RTF_model 44.34 -> 3.49 = 12.7x. Phase split: tower 12.88 s (72%),
-  encoder 3.44 (19%), decoders 1.48 (8%).
-  CPU STFT OpenMP scaling on the 4 Cortex-A57 cores: 0.3013 s (1 thread) -> 0.0891 s
-  (4 threads) = 3.4x, so #24 transferred to the Nano (its share is tiny there).
-  IMPORTANT - launch-count work is NOT a Nano priority: ~400 launches per forward with
-  a device sync each = 20-40 ms out of 17.8 s = 0.2%. The Nano's cost is raw compute
-  (1 SM / 128 cores @ 921 MHz), so the dev host is a faithful proxy. Ideas #2 (fuse the
-  direction chain), #7 (persistent kernel) and #12 (CUDA graphs / launch reduction) are
-  accordingly LOW value - deprioritise them.
-
-## Nano validation #2 (dev-host rtf_total 0.1080)
-Nano (tegra210, CUDA_LAUNCH_BLOCKING=1, REUSE_WS_MB=640, run_bench.sh feeds the reference
-STFT so stft(cpu)=0): RTF_total 3.4718 = model 3.4543 + istft 0.0175.
-Phases: encoder 3.439 | tower 12.676 | decoders 1.478 | heads 0.011.
-Previous Nano check (dev host 0.1199): model 3.4949, tower 12.88, encoder 3.44, dec 1.48.
-=> The last three keeps (x_proj register blocking, outproj_ln tiled GEMM, dt_proj+scan
-fusion) moved the dev host -10% and the Nano only -1.2% (tower -1.6%).
-INTERPRETATION: the Nano has 16 warps/SM (Maxwell) at 921 MHz, so its kernels are
-latency-bound; the dev host (2048 threads/SM, 158 GB/s) is at the DRAM/issue floor for
-these kernels, so traffic/ILP wins there do not transfer 1:1.
-CONSEQUENCE: the scored metric is the dev host - keep optimising the dev host; do not tune
-for the Nano (fewer registers / less shared memory helps the Nano and hurts the dev host).
-Expect ~10-15% Nano transfer for a dev-host tower win.
-
-## Nano validation #3 (dev host rtf_total 0.1072 / rtf_model 0.0986)
-Nano 8 kHz: RTF_total 3.2882 = model 3.2708 + istft 0.0175 (run_bench feeds the ref STFT).
-Phases: encoder 3.445 | tower 11.811 | decoders 1.399 | heads 0.012.  16 kHz: RTF_model 6.3683.
-Trajectory: model 3.4949 (#31 era, dev 0.1199) -> 3.4543 (#33 era, dev 0.1080) -> 3.2708 (now).
-Transfer ratio for the last 5 keeps: dev -10.6%, Nano -6.4% => ~60% (the previous window was
-12%: that window's keeps were pure GEMM register blocking, this one added dt_proj+scan fusion
-and the tiled gather, i.e. memory-pattern wins transfer, FMA-ratio wins do not).
-Cumulative vs the 44.34 RTF_model baseline: 13.6x.
-
-## CPU STFT: pre-pass + 4-chain ILP (built & validated, NOT kept — measurement-bound)
-`reuse_stft_mag_pha` computed `x[idx]*w[n]` plus the two reflect-pad branches per
-(bin, frame, n), i.e. F=161x redundant, and reduced into a single dependent fp64
-chain (4-cycle add latency -> ~8x of the FMA issue rate idle).
-Fix: a parallel pre-pass building xw[t][n] = windowed x (1.3 MB, one pass), then
-a bin-major dot product with 4 independent accumulator chains
-((re0+re1)+(re2+re3)). Measured best-of-5 with interleaved builds: 0.0188 s
-median (min 0.0070) vs 0.0305 s (min 0.0295) = -38%. End-to-end audio rel rms
-9.5e-08 vs the committed build = the iSTFT atomics floor, i.e. numerically
-invisible; checks.sh passes (the gate feeds the reference STFT, so STFT
-correctness rests on the end-to-end audio diff, which is the strong test: a
-phase flip shows up in the waveform).
-NOT KEPT because rtf_stft's run-to-run spread on this host is 0.0026-0.0155
-(4x, = +/-5% of rtf_total) under CPU contention, which swamps a 0.012 s effect.
-Re-measure when the host is quiet; validate on the Nano, where the STFT is
-0.0891 s = 2.7% of Nano RTF and the same ILP deficit applies (A57 at ~0.6 of
-~1.7 GFLOPS/core fp64).
+## Deployment (Nano) rules learned
+- Any kernel whose per-thread register demand rises must be Nano-validated: sm_53
+  COMPILES 64-accumulator kernels and fails at LAUNCH ("too many resources requested").
+  checks.sh cannot see that. Use gpu_is_maxwell() (honours REUSE_FORCE_MAXWELL_TILES=1).
+- Fastest strong Nano check: run both machines with the fed-reference protocol +
+  REUSE_DUMP_AUDIO and diff the waveforms (140 dB = bit-compatible). Binary is
+  ./engine/reuse_nano_gpu, blob tests/golden/reuse.blob, needs REUSE_WS_MB=640 (8k) /
+  1280 (16k); reps must be >=2 or "model best" prints 1e30 (rep 0 is warm-up).
+- Memory-pattern wins transfer ~1:1 to the Nano; FMA-ratio/accumulator wins do not
+  (Maxwell is latency-bound at 16 warps/SM). Score the dev host, deploy with the guards.
