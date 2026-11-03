@@ -2139,7 +2139,7 @@ extern "C" int reuse_gpu_encoder(reuse_gpu_t *g, const float *xin, float *enc, i
 // ================================================================= Mamba
 
 static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float *out,
-                         int S, int L, int rev)
+                         int S, int L, int rev, cudaStream_t st)
 {
     char key[256];
     snprintf(key, sizeof(key), "%s.in_proj.weight", pfx);  const float *W_in  = reuse_gpu_w(g, key);
@@ -2174,30 +2174,30 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
             const int kc = fuse_kc();
             if (fuse_tile() == 128) {          // 128 measured slower (0.638 vs 0.555 s):
                                                // the traffic model lost to 110 registers/block
-                k_in_conv_r2<32><<<dim3((unsigned)((SL+FUSE_MT2-1)/FUSE_MT2), (2*DINNER)/64), dim3(16,16)>>>(
+                k_in_conv_r2<32><<<dim3((unsigned)((SL+FUSE_MT2-1)/FUSE_MT2), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev);
             }
             else if (kc == 16)
-                k_in_conv_r<16><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16)>>>(
+                k_in_conv_r<16><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev);
             else if (kc == 8)
-                k_in_conv_r<8><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16)>>>(
+                k_in_conv_r<8><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev);
             else
-                k_in_conv_r<32><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16)>>>(
+                k_in_conv_r<32><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev);
         }
-        else if (tiled == 2) k_in_proj_r<<<dim3((unsigned)((SL+63)/64), (2*DINNER)/64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
-        else if (tiled) k_in_proj_t<<<dim3((unsigned)((SL+MT32-1)/MT32), (2*DINNER)/NT64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
-        else       k_in_proj<<<dim3((unsigned)((SL+255)/256), 2*DINNER), b1>>>(x, W_in, x0, z, S, L, rev);
+        else if (tiled == 2) k_in_proj_r<<<dim3((unsigned)((SL+63)/64), (2*DINNER)/64), dim3(16,16), 0, st>>>(x, W_in, x0, z, S, L, rev);
+        else if (tiled) k_in_proj_t<<<dim3((unsigned)((SL+MT32-1)/MT32), (2*DINNER)/NT64), dim3(16,16), 0, st>>>(x, W_in, x0, z, S, L, rev);
+        else       k_in_proj<<<dim3((unsigned)((SL+255)/256), 2*DINNER), b1, 0, st>>>(x, W_in, x0, z, S, L, rev);
     }
     kp_mark("in_proj", &klast);
     GDBG("x0", x0, (size_t)SL*DINNER); GDBG("z", z, (size_t)SL*DINNER);
     {
         static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_CONV") ? 0 : 1;
         if (getenv("REUSE_SKIP_CONV") || fuse_conv()) { } else
-        if (t) k_conv_causal_t<<<(unsigned)((SL+7)/8), 256>>>(x0, W_c, B_c, xc, S, L);
-        else   k_conv_causal<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(x0, W_c, B_c, xc, S, L);
+        if (t) k_conv_causal_t<<<(unsigned)((SL+7)/8), 256, 0, st>>>(x0, W_c, B_c, xc, S, L);
+        else   k_conv_causal<<<dim3((unsigned)((SL+255)/256), DINNER), b1, 0, st>>>(x0, W_c, B_c, xc, S, L);
     }
     kp_mark("conv", &klast);
     GDBG("gxact", xc, (size_t)SL*DINNER);
@@ -2205,8 +2205,8 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         static int tiled = -1;
         if (tiled < 0) tiled = getenv("REUSE_NAIVE_XPROJ") ? 0 : 1;
         if (getenv("REUSE_SKIP_XPROJ")) { } else
-        if (tiled) k_x_proj_t<<<dim3((XP+31)/32, (unsigned)((SL+63)/64)), dim3(16,16)>>>(xc, W_xp, xdbl, SL);
-        else       k_x_proj<<<dim3((unsigned)((SL+255)/256), XP), b1>>>(xc, W_xp, xdbl, SL);
+        if (tiled) k_x_proj_t<<<dim3((XP+31)/32, (unsigned)((SL+63)/64)), dim3(16,16), 0, st>>>(xc, W_xp, xdbl, SL);
+        else       k_x_proj<<<dim3((unsigned)((SL+255)/256), XP), b1, 0, st>>>(xc, W_xp, xdbl, SL);
     }
     kp_mark("x_proj", &klast);
     GDBG("gxdbl", xdbl, (size_t)SL*XP);
@@ -2214,17 +2214,17 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         static int t = -1;
         if (t < 0) { const char *e = getenv("REUSE_DTPROJ"); t = e ? atoi(e) : (getenv("REUSE_NAIVE_DTPROJ") ? 0 : 2); }
         if (getenv("REUSE_SKIP_DTPROJ")) { } else
-        if (t == 2) k_dt_proj_r<<<(unsigned)((SL+7)/8), 256>>>(xdbl, W_dt, B_dt, dtt, SL);
-        else if (t) k_dt_proj_t<<<(unsigned)((SL+7)/8), 256>>>(xdbl, W_dt, B_dt, dtt, SL);
-        else   k_dt_proj<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(xdbl, W_dt, B_dt, dtt, SL);
+        if (t == 2) k_dt_proj_r<<<(unsigned)((SL+7)/8), 256, 0, st>>>(xdbl, W_dt, B_dt, dtt, SL);
+        else if (t) k_dt_proj_t<<<(unsigned)((SL+7)/8), 256, 0, st>>>(xdbl, W_dt, B_dt, dtt, SL);
+        else   k_dt_proj<<<dim3((unsigned)((SL+255)/256), DINNER), b1, 0, st>>>(xdbl, W_dt, B_dt, dtt, SL);
     }
     kp_mark("dt_proj", &klast);
     GDBG("gdt", dtt, (size_t)SL*DINNER);
     {
         static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_SCAN") ? 0 : 1;
         if (getenv("REUSE_SKIP_SCAN")) { } else
-        if (t) k_scan_b<<<dim3((unsigned)((S+7)/8), DINNER/32), 256>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
-        else   k_scan<<<dim3((unsigned)S, DINNER/32), 32>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
+        if (t) k_scan_b<<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
+        else   k_scan<<<dim3((unsigned)S, DINNER/32), 32, 0, st>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
     }
     kp_mark("scan", &klast);
     GDBG("gscan", y, (size_t)SL*DINNER);
@@ -2233,10 +2233,10 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         if (tiled < 0) tiled = getenv("REUSE_NAIVE_OP") ? 0 : 1;
         if (tiled) {
             dim3 g((HID+GT-1)/GT, (unsigned)((SL+GT-1)/GT));
-            k_out_proj_tiled<<<g, dim3(GT/2, GT/2)>>>(y, z, W_op, out, (int)SL);
+            k_out_proj_tiled<<<g, dim3(GT/2, GT/2), 0, st>>>(y, z, W_op, out, (int)SL);
         } else {
             if (!getenv("REUSE_SKIP_GATEOP"))
-            k_gate_outproj<<<dim3((unsigned)((SL+255)/256), HID), b1>>>(y, z, W_op, out, SL);
+            k_gate_outproj<<<dim3((unsigned)((SL+255)/256), HID), b1, 0, st>>>(y, z, W_op, out, SL);
         }
     }
     kp_mark("gate_outproj", &klast);
@@ -2257,9 +2257,31 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
     if (!fw || !bw || !cat) return 1;
     char p[256];
     snprintf(p, sizeof(p), "%s.forward_blocks", pfx);
-    if (mamba_dir_gpu(g, p, x, fw, S, L, 0)) return 1;
-    snprintf(p, sizeof(p), "%s.backward_blocks", pfx);
-    if (mamba_dir_gpu(g, p, x, bw, S, L, 1)) return 1;
+    // The two scan directions are independent, so the backward one runs on a
+    // side stream: each direction is a chain of 5 dependent launches, and the
+    // ramp-down of one overlaps the ramp-up of the other.
+    static cudaStream_t st_side = 0;
+    static cudaEvent_t ev1, ev2;
+    static int two = -1;
+    if (two < 0) {
+        two = getenv("REUSE_STREAMS") ? atoi(getenv("REUSE_STREAMS")) : 1;
+        if (two && !st_side) {
+            if (cudaStreamCreateWithFlags(&st_side, cudaStreamNonBlocking) ||
+                cudaEventCreateWithFlags(&ev1, cudaEventDisableTiming) ||
+                cudaEventCreateWithFlags(&ev2, cudaEventDisableTiming)) { g->bad = 1; return 1; }
+        }
+    }
+    if (two) {
+        if (cudaEventRecord(ev1, 0) || cudaStreamWaitEvent(st_side, ev1, 0)) { g->bad = 1; return 1; }
+        if (mamba_dir_gpu(g, p, x, fw, S, L, 0, 0)) return 1;
+        snprintf(p, sizeof(p), "%s.backward_blocks", pfx);
+        if (mamba_dir_gpu(g, p, x, bw, S, L, 1, st_side)) return 1;
+        if (cudaEventRecord(ev2, st_side) || cudaStreamWaitEvent(0, ev2, 0)) { g->bad = 1; return 1; }
+    } else {
+        if (mamba_dir_gpu(g, p, x, fw, S, L, 0, 0)) return 1;
+        snprintf(p, sizeof(p), "%s.backward_blocks", pfx);
+        if (mamba_dir_gpu(g, p, x, bw, S, L, 1, 0)) return 1;
+    }
     if (getenv("REUSE_SKIP_CONCAT")) {
     } else if (getenv("REUSE_NAIVE_CONCAT")) {
         k_concat<<<(unsigned)((SL+255)/256), 256>>>(fw, bw, x, cat, S, L);
