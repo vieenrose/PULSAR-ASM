@@ -531,6 +531,18 @@ __global__ void k_crop_ft(const float *src, float *out, int T, int F, int Fx)
 }
 
 // mag/pha are [F,T]; xin is [2,Tp,Fp] with 2 zero freq cols and 2 zero time rows.
+__global__ void k_mag_pha_split(const float *mag, const float *pha, float *Cr, float *Ci, long n)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    double m = (double)mag[i];
+    if (m < 0.0) m = 0.0;
+    double mv = exp(m) - 1.0;
+    double p = (double)pha[i];
+    Cr[i] = (float)(mv * cos(p));
+    Ci[i] = (float)(mv * sin(p));
+}
+
 __global__ void k_build_input(const float *mag, const float *pha, float *xin, int T, int F)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -563,6 +575,112 @@ __global__ void k_sweep_mask(float *amp, int T, int F)
     }
     if ((float)nz / (float)F > 0.5f)
         for (int f = 0; f < F; f++) amp[(long)f*T + t] = 0.0f;
+}
+
+// ================================================================= iSTFT (GPU)
+
+// y[n][t] = (m_k / n_fft) * sum_k ( Cr[k][t]*cos(2*pi*n*k/N) - Ci[k][t]*sin(...) )
+// with m_k = 1 for DC/Nyquist and 2 for interior bins (conjugate pair).
+// Built as two real GEMMs against a float64-rounded DFT matrix so the result
+// matches the double-accumulating CPU reference to fp32 rounding.
+__global__ void k_idft(const float *Cr, const float *Ci, const float *Cc, const float *Cs,
+                       float *Y, int F, int T, int n_fft)
+{
+    // Y[n][t] = sum_k Cr[k][t]*Cc[n][k] + Ci[k][t]*Cs[n][k], accumulated in double
+    // (the CPU reference sums in double; float accumulation would not match).
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int t0 = blockIdx.y * 16;
+    if (n >= n_fft) return;
+    double acc[16];
+#pragma unroll
+    for (int i2 = 0; i2 < 16; i2++) acc[i2] = 0.0;
+    for (int k = 0; k < F; k++) {
+        double cv = (double)Cc[(long)n*F + k], sv = (double)Cs[(long)n*F + k];
+        const float *crp = Cr + (long)k*T + t0;
+        const float *cip = Ci + (long)k*T + t0;
+        int rem = T - t0;
+#pragma unroll 4
+        for (int j2 = 0; j2 < 16; j2++) {
+            if (j2 < rem) {
+                acc[j2] = fma(cv, (double)crp[j2], acc[j2]);
+                acc[j2] = fma(sv, (double)cip[j2], acc[j2]);
+            }
+        }
+    }
+    int rem = T - t0;
+#pragma unroll
+    for (int j2 = 0; j2 < 16; j2++)
+        if (j2 < rem) Y[(long)n*T + t0 + j2] = (float)acc[j2];
+}
+
+// overlap-add with the analysis window, then normalise by sum(w^2).
+__global__ void k_ola(const float *Y, const float *w, float *out, float *wsum,
+                      int F, int T, int n_fft, int hop, int pad, int out_len)
+{
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.y;
+    if (n >= n_fft || t >= T) return;
+    int idx = t*hop - pad + n;
+    float wv = w[n];
+    if (idx >= 0 && idx < out_len) {
+        atomicAdd(&out[idx],  Y[(long)n*T + t] * wv);
+        atomicAdd(&wsum[idx], wv * wv);
+    }
+}
+
+__global__ void k_norm_ola(float *out, const float *wsum, int out_len)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < out_len && wsum[i] > 1e-12f) out[i] /= wsum[i];
+}
+
+extern "C" int reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *d_pha,
+                               int F, int T, int n_fft, int hop, int win,
+                               float *d_out, int out_len)
+{
+    if (g->bad) return 1;
+    // host-side tables in double, stored as float (matches the CPU reference)
+    float *Cc = (float*)malloc((size_t)n_fft*F*sizeof(float));
+    float *Cs = (float*)malloc((size_t)n_fft*F*sizeof(float));
+    float *hw = (float*)malloc((size_t)n_fft*sizeof(float));
+    for (int n = 0; n < n_fft; n++) {
+        for (int k = 0; k < F; k++) {
+            double m = (k == 0 || 2*k == n_fft) ? 1.0 : 2.0;
+            double ang = 2.0 * M_PI * n * k / (double)n_fft;
+            Cc[(long)n*F + k] = (float)( m * cos(ang) / n_fft);
+            Cs[(long)n*F + k] = (float)(-m * sin(ang) / n_fft);
+        }
+    }
+    for (int i = 0; i < n_fft; i++) hw[i] = 1.0f;
+    for (int i = 0; i < win && i < n_fft; i++)
+        hw[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / win));
+    float *d_Cc, *d_Cs, *d_w, *d_Cr, *d_Ci, *d_Y, *d_wsum;
+    size_t nf = (size_t)n_fft*F, ft = (size_t)F*T, nt = (size_t)n_fft*T;
+    if (cudaMalloc(&d_Cc, nf*sizeof(float)) || cudaMalloc(&d_Cs, nf*sizeof(float)) ||
+        cudaMalloc(&d_w, n_fft*sizeof(float)) || cudaMalloc(&d_Cr, ft*sizeof(float)) ||
+        cudaMalloc(&d_Ci, ft*sizeof(float)) || cudaMalloc(&d_Y, nt*sizeof(float)) ||
+        cudaMalloc(&d_wsum, (size_t)out_len*sizeof(float))) {
+        fprintf(stderr, "istft: gpu OOM\n"); cudaGetLastError();
+        free(Cc); free(Cs); free(hw); return 1;
+    }
+    cudaMemcpy(d_Cc, Cc, nf*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Cs, Cs, nf*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w, hw, n_fft*sizeof(float), cudaMemcpyHostToDevice);
+    // mag -> linear (expm1(relu)) then split phase
+    long nsp = ft;
+    k_mag_pha_split<<<(unsigned)((nsp+255)/256), 256>>>(d_mag, d_pha, d_Cr, d_Ci, nsp);
+    k_idft<<<dim3((unsigned)((n_fft+127)/128), (unsigned)((T+15)/16)), 128>>>(
+        d_Cr, d_Ci, d_Cc, d_Cs, d_Y, F, T, n_fft);
+    cudaMemset(d_out, 0, (size_t)out_len*sizeof(float));
+    cudaMemset(d_wsum, 0, (size_t)out_len*sizeof(float));
+    k_ola<<<dim3((unsigned)((n_fft+127)/128), (unsigned)T), dim3(128, 1)>>>(
+        d_Y, d_w, d_out, d_wsum, F, T, n_fft, hop, n_fft/2, out_len);
+    k_norm_ola<<<(unsigned)((out_len+255)/256), 256>>>(d_out, d_wsum, out_len);
+    int rc = reuse_gpu_ok(g, "istft_gpu");
+    cudaFree(d_Cc); cudaFree(d_Cs); cudaFree(d_w); cudaFree(d_Cr); cudaFree(d_Ci);
+    cudaFree(d_Y); cudaFree(d_wsum);
+    free(Cc); free(Cs); free(hw);
+    return rc;
 }
 
 // ================================================================= helpers

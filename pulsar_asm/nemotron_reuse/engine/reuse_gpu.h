@@ -14,6 +14,9 @@ typedef struct reuse_gpu_s reuse_gpu_t;
 reuse_gpu_t *reuse_gpu_create(const reuse_blob_t *blob);
 void         reuse_gpu_destroy(reuse_gpu_t *g);
 void         reuse_gpu_set_skips(void);
+int          reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *d_pha,
+                             int F, int T, int n_fft, int hop, int win,
+                             float *d_out, int out_len);
 void         reuse_gpu_print_kprof(void);
 void         reuse_gpu_get_times(double *enc, double *blk, double *dec, double *head);
 const float *reuse_gpu_w(reuse_gpu_t *g, const char *name);   // device pointer

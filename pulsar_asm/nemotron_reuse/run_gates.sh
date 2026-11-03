@@ -26,6 +26,7 @@ run_rate() {
     *) echo "unknown rate $r"; return 1 ;;
   esac
   echo "############ $r Hz (F=$F T=$T) ############"
+  export REUSE_WS_MB="${REUSE_WS_MB:-$(_ws_for_rate "$r")}"
   if [ ! -f "$ref/in_mag.raw" ]; then
     echo "missing $ref/in_mag.raw - the model gate must be fed the REFERENCE (PyTorch) STFT." >&2
     echo "Regenerate with ref/ref_full.py; do NOT substitute engine STFT (tests/stft_dump.c)." >&2

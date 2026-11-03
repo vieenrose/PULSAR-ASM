@@ -117,10 +117,29 @@ why the earlier tiled-GEMM experiment (which left out_proj alone) showed no
 gain. Replacing it with a 32x32 shared-memory tiled kernel that fuses
 `y * silu(z)` into the A-tile load took the tower from 47.5 s to 8.6 s.
 
-Next targets, in order: the `in_proj` projection (tiled, register-blocked),
-the concat/residual transpose-scatter kernels (pure memory motion), and moving
-STFT/iSTFT to the GPU (iSTFT alone is RTF 1.36 on the Nano - it is the single
-largest non-model cost).
+### iSTFT moved to the GPU (`REUSE_GPU_ISTFT=1`)
+
+The iSTFT is a DFT-GEMM: `Y[n][t] = sum_k Cr[k][t]*Cc[n][k] + Ci[k][t]*Cs[n][k]`
+with the DFT table built in float64 on the host and accumulation in double
+(Tegra fp64 is 1/64 rate, so this is the accuracy/speed trade; the CPU
+reference also accumulates in double). Then a windowed overlap-add with
+`atomicAdd` and a `sum(w^2)` normalisation.
+
+| | CPU iSTFT | GPU iSTFT | speedup | waveform SNR |
+|---|---|---|---|---|
+| 8 kHz (dev host) | 1.27 s | 0.0103 s | 123x | 119.87 dB (CPU: 119.91) |
+| 16 kHz (dev host) | 4.29 s | 0.0365 s | 117x | 123.96 dB (CPU: 123.99) |
+
+On the Nano the CPU iSTFT cost 6.91 s (RTF 1.36) on 4x A57 - it was the
+largest non-model cost; GPU iSTFT is ~0.1 s there.
+
+Dev-host total with GPU iSTFT: **RTF_total 1.92 at 8 kHz** (was 2.13),
+**3.90 at 16 kHz** (was 4.71).
+
+Next targets, in order: the encoder convolutions (43.5 s = 19% of Nano model
+time, naive), the `in_proj` projection (tiled, register-blocked), the
+concat/residual transpose-scatter kernels (pure memory motion), and the STFT
+front-end (still CPU, 0.44 s on the Nano).
 
 ## Nano-only blockers found (all fixed)
 1. **Arena unit bug.** `REUSE_WS_MB` was megabytes-of-*floats*, so the default
@@ -160,9 +179,9 @@ every downstream number is meaningless. Verify with
 
 ## Next steps
 Ordered by expected RTF impact on the Nano:
-1. **iSTFT/STFT on the GPU.** iSTFT alone is RTF 1.36 on the Nano (CPU, 4x A57)
-   - larger than everything except the tower. The DFT-GEMM kernels already
-   exist on the CPU and handle nfft=1764/1920.
+1. **(done) iSTFT on the GPU** - see the iSTFT section above; `REUSE_GPU_ISTFT=1`.
+   The STFT front-end is still on the CPU (0.44 s on the Nano) and is the same
+   DFT-GEMM shape, so it is a small follow-on.
 2. **Encoder convolutions.** 43.5 s of Nano time (19%) in naive convs; tiled
    shared-memory convolutions, and the dense-block concat in shared memory.
 3. **in_proj + the concat/residual scatters.** in_proj is 163 GFLOPS (at the

@@ -6,6 +6,7 @@
 #include "stft_dft.cuh"
 #include "istft_dft.cuh"
 #include "reuse_gpu.h"
+#include "reuse_gpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,9 +97,23 @@ int main(int argc, char **argv)
     cudaMemcpy(h_phaout, d_phaout, nsp*sizeof(float), cudaMemcpyDeviceToHost);
     t_load = now_s() - t1;
 
-    double t_istft0 = now_s();
-    reuse_istft(h_amp, h_phaout, F, T, nfft, hop, wsize, out, nf);
-    double t_istft = now_s() - t_istft0;
+    double t_istft = 0;
+    if (getenv("REUSE_GPU_ISTFT")) {
+        float *d_out = NULL;
+        if (cudaMalloc(&d_out, (size_t)nf*sizeof(float))) { printf("istft gpu OOM\n"); return 1; }
+        double t0 = now_s();
+        if (reuse_gpu_istft(g, d_amp, d_phaout, F, T, nfft, hop, wsize, d_out, nf)) {
+            printf("gpu istft fail\n"); return 1;
+        }
+        cudaDeviceSynchronize();
+        t_istft = now_s() - t0;
+        cudaMemcpy(out, d_out, (size_t)nf*sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_out);
+    } else {
+        double t0 = now_s();
+        reuse_istft(h_amp, h_phaout, F, T, nfft, hop, wsize, out, nf);
+        t_istft = now_s() - t0;
+    }
 
     const char *da = getenv("REUSE_DUMP_AMP");
     if (da) { FILE *f = fopen(da, "wb"); fwrite(h_amp, sizeof(float), nsp, f); fclose(f); }
