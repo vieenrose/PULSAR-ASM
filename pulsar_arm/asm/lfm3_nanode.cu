@@ -2563,6 +2563,7 @@ static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const fl
 static bool is_attn_g[NLAYER], is_slide_g[NLAYER];   // mirrors main's locals, for the T-wide driver
 static float bf2f_host(bf16 v) { uint32_t u = (uint32_t)v << 16; float f; memcpy(&f, &u, 4); return f; }
 static int pfCT = -1, pfARM = -1, pfRB = -1, pfRPB = -1, pfForce = -1;
+static int g_pfChunk = 0;   // --prefill-run T: chunked T-wide prefill inside the real step loop
 static void pf_set_arm(int a) { pfForce = a; pfCT = -1; }   // pfCT<0 forces a re-init
 
 static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
@@ -3341,10 +3342,25 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   return 0;
 }
 
-static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* emb) {
-  if (Tn < 2 || Tn > 64) { printf("--prefill-e2e: T=%d out of range 2..64\n", Tn); return 2; }
-  const int N = (int)prompt.size();
-  PF4Arena A; memset(&A, 0, sizeof A);
+// The lm_head arms as ONE function, conditions copied verbatim from the step loop.
+// The driver needs the identical head on the last prompt position; copying the block
+// would let the two heads drift, and a head that drifts changes the argmax -- the
+// argmax IS the measurement. (My first attempt here invented a `g_lmhead` knob that
+// does not exist: the real chain dispatches on the embedding tensor's dtype and
+// M.emb_mode. Exact-text asserts caught that, and a second one caught me inventing the
+// driver's own parameter names -- it takes (Model&, int Tn, prompt, Ent* emb).)
+static void head_logits_from(Model& M, const bf16* li, Ent* eemb) {
+  if (eemb && eemb->dtype == 3 && M.emb_mode == 1 && M.hemb.hc)
+    lm_head_bf16_host(M, M.hemb, li, M.lgf);  // certified arm, host-staged
+  else if (eemb && eemb->dtype == 3)
+    lm_head_bf16(M, eemb, li, M.lgf);         // certified arm, resident
+  else if (M.emb_mode == 1)
+    lm_head_host(M, M.hemb, li, M.lgf);       // Q8 streamed from pinned host
+  else gemv_f(M, EMBNAME, li, M.lgf);         // tied lm_head, resident
+}
+
+static int pf4_arena_alloc(PF4Arena& A, int Tn) {
+  memset(&A, 0, sizeof A);
   const size_t rowH = (size_t)H, rowI = (size_t)INTER, row3 = 3 * (size_t)H;
   cudaMalloc(&A.xb, (size_t)Tn * rowH * 2);   cudaMalloc(&A.h1, (size_t)Tn * rowH * 2);
   cudaMalloc(&A.q, (size_t)Tn * NH * HD * 2); cudaMalloc(&A.k, (size_t)Tn * NKV * HD * 2);
@@ -3354,6 +3370,43 @@ static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* em
   cudaMalloc(&A.w1, (size_t)Tn * rowI * 2);   cudaMalloc(&A.w3, (size_t)Tn * rowI * 2);
   cudaMalloc(&A.hout, (size_t)Tn * rowH * 2);
   cudaMalloc(&A.part, (size_t)Tn * 10000 * 4);
+  if (!A.xb || !A.h1 || !A.q || !A.k || !A.v || !A.gate || !A.attn || !A.h2 ||
+      !A.bx || !A.cy || !A.w1 || !A.w3 || !A.hout || !A.part) {
+    printf("PF4: arena cudaMalloc failed (T=%d)\n", Tn); return 1;
+  }
+  return 0;
+}
+
+// Embed a chunk's positions, through the SAME paths the T=1 loop uses (bf16 copy,
+// host-Q8 dequant, resident Q8 dequant). Shared with the integrated --prefill-run.
+static int pf4_embed_chunk(Model& M, PF4Arena& A, const std::vector<int>& prompt,
+                           int c0, int Tc, Ent* emb) {
+  for (int t = 0; t < Tc; t++) {
+    const int tok = prompt[c0 + t];
+    bf16* dst = A.xb + (size_t)t * H;
+    if (emb->dtype == 3) {
+      const char* src = (M.emb_mode == 1 && M.hemb.hc) ? (const char*)M.hemb.hc : (const char*)emb->dq;
+      cudaMemcpy(dst, src + (size_t)tok * H * 2, (size_t)H * 2,
+                 M.emb_mode == 1 ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice);
+    } else if (M.emb_mode == 1) {
+      const int sb = H / Q8_BLK;
+      cudaMemcpyAsync(M.hemb.dc, M.hemb.hc + (size_t)tok * H, (size_t)H, cudaMemcpyHostToDevice, 0);
+      cudaMemcpyAsync(M.hemb.dsl, M.hemb.hs + (size_t)tok * sb, (size_t)sb * 4, cudaMemcpyHostToDevice, 0);
+      k_dequant_row<<<(H + 255) / 256, 256, 0, g_launch>>>(M.hemb.dc, M.hemb.dsl, dst, H);
+    } else {
+      k_dequant_row<<<(H + 255) / 256, 256, 0, g_launch>>>(emb->dq + (size_t)tok * H,
+                                             emb->ds + (size_t)tok * (H / Q8_BLK), dst, H);
+    }
+  }
+  cudaDeviceSynchronize();
+  return cudaGetLastError() != cudaSuccess;
+}
+
+static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* emb) {
+  if (Tn < 2 || Tn > 64) { printf("--prefill-e2e: T=%d out of range 2..64\n", Tn); return 2; }
+  const int N = (int)prompt.size();
+  PF4Arena A; memset(&A, 0, sizeof A);
+  if (pf4_arena_alloc(A, Tn)) return 1;
   { int c = 0; for (int L = 0; L < NLAYER; L++) { pf4_conv_idx[L] = c; if (!is_attn_g[L]) c++; }
     if (c != NCONV) { printf("PF4-E2E: conv count %d != NCONV %d\n", c, NCONV); return 2; } }
   // The shipped path zeroes the KV caches in its WARM-UP step (s < 0, next to the ring
@@ -3366,25 +3419,7 @@ static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* em
   struct timespec t0, t1; cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t0);
   for (int c0 = 0; c0 < N; c0 += Tn) {
     const int Tc = (N - c0 < Tn) ? N - c0 : Tn;
-    // Embeddings for the chunk, through the same paths the T=1 loop uses.
-    for (int t = 0; t < Tc; t++) {
-      const int tok = prompt[c0 + t];
-      bf16* dst = A.xb + (size_t)t * H;
-      if (emb->dtype == 3) {
-        const char* src = (M.emb_mode == 1 && M.hemb.hc) ? (const char*)M.hemb.hc : (const char*)emb->dq;
-        cudaMemcpy(dst, src + (size_t)tok * H * 2, (size_t)H * 2,
-                   M.emb_mode == 1 ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice);
-      } else if (M.emb_mode == 1) {
-        const int sb = H / Q8_BLK;
-        cudaMemcpyAsync(M.hemb.dc, M.hemb.hc + (size_t)tok * H, (size_t)H, cudaMemcpyHostToDevice, 0);
-        cudaMemcpyAsync(M.hemb.dsl, M.hemb.hs + (size_t)tok * sb, (size_t)sb * 4, cudaMemcpyHostToDevice, 0);
-        k_dequant_row<<<(H + 255) / 256, 256, 0, g_launch>>>(M.hemb.dc, M.hemb.dsl, dst, H);
-      } else {
-        k_dequant_row<<<(H + 255) / 256, 256, 0, g_launch>>>(emb->dq + (size_t)tok * H,
-                                               emb->ds + (size_t)tok * (H / Q8_BLK), dst, H);
-      }
-    }
-    if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E embedding launch failed at chunk %d\n", c0); return 1; }
+    if (pf4_embed_chunk(M, A, prompt, c0, Tc, emb)) { printf("PF4-E2E embedding failed at chunk %d\n", c0); return 1; }
     for (int L = 0; L < NLAYER; L++) {
       if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-E2E: layer %d failed\n", L); return 1; }
       // Per-layer rms of position 0, to be read against the T=1 path's own
@@ -3407,6 +3442,19 @@ static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* em
   const int last = (N - 1) % Tn;
   std::vector<bf16> hy((size_t)H);
   cudaMemcpy(hy.data(), A.xb + (size_t)last * H, (size_t)H * 2, cudaMemcpyDeviceToHost);
+  // The acceptance test that matters is the TOKEN: the chunk's last prompt row through
+  // the shared head, argmaxed -- directly comparable to the shipped T=1 path's token
+  // generated at the same position.
+  cudaMemcpy(M.x, A.xb + (size_t)last * H, (size_t)H * 2, cudaMemcpyDeviceToDevice);
+  {
+    Ent* fn = T(M, "lfm.model.embedding_norm.weight");
+    rms1(M, M.x, fn ? fn->df : nullptr, M.h1);
+    head_logits_from(M, M.h1, emb);
+    k_argmax<<<1, 256, 0, g_launch>>>(M.lgf, M.tok_dev, VOCAB);
+    cudaDeviceSynchronize();
+    int tok = -1; cudaMemcpy(&tok, M.tok_dev, 4, cudaMemcpyDeviceToHost);
+    printf("PF4-E2E T=%d: first generated id = %d  (prompt %d ids)\n", Tn, tok, (int)prompt.size());
+  }
   FILE* o = fopen("/tmp/pf4_x_last.bin", "wb");
   if (o) { fwrite(hy.data(), 2, H, o); fclose(o); }
   double s2 = 0; long nz = 0;
@@ -3447,6 +3495,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--prefill-h2batched")) emb_mode_req = 4;
     else if (!strcmp(argv[i], "--prefill-chunk") && i + 1 < argc) { emb_mode_req = 6; chunkT = atoi(argv[++i]); }
     else if (!strcmp(argv[i], "--prefill-e2e") && i + 1 < argc) { emb_mode_req = 7; chunkT = atoi(argv[++i]); }
+    else if (!strcmp(argv[i], "--prefill-run") && i + 1 < argc) g_pfChunk = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--prefill-arm5-gate")) emb_mode_req = 5;
     else if (!strcmp(argv[i], "--merge")) g_merge = true;   // merged gate/up GEMV
     else if (!strcmp(argv[i], "--lmrows") && i + 1 < argc) lm_rows_override = atoi(argv[++i]);
@@ -3924,17 +3973,36 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
     // nothing anyone consumes, so it is skipped -- unless --dump-logits-all is
     // set: the logit gate compares every teacher-forced position against HF.
     // LFM_LEGACYFEED=1 restores the old loop as the A/B control.
+    // INTEGRATED CHUNKED PREFILL (--prefill-run T): run the whole prompt T positions at
+    // a time -- one T-wide launch per GEMV -- then hand the last row to M.x and jump the
+    // loop counter to the last prompt step, so the head, argmax and feed run through the
+    // EXACT shipped code path (they are not duplicated here). Reached only after the
+    // warm-up step, which has just zeroed the KV caches and the conv ring, so the chunked
+    // prefill starts from the same clean state the T=1 loop does.
+    if (g_pfChunk >= 2 && s == 0) {
+      const int NP = (int)prompt.size();
+      static PF4Arena A; static int A_T = 0;
+      if (A_T < g_pfChunk) { pf4_arena_alloc(A, g_pfChunk); A_T = g_pfChunk; }
+      { int c = 0; for (int L = 0; L < NLAYER; L++) { pf4_conv_idx[L] = c; if (!is_attn_g[L]) c++; } }
+      int Tc = 0;
+      struct timespec q0, q1; clock_gettime(CLOCK_MONOTONIC, &q0);
+      for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
+        Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+        pf4_embed_chunk(M, A, prompt, c0, Tc, emb);
+        for (int L = 0; L < NLAYER; L++) layer_chunk_T(M, L, c0, Tc, A);
+      }
+      cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &q1);
+      printf("PF4-RUN: prompt %d ids in chunks of %d, %.0f ms (%.2f ms/pos)\n",
+             NP, g_pfChunk, (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6,
+             ((q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6) / NP);
+      cudaMemcpy(M.x, A.xb + (size_t)(Tc - 1) * H, (size_t)H * 2, cudaMemcpyDeviceToDevice);
+      s = NP - 1;      // the normal body runs this step: head, argmax, feed, bookkeeping
+    }
     const int nprompt = (int)prompt.size();
     const bool need_head = s < 0 || g_legacy_feed || s >= nprompt - 1 || dump_logits_all;
     Ent* eemb = emb;
     if (!need_head) {}
-    else if (eemb && eemb->dtype == 3 && M.emb_mode == 1 && M.hemb.hc)
-      lm_head_bf16_host(M, M.hemb, lm_head_input, M.lgf);  // certified arm, host-staged
-    else if (eemb && eemb->dtype == 3)
-      lm_head_bf16(M, eemb, lm_head_input, M.lgf);         // certified arm, resident
-    else if (M.emb_mode == 1)
-      lm_head_host(M, M.hemb, lm_head_input, M.lgf);     // Q8 streamed from pinned host
-    else gemv_f(M, EMBNAME, lm_head_input, M.lgf);       // tied lm_head, resident
+    else head_logits_from(M, lm_head_input, eemb);   // the four arms, shared with the driver
     if (need_head) k_argmax<<<1, 256, 0, g_launch>>>(M.lgf, M.tok_dev, VOCAB);
     cudaEventRecord(evB, g_launch);
     cudaEventSynchronize(evB);
