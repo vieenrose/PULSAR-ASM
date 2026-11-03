@@ -208,8 +208,10 @@ __global__ void k_conv2d(const float *x, const float *w, const float *b,
                          int padH, int padW, int dilH, int dilW, int strideH, int strideW,
                          float *y, int co0)
 {
-    int ho = blockIdx.x * blockDim.x + threadIdx.x;
-    int wo = blockIdx.y * blockDim.y + threadIdx.y;
+    // threadIdx.x maps to WIDTH (the contiguous output dimension): with ho
+    // first, a warp read x with stride W (26x over-fetch).
+    int wo = blockIdx.x * blockDim.x + threadIdx.x;
+    int ho = blockIdx.y * blockDim.y + threadIdx.y;
     int co = co0 + blockIdx.z;
     int H_out = (H + 2*padH - dilH*(kH-1) - 1)/strideH + 1;
     int W_out = (W + 2*padW - dilW*(kW-1) - 1)/strideW + 1;
@@ -630,8 +632,8 @@ __global__ void k_resid_scatter_out(const float *y, const float *xf, float *out,
 __global__ void k_sp_up(const float *x, const float *Ww, const float *b, float *y,
                         int H, int W, int r)
 {
-    int h = blockIdx.x * blockDim.x + threadIdx.x;
-    int w = blockIdx.y * blockDim.y + threadIdx.y;
+    int w = blockIdx.x * blockDim.x + threadIdx.x;     // contiguous dim first
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
     int co = blockIdx.z;                       // 0 .. 64*r-1
     if (h >= H || w >= W) return;
     const int c = co % HID, a = co / HID;
@@ -872,7 +874,7 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
                 C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, H_out, W_out, CH);
     for (int co0 = 0; co0 < C_out; co0 += CH) {
         int n = (C_out - co0 < CH) ? C_out - co0 : CH;
-        dim3 grd((unsigned)((H_out + 15) / 16), (unsigned)((W_out + 15) / 16), (unsigned)n);
+        dim3 grd((unsigned)((W_out + 15) / 16), (unsigned)((H_out + 15) / 16), (unsigned)n);
         // the kernel adds co0 itself, so pass the un-offset pointers
         k_conv2d<<<grd, blk>>>(x, w, b,
                                C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW,
@@ -937,7 +939,7 @@ static int sp_up(reuse_gpu_t *g, const char *prefix, const float *x, int H, int 
     snprintf(key, sizeof(key), "%s.0.conv.bias",   prefix); const float *b = reuse_gpu_w(g, key);
     if (g->bad) return 1;
     dim3 blk(16, 16);
-    dim3 grd((unsigned)((H + 15)/16), (unsigned)((W + 15)/16), (unsigned)(HID*r));
+    dim3 grd((unsigned)((W + 15)/16), (unsigned)((H + 15)/16), (unsigned)(HID*r));
     k_sp_up<<<grd, blk>>>(x, w, b, y, H, W, r);
     return reuse_gpu_ok(g, "sp_up");
 }
