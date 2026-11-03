@@ -1045,6 +1045,76 @@ __global__ void k_out_proj_r8(const float *y, const float *z, const float *W,
         *(float4*)(out + m*HID + tx*8 + 4) = make_float4(acc[a4][4], acc[a4][5], acc[a4][6], acc[a4][7]);
     }
 }
+// k_out_proj_r8 with k_concat_f fused into the epilogue: the gated projection
+// writes its half of cat directly, with the block input x added (the residual the
+// concat used to apply). Saves writing fw/bw and reading them back: 10.6 MB per
+// TFMamba block and 30 launches per forward. Same adds, so bit-identical.
+__global__ void k_out_proj_r8c(const float *y, const float *z, const float *W,
+                              const float *xres, float *cat, int coff, int L, int rev, int SL)
+{
+    const int KC = 16, MT = 256;
+    __shared__ __align__(16) float As[MT][KC+4];
+    __shared__ __align__(16) float WsT[KC][HID+4];
+    const long m0 = (long)blockIdx.x * MT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (8,32)
+    const int tid = ty*8 + tx;
+    float acc[8][8];
+#pragma unroll
+    for (int a = 0; a < 8; a++)
+#pragma unroll
+        for (int b = 0; b < 8; b++) acc[a][b] = 0.f;
+    for (int k0 = 0; k0 < DINNER; k0 += KC) {
+        for (int i = tid; i < MT*(KC/4); i += 256) {              /* 4 float4/thread */
+            const int r = i / (KC/4), q = 4*(i - r*(KC/4));
+            const long o_ = (m0 + r)*DINNER + k0 + q;
+            float4 v = make_float4(0.f,0.f,0.f,0.f);
+            if (m0 + r < SL) {
+                const float4 yy = *(const float4*)(y + o_);
+                const float4 zz = *(const float4*)(z + o_);
+                v.x = yy.x * dsilu(zz.x); v.y = yy.y * dsilu(zz.y);
+                v.z = yy.z * dsilu(zz.z); v.w = yy.w * dsilu(zz.w);
+            }
+            *(float4*)&As[r][q] = v;
+        }
+        for (int i = tid; i < KC*(HID/4); i += 256) {             /* transpose W tile */
+            const int co = i / (KC/4), q = 4*(i - co*(KC/4));
+            const float4 wv = *(const float4*)(W + (long)co*DINNER + k0 + q);
+            WsT[q+0][co] = wv.x; WsT[q+1][co] = wv.y;
+            WsT[q+2][co] = wv.z; WsT[q+3][co] = wv.w;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KC; k++) {
+            float a[8], w[8];
+#pragma unroll
+            for (int a4 = 0; a4 < 8; a4++) a[a4] = As[ty*8 + a4][k];
+#pragma unroll
+            for (int b4 = 0; b4 < 8; b4++) w[b4] = WsT[k][tx*8 + b4];
+#pragma unroll
+            for (int a4 = 0; a4 < 8; a4++)
+#pragma unroll
+                for (int b4 = 0; b4 < 8; b4++) acc[a4][b4] = fmaf(a[a4], w[b4], acc[a4][b4]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int a4 = 0; a4 < 8; a4++) {
+        const long m = m0 + ty*8 + a4;
+        if (m >= SL) continue;
+        /* k_concat_f's job, folded in: cat[s*L+t][0:HID] = fw + x,
+           cat[s*L+t][HID:2HID] = bw[s*L+L-1-t] + x. The backward direction
+           stores at the time-flipped row so cat needs no reversal pass. */
+        int mr = (int)m;
+        if (rev) { const int sh = mr / L, tt = mr - sh*L; mr = sh*L + (L-1-tt); }
+        const float4 xa = *(const float4*)(xres + (long)mr*HID + tx*8);
+        const float4 xb = *(const float4*)(xres + (long)mr*HID + tx*8 + 4);
+        float *d = cat + (long)mr*(2*HID) + coff + tx*8;
+        *(float4*)d = make_float4(acc[a4][0] + xa.x, acc[a4][1] + xa.y,
+                                  acc[a4][2] + xa.z, acc[a4][3] + xa.w);
+        *(float4*)(d+4) = make_float4(acc[a4][4] + xb.x, acc[a4][5] + xb.y,
+                                      acc[a4][6] + xb.z, acc[a4][7] + xb.w);
+    }
+}
 
 __global__ void k_out_proj_r(const float *y, const float *z, const float *W,
                              float *out, int SL)
@@ -3132,7 +3202,8 @@ extern "C" int reuse_gpu_encoder(reuse_gpu_t *g, const float *xin, float *enc, i
 // ================================================================= Mamba
 
 static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float *out,
-                         int S, int L, int rev, cudaStream_t st)
+                         int S, int L, int rev, cudaStream_t st,
+                         float *cat = NULL, int coff = 0)
 {
     char key[256];
     snprintf(key, sizeof(key), "%s.in_proj.weight", pfx);  const float *W_in  = reuse_gpu_w(g, key);
@@ -3244,7 +3315,10 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         }
         if (tiled) {
             dim3 g((HID+GT-1)/GT, (unsigned)((SL+GT-1)/GT));
-            if      (tiled == 3) k_out_proj_r8<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, out, (int)SL);
+            static int cf = -1;
+            if (cf < 0) cf = getenv("REUSE_CONCAT_FUSE") ? atoi(getenv("REUSE_CONCAT_FUSE")) : 1;
+            if      (tiled == 3 && cf && cat) k_out_proj_r8c<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, x, cat, coff, L, rev, (int)SL);
+            else if (tiled == 3) k_out_proj_r8<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, out, (int)SL);
             else if (tiled == 2) k_out_proj_r<<<(unsigned)((SL+63)/64), dim3(16,16), 0, st>>>(y, z, W_op, out, (int)SL);
             else            k_out_proj_tiled<<<g, dim3(GT/2, GT/2), 0, st>>>(y, z, W_op, out, (int)SL);
         } else {
@@ -3261,6 +3335,8 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
                            int S, int L)
 {
     long SL = (long)S * L;
+    static int cfuse = -1;
+    if (cfuse < 0) cfuse = getenv("REUSE_CONCAT_FUSE") ? atoi(getenv("REUSE_CONCAT_FUSE")) : 1;
     static double klast = 0;
     if (g_kprof < 0) g_kprof = getenv("REUSE_KPROF") ? 1 : 0;
     if (g_kprof) { cudaDeviceSynchronize(); klast = gt_now(); }
@@ -3286,16 +3362,18 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
     }
     if (two) {
         if (cudaEventRecord(ev1, 0) || cudaStreamWaitEvent(st_side, ev1, 0)) { g->bad = 1; return 1; }
-        if (mamba_dir_gpu(g, p, x, fw, S, L, 0, 0)) return 1;
+        if (mamba_dir_gpu(g, p, x, fw, S, L, 0, 0, cfuse ? cat : NULL, 0)) return 1;
         snprintf(p, sizeof(p), "%s.backward_blocks", pfx);
-        if (mamba_dir_gpu(g, p, x, bw, S, L, 1, st_side)) return 1;
+        if (mamba_dir_gpu(g, p, x, bw, S, L, 1, st_side, cfuse ? cat : NULL, HID)) return 1;
         if (cudaEventRecord(ev2, st_side) || cudaStreamWaitEvent(0, ev2, 0)) { g->bad = 1; return 1; }
     } else {
-        if (mamba_dir_gpu(g, p, x, fw, S, L, 0, 0)) return 1;
+        if (mamba_dir_gpu(g, p, x, fw, S, L, 0, 0, cfuse ? cat : NULL, 0)) return 1;
         snprintf(p, sizeof(p), "%s.backward_blocks", pfx);
-        if (mamba_dir_gpu(g, p, x, bw, S, L, 1, 0)) return 1;
+        if (mamba_dir_gpu(g, p, x, bw, S, L, 1, 0, cfuse ? cat : NULL, HID)) return 1;
     }
-    if (getenv("REUSE_SKIP_CONCAT")) {
+    if (cfuse && !getenv("REUSE_NAIVE_OUTPROJ")) {
+        /* cat was filled by the fused out_proj epilogues of both directions */
+    } else if (getenv("REUSE_SKIP_CONCAT")) {
     } else if (getenv("REUSE_NAIVE_CONCAT")) {
         k_concat<<<(unsigned)((SL+255)/256), 256>>>(fw, bw, x, cat, S, L);
     } else {
