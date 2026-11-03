@@ -670,6 +670,38 @@ __global__ void k_dt_proj_t(const float *xdbl, const float *W, const float *B,
                                     + d2*wr[j*DTRANK+2] + d3*wr[j*DTRANK+3]);
 }
 
+// dt_proj with the 4 KB weight matrix staged in shared memory.
+//
+// dt_proj is M=SL, N=DINNER, K=DTRANK=4: a near-elementwise kernel whose only
+// real cost is writing SL*DINNER floats. k_dt_proj_t reads W[c][p] with 8
+// channels per thread, so for a fixed tap the warp's 32 lanes are 16 floats
+// apart: 32 sectors per warp load, 8x L1 sector amplification. Measured in
+// isolation: 0.0236 s write-only, 0.0541 s with the FMA loop (and 0.0541 s
+// with softplus removed, so the transcedentals cost nothing). Staging W in
+// shared (loaded coalesced once per block) and reading it as float4 per lane
+// makes each warp read 512 B contiguous, conflict free.
+__global__ void k_dt_proj_r(const float *xdbl, const float *W, const float *B,
+                            float *dtt, long SL)
+{
+    __shared__ float4 Ws[DINNER];
+    const int m = (int)((long)blockIdx.x * 8 + threadIdx.x / 32);
+    const int c0 = (threadIdx.x % 32) * 8;
+    // every thread stages its part of W before any row work
+    for (int i = threadIdx.x; i < DINNER; i += 256)
+        Ws[i] = ((const float4*)W)[i];
+    __syncthreads();
+    if (m >= SL) return;
+    const float *di = xdbl + (long)m * XP;
+    const float d0 = di[0], d1 = di[1], d2 = di[2], d3 = di[3];
+    const float *bb = B + c0;
+    float *o = dtt + (long)m * DINNER + c0;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const float4 w = Ws[c0 + j];
+        o[j] = dsoftplus(bb[j] + d0*w.x + d1*w.y + d2*w.z + d3*w.w);
+    }
+}
+
 __global__ void k_scan_b(const float *xc, const float *dtt, const float *A_log,
                          const float *Dv, const float *xdbl, float *y, int S, int L, int rev)
 {
@@ -1929,9 +1961,11 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     kp_mark("x_proj", &klast);
     GDBG("gxdbl", xdbl, (size_t)SL*XP);
     {
-        static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_DTPROJ") ? 0 : 1;
+        static int t = -1;
+        if (t < 0) { const char *e = getenv("REUSE_DTPROJ"); t = e ? atoi(e) : (getenv("REUSE_NAIVE_DTPROJ") ? 0 : 2); }
         if (getenv("REUSE_SKIP_DTPROJ")) { } else
-        if (t) k_dt_proj_t<<<(unsigned)((SL+7)/8), 256>>>(xdbl, W_dt, B_dt, dtt, SL);
+        if (t == 2) k_dt_proj_r<<<(unsigned)((SL+7)/8), 256>>>(xdbl, W_dt, B_dt, dtt, SL);
+        else if (t) k_dt_proj_t<<<(unsigned)((SL+7)/8), 256>>>(xdbl, W_dt, B_dt, dtt, SL);
         else   k_dt_proj<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(xdbl, W_dt, B_dt, dtt, SL);
     }
     kp_mark("dt_proj", &klast);
