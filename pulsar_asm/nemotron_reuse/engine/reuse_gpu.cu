@@ -2524,11 +2524,23 @@ static int launch_conv1x1(reuse_gpu_t *g, const float *x, const float *w, const 
             else if (regtile && dilH == 4) { if (pco==4) k_conv2d_r8<R4,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R4,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R4,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
             else if (regtile && dilH == 8) { if (pco==4) k_conv2d_r8<R8,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R8,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R8,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); }
 
+static int dectile(void)
+{
+    static int t = -1;
+    if (t < 0) { const char *e = getenv("REUSE_DEC_TILE"); t = e ? atoi(e) : 644; }
+    return t;
+}
+
 static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const float *b,
                          int C_in, int H, int W, int C_out, int kH, int kW,
                          int padH, int padW, int dilH, int dilW, int strideH, int strideW,
-                         float *y)
+                         float *y, int tilehint)
 {
+    // tilehint: 0 = use REUSE_CONV_TILE, else a tile code for this call site.
+    // The encoder's dense block prefers 645 (8co x 4col x 2row) and the
+    // decoders' prefer 644 (8x2x4, a 64-row tile); measured 0.082/0.041 vs
+    // 0.082/0.037 for the two phases.
+    const int tileuse = tilehint;
     int H_out = (H + 2*padH - dilH*(kH-1) - 1)/strideH + 1;
     int W_out = (W + 2*padW - dilW*(kW-1) - 1)/strideW + 1;
     dim3 blk(16, 16);
@@ -2544,8 +2556,9 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         // own grid/block (blk here is the naive kernel's 16x16)
         const bool regtile = !getenv("REUSE_NAIVE_CONV2D") && kH == 3 && kW == 3 &&
                              dilW == 1 && strideH == 1 && strideW == 1 && padW == 1 && padH == dilH;
-        static int big = -1;
-        if (big < 0) { const char *e = getenv("REUSE_CONV_TILE"); big = e ? atoi(e) : 645; }
+        static int bigenv = -1;
+        if (bigenv < 0) { const char *e = getenv("REUSE_CONV_TILE"); bigenv = e ? atoi(e) : 645; }
+        int big = tileuse ? tileuse : bigenv;
         // 64-accumulator shapes: codes 644 (8co x 2col x 4row), 645 (8x4x2),
         // 646 (16x2x2). Each output amortises its 9 weight loads over
         // rows*cols positions and the warp-uniform weight loads are ~50% of
@@ -2647,7 +2660,7 @@ static int inorm(reuse_gpu_t *g, const float *x, float *y, int N, int C, int H, 
 
 // PyTorch DenseBlock over a scratch region of the arena.
 static int dense_block_gpu(reuse_gpu_t *g, const char *prefix, const float *x_in,
-                           int T, int F, float *out)
+                           int T, int F, float *out, int tilehint)
 {
     const int cap = HID * (DEPTH + 1) * T * F;
     float *skip  = wallc(g, (size_t)cap);
@@ -2663,7 +2676,7 @@ static int dense_block_gpu(reuse_gpu_t *g, const char *prefix, const float *x_in
         snprintf(key, sizeof(key), "%s.%d.0.bias",   prefix, i); const float *b = reuse_gpu_w(g, key);
         if (g->bad) return 1;
         int dil = 1 << i;
-        launch_conv2d(g, skip, w, b, c_skip, T, F, HID, 3, 3, dil, 1, dil, 1, 1, 1, tmp);
+        launch_conv2d(g, skip, w, b, c_skip, T, F, HID, 3, 3, dil, 1, dil, 1, 1, 1, tmp, tilehint);
         snprintf(nkey, sizeof(nkey), "%s.%d.1.weight", prefix, i);
         snprintf(akey, sizeof(akey), "%s.%d.2.weight", prefix, i);
         inorm(g, tmp, cur, 1, HID, T, F, nkey, akey);
@@ -2737,10 +2750,10 @@ extern "C" int reuse_gpu_encoder(reuse_gpu_t *g, const float *xin, float *enc, i
         inorm(g, x1, x1n, 1, HID, Tp, Fp, "dense_encoder.dense_conv_1.1.weight", "dense_encoder.dense_conv_1.2.weight");
     gdump("c1n", x1n, (size_t)HID*Tp*Fp);
     if (!getenv("REUSE_SKIP_DB"))
-        dense_block_gpu(g, "dense_encoder.dense_block.dense_block", x1n, Tp, Fp, xdb);
+        dense_block_gpu(g, "dense_encoder.dense_block.dense_block", x1n, Tp, Fp, xdb, 0);
     gdump("db", xdb, (size_t)HID*Tp*Fp);
     if (!getenv("REUSE_SKIP_ENC2D"))
-        launch_conv2d(g, xdb, w2, b2, HID, Tp, Fp, HID, 1, 3, 0, 0, 1, 1, 4, 2, x2);
+        launch_conv2d(g, xdb, w2, b2, HID, Tp, Fp, HID, 1, 3, 0, 0, 1, 1, 4, 2, x2, 0);
     gdump("c2", x2, (size_t)HID*T2*F2);
     if (!getenv("REUSE_SKIP_IN2"))
         inorm(g, x2, enc, 1, HID, T2, F2, "dense_encoder.dense_conv_2.1.weight", "dense_encoder.dense_conv_2.2.weight");
@@ -2977,7 +2990,7 @@ extern "C" int reuse_gpu_decoder_pre(reuse_gpu_t *g, const char *prefix, const f
     snprintf(dbp, sizeof(dbp), "%s.dense_block.dense_block", prefix);
     float *d = wallc(g, (size_t)HID*T*F);
     if (!d) return 1;
-    if (dense_block_gpu(g, dbp, x, T, F, d)) return 1;
+    if (dense_block_gpu(g, dbp, x, T, F, d, dectile())) return 1;
     gdump("d_db", d, (size_t)HID*T*F);
 
     float *u1  = wallc(g, (size_t)HID*T*(size_t)(F*2));
