@@ -2206,6 +2206,47 @@ __global__ void k_conv2d_r9(const float *x, const float *w, const float *b,
     }
 }
 
+// dt_proj fused into the scan. dtt[s,c] = softplus(B_dt[c] + sum_p D_p[s]*W_dt[c][p])
+// is a 4-term dot product consumed only by the scan's recurrence, so keeping it
+// in registers removes the 21 MB dtt write and its re-read: of the pair's 126 MB
+// per launch, 42 MB (33%) was that round trip. Same operand order as
+// k_dt_proj_r, so the result is bit-identical to the two-kernel path.
+__global__ void k_scan_dt(const float *xc, const float *Wdt, const float *Bdt,
+                          const float *A_log, const float *Dv, const float *xdbl,
+                          float *y, int S, int L, int rev)
+{
+    __shared__ float4 Ws[DINNER];
+    for (int i = threadIdx.x; i < DINNER; i += 256) Ws[i] = ((const float4*)Wdt)[i];
+    __syncthreads();
+    int s = (int)((long)blockIdx.x * 8 + threadIdx.x / 32);
+    int c = (threadIdx.x % 32) + blockIdx.y * 32;
+    if (s >= S || c >= DINNER) return;
+    float h[DSTATE];
+#pragma unroll
+    for (int n = 0; n < DSTATE; n++) h[n] = 0.0f;
+    float aA[DSTATE];
+#pragma unroll
+    for (int n = 0; n < DSTATE; n++) aA[n] = -__expf(A_log[c * DSTATE + n]);
+    const float Dc = Dv[c];
+    const float4 w = Ws[c];
+    const float bc = Bdt[c];
+    for (int ii = 0; ii < L; ii++) {
+        long sl = (long)s * L + ii;
+        const float *dr = xdbl + sl * XP;
+        float d = dsoftplus(bc + dr[0]*w.x + dr[1]*w.y + dr[2]*w.z + dr[3]*w.w);
+        float u = xc[sl * DINNER + c];
+        const float *Bt = xdbl + sl * XP + DTRANK;
+        const float *Ct = Bt + DSTATE;
+        float acc = 0.0f;
+#pragma unroll
+        for (int n = 0; n < DSTATE; n++) {
+            h[n] = __expf(d * aA[n]) * h[n] + d * Bt[n] * u;
+            acc = fmaf(h[n], Ct[n], acc);
+        }
+        y[sl * DINNER + c] = acc + u * Dc;
+    }
+}
+
 static int conv_chunk(void)
 {
     static int c = -1;
@@ -2519,16 +2560,25 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     {
         static int t = -1;
         if (t < 0) { const char *e = getenv("REUSE_DTPROJ"); t = e ? atoi(e) : (getenv("REUSE_NAIVE_DTPROJ") ? 0 : 2); }
-        if (getenv("REUSE_SKIP_DTPROJ")) { } else
+        // dt_proj fused into the scan (default on; REUSE_SCANDT=0 restores the pair).
+        static int f = -1;
+        if (f < 0) f = getenv("REUSE_SCANDT") ? atoi(getenv("REUSE_SCANDT")) : 1;
+        const bool fused = (f != 0) && t == 2 && !getenv("REUSE_SKIP_DTPROJ") && !getenv("REUSE_SKIP_SCAN");
+        if (fused) {
+            k_scan_dt<<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
+        } else if (getenv("REUSE_SKIP_DTPROJ")) { } else
         if (t == 2) k_dt_proj_r<<<(unsigned)((SL+7)/8), 256, 0, st>>>(xdbl, W_dt, B_dt, dtt, SL);
         else if (t) k_dt_proj_t<<<(unsigned)((SL+7)/8), 256, 0, st>>>(xdbl, W_dt, B_dt, dtt, SL);
         else   k_dt_proj<<<dim3((unsigned)((SL+255)/256), DINNER), b1, 0, st>>>(xdbl, W_dt, B_dt, dtt, SL);
     }
     kp_mark("dt_proj", &klast);
-    GDBG("gdt", dtt, (size_t)SL*DINNER);
+    GDBG("gdt", dtt, (size_t)SL*DINNER);   // dtt is not written on the fused path
     {
         static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_SCAN") ? 0 : 1;
-        if (getenv("REUSE_SKIP_SCAN")) { } else
+        static int f = -1; if (f < 0) f = getenv("REUSE_SCANDT") ? atoi(getenv("REUSE_SCANDT")) : 1;
+        static int tp = -1; if (tp < 0) { const char *e = getenv("REUSE_DTPROJ"); tp = e ? atoi(e) : (getenv("REUSE_NAIVE_DTPROJ") ? 0 : 2); }
+        const bool fused = (f != 0) && tp == 2 && !getenv("REUSE_SKIP_DTPROJ") && !getenv("REUSE_SKIP_SCAN");
+        if (fused || getenv("REUSE_SKIP_SCAN")) { } else
         if (t) k_scan_b<<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
         else   k_scan<<<dim3((unsigned)S, DINNER/32), 32, 0, st>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
     }
