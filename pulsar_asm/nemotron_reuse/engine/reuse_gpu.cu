@@ -477,7 +477,12 @@ __global__ void k_in_conv_r(const float *x, const float *W, float *z, float *xc,
         float fv[4];
 #pragma unroll
         for (int b4 = 0; b4 < 4; b4++) fv[b4] = Bc[c0 + b4];
-        for (int k = DCONV - ntap; k < DCONV; k++) {
+        // Fully unrolled with a predicate, never a runtime trip count: with
+        // "k = DCONV - ntap" as the loop start, j = a4+k is a runtime index and
+        // v[]/acc[] spill to local memory (128-176 byte stack frames).
+#pragma unroll
+        for (int k = 0; k < DCONV; k++) {
+            if (k < DCONV - ntap) continue;
             const int j = a4 + k;
 #pragma unroll
             for (int b4 = 0; b4 < 4; b4++)
@@ -1003,6 +1008,115 @@ static void prewarm(reuse_gpu_t *g)
     cudaDeviceSynchronize();
 }
 
+
+// 128x64-tile version of the fused in_proj+conv.
+//
+// Tile traffic for a GEMM of M rows x N columns tiled R x C is
+// M*N*K*(1/R + 1/C): the 80x64 tile re-reads each input row once per output
+// column tile (8 times) and each weight once per row tile. Doubling the tile
+// height to 128 rows (8 rows x 4 cols = 32 accumulators per thread) cuts that
+// 44%, and with 8 shared row loads per 32 FMAs the shared-load ratio goes
+// 2.2 -> 4.
+#define FUSE_MT2 128
+template<int KC>
+__global__ void k_in_conv_r2(const float *x, const float *W, float *z, float *xc,
+                             const float *Wc, const float *Bc,
+                             int S, int L, int rev)
+{
+    const int NT = 64, R = FUSE_MT2 + 3, RA = 8;
+    __shared__ float Xs[R][KC+4], Ws[NT][KC+4], Hl[3][NT+1];
+    const long SL = (long)S * L;
+    const long m0 = (long)blockIdx.x * FUSE_MT2;
+    const int n0 = blockIdx.y * NT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty*16 + tx;
+    const bool halo_thr = tid < 3*NT;
+    const int hr = tid / NT, hc = tid % NT;
+    float acc[RA][4];
+#pragma unroll
+    for (int a = 0; a < RA; a++)
+#pragma unroll
+        for (int b = 0; b < 4; b++) acc[a][b] = 0.f;
+    float hacc = 0.f;
+    for (int k0 = 0; k0 < HID; k0 += KC) {
+        for (int i = tid; i < R*KC; i += 256) {
+            int r = i / KC, c = i % KC;
+            long m = m0 - 3 + r;
+            int sm = (int)(m / L), tm = (int)(m % L);
+            if (m < 0 || m >= SL) { Xs[r][c] = 0.f; continue; }
+            Xs[r][c] = x[((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + c];
+        }
+        for (int i = tid; i < NT*KC; i += 256) {
+            int r = i / KC, c = i % KC;
+            Ws[r][c] = W[(long)(n0+r)*HID + k0 + c];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KC; k++) {
+            float a[RA], w[4];
+#pragma unroll
+            for (int a4 = 0; a4 < RA; a4++) a[a4] = Xs[tx*RA + 3 + a4][k];
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++) w[b4] = Ws[ty*4 + b4][k];
+#pragma unroll
+            for (int a4 = 0; a4 < RA; a4++)
+#pragma unroll
+                for (int b4 = 0; b4 < 4; b4++) acc[a4][b4] = fmaf(a[a4], w[b4], acc[a4][b4]);
+            if (halo_thr) hacc = fmaf(Xs[hr][k], Ws[hc][k], hacc);
+        }
+        __syncthreads();
+    }
+    if (halo_thr) Hl[hr][hc] = hacc;
+    __syncthreads();
+    if (n0 >= DINNER) {                                             // z half: plain GEMM
+#pragma unroll
+        for (int a4 = 0; a4 < RA; a4++) {
+            long m = m0 + tx*RA + a4;
+            if (m >= SL) continue;
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++) z[m*DINNER + (n0 - DINNER) + ty*4 + b4] = acc[a4][b4];
+        }
+        return;
+    }
+    const unsigned FULL = 0xffffffffu;
+    float v[3][4];
+#pragma unroll
+    for (int jj = 0; jj < 3; jj++)
+#pragma unroll
+        for (int b4 = 0; b4 < 4; b4++) v[jj][b4] = __shfl_up_sync(FULL, acc[jj+5][b4], 1);
+    if (tx == 0) {
+#pragma unroll
+        for (int h = 0; h < 3; h++)
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++) v[h][b4] = Hl[h][ty*4 + b4];
+    }
+    const int c0 = n0 + ty*4;
+#pragma unroll
+    for (int a4 = 0; a4 < RA; a4++) {
+        long m = m0 + tx*RA + a4;
+        if (m >= SL) continue;
+        const int t = (int)(m % L);
+        const int ntap = (t >= DCONV-1) ? DCONV : t + 1;
+        float fv[4];
+#pragma unroll
+        for (int b4 = 0; b4 < 4; b4++) fv[b4] = Bc[c0 + b4];
+        // Fully unrolled with a predicate, never a runtime trip count: with
+        // "k = DCONV - ntap" as the loop start, j = a4+k is a runtime index and
+        // v[]/acc[] spill to local memory (128-176 byte stack frames).
+#pragma unroll
+        for (int k = 0; k < DCONV; k++) {
+            if (k < DCONV - ntap) continue;
+            const int j = a4 + k;
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++)
+                fv[b4] = fmaf((j < 3 ? v[j][b4] : acc[j-3][b4]),
+                              Wc[(long)(c0 + b4)*DCONV + k], fv[b4]);
+        }
+#pragma unroll
+        for (int b4 = 0; b4 < 4; b4++) xc[m*DINNER + c0 + b4] = dsilu(fv[b4]);
+    }
+}
+
 static int inproj_mode(void)
 {
     static int v = -1;
@@ -1016,6 +1130,13 @@ static int inproj_mode(void)
 // in_proj and the causal depthwise conv are fused by default: x0 is consumed
 // only by the conv, so fusing keeps 42 MB per launch out of DRAM and drops a
 // launch. REUSE_NO_FUSE=1 falls back to the two-kernel path for A/B.
+static int fuse_tile(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("REUSE_FUSE_TILE"); v = e ? atoi(e) : 80; if (v != 128) v = 80; }
+    return v;
+}
+
 static int fuse_kc(void)
 {
     static int v = -1;
@@ -1769,7 +1890,12 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         if (getenv("REUSE_SKIP_INPROJ")) { } else
         if (fuse_conv()) {
             const int kc = fuse_kc();
-            if (kc == 16)
+            if (fuse_tile() == 128) {          // 128 measured slower (0.638 vs 0.555 s):
+                                               // the traffic model lost to 110 registers/block
+                k_in_conv_r2<32><<<dim3((unsigned)((SL+FUSE_MT2-1)/FUSE_MT2), (2*DINNER)/64), dim3(16,16)>>>(
+                    x, W_in, z, xc, W_c, B_c, S, L, rev);
+            }
+            else if (kc == 16)
                 k_in_conv_r<16><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16)>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev);
             else if (kc == 8)
