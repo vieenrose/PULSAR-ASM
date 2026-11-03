@@ -20,6 +20,7 @@ void reuse_stft_mag_pha(const float *x, int T, int n_fft, int hop_size, int win_
     double *tw = (double *)malloc((size_t)F * n_fft * 2 * sizeof(double));
     if (!tw) { free(w); return; }
     const double pi = 3.14159265358979323846;
+#pragma omp parallel for schedule(static)
     for (int k = 0; k < F; k++) {
         double *tc = tw + (size_t)k * n_fft * 2;
         for (int n = 0; n < n_fft; n++) {
@@ -29,10 +30,17 @@ void reuse_stft_mag_pha(const float *x, int T, int n_fft, int hop_size, int win_
         }
     }
     const int pad = n_fft / 2;
-    for (int t = 0; t < num_frames; t++) {
-        const int start = t * hop_size - pad;
-        for (int k = 0; k < F; k++) {
-            const double *tc = tw + (size_t)k * n_fft * 2;
+    // Bin-major with the frame loop inside: every output bin keeps its own
+    // double accumulation order, so this is bit-identical to the frame-major
+    // form, but the 5 KB twiddle row for bin k stays in L1 for the whole call.
+    // Frame-major re-read all 824 KB of twiddles for every one of the 1021
+    // frames (824 MB of RAM reads per call, i.e. memory bound at ~26 GB/s).
+    // Frames are independent, so the parallelism sits on the bin loop.
+#pragma omp parallel for schedule(static)
+    for (int k = 0; k < F; k++) {
+        const double *tc = tw + (size_t)k * n_fft * 2;
+        for (int t = 0; t < num_frames; t++) {
+            const int start = t * hop_size - pad;
             double re = 0.0, im = 0.0;
             for (int n = 0; n < n_fft; n++) {
                 int idx = start + n;
