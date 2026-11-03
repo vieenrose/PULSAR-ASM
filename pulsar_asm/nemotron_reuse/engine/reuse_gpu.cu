@@ -791,6 +791,31 @@ __global__ void k_gather_time(const float *x, float *xt, int T, int F)
     xt[i] = x[(long)c*T*F + (long)t*F + f];
 }
 // residual on the time block + resample into [T,F,HID] for the freq block
+
+// Diagnostic prewarm: burn GPU cycles with a compute-heavy, large-grid kernel
+// at the start of a forward, to test whether the ~10x penalty on the first
+// big conv2d launch of the rep is a clock/DVFS ramp (a 256-block spin kernel
+// was "fully additive" earlier, so it never ramped anything) or a
+// large-grid-launch effect (the conv launches 5632 blocks; every earlier probe
+// used 256-block kernels). REUSE_PREWARM=1 (FMA iters) and REUSE_PREWARM_GRID.
+__global__ void k_burn(float *sink, long iters)
+{
+    float a = threadIdx.x * 1e-8f + blockIdx.x * 1e-9f;
+    const float b = 1.00000012f;
+    for (long i = 0; i < iters; i++) a = fmaf(a, b, 1e-9f);
+    if (a == 12345.678f) sink[threadIdx.x + blockIdx.x*blockDim.x] = a;
+}
+
+static void prewarm(reuse_gpu_t *g)
+{
+    const char *e = getenv("REUSE_PREWARM");
+    if (!e) return;
+    long iters = atol(e);
+    int grid = getenv("REUSE_PREWARM_GRID") ? atoi(getenv("REUSE_PREWARM_GRID")) : 5632;
+    k_burn<<<grid, 256>>>(g->ws, iters);
+    cudaDeviceSynchronize();
+}
+
 static int naive_resid(void)
 {
     static int v = -1;
@@ -1199,6 +1224,64 @@ static int launch_kick(void)
     return 0;
 }
 
+// Register-tiled 3x3 dilated conv for the DenseBlock shapes.
+//
+// The naive kernel computes one output per thread and reads 9*C_in inputs for
+// 9*C_in FMAs: one FMA per load, which is what pins it at ~160 GFLOPS (2.8% of
+// peak) on the encoder's dense block (DEPTH=4, C_in = 64/128/192/256, 1023x163
+// = 121 GFlop, 0.754 s per forward = 45% of the model). Here a block owns a
+// 16x32 output tile, stages the (16+2*dilH) x 34 input window for one input
+// channel in shared, and each thread keeps 2 row accumulators, so the block
+// issues 1088 global loads for 4608 FMAs: 4.2 FMA per load.
+//
+// R is the tile height plus the two dilated halos, so the shared row for tap
+// kh of output row oh is exactly oh + kh*dilH. Warp lanes run along x with a
+// fixed row, so both the shared reads (S[sh][tx+kw]) and the y writes are
+// contiguous; the 34-float row stride keeps shared banks conflict-free.
+// Restricted to the shapes the dense block uses; everything else takes the
+// naive kernel, and REUSE_NAIVE_CONV2D=1 forces that for A/B.
+template<int R>
+__global__ void k_conv2d_r(const float *x, const float *w, const float *b,
+                           int C_in, int H, int W, int padH, int padW, int dilH,
+                           float *y, int co0)
+{
+    const int TW = 32, LS = TW+2;
+    __shared__ float S[R][LS];
+    const int co = co0 + blockIdx.z;
+    const int w0 = blockIdx.x*TW, h0 = blockIdx.y*16;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty*32 + tx;
+    float acc[2] = { b[co], b[co] };
+    for (int ci = 0; ci < C_in; ci++) {
+        const float *xin = x + (long)ci*H*W;
+        __syncthreads();
+        for (int i = tid; i < R*LS; i += 256) {
+            int r = i / LS, c = i % LS;
+            int hh = h0 - padH + r, ww = w0 - padW + c;
+            S[r][c] = (hh >= 0 && hh < H && ww >= 0 && ww < W) ? xin[(long)hh*W + ww] : 0.f;
+        }
+        __syncthreads();
+        const float *wv = w + ((long)co*C_in + ci)*9;
+        float a0 = 0.f, a1 = 0.f;
+#pragma unroll
+        for (int kh = 0; kh < 3; kh++) {
+            const int sh0 = ty*2 + kh*dilH, sh1 = ty*2 + 1 + kh*dilH;
+            const float w0f = wv[kh*3], w1f = wv[kh*3+1], w2f = wv[kh*3+2];
+            a0 = fmaf(S[sh0][tx],   w0f, a0); a1 = fmaf(S[sh1][tx],     w0f, a1);
+            a0 = fmaf(S[sh0][tx+1], w1f, a0); a1 = fmaf(S[sh1][tx+1],   w1f, a1);
+            a0 = fmaf(S[sh0][tx+2], w2f, a0); a1 = fmaf(S[sh1][tx+2],   w2f, a1);
+        }
+        acc[0] += a0; acc[1] += a1;
+    }
+    const int ww = w0 + tx;
+    if (ww < W) {
+        for (int rr = 0; rr < 2; rr++) {
+            int hh = h0 + ty*2 + rr;
+            if (hh < H) y[(long)co*H*W + (long)hh*W + ww] = acc[rr];
+        }
+    }
+}
+
 static int conv_chunk(void)
 {
     static int c = -1;
@@ -1240,9 +1323,24 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         int n = (C_out - co0 < CH) ? C_out - co0 : CH;
         dim3 grd((unsigned)((W_out + 15) / 16), (unsigned)((H_out + 15) / 16), (unsigned)n);
         // the kernel adds co0 itself, so pass the un-offset pointers
-        k_conv2d<<<grd, blk>>>(x, w, b,
-                               C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW,
-                               y, co0);
+        // the register-tiled kernel owns a 16x32 output tile, so it needs its
+        // own grid/block (blk here is the naive kernel's 16x16)
+        const bool regtile = !getenv("REUSE_NAIVE_CONV2D") && kH == 3 && kW == 3 &&
+                             dilW == 1 && strideH == 1 && strideW == 1 && padW == 1 && padH == dilH;
+        const dim3 grdt((unsigned)((W_out + 31) / 32), (unsigned)((H_out + 15) / 16), (unsigned)n);
+        const dim3 blkt(32, 8);
+        if (regtile && dilH == 1)
+            k_conv2d_r<18><<<grdt, blkt>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+        else if (regtile && dilH == 2)
+            k_conv2d_r<20><<<grdt, blkt>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+        else if (regtile && dilH == 4)
+            k_conv2d_r<24><<<grdt, blkt>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+        else if (regtile && dilH == 8)
+            k_conv2d_r<32><<<grdt, blkt>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+        else
+            k_conv2d<<<grd, blk>>>(x, w, b,
+                                   C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW,
+                                   y, co0);
         launch_kick();
     }
     return reuse_gpu_ok(g, "conv2d");
@@ -1326,15 +1424,20 @@ extern "C" int reuse_gpu_encoder(reuse_gpu_t *g, const float *xin, float *enc, i
     const float *w2 = reuse_gpu_w(g, "dense_encoder.dense_conv_2.0.weight");
     const float *b2 = reuse_gpu_w(g, "dense_encoder.dense_conv_2.0.bias");
     if (g->bad) return 1;
-    launch_conv1x1(g, xin, w1, b1, x1, 2, HID, (long)Tp*Fp);
+    if (!getenv("REUSE_SKIP_ENC1X1"))
+        launch_conv1x1(g, xin, w1, b1, x1, 2, HID, (long)Tp*Fp);
     gdump("c1", x1, (size_t)HID*Tp*Fp);
-    inorm(g, x1, x1n, 1, HID, Tp, Fp, "dense_encoder.dense_conv_1.1.weight", "dense_encoder.dense_conv_1.2.weight");
+    if (!getenv("REUSE_SKIP_IN1"))
+        inorm(g, x1, x1n, 1, HID, Tp, Fp, "dense_encoder.dense_conv_1.1.weight", "dense_encoder.dense_conv_1.2.weight");
     gdump("c1n", x1n, (size_t)HID*Tp*Fp);
-    dense_block_gpu(g, "dense_encoder.dense_block.dense_block", x1n, Tp, Fp, xdb);
+    if (!getenv("REUSE_SKIP_DB"))
+        dense_block_gpu(g, "dense_encoder.dense_block.dense_block", x1n, Tp, Fp, xdb);
     gdump("db", xdb, (size_t)HID*Tp*Fp);
-    launch_conv2d(g, xdb, w2, b2, HID, Tp, Fp, HID, 1, 3, 0, 0, 1, 1, 4, 2, x2);
+    if (!getenv("REUSE_SKIP_ENC2D"))
+        launch_conv2d(g, xdb, w2, b2, HID, Tp, Fp, HID, 1, 3, 0, 0, 1, 1, 4, 2, x2);
     gdump("c2", x2, (size_t)HID*T2*F2);
-    inorm(g, x2, enc, 1, HID, T2, F2, "dense_encoder.dense_conv_2.1.weight", "dense_encoder.dense_conv_2.2.weight");
+    if (!getenv("REUSE_SKIP_IN2"))
+        inorm(g, x2, enc, 1, HID, T2, F2, "dense_encoder.dense_conv_2.1.weight", "dense_encoder.dense_conv_2.2.weight");
     gdump("enc", enc, (size_t)HID*T2*F2);
     return g->bad;
 }
@@ -1373,6 +1476,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     {
         static int tiled = -1;
         if (tiled < 0) tiled = getenv("REUSE_NAIVE_INPROJ") ? 0 : 1;
+        if (getenv("REUSE_SKIP_INPROJ")) { } else
         if (tiled) k_in_proj_t<<<dim3((unsigned)((SL+MT32-1)/MT32), (2*DINNER)/NT64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
         else       k_in_proj<<<dim3((unsigned)((SL+255)/256), 2*DINNER), b1>>>(x, W_in, x0, z, S, L, rev);
     }
@@ -1380,6 +1484,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     GDBG("x0", x0, (size_t)SL*DINNER); GDBG("z", z, (size_t)SL*DINNER);
     {
         static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_CONV") ? 0 : 1;
+        if (getenv("REUSE_SKIP_CONV")) { } else
         if (t) k_conv_causal_t<<<(unsigned)((SL+7)/8), 256>>>(x0, W_c, B_c, xc, S, L);
         else   k_conv_causal<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(x0, W_c, B_c, xc, S, L);
     }
@@ -1388,6 +1493,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     {
         static int tiled = -1;
         if (tiled < 0) tiled = getenv("REUSE_NAIVE_XPROJ") ? 0 : 1;
+        if (getenv("REUSE_SKIP_XPROJ")) { } else
         if (tiled) k_x_proj_t<<<dim3((XP+31)/32, (unsigned)((SL+63)/64)), dim3(16,16)>>>(xc, W_xp, xdbl, SL);
         else       k_x_proj<<<dim3((unsigned)((SL+255)/256), XP), b1>>>(xc, W_xp, xdbl, SL);
     }
@@ -1395,6 +1501,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     GDBG("gxdbl", xdbl, (size_t)SL*XP);
     {
         static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_DTPROJ") ? 0 : 1;
+        if (getenv("REUSE_SKIP_DTPROJ")) { } else
         if (t) k_dt_proj_t<<<(unsigned)((SL+7)/8), 256>>>(xdbl, W_dt, B_dt, dtt, SL);
         else   k_dt_proj<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(xdbl, W_dt, B_dt, dtt, SL);
     }
@@ -1402,6 +1509,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     GDBG("gdt", dtt, (size_t)SL*DINNER);
     {
         static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_SCAN") ? 0 : 1;
+        if (getenv("REUSE_SKIP_SCAN")) { } else
         if (t) k_scan_b<<<dim3((unsigned)((S+7)/8), DINNER/32), 256>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
         else   k_scan<<<dim3((unsigned)S, DINNER/32), 32>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
     }
@@ -1414,6 +1522,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
             dim3 g((HID+GT-1)/GT, (unsigned)((SL+GT-1)/GT));
             k_out_proj_tiled<<<g, dim3(GT/2, GT/2)>>>(y, z, W_op, out, (int)SL);
         } else {
+            if (!getenv("REUSE_SKIP_GATEOP"))
             k_gate_outproj<<<dim3((unsigned)((SL+255)/256), HID), b1>>>(y, z, W_op, out, SL);
         }
     }
@@ -1557,6 +1666,7 @@ extern "C" int reuse_gpu_conv1x1_to1(reuse_gpu_t *g, const float *x, const char 
 extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *pha,
                                  int F, int T, float *amp_out, float *pha_out)
 {
+    prewarm(g);
     const int Tp = T + 2, Fp = F + 2;
     float *xin = (float*)dalloc((size_t)2*Tp*Fp);
     float *enc = (float*)dalloc((size_t)HID*((Tp-1)/4+1)*((Fp-3)/2+1));
