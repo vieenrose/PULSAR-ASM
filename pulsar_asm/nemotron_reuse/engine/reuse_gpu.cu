@@ -1379,6 +1379,116 @@ __global__ void k_resid_scatter_out(const float *y, const float *xf, float *out,
 // launch moves its 46 MB of output at 4 GB/s. Owning 8 co per thread reuses
 // the 3 loaded taps 8x; the 24 weight floats per (ci) are the same addresses
 // across the warp (lanes differ only in w), so they broadcast.
+// Sub-pixel conv with the r sub-pixel phases written as one vector store.
+// k_sp_up8 writes its 8 outputs as 8 scalar stores at stride r (the phases of
+// one output channel are r consecutive elements), which costs r sectors per
+// warp store - 46 MB of output at 14 GB/s. Grouping the 8 channels as
+// (8/r) channels x r phases lets each thread write the r phases of one
+// channel as a single float2/float4 at a w*r*4-byte aligned address, so a
+// warp's writes are contiguous.
+// Sub-pixel conv with the r sub-pixel phases written as one vector store.
+// k_sp_up8's 8 channels per thread are 8 channels of ONE phase (the channel
+// index is co % HID and the phase is co / HID), so its 8 stores each go to a
+// stride-r address: 46 MB of output at 14 GB/s. Here the 8 slots per thread
+// are (8/r) channels x r consecutive phases, so a thread writes the r phases
+// of one channel as a single float2/float4 at a w*r*4-byte aligned address
+// and a warp's writes become contiguous.
+// Sub-pixel conv with the weights pre-transposed to [ci][co][tap].
+// k_sp_up8 reads its 24 weights per (ci, 8 co) as 8 strided float3 loads
+// (one per co, HID*3 floats apart): 11 LSU per 24 FMAs = 2.2 FMA/LSU, which
+// is what pins it at 14 GB/s of writes. With [ci][co][tap] the same 24
+// weights are 24 contiguous floats = 6 float4 loads, 9 LSU per 24 FMAs.
+__global__ void k_wtrans_sp(const float *w, float *wT, int CO)
+{
+    // w: [CO][HID][3] -> wT: [HID][CO][3]
+    int i = blockIdx.x*256 + threadIdx.x;
+    if (i >= CO*HID*3) return;
+    const int t = i % 3, co = (i / 3) / HID, ci = (i / 3) % HID;
+    wT[((long)ci*CO + co)*3 + t] = w[i];
+}
+
+template<int NC>
+__global__ void k_sp_up8w(const float *x, const float *wT, const float *b, float *y,
+                          int H, int W, int r, int CO)
+{
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    const int co = blockIdx.z * NC;
+    if (h >= H || w >= W) return;
+    float acc[NC];
+#pragma unroll
+    for (int j = 0; j < NC; j++) acc[j] = b[co + j];
+    const long hw = (long)h*W;
+    for (int ci = 0; ci < HID; ci++) {
+        const float *xv = x + (long)ci*H*W + hw;
+        const float v1 = xv[w];
+        const float v0 = (w >= 1)   ? xv[w-1] : 0.f;
+        const float v2 = (w+1 < W)  ? xv[w+1] : 0.f;
+        const float4 *wp = (const float4*)(wT + ((long)ci*CO + co)*3);
+        float wt[3*NC];
+#pragma unroll
+        for (int q = 0; q < 3*NC/4; q++) {
+            const float4 f = wp[q];
+            wt[4*q] = f.x; wt[4*q+1] = f.y; wt[4*q+2] = f.z; wt[4*q+3] = f.w;
+        }
+#pragma unroll
+        for (int j = 0; j < NC; j++) {
+            acc[j] = fmaf(v0, wt[3*j],   acc[j]);
+            acc[j] = fmaf(v1, wt[3*j+1], acc[j]);
+            acc[j] = fmaf(v2, wt[3*j+2], acc[j]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NC; j++) {
+        const int cj = (co + j) % HID, aj = (co + j) / HID;
+        y[((long)cj*H + h)*(long)(W*r) + (long)w*r + aj] = acc[j];
+    }
+}
+
+template<int RR>
+__global__ void k_sp_up8v(const float *x, const float *Ww, const float *b, float *y,
+                          int H, int W, int r)
+{
+    const int CH = 8 / RR;                 // channels per thread
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    const int c0 = (int)blockIdx.z * CH;   // channel base; phases are all r
+    if (h >= H || w >= W) return;
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int co = (j % RR)*HID + c0 + (j / RR);
+        acc[j] = b[co];
+    }
+    const long hw = (long)h*W;
+    const int Wc = W*RR;
+    for (int ci = 0; ci < HID; ci++) {
+        const float *xv = x + (long)ci*H*W + hw;
+        const float v1 = xv[w];
+        const float v0 = (w >= 1)   ? xv[w-1] : 0.f;
+        const float v2 = (w+1 < W)  ? xv[w+1] : 0.f;
+#pragma unroll
+        for (int q = 0; q < CH; q++) {
+            const float *wp = Ww + ((long)(c0 + q)*HID + ci)*3;
+#pragma unroll
+            for (int a = 0; a < RR; a++) {
+                const float3 wt = *(const float3*)(wp + (long)a*HID*HID*3);
+                const int j = q*RR + a;
+                acc[j] = fmaf(v0, wt.x, acc[j]);
+                acc[j] = fmaf(v1, wt.y, acc[j]);
+                acc[j] = fmaf(v2, wt.z, acc[j]);
+            }
+        }
+    }
+#pragma unroll
+    for (int q = 0; q < CH; q++) {
+        float *p = y + ((long)(c0 + q)*H + h)*Wc + (long)w*RR;
+        if (RR == 4) *(float4*)p = make_float4(acc[4*q], acc[4*q+1], acc[4*q+2], acc[4*q+3]);
+        else         *(float2*)p = make_float2(acc[2*q], acc[2*q+1]);
+    }
+    (void)r;
+}
+
 __global__ void k_sp_up8(const float *x, const float *Ww, const float *b, float *y,
                          int H, int W, int r)
 {
@@ -2435,8 +2545,22 @@ static int sp_up(reuse_gpu_t *g, const char *prefix, const float *x, int H, int 
     dim3 grd((unsigned)((W + 15)/16), (unsigned)((H + 15)/16), (unsigned)(HID*r));
     {
         static int t8 = -1;
-        if (t8 < 0) t8 = getenv("REUSE_SPUP") ? atoi(getenv("REUSE_SPUP")) : 1;
-        if (t8 && (64*r) % 8 == 0) {
+        if (t8 < 0) t8 = getenv("REUSE_SPUP") ? atoi(getenv("REUSE_SPUP")) : 3;
+        if (t8 == 3) {
+            const int CO = 64*r;
+            float *wT = wallc(g, (size_t)CO*HID*3);
+            if (!wT) return 1;
+            k_wtrans_sp<<<(unsigned)((CO*HID*3+255)/256), 256>>>(w, wT, CO);
+            const int nc = getenv("REUSE_SPUP_NC") ? atoi(getenv("REUSE_SPUP_NC")) : 8;
+            dim3 g8(grd.x, grd.y, (unsigned)(CO/nc));
+            if (nc == 32)      k_sp_up8w<32><<<g8, blk>>>(x, wT, b, y, H, W, r, CO);
+            else if (nc == 16) k_sp_up8w<16><<<g8, blk>>>(x, wT, b, y, H, W, r, CO);
+            else               k_sp_up8w<8><<<g8, blk>>>(x, wT, b, y, H, W, r, CO);
+        } else if (t8 == 2 && (64*r) % 8 == 0 && (r == 2 || r == 4)) {
+            dim3 g8(grd.x, grd.y, (unsigned)((64*r)/8));
+            if (r == 4) k_sp_up8v<4><<<g8, blk>>>(x, w, b, y, H, W, r);
+            else        k_sp_up8v<2><<<g8, blk>>>(x, w, b, y, H, W, r);
+        } else if (t8 && (64*r) % 8 == 0) {
             dim3 g8(grd.x, grd.y, (unsigned)((64*r)/8));
             k_sp_up8<<<g8, blk>>>(x, w, b, y, H, W, r);
         } else {

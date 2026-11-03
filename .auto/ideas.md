@@ -99,3 +99,17 @@ Nano (tegra210, 1 SM, CUDA_LAUNCH_BLOCKING=1, REUSE_WS_MB=640, 8 kHz fixture, GP
   (1 SM / 128 cores @ 921 MHz), so the dev host is a faithful proxy. Ideas #2 (fuse the
   direction chain), #7 (persistent kernel) and #12 (CUDA graphs / launch reduction) are
   accordingly LOW value - deprioritise them.
+
+## Nano validation #2 (dev-host rtf_total 0.1080)
+Nano (tegra210, CUDA_LAUNCH_BLOCKING=1, REUSE_WS_MB=640, run_bench.sh feeds the reference
+STFT so stft(cpu)=0): RTF_total 3.4718 = model 3.4543 + istft 0.0175.
+Phases: encoder 3.439 | tower 12.676 | decoders 1.478 | heads 0.011.
+Previous Nano check (dev host 0.1199): model 3.4949, tower 12.88, encoder 3.44, dec 1.48.
+=> The last three keeps (x_proj register blocking, outproj_ln tiled GEMM, dt_proj+scan
+fusion) moved the dev host -10% and the Nano only -1.2% (tower -1.6%).
+INTERPRETATION: the Nano has 16 warps/SM (Maxwell) at 921 MHz, so its kernels are
+latency-bound; the dev host (2048 threads/SM, 158 GB/s) is at the DRAM/issue floor for
+these kernels, so traffic/ILP wins there do not transfer 1:1.
+CONSEQUENCE: the scored metric is the dev host - keep optimising the dev host; do not tune
+for the Nano (fewer registers / less shared memory helps the Nano and hurts the dev host).
+Expect ~10-15% Nano transfer for a dev-host tower win.
