@@ -702,6 +702,113 @@ __global__ void k_crop_ft(const float *src, float *out, int T, int F, int Fx)
 }
 
 // mag/pha are [F,T]; xin is [2,Tp,Fp] with 2 zero freq cols and 2 zero time rows.
+__global__ void k_stft_prep(const float *x, int T, double *xw, int n_fft, int hop,
+                            int pad, const float *w)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long n = (long)T * n_fft;
+    if (i >= n) return;
+    int t = (int)(i / n_fft), k = (int)(i % n_fft);
+    int idx = t*hop - pad + k;
+    float v;
+    if (idx < 0)        v = x[-idx - 1];
+    else if (idx >= T)  v = x[2*T - 2 - idx];
+    else                v = x[idx];
+    xw[i] = (double)v * (double)w[k];            // the reference forms this product in double
+}
+
+__global__ void k_stft_dft(const double *xw, const double *Cc, const double *Cs,
+                           double *re_out, double *im_out, int F, int T, int n_fft)
+{
+    const int KT = 32;
+    __shared__ double Ct[16][KT+1], St[16][KT+1], Xt[KT][16+1];
+    const int t0 = blockIdx.x * 16, k0 = blockIdx.y * 16;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty*16 + tx;
+    double re = 0.0, im = 0.0;
+    for (int n0 = 0; n0 < n_fft; n0 += KT) {
+        __syncthreads();
+        for (int i = tid; i < 16*KT; i += 256) {
+            int kk = i / KT, nn = i % KT;
+            int n = n0 + nn;
+            if (k0 + kk < F && n < n_fft) {
+                Ct[kk][nn] = Cc[(long)(k0+kk)*n_fft + n];
+                St[kk][nn] = Cs[(long)(k0+kk)*n_fft + n];
+            } else { Ct[kk][nn] = 0.0; St[kk][nn] = 0.0; }
+            Xt[nn][kk] = (t0 + kk < T && n < n_fft) ? xw[(long)(t0+kk)*n_fft + n] : 0.0;
+        }
+        __syncthreads();
+        if (k0 + ty < F && t0 + tx < T) {
+#pragma unroll
+            for (int nn = 0; nn < KT; nn++) {
+                double xv = Xt[nn][tx];
+                re += Ct[ty][nn]*xv;
+                im += St[ty][nn]*xv;
+            }
+        }
+    }
+    if (k0 + ty < F && t0 + tx < T) {
+        long off = (long)(k0+ty)*T + (t0+tx);
+        re_out[off] = re;
+        im_out[off] = im;
+    }
+}
+
+__global__ void k_stft_head(const double *re, const double *im, float *mag, float *pha, long n)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    double r = re[i], m = im[i];
+    mag[i] = (float)log1p(sqrt(r*r + m*m));
+    pha[i] = (float)atan2(m, r);
+}
+
+extern "C" int reuse_gpu_stft(reuse_gpu_t *g, const float *d_wav, int T, int n_fft,
+                              int hop, int win, int F, int num_frames,
+                              float *d_mag, float *d_pha)
+{
+    // Mirrors reuse_stft_mag_pha() bit-for-bit in spirit: reflect-pad, raise-
+    // cosine window, twiddles precomputed in double, double accumulation.
+    // The reference accumulates in double on purpose - a single-precision sum
+    // flips the sign of Im near the negative-real axis and moves whole bins by
+    // 2*pi, and float twiddles cost ~1.8e-4 rad of phase, which the 30-block
+    // tower amplifies down to 26 dB of output SNR.
+    g->ws_off = 0;
+    double *xw  = (double*)wallc(g, (size_t)num_frames*n_fft*2);
+    double *Cc  = (double*)wallc(g, (size_t)F*n_fft*2);
+    double *Cs  = (double*)wallc(g, (size_t)F*n_fft*2);
+    double *dre = (double*)wallc(g, (size_t)F*num_frames*2);
+    double *dim = (double*)wallc(g, (size_t)F*num_frames*2);
+    float  *w   = (float*) wallc(g, (size_t)n_fft);
+    if (!xw || !Cc || !Cs || !dre || !dim || !w) return 1;
+    float *hw = (float*)malloc((size_t)n_fft*sizeof(float));
+    double *hc = (double*)malloc((size_t)F*n_fft*sizeof(double));
+    double *hs = (double*)malloc((size_t)F*n_fft*sizeof(double));
+    if (!hw || !hc || !hs) { free(hw); free(hc); free(hs); return 1; }
+    for (int i = 0; i < n_fft; i++)
+        hw[i] = (i < win) ? 0.5f*(1.0f - cosf(2.0f*(float)M_PI*i/(float)win)) : 0.0f;
+    const double pi = 3.14159265358979323846;
+    for (int k = 0; k < F; k++)
+        for (int n = 0; n < n_fft; n++) {
+            double ang = -2.0*pi*((double)n*(double)k)/(double)n_fft;
+            hc[(size_t)k*n_fft+n] = cos(ang);
+            hs[(size_t)k*n_fft+n] = sin(ang);
+        }
+    if (cudaMemcpy(w, hw, (size_t)n_fft*sizeof(float), cudaMemcpyHostToDevice) ||
+        cudaMemcpy(Cc, hc, (size_t)F*n_fft*sizeof(double), cudaMemcpyHostToDevice) ||
+        cudaMemcpy(Cs, hs, (size_t)F*n_fft*sizeof(double), cudaMemcpyHostToDevice)) {
+        free(hw); free(hc); free(hs); return reuse_gpu_ok(g, "stft memcpy");
+    }
+    free(hw); free(hc); free(hs);
+    long pn = (long)num_frames*n_fft;
+    k_stft_prep<<<(unsigned)((pn+255)/256), 256>>>(d_wav, T, xw, n_fft, hop, n_fft/2, w);
+    k_stft_dft<<<dim3((unsigned)((num_frames+15)/16), (unsigned)((F+15)/16)), dim3(16,16)>>>(
+        xw, Cc, Cs, dre, dim, F, num_frames, n_fft);
+    long on = (long)F*num_frames;
+    k_stft_head<<<(unsigned)((on+255)/256), 256>>>(dre, dim, d_mag, d_pha, on);
+    return reuse_gpu_ok(g, "stft_gpu");
+}
+
 __global__ void k_mag_pha_split(const float *mag, const float *pha, float *Cr, float *Ci, long n)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;

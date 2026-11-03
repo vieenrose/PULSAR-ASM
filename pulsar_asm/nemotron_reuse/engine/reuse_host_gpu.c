@@ -59,6 +59,7 @@ int main(int argc, char **argv)
 
     const char *mfp = getenv("REUSE_MAG"), *pfp = getenv("REUSE_PHA");
     double t_stft = 0;
+    int gpu_stft = 0;
     if (mfp && pfp) {
         FILE *f = fopen(mfp, "rb");
         if (!f) { printf("cannot open %s\n", mfp); return 1; }
@@ -69,6 +70,37 @@ int main(int argc, char **argv)
         if (fread(h_pha, sizeof(float), nsp, f) != nsp) { printf("short read %s\n", pfp); return 1; }
         fclose(f);
         printf("using reference STFT\n");
+    } else if (getenv("REUSE_GPU_STFT")) {
+        // DFT-GEMM STFT on the GPU (same tables/semantics as the CPU path).
+        // The waveform upload is inside the timed region: it is part of the
+        // work the CPU STFT does not have to pay.
+        double t0 = now_s();
+        float *d_wav = NULL;
+        if (cudaMalloc(&d_wav, nsp*0 + (size_t)nf*sizeof(float)) == cudaSuccess) {
+            cudaMemcpy(d_wav, wav, (size_t)nf*sizeof(float), cudaMemcpyHostToDevice);
+            printf("[stft] nfft=%d hop=%d wsize=%d F=%d T=%d nf=%d\n", nfft, hop, wsize, F, T, nf);
+            cudaMemset(d_mag, 0, nsp*sizeof(float));
+            cudaMemset(d_pha, 0, nsp*sizeof(float));
+            if (reuse_gpu_stft(g, d_wav, nf, nfft, hop, wsize, F, T, d_mag, d_pha))
+                printf("gpu stft failed\n");
+            cudaDeviceSynchronize();
+            cudaFree(d_wav);
+        }
+        t_stft = now_s() - t0;
+        gpu_stft = 1;
+        printf("gpu stft %.3f s\n", t_stft);
+    } else if (getenv("REUSE_MALLOC_PROBE")) {
+        // Control for the GPU-STFT comparison: take the CPU STFT path but
+        // perform the same cudaMalloc/cudaFree the GPU path does, to see how
+        // much of the end-to-end difference is the model's schedule-sensitive
+        // scan rather than the STFT itself.
+        double t0 = now_s();
+        float *probe = NULL;
+        cudaMalloc(&probe, (size_t)nf*sizeof(float));
+        cudaFree(probe);
+        reuse_stft_mag_pha(wav, nf, nfft, hop, wsize, h_mag, h_pha, F, T);
+        t_stft = now_s() - t0;
+        printf("cpu stft (probe) %.3f s\n", t_stft);
     } else {
         double t0 = now_s();
         reuse_stft_mag_pha(wav, nf, nfft, hop, wsize, h_mag, h_pha, F, T);
@@ -76,9 +108,21 @@ int main(int argc, char **argv)
         printf("cpu stft %.3f s\n", t_stft);
     }
     fflush(stdout);
-    cudaMemcpy(d_mag, h_mag, nsp*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_pha, h_pha, nsp*sizeof(float), cudaMemcpyHostToDevice);
+    if (!gpu_stft) {
+        cudaMemcpy(d_mag, h_mag, nsp*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_pha, h_pha, nsp*sizeof(float), cudaMemcpyHostToDevice);
+    }
 
+    if (getenv("REUSE_DUMP_SPECT")) {
+        float *dm = (float*)malloc(nsp*sizeof(float)), *dp = (float*)malloc(nsp*sizeof(float));
+        cudaMemcpy(dm, d_mag, nsp*sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(dp, d_pha, nsp*sizeof(float), cudaMemcpyDeviceToHost);
+        FILE *f = fopen(getenv("REUSE_DUMP_SPECT"), "wb");
+        fwrite(dm, sizeof(float), nsp, f); fclose(f);
+        f = fopen(getenv("REUSE_DUMP_SPECT"), "ab");
+        fwrite(dp, sizeof(float), nsp, f); fclose(f);
+        printf("dumped spectrum\n");
+    }
     float *h_amp = (float*)malloc(nsp*sizeof(float));
     float *h_phaout = (float*)malloc(nsp*sizeof(float));
     float *out = (float*)calloc((size_t)nf, sizeof(float));
@@ -131,7 +175,8 @@ int main(int argc, char **argv)
     reuse_gpu_print_kprof();
     double te, tb, td, th; reuse_gpu_get_times(&te, &tb, &td, &th);
     printf("phases: encoder %.3f s | 30xTFMamba %.3f s | decoders %.3f s | heads %.3f s\n", te, tb, td, th);
-    printf("=== RTF (model GPU, STFT CPU, iSTFT %s) ===\n", getenv("REUSE_GPU_ISTFT") ? "GPU" : "CPU");
+    printf("=== RTF (model GPU, STFT %s, iSTFT %s) ===\n", gpu_stft ? "GPU" : "CPU",
+           getenv("REUSE_GPU_ISTFT") ? "GPU" : "CPU");
     printf("audio      %.4f s\n", audio_s);
     printf("model best %.4f s   RTF_model %.4f\n", best, best/audio_s);
     printf("stft(cpu)  %.4f s   RTF %.4f\n", t_stft, t_stft/audio_s);

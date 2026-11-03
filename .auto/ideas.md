@@ -52,3 +52,20 @@ Ordered by expected payoff. Verify each with the single-block harness
     and InstanceNorm double accumulators are expensive there. Verify gates.
 14. Workspace: the arena resets per stage; check peak usage to enable a smaller
     Nano arena (16 kHz needs 1.1 GiB today, which limits what else fits).
+
+## Measured: multi-stream / multi-process scaling (dev host, 8 kHz, 2 reps)
+Per-stream RTF_total: 1 stream 0.439 | 2 streams 0.932 | 4 streams 1.860 | 8 streams ~2.7 (2/8 OOM at 640 MB arena each).
+Aggregate RTF (wall/total audio): 0.439 / 0.962 / 0.953 / 0.76 -> the GPU saturates at ~1 stream;
+extra processes only add CUDA context switches. RTF<1 is reachable at 2 concurrent streams, not 4+.
+15. **Batch>1 (8 clips in one process, batch dim in the GEMMs/scan).** The ONLY form of "8 parallel"
+    that buys throughput: 8x work per launch, weights + launch overhead amortised, GEMM M dim 8x taller.
+    Highest-value Nano item (launches are serialised by CUDA_LAUNCH_BLOCKING there). Needs batch>1
+    threaded through the model graph (cfg says batch=1 today).
+16. **GPU STFT is written and validated in isolation** (`reuse_gpu_stft` in reuse_gpu.cu +
+    k_stft_prep/k_stft_dft/k_stft_head, opt-in REUSE_GPU_STFT, driver wired): 0.080 -> 0.010 s
+    (RTF 0.0157 -> 0.0020, ~3.5% of rtf_total; ~0.43 s on the Nano). Bit-identical to the CPU
+    reference (max|d|=0 on the real fixture) when run standalone. BLOCKED: in-app, 999/164381 mag
+    bins and 504 phase bins differ (max 1.04 / 3.14 = pi flips) and end-to-end SNR vs the CPU-STFT
+    run is 26.4 dB (deterministic, rep-independent, malloc-probe ruled out allocation). Next debug:
+    compare k_stft_dft's re/im in-app (dump dre/dim), check the tile grid (64,11) coverage vs the
+    isolated harness, and print wsize (app: nfft=320 hop=40 wsize=320 F=161 T=1021 nf=40800).

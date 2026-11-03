@@ -17,6 +17,9 @@ void         reuse_gpu_set_skips(void);
 int          reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *d_pha,
                              int F, int T, int n_fft, int hop, int win,
                              float *d_out, int out_len);
+int          reuse_gpu_stft(reuse_gpu_t *g, const float *d_wav, int T, int n_fft,
+                            int hop, int win, int F, int num_frames,
+                            float *d_mag, float *d_pha);
 void         reuse_gpu_print_kprof(void);
 void         reuse_gpu_get_times(double *enc, double *blk, double *dec, double *head);
 const float *reuse_gpu_w(reuse_gpu_t *g, const char *name);   // device pointer
