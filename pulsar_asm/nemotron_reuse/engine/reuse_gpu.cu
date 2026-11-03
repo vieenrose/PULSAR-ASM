@@ -430,6 +430,52 @@ __global__ void k_dt_proj(const float *xdbl, const float *W, const float *B,
 }
 
 // selective scan: one thread per (s, channel), 16 states in registers.
+__global__ void k_conv_causal_t(const float *x0, const float *Wc, const float *Bc,
+                                float *xc, int S, int L)
+{
+    // Coalesced sibling of k_conv_causal. The naive kernel assigns each thread a
+    // different ROW for a single channel, so a warp's reads are 32 floats spaced
+    // DINNER apart (26x over-fetch). Here a thread owns 8 CONSECUTIVE channels of
+    // one row, and all 32 lanes of a warp share that row: every access is 128 B
+    // contiguous.
+    long SL = (long)S * L;
+    int m = (int)((long)blockIdx.x * 8 + threadIdx.x / 32);
+    int c0 = (threadIdx.x % 32) * 8;
+    if (m >= SL) return;
+    int t = m % L;
+    int ntap = (t >= DCONV - 1) ? DCONV : t + 1;          // causal zero-pad
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc[j] = Bc[c0 + j];
+    for (int k = DCONV - ntap; k < DCONV; k++) {
+        const float *p = x0 + ((long)m - (DCONV - 1) + k) * DINNER + c0;
+        const float *w = Wc + (long)c0 * DCONV + k;
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc[j] = fmaf(p[j], w[j*DCONV], acc[j]);
+    }
+    float *o = xc + (long)m * DINNER + c0;
+#pragma unroll
+    for (int j = 0; j < 8; j++) o[j] = dsilu(acc[j]);
+}
+
+__global__ void k_dt_proj_t(const float *xdbl, const float *W, const float *B,
+                            float *dtt, long SL)
+{
+    // Same fix as k_conv_causal_t: 8 consecutive channels per thread, warp-coherent.
+    int m = (int)((long)blockIdx.x * 8 + threadIdx.x / 32);
+    int c0 = (threadIdx.x % 32) * 8;
+    if (m >= SL) return;
+    const float *di = xdbl + (long)m * XP;
+    float d0 = di[0], d1 = di[1], d2 = di[2], d3 = di[3];
+    const float *wr = W + (long)c0 * DTRANK;
+    const float *bb = B + c0;
+    float *o = dtt + (long)m * DINNER + c0;
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+        o[j] = dsoftplus(bb[j] + d0*wr[j*DTRANK] + d1*wr[j*DTRANK+1]
+                                    + d2*wr[j*DTRANK+2] + d3*wr[j*DTRANK+3]);
+}
+
 __global__ void k_scan(const float *xc, const float *dtt, const float *A_log,
                        const float *Dv, const float *xdbl, float *y, int S, int L, int rev)
 {
@@ -966,7 +1012,11 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     }
     kp_mark("in_proj", &klast);
     GDBG("x0", x0, (size_t)SL*DINNER); GDBG("z", z, (size_t)SL*DINNER);
-    k_conv_causal<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(x0, W_c, B_c, xc, S, L);
+    {
+        static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_CONV") ? 0 : 1;
+        if (t) k_conv_causal_t<<<(unsigned)((SL+7)/8), 256>>>(x0, W_c, B_c, xc, S, L);
+        else   k_conv_causal<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(x0, W_c, B_c, xc, S, L);
+    }
     kp_mark("conv", &klast);
     GDBG("gxact", xc, (size_t)SL*DINNER);
     {
@@ -977,7 +1027,11 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     }
     kp_mark("x_proj", &klast);
     GDBG("gxdbl", xdbl, (size_t)SL*XP);
-    k_dt_proj<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(xdbl, W_dt, B_dt, dtt, SL);
+    {
+        static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_DTPROJ") ? 0 : 1;
+        if (t) k_dt_proj_t<<<(unsigned)((SL+7)/8), 256>>>(xdbl, W_dt, B_dt, dtt, SL);
+        else   k_dt_proj<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(xdbl, W_dt, B_dt, dtt, SL);
+    }
     kp_mark("dt_proj", &klast);
     GDBG("gdt", dtt, (size_t)SL*DINNER);
     k_scan<<<dim3((unsigned)S, DINNER/32), 32>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
