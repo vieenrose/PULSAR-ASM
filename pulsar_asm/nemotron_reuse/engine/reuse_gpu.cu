@@ -3107,10 +3107,24 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
     if (reuse_gpu_encoder(g, xin, enc, Tp, Fp)) return 1;
     cudaDeviceSynchronize(); double t1 = gt_now(); g_t_enc = t1-t0;
     const int T2 = (Tp-1)/4 + 1, F2 = (Fp-3)/2 + 1;
-    for (int i = 0; i < 30; i++) {
-        if (reuse_gpu_tfmamba(g, i, enc, blk, T2, F2)) return 1;
-        cudaMemcpyAsync(enc, blk, (size_t)HID*T2*F2*sizeof(float), cudaMemcpyDeviceToDevice);
+    // Ping-pong the tower buffers: the per-block blk->enc copy is HID*T2*F2
+    // floats (10.5 MB at 8 kHz, 315 MB per forward), pure overhead. `cur`/`nxt`
+    // swap so each block reads what the previous one wrote. The decoders read
+    // whatever `cur` ends up being; with an even block count that is `blk`.
+    const int NBLK = 30;
+    float *cur = enc, *nxt = blk;
+    if (getenv("REUSE_COPYBACK")) {           /* A/B: restore the copy form */
+        for (int i = 0; i < NBLK; i++) {
+            if (reuse_gpu_tfmamba(g, i, enc, blk, T2, F2)) return 1;
+            cudaMemcpyAsync(enc, blk, (size_t)HID*T2*F2*sizeof(float), cudaMemcpyDeviceToDevice);
+        }
+    } else {
+        for (int i = 0; i < NBLK; i++) {
+            if (reuse_gpu_tfmamba(g, i, cur, nxt, T2, F2)) return 1;
+            float *sw = cur; cur = nxt; nxt = sw;
+        }
     }
+    enc = cur;
     cudaDeviceSynchronize(); double t2 = gt_now(); g_t_blk = t2-t1;
     if (getenv("REUSE_MEM")) { size_t fr=0,to=0; cudaMemGetInfo(&fr,&to);
         fprintf(stderr, "[mem] after 30 blocks: free %zu MiB / %zu MiB\n", fr>>20, to>>20); }
