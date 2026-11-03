@@ -3076,12 +3076,17 @@ static int dense_block_gpu(reuse_gpu_t *g, const char *prefix, const float *x_in
                            int T, int F, float *out, int tilehint)
 {
     const int cap = HID * (DEPTH + 1) * T * F;
-    float *skip  = wallc(g, (size_t)cap);
-    float *skip2 = wallc(g, (size_t)cap);
+    /* Two concat buffers are enough: layer 0 reads the caller's tensor directly
+       (the old code copied it into a third buffer), and each layer's [cur, skip]
+       pair is written into the buffer that is not being read. The last layer's
+       inorm writes `out` directly, which removes the trailing cur->out copy. */
+    float *bufA  = wallc(g, (size_t)cap);
+    float *bufB  = wallc(g, (size_t)cap);
     float *tmp   = wallc(g, (size_t)HID*T*F);
     float *cur   = wallc(g, (size_t)HID*T*F);
-    if (!skip || !skip2 || !tmp || !cur) return 1;
-    cudaMemcpyAsync(skip, x_in, (size_t)HID*T*F*sizeof(float), cudaMemcpyDeviceToDevice);
+    if (!bufA || !bufB || !tmp || !cur) return 1;
+    const float *srcs[3] = { x_in, bufA, bufB };
+    int cs = 0, ds = 1;                              /* source/destination slot ids */
     int c_skip = HID;
     char key[256], nkey[256], akey[256];
     for (int i = 0; i < DEPTH; i++) {
@@ -3089,17 +3094,23 @@ static int dense_block_gpu(reuse_gpu_t *g, const char *prefix, const float *x_in
         snprintf(key, sizeof(key), "%s.%d.0.bias",   prefix, i); const float *b = reuse_gpu_w(g, key);
         if (g->bad) return 1;
         int dil = 1 << i;
-        launch_conv2d(g, skip, w, b, c_skip, T, F, HID, 3, 3, dil, 1, dil, 1, 1, 1, tmp, tilehint);
+        launch_conv2d(g, srcs[cs], w, b, c_skip, T, F, HID, 3, 3, dil, 1, dil, 1, 1, 1, tmp, tilehint);
         snprintf(nkey, sizeof(nkey), "%s.%d.1.weight", prefix, i);
         snprintf(akey, sizeof(akey), "%s.%d.2.weight", prefix, i);
-        inorm(g, tmp, cur, 1, HID, T, F, nkey, akey);
-        cudaMemcpyAsync(skip2, cur, (size_t)HID*T*F*sizeof(float), cudaMemcpyDeviceToDevice);
-        cudaMemcpyAsync(skip2 + (size_t)HID*T*F, skip, (size_t)c_skip*T*F*sizeof(float), cudaMemcpyDeviceToDevice);
-        float *sw = skip; skip = skip2; skip2 = sw;
+        float *ocur = (i == DEPTH - 1) ? out : cur;
+        inorm(g, tmp, ocur, 1, HID, T, F, nkey, akey);
+        if (i != DEPTH - 1) {
+            float *d2 = (ds == 1) ? bufA : bufB;
+            cudaMemcpyAsync(d2, ocur, (size_t)HID*T*F*sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpyAsync(d2 + (size_t)HID*T*F, srcs[cs], (size_t)c_skip*T*F*sizeof(float), cudaMemcpyDeviceToDevice);
+            cs = ds; ds = (cs == 1) ? 2 : 1;      /* the next layer reads this slot,
+                                                     writes the other arena buffer */
+        }
         c_skip += HID;
     }
-    cudaMemcpyAsync(out, cur, (size_t)HID*T*F*sizeof(float), cudaMemcpyDeviceToDevice);
-    cudaDeviceSynchronize();
+    static int dbsync = -1;
+    if (dbsync < 0) dbsync = getenv("REUSE_DBSYNC") ? atoi(getenv("REUSE_DBSYNC")) : 0;
+    if (dbsync) cudaDeviceSynchronize();            /* A/B: drains the pipeline per dense block */
     return g->bad;
 }
 
