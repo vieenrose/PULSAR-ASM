@@ -478,6 +478,40 @@ __global__ void k_dt_proj_t(const float *xdbl, const float *W, const float *B,
                                     + d2*wr[j*DTRANK+2] + d3*wr[j*DTRANK+3]);
 }
 
+__global__ void k_scan_b(const float *xc, const float *dtt, const float *A_log,
+                         const float *Dv, const float *xdbl, float *y, int S, int L, int rev)
+{
+    // Same serial L-scan as k_scan, but 256-thread blocks that cover 8 scan
+    // rows: the 32-thread version gives the whole tensor only 648 warps and
+    // runs 3x off this shape. One channel per thread (more channels per thread
+    // costs more in registers than it saves: measured CPZ=2 0.00055 s,
+    // CPZ=4 0.00073 s vs 0.00044 s here).
+    int s = (int)((long)blockIdx.x * 8 + threadIdx.x / 32);
+    int c = (threadIdx.x % 32) + blockIdx.y * 32;
+    if (s >= S || c >= DINNER) return;
+    float h[DSTATE];
+#pragma unroll
+    for (int n = 0; n < DSTATE; n++) h[n] = 0.0f;
+    float aA[DSTATE];
+#pragma unroll
+    for (int n = 0; n < DSTATE; n++) aA[n] = -__expf(A_log[c * DSTATE + n]);
+    const float Dc = Dv[c];
+    for (int ii = 0; ii < L; ii++) {
+        long sl = (long)s * L + ii;
+        float d = dtt[sl * DINNER + c];
+        float u = xc[sl * DINNER + c];
+        const float *Bt = xdbl + sl * XP + DTRANK;
+        const float *Ct = Bt + DSTATE;
+        float acc = 0.0f;
+#pragma unroll
+        for (int n = 0; n < DSTATE; n++) {
+            h[n] = __expf(d * aA[n]) * h[n] + d * Bt[n] * u;
+            acc = fmaf(h[n], Ct[n], acc);
+        }
+        y[sl * DINNER + c] = acc + u * Dc;
+    }
+}
+
 __global__ void k_scan(const float *xc, const float *dtt, const float *A_log,
                        const float *Dv, const float *xdbl, float *y, int S, int L, int rev)
 {
@@ -1036,7 +1070,11 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     }
     kp_mark("dt_proj", &klast);
     GDBG("gdt", dtt, (size_t)SL*DINNER);
-    k_scan<<<dim3((unsigned)S, DINNER/32), 32>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
+    {
+        static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_SCAN") ? 0 : 1;
+        if (t) k_scan_b<<<dim3((unsigned)((S+7)/8), DINNER/32), 256>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
+        else   k_scan<<<dim3((unsigned)S, DINNER/32), 32>>>(xc, dtt, A_log, Dv, xdbl, y, S, L, rev);
+    }
     kp_mark("scan", &klast);
     GDBG("gscan", y, (size_t)SL*DINNER);
     {
