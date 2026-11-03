@@ -23,8 +23,10 @@ See [doc/NEMOTRON_REUSE_NANO_PLAN.md](../../doc/NEMOTRON_REUSE_NANO_PLAN.md) for
 - [x] S7: CUDA kernels; **verified on the Jetson Nano itself** (sm_53):
       complex rel-rms 1.104e-06, waveform SNR 119.91 dB, gate PASS
 - [x] S8 (partial): out_proj tiled+fused gate -> tower 47.5 s -> 8.6 s on the
-      dev host; Nano RTF_model 43.98 at 8 kHz (not real time, see RTF below)
-- [ ] S8 (open): real-time (RTF < 1) is NOT achieved; see next steps
+      dev host; GPU iSTFT (123x); Nano RTF_model 44.34 (8 kHz) / 88.86 (16 kHz)
+- [ ] S8 (open): real-time (RTF < 1) is NOT achieved (~45x short at 8 kHz);
+      the profile says the 45x has to come from the tower (74%) and the
+      encoder convolutions (19%). See next steps.
 
 ## Accuracy Gates
 Unlike other PULSAR-ASM ports, bit-exactness vs PyTorch is not required (exp/atan2/log1p). Gates:
@@ -87,10 +89,10 @@ profile says where it is: 74% tower, 19% encoder convolutions.
 
 Dev host (GTX 1070, 15 SMs, `sm_61`), same code:
 
-| fixture | model | RTF_model | iSTFT (CPU) | RTF_total |
+| fixture | model | RTF_model | iSTFT CPU -> GPU | RTF_total (GPU iSTFT) |
 |---|---|---|---|---|
-| 8 kHz | 9.73 s | 1.91 | 1.27 s | 2.13 |
-| 16 kHz | 19.9 s | 3.91 | 4.29 s | 4.71 |
+| 8 kHz | 9.73 s | 1.91 | 1.27 s -> 0.0103 s | **1.92** |
+| 16 kHz | 19.9 s | 3.91 | 4.29 s -> 0.0365 s | **3.90** |
 
 Nano is ~23x the 1070 model time (1 SM vs 15, 0.55x clock).
 
