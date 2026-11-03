@@ -302,6 +302,67 @@ __global__ void k_in_proj(const float *x, const float *W, float *x0, float *z,
 }
 
 // causal depthwise conv1d (k=4) + SiLU along L
+// in_proj with a 64x64 tile and 16 accumulators per thread.
+//
+// k_in_proj_t tiles 32x64 with 8 outputs/thread: 6 shared loads per 8 FMAs,
+// i.e. 1.33 FMA per shared load, which is the shared-memory ceiling (~32
+// floats/clk/SM) and pins the kernel at 424 GFLOPS - 7% of peak for a 1.36
+// GFlop GEMM launched 60 times. A 64x64 tile with a 4x4 accumulator gives 16
+// outputs from 8 shared loads per k (2 FMA/load), and chunking K=64 into two
+// 32-wide tiles keeps shared at 17.4 KB so 3 blocks stay resident per SM.
+__global__ void k_in_proj_r(const float *x, const float *W, float *x0, float *z,
+                            int S, int L, int rev)
+{
+    const int KC = 32, MT = 64, NT = 64;
+    __shared__ float Xs[MT][KC+4], Ws[NT][KC+4];
+    const long SL = (long)S * L;
+    const long m0 = (long)blockIdx.x * MT;
+    const int n0 = blockIdx.y * NT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty*16 + tx;
+    float acc[4][4];
+#pragma unroll
+    for (int a = 0; a < 4; a++)
+#pragma unroll
+        for (int b = 0; b < 4; b++) acc[a][b] = 0.f;
+    for (int k0 = 0; k0 < HID; k0 += KC) {
+        for (int i = tid; i < MT*KC; i += 256) {
+            int r = i / KC, c = i % KC;
+            long m = m0 + r;
+            int sm = (int)(m / L), tm = (int)(m % L);
+            if (m >= SL) { Xs[r][c] = 0.f; continue; }
+            Xs[r][c] = x[((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + c];
+        }
+        for (int i = tid; i < NT*KC; i += 256) {
+            int r = i / KC, c = i % KC;
+            Ws[r][c] = W[(long)(n0+r)*HID + k0 + c];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KC; k++) {
+            float a[4], w[4];
+#pragma unroll
+            for (int a4 = 0; a4 < 4; a4++) a[a4] = Xs[ty*4 + a4][k];
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++) w[b4] = Ws[tx*4 + b4][k];
+#pragma unroll
+            for (int a4 = 0; a4 < 4; a4++)
+#pragma unroll
+                for (int b4 = 0; b4 < 4; b4++) acc[a4][b4] = fmaf(a[a4], w[b4], acc[a4][b4]);
+        }
+        __syncthreads();
+    }
+    float *dst = (n0 >= DINNER) ? z : x0;
+    const int ob = (n0 >= DINNER) ? n0 - DINNER : n0;
+#pragma unroll
+    for (int a4 = 0; a4 < 4; a4++) {
+        long m = m0 + ty*4 + a4;
+        if (m >= SL) continue;
+#pragma unroll
+        for (int b4 = 0; b4 < 4; b4++) dst[m*DINNER + ob + tx*4 + b4] = acc[a4][b4];
+    }
+}
+
 __global__ void k_in_proj_t(const float *x, const float *W, float *x0, float *z,
                             int S, int L, int rev)
 {
@@ -1475,9 +1536,13 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         #define GDBG(tag, ptr, n) do { if (dbg) { char t_[32]; snprintf(t_, sizeof(t_), "%s%s", dt, tag); gdump(t_, ptr, n); } } while (0)
     {
         static int tiled = -1;
-        if (tiled < 0) tiled = getenv("REUSE_NAIVE_INPROJ") ? 0 : 1;
+        if (tiled < 0) {
+            const char *e = getenv("REUSE_INPROJ");
+            tiled = e ? atoi(e) : (getenv("REUSE_NAIVE_INPROJ") ? 0 : 2);
+        }
         if (getenv("REUSE_SKIP_INPROJ")) { } else
-        if (tiled) k_in_proj_t<<<dim3((unsigned)((SL+MT32-1)/MT32), (2*DINNER)/NT64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
+        if (tiled == 2) k_in_proj_r<<<dim3((unsigned)((SL+63)/64), (2*DINNER)/64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
+        else if (tiled) k_in_proj_t<<<dim3((unsigned)((SL+MT32-1)/MT32), (2*DINNER)/NT64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
         else       k_in_proj<<<dim3((unsigned)((SL+255)/256), 2*DINNER), b1>>>(x, W_in, x0, z, S, L, rev);
     }
     kp_mark("in_proj", &klast);
