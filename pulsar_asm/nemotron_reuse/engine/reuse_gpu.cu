@@ -19,6 +19,8 @@ static double gt_now(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); 
 
 #define HID 64
 #define GT 32
+#define MT32 32
+#define NT64 64
 #define DEPTH 4
 #define DINNER 256
 #define DSTATE 16
@@ -298,6 +300,52 @@ __global__ void k_in_proj(const float *x, const float *W, float *x0, float *z,
 }
 
 // causal depthwise conv1d (k=4) + SiLU along L
+__global__ void k_in_proj_t(const float *x, const float *W, float *x0, float *z,
+                            int S, int L, int rev)
+{
+    // x0/z[m][o] = sum_c x[perm(m)][c] * W[o][c];  K = HID = 64, N = 2*DINNER.
+    // The naive version assigned one (row, column) per thread, so every output
+    // column re-read the whole input row: 2.7 GB of reads for 42 MB of output
+    // (37 GFLOPS). Tiling 32 rows x 64 columns into shared memory and giving
+    // each thread 8 outputs (2x4) reads the tile once per 8 outputs.
+    const int MT = 32, NT = 64;
+    __shared__ float Xs[MT][HID+4];
+    __shared__ float Ws[NT][HID+4];
+    const int m0 = blockIdx.x * MT, n0 = blockIdx.y * NT;
+    const int tx = threadIdx.x, ty = threadIdx.y;              // (16,16) = 256
+    const int tid = ty * 16 + tx;
+    const long SL = (long)S * L;
+    for (int i = tid; i < MT*HID; i += 256) {
+        int r = i / HID, c = i % HID;
+        int m = m0 + r;
+        if (m >= SL) { Xs[r][c] = 0.f; continue; }
+        int sm = m / L, tm = m % L;
+        Xs[r][c] = x[((long)sm*L + (rev ? L-1-tm : tm))*HID + c];
+    }
+    for (int i = tid; i < NT*HID; i += 256) {
+        int r = i / HID, c = i % HID;
+        Ws[r][c] = W[(long)(n0+r)*HID + c];
+    }
+    __syncthreads();
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) acc[i] = 0.f;
+#pragma unroll
+    for (int k = 0; k < HID; k++) {
+        float a0 = Xs[ty*2][k], a1 = Xs[ty*2+1][k];
+        float b0 = Ws[tx*4][k], b1 = Ws[tx*4+1][k], b2 = Ws[tx*4+2][k], b3 = Ws[tx*4+3][k];
+        acc[0] += a0*b0; acc[1] += a1*b0; acc[2] += a0*b1; acc[3] += a1*b1;
+        acc[4] += a0*b2; acc[5] += a1*b2; acc[6] += a0*b3; acc[7] += a1*b3;
+    }
+    float *dst = (n0 >= DINNER) ? z : x0;
+    const int ob = (n0 >= DINNER) ? n0 - DINNER : n0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int m = m0 + ty*2 + (i & 1), c = tx*4 + (i >> 1);
+        if (m < SL) dst[(long)m*DINNER + ob + c] = acc[i];
+    }
+}
+
 __global__ void k_conv_causal(const float *x0, const float *Wc, const float *Bc,
                               float *xc, int S, int L)
 {
@@ -869,7 +917,12 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     int dbg = getenv("GPU_DEBUG") && strncmp(pfx, "TSMamba.0.time_mamba.", 19) == 0;
     char dt[8]; snprintf(dt, sizeof(dt), "%s_", rev ? "bw" : "fw");
         #define GDBG(tag, ptr, n) do { if (dbg) { char t_[32]; snprintf(t_, sizeof(t_), "%s%s", dt, tag); gdump(t_, ptr, n); } } while (0)
-    k_in_proj<<<dim3((unsigned)((SL+255)/256), 2*DINNER), b1>>>(x, W_in, x0, z, S, L, rev);
+    {
+        static int tiled = -1;
+        if (tiled < 0) tiled = getenv("REUSE_NAIVE_INPROJ") ? 0 : 1;
+        if (tiled) k_in_proj_t<<<dim3((unsigned)((SL+MT32-1)/MT32), (2*DINNER)/NT64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
+        else       k_in_proj<<<dim3((unsigned)((SL+255)/256), 2*DINNER), b1>>>(x, W_in, x0, z, S, L, rev);
+    }
     kp_mark("in_proj", &klast);
     GDBG("x0", x0, (size_t)SL*DINNER); GDBG("z", z, (size_t)SL*DINNER);
     k_conv_causal<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(x0, W_c, B_c, xc, S, L);
