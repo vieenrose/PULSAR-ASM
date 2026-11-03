@@ -1481,6 +1481,69 @@ __global__ void k_conv2d_r(const float *x, const float *w, const float *b,
     }
 }
 
+// 64x64-tile version of the register-tiled conv: 16 outputs per thread
+// (4 rows x 4 cols). The 16x32 tile used 2 row accumulators, so each thread
+// issued one shared load per FMA (9 taps x 2 rows = 18 shared loads for 18
+// FMAs), which is the shared-memory ceiling and is what kept the dense block
+// at ~370 GFLOPS. With 4 rows a thread reads 4 shared values (+1 block-uniform
+// weight) per 16 FMAs, and the bigger tile raises the global-load ratio from
+// 4.2 to 7.0 FMA/load.
+template<int R>
+__global__ void k_conv2d_r2(const float *x, const float *w, const float *b,
+                            int C_in, int H, int W, int padH, int padW, int dilH,
+                            float *y, int co0)
+{
+    const int TW = 64, LS = TW+2;
+    __shared__ float S[R][LS];
+    const int co = co0 + blockIdx.z;
+    const int w0 = blockIdx.x*TW, h0 = blockIdx.y*64;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty*16 + tx;
+    float acc[4][4];
+#pragma unroll
+    for (int a = 0; a < 4; a++)
+#pragma unroll
+        for (int bq = 0; bq < 4; bq++) acc[a][bq] = b[co];
+    for (int ci = 0; ci < C_in; ci++) {
+        const float *xin = x + (long)ci*H*W;
+        __syncthreads();
+        for (int i = tid; i < R*LS; i += 256) {
+            int r = i / LS, c = i % LS;
+            int hh = h0 - padH + r, ww = w0 - padW + c;
+            S[r][c] = (hh >= 0 && hh < H && ww >= 0 && ww < W) ? xin[(long)hh*W + ww] : 0.f;
+        }
+        __syncthreads();
+        const float *wv = w + ((long)co*C_in + ci)*9;
+        // output (row h0+ty*4+a, col w0+tx*4+bq) reads tile row
+        // ty*4+a+kh*dilH and tile col tx*4+bq+kw (the +1 pad cancels padW=1)
+#pragma unroll
+        for (int kh = 0; kh < 3; kh++) {
+            const float w0f = wv[kh*3], w1f = wv[kh*3+1], w2f = wv[kh*3+2];
+            const int rb = ty*4 + kh*dilH, cb = tx*4;
+#pragma unroll
+            for (int a = 0; a < 4; a++) {
+                const float *sr = S[rb + a];
+#pragma unroll
+                for (int bq = 0; bq < 4; bq++) {
+                    acc[a][bq] = fmaf(sr[cb + bq],     w0f, acc[a][bq]);
+                    acc[a][bq] = fmaf(sr[cb + bq + 1], w1f, acc[a][bq]);
+                    acc[a][bq] = fmaf(sr[cb + bq + 2], w2f, acc[a][bq]);
+                }
+            }
+        }
+    }
+    const int wc = w0 + tx*4;
+    float *yo = y + (long)co*H*W;
+#pragma unroll
+    for (int a = 0; a < 4; a++) {
+        int hh = h0 + ty*4 + a;
+        if (hh >= H) continue;
+        float *dst = yo + (long)hh*W;
+#pragma unroll
+        for (int bq = 0; bq < 4; bq++) if (wc + bq < W) dst[wc + bq] = acc[a][bq];
+    }
+}
+
 static int conv_chunk(void)
 {
     static int c = -1;
@@ -1526,6 +1589,19 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         // own grid/block (blk here is the naive kernel's 16x16)
         const bool regtile = !getenv("REUSE_NAIVE_CONV2D") && kH == 3 && kW == 3 &&
                              dilW == 1 && strideH == 1 && strideW == 1 && padW == 1 && padH == dilH;
+        static int big = -1;
+        if (big < 0) big = getenv("REUSE_CONV_TILE16") ? 0 : 1;
+        if (big) {
+            const dim3 grdb((unsigned)((W_out + 63) / 64), (unsigned)((H_out + 63) / 64), (unsigned)n);
+            const dim3 blkb(16, 16);
+            if (regtile && dilH == 1)      k_conv2d_r2<66><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            else if (regtile && dilH == 2) k_conv2d_r2<68><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            else if (regtile && dilH == 4) k_conv2d_r2<72><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            else if (regtile && dilH == 8) k_conv2d_r2<80><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0);
+            launch_kick();
+            continue;
+        }
         const dim3 grdt((unsigned)((W_out + 31) / 32), (unsigned)((H_out + 15) / 16), (unsigned)n);
         const dim3 blkt(32, 8);
         if (regtile && dilH == 1)
