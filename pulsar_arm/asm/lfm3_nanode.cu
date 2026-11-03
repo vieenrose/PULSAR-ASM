@@ -2178,22 +2178,46 @@ static int prefill_arm5_gate(Model& M) {
         for (size_t j = 0; j < h1.size(); j++) if (memcmp(&h1[j], &h2v[j], 4)) bad2++;
         // f32 (H2=0) ARM=5 T=1 vs the shipped output: the candidate for a
         // bit-exact-vs-shipped prefill arm (fp32 FMA order, no fp16 pairs).
-        float* pd3 = nullptr; cudaMalloc(&pd3, (size_t)Tn * N * nch * 4);
+        // The f32 arm needs the SAME shared-memory-aware KC chooser the shipped
+        // LFM_PF_USE path has. It did not have one: at the w2 shape (K=7680) the gate
+        // passed its outer KC=3840, which asks for CT*nb*33*4 = 63 KB of static shared
+        // memory -- over the 48 KB cap -- so the launch failed with `invalid argument`,
+        // and the code then graded a buffer that was never written and printed
+        // "MISMATCH 24576/92160" for a shape the kernel never ran on. That is exactly the
+        // failure mode the plausibility rules exist for: a launch error must stop the
+        // comparison, not flow into it. KC is now halved until the budget fits, a launch
+        // error is a hard failure, and the report carries the ENERGY-relative error
+        // (this project's standard metric) next to the per-cell max-rel, which is
+        // meaningless on its own -- per-cell max-rel over reference denormals is what
+        // produced the 4e+39 headline.
+        int KC3 = KC, nb3 = nb; size_t shm3 = (size_t)CT * nb3 * 33 * 4;
+        while (KC3 > 32 && (K % KC3 || shm3 > 49152)) { KC3 /= 2; nb3 = KC3 / Q8_BLK; shm3 = (size_t)CT * nb3 * 33 * 4; }
+        const int nch3 = (K % KC3 == 0) ? K / KC3 : 0;
+        if (!nch3 || shm3 > 49152) {
+          printf("arm5f32-gate-T1 %s T=%d: SKIPPED (no KC fits the 48 KB shared-memory cap: K=%d, KC3=%d, shm=%zu)\n",
+                 c.name.c_str(), Tn, K, KC3, shm3); fflush(stdout);
+          fails++;
+        } else {
+        float* pd3 = nullptr; cudaMalloc(&pd3, (size_t)Tn * N * nch3 * 4);
         const int R3 = (TPB / 32) * 2;
-        const int nblk3 = ((N + R3 - 1) / R3) * nch;
+        const int nblk3 = ((N + R3 - 1) / R3) * nch3;
         for (int t = 0; t < Tn; t++)
-          pf_launch(CT, 5, 0, 2, e->dq, e->ds, xd + (size_t)t * K, pd3 + (size_t)t * N * nch,
-                    N, K, KC, R3, nb, 1, nblk3, TPB, (size_t)CT * nb * 33 * 4);
+          pf_launch(CT, 5, 0, 2, e->dq, e->ds, xd + (size_t)t * K, pd3 + (size_t)t * N * nch3,
+                    N, K, KC3, R3, nb3, 1, nblk3, TPB, shm3);
         cudaError_t le3 = cudaGetLastError();
         cudaDeviceSynchronize();
-        if (le3) { printf("arm5f32 %s: LAUNCH ERROR %s\n", c.name.c_str(), cudaGetErrorString(le3)); fflush(stdout); }
-        std::vector<float> h3v((size_t)Tn * N * nch);
+        if (le3) {
+          printf("arm5f32-gate-T1 %s T=%d KC=%d: LAUNCH ERROR %s (NOT compared -- no number is reported for a kernel that did not run)\n",
+                 c.name.c_str(), Tn, KC3, cudaGetErrorString(le3)); fflush(stdout);
+          fails++;
+        } else {
+        std::vector<float> h3v((size_t)Tn * N * nch3);
         cudaMemcpy(h3v.data(), pd3, h3v.size() * 4, cudaMemcpyDeviceToHost);
-        long bad3 = 0; double worst3 = 0; int ninf3 = 0;
+        long bad3 = 0; double worst3 = 0; int ninf3 = 0; double snum = 0, sden = 0; long gt1ulp = 0;
         for (int t = 0; t < Tn; t++)
           for (int r = 0; r < N; r++) {
             float acc = 0.f;
-            for (int ch = 0; ch < nch; ch++) acc = acc + h3v[((size_t)t * N + r) * nch + ch];
+            for (int ch = 0; ch < nch3; ch++) acc = acc + h3v[((size_t)t * N + r) * nch3 + ch];
             uint16_t got = host_f2bf(acc), want = c.y[(size_t)t * N + r];
             if (got != want) {
               bad3++;
@@ -2205,14 +2229,24 @@ static int prefill_arm5_gate(Model& M) {
               double den = fabs((double)wf);
               double rel = den > 0 ? fabs(gf - wf) / den : (gf == wf ? 0.0 : 1.0);
               if (rel > worst3) worst3 = rel;
+              snum += (double)(gf - wf) * (gf - wf);
+              sden += (double)wf * wf;
+              // ulp-distance in bf16: >1 ulp is the "real defect" count, 1 ulp is rounding
+              int dg = (int)got, dw = (int)want;
+              if (abs(dg - dw) > 1) gt1ulp++;
             }
           }
-        printf("arm5f32-gate-T1 %s T=%d KC=%d nch=%d: %s (%ld/%zu differ, max rel %.3g, nonfinite %d)\n",
-               c.name.c_str(), Tn, KC, nch, bad3 ? "MISMATCH" : "BIT-EXACT", bad3,
-               (size_t)Tn * N, worst3, ninf3);
+        printf("arm5f32-gate-T1 %s T=%d KC=%d nch=%d: %s (%ld/%zu differ, >1ulp %ld, "
+               "ENERGY rel %.3e, per-cell max rel %.3g, nonfinite %d)\n",
+               c.name.c_str(), Tn, KC3, nch3, bad3 ? "MISMATCH" : "BIT-EXACT", bad3,
+               (size_t)Tn * N, gt1ulp, sden > 0 ? sqrt(snum / sden) : (snum > 0 ? 1.0 : 0.0),
+               worst3, ninf3);
         fflush(stdout);
+        if (sden > 0 && sqrt(snum / sden) > 1e-2) fails++;   // a real arithmetic delta is a gate failure
         g_last_partial_bad += bad3 ? 0 : 0;
+        }   // launch-error guard
         cudaFree(pd3);
+        }   // KC-fits guard
         printf("arm5-vs-q8partial %s T=%d KC=%d nch=%d: %s (%ld/%zu partials differ)\n",
                c.name.c_str(), Tn, KC, nch, bad2 ? "MISMATCH" : "BIT-EXACT", bad2, h1.size());
         fflush(stdout);
