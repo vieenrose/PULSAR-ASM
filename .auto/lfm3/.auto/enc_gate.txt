@@ -1,7 +1,7 @@
 ENC-ATTN layers=2,5,8,11,14,15,16 window=32 (encoder.sliding_window, all attention layers; section 42)
 Tm=400 -> EWo1=200 EWo2=100 tokens Tt=50 (expect ceil(Tm/8)); arms=fp32
   lin_mid N=256 K=256 T=3200 f32 weights
-ENCODER total 305.55 ms (min of 1) = 0.0764 s GPU per audio second; downsampler alone 458 MMAC, 1.5 GMAC/s at that rate
+ENCODER total 198.35 ms (min of 1) = 0.0496 s GPU per audio second; downsampler alone 458 MMAC, 2.3 GMAC/s at that rate
 dump ds_out       n=38400 nonzero=38400 max=1.7826
 dump layer_00     n=38400 nonzero=38400 max=1.6371
 dump layer_01     n=38400 nonzero=38400 max=1.6621

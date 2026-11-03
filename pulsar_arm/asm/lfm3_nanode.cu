@@ -2379,15 +2379,20 @@ static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const fl
 #undef PF3
 }
 
+// Batched-prefill arm knobs. File scope so the committed probe (LFM_PF_PROBE, in main)
+// can select an arm per pass; pfForce overrides the env value after the env parse.
+static int pfCT = -1, pfARM = -1, pfRB = -1, pfRPB = -1, pfForce = -1;
+static void pf_set_arm(int a) { pfForce = a; pfCT = -1; }   // pfCT<0 forces a re-init
+
 static int prefill_h2_one(Model& M, Ent* e, int T, int h2) {
   (void)M;
   const int N = e->ne[0], K = e->ne[1], TPB = 256;
   // LFM_PF_CT (2|4) / LFM_PF_ARM (0|1): test-only knobs, defaults = today's
   // structure (CT=2, ARM=0) so the shipped selftest output is unchanged.
-  static int pfCT = -1, pfARM = -1, pfRB = -1, pfRPB = -1;
   if (pfCT < 0) {
     pfCT = getenv("LFM_PF_CT") ? atoi(getenv("LFM_PF_CT")) : 2;
     pfARM = getenv("LFM_PF_ARM") ? atoi(getenv("LFM_PF_ARM")) : 0;
+    if (pfForce >= 0) pfARM = pfForce;   // set by the LFM_PF_PROBE passes in main()
     if (pfCT != 2 && pfCT != 4 && pfCT != 6 && pfCT != 8) { printf("LFM_PF_CT=%d unsupported (2|4|6|8) -- using 2\n", pfCT); pfCT = 2; }
     if (pfARM < 0 || pfARM > 10) { printf("LFM_PF_ARM=%d unsupported (0..10)\n", pfARM); exit(2); }
     if (pfARM == 7 && pfCT != 4) { printf("LFM_PF_ARM=7 is instantiated for CT=4 only\n"); exit(2); }
@@ -3188,6 +3193,32 @@ int main(int argc, char** argv) {
   struct timespec tw0; clock_gettime(CLOCK_MONOTONIC, &tw0);
   int nwarm = 0;
   const int nprompt_all = (int)prompt.size();   // for the S8 arm's prefill scope
+  // ---- committed batched-prefill bit-exactness probe ---------------------------------
+  // LFM_PF_PROBE=<arm> runs the whole prompt TWICE in this process: pass 0 with the
+  // shipped serial arm (ARM=0), pass 1 with the requested batched arm, and compares the
+  // id streams. This is the instrument the #296/#298 "bit-exact at T=1" claims were made
+  // with, rebuilt as committed code (run log row 325 found the original was a throwaway
+  // patched build, so those claims were not reproducible from the repository). A claim
+  // that licenses changing prefill arithmetic has to be checkable by anyone who clones.
+  //
+  // The KV cache is written per position and positions restart at 0 on each pass, so the
+  // second pass overwrites the first; the phase timers and g_aemb_fed are reset so the
+  // per-pass prints describe that pass. Pass 1's timing is the one that reaches the
+  // steady-state line, so the probe also shows what the arm costs.
+  const int pfprobe = getenv("LFM_PF_PROBE") ? atoi(getenv("LFM_PF_PROBE")) : -1;
+  if (pfprobe > 10) { printf("LFM_PF_PROBE=%d out of range (0..10)\n", pfprobe); return 2; }
+  std::vector<int> pf_base;
+  for (int pfpass = 0; pfpass < (pfprobe >= 0 ? 2 : 1); pfpass++) {
+  if (pfprobe >= 0) {
+    if (pfpass == 1) {
+      toks = prompt; tot = 0; ng = 0; g_aemb_fed = 0;
+      g_tEmb = g_tConv = g_tAttn = g_tNorm = g_tHead = 0.0;
+    }
+    pf_set_arm(pfpass == 0 ? 0 : pfprobe);
+    printf("PF-PROBE pass %d arm %d (prompt %d ids)\n", pfpass, pfpass == 0 ? 0 : pfprobe,
+           nprompt_all);
+    fflush(stdout);
+  }
   for (int s = warm ? -1 : 0; s < steps || s < 0; s++) {
     const int pos = s < 0 ? 0 : s;
     g_prefill_phase = (s < 0 || s < nprompt_all - 1) ? 1 : 0;   // S8 arm scope: prompt steps only
@@ -3499,6 +3530,21 @@ int main(int argc, char** argv) {
     cudaError_t e2 = cudaGetLastError();
     if (e2 != cudaSuccess) { printf("CUDA ERROR after step %d: %s\n", s, cudaGetErrorString(e2)); return 1; }
   }
+  if (pfprobe >= 0) {
+    if (pfpass == 0) pf_base = toks;
+    else {
+      size_t n = std::min(pf_base.size(), toks.size()), fd = n;
+      for (size_t i = 0; i < n; i++) if (pf_base[i] != toks[i]) { fd = i; break; }
+      printf("PF-PROBE arm=%d  ids equal=%s  compared=%zu  first_diff=%zd  prompt=%d gen=%zu\n",
+             pfprobe, fd == n ? "YES (bit-exact vs serial)" : "NO", n, (ssize_t)fd,
+             nprompt_all, toks.size() - (size_t)prompt.size());
+      printf("PF-PROBE arm=%d  verdict: %s\n", pfprobe,
+             fd == n ? "batched arm reproduces the shipped bits at this shape"
+                     : "batched arm DIVERGES -- must not be enabled without a contract decision");
+      fflush(stdout);
+    }
+  }
+  }  // LFM_PF_PROBE passes
   if (g_xrange) xrange_print();
   if (g_time && ng > 0)
     printf("PHASES ms/tok: emb %.2f  conv %.2f  attn %.2f  finalnorm %.2f  lm_head %.2f  sum %.2f\n",
