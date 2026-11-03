@@ -69,3 +69,20 @@ extra processes only add CUDA context switches. RTF<1 is reachable at 2 concurre
     run is 26.4 dB (deterministic, rep-independent, malloc-probe ruled out allocation). Next debug:
     compare k_stft_dft's re/im in-app (dump dre/dim), check the tile grid (64,11) coverage vs the
     isolated harness, and print wsize (app: nfft=320 hop=40 wsize=320 F=161 T=1021 nf=40800).
+
+## ACCURACY-MARGIN RISK (found in #18)
+The model's complex-spectrum rel-rms vs PyTorch sits within a factor ~1 of the 1e-4
+gate. Hoisting an integer `m / L` divide out of k_in_conv_r's tile-load loop (a pure
+scheduling/register-allocation change, ~3% faster) moved rel-rms to exactly 1.80e-04
+and FAILED the gate at 8 kHz. So:
+  - any change that perturbs instruction scheduling / FMA contraction can tip the gate;
+  - measure rel-rms (not just PASS/FAIL) when touching hot loops;
+  - buying margin: Kahan (two-float) accumulation in the fused in_proj GEMM's 64-term
+    K reduction, and/or in k_outproj_ln_g's 128-term dot product, would create headroom
+    for future scheduling optimisations. Verify the gate improves measurably first.
+## Manual gate protocol (checks.sh is authoritative; my ad-hoc loop is not)
+- checks.sh runs engine/reuse_nano_gpu, which ONLY measure.sh builds. Rebuild it yourself
+  with measure.sh's exact command before ad-hoc gate runs.
+- 16 kHz needs REUSE_WS_MB=1280 (1024 exhausts the arena and yields rel_rms ~0.48, a fake
+  model-accuracy failure).
+- Also pass REUSE_DUMP_AUDIO, else the waveform check compares a stale file (fake SNR fail).

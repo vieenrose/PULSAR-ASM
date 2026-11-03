@@ -378,6 +378,7 @@ __global__ void k_in_proj_r(const float *x, const float *W, float *x0, float *z,
 // K=64 in two 32-wide chunks, 2 FMA per shared load). The z half has no conv,
 // so it just writes z as before.
 #define FUSE_MT 80
+template<int KC>
 __global__ void k_in_conv_r(const float *x, const float *W, float *z, float *xc,
                             const float *Wc, const float *Bc,
                             int S, int L, int rev)
@@ -388,7 +389,7 @@ __global__ void k_in_conv_r(const float *x, const float *W, float *z, float *xc,
     // makes the conv's 3-tap history a warp-local __shfl_up(1): with the row
     // axis on ty, "the group above" for even ty sits in the previous warp and
     // shfl_up(16) silently returns the caller's own value (rel-rms 0.57).
-    const int KC = 32, NT = 64, R = FUSE_MT + 3, RA = 5;
+    const int NT = 64, R = FUSE_MT + 3, RA = 5;
     __shared__ float Xs[R][KC+4], Ws[NT][KC+4], Hl[3][NT+1];
     const long SL = (long)S * L;
     const long m0 = (long)blockIdx.x * FUSE_MT;
@@ -397,6 +398,14 @@ __global__ void k_in_conv_r(const float *x, const float *W, float *z, float *xc,
     const int tid = ty*16 + tx;
     const bool halo_thr = tid < 3*NT;
     const int hr = tid / NT, hc = tid % NT;
+    // NOTE: hoisting this row->(sequence,position) divide out of the tile-load
+    // loop (rows are consecutive, so one divide + a walk suffices) measured 3%
+    // on the model, and moved the model's complex rel-rms vs PyTorch from
+    // <1e-4 to exactly 1.8e-4, i.e. it FAILS the accuracy gate, purely through
+    // register allocation / FMA contraction. The model runs with almost no
+    // fp32 margin against the 1e-4 gate, so do not "optimise" this divide back
+    // in without re-running the gates.
+
     float acc[RA][4];
 #pragma unroll
     for (int a = 0; a < RA; a++)
@@ -1007,6 +1016,13 @@ static int inproj_mode(void)
 // in_proj and the causal depthwise conv are fused by default: x0 is consumed
 // only by the conv, so fusing keeps 42 MB per launch out of DRAM and drops a
 // launch. REUSE_NO_FUSE=1 falls back to the two-kernel path for A/B.
+static int fuse_kc(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("REUSE_FUSE_KC"); v = e ? atoi(e) : 32; if (v != 8 && v != 16) v = 32; }
+    return v;
+}
+
 static int fuse_conv(void)
 {
     static int v = -1;
@@ -1547,7 +1563,7 @@ __global__ void k_conv2d_r2(const float *x, const float *w, const float *b,
 static int conv_chunk(void)
 {
     static int c = -1;
-    if (c < 0) { const char *e = getenv("REUSE_CONV_CHUNK"); c = e ? atoi(e) : 8; if (c <= 0) c = 1 << 30; }
+    if (c < 0) { const char *e = getenv("REUSE_CONV_CHUNK"); c = e ? atoi(e) : 32; if (c <= 0) c = 1 << 30; }
     return c;
 }
 
@@ -1752,8 +1768,16 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         const int tiled = inproj_mode();
         if (getenv("REUSE_SKIP_INPROJ")) { } else
         if (fuse_conv()) {
-            k_in_conv_r<<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16)>>>(
-                x, W_in, z, xc, W_c, B_c, S, L, rev);
+            const int kc = fuse_kc();
+            if (kc == 16)
+                k_in_conv_r<16><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16)>>>(
+                    x, W_in, z, xc, W_c, B_c, S, L, rev);
+            else if (kc == 8)
+                k_in_conv_r<8><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16)>>>(
+                    x, W_in, z, xc, W_c, B_c, S, L, rev);
+            else
+                k_in_conv_r<32><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16)>>>(
+                    x, W_in, z, xc, W_c, B_c, S, L, rev);
         }
         else if (tiled == 2) k_in_proj_r<<<dim3((unsigned)((SL+63)/64), (2*DINNER)/64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
         else if (tiled) k_in_proj_t<<<dim3((unsigned)((SL+MT32-1)/MT32), (2*DINNER)/NT64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
