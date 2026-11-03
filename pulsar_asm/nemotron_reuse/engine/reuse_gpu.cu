@@ -2441,10 +2441,34 @@ __global__ void k_conv2d_r(const float *x, const float *w, const float *b,
 // at ~370 GFLOPS. With 4 rows a thread reads 4 shared values (+1 block-uniform
 // weight) per 16 FMAs, and the bigger tile raises the global-load ratio from
 // 4.2 to 7.0 FMA/load.
-template<int R>
+/* Dense-block concat mode: the conv input is the concatenation of ng channel
+   groups living in slot planes plus the caller's x_in tail. The 16 per-group
+   base pointers ride as kernel PARAMS (constant bank 0, zero loads, uniform).
+   A __device__ table version worked on sm_61 but corrupted output on sm_53
+   (#72/#73); params are the codegen-robust delivery. */
+#define CONV_SRCS_PARAMS const float *s0, const float *s1, const float *s2, const float *s3, \
+    const float *s4, const float *s5, const float *s6, const float *s7, \
+    const float *s8, const float *s9, const float *s10, const float *s11, \
+    const float *s12, const float *s13, const float *s14, const float *s15
+#define CONV_SRCS_ARGS s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15
+__device__ __forceinline__ const float *conv_src_pick(int g,
+    const float *s0, const float *s1, const float *s2, const float *s3,
+    const float *s4, const float *s5, const float *s6, const float *s7,
+    const float *s8, const float *s9, const float *s10, const float *s11,
+    const float *s12, const float *s13, const float *s14, const float *s15)
+{
+    switch (g) {
+    case 0: return s0;  case 1: return s1;  case 2: return s2;  case 3: return s3;
+    case 4: return s4;  case 5: return s5;  case 6: return s6;  case 7: return s7;
+    case 8: return s8;  case 9: return s9;  case 10: return s10; case 11: return s11;
+    case 12: return s12; case 13: return s13; case 14: return s14; default: return s15;
+    }
+}
+
+template<int R, bool TABLE = false>
 __global__ void k_conv2d_r2(const float *x, const float *w, const float *b,
                             int C_in, int H, int W, int padH, int padW, int dilH,
-                            float *y, int co0)
+                            float *y, int co0, const float *x2, int ng, CONV_SRCS_PARAMS)
 {
     const int TW = 64, LS = TW+4;   // multiple of 4: aligned float4 tile stores
     __shared__ __align__(16) float S[R][LS];
@@ -2458,7 +2482,13 @@ __global__ void k_conv2d_r2(const float *x, const float *w, const float *b,
 #pragma unroll
         for (int bq = 0; bq < 4; bq++) acc[a][bq] = b[co];
     for (int ci = 0; ci < C_in; ci++) {
-        const float *xin = x + (long)ci*H*W;
+        const float *xin; long pl;
+        if (!TABLE) { xin = x + (long)ci*H*W; pl = ci; }
+        else {
+            const int g = ci/HID;
+            xin = conv_src_pick(g, CONV_SRCS_ARGS) + (long)(ci%HID)*H*W;
+            pl = (g < ng) ? (long)(ng-1-g)*HID + ci%HID : (long)(g-ng)*HID + ci%HID;
+        }
         __syncthreads();
         // One index/mask computation per 4 elements: the scalar form spends
         // ~12 instructions (divide by LS, two bounds pairs, select, address)
@@ -2478,7 +2508,7 @@ __global__ void k_conv2d_r2(const float *x, const float *w, const float *b,
                     // 16B-aligned; with odd W (163 here) that is row
                     // dependent, so the scalar path covers the rest.
                     if (ww >= 0 && ww + 4 <= W &&
-                        ((((long)ci*H*W + (long)hh*W + ww) & 3) == 0))
+                        ((((long)pl*H*W + (long)hh*W + ww) & 3) == 0))
                         v = *(const float4*)sp;
                     else {
                         if (ww     >= 0 && ww     < W) v.x = sp[0];
@@ -2670,10 +2700,10 @@ __global__ void k_conv2d_r5(const float *x, const float *w, const float *b,
 // global traffic 1.7x (the tile is half as tall), raises FMA per global load
 // 7 -> 22 and FMA per shared load 2 -> 6, and keeps registers at 32
 // accumulators + ~12.
-template<int R, int PCO, int NCB, int NRA = 32/(PCO*NCB)>
+template<int R, int PCO, int NCB, int NRA = 32/(PCO*NCB), bool TABLE = false>
 __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
                             int C_in, int H, int W, int padH, int padW, int dilH,
-                            float *y, int co0)
+                            float *y, int co0, const float *x2, int ng, CONV_SRCS_PARAMS)
 {
     const int TW = 16*NCB, LS = TW+4;
     __shared__ __align__(16) float S[R][LS];
@@ -2688,7 +2718,13 @@ __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
 #pragma unroll
             for (int bq = 0; bq < NCB; bq++) acc[j][a][bq] = b[co0 + blockIdx.z*PCO + j];
     for (int ci = 0; ci < C_in; ci++) {
-        const float *xin = x + (long)ci*H*W;
+        const float *xin; long pl;
+        if (!TABLE) { xin = x + (long)ci*H*W; pl = ci; }
+        else {
+            const int g = ci/HID;
+            xin = conv_src_pick(g, CONV_SRCS_ARGS) + (long)(ci%HID)*H*W;
+            pl = (g < ng) ? (long)(ng-1-g)*HID + ci%HID : (long)(g-ng)*HID + ci%HID;
+        }
         if (ci) __syncthreads();
         {
             const int RS = LS/4, wbase = w0 - padW, hbase = h0 - padH;
@@ -2699,7 +2735,7 @@ __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
                 float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
                 if (hh >= 0 && hh < H) {
                     const float *sp = xin + (long)hh*W + ww;
-                    if (ww >= 0 && ww + 4 <= W && ((((long)ci*H*W + (long)hh*W + ww) & 3) == 0))
+                    if (ww >= 0 && ww + 4 <= W && ((((long)pl*H*W + (long)hh*W + ww) & 3) == 0))
                         v = *(const float4*)sp;
                     else {
                         if (ww     >= 0 && ww     < W) v.x = sp[0];
@@ -2938,10 +2974,10 @@ static int launch_conv1x1(reuse_gpu_t *g, const float *x, const float *w, const 
 }
 
 #define R8ONE(RN,PC,NC) do { \
-            if (regtile && dilH == 1)      k_conv2d_r8<RN,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
-            else if (regtile && dilH == 2) k_conv2d_r8<RN+2,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
-            else if (regtile && dilH == 4) k_conv2d_r8<RN+8,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
-            else if (regtile && dilH == 8) k_conv2d_r8<RN+24,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
+            if (regtile && dilH == 1)      do { if (ng >= 0) k_conv2d_r8<RN,PC,NC,32/(PC*NC),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<RN,PC,NC,32/(PC*NC),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); \
+            else if (regtile && dilH == 2) do { if (ng >= 0) k_conv2d_r8<RN+2,PC,NC,32/(PC*NC),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<RN+2,PC,NC,32/(PC*NC),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); \
+            else if (regtile && dilH == 4) do { if (ng >= 0) k_conv2d_r8<RN+8,PC,NC,32/(PC*NC),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<RN+8,PC,NC,32/(PC*NC),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); \
+            else if (regtile && dilH == 8) do { if (ng >= 0) k_conv2d_r8<RN+24,PC,NC,32/(PC*NC),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<RN+24,PC,NC,32/(PC*NC),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); \
         } while (0)
 #define R9LAUNCH(R1,R2,R4,R8) \
             if      (regtile && dilH == 1) { k_conv2d_r9<R1,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
@@ -2949,15 +2985,15 @@ static int launch_conv1x1(reuse_gpu_t *g, const float *x, const float *w, const 
             else if (regtile && dilH == 4) { k_conv2d_r9<R4,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
             else if (regtile && dilH == 8) { k_conv2d_r9<R8,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); }
 #define R64LAUNCH(PC_,NC_,NR_,R1,R2,R4,R8) \
-            if      (regtile && dilH == 1) { k_conv2d_r8<R1,PC_,NC_,NR_><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
-            else if (regtile && dilH == 2) { k_conv2d_r8<R2,PC_,NC_,NR_><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
-            else if (regtile && dilH == 4) { k_conv2d_r8<R4,PC_,NC_,NR_><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
-            else if (regtile && dilH == 8) { k_conv2d_r8<R8,PC_,NC_,NR_><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); }
+            if      (regtile && dilH == 1) { do { if (ng >= 0) k_conv2d_r8<R1,PC_,NC_,NR_,true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R1,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
+            else if (regtile && dilH == 2) { do { if (ng >= 0) k_conv2d_r8<R2,PC_,NC_,NR_,true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R2,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
+            else if (regtile && dilH == 4) { do { if (ng >= 0) k_conv2d_r8<R4,PC_,NC_,NR_,true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R4,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
+            else if (regtile && dilH == 8) { do { if (ng >= 0) k_conv2d_r8<R8,PC_,NC_,NR_,true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R8,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); }
 #define R8LAUNCH(R1,R2,R4,R8) \
-            if      (regtile && dilH == 1) { if (pco==4) k_conv2d_r8<R1,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R1,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R1,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
-            else if (regtile && dilH == 2) { if (pco==4) k_conv2d_r8<R2,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R2,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R2,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
-            else if (regtile && dilH == 4) { if (pco==4) k_conv2d_r8<R4,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R4,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R4,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
-            else if (regtile && dilH == 8) { if (pco==4) k_conv2d_r8<R8,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R8,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R8,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); }
+            if      (regtile && dilH == 1) { if (pco==4) do { if (ng >= 0) k_conv2d_r8<R1,4,4,32/(4*4),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R1,4,4,32/(4*4),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else if (pco==8) do { if (ng >= 0) k_conv2d_r8<R1,8,2,32/(8*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R1,8,2,32/(8*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else do { if (ng >= 0) k_conv2d_r8<R1,16,2,32/(16*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R1,16,2,32/(16*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
+            else if (regtile && dilH == 2) { if (pco==4) do { if (ng >= 0) k_conv2d_r8<R2,4,4,32/(4*4),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R2,4,4,32/(4*4),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else if (pco==8) do { if (ng >= 0) k_conv2d_r8<R2,8,2,32/(8*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R2,8,2,32/(8*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else do { if (ng >= 0) k_conv2d_r8<R2,16,2,32/(16*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R2,16,2,32/(16*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
+            else if (regtile && dilH == 4) { if (pco==4) do { if (ng >= 0) k_conv2d_r8<R4,4,4,32/(4*4),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R4,4,4,32/(4*4),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else if (pco==8) do { if (ng >= 0) k_conv2d_r8<R4,8,2,32/(8*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R4,8,2,32/(8*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else do { if (ng >= 0) k_conv2d_r8<R4,16,2,32/(16*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R4,16,2,32/(16*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
+            else if (regtile && dilH == 8) { if (pco==4) do { if (ng >= 0) k_conv2d_r8<R8,4,4,32/(4*4),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R8,4,4,32/(4*4),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else if (pco==8) do { if (ng >= 0) k_conv2d_r8<R8,8,2,32/(8*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R8,8,2,32/(8*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else do { if (ng >= 0) k_conv2d_r8<R8,16,2,32/(16*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R8,16,2,32/(16*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); }
 
 static int dectile(void)
 {
@@ -2969,8 +3005,15 @@ static int dectile(void)
 static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const float *b,
                          int C_in, int H, int W, int C_out, int kH, int kW,
                          int padH, int padW, int dilH, int dilW, int strideH, int strideW,
-                         float *y, int tilehint)
+                         float *y, int tilehint, const float *x2, int ng)
 {
+    const long shw = (long)H*W;
+    const float *S[16];
+    for (int t = 0; t < 16; t++)
+        S[t] = (t < ng) ? (x + (long)(ng-1-t)*HID*shw)
+                        : (x2 ? x2 + (long)(t-ng)*HID*shw : (const float*)0);
+    const float *s0=S[0],*s1=S[1],*s2=S[2],*s3=S[3],*s4=S[4],*s5=S[5],*s6=S[6],*s7=S[7];
+    const float *s8=S[8],*s9=S[9],*s10=S[10],*s11=S[11],*s12=S[12],*s13=S[13],*s14=S[14],*s15=S[15];
     // tilehint: 0 = use REUSE_CONV_TILE, else a tile code for this call site.
     // The encoder's dense block prefers 645 (8co x 4col x 2row) and the
     // decoders' prefer 644 (8x2x4, a 64-row tile); measured 0.082/0.041 vs
@@ -3087,10 +3130,10 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         if (big == 64) {
             const dim3 grdb((unsigned)((W_out + 63) / 64), (unsigned)((H_out + 63) / 64), (unsigned)n);
             const dim3 blkb(16, 16);
-            if (regtile && dilH == 1)      k_conv2d_r2<66><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
-            else if (regtile && dilH == 2) k_conv2d_r2<68><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
-            else if (regtile && dilH == 4) k_conv2d_r2<72><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
-            else if (regtile && dilH == 8) k_conv2d_r2<80><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            if (regtile && dilH == 1)      do { if (ng >= 0) k_conv2d_r2<66,true><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0, x2, ng, s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r2<66,false><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0, x2, ng, s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0);
+            else if (regtile && dilH == 2) do { if (ng >= 0) k_conv2d_r2<68,true><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0, x2, ng, s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r2<68,false><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0, x2, ng, s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0);
+            else if (regtile && dilH == 4) do { if (ng >= 0) k_conv2d_r2<72,true><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0, x2, ng, s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r2<72,false><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0, x2, ng, s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0);
+            else if (regtile && dilH == 8) do { if (ng >= 0) k_conv2d_r2<80,true><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0, x2, ng, s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r2<80,false><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0, x2, ng, s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0);
             else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0);
             launch_kick();
             continue;
@@ -3139,11 +3182,44 @@ static int dense_block_gpu(reuse_gpu_t *g, const char *prefix, const float *x_in
        (the old code copied it into a third buffer), and each layer's [cur, skip]
        pair is written into the buffer that is not being read. The last layer's
        inorm writes `out` directly, which removes the trailing cur->out copy. */
+    float *tmp   = wallc(g, (size_t)HID*T*F);
+    if (!tmp) return 1;
+    static int slots_mode = -1;
+    if (slots_mode < 0) {
+        const char *e = getenv("REUSE_DENSE_SLOTS");
+        /* Param-delivery table mode: removes the 11 [cur,skip] memcpys per forward
+           (444 MB at 8 kHz). Verified bit-compatible on the 64-accumulator shapes
+           the dev host uses (max|d| 8.9e-08 = the iSTFT-atomic floor) and 0.9%
+           faster there. The 32-accumulator shapes (Maxwell/Tile-82 family, the
+           Nano's deployment path) corrupt output under sm_53 codegen (#72/#73/#74:
+           max|d| 0.234 with both __device__ and param delivery), so Maxwell is
+           pinned to the copy path. REUSE_DENSE_SLOTS=0/1 overrides. */
+        slots_mode = e ? atoi(e) : (gpu_is_maxwell() ? 0 : 1);
+    }
+    if (slots_mode) {
+        float *slots = wallc(g, (size_t)HID*(DEPTH-1)*T*F);
+        if (!slots) return 1;
+        char key[256], nkey[256], akey[256];
+        for (int i = 0; i < DEPTH; i++) {
+            snprintf(key, sizeof(key), "%s.%d.0.weight", prefix, i); const float *w = reuse_gpu_w(g, key);
+            snprintf(key, sizeof(key), "%s.%d.0.bias",   prefix, i); const float *b = reuse_gpu_w(g, key);
+            if (g->bad) return 1;
+            int dil = 1 << i;
+            launch_conv2d(g, slots, w, b, (i+1)*HID, T, F, HID, 3, 3, dil, 1, dil, 1, 1, 1,
+                          tmp, tilehint, x_in, i);
+            snprintf(nkey, sizeof(nkey), "%s.%d.1.weight", prefix, i);
+            snprintf(akey, sizeof(akey), "%s.%d.2.weight", prefix, i);
+            inorm(g, tmp, (i == DEPTH-1) ? out : slots + (size_t)i*HID*T*F, 1, HID, T, F, nkey, akey);
+        }
+        static int dbsync2 = -1;
+        if (dbsync2 < 0) dbsync2 = getenv("REUSE_DBSYNC") ? atoi(getenv("REUSE_DBSYNC")) : 0;
+        if (dbsync2) cudaDeviceSynchronize();
+        return g->bad;
+    }
     float *bufA  = wallc(g, (size_t)cap);
     float *bufB  = wallc(g, (size_t)cap);
-    float *tmp   = wallc(g, (size_t)HID*T*F);
     float *cur   = wallc(g, (size_t)HID*T*F);
-    if (!bufA || !bufB || !tmp || !cur) return 1;
+    if (!bufA || !bufB || !cur) return 1;
     const float *srcs[3] = { x_in, bufA, bufB };
     int cs = 0, ds = 1;                              /* source/destination slot ids */
     int c_skip = HID;
@@ -3153,7 +3229,7 @@ static int dense_block_gpu(reuse_gpu_t *g, const char *prefix, const float *x_in
         snprintf(key, sizeof(key), "%s.%d.0.bias",   prefix, i); const float *b = reuse_gpu_w(g, key);
         if (g->bad) return 1;
         int dil = 1 << i;
-        launch_conv2d(g, srcs[cs], w, b, c_skip, T, F, HID, 3, 3, dil, 1, dil, 1, 1, 1, tmp, tilehint);
+        launch_conv2d(g, srcs[cs], w, b, c_skip, T, F, HID, 3, 3, dil, 1, dil, 1, 1, 1, tmp, tilehint, NULL, -1);
         snprintf(nkey, sizeof(nkey), "%s.%d.1.weight", prefix, i);
         snprintf(akey, sizeof(akey), "%s.%d.2.weight", prefix, i);
         float *ocur = (i == DEPTH - 1) ? out : cur;
@@ -3261,7 +3337,7 @@ extern "C" int reuse_gpu_encoder(reuse_gpu_t *g, const float *xin, float *enc, i
         dense_block_gpu(g, "dense_encoder.dense_block.dense_block", x1n, Tp, Fp, xdb, 0);
     gdump("db", xdb, (size_t)HID*Tp*Fp);
     if (!getenv("REUSE_SKIP_ENC2D"))
-        launch_conv2d(g, xdb, w2, b2, HID, Tp, Fp, HID, 1, 3, 0, 0, 1, 1, 4, 2, x2, 0);
+        launch_conv2d(g, xdb, w2, b2, HID, Tp, Fp, HID, 1, 3, 0, 0, 1, 1, 4, 2, x2, 0, NULL, -1);
     gdump("c2", x2, (size_t)HID*T2*F2);
     if (!getenv("REUSE_SKIP_IN2"))
         inorm(g, x2, enc, 1, HID, T2, F2, "dense_encoder.dense_conv_2.1.weight", "dense_encoder.dense_conv_2.2.weight");

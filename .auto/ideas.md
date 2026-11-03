@@ -10,7 +10,10 @@ python3, the nsys report scripts are missing in this install):
   convs (r8 64-acc shapes)            ~110 ms             — CLOSED (issue-bound: #48 skew +50-74%, #21 float4, #30, #39)
   scan (fused dt_proj+scan)           104 ms  60 launches  — CLOSED (#25 prefetch, #32 unroll, #34 fusion, #38 shared-decay, #46 LB)
   out_proj_r8c (8x8, #50+#57)          76 ms  60 launches  — CLOSED (K-split #41, warps #41, LB #46)
-  x_proj (register-tiled)              36 ms               — at ~4 TFLOPS, peak
+  x_proj k_x_proj_g<128,40,8>           ~27 ms  60 launches  — CLOSED (#68: 20 accs, 2.2 FMA/load,
+     one 40-wide tile covers XP=36; the old (128,32) shape ran 2 blocks in x, the 2nd with 4 useful
+     columns of 32. model -2.2%, bit-compatible. Shapes swept 12x; 128,48,16 0.4190 and 64,40,8/
+     192,40,8 ~0.422 are the only near ties. KT=64 is not viable: shared 45.7 KB -> 1 block/SM.)
   inorm_prelu                          10.5 ms 18 launches — CLOSED (#54: block width and 1-pass/3-pass both neutral)
   outproj_ln_g (4x4 + LN)               9.6 ms 30 launches — CLOSED (#59: 8x8 neutral; launch-quantisation bound)
   sp_up8t (tiled, #52)                  6.3 ms  2 launches — OPEN (shape sweeps only)
@@ -102,6 +105,50 @@ python3, the nsys report scripts are missing in this install):
        by construction), or keep it in __device__ global memory read through __ldg. Cost of the item:
        ~5 h across 4 attempts, ceiling -0.6%; the encoder's dense layers 0,1,2 were bit-exact in
        attempt #65, which is the closest it got.
+   (g) CLOSED 6TH ATTEMPT (#73, +1 h): template<bool TABLE> on r2+r8 (runtime branch rejected:
+   +5 instructions in the loader prologue inflated EVERY plain conv, enc 0.074 -> 0.122),
+   k_set_src __device__ table, dense slots buffer, REUSE_DENSE_SLOTS env, default 0 verified
+   bit-identical to HEAD (complex rel rms 2.855971e-06 / 6.0178e-03, exact). dev slots=1 = +10%
+   model (64-acc TABLE instantiations). maxwell proxy (tile 82 = 32-acc) on sm_61: slots=1 =
+   -0.7% model AND bit-compatible (max|d| 8.9e-08, all 4 conv configs incl. r2 via
+   REUSE_DEC_TILE=64). Nano (real sm_53, same binary): -5.4% model at 8 kHz (14.78 vs 15.62 s),
+   -3.0% at 16 kHz - the win is real - BUT audio corrupt: slots vs copies max|d| 0.234,
+   rel rms 1.274, deterministic; volatile on g_src changed nothing and broke the sm_61
+   maxwell-proxy identically (0.23425466/67 = one latent bug, two codegen paths). Verdict:
+   the ~5% Nano win is real but pointer-table delivery is not codegen-robust; 6 attempts,
+   ~4.5 h, CLOSED permanently. A 7th would need the loader byte-identical to shipped with the
+   base from kernel PARAMS (by-value struct broken on CUDA 10.2, (f)(1)) - e.g. 16 separate
+   pointer params; not worth further time.
+   (f) 5TH ATTEMPT (#72, ~3.5 h, the design is now fully solved - item CLOSED for the dev host,
+   Nano-only value): k_conv2d_r8 given (x2, ng) + a __device__ g_src[16] table written by a
+   k_set_src<<<1,32>>> launched on the same stream immediately before the conv (stream-ordered,
+   which fixes #66's cudaMemcpyToSymbolAsync race). Result: BIT-COMPATIBLE app-wide (slots vs
+   copies max|d| 5.96e-08 = the atomic floor; all 4 dense blocks, encoder + decoders). Measured
+   cost: the TABLE=true instantiations run the 16 dense convs ~5-10 ms slower than the 1.4 ms of
+   cudaMemcpyAsync they remove (16 extra dependent loads: the loader's base pointer comes from a
+   global table read per group) => NET NEGATIVE on the dev host, so slots_mode defaults to 0 and
+   the tree keeps only the (bit-identical) scaffolding behind REUSE_DENSE_SLOTS=1. Nano value is
+   real (-444 MB of copies ~ -18 ms, -44 launches/forward under CUDA_LAUNCH_BLOCKING, -111 MB
+   arena per dense block) but the Nano runs k_conv2d_r2 (32-acc guard), which has NO table mode -
+   porting the same (xin, pl) per-ci form into k_conv2d_r2 is the remaining step (~1 h, harness:
+   compare slots vs copies audio as done here: max|d| ~6e-08 expected).
+   TRAPS found the hard way (#72, all measured, do not repeat):
+     (1) passing ConvSrcs {const float* p[16]} BY VALUE as a kernel param under CUDA 10.2 gave
+         rel rms 6344 (garbage) - the by-value struct param path is broken/bitten here; use the
+         __device__ table + setup kernel, which is verified correct;
+     (2) a group-outer/channel-inner restructure of the ci loop (to keep the loader affine):
+         brace surgery on that 90-line kernel put the epilogue INSIDE the loops - the model broke
+         (gate rel rms 1.36) while timing stayed plausible (enc 0.065 = epilogue runs per-ci +
+         sync skip artifacts). Braces around the compute-loop/epilogue boundary must be edited by
+         replacing the WHOLE loop region, not by inserting closers at rindex;
+     (3) `if (ci) __syncthreads()` inside a restructured loop becomes the outer loop variable -
+         sync silently vanishes (enc 0.065, garbage output). Sync condition must be
+         `(cij || g)` for a nested loop;
+     (4) REUSE_CONV_TILE=64 is NOT a valid control for the dense convs: dense_block passes a
+         per-call-site tilehint (645/644, #42) that OVERRIDES the env, so an "r2 control" run
+         still measured r8.
+     (5) the plain (TABLE=false) instantiations are codegen-identical to the shipped kernel
+         (enc 0.074, gates bit-identical) - verified after every surgery; keep that invariant.
    (e) (4b) is therefore NOT worth building (its 2.7 FMA/load sits between OP=2's 2.0 and OP=3's
    4.0, and 4.0 is already neutral there). The instrumentation knob REUSE_INCONV_LB={2,3,4,6} is in
    the tree (default = the shipped LBV=3, bit-identical).
@@ -127,8 +174,25 @@ python3, the nsys report scripts are missing in this install):
 - 2 CUDA streams for the independent mask/phase decoder branches: NEUTRAL and it races (the
   decoder arena resets to offset 0 and reuses the tower region where `enc` lives) (#56).
 - STFT/iSTFT/heads = 0.005 s = 5.6% of rtf_total, all at their floors on the dev host.
-- CPU STFT vectorisation (#43): 38% faster standalone, invisible in the metric (CPU noise 4x).
-  Retry only on a quiet host, and it is a real Nano win (STFT = 2.7% of Nano RTF there).
+- CLOSED FOR THE Nano (#70, implemented + validated, NOT LANDED - re-apply in ~2 min with the next
+  Nano-validation keep): engine/stft_dft.cu - add a parallel pre-pass building the windowed frames in
+  double (xw[t][n] = x[idx]*w[n], reflect-pad index computed once; the committed loop recomputes it F
+  times per sample) and turn the DFT inner loop into a pure dot product with FOUR independent double
+  accumulator chains (n mod 4), tree-combined (r0+r1)+(r2+r3), plus a tail loop for n_fft % 4.
+  Nano 8 kHz: stft(cpu) 0.0893 -> 0.0686 s (median of 3 interleaved pairs) = -23% = -21 ms per
+  forward = -0.7% of Nano RTF 3.05. Accuracy: mag BIT-IDENTICAL (max|d| = 0), pha max|d| 1.8e-12,
+  rel rms 2.5e-15 -> float outputs identical, no atan2 sign flips. Env REUSE_STFT_FAST=0 restores the
+  serial form (default ON). Dev host: the scored metric is untouched, the GPU STFT (0.0020 s) is the
+  default there. Same patch adds REUSE_DUMP_STFT=<base> to reuse_host_gpu.c (writes <base>_mag.raw
+  and <base>_pha.raw from the CPU STFT) - the tool for verifying any future STFT change; keep it.
+  Not landed as a scored experiment because the dev metric is flat by construction; keeps are
+  reserved for scored improvements.
+  REVALIDATED #73 on a fresh Nano build: stft(cpu) 0.0636/0.0706 (fast) vs 0.0869 (serial) =
+  -22% again; run_bench.sh has REUSE_CPU_STFT=1 and NO REUSE_DENSE_SLOTS (slots=0 on the Nano:
+  the table mode is not codegen-robust, see item 1b(g)). IMPORTANT: the Nano's engine/stft_dft.cu
+  now carries the fast form while the repo keeps the serial one - the next repo-side land must
+  re-apply this patch (it is in git history via the #70/#73 working trees) BEFORE the next
+  engine/ rsync, which would otherwise overwrite the Nano copy with the serial version.
 
 ## Deployment (Nano) rules learned
 - Kernels with >=64 per-thread registers COMPILE for sm_53 and FAIL AT LAUNCH ("too many
