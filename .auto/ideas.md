@@ -86,3 +86,16 @@ and FAILED the gate at 8 kHz. So:
 - 16 kHz needs REUSE_WS_MB=1280 (1024 exhausts the arena and yields rel_rms ~0.48, a fake
   model-accuracy failure).
 - Also pass REUSE_DUMP_AUDIO, else the waveform check compares a stale file (fake SNR fail).
+
+## Nano validation (measured 2026-11-03, at rtf_total 0.1199 dev host)
+Nano (tegra210, 1 SM, CUDA_LAUNCH_BLOCKING=1, REUSE_WS_MB=640, 8 kHz fixture, GPU iSTFT on):
+  RTF_total 3.5291 = model 3.4949 + stft(cpu) 0.0167 + istft(gpu) 0.0175.
+  Baseline was RTF_model 44.34 -> 3.49 = 12.7x. Phase split: tower 12.88 s (72%),
+  encoder 3.44 (19%), decoders 1.48 (8%).
+  CPU STFT OpenMP scaling on the 4 Cortex-A57 cores: 0.3013 s (1 thread) -> 0.0891 s
+  (4 threads) = 3.4x, so #24 transferred to the Nano (its share is tiny there).
+  IMPORTANT - launch-count work is NOT a Nano priority: ~400 launches per forward with
+  a device sync each = 20-40 ms out of 17.8 s = 0.2%. The Nano's cost is raw compute
+  (1 SM / 128 cores @ 921 MHz), so the dev host is a faithful proxy. Ideas #2 (fuse the
+  direction chain), #7 (persistent kernel) and #12 (CUDA graphs / launch reduction) are
+  accordingly LOW value - deprioritise them.

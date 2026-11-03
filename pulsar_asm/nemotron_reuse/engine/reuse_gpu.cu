@@ -591,6 +591,59 @@ __global__ void k_x_proj(const float *xc, const float *W, float *xdbl, long SL)
     xdbl[st * XP + o] = acc;
 }
 
+// x_proj as a 128-row x 32-col register-tiled GEMM.
+//
+// k_x_proj_t (MT=64, 4 rows x 2 cols = 8 accumulators) issued 6 shared loads
+// per 8 FMAs and its tile loaders did per-element index math (2048 + 1024
+// scalar loads per block per K chunk). This version: MT=128 with 8x2 = 16
+// accumulators (10 loads per 16 FMAs) and float4 tile loads, one index/mask
+// computation per 4 elements. RS is in float4 units of the PADDED row stride.
+__global__ void k_x_proj_r(const float *xc, const float *W, float *xdbl, long SL)
+{
+    const int MT = 128, NT = 32, KT = 32, RS = (KT+4)/4;
+    __shared__ __align__(16) float As[MT][KT+4];
+    __shared__ __align__(16) float Bs[NT][KT+4];
+    const int m0 = blockIdx.y * MT, n0 = blockIdx.x * NT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty * 16 + tx;
+    float acc[16];
+#pragma unroll
+    for (int i = 0; i < 16; i++) acc[i] = 0.f;
+    for (int k0 = 0; k0 < DINNER; k0 += KT) {
+        for (int i = tid; i < MT*RS; i += 256) {
+            const int r = i / RS, q = 4*(i - r*RS);
+            const int m = m0 + r;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (q < KT && m < SL) v = *(const float4*)(xc + (long)m*DINNER + k0 + q);
+            ((float4*)&As[0][0])[i] = v;
+        }
+        for (int i = tid; i < NT*RS; i += 256) {
+            const int r = i / RS, q = 4*(i - r*RS);
+            const int n = n0 + r;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (q < KT && n < XP) v = *(const float4*)(W + (long)n*DINNER + k0 + q);
+            ((float4*)&Bs[0][0])[i] = v;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KT; k++) {
+            const float b0 = Bs[tx*2][k], b1 = Bs[tx*2+1][k];
+#pragma unroll
+            for (int r = 0; r < 8; r++) {
+                const float a = As[ty*8 + r][k];
+                acc[r*2] = fmaf(a, b0, acc[r*2]);
+                acc[r*2+1] = fmaf(a, b1, acc[r*2+1]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 16; i++) {
+        int m = m0 + ty*8 + (i >> 1), n = n0 + tx*2 + (i & 1);
+        if (m < SL && n < XP) xdbl[(long)m*XP + n] = acc[i];
+    }
+}
+
 __global__ void k_x_proj_t(const float *xc, const float *W, float *xdbl, long SL)
 {
     // xdbl[m][o] = sum_k xc[m][k] * W[o][k];  K = DINNER = 256, N = XP = 36.
@@ -2455,9 +2508,10 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     GDBG("gxact", xc, (size_t)SL*DINNER);
     {
         static int tiled = -1;
-        if (tiled < 0) tiled = getenv("REUSE_NAIVE_XPROJ") ? 0 : 1;
+        if (tiled < 0) tiled = getenv("REUSE_XPROJ") ? atoi(getenv("REUSE_XPROJ")) : (getenv("REUSE_NAIVE_XPROJ") ? 0 : 2);
         if (getenv("REUSE_SKIP_XPROJ")) { } else
-        if (tiled) k_x_proj_t<<<dim3((XP+31)/32, (unsigned)((SL+63)/64)), dim3(16,16), 0, st>>>(xc, W_xp, xdbl, SL);
+        if (tiled == 2) k_x_proj_r<<<dim3((XP+31)/32, (unsigned)((SL+127)/128)), dim3(16,16), 0, st>>>(xc, W_xp, xdbl, SL);
+        else if (tiled) k_x_proj_t<<<dim3((XP+31)/32, (unsigned)((SL+63)/64)), dim3(16,16), 0, st>>>(xc, W_xp, xdbl, SL);
         else       k_x_proj<<<dim3((unsigned)((SL+255)/256), XP), b1, 0, st>>>(xc, W_xp, xdbl, SL);
     }
     kp_mark("x_proj", &klast);
