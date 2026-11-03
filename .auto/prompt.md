@@ -1,64 +1,132 @@
-# Autoresearch: Jetson Nano 8B exact-PQ2 — prefill + decode speed, peak RSS
+# Autoresearch: RE-USE GPU port RTF (Jetson Nano target)
 
 ## Objective
-Speed up the Nano GPU engine on branch `bonsai-jetson-nano`
-(`pulsar_arm/bonsai2/pq2_swar_sm53.cu` + `pq2_fwd8_glue.c` + the PQ2 path):
-**prefill and decode**, at frozen accuracy, while **reducing peak RSS**.
-Every kept run must keep three gates green (`.auto/checks.sh` enforces them
-and they cannot be overridden):
-  1. `pq2_parity` BIT-EXACT at K=4096 (256/256) and K=12288 (512/512) vs the
-     fork-faithful host reference (mirrors `pq2_gemv.c` /
-     `ggml_vec_dot_pq2_0_q8_K` accumulation order).
-  2. greedy stream on prompt A (measured) == frozen golden (44 tokens).
-  3. greedy stream on held-out prompt B == frozen golden (26 tokens).
+Reduce the runtime of the self-contained C/CUDA port of NVIDIA NemotronLabs
+RE-USE (speech enhancement: DFT STFT -> DenseEncoder -> 30x bidirectional
+TFMamba -> mag/phase decoders -> atan2 head -> sweep mask -> DFT iSTFT)
+**while preserving numerical accuracy** against the PyTorch reference.
 
-Context: 8B PQ2_0 streams 2.18 GB/token, so the board's 25.6 GB/s bus caps
-this at 11.6 tok/s at 100% EMC (~7 realistic); the kernel is compute-bound
-today, not bus-bound. 13-15 tok/s is above the theoretical bus for this
-model size and is not a target.
+Target hardware is a Jetson Nano Gen1 (tegra210, **1 SM / 128 cores @ 921 MHz**,
+CUDA 10.2, `sm_53`, 3 GiB shared memory). The optimization loop runs on a dev
+host (GTX 1070, 15 SMs, CUDA 10.2, `sm_61`) because it is ~23x faster; the
+Nano is validated by periodic manual checks (see "Nano validation").
+
+Current dev-host state (8 kHz fixture, 5.100 s audio):
+`rtf_total ~= 1.93` = model 1.91 + STFT 0.016 + iSTFT 0.002.
+Phase split: tower 8.55 s (97%), encoder 0.85 s, decoders 0.33 s, STFT 0.08 s,
+iSTFT 0.010 s. On the Nano: RTF_model 44.34 (8 kHz) / 88.86 (16 kHz).
 
 ## Metrics
-- **Primary**: `decode_ms_per_tok` (ms per generated token, lower better) —
-  steady-state per-step forward time from in-binary timers.
-- **Secondary**: `prefill_ms_per_tok` (steady-state prompt steps),
-  `peak_rss_mb` (maximum resident set size), `startup_s` (one-time
-  split-repack + 2.3GB arena upload), `build_s`.
-- Contention witness: GPU clock + `gpu_clk_hz` echoed in the METRIC line
-  block. Bus/clock drift is real on this board: judge by ratios from
-  same-invocation A/B whenever a change is within ~3%.
+- **Primary**: `rtf_total` (ratio, **lower is better**) = (model best + STFT +
+  iSTFT) wall time / audio duration, 8 kHz fixture, full pipeline with **no**
+  reference fed into the model.
+- **Secondary** (monitors, not scored): `rtf_model`, `rtf_stft`, `rtf_istft`,
+  `enc_s`, `tower_s`, `dec_s`, `heads_s`, and three **held-out shapes**:
+  `rtf_held8k` (3.90 s clip, 8 kHz), `rtf_held12k` (3.30 s, 12 kHz, nfft 480),
+  `rtf_held16k` (4.40 s, 16 kHz). These exist to catch fixture-specific tuning:
+  a real optimization improves them too. If `rtf_total` improves while the
+  held-out RTFs do not, treat it as overfitting and discard.
 
 ## How to run
-`bash .auto/measure.sh` — syncs sources to the Nano, builds, runs the fixed
-prompt, prints METRIC lines, saves logs to `.auto/last_*.txt`.
-`bash .auto/checks.sh` — the three accuracy gates (runs automatically after
-each passing benchmark).
-
-## Fixed prompts (never tune to them)
-- **A (measured)**: chatml, "List the four seasons and one thing that changes
-  in each." — 20 ids + 24 greedy steps.
-- **B (held-out, checks only)**: chatml, "Write a haiku about the ocean." —
-  16 ids + 10 greedy steps.
+- `./.auto/measure.sh` (~66 s) — builds, runs the benchmark + held-outs, emits
+  `METRIC name=value` lines.
+- `./.auto/checks.sh` (~32 s) — accuracy gates + `sm_53` compile. Runs
+  automatically after a passing benchmark; a failure blocks `keep`.
 
 ## Files in scope
-- `pulsar_arm/bonsai2/pq2_swar_sm53.cu` — the sm_53 SWAR GEMV (hot loop)
-- `pulsar_arm/bonsai2/pq2_fwd8_glue.c` — repack/cache/arena/launch glue
-- `pulsar_arm/bonsai2/pq2_host.c`, `pq2_wrap.h` — repack + host reference
-- `pulsar_arm/bonsai2/pq2_parity.c` — the parity gate itself
-- `.auto/measure.sh`, `.auto/checks.sh` — harness (may gain instrumentation)
+- `pulsar_asm/nemotron_reuse/engine/reuse_gpu.cu` — all GPU kernels + the model
+  graph + the GPU iSTFT. This is where nearly all work happens.
+- `pulsar_asm/nemotron_reuse/engine/reuse_gpu.h` — GPU API.
+- `pulsar_asm/nemotron_reuse/engine/gemm_tiled.cuh` — tiled GEMM helpers.
+- `pulsar_asm/nemotron_reuse/engine/stft_dft.cu`, `istft_dft.cu` — CPU DFT-GEMM
+  STFT/iSTFT (the STFT is still on the CPU at 0.081 s; a GPU STFT is fair game).
+- `pulsar_asm/nemotron_reuse/engine/blob.c`/`blob.h` — weight blob loader.
+  Changing the on-disk/in-memory **layout** of weights (e.g. pre-transposed for
+  coalesced B-tile loads) is a legitimate optimization; regenerate with
+  `python3 pulsar_asm/nemotron_reuse/tools/mkblob.py` if the format changes.
+- `pulsar_asm/nemotron_reuse/engine/reuse_host_gpu.c` — driver. **Timing
+  protocol off limits** (see below); you may add instrumentation.
+- `pulsar_asm/nemotron_reuse/tests/gpu_*.c` — block/encoder/decoder gate
+  harnesses, `tests/gpu_block_bench.c` for single-block timing. Use them to
+  iterate quickly (a single TFMamba block gate runs in ~2 s).
 
-## Known optimization directions (from the perf analysis)
-- Occupancy is capped at 3 blocks/SM by the 13KB act tile (register cap
-  allows 4). Chunking K would shrink the tile.
-- Mask work (split4 + keep4, 11 ops per 4 weights) is *row-independent*: it
-  can be computed once for 2+ rows per lane, amortizing it.
-- Latency hiding: software-pipeline the next group's code loads.
-- Peak RSS: the transient host split buffers (up to ~165MB for the head)
-  and the mmap'd GGUF pages are the resident mass; `madvise(MADV_DONTNEED)`
-  after each tensor is uploaded drops the latter.
+## Off limits
+- `pulsar_asm/nemotron_reuse/tests/golden/**` (PyTorch references),
+  `tests/gate_*.py`, `ref/**`, `.auto/fixtures/**`.
+- The **measurement protocol** in `reuse_host_gpu.c`: what is timed, the
+  reps/warm-up rule (rep 0 is warm-up, best of the rest), the RTF formulas, and
+  the `REUSE_MAG`/`REUSE_PHA` reference-STFT-feeding path. Making the benchmark
+  look faster by changing any of these is cheating.
+- Gate thresholds in `.auto/checks.sh` and `.auto/measure.sh`. Instrumentation
+  may be added; thresholds may never be relaxed.
+- The CPU reference model used for cross-checks: `engine/model_full.c`,
+  `engine/tfmamba.c`, `engine/conv2d_full.c`, `engine/instancenorm.c`.
 
-## Record: superseded objective
-The previous session on this repo targeted the Spark 27B CPU engine
-(`fwd.c` + `tq_gemv_neon.c` + `fwht.S`), primary `decode_ms`, ~0.71 s/token
-threaded. Its harness is kept at `.auto/measure_spark_27b.sh` and its
-directives/goldens (`golden_A.txt`/`golden_B.txt` were re-frozen for the
-Nano prompts above) are in the git history. Do not mix the two.
+## Constraints
+1. Gates must PASS at **both** 8 kHz and 16 kHz: model complex-spectrum
+   rel-rms <= 1e-4 and waveform SNR >= 50 dB (reference STFT fed).
+2. `sm_53` with CUDA 10.2 must keep compiling (checks.sh). The Nano is the
+   deployment target, so prefer work that fits **Maxwell limits**: 64 KB
+   shared memory per SM, <= 48 KB/block, 24 blocks/SM, no `mma`/tensor-core
+   paths, fp64 at 1/64 rate.
+3. No cuBLAS / cuFFT / cuDNN / new dependencies / network. Self-contained
+   kernels only (that is the project premise: no Python, no BLAS at runtime).
+4. Keep fp32 storage and the reference's accumulation semantics: places where
+   the PyTorch/CPU reference accumulates in double (InstanceNorm sums over
+   ~169k terms, the selective scan, the inverse DFT) must stay accurate — use
+   double (CPU/dev host) or compensated fp32 (Kahan / two-float) where Nano
+   fp64 throughput is prohibitive, and verify the gate.
+5. No fixture-specific behaviour: no branching on T/F/frame counts, no caching
+   outputs, no skipping frames/blocks, no early exit.
+6. Keep the naive reference paths behind env switches where they exist
+   (`REUSE_NAIVE_OP=1`) so A/B is possible.
+
+## Anti-cheat / anti-overfit rules (checked every iteration)
+- Primary metric is the **full pipeline**; never feed the reference STFT in the
+  measured run (measure.sh unsets `REUSE_MAG`/`REUSE_PHA` for a reason).
+- All three phases are reported; a "win" that moves cost from the model into
+  STFT/iSTFT shows up as `rtf_stft`/`rtf_istft` rising and `rtf_total` not
+  improving.
+- Held-out clips at 3 unseen shapes must not regress materially (they are the
+  overfit detector; ~1-2% noise is normal).
+- Accuracy is a hard gate, not a tradeoff: no precision loss, no truncation of
+  the 30 blocks, no reduced frame/binary counts, no looser epsilon in exp/softplus.
+- `git diff` must show real kernel work, not measurement edits.
+
+## What's Been Tried
+Wins so far (all committed on `nemotron-re-use-jetson-nano`, which this branch
+started from):
+- **out_proj was the hotspot**: `k_gate_outproj` (naive SGEMV, 256 threads,
+  shared reduce) cost 0.31-0.33 s per scan direction = ~81% of a TFMamba block.
+  A 32x32 shared-memory tiled kernel with the elementwise gate fused into the
+  A-tile load (`out[m][o] = sum_k y[m][k]*silu(z[m][k])*W[o][k]`, output layout
+  `[SL,HID]`, gate = **first** DINNER columns of z, applied **inside** the
+  K-reduction) runs in 0.00060 s (~590x). Tower 47.5 s -> 8.6 s, RTF 9.53 ->
+  1.91. Beware: an earlier version applied `z` post-hoc as `[HID,SL]` and gave
+  rel-rms 2.57 — the gate caught it.
+- **GPU iSTFT** as two real GEMMs against a host-built float64 DFT table
+  (m_k = 1 at DC/Nyquist, 2 for interior bins), double accumulation, atomicAdd
+  overlap-add, `sum(w^2)` normalisation: 1.27 s -> 0.0103 s (8 kHz).
+- Per-kernel timings per scan direction (S=81, L=256, dev host, sync-based
+  `REUSE_KPROF=1`; the concat/resid numbers are *windows* that include the
+  un-instrumented output_proj GEMV + LayerNorm):
+  in_proj 0.0332 s, x_proj 0.0214 s, conv 0.0064 s, dt_proj 0.0048 s,
+  scan 0.0011 s, out_proj 0.0006 s, concat window 0.138 s, resid windows
+  0.141/0.147 s.
+- `in_proj` runs at ~163 GFLOPS (5.4 GFlop per launch) — i.e. a plain tiled GEMM
+  is not enough; it needs register blocking (>=4 accumulators/thread) plus
+  double buffering. Measured earlier: a 32x32 tiled GEMM without register
+  blocking gave **no** speedup over the naive kernel on the projections.
+- Nano: the async launch path dies with a Tegra poisoned-page MMU fault, so the
+  Nano runs `CUDA_LAUNCH_BLOCKING=1`. Consequence: **kernel launch count matters
+  much more on the Nano than on the dev host**; fusion-driven wins that do not
+  move the dev-host metric may still be the highest-value Nano work. Record
+  launch counts in ASI when a change reduces them.
+
+## Nano validation (periodic, not per iteration)
+`ssh pesi@100.70.245.36` (hostname `iPhO`), repo at `~/reuse_port`:
+`rsync -a --exclude '*.o' --exclude 'reuse_nano_gpu' engine/ pesi@100.70.245.36:~/reuse_port/engine/`
+then `cd ~/reuse_port && NVCC=/usr/local/cuda-10.2/bin/nvcc ./build_nano.sh`
+and `CUDA_LAUNCH_BLOCKING=1 REUSE_WS_MB=640 ./run_bench.sh`.
+Only ~3 GiB device memory: the encoder arena peak is ~560 MiB at 8 kHz, ~1.1 GiB
+at 16 kHz. Disk is tight (~450 MB). Do not stop services on it.

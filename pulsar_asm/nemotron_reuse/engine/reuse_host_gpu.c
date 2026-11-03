@@ -135,7 +135,7 @@ int main(int argc, char **argv)
     printf("audio      %.4f s\n", audio_s);
     printf("model best %.4f s   RTF_model %.4f\n", best, best/audio_s);
     printf("stft(cpu)  %.4f s   RTF %.4f\n", t_stft, t_stft/audio_s);
-    printf("istft(cpu) %.4f s   RTF %.4f\n", t_istft, t_istft/audio_s);
+    printf("istft(%s) %.4f s   RTF %.4f\n", getenv("REUSE_GPU_ISTFT") ? "gpu" : "cpu", t_istft, t_istft/audio_s);
     printf("total(best+stft+istft) %.4f s  RTF_total %.4f\n", best+t_stft+t_istft, (best+t_stft+t_istft)/audio_s);
     printf("d2h %.4f s\n", t_load);
     fflush(stdout);
