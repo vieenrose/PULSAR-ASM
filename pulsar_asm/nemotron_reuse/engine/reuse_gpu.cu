@@ -2071,10 +2071,92 @@ __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
     }
 }
 
+template<int R, int PCO, int NCB>
+__global__ void k_conv2d_r9(const float *x, const float *w, const float *b,
+                            int C_in, int H, int W, int padH, int padW, int dilH,
+                            float *y, int co0)
+{
+    const int TW = 16*NCB, LS = TW+4;
+    const int NRA = 32/(PCO*NCB);
+    __shared__ __align__(16) float S[R][LS];
+    const int w0 = blockIdx.x*TW, h0 = blockIdx.y*32;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty*16 + tx;
+    float acc[PCO][NRA][NCB];
+#pragma unroll
+    for (int j = 0; j < PCO; j++)
+#pragma unroll
+        for (int a = 0; a < NRA; a++)
+#pragma unroll
+            for (int bq = 0; bq < NCB; bq++) acc[j][a][bq] = b[co0 + blockIdx.z*PCO + j];
+    for (int ci = 0; ci < C_in; ci++) {
+        const float *xin = x + (long)ci*H*W;
+        if (ci) __syncthreads();
+        {
+            const int RS = LS/4, wbase = w0 - padW, hbase = h0 - padH;
+            float4 *dv = (float4*)&S[0][0];
+            for (int i = tid; i < R*RS; i += 256) {
+                const int r = i / RS, q = 4*(i - r*RS);
+                const int hh = hbase + r, ww = wbase + q;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (hh >= 0 && hh < H) {
+                    const float *sp = xin + (long)hh*W + ww;
+                    if (ww >= 0 && ww + 4 <= W && ((((long)ci*H*W + (long)hh*W + ww) & 3) == 0))
+                        v = *(const float4*)sp;
+                    else {
+                        if (ww     >= 0 && ww     < W) v.x = sp[0];
+                        if (ww + 1 >= 0 && ww + 1 < W) v.y = sp[1];
+                        if (ww + 2 >= 0 && ww + 2 < W) v.z = sp[2];
+                        if (ww + 3 >= 0 && ww + 3 < W) v.w = sp[3];
+                    }
+                }
+                dv[i] = v;
+            }
+        }
+        __syncthreads();
+        const float *wv = w + ((long)(co0 + blockIdx.z*PCO)*C_in + ci)*9;
+#pragma unroll
+        for (int kh = 0; kh < 3; kh++) {
+            const int rb = ty*NRA + kh*dilH, cb = tx*NCB;
+#pragma unroll
+            for (int a = 0; a < NRA; a++) {
+                const float *sr = &S[rb + a][cb];
+                const float s0 = sr[0], s1 = sr[1], s2 = sr[2], s3 = sr[3], s4 = sr[4];
+#pragma unroll
+                for (int j = 0; j < PCO; j++) {
+                    const float w0f = wv[j*C_in*9 + kh*3], w1f = wv[j*C_in*9 + kh*3+1], w2f = wv[j*C_in*9 + kh*3+2];
+#pragma unroll
+                    for (int bq = 0; bq < NCB; bq++) {
+                        const float p0 = (bq == 0) ? s0 : ((bq == 1) ? s1 : ((bq == 2) ? s2 : s3));
+                        const float p1 = (bq == 0) ? s1 : ((bq == 1) ? s2 : ((bq == 2) ? s3 : s4));
+                        const float p2 = (bq == 0) ? s2 : ((bq == 1) ? s3 : ((bq == 2) ? s4 : s4));
+                        acc[j][a][bq] = fmaf(p0, w0f, acc[j][a][bq]);
+                        acc[j][a][bq] = fmaf(p1, w1f, acc[j][a][bq]);
+                        acc[j][a][bq] = fmaf(p2, w2f, acc[j][a][bq]);
+                    }
+                }
+            }
+        }
+    }
+    const int wc = w0 + tx*NCB;
+#pragma unroll
+    for (int j = 0; j < PCO; j++) {
+        float *yo = y + (long)(co0 + blockIdx.z*PCO + j)*H*W;
+#pragma unroll
+        for (int a = 0; a < NRA; a++) {
+            int hh = h0 + ty*NRA + a;
+            if (hh >= H) continue;
+            float *d2 = yo + (long)hh*W;
+#pragma unroll
+            for (int bq = 0; bq < NCB; bq++) if (wc + bq < W) d2[wc + bq] = acc[j][a][bq];
+        }
+    }
+}
+
 static int conv_chunk(void)
 {
     static int c = -1;
-    if (c < 0) { const char *e = getenv("REUSE_CONV_CHUNK"); c = e ? atoi(e) : 32; if (c <= 0) c = 1 << 30; }
+    if (c < 0) { const char *e = getenv("REUSE_CONV_CHUNK"); c = e ? atoi(e) : 64; if (c <= 0) c = 1 << 30; }
     return c;
 }
 
@@ -2102,6 +2184,11 @@ static int launch_conv1x1(reuse_gpu_t *g, const float *x, const float *w, const 
             else if (regtile && dilH == 4) k_conv2d_r8<RN+8,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
             else if (regtile && dilH == 8) k_conv2d_r8<RN+24,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
         } while (0)
+#define R9LAUNCH(R1,R2,R4,R8) \
+            if      (regtile && dilH == 1) { k_conv2d_r9<R1,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
+            else if (regtile && dilH == 2) { k_conv2d_r9<R2,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
+            else if (regtile && dilH == 4) { k_conv2d_r9<R4,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
+            else if (regtile && dilH == 8) { k_conv2d_r9<R8,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); }
 #define R8LAUNCH(R1,R2,R4,R8) \
             if      (regtile && dilH == 1) { if (pco==4) k_conv2d_r8<R1,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R1,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R1,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
             else if (regtile && dilH == 2) { if (pco==4) k_conv2d_r8<R2,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R2,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R2,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
@@ -2130,13 +2217,16 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
                              dilW == 1 && strideH == 1 && strideW == 1 && padW == 1 && padH == dilH;
         static int big = -1;
         if (big < 0) { const char *e = getenv("REUSE_CONV_TILE"); big = e ? atoi(e) : 82; }
-        if (big >= 81 && big <= 83 && n % (big == 81 ? 4 : (big == 82 ? 8 : 16)) == 0) {
-            const int pco = (big == 81) ? 4 : (big == 82 ? 8 : 16), ncb = (big == 81) ? 4 : 2;
+        if (big >= 81 && big <= 92 && n % (big == 81 ? 4 : (big == 82 || big == 92 ? 8 : 16)) == 0) {
+            const int pco = (big == 81) ? 4 : (big == 82 || big == 92 ? 8 : 16), ncb = (big == 81) ? 4 : 2;
+            const bool r9 = (big == 92);
             const int trh = (big == 83) ? 16 : 32;
             const dim3 grdb((unsigned)((W_out + 16*ncb - 1) / (16*ncb)), (unsigned)((H_out + trh - 1) / trh), (unsigned)(n/pco));
             const dim3 blkb(16, 16);
-            R8LAUNCH(34,36,40,48)
-            else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0);
+            if (r9) { R9LAUNCH(34,36,40,48)
+                      else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0); }
+            else    { R8LAUNCH(34,36,40,48)
+                      else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0); }
             launch_kick();
             continue;
         }
