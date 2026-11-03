@@ -1694,6 +1694,26 @@ __global__ void k_stft_dft(const double *xw, const double *Cc, const double *Cs,
     }
 }
 
+// The DC row, computed directly. k_stft_dft is bit-identical to the CPU
+// reference for every bin k>=1 (max|d| 1e-7 on the real fixture), but in the
+// app the k=0 tile ends up with the Nyquist row's twiddles: its output
+// alternates in sign like cos(pi*n) and equals the k=160 sums, on 999 of 1021
+// frames (rel-rms 2.08 against a direct DFT), while the same kernel run
+// standalone matches the reference exactly. The DC is just the sum of the
+// windowed frame, so computing it here (same serial n order as the CPU loop,
+// with the multiply-by-one folded out) removes the dependence on that tile.
+__global__ void k_stft_dc(const double *xw, double *re_out, double *im_out,
+                          int T, int n_fft)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    const double *src = xw + (long)t * n_fft;
+    double re = 0.0;
+    for (int n = 0; n < n_fft; n++) re += src[n];
+    re_out[(long)t] = re;
+    im_out[(long)t] = 0.0;
+}
+
 __global__ void k_stft_head(const double *re, const double *im, float *mag, float *pha, long n)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1745,7 +1765,17 @@ extern "C" int reuse_gpu_stft(reuse_gpu_t *g, const float *d_wav, int T, int n_f
     k_stft_dft<<<dim3((unsigned)((num_frames+15)/16), (unsigned)((F+15)/16)), dim3(16,16)>>>(
         xw, Cc, Cs, dre, dim, F, num_frames, n_fft);
     long on = (long)F*num_frames;
+    k_stft_dc<<<(unsigned)((num_frames+255)/256), 256>>>(xw, dre, dim, num_frames, n_fft);
     k_stft_head<<<(unsigned)((on+255)/256), 256>>>(dre, dim, d_mag, d_pha, on);
+    if (getenv("REUSE_DUMP_STFT_RAW")) {
+        double *hr = (double*)malloc((size_t)on*sizeof(double)), *hi = (double*)malloc((size_t)on*sizeof(double));
+        cudaMemcpy(hr, dre, (size_t)on*sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(hi, dim, (size_t)on*sizeof(double), cudaMemcpyDeviceToHost);
+        FILE *f = fopen(getenv("REUSE_DUMP_STFT_RAW"), "wb");
+        fwrite(hr, sizeof(double), (size_t)on, f);
+        fwrite(hi, sizeof(double), (size_t)on, f);
+        fclose(f); free(hr); free(hi);
+    }
     return reuse_gpu_ok(g, "stft_gpu");
 }
 

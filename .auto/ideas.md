@@ -122,3 +122,21 @@ Transfer ratio for the last 5 keeps: dev -10.6%, Nano -6.4% => ~60% (the previou
 12%: that window's keeps were pure GEMM register blocking, this one added dt_proj+scan fusion
 and the tiled gather, i.e. memory-pattern wins transfer, FMA-ratio wins do not).
 Cumulative vs the 44.34 RTF_model baseline: 13.6x.
+
+## CPU STFT: pre-pass + 4-chain ILP (built & validated, NOT kept — measurement-bound)
+`reuse_stft_mag_pha` computed `x[idx]*w[n]` plus the two reflect-pad branches per
+(bin, frame, n), i.e. F=161x redundant, and reduced into a single dependent fp64
+chain (4-cycle add latency -> ~8x of the FMA issue rate idle).
+Fix: a parallel pre-pass building xw[t][n] = windowed x (1.3 MB, one pass), then
+a bin-major dot product with 4 independent accumulator chains
+((re0+re1)+(re2+re3)). Measured best-of-5 with interleaved builds: 0.0188 s
+median (min 0.0070) vs 0.0305 s (min 0.0295) = -38%. End-to-end audio rel rms
+9.5e-08 vs the committed build = the iSTFT atomics floor, i.e. numerically
+invisible; checks.sh passes (the gate feeds the reference STFT, so STFT
+correctness rests on the end-to-end audio diff, which is the strong test: a
+phase flip shows up in the waveform).
+NOT KEPT because rtf_stft's run-to-run spread on this host is 0.0026-0.0155
+(4x, = +/-5% of rtf_total) under CPU contention, which swamps a 0.012 s effect.
+Re-measure when the host is quiet; validate on the Nano, where the STFT is
+0.0891 s = 2.7% of Nano RTF and the same ILP deficit applies (A57 at ~0.6 of
+~1.7 GFLOPS/core fp64).
