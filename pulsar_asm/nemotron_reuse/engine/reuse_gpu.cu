@@ -375,6 +375,47 @@ __global__ void k_x_proj(const float *xc, const float *W, float *xdbl, long SL)
     xdbl[st * XP + o] = acc;
 }
 
+__global__ void k_x_proj_t(const float *xc, const float *W, float *xdbl, long SL)
+{
+    // xdbl[m][o] = sum_k xc[m][k] * W[o][k];  K = DINNER = 256, N = XP = 36.
+    // Same naive-GEMV problem as in_proj: 756 MB of reads for 3 MB of output.
+    const int MT = 64, NT = 32, KT = 32;
+    __shared__ float As[MT][KT+4];
+    __shared__ float Bs[NT][KT+4];
+    const int m0 = blockIdx.y * MT, n0 = blockIdx.x * NT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty * 16 + tx;
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) acc[i] = 0.f;
+    for (int k0 = 0; k0 < DINNER; k0 += KT) {
+        for (int i = tid; i < MT*KT; i += 256) {
+            int r = i / KT, c = i % KT, m = m0 + r;
+            As[r][c] = (m < SL) ? xc[(long)m*DINNER + k0 + c] : 0.f;
+        }
+        for (int i = tid; i < NT*KT; i += 256) {
+            int r = i / KT, c = i % KT, n = n0 + r;
+            Bs[r][c] = (n < XP) ? W[(long)n*DINNER + k0 + c] : 0.f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KT; k++) {
+            float b0 = Bs[tx*2][k], b1 = Bs[tx*2+1][k];
+#pragma unroll
+            for (int r = 0; r < 4; r++) {
+                float a = As[ty*4 + r][k];
+                acc[r*2] += a*b0; acc[r*2+1] += a*b1;
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int m = m0 + ty*4 + (i >> 1), n = n0 + tx*2 + (i & 1);
+        if (m < SL && n < XP) xdbl[(long)m*XP + n] = acc[i];
+    }
+}
+
 __global__ void k_dt_proj(const float *xdbl, const float *W, const float *B,
                           float *dtt, long SL)
 {
@@ -928,7 +969,12 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     k_conv_causal<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(x0, W_c, B_c, xc, S, L);
     kp_mark("conv", &klast);
     GDBG("gxact", xc, (size_t)SL*DINNER);
-    k_x_proj<<<dim3((unsigned)((SL+255)/256), XP), b1>>>(xc, W_xp, xdbl, SL);
+    {
+        static int tiled = -1;
+        if (tiled < 0) tiled = getenv("REUSE_NAIVE_XPROJ") ? 0 : 1;
+        if (tiled) k_x_proj_t<<<dim3((XP+31)/32, (unsigned)((SL+63)/64)), dim3(16,16)>>>(xc, W_xp, xdbl, SL);
+        else       k_x_proj<<<dim3((unsigned)((SL+255)/256), XP), b1>>>(xc, W_xp, xdbl, SL);
+    }
     kp_mark("x_proj", &klast);
     GDBG("gxdbl", xdbl, (size_t)SL*XP);
     k_dt_proj<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(xdbl, W_dt, B_dt, dtt, SL);
