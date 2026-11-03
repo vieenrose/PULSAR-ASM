@@ -828,6 +828,7 @@ struct Model {
   int* dpos = nullptr; int* hpos_pin = nullptr;
   cudaStream_t stCap = nullptr, stRun = nullptr;
   cudaGraphExec_t gx = nullptr;
+  int pf4_ci = 0;                   // conv-layer counter for the T-wide driver's ring index
   float *xf, *lgf, *part;          // part = GEMV per-chunk partials, f32 by contract
   bf16 *kc, *vc;
   float *invf_full, *invf_slide;
@@ -2559,6 +2560,8 @@ static void pf_launch(int ct, int arm, int h2, int rb, const int8_t* q, const fl
 
 // Batched-prefill arm knobs. File scope so the committed probe (LFM_PF_PROBE, in main)
 // can select an arm per pass; pfForce overrides the env value after the env parse.
+static bool is_attn_g[NLAYER], is_slide_g[NLAYER];   // mirrors main's locals, for the T-wide driver
+static float bf2f_host(bf16 v) { uint32_t u = (uint32_t)v << 16; float f; memcpy(&f, &u, 4); return f; }
 static int pfCT = -1, pfARM = -1, pfRB = -1, pfRPB = -1, pfForce = -1;
 static void pf_set_arm(int a) { pfForce = a; pfCT = -1; }   // pfCT<0 forces a re-init
 
@@ -3185,6 +3188,196 @@ static void layer_body(Model& M, int L, int pos, int step_s, int trace, int ci,
   g_probe = 0;
 }
 
+// ---------------------------------------------------------------------------
+// Tranche 3 of true CT=4 batched prefill (doc section 51, run log row 335).
+//
+// The pieces are all certified now: the batched GEMM reads a driver-owned
+// position-first arena bit-exactly (row 332), k_combine_bf_T combines T positions in one
+// launch (row 333), k_rmsnorm_T is the T=1 rmsnorm with a row offset (row 332), and
+// layer_body is parameterised by position and activation row (row 334). This is the
+// driver that consumes them: the prompt is fed T positions at a time, the ten GEMVs of a
+// layer go out as ONE launch each, and the cheap per-position passes (headnorm, RoPE,
+// KV write, attention, gated conv, SiLU, the two residual adds) run in a per-position
+// loop using the SAME kernels as the T=1 path.
+//
+// Acceptance bar for this tranche: after all chunks, the ACTIVATION AT THE LAST PROMPT
+// POSITION must be bit-identical to what the shipped T=1 prefill produces there
+// (LFM_DUMPX dumps the shipped value). That is a full 24-layer, ~10-GEMV-per-layer
+// end-to-end check of the T-wide sequencing -- if the residual stream at the last prompt
+// position matches bit for bit, every GEMV, norm, conv ring, RoPE and attention call in
+// between matched. Generated ids come when this driver is wired as the real prefill
+// (next tranche); they need lm_head, which is still inline in the step loop.
+static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+                     float* part, int Tn) {
+  Ent* e = T(M, name);
+  if (!e || !(e->dq && e->ds)) { printf("PF4-E2E %s: NOT IN BLOB\n", name.c_str()); return 1; }
+  const int N = e->ne[0], K = e->ne[1];
+  const int CT = 4, RPB = 8, R = (256 / 32) * RPB, TPB = 256;
+  if (K % Q8_BLK) { printf("PF4-E2E %s: K=%d not a multiple of %d\n", name.c_str(), K, Q8_BLK); return 1; }
+  int KC = K, nb = K / Q8_BLK; size_t shm = (size_t)CT * nb * 33 * 4;
+  while (KC > 32 && (K % KC || shm > 49152)) { KC /= 2; nb = KC / Q8_BLK; shm = (size_t)CT * nb * 33 * 4; }
+  if (K % KC || shm > 49152) { printf("PF4-E2E %s: no KC fits (K=%d)\n", name.c_str(), K); return 1; }
+  const int nch = K / KC, nblk = ((N + R - 1) / R) * nch;
+  pf_launch(CT, 5, 1, RPB, e->dq, e->ds, x, part, N, K, KC, R, nb, Tn, nblk, TPB, shm);
+  cudaError_t le = cudaGetLastError();
+  if (le != cudaSuccess) {   // no number for a kernel that did not run (the standing rule)
+    printf("PF4-E2E %s N=%d K=%d KC=%d: LAUNCH ERROR %s\n", name.c_str(), N, K, KC, cudaGetErrorString(le));
+    return 1;
+  }
+  dim3 g((N + 255) / 256, Tn);
+  k_combine_bf_T<<<g, 256, 0, g_launch>>>(part, y, N, nch, Tn);
+  cudaError_t le2 = cudaGetLastError();
+  if (le2 != cudaSuccess) { printf("PF4-E2E %s combine: LAUNCH ERROR %s\n", name.c_str(), cudaGetErrorString(le2)); return 1; }
+  return 0;
+}
+
+struct PF4Arena {
+  bf16 *xb, *h1, *q, *k, *v, *gate, *attn, *h2, *bx, *cy, *w1, *w3, *hout;
+  float* part;
+};
+
+// One decoder layer, T positions at a time. Sequencing mirrors layer_body exactly:
+// operator_norm -> {q,k,v,gate | conv in_proj} -> attention | conv -> o_proj | out_proj
+// -> residual -> ffn_norm -> {w1,w3} -> silu -> w2 -> residual.
+static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
+  const int QDIM = NH * HD, KVDIM = NKV * HD;
+  k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "operator_norm.weight"), A.h1, NORM_EPS, H);
+  if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d operator_norm launch failed\n", L); return 1; }
+  if (is_attn_g[L]) {
+    if (pf_gemv_T(M, LN(L, "self_attn.q_proj.weight"), A.h1, A.q, A.part, Tn)) return 1;
+    if (pf_gemv_T(M, LN(L, "self_attn.k_proj.weight"), A.h1, A.k, A.part, Tn)) return 1;
+    if (pf_gemv_T(M, LN(L, "self_attn.v_proj.weight"), A.h1, A.v, A.part, Tn)) return 1;
+    if (pf_gemv_T(M, LN(L, "self_attn.gate_proj.weight"), A.h1, A.gate, A.part, Tn)) return 1;
+    const float* invf = is_slide_g[L] ? M.invf_slide : M.invf_full;
+    const int rot = is_slide_g[L] ? HD : HD / 2;
+    const int win = is_slide_g[L] ? SLIDE_WIN : 0;
+    const float scaling = 1.0f / sqrtf((float)HD);
+    bf16* kbase = M.kc + (size_t)L * MAXTOK * KVDIM;
+    bf16* vbase = M.vc + (size_t)L * MAXTOK * KVDIM;
+    for (int t = 0; t < Tn; t++) {
+      const int pos = pos0 + t;
+      bf16* q = A.q + (size_t)t * QDIM, *k = A.k + (size_t)t * KVDIM, *v = A.v + (size_t)t * KVDIM;
+      bf16* gt = A.gate + (size_t)t * NH, *at = A.attn + (size_t)t * QDIM;
+      k_headnorm<<<NH, 32, 0, g_launch>>>(q, NW(M, L, "self_attn.q_norm.weight"), NORM_EPS, HD);
+      k_headnorm<<<NKV, 32, 0, g_launch>>>(k, NW(M, L, "self_attn.k_norm.weight"), NORM_EPS, HD);
+      k_rope<<<NH, 64, 0, g_launch>>>(q, invf, pos, HD, rot, nullptr);
+      k_rope<<<NKV, 64, 0, g_launch>>>(k, invf, pos, HD, rot, nullptr);
+      cudaMemcpy(kbase + (size_t)pos * KVDIM, k, (size_t)KVDIM * 2, cudaMemcpyDeviceToDevice);
+      cudaMemcpy(vbase + (size_t)pos * KVDIM, v, (size_t)KVDIM * 2, cudaMemcpyDeviceToDevice);
+      k_attn_head<<<NH, 256, 0, g_launch>>>(q, kbase, vbase, at, pos + 1, win, scaling, HD, NKV, nullptr);
+      k_sigmoid_gate<<<1, NH, 0, g_launch>>>(gt, at, HD);
+    }
+    if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d attention launch failed\n", L); return 1; }
+    if (pf_gemv_T(M, LN(L, "self_attn.o_proj.weight"), A.attn, A.h2, A.part, Tn)) return 1;
+  } else {
+    if (pf_gemv_T(M, LN(L, "conv.in_proj.weight"), A.h1, A.bx, A.part, Tn)) return 1;
+    for (int t = 0; t < Tn; t++) {
+      bf16* bx = A.bx + (size_t)t * 3 * H;
+      bf16* cy = A.cy + (size_t)t * H;
+      bf16* tmp = A.h2 + (size_t)t * H;              // h2 is free until out_proj
+      // emul / k_shift_in / k_conv7 are the T=1 kernels, called per position, in the
+      // same order as layer_body: the gate multiply completes BEFORE the newest ring
+      // slot is written (that ordering is what the "bug that broke the engine" note in
+      // the step loop is about), and the ring is per conv layer, indexed by the conv
+      // counter -- chunk state carried in the ring, which is why conv needs no new state.
+      emul(M, bx, bx + 2 * H, tmp, H);
+      bf16* ring = M.ring + (size_t)M.pf4_ci * 7 * H;
+      k_shift_in<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, tmp, H);
+      k_conv7<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, T(M, LN(L, "conv.conv.weight"))->df, cy, H);
+      emul(M, bx + H, cy, tmp, H);
+      M.pf4_ci++;
+    }
+    if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d conv launch failed\n", L); return 1; }
+    if (pf_gemv_T(M, LN(L, "conv.out_proj.weight"), A.h2, A.h2, A.part, Tn)) return 1;
+  }
+  // post_operator_norm, then the residual add -- layer_body normalises the operator
+  // branch output into h3 BEFORE adding, and the first version of this driver added the
+  // raw o_proj/out_proj result. Symptom was x rms = nan at the last prompt position: the
+  // residual stream grew without bound across 24 layers.
+  k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.h2, NW(M, L, "post_operator_norm.weight"), A.cy, NORM_EPS, H);
+  if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d post_operator_norm launch failed\n", L); return 1; }
+  for (int t = 0; t < Tn; t++) eadd(M, A.xb + (size_t)t * H, A.cy + (size_t)t * H, A.xb + (size_t)t * H, H);
+  k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "ffn_norm.weight"), A.h1, NORM_EPS, H);
+  if (pf_gemv_T(M, LN(L, "feed_forward.w1.weight"), A.h1, A.w1, A.part, Tn)) return 1;
+  if (pf_gemv_T(M, LN(L, "feed_forward.w3.weight"), A.h1, A.w3, A.part, Tn)) return 1;
+  for (int t = 0; t < Tn; t++)
+    k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(A.w1 + (size_t)t * INTER,
+                                                             A.w3 + (size_t)t * INTER,
+                                                             A.h2 + (size_t)t * INTER, INTER);
+  if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d silu launch failed\n", L); return 1; }
+  if (pf_gemv_T(M, LN(L, "feed_forward.w2.weight"), A.h2, A.hout, A.part, Tn)) return 1;
+  k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.hout, NW(M, L, "post_ffn_norm.weight"), A.h2, NORM_EPS, H);
+  for (int t = 0; t < Tn; t++) eadd(M, A.xb + (size_t)t * H, A.h2 + (size_t)t * H, A.xb + (size_t)t * H, H);
+  return 0;
+}
+
+static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* emb) {
+  if (Tn < 2 || Tn > 64) { printf("--prefill-e2e: T=%d out of range 2..64\n", Tn); return 2; }
+  const int N = (int)prompt.size();
+  PF4Arena A; memset(&A, 0, sizeof A);
+  const size_t rowH = (size_t)H, rowI = (size_t)INTER, row3 = 3 * (size_t)H;
+  cudaMalloc(&A.xb, (size_t)Tn * rowH * 2);   cudaMalloc(&A.h1, (size_t)Tn * rowH * 2);
+  cudaMalloc(&A.q, (size_t)Tn * NH * HD * 2); cudaMalloc(&A.k, (size_t)Tn * NKV * HD * 2);
+  cudaMalloc(&A.v, (size_t)Tn * NKV * HD * 2);cudaMalloc(&A.gate, (size_t)Tn * NH * 2);
+  cudaMalloc(&A.attn, (size_t)Tn * NH * HD * 2); cudaMalloc(&A.h2, (size_t)Tn * (rowI > rowH ? rowI : rowH) * 2);
+  cudaMalloc(&A.bx, (size_t)Tn * row3 * 2);   cudaMalloc(&A.cy, (size_t)Tn * rowH * 2);
+  cudaMalloc(&A.w1, (size_t)Tn * rowI * 2);   cudaMalloc(&A.w3, (size_t)Tn * rowI * 2);
+  cudaMalloc(&A.hout, (size_t)Tn * rowH * 2);
+  cudaMalloc(&A.part, (size_t)Tn * 10000 * 4);
+  M.pf4_ci = 0;
+  struct timespec t0, t1; cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t0);
+  for (int c0 = 0; c0 < N; c0 += Tn) {
+    const int Tc = (N - c0 < Tn) ? N - c0 : Tn;
+    // Embeddings for the chunk, through the same paths the T=1 loop uses.
+    for (int t = 0; t < Tc; t++) {
+      const int tok = prompt[c0 + t];
+      bf16* dst = A.xb + (size_t)t * H;
+      if (emb->dtype == 3) {
+        const char* src = (M.emb_mode == 1 && M.hemb.hc) ? (const char*)M.hemb.hc : (const char*)emb->dq;
+        cudaMemcpy(dst, src + (size_t)tok * H * 2, (size_t)H * 2,
+                   M.emb_mode == 1 ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice);
+      } else if (M.emb_mode == 1) {
+        const int sb = H / Q8_BLK;
+        cudaMemcpyAsync(M.hemb.dc, M.hemb.hc + (size_t)tok * H, (size_t)H, cudaMemcpyHostToDevice, 0);
+        cudaMemcpyAsync(M.hemb.dsl, M.hemb.hs + (size_t)tok * sb, (size_t)sb * 4, cudaMemcpyHostToDevice, 0);
+        k_dequant_row<<<(H + 255) / 256, 256, 0, g_launch>>>(M.hemb.dc, M.hemb.dsl, dst, H);
+      } else {
+        k_dequant_row<<<(H + 255) / 256, 256, 0, g_launch>>>(emb->dq + (size_t)tok * H,
+                                               emb->ds + (size_t)tok * (H / Q8_BLK), dst, H);
+      }
+    }
+    if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E embedding launch failed at chunk %d\n", c0); return 1; }
+    for (int L = 0; L < NLAYER; L++) {
+      if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-E2E: layer %d failed\n", L); return 1; }
+      // Per-layer rms of position 0, to be read against the T=1 path's own
+      // "POS <s> L<L> attn|conv rms <v>" trace lines: the first layer whose rms
+      // disagrees is the origin, which is how the encoder divergence was localised.
+      if (getenv("LFM_PF4_TRACE")) cudaDeviceSynchronize(),
+        printf("PF4POS %3d L%-2d %s rms %.5f\n", c0, L, is_attn_g[L] ? "attn" : "conv",
+               rms_host_n(A.xb + (size_t)(L % 2) * 0, H));
+    }
+    if (N > Tn) { printf("PF4-E2E chunk pos %d..%d done\n", c0, c0 + Tc - 1); fflush(stdout); }
+  }
+  cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t1);
+  const double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
+  // The last prompt position's residual stream is the acceptance value.
+  const int last = (N - 1) % Tn;
+  std::vector<bf16> hy((size_t)H);
+  cudaMemcpy(hy.data(), A.xb + (size_t)last * H, (size_t)H * 2, cudaMemcpyDeviceToHost);
+  FILE* o = fopen("/tmp/pf4_x_last.bin", "wb");
+  if (o) { fwrite(hy.data(), 2, H, o); fclose(o); }
+  double s2 = 0; long nz = 0;
+  for (int i = 0; i < H; i++) { float v = bf2f_host(hy[i]); s2 += (double)v * v; if (hy[i]) nz++; }
+  printf("PF4-E2E prefill %d ids in chunks of %d: %.0f ms (%.2f ms/pos), last-position x rms %.5f nonzero %d/%d\n",
+         N, Tn, ms, ms / N, sqrt(s2 / H), (int)nz, H);
+  printf("PF4_E2E_DUMP /tmp/pf4_x_last.bin\n");
+  fflush(stdout);
+  cudaFree(A.xb); cudaFree(A.h1); cudaFree(A.q); cudaFree(A.k); cudaFree(A.v); cudaFree(A.gate);
+  cudaFree(A.attn); cudaFree(A.h2); cudaFree(A.bx); cudaFree(A.cy); cudaFree(A.w1); cudaFree(A.w3);
+  cudaFree(A.hout); cudaFree(A.part);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     printf("usage: %s <blob.lfm3q8> [--steps N] [--prompt id,id,...] [--trace]\n", argv[0]);
@@ -3210,6 +3403,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--prefill-minimal")) emb_mode_req = 3;
     else if (!strcmp(argv[i], "--prefill-h2batched")) emb_mode_req = 4;
     else if (!strcmp(argv[i], "--prefill-chunk") && i + 1 < argc) { emb_mode_req = 6; chunkT = atoi(argv[++i]); }
+    else if (!strcmp(argv[i], "--prefill-e2e") && i + 1 < argc) { emb_mode_req = 7; chunkT = atoi(argv[++i]); }
     else if (!strcmp(argv[i], "--prefill-arm5-gate")) emb_mode_req = 5;
     else if (!strcmp(argv[i], "--merge")) g_merge = true;   // merged gate/up GEMV
     else if (!strcmp(argv[i], "--lmrows") && i + 1 < argc) lm_rows_override = atoi(argv[++i]);
@@ -3306,6 +3500,7 @@ int main(int argc, char** argv) {
              a.w, a.n, freeb0 / 1e9);
       return 1;
     }
+    for (int L = 0; L < NLAYER; L++) { is_attn_g[L] = is_attn[L]; is_slide_g[L] = is_slide[L]; }
   }
   cudaMemset(M.ring, 0, (size_t)NCONV * 7 * H * 2);
   cudaMemset(M.x, 0, H * 2);
@@ -3612,6 +3807,18 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
         if (!is_attn[L]) ci++;
       }
     }
+    // LFM_DUMPX=<step>: dump the residual stream at that step. This is the acceptance
+    // value the T-wide chunked driver is graded against (PF4_E2E writes /tmp/pf4_x_last.bin
+    // and the two files must match bit for bit). Off by default: it is a debug readback,
+    // and a device sync inside the step loop is not something to leave in the shipped
+    // timing path -- the encoder lost 40 s to exactly that pattern.
+    if (getenv("LFM_DUMPX") && s == atoi(getenv("LFM_DUMPX"))) {
+      cudaDeviceSynchronize();
+      std::vector<bf16> hx((size_t)H);
+      cudaMemcpy(hx.data(), M.x, (size_t)H * 2, cudaMemcpyDeviceToHost);
+      FILE* df = fopen("/tmp/lfm_x_ref.bin", "wb");
+      if (df) { fwrite(hx.data(), 2, H, df); fclose(df); printf("LFM_DUMPX step %d -> /tmp/lfm_x_ref.bin\n", s); fflush(stdout); }
+    }
     }   // end of the non-graph / captured region
     if (capturing) {
       cudaGraph_t graph = nullptr;
@@ -3790,5 +3997,6 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
   printf("FM3_NANODE_DONE\n");
   if (emb_mode_req == 5) return prefill_arm5_gate(M);
   if (emb_mode_req == 6) return prefill_chunk_test(M, chunkT);
+  if (emb_mode_req == 7) return prefill_e2e(M, chunkT, prompt, emb);
   return 0;
 }
