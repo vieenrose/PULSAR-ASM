@@ -632,6 +632,62 @@ __global__ void k_outproj_ln(const float *cat, const float *W, const float *B,
     out[st * HID + o] = (v - mean) * inv * LW[o] + LB[o];
 }
 
+// concat, coalesced: a thread owns one (row, channel) pair instead of walking
+// a whole row, so every stream (fw, bw, x reads and the cat write) is
+// contiguous. The old one-thread-per-row version read/wrote with a 64-float
+// stride, i.e. 4.4 GB/s on a ~250 GB/s device.
+__global__ void k_concat_f(const float *fw, const float *bw, const float *x,
+                           float *cat, int S, int L)
+{
+    const int row = blockIdx.x*4 + threadIdx.y;
+    const int c = threadIdx.x;
+    if (row >= S*L) return;
+    const int s = row / L, t = row % L;
+    const long ir = (long)s*L + (L-1-t);
+    const long base = (long)row*HID;
+    float xv = x[base + c];
+    float *dst = cat + (long)row*2*HID;
+    dst[c]       = fw[base + c] + xv;
+    dst[HID + c] = bw[(long)ir*HID + c] + xv;
+}
+
+// output_proj (512->64) + LayerNorm.
+//
+// The old kernel spent ~1150 flops per thread on Kahan accumulations: 128
+// FMAs for the dot product, then two 64-term Kahan sums per thread for the
+// mean/variance (8 flops each). Those Kahan loops were the real cost, not
+// memory - the kernel ran at fp32 peak for 16 MB of traffic. The reference
+// (PyTorch LayerNorm) accumulates mean/variance in fp32 over 64 terms, where
+// a shuffled tree reduction is ~1e-7, so plain fp32 partial sums + warp
+// shuffles reproduce it. Naive path kept behind REUSE_NAIVE_OUTPROJ for A/B.
+__global__ void k_outproj_ln_f(const float *cat, const float *W, const float *B,
+                               const float *LW, const float *LB, float *out, long SL)
+{
+    const int ty = threadIdx.y;                    // 0..3: row within block
+    const int row = blockIdx.x*4 + ty;
+    const int o = threadIdx.x;                     // 0..63: output unit, 2 warps
+    if (row >= SL) return;
+    __shared__ float red[4][2][2];                 // [row][warp][sum/sumsq]
+    const float *ci = cat + (long)row*2*HID;
+    const float *wr = W + (long)o*2*HID;
+    float v = B[o];
+#pragma unroll
+    for (int c = 0; c < 2*HID; c++) v = fmaf(ci[c], wr[c], v);
+    float s = v, q = v*v;
+#pragma unroll
+    for (int d = 16; d; d >>= 1) {
+        s += __shfl_down_sync(0xffffffffu, s, d);
+        q += __shfl_down_sync(0xffffffffu, q, d);
+    }
+    if ((o & 31) == 0) { red[ty][o>>5][0] = s; red[ty][o>>5][1] = q; }
+    __syncthreads();
+    s = red[ty][0][0] + red[ty][1][0];
+    q = red[ty][0][1] + red[ty][1][1];
+    const float mean = s * (1.0f/HID);
+    const float inv  = rsqrtf(fmaxf(q * (1.0f/HID) - mean*mean, 0.0f) + 1e-5f);
+    out[(long)row*HID + o] = (v - mean) * inv * LW[o] + LB[o];
+}
+
 // [HID,T,F] -> [F,T,HID]
 __global__ void k_gather_time(const float *x, float *xt, int T, int F)
 {
@@ -641,6 +697,13 @@ __global__ void k_gather_time(const float *x, float *xt, int T, int F)
     xt[i] = x[(long)c*T*F + (long)t*F + f];
 }
 // residual on the time block + resample into [T,F,HID] for the freq block
+static int naive_resid(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("REUSE_NAIVE_RESID") ? 1 : 0;
+    return v;
+}
+
 __global__ void k_resid_scatter_freq(const float *y, const float *x, float *out,
                                      float *xf, int T, int F)
 {
@@ -652,6 +715,72 @@ __global__ void k_resid_scatter_freq(const float *y, const float *x, float *out,
     out[dst] = v;
     xf[((long)t*F + f)*HID + c] = v;
 }
+// Tiled versions of the two residual scatters. A-layout is [F,T,C] (c
+// contiguous), B-layout is [C,T,F] (f contiguous), so any elementwise op
+// between them has one side strided by T*F floats: a warp touched 32 separate
+// 128 B sectors, 32x traffic amplification, which is exactly why the naive
+// kernels measured 12.7 GB/s on a ~250 GB/s device. A 32x32 (f x c) tile per
+// t makes every load and store contiguous; the two decompositions of the tile
+// index differ per layout so each side is coalesced in its own order.
+__global__ void k_resid_scatter_freq_t(const float *y, const float *x, float *out,
+                                       float *xf, int T, int F)
+{
+    __shared__ float sy[32][33], sx[32][33];
+    const int t = blockIdx.z, f0 = blockIdx.x*32, c0 = blockIdx.y*32;
+    const int tid = threadIdx.y*32 + threadIdx.x;
+    // A-layout load: c contiguous -> i = f*32 + c
+#pragma unroll
+    for (int i = tid; i < 32*32; i += 1024) {
+        int fi = i >> 5, ci = i & 31;
+        int f = f0 + fi, c = c0 + ci;
+        sy[fi][ci] = (f < F) ? y[((long)f*T + t)*HID + c] : 0.f;
+    }
+    // B-layout load: f contiguous -> i = c*32 + f
+#pragma unroll
+    for (int i = tid; i < 32*32; i += 1024) {
+        int ci = i >> 5, fi = i & 31;
+        int f = f0 + fi, c = c0 + ci;
+        sx[fi][ci] = (f < F) ? x[(long)c*T*F + (long)t*F + f] : 0.f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = tid; i < 32*32; i += 1024) {
+        int fi = i >> 5, ci = i & 31;
+        int f = f0 + fi, c = c0 + ci;
+        if (f >= F) continue;
+        float v = sy[fi][ci] + sx[fi][ci];
+        xf[((long)t*F + f)*HID + c] = v;                      // A layout, c contiguous
+    }
+#pragma unroll
+    for (int i = tid; i < 32*32; i += 1024) {
+        int ci = i >> 5, fi = i & 31;
+        int f = f0 + fi, c = c0 + ci;
+        if (f < F) out[(long)c*T*F + (long)t*F + f] = sy[fi][ci] + sx[fi][ci];   // B, f contiguous
+    }
+}
+
+__global__ void k_resid_scatter_out_t(const float *y, const float *xf, float *out, int T, int F)
+{
+    __shared__ float sa[32][33];
+    const int t = blockIdx.z, f0 = blockIdx.x*32, c0 = blockIdx.y*32;
+    const int tid = threadIdx.y*32 + threadIdx.x;
+#pragma unroll
+    for (int i = tid; i < 32*32; i += 1024) {
+        int fi = i >> 5, ci = i & 31;
+        int f = f0 + fi, c = c0 + ci;
+        float v = 0.f;
+        if (f < F) { long src = ((long)t*F + f)*HID + c; v = y[src] + xf[src]; }
+        sa[fi][ci] = v;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int i = tid; i < 32*32; i += 1024) {
+        int ci = i >> 5, fi = i & 31;
+        int f = f0 + fi, c = c0 + ci;
+        if (f < F) out[(long)c*T*F + (long)t*F + f] = sa[fi][ci];
+    }
+}
+
 __global__ void k_resid_scatter_out(const float *y, const float *xf, float *out, int T, int F)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1215,7 +1344,12 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
     if (mamba_dir_gpu(g, p, x, fw, S, L, 0)) return 1;
     snprintf(p, sizeof(p), "%s.backward_blocks", pfx);
     if (mamba_dir_gpu(g, p, x, bw, S, L, 1)) return 1;
-    k_concat<<<(unsigned)((SL+255)/256), 256>>>(fw, bw, x, cat, S, L);
+    if (getenv("REUSE_SKIP_CONCAT")) {
+    } else if (getenv("REUSE_NAIVE_CONCAT")) {
+        k_concat<<<(unsigned)((SL+255)/256), 256>>>(fw, bw, x, cat, S, L);
+    } else {
+        k_concat_f<<<(unsigned)((SL+3)/4), dim3(64,4)>>>(fw, bw, x, cat, S, L);
+    }
         kp_mark("concat", &klast);
     char key[256];
     snprintf(key, sizeof(key), "%s.output_proj.weight", pfx); const float *W = reuse_gpu_w(g, key);
@@ -1223,7 +1357,12 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
     snprintf(key, sizeof(key), "%s.norm.weight",        pfx); const float *LW = reuse_gpu_w(g, key);
     snprintf(key, sizeof(key), "%s.norm.bias",          pfx); const float *LB = reuse_gpu_w(g, key);
     if (g->bad) return 1;
-    k_outproj_ln<<<(unsigned)SL, HID>>>(cat, W, B, LW, LB, out, SL);
+    if (getenv("REUSE_SKIP_OUTPROJ")) {
+    } else if (getenv("REUSE_NAIVE_OUTPROJ")) {
+        k_outproj_ln<<<(unsigned)SL, HID>>>(cat, W, B, LW, LB, out, SL);
+    } else {
+        k_outproj_ln_f<<<(unsigned)((SL+3)/4), dim3(64,4)>>>(cat, W, B, LW, LB, out, SL);
+    }
     return reuse_gpu_ok(g, "mamba_block");
 }
 
@@ -1244,11 +1383,17 @@ extern "C" int reuse_gpu_tfmamba(reuse_gpu_t *g, int idx, const float *x, float 
     char p[256];
     snprintf(p, sizeof(p), "TSMamba.%d.time_mamba", idx);
     if (mamba_block_gpu(g, p, xt, yt, S_t, T)) return 1;
-    k_resid_scatter_freq<<<(unsigned)(((long)F*T*HID+255)/256), 256>>>(yt, x, y, xf, T, F);
+    if (getenv("REUSE_SKIP_RESID")) { } else if (naive_resid())
+        k_resid_scatter_freq<<<(unsigned)(((long)F*T*HID+255)/256), 256>>>(yt, x, y, xf, T, F);
+    else
+        k_resid_scatter_freq_t<<<dim3((unsigned)((F+31)/32), HID/32, (unsigned)T), dim3(32,32)>>>(yt, x, y, xf, T, F);
         kp_mark("resid_freq", &klast);
     snprintf(p, sizeof(p), "TSMamba.%d.freq_mamba", idx);
     if (mamba_block_gpu(g, p, xf, yf, S_f, F)) return 1;
-    k_resid_scatter_out<<<(unsigned)(((long)F*T*HID+255)/256), 256>>>(yf, xf, y, T, F);
+    if (getenv("REUSE_SKIP_RESID")) { } else if (naive_resid())
+        k_resid_scatter_out<<<(unsigned)(((long)F*T*HID+255)/256), 256>>>(yf, xf, y, T, F);
+    else
+        k_resid_scatter_out_t<<<dim3((unsigned)((F+31)/32), HID/32, (unsigned)T), dim3(32,32)>>>(yf, xf, y, T, F);
         kp_mark("resid_out", &klast);
     return reuse_gpu_ok(g, "tfmamba");
 }
