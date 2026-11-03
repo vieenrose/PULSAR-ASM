@@ -1613,8 +1613,8 @@ __global__ void k_conv2d_r(const float *x, const float *w, const float *b,
                            int C_in, int H, int W, int padH, int padW, int dilH,
                            float *y, int co0)
 {
-    const int TW = 32, LS = TW+2;
-    __shared__ float S[R][LS];
+    const int TW = 32, LS = TW+4;   // multiple of 4: aligned float4 tile stores
+    __shared__ __align__(16) float S[R][LS];
     const int co = co0 + blockIdx.z;
     const int w0 = blockIdx.x*TW, h0 = blockIdx.y*16;
     const int tx = threadIdx.x, ty = threadIdx.y;
@@ -1623,10 +1623,35 @@ __global__ void k_conv2d_r(const float *x, const float *w, const float *b,
     for (int ci = 0; ci < C_in; ci++) {
         const float *xin = x + (long)ci*H*W;
         __syncthreads();
-        for (int i = tid; i < R*LS; i += 256) {
-            int r = i / LS, c = i % LS;
-            int hh = h0 - padH + r, ww = w0 - padW + c;
-            S[r][c] = (hh >= 0 && hh < H && ww >= 0 && ww < W) ? xin[(long)hh*W + ww] : 0.f;
+        // One index/mask computation per 4 elements: the scalar form spends
+        // ~12 instructions (divide by LS, two bounds pairs, select, address)
+        // on EVERY element, i.e. 20.6 x 12 ~ 250 issue slots per thread per
+        // input channel against 144 FMAs. Measured ceilings for this kernel:
+        // FMA 4%, LSU 15%, DRAM 15% of peak, so loader issue was the limit.
+        {
+            const int LSF = LS/4, wbase = w0 - padW, hbase = h0 - padH;
+            float4 *dv = (float4*)&S[0][0];
+            for (int i = tid; i < R*LSF; i += 256) {
+                const int r = i / LSF, q = i - r*LSF;
+                const int hh = hbase + r, ww = wbase + q*4;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (hh >= 0 && hh < H) {
+                    const float *sp = xin + (long)hh*W + ww;
+                    // the vector load needs the global element index
+                    // 16B-aligned; with odd W (163 here) that is row
+                    // dependent, so the scalar path covers the rest.
+                    if (ww >= 0 && ww + 4 <= W &&
+                        ((((long)ci*H*W + (long)hh*W + ww) & 3) == 0))
+                        v = *(const float4*)sp;
+                    else {
+                        if (ww     >= 0 && ww     < W) v.x = sp[0];
+                        if (ww + 1 >= 0 && ww + 1 < W) v.y = sp[1];
+                        if (ww + 2 >= 0 && ww + 2 < W) v.z = sp[2];
+                        if (ww + 3 >= 0 && ww + 3 < W) v.w = sp[3];
+                    }
+                }
+                dv[i] = v;
+            }
         }
         __syncthreads();
         const float *wv = w + ((long)co*C_in + ci)*9;
@@ -1662,8 +1687,8 @@ __global__ void k_conv2d_r2(const float *x, const float *w, const float *b,
                             int C_in, int H, int W, int padH, int padW, int dilH,
                             float *y, int co0)
 {
-    const int TW = 64, LS = TW+2;
-    __shared__ float S[R][LS];
+    const int TW = 64, LS = TW+4;   // multiple of 4: aligned float4 tile stores
+    __shared__ __align__(16) float S[R][LS];
     const int co = co0 + blockIdx.z;
     const int w0 = blockIdx.x*TW, h0 = blockIdx.y*64;
     const int tx = threadIdx.x, ty = threadIdx.y;
@@ -1676,10 +1701,35 @@ __global__ void k_conv2d_r2(const float *x, const float *w, const float *b,
     for (int ci = 0; ci < C_in; ci++) {
         const float *xin = x + (long)ci*H*W;
         __syncthreads();
-        for (int i = tid; i < R*LS; i += 256) {
-            int r = i / LS, c = i % LS;
-            int hh = h0 - padH + r, ww = w0 - padW + c;
-            S[r][c] = (hh >= 0 && hh < H && ww >= 0 && ww < W) ? xin[(long)hh*W + ww] : 0.f;
+        // One index/mask computation per 4 elements: the scalar form spends
+        // ~12 instructions (divide by LS, two bounds pairs, select, address)
+        // on EVERY element, i.e. 20.6 x 12 ~ 250 issue slots per thread per
+        // input channel against 144 FMAs. Measured ceilings for this kernel:
+        // FMA 4%, LSU 15%, DRAM 15% of peak, so loader issue was the limit.
+        {
+            const int LSF = LS/4, wbase = w0 - padW, hbase = h0 - padH;
+            float4 *dv = (float4*)&S[0][0];
+            for (int i = tid; i < R*LSF; i += 256) {
+                const int r = i / LSF, q = i - r*LSF;
+                const int hh = hbase + r, ww = wbase + q*4;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (hh >= 0 && hh < H) {
+                    const float *sp = xin + (long)hh*W + ww;
+                    // the vector load needs the global element index
+                    // 16B-aligned; with odd W (163 here) that is row
+                    // dependent, so the scalar path covers the rest.
+                    if (ww >= 0 && ww + 4 <= W &&
+                        ((((long)ci*H*W + (long)hh*W + ww) & 3) == 0))
+                        v = *(const float4*)sp;
+                    else {
+                        if (ww     >= 0 && ww     < W) v.x = sp[0];
+                        if (ww + 1 >= 0 && ww + 1 < W) v.y = sp[1];
+                        if (ww + 2 >= 0 && ww + 2 < W) v.z = sp[2];
+                        if (ww + 3 >= 0 && ww + 3 < W) v.w = sp[3];
+                    }
+                }
+                dv[i] = v;
+            }
         }
         __syncthreads();
         const float *wv = w + ((long)co*C_in + ci)*9;
@@ -1710,6 +1760,74 @@ __global__ void k_conv2d_r2(const float *x, const float *w, const float *b,
         float *dst = yo + (long)hh*W;
 #pragma unroll
         for (int bq = 0; bq < 4; bq++) if (wc + bq < W) dst[wc + bq] = acc[a][bq];
+    }
+}
+
+// Double-buffered register-tiled conv, 32 rows x 64 cols, 8 outputs/thread.
+//
+// The 64x64 kernel runs, per input channel, load-phase -> barrier ->
+// compute-phase -> barrier, 256 times, with nothing saturated: FMA issue ~4%
+// of peak, LSU ~15%, DRAM ~15% of the measured 158 GB/s. That is the
+// signature of exposed memory latency across the barrier, so this variant
+// issues the ci+1 tile loads before computing ci, from a second buffer.
+// The tile is 32x64 (not 64x64) so the two buffers fit in 25 KB and keep two
+// blocks resident per SM.
+template<int R>
+__global__ void k_conv2d_r3(const float *x, const float *w, const float *b,
+                            int C_in, int H, int W, int padH, int padW, int dilH,
+                            float *y, int co0)
+{
+    const int TW = 64, LS = TW+4;   // multiple of 4: aligned float4 tile stores
+    __shared__ float S[2][R][LS];
+    const int co = co0 + blockIdx.z;
+    const int w0 = blockIdx.x*TW, h0 = blockIdx.y*32;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty*16 + tx;
+    float acc[2][4];
+#pragma unroll
+    for (int a = 0; a < 2; a++)
+#pragma unroll
+        for (int bq = 0; bq < 4; bq++) acc[a][bq] = b[co];
+    int par = 0;
+    for (int ci = 0; ci <= C_in; ci++) {
+        if (ci < C_in) {
+            const float *xin = x + (long)ci*H*W;
+            float *dst = (float*)S[par];
+            for (int i = tid; i < R*LS; i += 256) {
+                int r = i / LS, c = i % LS;
+                int hh = h0 - padH + r, ww = w0 - padW + c;
+                dst[r*LS + c] = (hh >= 0 && hh < H && ww >= 0 && ww < W)
+                              ? xin[(long)hh*W + ww] : 0.f;
+            }
+        }
+        __syncthreads();
+        if (ci >= C_in) break;
+        const float *src = (const float*)S[par];
+        const float *wv = w + ((long)co*C_in + ci)*9;
+#pragma unroll
+        for (int kh = 0; kh < 3; kh++) {
+            const float w0f = wv[kh*3], w1f = wv[kh*3+1], w2f = wv[kh*3+2];
+            const int rb = ty*2 + kh*dilH, cb = tx*4;
+#pragma unroll
+            for (int a = 0; a < 2; a++) {
+                const float *sr = src + (rb + a)*LS + cb;
+                acc[a][0] = fmaf(sr[0], w0f, acc[a][0]); acc[a][0] = fmaf(sr[1], w1f, acc[a][0]); acc[a][0] = fmaf(sr[2], w2f, acc[a][0]);
+                acc[a][1] = fmaf(sr[1], w0f, acc[a][1]); acc[a][1] = fmaf(sr[2], w1f, acc[a][1]); acc[a][1] = fmaf(sr[3], w2f, acc[a][1]);
+                acc[a][2] = fmaf(sr[2], w0f, acc[a][2]); acc[a][2] = fmaf(sr[3], w1f, acc[a][2]); acc[a][2] = fmaf(sr[4], w2f, acc[a][2]);
+                acc[a][3] = fmaf(sr[3], w0f, acc[a][3]); acc[a][3] = fmaf(sr[4], w1f, acc[a][3]); acc[a][3] = fmaf(sr[5], w2f, acc[a][3]);
+            }
+        }
+        par ^= 1;
+    }
+    const int wc = w0 + tx*4;
+    float *yo = y + (long)co*H*W;
+#pragma unroll
+    for (int a = 0; a < 2; a++) {
+        int hh = h0 + ty*2 + a;
+        if (hh >= H) continue;
+        float *d2 = yo + (long)hh*W;
+#pragma unroll
+        for (int bq = 0; bq < 4; bq++) if (wc + bq < W) d2[wc + bq] = acc[a][bq];
     }
 }
 
@@ -1759,8 +1877,20 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         const bool regtile = !getenv("REUSE_NAIVE_CONV2D") && kH == 3 && kW == 3 &&
                              dilW == 1 && strideH == 1 && strideW == 1 && padW == 1 && padH == dilH;
         static int big = -1;
-        if (big < 0) big = getenv("REUSE_CONV_TILE16") ? 0 : 1;
-        if (big) {
+        if (big < 0) { const char *e = getenv("REUSE_CONV_TILE"); big = e ? atoi(e) : 64; }
+        if (big == 32) {
+            const dim3 grdb((unsigned)((W_out + 63) / 64), (unsigned)((H_out + 31) / 32), (unsigned)n);
+            const dim3 blkb(16, 16);
+            if (regtile && dilH == 1)      k_conv2d_r3<34><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            else if (regtile && dilH == 2) k_conv2d_r3<36><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            else if (regtile && dilH == 4) k_conv2d_r3<40><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            else if (regtile && dilH == 8) k_conv2d_r3<48><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0);
+            launch_kick();
+            continue;
+        }
+        if (big == 16) big = 0;
+        if (big == 64) {
             const dim3 grdb((unsigned)((W_out + 63) / 64), (unsigned)((H_out + 63) / 64), (unsigned)n);
             const dim3 blkb(16, 16);
             if (regtile && dilH == 1)      k_conv2d_r2<66><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
