@@ -3395,6 +3395,64 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
     return reuse_gpu_ok(g, "mamba_block");
 }
 
+/* Tower resid chain, all in the "A" ([f*T+t]*HID+c) layout, so the [C,T,F]
+   tensor that k_resid_scatter_out_t wrote and the next block's k_gather_time_t
+   read straight back never exists: the two transposes compose to the identity
+   and the block residual becomes a flat add. freq input:
+       xf[t*F+f][c] = yt[f*T+t][c] + xt[f*T+t][c]
+   (identical arithmetic to k_resid_scatter_freq_t, with its [C,T,F] operand
+   supplied in the gather form it was produced in). */
+__global__ void k_resid_freq_a(const float *__restrict__ yt, const float *__restrict__ xt,
+                              float *__restrict__ xf, int T, int F)
+{
+    const long i = (long)blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= (long)F*T*HID) return;
+    const int f = (int)(i / ((long)T*HID));
+    const int r = (int)(i - (long)f*T*HID);
+    xf[((long)(r/HID)*F + f)*HID + (r - (r/HID)*HID)] = yt[i] + xt[i];
+}
+
+/* Next block's time input: xt_next[f*T+t][c] = yf[t*F+f][c] + xf[t*F+f][c]. */
+__global__ void k_resid_out_a(const float *__restrict__ yf, const float *__restrict__ xf,
+                              float *__restrict__ xa, int T, int F)
+{
+    const long i = (long)blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= (long)F*T*HID) return;
+    /* reads are linear in the freq sub-block's [t*F+f][c] layout; the time
+       sub-block's input is [f*T+t][c], so the store carries the (f,t) swap */
+    const int t = (int)(i / ((long)F*HID));
+    const int r = (int)(i - (long)t*F*HID);
+    xa[(long)(r/HID)*T*HID + (long)t*HID + (r - (r/HID)*HID)] = yf[i] + xf[i];
+}
+
+static int reuse_gpu_tfmamba_a(reuse_gpu_t *g, int idx, const float *xt_in,
+                               float *out_B, float *xt_next, int T, int F, int last)
+{
+    static double klast = 0;
+    if (g_kprof < 0) g_kprof = getenv("REUSE_KPROF") ? 1 : 0;
+    if (g_kprof) { cudaDeviceSynchronize(); klast = gt_now(); }
+    g->ws_off = 0;
+    const int S_t = F, S_f = T;
+    const long n = (long)F*T*HID;
+    float *yt = wallc(g, (size_t)n);
+    float *xf = wallc(g, (size_t)n);
+    float *yf = wallc(g, (size_t)n);
+    if (!yt || !xf || !yf) return 1;
+    char p[256];
+    snprintf(p, sizeof(p), "TSMamba.%d.time_mamba", idx);
+    if (mamba_block_gpu(g, p, xt_in, yt, S_t, T)) return 1;
+
+    k_resid_freq_a<<<(unsigned)((n+255)/256), 256>>>(yt, xt_in, xf, T, F);
+    kp_mark("resid_freq", &klast);
+    snprintf(p, sizeof(p), "TSMamba.%d.freq_mamba", idx);
+    if (mamba_block_gpu(g, p, xf, yf, S_f, F)) return 1;
+
+    if (last) k_resid_scatter_out_t<<<dim3((unsigned)((F+31)/32), HID/32, (unsigned)T), dim3(32,32)>>>(yf, xf, out_B, T, F);
+    else      k_resid_out_a<<<(unsigned)((n+255)/256), 256>>>(yf, xf, xt_next, T, F);
+    kp_mark("resid_out", &klast);
+    return reuse_gpu_ok(g, "tfmamba_a");
+}
+
 extern "C" int reuse_gpu_tfmamba(reuse_gpu_t *g, int idx, const float *x, float *y, int T, int F)
 {
     static double klast = 0;
@@ -3424,6 +3482,7 @@ extern "C" int reuse_gpu_tfmamba(reuse_gpu_t *g, int idx, const float *x, float 
         kp_mark("resid_freq", &klast);
     snprintf(p, sizeof(p), "TSMamba.%d.freq_mamba", idx);
     if (mamba_block_gpu(g, p, xf, yf, S_f, F)) return 1;
+
     if (getenv("REUSE_SKIP_RESID")) { } else if (naive_resid())
         k_resid_scatter_out<<<(unsigned)(((long)F*T*HID+255)/256), 256>>>(yf, xf, y, T, F);
     else
@@ -3443,6 +3502,7 @@ extern "C" int reuse_gpu_decoder_pre(reuse_gpu_t *g, const char *prefix, const f
     float *d = wallc(g, (size_t)HID*T*F);
     if (!d) return 1;
     if (dense_block_gpu(g, dbp, x, T, F, d, dectile())) return 1;
+
     gdump("d_db", d, (size_t)HID*T*F);
 
     float *u1  = wallc(g, (size_t)HID*T*(size_t)(F*2));
@@ -3450,6 +3510,7 @@ extern "C" int reuse_gpu_decoder_pre(reuse_gpu_t *g, const char *prefix, const f
     if (!u1 || !u1n) return 1;
     snprintf(key, sizeof(key), "%s.up_conv1", prefix);
     if (sp_up(g, key, d, T, F, 2, u1)) return 1;
+
     gdump("d_u1", u1, (size_t)HID*T*(size_t)(F*2));
     {
         char nk[256], ak[256];
@@ -3464,12 +3525,15 @@ extern "C" int reuse_gpu_decoder_pre(reuse_gpu_t *g, const char *prefix, const f
     float *sw = wallc(g, (size_t)HID*Tt*Ft);
     if (!sw) return 1;
     launch_transpose(HID, T, F*2, u1n, sw);
+
     gdump("d_sw", sw, (size_t)HID*Tt*Ft);
     float *u2  = wallc(g, (size_t)HID*Tt*(size_t)(Ft*4));
     float *u2n = wallc(g, (size_t)HID*Tt*(size_t)(Ft*4));
     if (!u2 || !u2n) return 1;
+
     snprintf(key, sizeof(key), "%s.up_conv2", prefix);
     if (sp_up(g, key, sw, Tt, Ft, 4, u2)) return 1;
+
     gdump("d_u2", u2, (size_t)HID*Tt*(size_t)(Ft*4));
     {
         char nk[256], ak[256];
@@ -3478,6 +3542,7 @@ extern "C" int reuse_gpu_decoder_pre(reuse_gpu_t *g, const char *prefix, const f
         inorm(g, u2, u2n, 1, HID, Tt, Ft*4, nk, ak);
     }
     launch_transpose(HID, Tt, Ft*4, u2n, y);
+
     gdump("d_pre", y, (size_t)HID*Tt*(size_t)(Ft*4));
     return g->bad;
 }
@@ -3523,12 +3588,41 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
             cudaMemcpyAsync(enc, blk, (size_t)HID*T2*F2*sizeof(float), cudaMemcpyDeviceToDevice);
         }
     } else {
-        for (int i = 0; i < NBLK; i++) {
-            if (reuse_gpu_tfmamba(g, i, cur, nxt, T2, F2)) return 1;
-            float *sw = cur; cur = nxt; nxt = sw;
+        static int tf = -1;
+        if (tf < 0) tf = getenv("REUSE_TOWER_FUSE") ? atoi(getenv("REUSE_TOWER_FUSE")) : 1;
+        float *xa = NULL, *xb = NULL;
+        if (tf) {
+            /* Keep the tower in the [F,T,C] layout: one gather before the loop,
+               and the per-block [C,T,F] write + re-transpose (21 MB and two
+               launches per block) collapses into the two flat adds above. */
+            xa = (float*)dalloc((size_t)HID*T2*F2);
+            xb = (float*)dalloc((size_t)HID*T2*F2);
+            if (!xa || !xb) return 1;
+
+            k_gather_time_t<<<dim3((unsigned)((F2+31)/32), (unsigned)((HID+31)/32), (unsigned)T2), dim3(32,8)>>>(cur, xa, T2, F2);
+
+        }
+        if (tf) {
+            for (int i = 0; i < NBLK; i++) {
+                /* the last block's [C,T,F] output goes into `enc`, which the gather
+                   consumed at loop entry and nothing else reads, so the forward's
+                   tail keeps freeing exactly xin/enc/blk as before */
+                if (reuse_gpu_tfmamba_a(g, i, xa, (i == NBLK-1 ? enc : NULL),
+                                        (i == NBLK-1 ? NULL : xb), T2, F2, i == NBLK-1)) return 1;
+                float *sw = xa; xa = xb; xb = sw;
+            }
+            cur = enc;                                       /* B-layout output for decoders */
+            cudaFree(xa); cudaFree(xb);
+            xa = xb = NULL;
+        } else {
+            for (int i = 0; i < NBLK; i++) {
+                if (reuse_gpu_tfmamba(g, i, cur, nxt, T2, F2)) return 1;
+                float *sw = cur; cur = nxt; nxt = sw;
+            }
         }
     }
     enc = cur;
+
     cudaDeviceSynchronize(); double t2 = gt_now(); g_t_blk = t2-t1;
     if (getenv("REUSE_MEM")) { size_t fr=0,to=0; cudaMemGetInfo(&fr,&to);
         fprintf(stderr, "[mem] after 30 blocks: free %zu MiB / %zu MiB\n", fr>>20, to>>20); }
