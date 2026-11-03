@@ -3995,8 +3995,27 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
       printf("PF4-RUN: prompt %d ids in chunks of %d, %.0f ms (%.2f ms/pos)\n",
              NP, g_pfChunk, (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6,
              ((q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6) / NP);
+      // Finish the last prompt step HERE: the body's layer loop runs before its head,
+      // so falling through would push the chunk's final residual through one extra
+      // 24-layer pass (observed: the first generated token came out 11 instead of 207).
+      // The head, the argmax and the queue append are the shipped ones -- head_logits_from
+      // is shared with the body, and toks is pre-filled from `prompt`, so step NP consumes
+      // toks[NP] = the token appended here exactly as the T=1 path does.
       cudaMemcpy(M.x, A.xb + (size_t)(Tc - 1) * H, (size_t)H * 2, cudaMemcpyDeviceToDevice);
-      s = NP - 1;      // the normal body runs this step: head, argmax, feed, bookkeeping
+      {
+        Ent* fn = T(M, "lfm.model.embedding_norm.weight");
+        rms1(M, M.x, fn ? fn->df : nullptr, M.h1);
+        head_logits_from(M, M.h1, emb);
+        k_argmax<<<1, 256, 0, g_launch>>>(M.lgf, M.tok_dev, VOCAB);
+        cudaDeviceSynchronize();
+        int nt = -1; cudaMemcpy(&nt, M.tok_dev, 4, cudaMemcpyDeviceToHost);
+        toks.push_back(nt);   // this IS the last prompt step: the shipped body appends here too
+        printf("%4d %8d  %8.2f  %6.2f   <- PF4-RUN last prompt step\n", NP - 1, nt,
+               (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6, 0.0);
+        fflush(stdout);
+      }
+      s = NP - 1;                 // next iteration is the first decode step
+      continue;
     }
     const int nprompt = (int)prompt.size();
     const bool need_head = s < 0 || g_legacy_feed || s >= nprompt - 1 || dump_logits_all;
