@@ -349,8 +349,8 @@ __global__ void k_combine_f(const float* __restrict__ part, float* __restrict__ 
 // Rounding before the weight multiply is the most common way an rmsnorm
 // parity gate fails, so it is written as an explicit widen-after-round here.
 // blockDim = 256, 8 elements per thread, warp tree then 8 partials ascending.
-__global__ void k_rmsnorm(const bf16* __restrict__ x, const float* __restrict__ w,
-                          bf16* __restrict__ y, float eps, int H_) {
+__device__ __forceinline__ void rmsnorm_body(const bf16* __restrict__ x, const float* __restrict__ w,
+                                             bf16* __restrict__ y, float eps, int H_) {
   const int tid = threadIdx.x;
   const bf16* xr = x;
   float ss[8];
@@ -374,6 +374,22 @@ __global__ void k_rmsnorm(const bf16* __restrict__ x, const float* __restrict__ 
     const float rounded = bf2f(f2bf(__fmul_rn(v, rs)));      // .to(input_dtype)
     y[i] = f2bf(__fmul_rn(w[i], rounded));                    // weight * that
   }
+}
+
+__global__ void k_rmsnorm(const bf16* __restrict__ x, const float* __restrict__ w,
+                          bf16* __restrict__ y, float eps, int H_) {
+  rmsnorm_body(x, w, y, eps, H_);
+}
+
+// The same block, one row per blockIdx.x, over a POSITION-FIRST activation arena
+// (row t at x + t*H). Sharing rmsnorm_body is deliberate: the T-wide prefill path
+// must be the same code, in the same evaluation order, as the T=1 path -- a
+// re-written normalisation kernel is exactly the class of defect that cost this
+// project six encoder runs (the in-place k_rmsnorm_f32 race, doc section 40).
+__global__ void k_rmsnorm_T(const bf16* __restrict__ x, const float* __restrict__ w,
+                            bf16* __restrict__ y, float eps, int H_) {
+  const size_t off = (size_t)blockIdx.x * H_;
+  rmsnorm_body(x + off, w, y + off, eps, H_);
 }
 
 // per-head RMSNorm over head_dim (q_norm / k_norm): one block per head,
@@ -2299,6 +2315,115 @@ static int prefill_arm5_gate(Model& M) {
   return fails ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Tranche 1 of true CT=4 batched prefill (doc section 49, run log row 332).
+//
+// Row 331 measured the CEILING (2.7-3.8x on the real shapes, bit-exact, all rates
+// under the plausibility ceiling). Row 330 ruled out the GEMV-level "vs shipped"
+// gate as the arbiter. What is left before the engine's layer loop can be taken
+// T-wide is a plumbing question, and it is the one the w2 item was parked on: can the
+// batched GEMM read a POSITION-FIRST activation arena (row t at x + t*K) that the
+// prefill driver owns, and reproduce T per-position launches bit-for-bit, on the real
+// weights?
+//
+// This selftest answers exactly that, in isolation, and nothing else: one T-wide launch
+// per GEMV vs T launches of the same kernel at T=1, over the same arena, compared byte
+// for byte. It does NOT compare against the shipped q8_gemv_hs path -- row 330 says that
+// comparison is not the arbiter -- and its x is a deterministic synthetic pattern (the
+// real-activation version of the check is --prefill-arm5-gate, and row 331 used captured
+// real activations), because the question here is LAYOUT, not embedding semantics.
+static int prefill_chunk_test(Model& M, int Tn) {
+  if (Tn < 2 || Tn > 64) { printf("--prefill-chunk: T=%d out of range 2..64\n", Tn); return 2; }
+  // H and TPB are #defines in this file (H = 2048), so only the new constants are
+  // declared here: shadowing them made the preprocessor expand `const int H = 2048`
+  // into `const int 2048 = 2048`, which is the "expected an identifier" nvcc gave.
+  const int TPBC = 256, CT = 4, RPB = 8, R = (256 / 32) * RPB;
+  std::vector<bf16> hx((size_t)Tn * H);
+  for (int t = 0; t < Tn; t++)
+    for (int i = 0; i < H; i++)
+      hx[(size_t)t * H + i] = host_f2bf(sinf(t * 7.13f + i * 0.0013f) * 0.37f);   // nonzero, finite, per-t distinct
+  bf16 *xb = nullptr, *xb2 = nullptr;
+  cudaMalloc(&xb, (size_t)Tn * H * 2); cudaMalloc(&xb2, (size_t)Tn * H * 2);
+  cudaMemcpy(xb, hx.data(), (size_t)Tn * H * 2, cudaMemcpyHostToDevice);
+  std::vector<float> hw(H, 1.0f);
+  float* hw_d = nullptr; cudaMalloc(&hw_d, H * 4); cudaMemcpy(hw_d, hw.data(), H * 4, cudaMemcpyHostToDevice);
+  k_rmsnorm_T<<<Tn, TPBC, 0, g_launch>>>(xb, hw_d, xb2, 1e-5f, H);
+  cudaError_t e0 = cudaGetLastError(); cudaDeviceSynchronize();
+  printf("PF4-CHUNK arena: T=%d, k_rmsnorm_T launch %s\n", Tn, e0 ? cudaGetErrorString(e0) : "ok");
+  fflush(stdout);
+  if (e0) return 1;
+
+  const char* nm[] = {"lfm.model.layers.0.conv.in_proj.weight", "lfm.model.layers.0.conv.out_proj.weight",
+                      "lfm.model.layers.0.feed_forward.w1.weight", "lfm.model.layers.0.feed_forward.w3.weight",
+                      "lfm.model.layers.0.feed_forward.w2.weight",
+                      "lfm.model.layers.2.self_attn.q_proj.weight", "lfm.model.layers.2.self_attn.k_proj.weight",
+                      "lfm.model.layers.2.self_attn.v_proj.weight", "lfm.model.layers.2.self_attn.o_proj.weight",
+                      "lfm.model.layers.2.self_attn.gate_proj.weight"};
+  int fails = 0, tested = 0;
+  for (int w = 0; w < 10; w++) {
+    Ent* e = T(M, nm[w]);
+    if (!e || !(e->dq && e->ds)) { printf("PF4-CHUNK %s: NOT IN BLOB\n", nm[w]); fails++; tested++; continue; }
+    const int N = e->ne[0], K = e->ne[1];
+    if (K % Q8_BLK) { printf("PF4-CHUNK %s: K=%d not a multiple of %d\n", nm[w], K, Q8_BLK); fails++; tested++; continue; }
+    int KC = K, nb = K / Q8_BLK; size_t shm = (size_t)CT * nb * 33 * 4;
+    while (KC > 32 && (K % KC || shm > 49152)) { KC /= 2; nb = KC / Q8_BLK; shm = (size_t)CT * nb * 33 * 4; }
+    if (K % KC || shm > 49152) { printf("PF4-CHUNK %s: SKIPPED (no KC fits: K=%d KC=%d shm=%zu)\n", nm[w], K, KC, shm); fails++; tested++; continue; }
+    const int nch = K / KC, nblk = ((N + R - 1) / R) * nch;
+    float* pB = nullptr; float* p1 = nullptr; bf16 *yB = nullptr, *y1 = nullptr;
+    cudaMalloc(&pB, (size_t)Tn * N * nch * 4); cudaMalloc(&p1, (size_t)Tn * N * nch * 4);
+    cudaMalloc(&yB, (size_t)Tn * N * 2);       cudaMalloc(&y1, (size_t)Tn * N * 2);
+    struct timespec t0, t1; cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t0);
+    pf_launch(CT, 5, 1, RPB, e->dq, e->ds, xb2, pB, N, K, KC, R, nb, Tn, nblk, TPBC, shm);
+    // k_combine_bf has NO T dimension: it combines N rows x nch partials, i.e. ONE
+    // position. Launching it once over a T-position partial buffer writes position 0 and
+    // leaves t>=1 as unwritten memory -- which is exactly what this selftest first
+    // reported (first diff at t=1 row=0 on every shape, unmatched cells holding
+    // 0x0000/0x7fff/0xffff). Combining per position is cheap (N*2 bytes each) and keeps
+    // the comparison honest; a real T-wide prefill will want a T-aware combine kernel,
+    // which is a one-line change to this kernel's grid, and this line is the reminder.
+    for (int t = 0; t < Tn; t++)
+      k_combine_bf<<<(N + 255) / 256, 256, 0, g_launch>>>(pB + (size_t)t * N * nch, yB + (size_t)t * N, N, nch);
+    cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t1);
+    const double msbat = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
+    cudaError_t le = cudaGetLastError();
+    for (int t = 0; t < Tn; t++) {
+      pf_launch(CT, 5, 1, RPB, e->dq, e->ds, xb2 + (size_t)t * K, p1 + (size_t)t * N * nch,
+                N, K, KC, R, nb, 1, nblk, TPBC, shm);
+      k_combine_bf<<<(N + 255) / 256, 256, 0, g_launch>>>(p1 + (size_t)t * N * nch, y1 + (size_t)t * N, N, nch);
+    }
+    cudaError_t le2 = cudaGetLastError(); cudaDeviceSynchronize();
+    if (le || le2) {
+      printf("PF4-CHUNK %s N=%d K=%d KC=%d: LAUNCH ERROR %s / %s (NO number reported)\n",
+             nm[w], N, K, KC, cudaGetErrorString(le), cudaGetErrorString(le2));
+      fflush(stdout); fails++; tested++;
+      cudaFree(pB); cudaFree(p1); cudaFree(yB); cudaFree(y1); continue;
+    }
+    std::vector<bf16> hyB((size_t)Tn * N), hy1((size_t)Tn * N);
+    cudaMemcpy(hyB.data(), yB, (size_t)Tn * N * 2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hy1.data(), y1, (size_t)Tn * N * 2, cudaMemcpyDeviceToHost);
+    long diff = 0, nz = 0; size_t first = (size_t)-1;
+    for (size_t i = 0; i < hyB.size(); i++) {
+      if (hyB[i] != hy1[i]) { diff++; if (first == (size_t)-1) first = i; }
+      if (hyB[i] != 0) nz++;
+    }
+    const double gmac = 2.0 * N * K * Tn / (msbat * 1e6);
+    const int plaus = (gmac <= 120.0) && nz > 0;
+    printf("PF4-CHUNK %s N=%d K=%d KC=%d nch=%d T=%d: %s (%ld/%zu cells differ, nonzero %zu/%zu, bat %.2f ms, %.1f GMAC/s, plausible %s)\n",
+           nm[w], N, K, KC, nch, Tn, diff ? "MISMATCH" : "BIT-EXACT", diff, hyB.size(),
+           (size_t)nz, hyB.size(), msbat, gmac, plaus ? "yes" : "NO");
+    if (diff && first != (size_t)-1)
+      printf("   first diff at t=%zu row=%zu (bat %04x vs seq %04x)\n", first / N, first % N, hyB[first], hy1[first]);
+    fflush(stdout);
+    tested++;
+    if (diff || !plaus) fails++;
+    cudaFree(pB); cudaFree(p1); cudaFree(yB); cudaFree(y1);
+  }
+  cudaFree(xb); cudaFree(xb2); cudaFree(hw_d);
+  printf("PF4_CHUNK %s: %d shapes, %s\n", fails ? "FAIL" : "PASS", tested, fails ? "FAILURES" : "ALL BIT-EXACT");
+  fflush(stdout);
+  return fails ? 1 : 0;
+}
+
 static int prefill_h2batched(Model& M) {
   // LFM_PF_T: the batch size the harness tests (default 8 = today). The ASR
   // chunk is 24 backbone tokens per 0.96 s of audio, so 24 is the shape that
@@ -2917,6 +3042,7 @@ int main(int argc, char** argv) {
   }
   int steps = 8; bool trace = false;
   int lm_rows_override = 0, emb_mode_req = 0, probe_layer = 0, probe_step = 0;
+  int chunkT = getenv("LFM_PF_T") ? atoi(getenv("LFM_PF_T")) : 4;   // --prefill-chunk T
   const char* audio_emb_file = nullptr;   // --audio-emb (ASR path)
   std::vector<std::string> clip_files;  // --clip SPEC repeated: resident multi-clip ASR
   const char* dump_logits = nullptr;
@@ -2931,6 +3057,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--lm-selftest")) emb_mode_req = 2;
     else if (!strcmp(argv[i], "--prefill-minimal")) emb_mode_req = 3;
     else if (!strcmp(argv[i], "--prefill-h2batched")) emb_mode_req = 4;
+    else if (!strcmp(argv[i], "--prefill-chunk") && i + 1 < argc) { emb_mode_req = 6; chunkT = atoi(argv[++i]); }
     else if (!strcmp(argv[i], "--prefill-arm5-gate")) emb_mode_req = 5;
     else if (!strcmp(argv[i], "--merge")) g_merge = true;   // merged gate/up GEMV
     else if (!strcmp(argv[i], "--lmrows") && i + 1 < argc) lm_rows_override = atoi(argv[++i]);
@@ -3619,5 +3746,6 @@ int main(int argc, char** argv) {
   }
   printf("FM3_NANODE_DONE\n");
   if (emb_mode_req == 5) return prefill_arm5_gate(M);
+  if (emb_mode_req == 6) return prefill_chunk_test(M, chunkT);
   return 0;
 }

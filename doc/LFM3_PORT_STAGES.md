@@ -2256,3 +2256,49 @@ project already has rules for:
 
 Measured ASR_RT for a stream of clips is the warm number: 2.689 single-shot, **2.057
 warm** (startup amortized), verified by the 2-clip wall above.
+
+### 49. True CT=4 batched prefill, tranche 1: the x-layout question is resolved (`--prefill-chunk`)
+
+Row 331 measured the ceiling (2.7–3.8× on the real shapes). Tranche 1 answers the
+plumbing question the `w2` item was parked on: **can the batched GEMM read a
+driver-owned, position-first activation arena (row *t* at `x + t*K`) and reproduce T
+per-position launches bit-for-bit, on the real weights?**
+
+`./lfm3_nanode <blob> --prefill-chunk T` says yes, for all ten real GEMV shapes at
+**T=4 and T=24** (24 = the ASR chunk: 24 backbone tokens per 0.96 s of audio):
+
+```
+PF4-CHUNK ...feed_forward.w2.weight N=2048 K=7680 KC=1920 nch=4 T=24: BIT-EXACT
+   (0/49152 cells differ, nonzero 49152/49152, bat 44.07 ms, 17.1 GMAC/s, plausible yes)
+PF4_CHUNK PASS: 10 shapes, ALL BIT-EXACT        (T=4 and T=24, k_rmsnorm_T launch ok)
+```
+
+Design points, all deliberate:
+* `k_rmsnorm_T` calls the **same `rmsnorm_body`** as `k_rmsnorm`, with a row offset from
+  `blockIdx.x` — the T-wide path must be the same code in the same evaluation order as
+  the T=1 path, because a re-written normalisation kernel is exactly what cost the
+  encoder six runs (§40's in-place `k_rmsnorm_f32` race).
+* `x` is a deterministic synthetic pattern (nonzero, finite, per-*t* distinct). The
+  question is **layout**, not embedding semantics; real-activation coverage is
+  `--prefill-arm5-gate` and row 331's captured activations.
+* It compares **batched-vs-per-position**, never vs shipped: row 330 established that
+  `q8_partial` and `q8_gemv_hs` are different functionals, so the GEMV-level "vs
+  shipped" gate is not the arbiter. End-to-end HF gates are.
+* A launch error prints **no number** (the rule, applied inside the new test).
+
+**The test found a real defect on its first run**: every shape mismatched at `t>=1`
+(`first diff at t=1 row=0`, unmatched cells holding `0x0000/0x7fff/0xffff` = unwritten
+memory). Cause: **`k_combine_bf` has no T dimension** — it combines `N × nch` partials,
+i.e. one position, so a single launch over a T-position partial buffer writes position 0
+only. Fixed by combining per position in the test; a real T-wide prefill wants a T-aware
+combine kernel (a one-line grid change), and the comment at that call records it.
+
+Also fixed while building: `H` and `TPB` are `#defines` in this file, so `const int H =
+2048` preprocessed to `const int 2048 = 2048`; and the host fill must use `host_f2bf`
+(`f2bf` is `__device__`).
+
+Not shipped: `--prefill-chunk` is a selftest. The layer loop is still one position per
+step; the remaining tranches are conv (needs the previous `K-1` activations as chunk
+state), RoPE/attention (T-wide scores, causal within chunk + all previous positions),
+SwiGLU/residual/Q8-quant, and the T-aware combine — graded by the existing HF gates
+(backbone streams 2/2, ASR EMB cos 0.999774, token-WER 0.008).
