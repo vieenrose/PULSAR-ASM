@@ -3052,6 +3052,139 @@ static void build_invf(float* out, float base, int dim, double partial) {
     out[i] = (i < angles) ? 1.0f / powf(base, (float)(2 * i) / (float)dim) : 0.0f;
 }
 
+// ---------------------------------------------------------------------------
+// One decoder layer, parameterised by POSITION and ACTIVATION ROW (CT=4 batched
+// prefill, tranche 2b; run log row 334).
+//
+// This is the step loop's layer body moved verbatim, with the shared single-position
+// buffers reached through LayerScratch and the residual stream reached through `x`.
+// The shipped path calls it with S = {M.h1, M.h2, ... M.hgu} -- the very same buffers
+// it used inline -- so any buffer mapping this refactor missed is a NO-OP for the
+// shipped path, and the gates (backbone streams 2/2, ASR EMB cos, token-WER) are the
+// check that the move is exact. A future T-wide driver passes per-position scratches,
+// which is the whole point: a missed mapping there becomes a gate failure, not a
+// silent aliasing bug.
+struct LayerScratch { bf16 *h1,*h2,*h3,*h4,*q,*k,*v,*gate,*attn,*bx,*hgu; };
+
+static void layer_body(Model& M, int L, int pos, int step_s, int trace, int ci,
+                       bf16* x, LayerScratch& S, int probe_on, int attn_L, int slide_L) {
+      KT("rms operator_norm", rms1(M, x, NW(M, L, "operator_norm.weight"), S.h1));
+      g_probe = probe_on;
+      PROBE("operator_norm", S.h1, H);
+      if (attn_L) {
+        gemv(M, LN(L, "self_attn.q_proj.weight"), S.h1, S.q);
+        gemv(M, LN(L, "self_attn.k_proj.weight"), S.h1, S.k);
+        gemv(M, LN(L, "self_attn.v_proj.weight"), S.h1, S.v);
+        gemv(M, LN(L, "self_attn.gate_proj.weight"), S.h1, S.gate);
+        k_headnorm<<<NH, 32, 0, g_launch>>>(S.q, NW(M, L, "self_attn.q_norm.weight"), NORM_EPS, HD);
+        k_headnorm<<<NKV, 32, 0, g_launch>>>(S.k, NW(M, L, "self_attn.k_norm.weight"), NORM_EPS, HD);
+        PROBE("q(postnorm)", S.q, NH * HD);
+        PROBE("k(postnorm)", S.k, NKV * HD);
+        PROBE("v", S.v, NKV * HD);
+        PROBE("gate", S.gate, NH);
+        const float* invf = slide_L ? M.invf_slide : M.invf_full;
+        const int* posp = g_graphs ? M.dpos : nullptr;
+        // rot is per-layer-type: full_attention rotates half the dims
+        // (partial_rotary_factor 0.5), sliding_attention rotates all of them
+        // (partial 1.0). The old code passed HD/2 for both, leaving sliding
+        // layers' slow half (dims 32..63) unrotated -- invisible at pos 0
+        // (RoPE is the identity there) and under the 3% gate at pos <= 22,
+        // but a position-growing phase error after that (#151: 243/7200 long
+        // cells outside 3%, engine-low, first sliding layer L4 origin).
+        const int rot = slide_L ? HD : HD / 2;
+        k_rope<<<NH, 64, 0, g_launch>>>(S.q, invf, pos, HD, rot, posp);
+        k_rope<<<NKV, 64, 0, g_launch>>>(S.k, invf, pos, HD, rot, posp);
+        PROBE("q(postrope)", S.q, NH * HD);
+        bf16* kbase = M.kc + (size_t)L * MAXTOK * NKV * HD;
+        bf16* vbase = M.vc + (size_t)L * MAXTOK * NKV * HD;
+        if (g_graphs) {
+          // The KV write must be a kernel, not a D2D memcpy: a memcpy's
+          // destination is baked into the capture, and pos*NKV*HD is exactly
+          // what changes per step. Same bytes, same order.
+          k_kv_write<<<(NKV * HD + 255) / 256, 256, 0, g_launch>>>(kbase, S.k, NKV * HD, M.dpos, NKV * HD);
+          k_kv_write<<<(NKV * HD + 255) / 256, 256, 0, g_launch>>>(vbase, S.v, NKV * HD, M.dpos, NKV * HD);
+        } else {
+          cudaMemcpy(kbase + (size_t)pos * NKV * HD, S.k, (size_t)NKV * HD * 2, cudaMemcpyDeviceToDevice);
+          cudaMemcpy(vbase + (size_t)pos * NKV * HD, S.v, (size_t)NKV * HD * 2, cudaMemcpyDeviceToDevice);
+        }
+        const float scaling = 1.0f / sqrtf((float)HD);
+        // sliding_attention layers see only the last 256 keys (config
+        // /lfm/sliding_window); full_attention layers see all of them.
+        const int win = slide_L ? SLIDE_WIN : 0;
+        k_attn_head<<<NH, 256, 0, g_launch>>>(S.q, kbase, vbase, S.attn, pos + 1, win, scaling, HD, NKV, g_graphs ? M.dpos + 1 : nullptr);
+        PROBE("attn", S.attn, NH * HD);
+        k_sigmoid_gate<<<1, NH, 0, g_launch>>>(S.gate, S.attn, HD);
+        PROBE("attn*gate", S.attn, NH * HD);
+        gemv(M, LN(L, "self_attn.o_proj.weight"), S.attn, S.h2);
+        PROBE("o_proj", S.h2, H);
+      } else {
+        bf16* ring = M.ring + (size_t)ci * 7 * H;
+        KT("gemv conv.in_proj", gemv(M, LN(L, "conv.in_proj.weight"), S.h1, S.bx));
+        PROBE("in_proj", S.bx, 3 * H);
+        // THE BUG THAT BROKE THE ENGINE. HF's conv branch is
+        //     B, C, x = in_proj(h).chunk(3)  ->  conv(B * x)  ->  C * y   (modeling_lfm3.py:372-421)
+        // so the convolves the GATED product. The first version computed
+        // B*x into h3 and then fed the RING the raw x (bx + 2*H) -- the
+        // B*x result was written and immediately discarded, because h3 is
+        // reused for post_operator_norm. Symptom chain: conv branch output
+        // 1.8x too large -> post_op_norm 0.0064 vs HF 0.0052 -> layer 0 rms
+        // 0.0280 vs 0.0247 -> logits uncorrelated with HF (corr -0.05),
+        // teacher-forcing 0/22. Found by printing rms per RING SLOT: slot 6
+        // read 0.21026 = in_proj's rms, while B*x is 0.12444, so the ring
+        // provably did not contain B*x.
+        // Ordering matters: the gate multiply must complete before the
+        // newest ring slot is written, so the shift follows the multiply.
+        KT("emul B*xg", emul(M, S.bx, S.bx + 2 * H, S.h3, H));
+        PROBE("B*x", S.h3, H);
+        KT("k_shift_in", k_shift_in<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, S.h3, H));
+        if (g_probe) for (int k = 0; k < 7; k++)
+          printf("    ring slot %d     rms %9.5f\n", k, rms_host_n(ring + (size_t)k * H, H));
+        KT("k_conv7", k_conv7<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, T(M, LN(L, "conv.conv.weight"))->df, S.h4, H));
+        PROBE("conv", S.h4, H);
+        KT("emul C*y", emul(M, S.bx + H, S.h4, S.h2, H));
+        PROBE("C*y", S.h2, H);
+        KT("gemv conv.out_proj", gemv(M, LN(L, "conv.out_proj.weight"), S.h2, S.h2));
+        PROBE("out_proj", S.h2, H);
+      }
+      KT("rms post_op_norm", rms1(M, S.h2, NW(M, L, "post_operator_norm.weight"), S.h3));
+      PROBE("post_op_norm", S.h3, H);
+      eadd(M, x, S.h3, x, H);
+      PROBE("add1", x, H);
+      KT("rms ffn_norm", rms1(M, x, NW(M, L, "ffn_norm.weight"), S.h1));
+      PROBE("ffn_norm", S.h1, H);
+      char mn[96]; snprintf(mn, sizeof mn, "MERGE:%d:gate_up", L);
+      if (g_merge && T(M, mn)) {
+        // One GEMV over 2*INTER rows; rows [0,INTER) are w1 (gate), rows
+        // [INTER,2*INTER) are w3 (up). k_silu_mul_bf takes the two halves as
+        // its two input pointers, so no kernel change is needed.
+        gemv(M, mn, S.h1, S.hgu);
+        PROBE("w1", S.hgu, INTER);
+        PROBE("w3", S.hgu + INTER, INTER);
+        k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(S.hgu, S.hgu + INTER, S.h2, INTER);
+      } else {
+      KT("gemv ffn.w1", gemv(M, LN(L, "feed_forward.w1.weight"), S.h1, S.h2));
+      PROBE("w1", S.h2, INTER);
+      KT("gemv ffn.w3", gemv(M, LN(L, "feed_forward.w3.weight"), S.h1, S.h3));
+      PROBE("w3", S.h3, INTER);
+      k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(S.h2, S.h3, S.h2, INTER);
+      }
+      PROBE("silu_mul", S.h2, INTER);
+      KT("gemv ffn.w2", gemv(M, LN(L, "feed_forward.w2.weight"), S.h2, S.h2));
+      PROBE("w2", S.h2, INTER);
+      KT("rms post_ffn_norm", rms1(M, S.h2, NW(M, L, "post_ffn_norm.weight"), S.h3));
+      PROBE("post_ffn_norm", S.h3, H);
+      eadd(M, x, S.h3, x, H);
+      PROBE("add2", x, H);
+      g_probe = 0;
+      // Full layer x position matrix in one run: the perlayer_probe role the
+      // Pi engine plays with tools/perlayer_probe.patch. Cheap enough to leave
+      // on under --trace (a 4 KB D2H copy per layer per step).
+      if (trace) printf("POS %2d L%-2d %s%s rms %.5f\n", step_s, L,
+                        attn_L ? "attn" : "conv", slide_L ? "(slide)" : "",
+                        rms_host(M, x));
+  g_probe = 0;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     printf("usage: %s <blob.lfm3q8> [--steps N] [--prompt id,id,...] [--trace]\n", argv[0]);
@@ -3471,122 +3604,13 @@ int main(int argc, char** argv) {
     if (!use_graph) {
     int ci = 0;
     for (int L = 0; L < NLAYER; L++) {
-      if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[L] ? &g_tAttn : &g_tConv; }
-      KT("rms operator_norm", rms1(M, M.x, NW(M, L, "operator_norm.weight"), M.h1));
-      g_probe = trace && L == g_probe_layer && s == g_probe_step;
-      PROBE("operator_norm", M.h1, H);
-      if (is_attn[L]) {
-        gemv(M, LN(L, "self_attn.q_proj.weight"), M.h1, M.q);
-        gemv(M, LN(L, "self_attn.k_proj.weight"), M.h1, M.k);
-        gemv(M, LN(L, "self_attn.v_proj.weight"), M.h1, M.v);
-        gemv(M, LN(L, "self_attn.gate_proj.weight"), M.h1, M.gate);
-        k_headnorm<<<NH, 32, 0, g_launch>>>(M.q, NW(M, L, "self_attn.q_norm.weight"), NORM_EPS, HD);
-        k_headnorm<<<NKV, 32, 0, g_launch>>>(M.k, NW(M, L, "self_attn.k_norm.weight"), NORM_EPS, HD);
-        PROBE("q(postnorm)", M.q, NH * HD);
-        PROBE("k(postnorm)", M.k, NKV * HD);
-        PROBE("v", M.v, NKV * HD);
-        PROBE("gate", M.gate, NH);
-        const float* invf = is_slide[L] ? M.invf_slide : M.invf_full;
-        const int* posp = g_graphs ? M.dpos : nullptr;
-        // rot is per-layer-type: full_attention rotates half the dims
-        // (partial_rotary_factor 0.5), sliding_attention rotates all of them
-        // (partial 1.0). The old code passed HD/2 for both, leaving sliding
-        // layers' slow half (dims 32..63) unrotated -- invisible at pos 0
-        // (RoPE is the identity there) and under the 3% gate at pos <= 22,
-        // but a position-growing phase error after that (#151: 243/7200 long
-        // cells outside 3%, engine-low, first sliding layer L4 origin).
-        const int rot = is_slide[L] ? HD : HD / 2;
-        k_rope<<<NH, 64, 0, g_launch>>>(M.q, invf, pos, HD, rot, posp);
-        k_rope<<<NKV, 64, 0, g_launch>>>(M.k, invf, pos, HD, rot, posp);
-        PROBE("q(postrope)", M.q, NH * HD);
-        bf16* kbase = M.kc + (size_t)L * MAXTOK * NKV * HD;
-        bf16* vbase = M.vc + (size_t)L * MAXTOK * NKV * HD;
-        if (g_graphs) {
-          // The KV write must be a kernel, not a D2D memcpy: a memcpy's
-          // destination is baked into the capture, and pos*NKV*HD is exactly
-          // what changes per step. Same bytes, same order.
-          k_kv_write<<<(NKV * HD + 255) / 256, 256, 0, g_launch>>>(kbase, M.k, NKV * HD, M.dpos, NKV * HD);
-          k_kv_write<<<(NKV * HD + 255) / 256, 256, 0, g_launch>>>(vbase, M.v, NKV * HD, M.dpos, NKV * HD);
-        } else {
-          cudaMemcpy(kbase + (size_t)pos * NKV * HD, M.k, (size_t)NKV * HD * 2, cudaMemcpyDeviceToDevice);
-          cudaMemcpy(vbase + (size_t)pos * NKV * HD, M.v, (size_t)NKV * HD * 2, cudaMemcpyDeviceToDevice);
-        }
-        const float scaling = 1.0f / sqrtf((float)HD);
-        // sliding_attention layers see only the last 256 keys (config
-        // /lfm/sliding_window); full_attention layers see all of them.
-        const int win = is_slide[L] ? SLIDE_WIN : 0;
-        k_attn_head<<<NH, 256, 0, g_launch>>>(M.q, kbase, vbase, M.attn, pos + 1, win, scaling, HD, NKV, g_graphs ? M.dpos + 1 : nullptr);
-        PROBE("attn", M.attn, NH * HD);
-        k_sigmoid_gate<<<1, NH, 0, g_launch>>>(M.gate, M.attn, HD);
-        PROBE("attn*gate", M.attn, NH * HD);
-        gemv(M, LN(L, "self_attn.o_proj.weight"), M.attn, M.h2);
-        PROBE("o_proj", M.h2, H);
-      } else {
-        bf16* ring = M.ring + (size_t)ci * 7 * H;
-        KT("gemv conv.in_proj", gemv(M, LN(L, "conv.in_proj.weight"), M.h1, M.bx));
-        PROBE("in_proj", M.bx, 3 * H);
-        // THE BUG THAT BROKE THE ENGINE. HF's conv branch is
-        //     B, C, x = in_proj(h).chunk(3)  ->  conv(B * x)  ->  C * y   (modeling_lfm3.py:372-421)
-        // so the convolves the GATED product. The first version computed
-        // B*x into h3 and then fed the RING the raw x (bx + 2*H) -- the
-        // B*x result was written and immediately discarded, because h3 is
-        // reused for post_operator_norm. Symptom chain: conv branch output
-        // 1.8x too large -> post_op_norm 0.0064 vs HF 0.0052 -> layer 0 rms
-        // 0.0280 vs 0.0247 -> logits uncorrelated with HF (corr -0.05),
-        // teacher-forcing 0/22. Found by printing rms per RING SLOT: slot 6
-        // read 0.21026 = in_proj's rms, while B*x is 0.12444, so the ring
-        // provably did not contain B*x.
-        // Ordering matters: the gate multiply must complete before the
-        // newest ring slot is written, so the shift follows the multiply.
-        KT("emul B*xg", emul(M, M.bx, M.bx + 2 * H, M.h3, H));
-        PROBE("B*x", M.h3, H);
-        KT("k_shift_in", k_shift_in<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, M.h3, H));
-        if (g_probe) for (int k = 0; k < 7; k++)
-          printf("    ring slot %d     rms %9.5f\n", k, rms_host_n(ring + (size_t)k * H, H));
-        KT("k_conv7", k_conv7<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, T(M, LN(L, "conv.conv.weight"))->df, M.h4, H));
-        PROBE("conv", M.h4, H);
-        KT("emul C*y", emul(M, M.bx + H, M.h4, M.h2, H));
-        PROBE("C*y", M.h2, H);
-        KT("gemv conv.out_proj", gemv(M, LN(L, "conv.out_proj.weight"), M.h2, M.h2));
-        PROBE("out_proj", M.h2, H);
-        ci++;
+      {
+if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[L] ? &g_tAttn : &g_tConv; }
+        LayerScratch S = {M.h1,M.h2,M.h3,M.h4,M.q,M.k,M.v,M.gate,M.attn,M.bx,M.hgu};
+        const int probe_on = (trace && L == g_probe_layer && s == g_probe_step) ? 1 : 0;
+        layer_body(M, L, pos, s, trace, ci, M.x, S, probe_on, is_attn[L] ? 1 : 0, is_slide[L] ? 1 : 0);
+        if (!is_attn[L]) ci++;
       }
-      KT("rms post_op_norm", rms1(M, M.h2, NW(M, L, "post_operator_norm.weight"), M.h3));
-      PROBE("post_op_norm", M.h3, H);
-      eadd(M, M.x, M.h3, M.x, H);
-      PROBE("add1", M.x, H);
-      KT("rms ffn_norm", rms1(M, M.x, NW(M, L, "ffn_norm.weight"), M.h1));
-      PROBE("ffn_norm", M.h1, H);
-      char mn[96]; snprintf(mn, sizeof mn, "MERGE:%d:gate_up", L);
-      if (g_merge && T(M, mn)) {
-        // One GEMV over 2*INTER rows; rows [0,INTER) are w1 (gate), rows
-        // [INTER,2*INTER) are w3 (up). k_silu_mul_bf takes the two halves as
-        // its two input pointers, so no kernel change is needed.
-        gemv(M, mn, M.h1, M.hgu);
-        PROBE("w1", M.hgu, INTER);
-        PROBE("w3", M.hgu + INTER, INTER);
-        k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(M.hgu, M.hgu + INTER, M.h2, INTER);
-      } else {
-      KT("gemv ffn.w1", gemv(M, LN(L, "feed_forward.w1.weight"), M.h1, M.h2));
-      PROBE("w1", M.h2, INTER);
-      KT("gemv ffn.w3", gemv(M, LN(L, "feed_forward.w3.weight"), M.h1, M.h3));
-      PROBE("w3", M.h3, INTER);
-      k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(M.h2, M.h3, M.h2, INTER);
-      }
-      PROBE("silu_mul", M.h2, INTER);
-      KT("gemv ffn.w2", gemv(M, LN(L, "feed_forward.w2.weight"), M.h2, M.h2));
-      PROBE("w2", M.h2, INTER);
-      KT("rms post_ffn_norm", rms1(M, M.h2, NW(M, L, "post_ffn_norm.weight"), M.h3));
-      PROBE("post_ffn_norm", M.h3, H);
-      eadd(M, M.x, M.h3, M.x, H);
-      PROBE("add2", M.x, H);
-      g_probe = 0;
-      // Full layer x position matrix in one run: the perlayer_probe role the
-      // Pi engine plays with tools/perlayer_probe.patch. Cheap enough to leave
-      // on under --trace (a 4 KB D2H copy per layer per step).
-      if (trace) printf("POS %2d L%-2d %s%s rms %.5f\n", s, L,
-                        is_attn[L] ? "attn" : "conv", is_slide[L] ? "(slide)" : "",
-                        rms_host(M, M.x));
     }
     }   // end of the non-graph / captured region
     if (capturing) {

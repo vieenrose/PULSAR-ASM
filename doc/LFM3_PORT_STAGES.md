@@ -2302,3 +2302,36 @@ step; the remaining tranches are conv (needs the previous `K-1` activations as c
 state), RoPE/attention (T-wide scores, causal within chunk + all previous positions),
 SwiGLU/residual/Q8-quant, and the T-aware combine — graded by the existing HF gates
 (backbone streams 2/2, ASR EMB cos 0.999774, token-WER 0.008).
+
+### 50. Tranche 2b: the layer body is now position- and row-parameterised (`layer_body`)
+
+The step loop's 114-line decoder-layer body moved verbatim into
+
+```c
+struct LayerScratch { bf16 *h1,*h2,*h3,*h4,*q,*k,*v,*gate,*attn,*bx,*hgu; };
+static void layer_body(Model& M, int L, int pos, int step_s, int trace, int ci,
+                       bf16* x, LayerScratch& S, int probe_on, int attn_L, int slide_L);
+```
+
+The shipped step loop calls it with `S = {M.h1, M.h2, … M.hgu}` — **the same buffers it
+used inline** — and `x = M.x`. That is why this refactor is safe in a way a normal
+extraction is not: **any buffer mapping the move missed is a no-op on the shipped path**
+(the aliases are literally identical pointers), so the only thing the gates can catch is a
+real behavioural change — and they catch the case that matters later, when a T-wide driver
+passes *per-position* scratches and a missed mapping becomes a gate failure instead of a
+silent aliasing bug.
+
+Verified on the same prompt, same board, before and after:
+
+```
+pre-refactor ids: 44   post-refactor: 44      BIT-IDENTICAL: True
+CHECKS OK (matrix 23x23, 6 prompts, streams 2/2)   ENC_GATE PASS
+PF4_CHUNK PASS: 10 shapes, ALL BIT-EXACT           PF-PROBE arm=5 ids equal=YES (45/45)
+steady-state 184.05 ms/token (pre-refactor 184.08)
+```
+
+Mechanical changes in the move: `is_attn[L]`/`is_slide[L]` become `attn_L`/`slide_L`
+parameters (they are `main` locals), the probe predicate becomes `probe_on`, `printf("POS
+%d…", s, …)` takes `step_s`, the conv-ring counter `ci++` moves to the caller, and the
+`g_time` phase bookkeeping stays in the loop (it wraps the call). `M.kc`/`M.vc`/`M.ring`
+are cache/ring state and deliberately stay as `M.`.
