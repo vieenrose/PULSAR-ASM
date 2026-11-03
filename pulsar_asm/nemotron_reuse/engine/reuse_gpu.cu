@@ -857,6 +857,62 @@ __global__ void k_gate_outproj(const float *y, const float *z, const float *W,
 }
 
 
+// The gated output projection as a 32x64 register-tiled GEMM.
+// k_out_proj_tiled uses GT=32 tiles with 4 accumulators per thread (6 shared
+// loads per 8 FMAs, i.e. at the shared-memory issue ceiling) and scalar tile
+// loads. This variant owns 64 rows x all HID=64 outputs per block with a 4x4
+// accumulator per thread (8 loads per 16 FMAs), stages W in shared with
+// float4 loads, and writes the result back as float4.
+__global__ void k_out_proj_r(const float *y, const float *z, const float *W,
+                             float *out, int SL)
+{
+    const int KC = 32, MT = 64;
+    __shared__ float As[MT][KC+4], Ws[HID][KC+4];
+    const long m0 = (long)blockIdx.x * MT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty*16 + tx;
+    float acc[4][4];
+#pragma unroll
+    for (int a = 0; a < 4; a++)
+#pragma unroll
+        for (int b = 0; b < 4; b++) acc[a][b] = 0.f;
+    for (int k0 = 0; k0 < DINNER; k0 += KC) {
+        for (int i = tid; i < MT*KC; i += 256) {
+            const int r = i / KC, c = i % KC;
+            const long o_ = (m0 + r)*DINNER + k0 + c;
+            As[r][c] = (m0 + r < SL) ? y[o_] * dsilu(z[o_]) : 0.f;
+        }
+        {
+            const int RS = (KC+4)/4;
+            for (int i = tid; i < HID*RS; i += 256) {
+                const int r = i / RS, q = 4*(i - r*RS);
+                if (q >= KC) continue;
+                ((float4*)&Ws[0][0])[i] = *(const float4*)(W + (long)r*DINNER + k0 + q);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KC; k++) {
+            float a[4], w[4];
+#pragma unroll
+            for (int a4 = 0; a4 < 4; a4++) a[a4] = As[ty*4 + a4][k];
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++) w[b4] = Ws[tx*4 + b4][k];
+#pragma unroll
+            for (int a4 = 0; a4 < 4; a4++)
+#pragma unroll
+                for (int b4 = 0; b4 < 4; b4++) acc[a4][b4] = fmaf(a[a4], w[b4], acc[a4][b4]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int a4 = 0; a4 < 4; a4++) {
+        const long m = m0 + ty*4 + a4;
+        if (m >= SL) continue;
+        *(float4*)(out + m*HID + tx*4) = make_float4(acc[a4][0], acc[a4][1], acc[a4][2], acc[a4][3]);
+    }
+}
+
 __global__ void k_out_proj_tiled(const float *y, const float *z, const float *W, float *out,
                                  int SL)
 {
@@ -2733,10 +2789,11 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     GDBG("gscan", y, (size_t)SL*DINNER);
     {
         static int tiled = -1;
-        if (tiled < 0) tiled = getenv("REUSE_NAIVE_OP") ? 0 : 1;
+        if (tiled < 0) tiled = getenv("REUSE_OP") ? atoi(getenv("REUSE_OP")) : (getenv("REUSE_NAIVE_OP") ? 0 : 2);
         if (tiled) {
             dim3 g((HID+GT-1)/GT, (unsigned)((SL+GT-1)/GT));
-            k_out_proj_tiled<<<g, dim3(GT/2, GT/2), 0, st>>>(y, z, W_op, out, (int)SL);
+            if (tiled == 2) k_out_proj_r<<<(unsigned)((SL+63)/64), dim3(16,16), 0, st>>>(y, z, W_op, out, (int)SL);
+            else            k_out_proj_tiled<<<g, dim3(GT/2, GT/2), 0, st>>>(y, z, W_op, out, (int)SL);
         } else {
             if (!getenv("REUSE_SKIP_GATEOP"))
             k_gate_outproj<<<dim3((unsigned)((SL+255)/256), HID), b1, 0, st>>>(y, z, W_op, out, SL);
