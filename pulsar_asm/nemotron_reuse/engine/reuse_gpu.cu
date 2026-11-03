@@ -2435,6 +2435,48 @@ __global__ void k_scan_dt(const float *xc, const float *Wdt, const float *Bdt,
         y[sl * DINNER + c] = acc + u * Dc;
     }
 }
+// k_scan_dt with aA[] in padded shared memory instead of registers. ptxas
+// spends 56 registers on the register version, which caps occupancy at 4
+// blocks (32 of 64 warps) per SM; the kernel is latency-bound (72 GB/s of the
+// 158 GB/s ceiling, 3x off its DRAM floor), so trading 16 registers for 16
+// warp-broadcast shared loads per L step buys in-flight capacity.
+__global__ void __launch_bounds__(256, 4) k_scan_dts(const float *xc, const float *Wdt, const float *Bdt,
+                          const float *A_log, const float *Dv, const float *xdbl,
+                          float *y, int S, int L, int rev)
+{
+    __shared__ float4 Ws[DINNER];
+    __shared__ float aAs[32][DSTATE+1];   // stride 17: coprime with 32 banks
+    for (int i = threadIdx.x; i < DINNER; i += 256) Ws[i] = ((const float4*)Wdt)[i];
+    __syncthreads();
+    int s = (int)((long)blockIdx.x * 8 + threadIdx.x / 32);
+    int c = (threadIdx.x % 32) + blockIdx.y * 32;
+    if (s >= S || c >= DINNER) return;
+    float h[DSTATE];
+#pragma unroll
+    for (int n = 0; n < DSTATE; n++) h[n] = 0.0f;
+    const int lane = (int)threadIdx.x % 32;
+#pragma unroll
+    for (int n = 0; n < DSTATE; n++) aAs[lane][n] = -__expf(A_log[c * DSTATE + n]);
+    __syncthreads();
+    const float Dc = Dv[c];
+    const float4 w = Ws[c];
+    const float bc = Bdt[c];
+    for (int ii = 0; ii < L; ii++) {
+        long sl = (long)s * L + ii;
+        const float *dr = xdbl + sl * XP;
+        float d = dsoftplus(bc + dr[0]*w.x + dr[1]*w.y + dr[2]*w.z + dr[3]*w.w);
+        float u = xc[sl * DINNER + c];
+        const float *Bt = xdbl + sl * XP + DTRANK;
+        const float *Ct = Bt + DSTATE;
+        float acc = 0.0f;
+#pragma unroll
+        for (int n = 0; n < DSTATE; n++) {
+            h[n] = __expf(d * aAs[lane][n]) * h[n] + d * Bt[n] * u;
+            acc = fmaf(h[n], Ct[n], acc);
+        }
+        y[sl * DINNER + c] = acc + u * Dc;
+    }
+}
 
 static int conv_chunk(void)
 {
@@ -2768,7 +2810,10 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         if (f < 0) f = getenv("REUSE_SCANDT") ? atoi(getenv("REUSE_SCANDT")) : 1;
         const bool fused = (f != 0) && t == 2 && !getenv("REUSE_SKIP_DTPROJ") && !getenv("REUSE_SKIP_SCAN");
         if (fused) {
-            k_scan_dt<<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
+            static int ts = -1;
+            if (ts < 0) ts = getenv("REUSE_SCAN") ? atoi(getenv("REUSE_SCAN")) : 2;
+            if (ts == 2) k_scan_dts<<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
+            else         k_scan_dt<<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
         } else if (getenv("REUSE_SKIP_DTPROJ")) { } else
         if (t == 2) k_dt_proj_r<<<(unsigned)((SL+7)/8), 256, 0, st>>>(xdbl, W_dt, B_dt, dtt, SL);
         else if (t) k_dt_proj_t<<<(unsigned)((SL+7)/8), 256, 0, st>>>(xdbl, W_dt, B_dt, dtt, SL);
