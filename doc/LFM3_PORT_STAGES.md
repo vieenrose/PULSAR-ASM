@@ -2385,3 +2385,36 @@ measured (printed 0.00000), and `PF4POS` printed the chunk's **first** row, so a
 comparison labelled "position 19" was comparing position 0; a regex written `PFPOS`
 silently matched zero lines and returned `first diverging layer: None`, which is exactly
 the kind of confident-looking null a gate must not be allowed to emit.
+
+### 52. The chunked T-wide prefill is refuted as the ASR lever (measured at ASR shapes)
+
+Row 331 measured the four heaviest GEMVs in isolation at T=4 and projected prefill
+178.8 s -> ~66 s, warm ASR_RT ~2.057 -> ~1.19. Measured end to end on the real
+1642-id ASR prompt, that projection does not transfer:
+
+| arm | prefill ms/pos | wall, prompt + 24 gen |
+|---|---|---|
+| shipped T=1 (TQ4 cache, no trace) | ~38-50 | **84.1 s** |
+| chunked T=8  | 196.33 | 404.1 s |
+| chunked T=16 | 187.15 | 388.6 s |
+
+The batched GEMVs do win in isolation (2.7-3.8x, row 331, and PF4_CHUNK certifies them
+bit-exact against per-position launches). They are not the bottleneck in the driver:
+attention, RoPE, the KV write, the gated conv, SiLU and both residual adds run as
+*per-position loops*, and on a single-SM Nano the per-position launches -- plus
+attention's O(position) scan, which at position 1600 reads 1600 keys per head --
+dominate. T-wide launches amortize weight traffic; they amortize nothing that is
+per-position, and the weight traffic they save was already only part of the cost.
+
+Consequence for the realtime goal: the shipped T=1 prefill is the fast path, and at
+ASR shapes it is ~4x faster than the chunked driver. From this run, the shipped path's
+engine time for the full 1642-id prompt plus 24 generated tokens is 84.1 s on 129.72 s
+of audio -- engine-only ASR_RT ~0.65. The gate's 2.057 warm figure includes the
+mel+encoder front end (~60 s) and process startup (~82 s, already recovered by resident
+mode). So the remaining realtime levers are the FRONT END and STARTUP, not prefill.
+
+The integrated `--prefill-run` arm also emitted no decode step lines at ASR shapes
+(1 line: its own prefill step), so it cannot be used for measurement as it stands; the
+standalone driver's numbers (token 207 at every chunk size, L0 exact, chunk-size
+invariant) are unaffected. The code stays in the tree, flag-gated, shipped path
+bit-identical.
