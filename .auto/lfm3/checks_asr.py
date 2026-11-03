@@ -263,7 +263,47 @@ def main():
     print("  ASR_RT = %.3f  (prefill+decode %.3f, front end %.3f)"
           % (tot / audio_sec, t_eng / audio_sec, (t_wav + t_mel + t_enc) / audio_sec))
     ok = pref >= MIN_PREFIX
-    print("ASR_GATE %s (prefix %d >= %d, rows %d, Tm %d)" % ("PASS" if ok else "FAIL", pref, MIN_PREFIX, rows, Tm))
+    # Resident-process section: the same clip run inside ONE process that serves several
+    # clips (--clip SPEC), which must be bit-identical to the solo run above. This is the
+    # 0.63-of-ASR_RT startup lever, so it is gated, not assumed: measured 451.4 s for two
+    # clips against 545.1 s for the two solo runs, with both clips' ids equal to solo.
+    print("== resident clip mode ==")
+    n_gen_req = int(os.environ.get("ASR_CLIP_GEN", "64"))
+    open("/tmp/asr_clip0.spec", "w").write("%s\n%s\n15\n%d\n" % ("asrgate/proj_out.bin", ids, n_gen_req))
+    open("/tmp/asr_clip1.spec", "w").write(
+        "-\n1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20\n0\n24\n")
+    open("/tmp/asr_solo0.ids", "w").write(eng)          # the traced solo run above
+    for f in ("/tmp/asr_clip0.spec", "/tmp/asr_clip1.spec", "/tmp/asr_solo0.ids",
+              os.path.join(HERE, "cmp_clips.py")):
+        sh("scp -q -o ConnectTimeout=20 %s %s:/tmp/" % (f, NANO))
+    sh("scp -q -o ConnectTimeout=20 %s %s:/tmp/cmp_clips.py" % (os.path.join(HERE, "cmp_clips.py"), NANO))
+    t0 = time.time()
+    res = ssh("cd %s && ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip /tmp/asr_clip0.spec "
+              "--clip /tmp/asr_clip1.spec --steps %d --trace > /tmp/asr_res.ids 2>&1; "
+              "grep -E 'CLIPMODE|CLIP [0-9]+ (START|DONE)' /tmp/asr_res.ids; "
+              "python3 /tmp/cmp_clips.py /tmp/asr_res.ids /tmp/asr_solo0.ids 2>&1 | tail -4"
+              % (NDIR, steps), timeout=5400)
+    t_res = time.time() - t0
+    for l in res.splitlines():
+        if l.strip():
+            print("  " + l.strip())
+    ssh("cd %s && ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --prompt "
+        "'1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20' --steps 44 --trace "
+        "> /tmp/asr_solo1.ids 2>&1" % NDIR, timeout=1200)
+    cmp1 = ssh("python3 /tmp/cmp_clips.py /tmp/asr_res.ids 1:/tmp/asr_solo1.ids 2>&1 | tail -3",
+               timeout=300)
+    for l in cmp1.splitlines():
+        if l.strip():
+            print("  " + l.strip())
+    print("  resident wall %.1f s for 2 clips (the two solo runs cost ~%.0f s: %.1f + ~85)"
+          % (t_res, t_eng_timed + 85.0, t_eng_timed))
+    res_ok = ("clip 0 == solo 0 : True" in res) and ("clip 1 == solo 1 : True" in cmp1)
+    if not res_ok:
+        print("  RESIDENT FAIL: per-clip ids are not bit-identical to the solo runs")
+    ok = ok and res_ok
+    print("ASR_GATE %s (prefix %d >= %d, rows %d, Tm %d, resident clips %s)"
+          % ("PASS" if ok else "FAIL", pref, MIN_PREFIX, rows, Tm,
+             "bit-identical" if res_ok else "MISMATCH"))
     sys.exit(0 if ok else 1)
 
 

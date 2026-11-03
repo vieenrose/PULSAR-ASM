@@ -2213,3 +2213,46 @@ Distance to the bar, term by term: prefill 1.38 -> ~0.35 with true CT=4 batching
 item), startup 0.63 -> ~0 in a resident process, decode 0.22 is at the ceiling, front end
 0.46 is mel 0.066 + encoder 0.365 (GPU 0.0125) + wav 0.031 + process launches. Floor
 ~1.0-1.1, so `ASR_RT <= 1.00` is at the edge of reachability, not out of it.
+
+### 48. Resident-process mode (`--clip`): 93.7 s of the 545 s pair is the startup, and clips are bit-identical
+
+`lfm3_nanode --clip SPEC --clip SPEC ...` runs several ASR clips in **one process**, so
+the 82 s one-time startup (1.946 GB blob read + upload + setup) is paid once. `SPEC` is a
+text file: line 1 = embedding path (or `-`), line 2 = prompt ids, line 3 = `--audio-at`
+position, line 4 = `ngen` (per-clip generation count, so a short clip in a resident batch
+isn't forced to the longest clip's `--steps`). With no `--clip`, the code is exactly one
+pass, so the shipped single-prompt path is untouched.
+
+```
+resident wall 451.40 s for 2 clips      (solo pair: 453.5 + 91.6 = 545.1 s)  -> -93.7 s
+clip 0 == solo 0 : True   (agree on 1906 ids)
+clip 1 == solo 1 : True   (agree on   44 ids)
+CLIPMODE_IDS PASS
+```
+
+`checks_asr.py` now has a `== resident clip mode ==` section that runs 2 clips in one
+process and compares each against its own solo run, and `ASR_GATE` requires it
+bit-identical. `.auto/lfm3/cmp_clips.py` takes `N:FILE` to pair run N with a solo
+reference, and uses **prefix** semantics: a resident clip may be asked for a shorter tail
+than the reference, and demanding equal lengths made a bit-identical clip report
+`eq False` with `first diffs at []` -- the signature of a length check posing as a
+content check.
+
+Three traps hit and closed while building this, all of them the same class of trap this
+project already has rules for:
+1. **Stale binary, twice.** `nvcc -o /tmp/nX` followed by a failed build left the old
+   `lfm3_nanode` in place, and the test measured it: the tell was the new build marker
+   (`LFM3_CLIPMODE BUILD=...`) not printing, and `BUILT_MOVED` absent. Now every build
+   step asserts `RC -eq 0 && test -s OUT` before `mv`, and the binary prints a build
+   marker that the test greps for.
+2. **Fixed-size spec buffer.** `char idsp[8192]` truncated the ASR prompt's 11 KB id
+   line: `CLIP 0 START ids=150 ... at=0`, the remainder of line 2 read as line 3 (so
+   `audio-at` became garbage) and the real line 3 read as line 4. The reader now grows a
+   `std::string` across buffer-sized line fragments.
+3. **`PQ1_GRAPH` is the Bonsai knob.** LFM3 uses `LFM_GRAPHS`, so section 45's
+   "graphs cost nothing here" A/B ran graphs-off on both arms -- that claim is
+   UNTESTED, not measured, and the clip-mode safety argument does not rely on it (LFM3
+   captures graphs only when `LFM_GRAPHS` is set, so the ASR path never uses one).
+
+Measured ASR_RT for a stream of clips is the warm number: 2.689 single-shot, **2.057
+warm** (startup amortized), verified by the 2-clip wall above.

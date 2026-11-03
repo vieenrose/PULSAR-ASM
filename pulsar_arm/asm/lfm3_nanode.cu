@@ -2872,11 +2872,14 @@ static void build_invf(float* out, float base, int dim, double partial) {
 int main(int argc, char** argv) {
   if (argc < 2) {
     printf("usage: %s <blob.lfm3q8> [--steps N] [--prompt id,id,...] [--trace]\n", argv[0]);
+    printf("       [--audio-emb F --audio-at P] | [--clip SPEC]... (resident multi-clip; SPEC"
+           " lines: emb|-, ids, audio-at, ngen)\n", argv[0]);
     return 1;
   }
   int steps = 8; bool trace = false;
   int lm_rows_override = 0, emb_mode_req = 0, probe_layer = 0, probe_step = 0;
   const char* audio_emb_file = nullptr;   // --audio-emb (ASR path)
+  std::vector<std::string> clip_files;  // --clip SPEC repeated: resident multi-clip ASR
   const char* dump_logits = nullptr;
   const char* dump_logits_all = nullptr;   // every decode step, appended (gate: top-k vs HF)
   std::vector<int> prompt;
@@ -2898,6 +2901,7 @@ int main(int argc, char** argv) {
       char* s = argv[++i];
       while (*s) { prompt.push_back((int)strtol(s, &s, 10)); if (*s == ',') s++; }
     }
+    else if (!strcmp(argv[i], "--clip") && i + 1 < argc) clip_files.push_back(argv[++i]);
     else if (!strcmp(argv[i], "--audio-emb") && i + 1 < argc) audio_emb_file = argv[++i];
     else if (!strcmp(argv[i], "--audio-at") && i + 1 < argc) g_aemb_at = atoi(argv[++i]);
   }
@@ -3033,7 +3037,7 @@ int main(int argc, char** argv) {
   if (emb_mode_req == 4) return prefill_h2batched(M);
   if (emb_mode_req == 5) g_cap_on = 1;   // capture during the normal run; gate runs at the end
   if (emb->ne[0] != VOCAB || emb->ne[1] != H) { printf("embed shape %dx%d\n", emb->ne[0], emb->ne[1]); return 1; }
-  if (audio_emb_file) {
+  auto load_emb = [&](const char* audio_emb_file) -> int {
     // Row count comes from the file size, not from a flag: a count the caller typed
     // by hand is one more thing that can silently disagree with the encoder's output.
     FILE* af = fopen(audio_emb_file, "rb");
@@ -3052,7 +3056,9 @@ int main(int argc, char** argv) {
     printf("AUDIO-EMB armed: %s = %d rows x %d, overriding prompt positions %d..%d (%.1f MB)\n",
            audio_emb_file, g_aemb_n, H, g_aemb_at, g_aemb_at + g_aemb_n - 1, h.size() * 4 / 1e6);
     fflush(stdout);
-  }
+    return 0;
+  };
+  if (audio_emb_file && load_emb(audio_emb_file)) return 2;
   if (M.emb_mode >= 1) {
     if (!lm_host_init(M, M.hemb, argv[1])) return 1;
     if (lm_rows_override > 0 && (VOCAB % lm_rows_override) == 0) M.hemb.rows = lm_rows_override;
@@ -3094,6 +3100,64 @@ int main(int argc, char** argv) {
     return bad ? 1 : 0;
   }
 
+  // ---- resident-process clip loop -------------------------------------------------
+  // --clip SPEC repeated runs several clips in ONE process. The point is the 82 s
+  // one-time startup (1.946 GB blob read + upload + setup), which is 0.63 of ASR_RT for
+  // a 129.7 s clip and is paid once per process, not per clip: a service pays it at
+  // boot. SPEC is a text file: line 1 = embedding path (or "-" for none), line 2 =
+  // comma-separated prompt ids, line 3 = audio-at position (optional).
+  //
+  // With no --clip this is exactly one pass, so the shipped single-prompt path is
+  // byte-identical to before the loop existed.
+  //
+  // Graphs are NOT a factor here: LFM3 enables them only with LFM_GRAPHS set, so the
+  // ASR path runs without a captured graph and a second pass cannot replay clip 0's
+  // capture. (An earlier note claimed graphs were measured free on this workload; that
+  // A/B used PQ1_GRAPH, which is the Bonsai engine's knob and is ignored here, so both
+  // arms ran graphs-off -- see doc section 45's correction.)
+  const int nclip = (int)clip_files.size();
+  printf("LFM3_CLIPMODE BUILD=2026-11-03B nclip=%d\n", nclip); fflush(stdout);
+  for (int cl = 0; cl < (nclip ? nclip : 1); cl++) {
+  if (nclip) {
+    FILE* sf = fopen(clip_files[cl].c_str(), "r");
+    if (!sf) { printf("--clip: cannot open %s\n", clip_files[cl].c_str()); return 2; }
+    // Read the spec as LINES, growing a std::string when a line exceeds the read
+    // buffer. The first version used char idsp[8192], and the ASR prompt's id line is
+    // ~11 KB (1642 ids), so fgets split it: 150 ids were parsed, the remainder of the
+    // line was read as "line 3" (so audio-at became garbage) and the real line 3 became
+    // "line 4". Symptom was a clip that ran a completely different workload from its
+    // solo run, which is exactly the kind of thing a bit-exactness gate must catch.
+    std::vector<std::string> lines;
+    {
+      char ln[1024];
+      std::string cur;
+      while (fgets(ln, sizeof ln, sf)) {
+        char* nl = strchr(ln, '\n');
+        if (nl) { *nl = 0; cur += ln; lines.push_back(cur); cur.clear(); }
+        else cur += ln;                      // line continues past the buffer
+      }
+      if (!cur.empty()) lines.push_back(cur);
+    }
+    fclose(sf);
+    const char* embp = lines.size() > 0 ? lines[0].c_str() : "";
+    const char* idsp = lines.size() > 1 ? lines[1].c_str() : "";
+    int atv = lines.size() > 2 ? atoi(lines[2].c_str()) : -1;
+    int ngv = lines.size() > 3 ? atoi(lines[3].c_str()) : -1;
+    prompt.clear();
+    std::string idbuf(idsp);            // strtol wants a writable endptr
+    for (char* q = &idbuf[0]; *q; ) { prompt.push_back((int)strtol(q, &q, 10)); if (*q == ',') q++; }
+    if (atv >= 0) g_aemb_at = atv;
+    audio_emb_file = (embp[0] && strcmp(embp, "-")) ? strdup(embp) : nullptr;
+    if (g_aemb) { cudaFree(g_aemb); g_aemb = nullptr; }
+    g_aemb_n = 0; g_aemb_fed = 0;
+    printf("CLIP %d START ids=%zu emb=%s at=%d ngen=%d\n", cl, prompt.size(),
+           audio_emb_file ? audio_emb_file : "-", g_aemb_at, steps - (int)prompt.size());
+    fflush(stdout);
+    // Per-clip generation count (spec line 4), so a short clip in a resident batch is
+    // not forced to the longest clip's --steps.
+    if (ngv >= 0) steps = (int)prompt.size() + ngv;
+    if (audio_emb_file && load_emb(audio_emb_file)) return 2;
+  }
   if (prompt.empty()) prompt.push_back(124894);                 // bos
   std::vector<int> toks = prompt;
   cudaEvent_t evA, evB; cudaEventCreate(&evA); cudaEventCreate(&evB);
@@ -3447,6 +3511,8 @@ int main(int argc, char** argv) {
     printf("AUDIO-EMB fed %ld of %d rows (positions %d..%d); steady-state steps counted: %d\n",
            g_aemb_fed, g_aemb_n, g_aemb_at, g_aemb_at + g_aemb_n - 1, ng);
   fflush(stdout);
+  if (nclip) { printf("CLIP %d DONE steps=%d\n", cl, ng); fflush(stdout); }
+  }  // resident-process clip loop
   {
     // Peak RSS, from the kernel's own counter. measure.sh needs it and the
     // Nano's login shell is dash (whose `time` has no -f) with no
