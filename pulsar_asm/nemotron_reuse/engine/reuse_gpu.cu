@@ -383,8 +383,11 @@ __global__ void k_in_proj_r(const float *x, const float *W, float *x0, float *z,
 // K=64 in two 32-wide chunks, 2 FMA per shared load). The z half has no conv,
 // so it just writes z as before.
 #define FUSE_MT 80
-template<int KC>
-__global__ void k_in_conv_r(const float *x, const float *W, float *z, float *xc,
+#ifndef LBV
+#define LBV 3
+#endif
+template<int KC, int LBMIN = 2>
+__global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const float *W, float *z, float *xc,
                             const float *Wc, const float *Bc,
                             int S, int L, int rev)
 {
@@ -2833,13 +2836,13 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
                     x, W_in, z, xc, W_c, B_c, S, L, rev);
             }
             else if (kc == 16)
-                k_in_conv_r<16><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
+                k_in_conv_r<16, LBV><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev);
             else if (kc == 8)
-                k_in_conv_r<8><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
+                k_in_conv_r<8, LBV><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev);
             else
-                k_in_conv_r<32><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
+                k_in_conv_r<32, LBV><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev);
         }
         else if (tiled == 2) k_in_proj_r<<<dim3((unsigned)((SL+63)/64), (2*DINNER)/64), dim3(16,16), 0, st>>>(x, W_in, x0, z, S, L, rev);
