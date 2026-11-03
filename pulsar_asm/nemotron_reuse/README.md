@@ -70,21 +70,20 @@ end-to-end requires reproducing the reference FFT's float32 rounding bit-for-bit
 ## RTF (RTF = processing wall time / audio duration; <1 = faster than real time)
 
 Jetson Nano Gen1 (tegra210, 1 SM / 128 cores @ 921 MHz, CUDA 10.2, L4T R32.5.1,
-`sm_53`, 8 kHz fixture, 5.100 s audio, `CUDA_LAUNCH_BLOCKING=1`):
+`sm_53`, `CUDA_LAUNCH_BLOCKING=1`, GPU model + GPU iSTFT, CPU STFT):
 
-| phase | time | share |
-|---|---|---|
-| DenseEncoder | 43.50 s | 19% |
-| 30x TFMamba | 166.17 s | 74% |
-| decoders | 14.62 s | 7% |
-| heads | 0.01 s | 0% |
-| **model best** | **224.32 s** | **RTF_model 43.98** |
-| STFT (CPU) | 0.44 s | RTF 0.09 |
-| iSTFT (CPU) | 6.91 s | RTF 1.36 |
-| **total** | **231.23 s** | **RTF_total 45.34** |
+| fixture | audio | model | **RTF_model** | STFT | iSTFT | **RTF_total** | gate on device |
+|---|---|---|---|---|---|---|---|
+| 8 kHz | 5.100 s | 226.12 s | **44.34** | 0.44 s | 0.09 s | **44.36** | 1.104e-06 / 119.88 dB PASS |
+| 16 kHz | 5.100 s | 453.16 s | **88.86** | 1.66 s | 0.35 s | **88.92** | 7.818e-07 / 123.99 dB PASS |
 
-Gate on the device: complex spectrum rel-rms **1.104e-06**, waveform SNR
-**119.91 dB** -> PASS (identical to the dev host: same kernels, fp32).
+8 kHz phase breakdown on the Nano: encoder 43.84 s (19%), 30x TFMamba
+167.42 s (74%), decoders 14.83 s (7%), heads 0.01 s.
+
+Real time (RTF < 1) is **not** achieved: the Nano is ~23x slower than the
+GTX 1070 (1 SM vs 15, 0.55x clock), and the naive-kernel model needs ~44x
+real time at 8 kHz. Getting to RTF < 1 needs ~45x more throughput; the
+profile says where it is: 74% tower, 19% encoder convolutions.
 
 Dev host (GTX 1070, 15 SMs, `sm_61`), same code:
 
