@@ -3231,6 +3231,15 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   return 0;
 }
 
+// Ring index = the conv-LAYER index (0..NCONV-1), NOT a running counter. The first
+// version incremented it per POSITION inside the conv branch, so a 20-position chunk
+// walked 20 ring slots -- past the NCONV=13 the ring array has -- and read garbage:
+// in_proj and B*x matched the T=1 reference exactly (0.21023, 0.12444) while conv came
+// out 4.6x too large (0.01160 vs 0.00252), which is what poisoned the residual stream
+// into nan by layer 1. Each conv layer owns ONE 7-slot ring; positions advance its
+// contents through k_shift_in, they do not select a different ring.
+static int pf4_conv_idx[NLAYER];
+
 struct PF4Arena {
   bf16 *xb, *h1, *q, *k, *v, *gate, *attn, *h2, *bx, *cy, *w1, *w3, *hout;
   float* part;
@@ -3239,10 +3248,15 @@ struct PF4Arena {
 // One decoder layer, T positions at a time. Sequencing mirrors layer_body exactly:
 // operator_norm -> {q,k,v,gate | conv in_proj} -> attention | conv -> o_proj | out_proj
 // -> residual -> ffn_norm -> {w1,w3} -> silu -> w2 -> residual.
+#define P4(nm, ptr, n) if (pf4trace && L == 0) (cudaDeviceSynchronize(), \
+    printf("PF4PROBE %-14s rms %9.5f\n", nm, rms_host_n((ptr), (n))), 0)
 static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   const int QDIM = NH * HD, KVDIM = NKV * HD;
+  const int pf4trace = getenv("LFM_PF4_TRACE") ? 1 : 0;   // stage-by-stage rms for L0,
+  // to be read against the T=1 path's own --probe-layer 0 --probe-step 0 PROBE lines.
   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "operator_norm.weight"), A.h1, NORM_EPS, H);
   if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d operator_norm launch failed\n", L); return 1; }
+  P4("operator_norm", A.h1, H);   // after the launch: the first version probed before it and printed 0.00000
   if (is_attn_g[L]) {
     if (pf_gemv_T(M, LN(L, "self_attn.q_proj.weight"), A.h1, A.q, A.part, Tn)) return 1;
     if (pf_gemv_T(M, LN(L, "self_attn.k_proj.weight"), A.h1, A.k, A.part, Tn)) return 1;
@@ -3271,6 +3285,7 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
     if (pf_gemv_T(M, LN(L, "self_attn.o_proj.weight"), A.attn, A.h2, A.part, Tn)) return 1;
   } else {
     if (pf_gemv_T(M, LN(L, "conv.in_proj.weight"), A.h1, A.bx, A.part, Tn)) return 1;
+    P4("in_proj", A.bx, 3 * H);
     for (int t = 0; t < Tn; t++) {
       bf16* bx = A.bx + (size_t)t * 3 * H;
       bf16* cy = A.cy + (size_t)t * H;
@@ -3281,14 +3296,20 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
       // the step loop is about), and the ring is per conv layer, indexed by the conv
       // counter -- chunk state carried in the ring, which is why conv needs no new state.
       emul(M, bx, bx + 2 * H, tmp, H);
-      bf16* ring = M.ring + (size_t)M.pf4_ci * 7 * H;
+      if (t == 0) P4("B*x", tmp, H);
+      bf16* ring = M.ring + (size_t)pf4_conv_idx[L] * 7 * H;
       k_shift_in<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, tmp, H);
+      if (t == 0 && pf4trace) { cudaDeviceSynchronize();
+        for (int k = 0; k < 7; k++)
+          printf("PF4  ring slot %d     rms %9.5f\n", k, rms_host_n(ring + (size_t)k * H, H)); }
       k_conv7<<<(H + 63) / 64, 64, 0, g_launch>>>(ring, T(M, LN(L, "conv.conv.weight"))->df, cy, H);
+      if (t == 0) P4("conv", cy, H);
       emul(M, bx + H, cy, tmp, H);
-      M.pf4_ci++;
+      if (t == 0) P4("C*y", tmp, H);
     }
     if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d conv launch failed\n", L); return 1; }
     if (pf_gemv_T(M, LN(L, "conv.out_proj.weight"), A.h2, A.h2, A.part, Tn)) return 1;
+    P4("out_proj", A.h2, H);
   }
   // post_operator_norm, then the residual add -- layer_body normalises the operator
   // branch output into h3 BEFORE adding, and the first version of this driver added the
@@ -3296,18 +3317,27 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   // residual stream grew without bound across 24 layers.
   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.h2, NW(M, L, "post_operator_norm.weight"), A.cy, NORM_EPS, H);
   if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d post_operator_norm launch failed\n", L); return 1; }
+  P4("post_op_norm", A.cy, H);
   for (int t = 0; t < Tn; t++) eadd(M, A.xb + (size_t)t * H, A.cy + (size_t)t * H, A.xb + (size_t)t * H, H);
+  P4("add1", A.xb, H);
   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "ffn_norm.weight"), A.h1, NORM_EPS, H);
+  P4("ffn_norm", A.h1, H);
   if (pf_gemv_T(M, LN(L, "feed_forward.w1.weight"), A.h1, A.w1, A.part, Tn)) return 1;
+  P4("w1", A.w1, INTER);
   if (pf_gemv_T(M, LN(L, "feed_forward.w3.weight"), A.h1, A.w3, A.part, Tn)) return 1;
+  P4("w3", A.w3, INTER);
   for (int t = 0; t < Tn; t++)
     k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(A.w1 + (size_t)t * INTER,
                                                              A.w3 + (size_t)t * INTER,
                                                              A.h2 + (size_t)t * INTER, INTER);
   if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d silu launch failed\n", L); return 1; }
+  P4("silu_mul", A.h2, INTER);
   if (pf_gemv_T(M, LN(L, "feed_forward.w2.weight"), A.h2, A.hout, A.part, Tn)) return 1;
+  P4("w2", A.hout, H);
   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.hout, NW(M, L, "post_ffn_norm.weight"), A.h2, NORM_EPS, H);
+  P4("post_ffn_norm", A.h2, H);
   for (int t = 0; t < Tn; t++) eadd(M, A.xb + (size_t)t * H, A.h2 + (size_t)t * H, A.xb + (size_t)t * H, H);
+  P4("add2", A.xb, H);
   return 0;
 }
 
@@ -3324,7 +3354,15 @@ static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* em
   cudaMalloc(&A.w1, (size_t)Tn * rowI * 2);   cudaMalloc(&A.w3, (size_t)Tn * rowI * 2);
   cudaMalloc(&A.hout, (size_t)Tn * rowH * 2);
   cudaMalloc(&A.part, (size_t)Tn * 10000 * 4);
-  M.pf4_ci = 0;
+  { int c = 0; for (int L = 0; L < NLAYER; L++) { pf4_conv_idx[L] = c; if (!is_attn_g[L]) c++; }
+    if (c != NCONV) { printf("PF4-E2E: conv count %d != NCONV %d\n", c, NCONV); return 2; } }
+  // The shipped path zeroes the KV caches in its WARM-UP step (s < 0, next to the ring
+  // reset), which this driver never runs -- so without this, attention reads
+  // uninitialised keys/values. Mirroring that reset is part of "same starting state".
+  cudaMemset(M.kc, 0, (size_t)NLAYER * MAXTOK * NKV * HD * 2);
+  cudaMemset(M.vc, 0, (size_t)NLAYER * MAXTOK * NKV * HD * 2);
+  cudaMemset(M.ring, 0, (size_t)NCONV * 7 * H * 2);
+  cudaMemset(M.x, 0, H * 2);
   struct timespec t0, t1; cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t0);
   for (int c0 = 0; c0 < N; c0 += Tn) {
     const int Tc = (N - c0 < Tn) ? N - c0 : Tn;
@@ -3352,9 +3390,14 @@ static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* em
       // Per-layer rms of position 0, to be read against the T=1 path's own
       // "POS <s> L<L> attn|conv rms <v>" trace lines: the first layer whose rms
       // disagrees is the origin, which is how the encoder divergence was localised.
+      // Reports the LAST position of the chunk, so the lines line up with the shipped
+      // path's "POS <s> L<L> ... rms" trace at the prompt's final position -- the
+      // position whose residual stream is the acceptance value. (The first version
+      // printed the chunk's FIRST row, which is position 0 for a single-chunk run:
+      // it compared position 0 against position 19, a comparison that means nothing.)
       if (getenv("LFM_PF4_TRACE")) cudaDeviceSynchronize(),
-        printf("PF4POS %3d L%-2d %s rms %.5f\n", c0, L, is_attn_g[L] ? "attn" : "conv",
-               rms_host_n(A.xb + (size_t)(L % 2) * 0, H));
+        printf("PF4POS %3d L%-2d %s rms %.5f\n", c0 + Tc - 1, L, is_attn_g[L] ? "attn" : "conv",
+               rms_host_n(A.xb + (size_t)(Tc - 1) * H, H));
     }
     if (N > Tn) { printf("PF4-E2E chunk pos %d..%d done\n", c0, c0 + Tc - 1); fflush(stdout); }
   }

@@ -2335,3 +2335,53 @@ parameters (they are `main` locals), the probe predicate becomes `probe_on`, `pr
 %d…", s, …)` takes `step_s`, the conv-ring counter `ci++` moves to the caller, and the
 `g_time` phase bookkeeping stays in the loop (it wraps the call). `M.kc`/`M.vc`/`M.ring`
 are cache/ring state and deliberately stay as `M.`.
+
+### 51. The chunked T-wide driver runs, is chunk-size invariant, and diverges at the first attention layer
+
+`./lfm3_nanode <blob> --prefill-e2e T` feeds the prompt T positions at a time: one
+T-wide launch per GEMV, per-position loops over the *same* T=1 kernels for headnorm,
+RoPE, KV write, attention, the gated conv, SiLU and both residual adds.
+
+Three defects found and fixed, each by a comparison, not by inspection:
+
+1. **Missing `post_operator_norm`** — the first version added the raw `o_proj`/`out_proj`
+   result to the residual instead of normalising it first, so the stream grew unbounded
+   across 24 layers (`x rms = nan`).
+2. **The conv ring index counted positions, not layers.** `in_proj` (0.21023) and `B*x`
+   (0.12444) matched the T=1 reference *exactly* while `conv` came out 4.6× too large
+   (0.01160 vs 0.00252): a 20-position chunk walked 20 ring slots past the `NCONV=13`
+   the ring array has. The ring index is the **conv-layer** index; positions advance a
+   layer's single 7-slot ring through `k_shift_in`, they do not select a new ring.
+3. **The driver inherited dirty scratch.** The shipped path zeroes the KV caches (and
+   the ring) in its *warm-up* step (`s < 0`), which the driver never runs — so attention
+   read uninitialised keys/values. The driver now establishes its own starting state.
+
+Then, and only then, the per-layer comparison at the prompt's last position (driver
+`PF4POS` lines vs the shipped path's `POS` trace lines):
+
+```
+L0  conv         ref 0.01976  drv 0.01976  rel 0.00e+00     exact
+L1  conv         ref 0.01830  drv 0.01831  rel 5.5e-04
+L2  attn         ref 0.02312  drv 0.02317  rel 2.2e-03   <== first divergence
+L21 conv         ref 0.20391  drv 0.20316  rel 3.7e-03     (bounded, 2-5e-03 to L23)
+last-position rms: PF_USE=1 0.46086, shipped 0.46001, driver 0.46034
+T = 2, 4, 8, 20, 24  ->  identical rms 0.46034              chunk-size invariant
+```
+
+Reading: the driver matches the reference **exactly through layer 0**, and the
+divergence begins at the **first attention layer** and stays at 2–5e-03 — rounding
+scale, not structural (a structural bug explodes; this does not). The two reference arms
+differ from *each other* by the same order (`PF_USE=1` vs shipped: 1700/2048 cells at the
+last position), which is what `q8_partial`-vs-`q8_gemv_hs` (row 330) predicts.
+
+So the acceptance bar "bit-identical to the reference" is **not met**, and the remaining
+2–5e-03 is where the next tranche starts: the decisive test is HF, not bit-equality —
+generated ids and token-WER, which needs `lm_head` (still inline in the step loop)
+inside the driver.
+
+Also recorded because they are the same class of trap: two of my own probes were wrong
+before the data was trustworthy — `P4("operator_norm")` ran *before* the launch it
+measured (printed 0.00000), and `PF4POS` printed the chunk's **first** row, so a
+comparison labelled "position 19" was comparing position 0; a regex written `PFPOS`
+silently matched zero lines and returned `first diverging layer: None`, which is exactly
+the kind of confident-looking null a gate must not be allowed to emit.
