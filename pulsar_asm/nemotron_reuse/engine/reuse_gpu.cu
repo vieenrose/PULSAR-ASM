@@ -1082,6 +1082,29 @@ __global__ void k_outproj_ln_g(const float *cat, const float *W, const float *B,
 }
 
 // [HID,T,F] -> [F,T,HID]
+// [C,T,F] -> [F,T,C] gather (the tower's per-block input view). k_gather_time
+// walks the output linearly, so for 32 consecutive outputs a warp reads 32
+// floats spaced T*F apart: 32 sectors per warp load, measured 63 GB/s of the
+// 158 GB/s ceiling. T is the shared middle dimension in both layouts, so this
+// is a plain 2D transpose of (C,F) per t, tiled 32x32 through padded shared.
+__global__ void k_gather_time_t(const float *x, float *xt, int T, int F)
+{
+    __shared__ float sh[32][33];
+    const int t = blockIdx.z, f0 = blockIdx.x*32, c0 = blockIdx.y*32;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+#pragma unroll
+    for (int j = ty; j < 32; j += 8) {
+        const int c = c0 + j, f = f0 + tx;
+        sh[j][tx] = (c < HID && f < F) ? x[((long)c*T + t)*F + f] : 0.f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = ty; j < 32; j += 8) {
+        const int f = f0 + j, c = c0 + tx;
+        if (c < HID && f < F) xt[((long)f*T + t)*HID + c] = sh[tx][j];
+    }
+}
+
 __global__ void k_gather_time(const float *x, float *xt, int T, int F)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2797,7 +2820,12 @@ extern "C" int reuse_gpu_tfmamba(reuse_gpu_t *g, int idx, const float *x, float 
     float *xf = wallc(g, (size_t)F*T*HID);
     float *yf = wallc(g, (size_t)F*T*HID);
     if (!xt || !yt || !xf || !yf) return 1;
-    k_gather_time<<<(unsigned)(((long)F*T*HID+255)/256), 256>>>(x, xt, T, F);
+    {
+        static int t = -1;
+        if (t < 0) t = getenv("REUSE_GATHER") ? atoi(getenv("REUSE_GATHER")) : 1;
+        if (t) k_gather_time_t<<<dim3((unsigned)((F+31)/32), (unsigned)((HID+31)/32), (unsigned)T), dim3(32,8)>>>(x, xt, T, F);
+        else   k_gather_time<<<(unsigned)(((long)F*T*HID+255)/256), 256>>>(x, xt, T, F);
+    }
     char p[256];
     snprintf(p, sizeof(p), "TSMamba.%d.time_mamba", idx);
     if (mamba_block_gpu(g, p, xt, yt, S_t, T)) return 1;
