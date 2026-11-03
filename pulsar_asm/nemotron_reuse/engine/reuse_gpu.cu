@@ -1318,6 +1318,49 @@ __global__ void k_resid_scatter_out(const float *y, const float *xf, float *out,
 
 // SPConvTranspose2d: zero-pad W by 1, conv (1,3) to C_out=64*r, sub-pixel scatter.
 // y[c, h, w*r + a] = conv[a*64 + c, h, w]
+// Sub-pixel conv with 8 output channels per thread.
+//
+// k_sp_up is a GEMM (M = H*W, N = 64*r, K = HID*3) launched with one output
+// channel per block, so every one of the 256 co-blocks re-reads the whole
+// 11.5 MB input: ~3 GB of DRAM traffic per launch, which is why an 11 ms
+// launch moves its 46 MB of output at 4 GB/s. Owning 8 co per thread reuses
+// the 3 loaded taps 8x; the 24 weight floats per (ci) are the same addresses
+// across the warp (lanes differ only in w), so they broadcast.
+__global__ void k_sp_up8(const float *x, const float *Ww, const float *b, float *y,
+                         int H, int W, int r)
+{
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    const int co = blockIdx.z * 8;
+    if (h >= H || w >= W) return;
+    float acc[8];
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc[j] = b[co + j];
+    const long hw = (long)h*W;
+    for (int ci = 0; ci < HID; ci++) {
+        const float *xv = x + (long)ci*H*W + hw;
+        const float v1 = xv[w];
+        const float v0 = (w >= 1)   ? xv[w-1] : 0.f;
+        const float v2 = (w+1 < W)  ? xv[w+1] : 0.f;
+        const float *wp = Ww + ((long)co*HID + ci)*3;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const float3 wt = *(const float3*)(wp + j*HID*3);
+            acc[j] = fmaf(v0, wt.x, acc[j]);
+            acc[j] = fmaf(v1, wt.y, acc[j]);
+            acc[j] = fmaf(v2, wt.z, acc[j]);
+        }
+    }
+    const int c = co % HID, a = co / HID;
+    float *yo = y + ((long)c*H + h)*(long)(W*r) + (long)w*r + a;
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const int cj = (co + j) % HID, aj = (co + j) / HID;
+        y[((long)cj*H + h)*(long)(W*r) + (long)w*r + aj] = acc[j];
+    }
+    (void)yo; (void)c; (void)a;
+}
+
 __global__ void k_sp_up(const float *x, const float *Ww, const float *b, float *y,
                         int H, int W, int r)
 {
@@ -2096,7 +2139,16 @@ static int sp_up(reuse_gpu_t *g, const char *prefix, const float *x, int H, int 
     if (g->bad) return 1;
     dim3 blk(16, 16);
     dim3 grd((unsigned)((W + 15)/16), (unsigned)((H + 15)/16), (unsigned)(HID*r));
-    k_sp_up<<<grd, blk>>>(x, w, b, y, H, W, r);
+    {
+        static int t8 = -1;
+        if (t8 < 0) t8 = getenv("REUSE_SPUP") ? atoi(getenv("REUSE_SPUP")) : 1;
+        if (t8 && (64*r) % 8 == 0) {
+            dim3 g8(grd.x, grd.y, (unsigned)((64*r)/8));
+            k_sp_up8<<<g8, blk>>>(x, w, b, y, H, W, r);
+        } else {
+            k_sp_up<<<grd, blk>>>(x, w, b, y, H, W, r);
+        }
+    }
     return reuse_gpu_ok(g, "sp_up");
 }
 
