@@ -1993,24 +1993,24 @@ __global__ void k_conv2d_r5(const float *x, const float *w, const float *b,
 // global traffic 1.7x (the tile is half as tall), raises FMA per global load
 // 7 -> 22 and FMA per shared load 2 -> 6, and keeps registers at 32
 // accumulators + ~12.
-#define PCO 4
-template<int R>
+template<int R, int PCO, int NCB>
 __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
                             int C_in, int H, int W, int padH, int padW, int dilH,
                             float *y, int co0)
 {
-    const int TW = 64, LS = TW+4;
+    const int TW = 16*NCB, LS = TW+4;
+    const int NRA = 32/(PCO*NCB);
     __shared__ __align__(16) float S[R][LS];
     const int w0 = blockIdx.x*TW, h0 = blockIdx.y*32;
     const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
     const int tid = ty*16 + tx;
-    float acc[PCO][2][4];
+    float acc[PCO][NRA][NCB];
 #pragma unroll
     for (int j = 0; j < PCO; j++)
 #pragma unroll
-        for (int a = 0; a < 2; a++)
+        for (int a = 0; a < NRA; a++)
 #pragma unroll
-            for (int bq = 0; bq < 4; bq++) acc[j][a][bq] = b[co0 + blockIdx.z*PCO + j];
+            for (int bq = 0; bq < NCB; bq++) acc[j][a][bq] = b[co0 + blockIdx.z*PCO + j];
     for (int ci = 0; ci < C_in; ci++) {
         const float *xin = x + (long)ci*H*W;
         if (ci) __syncthreads();
@@ -2042,29 +2042,31 @@ __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
 #pragma unroll
             for (int kh = 0; kh < 3; kh++) {
                 const float w0f = wv[j*C_in*9 + kh*3], w1f = wv[j*C_in*9 + kh*3+1], w2f = wv[j*C_in*9 + kh*3+2];
-                const int rb = ty*2 + kh*dilH, cb = tx*4;
+                const int rb = ty*NRA + kh*dilH, cb = tx*NCB;
 #pragma unroll
-                for (int a = 0; a < 2; a++) {
+                for (int a = 0; a < NRA; a++) {
                     const float *sr = &S[rb + a][cb];
-                    acc[j][a][0] = fmaf(sr[0], w0f, acc[j][a][0]); acc[j][a][0] = fmaf(sr[1], w1f, acc[j][a][0]); acc[j][a][0] = fmaf(sr[2], w2f, acc[j][a][0]);
-                    acc[j][a][1] = fmaf(sr[1], w0f, acc[j][a][1]); acc[j][a][1] = fmaf(sr[2], w1f, acc[j][a][1]); acc[j][a][1] = fmaf(sr[3], w2f, acc[j][a][1]);
-                    acc[j][a][2] = fmaf(sr[2], w0f, acc[j][a][2]); acc[j][a][2] = fmaf(sr[3], w1f, acc[j][a][2]); acc[j][a][2] = fmaf(sr[4], w2f, acc[j][a][2]);
-                    acc[j][a][3] = fmaf(sr[3], w0f, acc[j][a][3]); acc[j][a][3] = fmaf(sr[4], w1f, acc[j][a][3]); acc[j][a][3] = fmaf(sr[5], w2f, acc[j][a][3]);
+#pragma unroll
+                    for (int bq = 0; bq < NCB; bq++) {
+                        acc[j][a][bq] = fmaf(sr[bq], w0f, acc[j][a][bq]);
+                        acc[j][a][bq] = fmaf(sr[bq+1], w1f, acc[j][a][bq]);
+                        acc[j][a][bq] = fmaf(sr[bq+2], w2f, acc[j][a][bq]);
+                    }
                 }
             }
         }
     }
-    const int wc = w0 + tx*4;
+    const int wc = w0 + tx*NCB;
 #pragma unroll
     for (int j = 0; j < PCO; j++) {
         float *yo = y + (long)(co0 + blockIdx.z*PCO + j)*H*W;
 #pragma unroll
-        for (int a = 0; a < 2; a++) {
-            int hh = h0 + ty*2 + a;
+        for (int a = 0; a < NRA; a++) {
+            int hh = h0 + ty*NRA + a;
             if (hh >= H) continue;
             float *d2 = yo + (long)hh*W;
 #pragma unroll
-            for (int bq = 0; bq < 4; bq++) if (wc + bq < W) d2[wc + bq] = acc[j][a][bq];
+            for (int bq = 0; bq < NCB; bq++) if (wc + bq < W) d2[wc + bq] = acc[j][a][bq];
         }
     }
 }
@@ -2094,6 +2096,18 @@ static int launch_conv1x1(reuse_gpu_t *g, const float *x, const float *w, const 
     return reuse_gpu_ok(g, "conv1x1");
 }
 
+#define R8ONE(RN,PC,NC) do { \
+            if (regtile && dilH == 1)      k_conv2d_r8<RN,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
+            else if (regtile && dilH == 2) k_conv2d_r8<RN+2,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
+            else if (regtile && dilH == 4) k_conv2d_r8<RN+8,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
+            else if (regtile && dilH == 8) k_conv2d_r8<RN+24,PC,NC><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); \
+        } while (0)
+#define R8LAUNCH(R1,R2,R4,R8) \
+            if      (regtile && dilH == 1) { if (pco==4) k_conv2d_r8<R1,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R1,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R1,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
+            else if (regtile && dilH == 2) { if (pco==4) k_conv2d_r8<R2,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R2,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R2,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
+            else if (regtile && dilH == 4) { if (pco==4) k_conv2d_r8<R4,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R4,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R4,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
+            else if (regtile && dilH == 8) { if (pco==4) k_conv2d_r8<R8,4,4><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else if (pco==8) k_conv2d_r8<R8,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); else k_conv2d_r8<R8,16,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); }
+
 static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const float *b,
                          int C_in, int H, int W, int C_out, int kH, int kW,
                          int padH, int padW, int dilH, int dilW, int strideH, int strideW,
@@ -2115,14 +2129,13 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         const bool regtile = !getenv("REUSE_NAIVE_CONV2D") && kH == 3 && kW == 3 &&
                              dilW == 1 && strideH == 1 && strideW == 1 && padW == 1 && padH == dilH;
         static int big = -1;
-        if (big < 0) { const char *e = getenv("REUSE_CONV_TILE"); big = e ? atoi(e) : 81; }
-        if (big == 81 && n % PCO == 0) {
-            const dim3 grdb((unsigned)((W_out + 63) / 64), (unsigned)((H_out + 31) / 32), (unsigned)(n/PCO));
+        if (big < 0) { const char *e = getenv("REUSE_CONV_TILE"); big = e ? atoi(e) : 82; }
+        if (big >= 81 && big <= 83 && n % (big == 81 ? 4 : (big == 82 ? 8 : 16)) == 0) {
+            const int pco = (big == 81) ? 4 : (big == 82 ? 8 : 16), ncb = (big == 81) ? 4 : 2;
+            const int trh = (big == 83) ? 16 : 32;
+            const dim3 grdb((unsigned)((W_out + 16*ncb - 1) / (16*ncb)), (unsigned)((H_out + trh - 1) / trh), (unsigned)(n/pco));
             const dim3 blkb(16, 16);
-            if (regtile && dilH == 1)      k_conv2d_r8<34><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
-            else if (regtile && dilH == 2) k_conv2d_r8<36><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
-            else if (regtile && dilH == 4) k_conv2d_r8<40><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
-            else if (regtile && dilH == 8) k_conv2d_r8<48><<<grdb, blkb>>>(x, w, b, C_in, H, W, padH, padW, dilH, y, co0);
+            R8LAUNCH(34,36,40,48)
             else k_conv2d<<<grd, blk>>>(x, w, b, C_in, H, W, C_out, kH, kW, padH, padW, dilH, dilW, strideH, strideW, y, co0);
             launch_kick();
             continue;
