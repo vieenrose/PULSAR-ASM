@@ -363,6 +363,123 @@ __global__ void k_in_proj_r(const float *x, const float *W, float *x0, float *z,
     }
 }
 
+
+// in_proj fused with the causal depthwise conv, for one 80x64 tile.
+//
+// in_proj writes x0 (SL*DINNER floats) and the very next kernel reads it back,
+// 42 MB per launch x 60 launches per forward, and x0 is used by nothing else.
+// A thread here owns 4 consecutive rows of the tile, so the conv's 3-tap
+// history (DCONV=4) is in its own registers for taps inside the tile, comes
+// from the ty-1 lane group with a shuffle, and for the tile's first row comes
+// from a 3-row halo computed redundantly by the same block. x0 never reaches
+// global memory at all, and one launch replaces two.
+//
+// The GEMM keeps k_in_proj_r's shape (64 columns per block, 4x4 accumulators,
+// K=64 in two 32-wide chunks, 2 FMA per shared load). The z half has no conv,
+// so it just writes z as before.
+#define FUSE_MT 80
+__global__ void k_in_conv_r(const float *x, const float *W, float *z, float *xc,
+                            const float *Wc, const float *Bc,
+                            int S, int L, int rev)
+{
+    // Tile: 80 rows (L index) x 64 channels, 256 threads as (16,16).
+    // tx owns 5 consecutive rows, ty owns 4 channels -> 20 accumulators and
+    // 9 shared loads per k (2.2 FMA/load). Putting the row axis on tx is what
+    // makes the conv's 3-tap history a warp-local __shfl_up(1): with the row
+    // axis on ty, "the group above" for even ty sits in the previous warp and
+    // shfl_up(16) silently returns the caller's own value (rel-rms 0.57).
+    const int KC = 32, NT = 64, R = FUSE_MT + 3, RA = 5;
+    __shared__ float Xs[R][KC+4], Ws[NT][KC+4], Hl[3][NT+1];
+    const long SL = (long)S * L;
+    const long m0 = (long)blockIdx.x * FUSE_MT;
+    const int n0 = blockIdx.y * NT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty*16 + tx;
+    const bool halo_thr = tid < 3*NT;
+    const int hr = tid / NT, hc = tid % NT;
+    float acc[RA][4];
+#pragma unroll
+    for (int a = 0; a < RA; a++)
+#pragma unroll
+        for (int b = 0; b < 4; b++) acc[a][b] = 0.f;
+    float hacc = 0.f;
+    for (int k0 = 0; k0 < HID; k0 += KC) {
+        for (int i = tid; i < R*KC; i += 256) {
+            int r = i / KC, c = i % KC;
+            long m = m0 - 3 + r;
+            int sm = (int)(m / L), tm = (int)(m % L);
+            if (m < 0 || m >= SL) { Xs[r][c] = 0.f; continue; }
+            Xs[r][c] = x[((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + c];
+        }
+        for (int i = tid; i < NT*KC; i += 256) {
+            int r = i / KC, c = i % KC;
+            Ws[r][c] = W[(long)(n0+r)*HID + k0 + c];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KC; k++) {
+            float a[RA], w[4];
+#pragma unroll
+            for (int a4 = 0; a4 < RA; a4++) a[a4] = Xs[tx*RA + 3 + a4][k];
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++) w[b4] = Ws[ty*4 + b4][k];
+#pragma unroll
+            for (int a4 = 0; a4 < RA; a4++)
+#pragma unroll
+                for (int b4 = 0; b4 < 4; b4++) acc[a4][b4] = fmaf(a[a4], w[b4], acc[a4][b4]);
+            if (halo_thr) hacc = fmaf(Xs[hr][k], Ws[hc][k], hacc);
+        }
+        __syncthreads();
+    }
+    if (halo_thr) Hl[hr][hc] = hacc;
+    __syncthreads();
+    if (n0 >= DINNER) {                                             // z half: plain GEMM
+#pragma unroll
+        for (int a4 = 0; a4 < RA; a4++) {
+            long m = m0 + tx*RA + a4;
+            if (m >= SL) continue;
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++) z[m*DINNER + (n0 - DINNER) + ty*4 + b4] = acc[a4][b4];
+        }
+        return;
+    }
+    // Taps for output row m = m0+tx*RA+a4 are rows m-3..m = tile rows
+    // (tx*RA-3+a4) .. ; j = a4+k indexes them from m-3. j<3 lives in tx-1's
+    // rows 2,3,4 (one lane away, same warp); j>=3 is this thread's acc[j-3].
+    const unsigned FULL = 0xffffffffu;
+    float v[3][4];
+#pragma unroll
+    for (int jj = 0; jj < 3; jj++)
+#pragma unroll
+        for (int b4 = 0; b4 < 4; b4++) v[jj][b4] = __shfl_up_sync(FULL, acc[jj+2][b4], 1);
+    if (tx == 0) {
+#pragma unroll
+        for (int h = 0; h < 3; h++)
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++) v[h][b4] = Hl[h][ty*4 + b4];
+    }
+    const int c0 = n0 + ty*4;
+#pragma unroll
+    for (int a4 = 0; a4 < RA; a4++) {
+        long m = m0 + tx*RA + a4;
+        if (m >= SL) continue;
+        const int t = (int)(m % L);
+        const int ntap = (t >= DCONV-1) ? DCONV : t + 1;
+        float fv[4];
+#pragma unroll
+        for (int b4 = 0; b4 < 4; b4++) fv[b4] = Bc[c0 + b4];
+        for (int k = DCONV - ntap; k < DCONV; k++) {
+            const int j = a4 + k;
+#pragma unroll
+            for (int b4 = 0; b4 < 4; b4++)
+                fv[b4] = fmaf((j < 3 ? v[j][b4] : acc[j-3][b4]),
+                              Wc[(long)(c0 + b4)*DCONV + k], fv[b4]);
+        }
+#pragma unroll
+        for (int b4 = 0; b4 < 4; b4++) xc[m*DINNER + c0 + b4] = dsilu(fv[b4]);
+    }
+}
+
 __global__ void k_in_proj_t(const float *x, const float *W, float *x0, float *z,
                             int S, int L, int rev)
 {
@@ -875,6 +992,27 @@ static void prewarm(reuse_gpu_t *g)
     int grid = getenv("REUSE_PREWARM_GRID") ? atoi(getenv("REUSE_PREWARM_GRID")) : 5632;
     k_burn<<<grid, 256>>>(g->ws, iters);
     cudaDeviceSynchronize();
+}
+
+static int inproj_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("REUSE_INPROJ");
+        v = e ? atoi(e) : (getenv("REUSE_NAIVE_INPROJ") ? 0 : 2);
+    }
+    return v;
+}
+
+// in_proj and the causal depthwise conv are fused by default: x0 is consumed
+// only by the conv, so fusing keeps 42 MB per launch out of DRAM and drops a
+// launch. REUSE_NO_FUSE=1 falls back to the two-kernel path for A/B.
+static int fuse_conv(void)
+{
+    static int v = -1;
+    if (v < 0)
+        v = (inproj_mode() == 2 && !getenv("REUSE_NAIVE_CONV") && !getenv("REUSE_NO_FUSE")) ? 1 : 0;
+    return v;
 }
 
 static int naive_resid(void)
@@ -1535,13 +1673,13 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     char dt[8]; snprintf(dt, sizeof(dt), "%s_", rev ? "bw" : "fw");
         #define GDBG(tag, ptr, n) do { if (dbg) { char t_[32]; snprintf(t_, sizeof(t_), "%s%s", dt, tag); gdump(t_, ptr, n); } } while (0)
     {
-        static int tiled = -1;
-        if (tiled < 0) {
-            const char *e = getenv("REUSE_INPROJ");
-            tiled = e ? atoi(e) : (getenv("REUSE_NAIVE_INPROJ") ? 0 : 2);
-        }
+        const int tiled = inproj_mode();
         if (getenv("REUSE_SKIP_INPROJ")) { } else
-        if (tiled == 2) k_in_proj_r<<<dim3((unsigned)((SL+63)/64), (2*DINNER)/64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
+        if (fuse_conv()) {
+            k_in_conv_r<<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16)>>>(
+                x, W_in, z, xc, W_c, B_c, S, L, rev);
+        }
+        else if (tiled == 2) k_in_proj_r<<<dim3((unsigned)((SL+63)/64), (2*DINNER)/64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
         else if (tiled) k_in_proj_t<<<dim3((unsigned)((SL+MT32-1)/MT32), (2*DINNER)/NT64), dim3(16,16)>>>(x, W_in, x0, z, S, L, rev);
         else       k_in_proj<<<dim3((unsigned)((SL+255)/256), 2*DINNER), b1>>>(x, W_in, x0, z, S, L, rev);
     }
@@ -1549,7 +1687,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     GDBG("x0", x0, (size_t)SL*DINNER); GDBG("z", z, (size_t)SL*DINNER);
     {
         static int t = -1; if (t < 0) t = getenv("REUSE_NAIVE_CONV") ? 0 : 1;
-        if (getenv("REUSE_SKIP_CONV")) { } else
+        if (getenv("REUSE_SKIP_CONV") || fuse_conv()) { } else
         if (t) k_conv_causal_t<<<(unsigned)((SL+7)/8), 256>>>(x0, W_c, B_c, xc, S, L);
         else   k_conv_causal<<<dim3((unsigned)((SL+255)/256), DINNER), b1>>>(x0, W_c, B_c, xc, S, L);
     }
