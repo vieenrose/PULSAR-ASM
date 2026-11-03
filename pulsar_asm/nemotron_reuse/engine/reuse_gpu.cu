@@ -148,6 +148,24 @@ extern "C" const float *reuse_gpu_w(reuse_gpu_t *g, const char *name)
     return r->dptr;
 }
 
+// Maxwell (sm_53 / Jetson Nano) launch-resource guard. Some register-tiled
+// kernels (64 accumulators per thread) COMPILE for sm_53 but fail at LAUNCH
+// time with "too many resources requested for launch", because ptxas hands back
+// a kernel needing more than Maxwell's 255 registers/thread. The sm_53 compile
+// gate in checks.sh cannot see a launch failure, so the fallback has to be
+// chosen at runtime. REUSE_FORCE_MAXWELL_TILES=1 exercises the branch on a
+// dev host.
+static int gpu_is_maxwell(void)
+{
+    static int mw = -1;
+    if (mw < 0) {
+        cudaDeviceProp dp;
+        mw = (cudaGetDeviceProperties(&dp, 0) == cudaSuccess && dp.major < 6) ? 1 : 0;
+        if (getenv("REUSE_FORCE_MAXWELL_TILES")) mw = 1;
+    }
+    return mw;
+}
+
 static float *wallc(reuse_gpu_t *g, size_t n)
 {
     if (g->ws_off + n > g->ws_cap) {
@@ -2721,15 +2739,7 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         // resources requested" - it compiles for sm_53 fine, so the compile
         // gate cannot see it. The 32-accumulator code 82 is the Maxwell
         // fallback (it is what the Nano ran before the 64-acc tiles existed).
-        if (big >= 644 && big <= 646) {
-            static int maxw = -1;
-            if (maxw < 0) {
-                cudaDeviceProp dp;
-                maxw = (cudaGetDeviceProperties(&dp, 0) == cudaSuccess && dp.major < 6) ? 1 : 0;
-                if (getenv("REUSE_FORCE_MAXWELL_TILES")) maxw = 1;
-            }
-            if (maxw) big = 82;
-        }
+        if (big >= 644 && big <= 646 && gpu_is_maxwell()) big = 82;
         // 64-accumulator shapes: codes 644 (8co x 2col x 4row), 645 (8x4x2),
         // 646 (16x2x2). Each output amortises its 9 weight loads over
         // rows*cols positions and the warp-uniform weight loads are ~50% of
@@ -3064,7 +3074,12 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     GDBG("gscan", y, (size_t)SL*DINNER);
     {
         static int tiled = -1;
-        if (tiled < 0) tiled = getenv("REUSE_OP") ? atoi(getenv("REUSE_OP")) : (getenv("REUSE_NAIVE_OP") ? 0 : 3);
+        if (tiled < 0) {
+            tiled = getenv("REUSE_OP") ? atoi(getenv("REUSE_OP")) : (getenv("REUSE_NAIVE_OP") ? 0 : 3);
+            /* k_out_proj_r8's 64 accumulators exceed Maxwell's per-thread
+               register limit: it compiles for sm_53 and fails to launch. */
+            if (tiled == 3 && gpu_is_maxwell()) tiled = 2;
+        }
         if (tiled) {
             dim3 g((HID+GT-1)/GT, (unsigned)((SL+GT-1)/GT));
             if      (tiled == 3) k_out_proj_r8<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, out, (int)SL);
