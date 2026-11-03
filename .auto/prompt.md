@@ -127,6 +127,10 @@ started from):
 `ssh pesi@100.70.245.36` (hostname `iPhO`), repo at `~/reuse_port`:
 `rsync -a --exclude '*.o' --exclude 'reuse_nano_gpu' engine/ pesi@100.70.245.36:~/reuse_port/engine/`
 then `cd ~/reuse_port && NVCC=/usr/local/cuda-10.2/bin/nvcc ./build_nano.sh`
-and `CUDA_LAUNCH_BLOCKING=1 REUSE_WS_MB=640 ./run_bench.sh`.
+and `./run_bench.sh` (it exports `CUDA_LAUNCH_BLOCKING=1 REUSE_GPU_ISTFT=1 REUSE_CPU_STFT=1` and
+runs both rates with the fed-reference protocol; always drive the Nano through this script - manual
+invocations without `REUSE_GPU_ISTFT` fall back to the CPU iSTFT and produced a bogus 16 kHz RTF of
+11.5 in an earlier note). Current: 8 kHz RTF_total 3.1500 (model 3.1326 + istft(gpu) 0.0174),
+16 kHz RTF_total 6.2304 (model 6.1615 + istft(gpu) 0.0689); cumulative 44.34 -> 3.15 = 14.1x.
 Only ~3 GiB device memory: the encoder arena peak is ~560 MiB at 8 kHz, ~1.1 GiB
 at 16 kHz. Disk is tight (~450 MB). Do not stop services on it.

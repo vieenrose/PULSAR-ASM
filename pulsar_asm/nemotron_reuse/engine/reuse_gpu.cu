@@ -764,6 +764,65 @@ __global__ void k_x_proj_r(const float *xc, const float *W, float *xdbl, long SL
     }
 }
 
+/* xdbl[m][o] = sum_k xc[m][k]*W[o][k], K = DINNER = 256, N = XP = 36, M = SL rows.
+ * Templated tile: block (TX, 256/TX), each thread owns RA = MT/(256/TX) rows and
+ * CB = NT/TX columns, so FMA per shared load = RA*CB/(RA+CB). The shipped shape
+ * (128,32,(16,16)) = 8 rows x 2 cols = 16 accumulators = 1.6 FMA/load and 2 blocks
+ * in x for XP=36 (the second tile has 4 useful columns of 32). NT=40 covers XP in
+ * one tile with 10% padding; more accumulators is the lever that moved every other
+ * GEMM here. K order is unchanged (k0 chunks of 32, k ascending), so results are
+ * bit-identical. REUSE_XPROJ=MT,NT,TX selects the shape; 2 = the shipped one. */
+template<int MT, int NT, int TX>
+__global__ void k_x_proj_g(const float *xc, const float *W, float *xdbl, long SL)
+{
+    const int KT = 32, RS = (KT+4)/4, TY = 256/TX, RA = MT/TY, CB = NT/TX;
+    static_assert(NT % TX == 0 && MT % (256/TX) == 0 && 256 % TX == 0, "tile must divide the block");
+    __shared__ __align__(16) float As[MT][KT+4];
+    __shared__ __align__(16) float Bs[NT][KT+4];
+    const int m0 = blockIdx.y * MT, n0 = blockIdx.x * NT;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty*TX + tx;
+    float acc[RA*CB];
+#pragma unroll
+    for (int i = 0; i < RA*CB; i++) acc[i] = 0.f;
+    for (int k0 = 0; k0 < DINNER; k0 += KT) {
+        for (int i = tid; i < MT*RS; i += 256) {
+            const int r = i / RS, q = 4*(i - r*RS);
+            const int m = m0 + r;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (q < KT && m < SL) v = *(const float4*)(xc + (long)m*DINNER + k0 + q);
+            ((float4*)&As[0][0])[i] = v;
+        }
+        for (int i = tid; i < NT*RS; i += 256) {
+            const int r = i / RS, q = 4*(i - r*RS);
+            const int n = n0 + r;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (q < KT && n < XP) v = *(const float4*)(W + (long)n*DINNER + k0 + q);
+            ((float4*)&Bs[0][0])[i] = v;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KT; k++) {
+            float bv[CB];
+#pragma unroll
+            for (int c = 0; c < CB; c++) bv[c] = Bs[tx*CB + c][k];
+#pragma unroll
+            for (int r = 0; r < RA; r++) {
+                const float a = As[ty*RA + r][k];
+#pragma unroll
+                for (int c = 0; c < CB; c++) acc[r*CB + c] = fmaf(a, bv[c], acc[r*CB + c]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < RA*CB; i++) {
+        const int r = i / CB, c = i % CB;
+        int m = m0 + ty*RA + r, n = n0 + tx*CB + c;
+        if (m < SL && n < XP) xdbl[(long)m*XP + n] = acc[i];
+    }
+}
+
 __global__ void k_x_proj_t(const float *xc, const float *W, float *xdbl, long SL)
 {
     // xdbl[m][o] = sum_k xc[m][k] * W[o][k];  K = DINNER = 256, N = XP = 36.
@@ -3278,9 +3337,27 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     GDBG("gxact", xc, (size_t)SL*DINNER);
     {
         static int tiled = -1;
-        if (tiled < 0) tiled = getenv("REUSE_XPROJ") ? atoi(getenv("REUSE_XPROJ")) : (getenv("REUSE_NAIVE_XPROJ") ? 0 : 2);
+        if (tiled < 0) tiled = getenv("REUSE_XPROJ") ? atoi(getenv("REUSE_XPROJ"))
+                                                      : (getenv("REUSE_NAIVE_XPROJ") ? 0 : 1284008);
+        /* default 1284008 = k_x_proj_g<128,40,8>: 4 rows x 5 cols = 20 accumulators
+           (2.2 FMA per shared load vs 1.6) and ONE tile column covering all XP=36
+           outputs, where the shipped (128,32) shape needed two and the second had 4
+           useful columns of 32. x_proj 36 ms -> ~27 ms, model -2.2%, bit-compatible.
+           =2 restores k_x_proj_r, =0 the naive GEMV. */
         if (getenv("REUSE_SKIP_XPROJ")) { } else
         if (tiled == 2) k_x_proj_r<<<dim3((XP+31)/32, (unsigned)((SL+127)/128)), dim3(16,16), 0, st>>>(xc, W_xp, xdbl, SL);
+        else if (tiled >= 100) {
+            /* REUSE_XPROJ = MT*10000 + NT*100 + TX, e.g. 12804016 = MT=128 NT=40 TX=16 */
+            const int gmt = tiled/10000, gnt = (tiled/100) % 100, gtx = tiled % 100;
+            const dim3 grd((unsigned)((XP+gnt-1)/gnt), (unsigned)((SL+gmt-1)/gmt));
+            #define XPG(MTv,NTv,TXv) do { if (gmt==MTv && gnt==NTv && gtx==TXv)                 k_x_proj_g<MTv,NTv,TXv><<<grd, dim3(TXv,256/TXv), 0, st>>>(xc, W_xp, xdbl, SL); } while (0)
+            XPG(128,32,16); XPG(128,40,8);  XPG(256,40,8);  XPG(128,64,16);
+            XPG(256,32,16); XPG(64,40,8);   XPG(128,48,16);
+            XPG(64,32,16);  XPG(256,64,16); XPG(128,80,16); XPG(32,40,8);
+            XPG(192,40,8);  XPG(128,40,4);  XPG(64,72,8);   XPG(96,40,8);
+            XPG(128,72,8);  XPG(256,40,8);
+            #undef XPG
+        }
         else if (tiled) k_x_proj_t<<<dim3((XP+31)/32, (unsigned)((SL+63)/64)), dim3(16,16), 0, st>>>(xc, W_xp, xdbl, SL);
         else       k_x_proj<<<dim3((unsigned)((SL+255)/256), XP), b1, 0, st>>>(xc, W_xp, xdbl, SL);
     }
