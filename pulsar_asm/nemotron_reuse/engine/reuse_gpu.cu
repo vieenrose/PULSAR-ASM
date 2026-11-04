@@ -3251,6 +3251,8 @@ static int launch_conv2d_pair(reuse_gpu_t *g, const float *x, const float *w, co
                               float *y, int tilehint, const float *x2, int ng,
                               long hoff_out, long hoff_x);
 static int sp_up(reuse_gpu_t *g, const char *prefix, const float *x, int H, int W, int r, float *y);
+static int dense_block_gpu(reuse_gpu_t *g, const char *prefix, const float *x_in,
+                           int T, int F, float *out, int tilehint);
 static int inorm(reuse_gpu_t *g, const float *x, float *y, int N, int C, int H, int W,
                  const char *nkey, const char *akey);
 
@@ -3265,6 +3267,7 @@ static int dense_block_pair(reuse_gpu_t *g, const char *pfx0, const char *pfx1,
                             long hoff_out_pair)
 {
     if (DEPTH > 4) return 0;                       // dil 16/32 have no paired tile
+    if (gpu_is_maxwell()) return 0;                // TABLE convs corrupt on sm_53 (#73/#74)
     float *slots = wallc(g, (size_t)2*HID*(DEPTH-1)*T*F);
     float *tmp   = wallc(g, (size_t)2*HID*T*F);
     if (!slots || !tmp) return 1;
@@ -3370,7 +3373,13 @@ extern "C" int reuse_gpu_decoders_pair(reuse_gpu_t *g, const float *enc,
     snprintf(k1, sizeof(k1), "%s.dense_block.dense_block", "phase_decoder");
     int rc = dense_block_pair(g, k0, k1, enc, T, F, d_pair, d_pair + htf, dectile(), htf);
     if (rc < 0) return 1;
-    if (!rc) return 2;
+    if (!rc) {
+        // TABLE convs unsupported on this arch (sm_53 corrupts the 32-acc
+        // table shapes, #73/#74): run the two dense blocks sequentially with
+        // the shipped copy path, then pair the (non-conv) tail.
+        if (dense_block_gpu(g, k0, enc, T, F, d_pair, dectile())) return 1;
+        if (dense_block_gpu(g, k1, enc, T, F, d_pair + htf, dectile())) return 1;
+    }
     gdump("d_db", d_pair, (size_t)2*HID*T*F);
 
     const long hu1 = (long)HID*T*(F*2);
