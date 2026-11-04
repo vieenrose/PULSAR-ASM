@@ -2242,11 +2242,59 @@ __global__ void k_sweep_mask(float *amp, int T, int F)
 // with m_k = 1 for DC/Nyquist and 2 for interior bins (conjugate pair).
 // Built as two real GEMMs against a float64-rounded DFT matrix so the result
 // matches the double-accumulating CPU reference to fp32 rounding.
+// Kahan (compensated) accumulation of one float term into (s, c).
+// The sum keeps its own rounding error in c, so the running sum of N terms has
+// an O(u*|sum|) error bound instead of O(N*u*|sum|) for a naive float sum.
+#define KAHAN_ADD(s, c, v) do { float y_ = (v) - (c); float t_ = (s) + y_; \
+                                (c) = ((t_) - (s)) - (y_); (s) = t_; } while (0)
+
+// Fast path: the same GEMM accumulated in fp32 with Kahan compensation, and the
+// exact product residual folded in. Each term v = a*b is split into (p, e) with
+// p = a*b (rounded) and e = fmaf(a, b, -p) (exact, by Sterbenz/FMA), and BOTH
+// parts are pushed through the compensated sum, so the products contribute
+// exactly and only the additions round - 514 terms land at ~1e-7 relative
+// (2x the float output rounding; the fp32 iSTFT atomics already sit at 9e-8),
+// where a plain fp32 sum would be ~1e-5 and the fp64 form costs 64x the issue
+// slots on Maxwell. REUSE_IDFT=0 restores the fp64 form for A/B.
+__global__ void k_idft_k(const float *Cr, const float *Ci, const float *Cc, const float *Cs,
+                         float *Y, int F, int T, int n_fft)
+{
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int t0 = blockIdx.y * 16;
+    if (n >= n_fft) return;
+    float acc[16], comp[16];
+#pragma unroll
+    for (int i2 = 0; i2 < 16; i2++) { acc[i2] = 0.0f; comp[i2] = 0.0f; }
+    const int rem = T - t0;
+    for (int k = 0; k < F; k++) {
+        // tables are stored [k][n]: lanes run along n -> 128 B per warp
+        const float cv = Cc[(long)k*n_fft + n], sv = Cs[(long)k*n_fft + n];
+        const float *crp = Cr + (long)k*T + t0;
+        const float *cip = Ci + (long)k*T + t0;
+#pragma unroll 4
+        for (int j2 = 0; j2 < 16; j2++) {
+            if (j2 < rem) {
+                float xr = crp[j2], xi = cip[j2];
+                float p = cv * xr;
+                KAHAN_ADD(acc[j2], comp[j2], p);
+                KAHAN_ADD(acc[j2], comp[j2], fmaf(cv, xr, -p));
+                float q = sv * xi;
+                KAHAN_ADD(acc[j2], comp[j2], q);
+                KAHAN_ADD(acc[j2], comp[j2], fmaf(sv, xi, -q));
+            }
+        }
+    }
+#pragma unroll
+    for (int j2 = 0; j2 < 16; j2++)
+        if (j2 < rem) Y[(long)n*T + t0 + j2] = acc[j2];
+}
+
 __global__ void k_idft(const float *Cr, const float *Ci, const float *Cc, const float *Cs,
                        float *Y, int F, int T, int n_fft)
 {
     // Y[n][t] = sum_k Cr[k][t]*Cc[n][k] + Ci[k][t]*Cs[n][k], accumulated in double
     // (the CPU reference sums in double; float accumulation would not match).
+    // Tables arrive in [k][n] order (coalesced for the lane-along-n pattern).
     int n = blockIdx.x * blockDim.x + threadIdx.x;
     int t0 = blockIdx.y * 16;
     if (n >= n_fft) return;
@@ -2254,7 +2302,7 @@ __global__ void k_idft(const float *Cr, const float *Ci, const float *Cc, const 
 #pragma unroll
     for (int i2 = 0; i2 < 16; i2++) acc[i2] = 0.0;
     for (int k = 0; k < F; k++) {
-        double cv = (double)Cc[(long)n*F + k], sv = (double)Cs[(long)n*F + k];
+        double cv = (double)Cc[(long)k*n_fft + n], sv = (double)Cs[(long)k*n_fft + n];
         const float *crp = Cr + (long)k*T + t0;
         const float *cip = Ci + (long)k*T + t0;
         int rem = T - t0;
@@ -2297,7 +2345,10 @@ __global__ void k_istft_tables(float *Cc, float *Cs, float *w, int F, int n_fft,
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     long total = (long)n_fft * F;
     if (i < total) {
-        int n = (int)(i / F), k = (int)(i % F);
+        // [k][n] layout: k_idft's lanes run along n, so the old [n][k] layout
+        // put one useful float in every 32 B sector (168 MB of sector traffic
+        // per call at 8 kHz). Same values, transposed index.
+        int k = (int)(i / n_fft), n = (int)(i % n_fft);
         double m = (k == 0 || 2*k == n_fft) ? 1.0 : 2.0;
         double ang = 2.0 * pi * (double)n * (double)k / (double)n_fft;
         Cc[i] = (float)( m * cos(ang) / n_fft);
@@ -2341,11 +2392,17 @@ extern "C" int reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *
     d_Ci = d_Cr + ft;  d_Y = d_Ci + ft;  d_wsum = d_Y + nt;
     k_istft_tables<<<(unsigned)(((long)nf+n_fft+255)/256), 256>>>(d_Cc, d_Cs, d_w, F, n_fft, win);
     { cudaError_t e = cudaGetLastError(); if (e) fprintf(stderr, "[istfterr] tables %s\n", cudaGetErrorString(e)); }
+    static int idft_k = -1;
+    if (idft_k < 0) { const char *e = getenv("REUSE_IDFT"); idft_k = (e && atoi(e) == 0) ? 0 : 1; }
     // mag -> linear (expm1(relu)) then split phase
     long nsp = ft;
     k_mag_pha_split<<<(unsigned)((nsp+255)/256), 256>>>(d_mag, d_pha, d_Cr, d_Ci, nsp);
-    k_idft<<<dim3((unsigned)((n_fft+127)/128), (unsigned)((T+15)/16)), 128>>>(
-        d_Cr, d_Ci, d_Cc, d_Cs, d_Y, F, T, n_fft);
+    if (idft_k)
+        k_idft_k<<<dim3((unsigned)((n_fft+127)/128), (unsigned)((T+15)/16)), 128>>>(
+            d_Cr, d_Ci, d_Cc, d_Cs, d_Y, F, T, n_fft);
+    else
+        k_idft<<<dim3((unsigned)((n_fft+127)/128), (unsigned)((T+15)/16)), 128>>>(
+            d_Cr, d_Ci, d_Cc, d_Cs, d_Y, F, T, n_fft);
     cudaMemset(d_out, 0, (size_t)out_len*sizeof(float));
     cudaMemset(d_wsum, 0, (size_t)out_len*sizeof(float));
     k_ola<<<dim3((unsigned)((n_fft+127)/128), (unsigned)T), dim3(128, 1)>>>(
