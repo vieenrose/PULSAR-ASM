@@ -204,29 +204,9 @@ static void attention(float* q, float* k, float* v, float* out, int pos, int NQ,
   }
 }
 
-int main(int argc, char** argv) {
-  if (argc < 6) {
-    printf("usage: %s <depth.lfm3q8> <hidden.f32> <codes.i32> <masked.u8> <out.f32>\n", argv[0]);
-    return 2;
-  }
-  std::vector<Ent> ents;
-  std::map<std::string, Ent*> by;
-  char* js = nullptr;
-  if (!load_blob(argv[1], ents, by, js)) return 1;
-
-  // read hidden
-  FILE* fh = fopen(argv[2], "rb");
-  float hidden[2048];
-  fread(hidden, 4, 2048, fh); fclose(fh);
-  // read codes
-  FILE* fc = fopen(argv[3], "rb");
-  int codes[12];
-  fread(codes, 4, 12, fc); fclose(fc);
-  // read masked
-  FILE* fm = fopen(argv[4], "rb");
-  unsigned char masked[12];
-  fread(masked, 1, 12, fm); fclose(fm);
-
+static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& by,
+                      const float* hidden, const int* codes, const unsigned char* masked,
+                      float* out_logits) {
   const int DH = 1024;  // depth hidden
   const int SH = 2048;  // src hidden
   const int NCB = 12;
@@ -422,7 +402,6 @@ int main(int argc, char** argv) {
   // Each codebook has its OWN embedding_norm before the tied head. Missing this step was
   // the cause of the final-logit error (layer rms matched; logits did not).
   Ent* head = get("depth_head_stacked.weight");
-  float out_logits[12 * 2017];
   float xn[DH];
   for (int c = 0; c < NCB; c++) {
     char en[256]; snprintf(en, sizeof en, "depth_embeddings.%d.embedding_norm.weight", c);
@@ -432,10 +411,122 @@ int main(int argc, char** argv) {
             xn, out_logits + c*CBS, CBS, DH);
   }
 
-  // write output
+}
+
+int main(int argc, char** argv) {
+  // single pass:  lfm3_depth <blob> <hidden.f32> <codes.i32> <masked.u8> <out.f32>
+  // MaskGIT:      lfm3_depth <blob> <hidden.f32> --maskgit <order.i32> <hist.i32> <out_codes.i32> [penalty] [window]
+  //   order.i32: n_pass*4 int32, pass-major reveal order (the oracle's order.<f>.i32, fed as data)
+  //   hist.i32 : n_hist*12 int32, frame-major per-codebook history (may be empty); the
+  //              repetition penalty is applied over the last `window` frames, default 64, penalty 1.1
+  if (argc < 6) {
+    printf("usage: %s <depth.lfm3q8> <hidden.f32> <codes.i32> <masked.u8> <out.f32>\n", argv[0]);
+    printf("       %s <depth.lfm3q8> <hidden.f32> --maskgit <order.i32> <hist.i32> <out_codes.i32> [penalty] [window]\n", argv[0]);
+    return 2;
+  }
+  std::vector<Ent> ents;
+  std::map<std::string, Ent*> by;
+  char* js = nullptr;
+  if (!load_blob(argv[1], ents, by, js)) return 1;
+
+  float hidden[2048];
+  FILE* fh = fopen(argv[2], "rb");
+  if (!fh) { printf("cannot open %s\n", argv[2]); return 2; }
+  if (fread(hidden, 4, 2048, fh) != 2048) { printf("short hidden\n"); fclose(fh); return 2; }
+  fclose(fh);
+
+  if (!strcmp(argv[3], "--maskgit")) {
+    if (argc < 7) { printf("maskgit needs order, history, out\n"); return 2; }
+    const float PEN = (argc > 7) ? (float)atof(argv[7]) : 1.1f;
+    const int WIN = (argc > 8) ? atoi(argv[8]) : 64;
+    FILE* fo1 = fopen(argv[4], "rb");
+    if (!fo1) { printf("cannot open %s\n", argv[4]); return 2; }
+    fseek(fo1, 0, SEEK_END); long no = ftell(fo1) / 4; fseek(fo1, 0, SEEK_SET);
+    std::vector<int> order(no);
+    if (fread(order.data(), 4, no, fo1) != (size_t)no) { printf("short order\n"); return 2; }
+    fclose(fo1);
+    if (no % 4) { printf("order length %ld not a multiple of 4 (schedule [4,4,4])\n", no); return 2; }
+    FILE* fhist = fopen(argv[5], "rb");
+    std::vector<int> hist;
+    if (fhist) {
+      fseek(fhist, 0, SEEK_END); long nh = ftell(fhist) / 4; fseek(fhist, 0, SEEK_SET);
+      hist.resize(nh);
+      if (nh && fread(hist.data(), 4, nh, fhist) != (size_t)nh) { printf("short hist\n"); fclose(fhist); return 2; }
+      fclose(fhist);
+    }
+    if (hist.size() % 12) { printf("history length %zu not a multiple of 12\n", hist.size()); return 2; }
+    int n_hist = (int)(hist.size() / 12);
+    int lo = n_hist - WIN; if (lo < 0) lo = 0;
+
+    int codes[12] = {0};
+    unsigned char revealed[12] = {0};
+    float logits[12 * 2017];
+    for (long p = 0; p + 4 <= no; p += 4) {
+      unsigned char masked[12];
+      for (int c = 0; c < 12; c++) masked[c] = (unsigned char)!revealed[c];
+      depth_forward(ents, by, hidden, codes, masked, logits);
+      for (int j = 0; j < 4; j++) {
+        int idx = order[p + j];
+        if (idx < 0 || idx >= 12) { printf("bad order entry %d\n", idx); return 2; }
+        float s[2017];
+        memcpy(s, logits + idx * 2017, sizeof s);
+        // HF RepetitionPenaltyLogitsProcessor, 2-D path: it GATHERS the history's scores
+        // from the unmodified row and scatters the penalised values back, so a code that
+        // appears k times in the window is penalised ONCE. Penalising per occurrence
+        // over-penalised repeated codes (found on fixture p3, frames 11/14/15).
+        static unsigned char seen[2017];
+        memset(seen, 0, sizeof seen);
+        for (int i = lo; i < n_hist; i++) {
+          int v = hist[(size_t)i * 12 + idx];                   // per-codebook history, window 64
+          if (v < 0 || v >= 2017) { printf("history code out of range %d\n", v); return 2; }
+          if (seen[v]) continue;
+          seen[v] = 1;
+          float g = s[v];
+          s[v] = (g < 0) ? g * PEN : g / PEN;
+        }
+        int best = 0;
+        for (int v = 1; v < 2017; v++) if (s[v] > s[best]) best = v;
+        codes[idx] = best;
+        revealed[idx] = 1;
+      }
+      if (getenv("LFM_DEPTH_TRACE")) {
+        printf("pass %ld codes = [", p);
+        for (int c = 0; c < 12; c++) printf("%d%s", revealed[c] ? codes[c] : -1, c == 11 ? "]" : ",");
+        printf("  order = [");
+        for (int j = 0; j < 4; j++) printf("%d%s", order[p + j], j == 3 ? "]" : ",");
+        printf("  n_hist=%d\n", n_hist);
+        fflush(stdout);
+      }
+    }
+    for (int c = 0; c < 12; c++)
+      if (!revealed[c]) { printf("codebook %d never scheduled by the reveal order\n", c); return 2; }
+    FILE* foc = fopen(argv[6], "wb");
+    if (!foc) { printf("cannot write %s\n", argv[6]); return 2; }
+    fwrite(codes, 4, 12, foc);
+    fclose(foc);
+    printf("maskgit: codes = [");
+    for (int c = 0; c < 12; c++) printf("%d%s", codes[c], c == 11 ? "]" : ",");
+    printf("\n");
+    return 0;
+  }
+
+  int codes[12];
+  FILE* fc = fopen(argv[3], "rb");
+  if (!fc) { printf("cannot open %s\n", argv[3]); return 2; }
+  if (fread(codes, 4, 12, fc) != 12) { printf("short codes\n"); fclose(fc); return 2; }
+  fclose(fc);
+  unsigned char masked[12];
+  FILE* fm = fopen(argv[4], "rb");
+  if (!fm) { printf("cannot open %s\n", argv[4]); return 2; }
+  if (fread(masked, 1, 12, fm) != 12) { printf("short masked\n"); fclose(fm); return 2; }
+  fclose(fm);
+
+  float out_logits[12 * 2017];
+  depth_forward(ents, by, hidden, codes, masked, out_logits);
   FILE* fo = fopen(argv[5], "wb");
-  fwrite(out_logits, 4, 12 * CBS, fo);
+  if (!fo) { printf("cannot write %s\n", argv[5]); return 2; }
+  fwrite(out_logits, 4, 12 * 2017, fo);
   fclose(fo);
-  printf("done: wrote %d floats\n", 12 * CBS);
+  printf("done: wrote %d floats\n", 12 * 2017);
   return 0;
 }
