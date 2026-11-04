@@ -1,0 +1,31 @@
+{
+ "prompt_len": 26,
+ "seed": 1234,
+ "audio_temperature": 0.0,
+ "repetition_penalty": 1.1,
+ "repetition_window": 64,
+ "schedule": [
+  4,
+  4,
+  4
+ ],
+ "eos_code": 2016,
+ "nframes": 16,
+ "eos_at": -1,
+ "eos.0": 0,
+ "eos.1": 0,
+ "eos.2": 0,
+ "eos.3": 0,
+ "eos.4": 0,
+ "eos.5": 0,
+ "eos.6": 0,
+ "eos.7": 0,
+ "eos.8": 0,
+ "eos.9": 0,
+ "eos.10": 0,
+ "eos.11": 0,
+ "eos.12": 0,
+ "eos.13": 0,
+ "eos.14": 0,
+ "eos.15": 0
+}

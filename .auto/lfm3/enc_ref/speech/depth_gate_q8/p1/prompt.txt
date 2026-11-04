@@ -1,0 +1,5 @@
+<|startoftext|><|im_start|>system
+Perform ASR in English.<|im_end|>
+<|im_start|>user
+Tell me a short fact.<|im_end|>
+<|im_start|>assistant

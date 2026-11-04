@@ -1,0 +1,17 @@
+{
+ "prompt_len": 26,
+ "seed": 1234,
+ "audio_temperature": 0.0,
+ "repetition_penalty": 1.1,
+ "repetition_window": 64,
+ "schedule": [
+  4,
+  4,
+  4
+ ],
+ "eos_code": 2016,
+ "nframes": 2,
+ "eos_at": 1,
+ "eos.0": 0,
+ "eos.1": 1
+}

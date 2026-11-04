@@ -1,0 +1,5 @@
+<|startoftext|><|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Good morning, how are you today?<|im_end|>
+<|im_start|>assistant

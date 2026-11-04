@@ -38,15 +38,74 @@ import numpy as np
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "speech", "depth_gate")
+# DEPTH_Q8=<blob>: evaluate HF on the SAME dequantised Q8 depth weights the engine ships
+# (HF-as-contract). The fp32 oracle measures the quantization error; the Q8 oracle is the
+# gate reference, because the engine computes the Q8 function, not the fp32 one.
+DEPTH_Q8 = os.environ.get("DEPTH_Q8")
+_BASE = os.path.join(HERE, "speech", "depth_gate_q8" if DEPTH_Q8 else "depth_gate")
+OUT = _BASE if int(os.environ.get("DEPTH_PROMPT", "0")) == 0 and not os.environ.get("DEPTH_SUB") \
+    else os.path.join(_BASE, "p" + os.environ.get("DEPTH_PROMPT", "0"))
 MODEL = os.environ.get("LFM3_MODEL", "/home/louis/models/lfm3/LFM3-Audio-2B")
 NFRAMES = int(os.environ.get("DEPTH_FRAMES", "16"))
 SEED = 1234
 PENALTY = 1.1
 REP_WIN = 64
 
-PROMPT_TEXT = ("<|startoftext|><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-               "<|im_start|>user\nSay something.<|im_end|>\n<|im_start|>assistant\n")
+# Five fixtures (the S4 gate protocol asks for 5). DEPTH_PROMPT=k selects one; the
+# default 0 is the original fixture and keeps its historical output directory.
+PROMPTS = [
+    ("<|startoftext|><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+     "<|im_start|>user\nSay something.<|im_end|>\n<|im_start|>assistant\n"),
+    ("<|startoftext|><|im_start|>system\nPerform ASR in English.<|im_end|>\n"
+     "<|im_start|>user\nTell me a short fact.<|im_end|>\n<|im_start|>assistant\n"),
+    ("<|startoftext|><|im_start|>system\nYou are a concise narrator.<|im_end|>\n"
+     "<|im_start|>user\nRead the weather report aloud.<|im_end|>\n<|im_start|>assistant\n"),
+    ("<|startoftext|><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+     "<|im_start|>user\nGood morning, how are you today?<|im_end|>\n<|im_start|>assistant\n"),
+    ("<|startoftext|><|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+     "<|im_start|>user\nCount slowly from one to five.<|im_end|>\n<|im_start|>assistant\n"),
+]
+FIXTURE = int(os.environ.get("DEPTH_PROMPT", "0"))
+PROMPT_TEXT = PROMPTS[FIXTURE]
+
+def load_q8_blob(path):
+    """Dequantise the depth blob exactly as lfm3_depth.cu does: float(code) * scale per
+    32-wide block (fp32). Returns {tensor name: float32 array} for the dtype-1 tensors."""
+    import struct
+    with open(path, "rb") as f:
+        assert f.read(8) == b"LFM3Q8\x01\x00", "bad magic"
+        n = struct.unpack("<I", f.read(4))[0]
+        hdr = json.loads(f.read(n))
+        base = 12 + n
+        out = {}
+        for e in hdr["table"]:
+            if e["dtype"] != 1:
+                continue
+            f.seek(base + e["off"])
+            codes = np.frombuffer(f.read(e["ncodes"]), dtype=np.int8).reshape(e["ne"])
+            scales = np.frombuffer(f.read(e["nscales"]), dtype=np.float32).reshape(e["ne"][0], -1)
+            out[e["name"]] = (codes.astype(np.float32) * np.repeat(scales, 32, axis=1)).astype(np.float32)
+    return out
+
+def apply_q8_depth(dd, q8):
+    """Replace every depth-decoder Linear with its Q8 dequant. The codebook logits use the
+    STACKED Q8 head (depth_head_stacked = the 12 tied embeddings, codebook-major), not the
+    bf16 embedding tensors, which stay exact for the lookups."""
+    with torch.no_grad():
+        dd.depth_linear.weight.copy_(torch.from_numpy(q8["depth_linear.weight"]))
+        for li, layer in enumerate(dd.model.layers):
+            for name, mod in [("self_attn.q_proj", layer.self_attn.q_proj), ("self_attn.k_proj", layer.self_attn.k_proj),
+                              ("self_attn.v_proj", layer.self_attn.v_proj), ("self_attn.o_proj", layer.self_attn.o_proj),
+                              ("self_attn.gate_proj", layer.self_attn.gate_proj),
+                              ("feed_forward.w1", layer.feed_forward.w1), ("feed_forward.w2", layer.feed_forward.w2),
+                              ("feed_forward.w3", layer.feed_forward.w3)]:
+                mod.weight.copy_(torch.from_numpy(q8[f"depthformer.model.layers.{li}.{name}.weight"]))
+    head = torch.from_numpy(q8["depth_head_stacked.weight"]).view(dd.num_codebooks, -1, dd.hidden_size)
+    for c, emb in enumerate(dd.depth_embeddings):
+        def logits(hidden_states, _c=c, _e=emb):
+            # HF: F.linear(embedding_norm(h), embedding.weight); here the weight is the Q8 head slice
+            return torch.nn.functional.linear(_e.embedding_norm(hidden_states), head[_c])
+        emb.logits = logits
 
 def w32(name, a):
     a = np.ascontiguousarray(np.asarray(a, dtype=np.float32))
@@ -79,6 +138,9 @@ def main():
     print(f"loader={Loader.__name__} num_codebooks={ncb} schedule={sched} "
           f"eos_code={eos_code} dev={dev}")
     dd = m.depth_decoder
+    if DEPTH_Q8:
+        apply_q8_depth(dd, load_q8_blob(DEPTH_Q8))
+        print("depth decoder weights replaced by the Q8 dequant of", DEPTH_Q8, flush=True)
     print("depth_linear", tuple(dd.depth_linear.weight.shape),
           "codebook_emb", tuple(m.codebook_embedding.weight.shape))
 

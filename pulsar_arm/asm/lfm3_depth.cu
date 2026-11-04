@@ -154,20 +154,23 @@ static float gelu(float x) {
 }
 
 // RoPE
+// HF apply_rotary_pos_emb: rotate_half pairs element i with i + HD/2 (NOT 2i with 2i+1).
+// q_embed = q*cos + rotate_half(q)*sin, with cos/sin built from cat(freqs, freqs).
 static void rope(float* q, float* k, int pos, int HD, float theta, float partial) {
   int angles = (int)(partial * HD) / 2;
-  for (int i = 0; i < HD/2; i++) {
+  const int half = HD / 2;
+  for (int i = 0; i < half; i++) {
     float freq = (i < angles) ? 1.0f / powf(theta, (float)(2*i) / (float)HD) : 0.0f;
     float cosv = cosf(pos * freq), sinv = sinf(pos * freq);
     if (q) {
-      float q0 = q[2*i], q1 = q[2*i+1];
-      q[2*i] = q0*cosv - q1*sinv;
-      q[2*i+1] = q0*sinv + q1*cosv;
+      float a = q[i], b = q[i + half];
+      q[i]        = a*cosv - b*sinv;
+      q[i + half] = b*cosv + a*sinv;
     }
     if (k) {
-      float k0 = k[2*i], k1 = k[2*i+1];
-      k[2*i] = k0*cosv - k1*sinv;
-      k[2*i+1] = k0*sinv + k1*cosv;
+      float a = k[i], b = k[i + half];
+      k[i]        = a*cosv - b*sinv;
+      k[i + half] = b*cosv + a*sinv;
     }
   }
 }
@@ -237,7 +240,9 @@ int main(int argc, char** argv) {
   // find tensors
   auto get = [&](const char* name) -> Ent* {
     auto it = by.find(name);
-    if (it == by.end()) { printf("MISSING TENSOR: %s\n", name); return nullptr; }
+    // A missing tensor is fatal: returning nullptr here segfaulted the caller two
+    // sessions ago, and a silently skipped weight would run the trunk without it.
+    if (it == by.end()) { printf("MISSING TENSOR: %s\n", name); exit(2); }
     return it->second;
   };
 
@@ -330,7 +335,6 @@ int main(int argc, char** argv) {
       for (int h = 0; h < NHEADS; h++) {
         rope(q + t*NHEADS*HD + h*HD, nullptr, t, HD, 1e6f, 1.0f);
       }
-      if (t == 0) { printf("rope t=0 done\n"); fflush(stdout); }
       for (int h = 0; h < NKV; h++) {
         rope(nullptr, k + t*NKV*HD + h*HD, t, HD, 1e6f, 1.0f);
       }
@@ -394,7 +398,12 @@ int main(int argc, char** argv) {
     // residual add
     for (int i = 0; i < 12*DH; i++) x[i] += h4[i];
     // per-layer rms
-    double acc = 0; for (int i = 0; i < 12*DH; i++) acc += (double)x[i]*x[i];
+    // LFM_DEPTH_TRACE=1: per-layer rms of the 12-position trunk state, the same quantity
+    // the oracle's forward hooks record (tf/layers_*.json), so a layer can be localised.
+    if (getenv("LFM_DEPTH_TRACE")) {
+      double acc = 0; for (int i = 0; i < 12*DH; i++) acc += (double)x[i]*x[i];
+      printf("layer%d rms=%.4f first4=[%.4f,%.4f,%.4f,%.4f]\n", L, sqrt(acc/(12*DH)), x[0], x[1], x[2], x[3]);
+    }
   }
   // final embedding_norm (once, after all layers)
   {
@@ -409,12 +418,18 @@ int main(int argc, char** argv) {
   // logits[c, v] = stacked_head[c*2017 + v] @ x[c]  (each codebook has its own position)
   // Actually: the trunk outputs x[c] for codebook c, and head c computes logits
   // out[c, v] = W_head[c*CBS + v] . x[c]  (W_head is [24204, 1024])
+  // HF Lfm3AudioCodebookEmbedding.logits(): F.linear(embedding_norm(h), embedding.weight).
+  // Each codebook has its OWN embedding_norm before the tied head. Missing this step was
+  // the cause of the final-logit error (layer rms matched; logits did not).
   Ent* head = get("depth_head_stacked.weight");
   float out_logits[12 * 2017];
+  float xn[DH];
   for (int c = 0; c < NCB; c++) {
+    char en[256]; snprintf(en, sizeof en, "depth_embeddings.%d.embedding_norm.weight", c);
+    rmsnorm(x + c*DH, get(en)->df, xn, DH, 1e-5f);
     q8_gemv(head->dq + (size_t)(c*CBS)*DH,
             head->ds + (size_t)(c*CBS)*(DH/Q8_BLK),
-            x + c*DH, out_logits + c*CBS, CBS, DH);
+            xn, out_logits + c*CBS, CBS, DH);
   }
 
   // write output

@@ -1,0 +1,5 @@
+<|startoftext|><|im_start|>system
+You are a concise narrator.<|im_end|>
+<|im_start|>user
+Read the weather report aloud.<|im_end|>
+<|im_start|>assistant
