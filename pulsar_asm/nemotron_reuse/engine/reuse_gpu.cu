@@ -2287,6 +2287,33 @@ __global__ void k_ola(const float *Y, const float *w, float *out, float *wsum,
     }
 }
 
+/* Device-side iSTFT twiddle generation (same lever as k_stft_twiddles, #81):
+   the host loop built Cc[n][k]/Cs[n][k] in double with a nested n/k loop
+   (n_fft*F = 51610 elements per table, 2 tables = 413 KB) on every call, then
+   copied them + the window over PCIe. Same values, same float storage. */
+__global__ void k_istft_tables(float *Cc, float *Cs, float *w, int F, int n_fft, int win)
+{
+    const double pi = 3.14159265358979323846;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)n_fft * F;
+    if (i < total) {
+        int n = (int)(i / F), k = (int)(i % F);
+        double m = (k == 0 || 2*k == n_fft) ? 1.0 : 2.0;
+        double ang = 2.0 * pi * (double)n * (double)k / (double)n_fft;
+        Cc[i] = (float)( m * cos(ang) / n_fft);
+        Cs[i] = (float)(-m * sin(ang) / n_fft);
+        return;
+    }
+    i -= total;
+    if (i < (long)n_fft) {
+        int n = (int)i;
+        /* the shipped host loop filled w with 1.0f, then overwrote [0, win)
+           with the hann window; the ternary reproduces that exactly */
+        w[n] = (n < win) ? 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)n / (float)win)) : 1.0f;
+        return;
+    }
+}
+
 __global__ void k_norm_ola(float *out, const float *wsum, int out_len)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2298,21 +2325,8 @@ extern "C" int reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *
                                float *d_out, int out_len)
 {
     if (g->bad) return 1;
-    // host-side tables in double, stored as float (matches the CPU reference)
-    float *Cc = (float*)malloc((size_t)n_fft*F*sizeof(float));
-    float *Cs = (float*)malloc((size_t)n_fft*F*sizeof(float));
-    float *hw = (float*)malloc((size_t)n_fft*sizeof(float));
-    for (int n = 0; n < n_fft; n++) {
-        for (int k = 0; k < F; k++) {
-            double m = (k == 0 || 2*k == n_fft) ? 1.0 : 2.0;
-            double ang = 2.0 * M_PI * n * k / (double)n_fft;
-            Cc[(long)n*F + k] = (float)( m * cos(ang) / n_fft);
-            Cs[(long)n*F + k] = (float)(-m * sin(ang) / n_fft);
-        }
-    }
-    for (int i = 0; i < n_fft; i++) hw[i] = 1.0f;
-    for (int i = 0; i < win && i < n_fft; i++)
-        hw[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / win));
+    /* tables are generated ON DEVICE (k_istft_tables): removes the host
+       double-cos/sin loop and 826 KB of PCIe traffic per call (#81 lever). */
     float *d_Cc, *d_Cs, *d_w, *d_Cr, *d_Ci, *d_Y, *d_wsum;
     size_t nf = (size_t)n_fft*F, ft = (size_t)F*T, nt = (size_t)n_fft*T;
     if (cudaMalloc(&d_Cc, nf*sizeof(float)) || cudaMalloc(&d_Cs, nf*sizeof(float)) ||
@@ -2320,11 +2334,10 @@ extern "C" int reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *
         cudaMalloc(&d_Ci, ft*sizeof(float)) || cudaMalloc(&d_Y, nt*sizeof(float)) ||
         cudaMalloc(&d_wsum, (size_t)out_len*sizeof(float))) {
         fprintf(stderr, "istft: gpu OOM\n"); cudaGetLastError();
-        free(Cc); free(Cs); free(hw); return 1;
+        return 1;
     }
-    cudaMemcpy(d_Cc, Cc, nf*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_Cs, Cs, nf*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_w, hw, n_fft*sizeof(float), cudaMemcpyHostToDevice);
+    k_istft_tables<<<(unsigned)(((long)nf+n_fft+255)/256), 256>>>(d_Cc, d_Cs, d_w, F, n_fft, win);
+    { cudaError_t e = cudaGetLastError(); if (e) fprintf(stderr, "[istfterr] tables %s\n", cudaGetErrorString(e)); }
     // mag -> linear (expm1(relu)) then split phase
     long nsp = ft;
     k_mag_pha_split<<<(unsigned)((nsp+255)/256), 256>>>(d_mag, d_pha, d_Cr, d_Ci, nsp);
@@ -2338,7 +2351,6 @@ extern "C" int reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *
     int rc = reuse_gpu_ok(g, "istft_gpu");
     cudaFree(d_Cc); cudaFree(d_Cs); cudaFree(d_w); cudaFree(d_Cr); cudaFree(d_Ci);
     cudaFree(d_Y); cudaFree(d_wsum);
-    free(Cc); free(Cs); free(hw);
     return rc;
 }
 
