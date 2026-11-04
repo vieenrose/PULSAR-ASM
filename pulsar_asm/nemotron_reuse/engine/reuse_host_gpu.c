@@ -111,6 +111,14 @@ int main(int argc, char **argv)
         t_stft = now_s() - t0;
         printf("cpu stft %.3f s\n", t_stft);
     }
+    const char *ds = getenv("REUSE_DUMP_STFT");
+    if (ds && !gpu_stft) {
+        char nm[512];
+        snprintf(nm, sizeof(nm), "%s_mag.raw", ds);
+        FILE *f = fopen(nm, "wb"); if (f) { fwrite(h_mag, sizeof(float), (size_t)F*T, f); fclose(f); }
+        snprintf(nm, sizeof(nm), "%s_pha.raw", ds);
+        f = fopen(nm, "wb"); if (f) { fwrite(h_pha, sizeof(float), (size_t)F*T, f); fclose(f); }
+    }
     fflush(stdout);
     if (!gpu_stft) {
         cudaMemcpy(d_mag, h_mag, nsp*sizeof(float), cudaMemcpyHostToDevice);
