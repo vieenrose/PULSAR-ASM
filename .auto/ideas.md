@@ -21,7 +21,11 @@ python3, the nsys report scripts are missing in this install):
   encoder skip concats/copies          0 ms (was 1.4)      — CLOSED #74: param-delivery table
      mode (REUSE_DENSE_SLOTS default 1 on non-Maxwell, 0 on Maxwell: the 32-acc shapes corrupt
      under sm_53 codegen, 0.234 signature, delivery-independent). 11 memcpys/444 MB gone.
-  heads (3x conv1x1, atan2, crop, sweep) ~1 ms 7 launches  — OPEN, tiny
+  heads (3x conv1x1, atan2, crop, sweep) ~1 ms 7 launches  — CLOSED #76 analysis: heads_s=0.001
+     is the WALL time between decoder-sync and final-sync (all 3 conv1x1 are inside it); 1 ms is
+     already ~2x the naive-read floor; GEMM tiling ceiling = 1 ms = 0.25% of model. Not worth it.
+  decoder tail pairing (sp_up2/inorm/transpose)  — CLOSED #76: tail-only pairing FLAT on Nano;
+     paired TABLE dense convs = -9.3% Nano decoders but sm_53 TABLE corruption (8th confirmation).
 
 ## OPEN items
 1. CLOSED (#67, non-issue): the Nano's 16 kHz "CPU iSTFT 27.2 s" was an artifact of a manual
