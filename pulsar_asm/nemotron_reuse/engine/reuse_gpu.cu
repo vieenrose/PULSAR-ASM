@@ -572,7 +572,13 @@ __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const 
     const int n0 = blockIdx.y * NT;
     const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
     const int tid = ty*16 + tx;
-const bool halo_thr = (tid < 3*NT) && (zhalo || n0 < DINNER);
+    const bool halo_thr = (tid < 3*NT) && (zhalo || n0 < DINNER);
+    // Rows 0..2 of the A-tile are the conv's 3-row halo, consumed only through
+    // Hl, i.e. only by the x0 half. Loading them costs 27 float4 global loads +
+    // 27 shared stores per block (each with the m/L divide), so the z half
+    // skips them. Only blockIdx.x == 0 can have m < 0, hence mlo_ok.
+    const int rlo = (zhalo || n0 < DINNER) ? 0 : 3;
+    const bool mlo_ok = (m0 >= 3);
     const int hr = tid / NT, hc = tid % NT;
     // NOTE: hoisting this row->(sequence,position) divide out of the tile-load
     // loop (rows are consecutive, so one divide + a walk suffices) measured 3%
@@ -599,9 +605,10 @@ const bool halo_thr = (tid < 3*NT) && (zhalo || n0 < DINNER);
             const int RS = (KC+4)/4;
             for (int i = tid; i < R*RS; i += 256) {
                 const int r = i / RS, q = 4*(i - r*RS);
+                if (r < rlo) continue;
                 const long m = m0 - 3 + r;
                 float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (q < KC && m >= 0 && m < SL) {
+                if (q < KC && m < SL && (mlo_ok || m >= 0)) {
                     const int sm = (int)(m / L), tm = (int)(m % L);
                     v = *(const float4*)(x + ((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + q);
                 }
@@ -1579,7 +1586,13 @@ __global__ void k_in_conv_r2(const float *x, const float *W, float *z, float *xc
     const int n0 = blockIdx.y * NT;
     const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
     const int tid = ty*16 + tx;
-const bool halo_thr = (tid < 3*NT) && (zhalo || n0 < DINNER);
+    const bool halo_thr = (tid < 3*NT) && (zhalo || n0 < DINNER);
+    // Rows 0..2 of the A-tile are the conv's 3-row halo, consumed only through
+    // Hl, i.e. only by the x0 half. Loading them costs 27 float4 global loads +
+    // 27 shared stores per block (each with the m/L divide), so the z half
+    // skips them. Only blockIdx.x == 0 can have m < 0, hence mlo_ok.
+    const int rlo = (zhalo || n0 < DINNER) ? 0 : 3;
+    const bool mlo_ok = (m0 >= 3);
     const int hr = tid / NT, hc = tid % NT;
     float acc[RA][4];
 #pragma unroll
@@ -1598,9 +1611,10 @@ const bool halo_thr = (tid < 3*NT) && (zhalo || n0 < DINNER);
             const int RS = (KC+4)/4;
             for (int i = tid; i < R*RS; i += 256) {
                 const int r = i / RS, q = 4*(i - r*RS);
+                if (r < rlo) continue;
                 const long m = m0 - 3 + r;
                 float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (q < KC && m >= 0 && m < SL) {
+                if (q < KC && m < SL && (mlo_ok || m >= 0)) {
                     const int sm = (int)(m / L), tm = (int)(m % L);
                     v = *(const float4*)(x + ((long)sm*L + (rev ? L-1-tm : tm))*HID + k0 + q);
                 }
