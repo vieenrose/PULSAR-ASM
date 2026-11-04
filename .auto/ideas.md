@@ -280,3 +280,13 @@ The STFT/iSTFT were declared "at their floors" (#59) but were fp64 GEMMs on hard
    loop, so the in-code note's "3% for hoisting" is unreachable from this direction
    (it came from a restructure that also moved register allocation, and failed the
    gate at 1.8e-4). Do not retry divide hoisting in k_in_conv_r/r2.
+
+## Session state (2026-11-04, run #162)
+Dev-host band **rtf_total 0.0790-0.0794** (rtf_model 0.0784-0.0788 | stft 0.0002 | istft 0.0004-0.0005;
+enc 0.071-0.072 | tower 0.298-0.299 | dec 0.030 | heads 0.001; held-outs 0.0800-0.0804 /
+0.1183-0.1185 / 0.1614-0.1619). Noise floor 0.25%.
+Newest win: #157 vectorised scan's per-step xdbl reads (Bt/Ct/dr loaded as float4 once per
+step instead of scalars inside the unrolled DSTATE loop) - tower 0.305 -> 0.298 (-2.3%),
+rtf_total 0.0801 -> 0.0791 (-1.2%). Bit-compatible (max|d| 1.19e-07).
+Remaining above-noise candidate: **Winograd F(2x2,3x3) on dilH=1 dense convs** (~0.5-1% of
+rtf_total, hours, gate risk). Everything else measured is sub-noise or closed.
