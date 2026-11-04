@@ -3454,15 +3454,22 @@ __global__ void __launch_bounds__(256, 4) k_scan_dts(const float *xc, const floa
     for (int ii = 0; ii < L; ii++) {
         long sl = (long)s * L + ii;
         const float *dr = xdbl + sl * XP;
-        float d = dsoftplus(bc + dr[0]*w.x + dr[1]*w.y + dr[2]*w.z + dr[3]*w.w);
+        float4 drv = *(const float4*)dr;
+        float d = dsoftplus(bc + drv.x*w.x + drv.y*w.y + drv.z*w.z + drv.w*w.w);
         float u = xc[sl * DINNER + c];
         const float *Bt = xdbl + sl * XP + DTRANK;
         const float *Ct = Bt + DSTATE;
+        float4 Bv0 = *(const float4*)(Bt + 0), Bv1 = *(const float4*)(Bt + 4);
+        float4 Bv2 = *(const float4*)(Bt + 8), Bv3 = *(const float4*)(Bt + 12);
+        float4 Cv0 = *(const float4*)(Ct + 0), Cv1 = *(const float4*)(Ct + 4);
+        float4 Cv2 = *(const float4*)(Ct + 8), Cv3 = *(const float4*)(Ct + 12);
+        float Bt_[16] = {Bv0.x,Bv0.y,Bv0.z,Bv0.w,Bv1.x,Bv1.y,Bv1.z,Bv1.w,Bv2.x,Bv2.y,Bv2.z,Bv2.w,Bv3.x,Bv3.y,Bv3.z,Bv3.w};
+        float Ct_[16] = {Cv0.x,Cv0.y,Cv0.z,Cv0.w,Cv1.x,Cv1.y,Cv1.z,Cv1.w,Cv2.x,Cv2.y,Cv2.z,Cv2.w,Cv3.x,Cv3.y,Cv3.z,Cv3.w};
         float acc = 0.0f;
 #pragma unroll
         for (int n = 0; n < DSTATE; n++) {
-            h[n] = __expf(d * aAs[lane][n]) * h[n] + d * Bt[n] * u;
-            acc = fmaf(h[n], Ct[n], acc);
+            h[n] = __expf(d * aAs[lane][n]) * h[n] + d * Bt_[n] * u;
+            acc = fmaf(h[n], Ct_[n], acc);
         }
         y[sl * DINNER + c] = acc + u * Dc;
     }
