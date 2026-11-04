@@ -170,6 +170,26 @@ def main():
         )
     finally:
         torch.randperm = real_randperm
+    # slots.txt: one line per generated slot, in HF's own order: "T <id>" for a text token,
+    # "A <eos 0|1>" for a speech frame. Taken from the returned sequences, so the marker
+    # generate() appends is excluded by construction, not by counting.
+    seq = out.sequences[0].tolist()
+    marker = {"audio": [int(cf("audio_start_token_id"))],
+              "interleaved": [int(cf("mixed_start_token_id"))]}.get(MODE, [])
+    gen_start = len(ids_list) + (1 if marker else 0)
+    if marker:
+        assert seq[len(ids_list)] == marker[0], "appended marker not where expected"
+    gen = seq[gen_start:]
+    lines, a = [], 0
+    for t in gen:
+        if t == int(cf("audio_out_token_id")):
+            is_eos = int(bool((out.audio_codes[0][:, a] == int(cf("audio_eos_code", 2016))).any()))
+            lines.append("A %d" % is_eos)
+            a += 1
+        else:
+            lines.append("T %d" % t)
+    with open(os.path.join(OUT, "slots.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
     for i, o in enumerate(orders):
         wi32(os.path.join(OUT, "order.%d.i32" % i), o)
 
