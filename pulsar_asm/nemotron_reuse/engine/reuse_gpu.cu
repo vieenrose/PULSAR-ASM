@@ -557,7 +557,7 @@ __global__ void k_in_proj_r(const float *x, const float *W, float *x0, float *z,
 template<int KC, int LBMIN = 2>
 __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const float *W, float *z, float *xc,
                             const float *Wc, const float *Bc,
-                            int S, int L, int rev)
+                            int S, int L, int rev, int zhalo = 1)
 {
     // Tile: 80 rows (L index) x 64 channels, 256 threads as (16,16).
     // tx owns 5 consecutive rows, ty owns 4 channels -> 20 accumulators and
@@ -572,7 +572,7 @@ __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const 
     const int n0 = blockIdx.y * NT;
     const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
     const int tid = ty*16 + tx;
-    const bool halo_thr = tid < 3*NT;
+const bool halo_thr = (tid < 3*NT) && (zhalo || n0 < DINNER);
     const int hr = tid / NT, hc = tid % NT;
     // NOTE: hoisting this row->(sequence,position) divide out of the tile-load
     // loop (rows are consecutive, so one divide + a walk suffices) measured 3%
@@ -634,7 +634,7 @@ __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const 
         __syncthreads();
     }
     if (halo_thr) Hl[hr][hc] = hacc;
-    __syncthreads();
+    if (n0 < DINNER) __syncthreads();   // Hl readers only
     if (n0 >= DINNER) {                                             // z half: plain GEMM
 #pragma unroll
         for (int a4 = 0; a4 < RA; a4++) {
@@ -1570,7 +1570,7 @@ static void prewarm(reuse_gpu_t *g)
 template<int KC>
 __global__ void k_in_conv_r2(const float *x, const float *W, float *z, float *xc,
                              const float *Wc, const float *Bc,
-                             int S, int L, int rev)
+                             int S, int L, int rev, int zhalo = 1)
 {
     const int NT = 64, R = FUSE_MT2 + 3, RA = 8;
     __shared__ __align__(16) float Xs[R][KC+4], Ws[NT][KC+4], Hl[3][NT+1];
@@ -1579,7 +1579,7 @@ __global__ void k_in_conv_r2(const float *x, const float *W, float *z, float *xc
     const int n0 = blockIdx.y * NT;
     const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
     const int tid = ty*16 + tx;
-    const bool halo_thr = tid < 3*NT;
+const bool halo_thr = (tid < 3*NT) && (zhalo || n0 < DINNER);
     const int hr = tid / NT, hc = tid % NT;
     float acc[RA][4];
 #pragma unroll
@@ -1633,7 +1633,7 @@ __global__ void k_in_conv_r2(const float *x, const float *W, float *z, float *xc
         __syncthreads();
     }
     if (halo_thr) Hl[hr][hc] = hacc;
-    __syncthreads();
+    if (n0 < DINNER) __syncthreads();   // Hl readers only
     if (n0 >= DINNER) {                                             // z half: plain GEMM
 #pragma unroll
         for (int a4 = 0; a4 < RA; a4++) {
@@ -4134,23 +4134,27 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         #define GDBG(tag, ptr, n) do { if (dbg) { char t_[32]; snprintf(t_, sizeof(t_), "%s%s", dt, tag); gdump(t_, ptr, n); } } while (0)
     {
         const int tiled = inproj_mode();
+        // REUSE_ZHALO=1 restores the shipped form (every block computes the
+        // 3-row conv halo, including the z-half blocks that discard it).
+        static int zhalo = -1;
+        if (zhalo < 0) zhalo = getenv("REUSE_ZHALO") ? atoi(getenv("REUSE_ZHALO")) : 0;
         if (getenv("REUSE_SKIP_INPROJ")) { } else
         if (fuse_conv()) {
             const int kc = fuse_kc();
             if (fuse_tile() == 128) {          // 128 measured slower (0.638 vs 0.555 s):
                                                // the traffic model lost to 110 registers/block
                 k_in_conv_r2<32><<<dim3((unsigned)((SL+FUSE_MT2-1)/FUSE_MT2), (2*DINNER)/64), dim3(16,16), 0, st>>>(
-                    x, W_in, z, xc, W_c, B_c, S, L, rev);
+                    x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
             }
             else if (kc == 16)
                 k_in_conv_r<16, LBV><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
-                    x, W_in, z, xc, W_c, B_c, S, L, rev);
+                    x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
             else if (kc == 8)
                 k_in_conv_r<8, LBV><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
-                    x, W_in, z, xc, W_c, B_c, S, L, rev);
+                    x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
             else
                 k_in_conv_r<32, LBV><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
-                    x, W_in, z, xc, W_c, B_c, S, L, rev);
+                    x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
         }
         else if (tiled == 2) k_in_proj_r<<<dim3((unsigned)((SL+63)/64), (2*DINNER)/64), dim3(16,16), 0, st>>>(x, W_in, x0, z, S, L, rev);
         else if (tiled) k_in_proj_t<<<dim3((unsigned)((SL+MT32-1)/MT32), (2*DINNER)/NT64), dim3(16,16), 0, st>>>(x, W_in, x0, z, S, L, rev);
