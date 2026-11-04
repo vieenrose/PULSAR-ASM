@@ -1,5 +1,26 @@
 # Ideas backlog — RE-USE RTF
 
+## Session state (2026-11-04, run #151)
+Dev-host band **rtf_total 0.0803-0.0806** (rtf_model 0.0797-0.0800 | stft 0.0002 | istft 0.0004;
+enc 0.071 | tower 0.305-0.307 | dec 0.030 | heads 0.001; held-outs 0.0811-0.0819 /
+0.1203-0.1209 / 0.1639-0.1648). Noise floor 0.25% => only changes worth >=0.3% are scoreable.
+Nano (deployment target, from /dev/shm/rp, run_bench2.sh): **RTF_total 3.0282-3.0352 @ 8 kHz**,
+**5.9252-5.9855 @ 16 kHz**; RTF_model 44.34 -> 3.03 = 14.7x, 88.86 -> 5.94 = 14.9x.
+Wins this session: #134 Kahan iSTFT (rtf_istft 0.0014->0.0004), #136 page-touch (rtf_stft
+0.0014->0.0002), #137 DD STFT (0.0002), #141 **device allocation cache (-1.0%, rtf_model
+0.0804->0.0797, Nano decoders -5.3%)**.
+Closed this session (do not retry): #139 k_idft kernel sweep (11 tile shapes, split-k, multi-chain
+Kahan, conjugate-symmetry pairing - all flat or worse; compensated floor 1.5-1.9 ms),
+#143 chunked parallel scan (Hillis-Steele over the affine pair: +2.8%, the serial scan has 47
+warps/SM so it is issue-bound not latency-bound), #144 in_conv row table (flat, LICM already
+hoists the divide), #145 phase-sync removal (+0.2-0.4%, the syncs keep the launch queue from
+stalling).
+Only known lever above the noise floor: **Winograd F(2x2,3x3) on the dilation=1 dense convs**
+(~0.5-1% of rtf_total; hours of work; gate risk - a register-allocation shuffle once cost
+rel-rms 1.8e-4 against the 1e-4 gate). Everything else measured is sub-noise (STFT/iSTFT table
+caching + memset removal 0.055%, float-polish STFT head 0.06%, iSTFT split-k 0.08%).
+
+
 Dev host best: rtf_total **0.0831** (rtf_model 0.0802 | enc 0.071 | tower 0.306 | dec 0.030 | heads 0.001 | stft 0.0014 | istft 0.0015).
 Nano (deployment target, tegra210, CUDA_LAUNCH_BLOCKING=1, REUSE_CPU_STFT=1):
 RTF_model **3.1346** @ 8 kHz (enc 3.285 | tower 11.566 | dec 1.113 | heads 0.011), **6.1243** @ 16 kHz. Cumulative 44.34 -> 3.13 = **14.1x**.
