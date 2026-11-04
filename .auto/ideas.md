@@ -209,3 +209,24 @@ python3, the nsys report scripts are missing in this install):
 - Fast Nano A/B: same input + fed-reference protocol + REUSE_DUMP_AUDIO, diff waveforms
   (140 dB = bit-compatible). Binary ./engine/reuse_nano_gpu, blob tests/golden/reuse.blob,
   REUSE_WS_MB=640 (8k) / 1280 (16k), reps >= 2 (rep 0 is warm-up). Disk ~450 MB free, 3 GiB RAM.
+
+## OPEN (new chapter: STFT/iSTFT fp64 -> compensated fp32, opened #134-#137)
+The STFT/iSTFT were declared "at their floors" (#59) but were fp64 GEMMs on hardware with
+1/32-1/64-rate fp64. Four keeps: rtf_total 0.0832 -> 0.0810.
+1. **Nano: switch to the GPU STFT.** run_bench.sh exports REUSE_CPU_STFT=1 (CPU fp64 STFT,
+   0.091 s) precisely because the GPU STFT's fp64 GEMM is 1/64-rate-bound (0.100 s). With the
+   DD form (#137) the GPU STFT should be ~10 ms on the Nano = -0.5% Nano RTF. Verify on-device
+   SNR/rel-rms with the GPU STFT before editing run_bench.sh (the gates feed the reference STFT
+   so they cannot see STFT regressions).
+2. k_idft (~1.0 ms of the 2.0 ms iSTFT): grid is 4 x ceil(T/16) = 80 blocks on 15 SMs, 128
+   threads each = 680 threads/SM. Split-k over 2-4 partials + a reduction, or a 2D tiling over
+   n, raises occupancy. Ceiling -0.2% rtf_total. fp32-Kahan accumulation makes a split-k
+   reduction cheap (add dd pairs, not fp64).
+3. k_stft_head 0.28 ms: 161x1021 = 165k elements, double sqrt/log1p/atan2. log1p+atan2 in
+   double are ~100-instruction paths; a dd/fp32 form with a double-polish only near the
+   boundaries would cut it to ~0.1 ms. Ceiling -0.04%. Low value.
+4. k_istft_tables regenerates the 2 x n_fft x F twiddle table on EVERY call (0.084 ms) - cache
+   it per (n_fft, F) in the graph (it is a pure function of the shape). Ceiling -0.08 ms/call.
+   Also k_stft_twiddles_dd (0.065 ms) and the window: same argument. Cheap, ~-0.03%.
+5. Model side is unchanged and closed: tower 0.306 s (in_conv 288 ms/240, scan 209/240,
+   out_proj 153/240, x_proj 58/240 per profile), enc 0.070, dec 0.030, heads 0.001.
