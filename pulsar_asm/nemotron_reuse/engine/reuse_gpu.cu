@@ -2783,6 +2783,248 @@ __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
     }
 }
 
+// ============================================================================
+// Paired mask/phase decoder (REUSE_DEC_PAIR).
+// The mask and phase decoders run the SAME chain shape on the SAME tower
+// output `enc`, so every launch in the tail runs both heads with one grid:
+// head h is blockIdx.z / znb and reads the head-pair buffer at +h*hoff
+// (all paired tensors are head-contiguous: single wallc of 2*size).
+// One uniform head SEL in the prologue; per-head weights arrive pre-offset
+// (blob neighbours, verified by the caller), so the kernel body is the
+// shipped one and the plain (PAIR=false) instantiations are untouched.
+
+template<int RW, int RC, int TW, int NC>
+__global__ void k_sp_up8t2(const float *x, const float *wT, const float *b0, const float *b1,
+                           float *y, int H, int W, int r, int CO,
+                           long hoff_in, long hoff_out, int zheads, long hoff_wt)
+{
+    const int TXN = TW/RW, TBY = NC/RC, NT = TXN*TBY;
+    const int hd = blockIdx.z / zheads;
+    const int w0 = blockIdx.x*TW;
+    const int h = blockIdx.y;
+    const int co0 = (blockIdx.z % zheads)*NC;
+    const float *xb = x + (long)hd * hoff_in;
+    const float *wtb = wT + (long)hd * hoff_wt;
+    const float *bn = hd ? b1 : b0;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty*TXN + tx;
+    __shared__ __align__(16) float xs[TW+8];
+    __shared__ __align__(16) float ws[NC*3 + 4];
+    const int wl = tx*RW, cl = ty*RC;
+    float acc[RC][RW];
+#pragma unroll
+    for (int j = 0; j < RC; j++)
+#pragma unroll
+        for (int i = 0; i < RW; i++) acc[j][i] = bn[co0 + cl + j];
+    const long hw = (long)h*W;
+    for (int ci = 0; ci < HID; ci++) {
+        const float *xv = xb + (long)ci*H*W + hw;
+        for (int i = tid; i < (TW+3)/4 + 1; i += NT) {
+            const int q = 4*i;
+            float4 v = make_float4(0.f,0.f,0.f,0.f);
+            const int s0 = w0 - 1 + q;
+            if (q+0 < TW+3) v.x = (s0+0 >= 0 && s0+0 < W) ? xv[s0+0] : 0.f;
+            if (q+1 < TW+3) v.y = (s0+1 >= 0 && s0+1 < W) ? xv[s0+1] : 0.f;
+            if (q+2 < TW+3) v.z = (s0+2 >= 0 && s0+2 < W) ? xv[s0+2] : 0.f;
+            if (q+3 < TW+3) v.w = (s0+3 >= 0 && s0+3 < W) ? xv[s0+3] : 0.f;
+            *(float4*)&xs[q] = v;
+        }
+        { const float4 *wp = (const float4*)(wtb + ((long)ci*CO + co0)*3);
+          for (int i = tid; i < NC*3/4; i += NT) *(float4*)&ws[4*i] = wp[i]; }
+        __syncthreads();
+        const float4 a0 = *(const float4*)&xs[wl];
+        const float4 a1 = *(const float4*)&xs[wl+4];
+        const float4 a2 = *(const float4*)&xs[wl+8];
+        const float xv2[16] = { a0.x,a0.y,a0.z,a0.w, a1.x,a1.y,a1.z,a1.w, a2.x,a2.y,a2.z,a2.w, 0,0,0,0 };
+#pragma unroll
+        for (int j = 0; j < RC; j++) {
+            const float c0 = ws[3*(cl+j)], c1 = ws[3*(cl+j)+1], c2 = ws[3*(cl+j)+2];
+#pragma unroll
+            for (int i = 0; i < RW; i++) {
+                acc[j][i] = fmaf(xv2[i],   c0, acc[j][i]);
+                acc[j][i] = fmaf(xv2[i+1], c1, acc[j][i]);
+                acc[j][i] = fmaf(xv2[i+2], c2, acc[j][i]);
+            }
+        }
+        __syncthreads();
+    }
+    float *yb = y + (long)hd * hoff_out;
+#pragma unroll
+    for (int j = 0; j < RC; j++) {
+        const int cj = (co0 + cl + j) % HID, aj = (co0 + cl + j) / HID;
+        float *yp = yb + ((long)cj*H + h)*(long)(W*r) + (long)(w0+wl)*r + aj;
+#pragma unroll
+        for (int i = 0; i < RW; i++) if (w0 + wl + i < W) yp[i*r] = acc[j][i];
+    }
+}
+
+template<int R, int PCO, int NCB, int NRA, bool TABLE, bool PAIR = false>
+__global__ void k_conv2d_r8p(const float *x, const float *w, const float *b,
+                             const float *w2, const float *b2,
+                             int C_in, int H, int W, int padH, int padW, int dilH,
+                             float *y, int co0, const float *x2, int ng, CONV_SRCS_PARAMS,
+                             long hoff_out, int znb, long hoff_x)
+{
+    const int TW = 16*NCB, LS = TW+4;
+    __shared__ __align__(16) float S[R][LS];
+    const int hd = PAIR ? blockIdx.z / znb : 0;
+    const int w0 = blockIdx.x*TW, h0 = blockIdx.y*(16*NRA);
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty*16 + tx;
+    const float *xh = x + (long)hd * (PAIR ? hoff_x : 0L);
+    float *yh = y + (long)hd * (PAIR ? hoff_out : 0L);
+    const float *wb = PAIR ? (hd ? w2 : w) : w;
+    const float *bb = PAIR ? (hd ? b2 : b) : b;
+    float acc[PCO][NRA][NCB];
+#pragma unroll
+    for (int j = 0; j < PCO; j++)
+#pragma unroll
+        for (int a = 0; a < NRA; a++)
+#pragma unroll
+            for (int bq = 0; bq < NCB; bq++) acc[j][a][bq] = bb[co0 + (blockIdx.z % znb)*PCO + j];
+    for (int ci = 0; ci < C_in; ci++) {
+        const float *xin; long pl;
+        if (!TABLE) { xin = xh + (long)ci*H*W; pl = ci; }
+        else {
+            const int g = ci/HID;
+            // head1 shifts the SLOT groups only; x2 (the tower tensor) is shared
+            const float *pg = conv_src_pick(g, CONV_SRCS_ARGS) + (PAIR && hd && g < ng ? hd*hoff_x : 0L);
+            xin = pg + (long)(ci%HID)*H*W;
+            pl = (g < ng) ? (long)(ng-1-g)*HID + ci%HID : (long)(g-ng)*HID + ci%HID;
+        }
+        if (ci) __syncthreads();
+        {
+            const int RS = LS/4, wbase = w0 - padW, hbase = h0 - padH;
+            float4 *dv = (float4*)&S[0][0];
+            for (int i = tid; i < R*RS; i += 256) {
+                const int r = i / RS, q = 4*(i - r*RS);
+                const int hh = hbase + r, ww = wbase + q;
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (hh >= 0 && hh < H) {
+                    const float *sp = xin + (long)hh*W + ww;
+                    if (ww >= 0 && ww + 4 <= W && ((((long)pl*H*W + (long)hh*W + ww) & 3) == 0))
+                        v = *(const float4*)sp;
+                    else {
+                        if (ww     >= 0 && ww     < W) v.x = sp[0];
+                        if (ww + 1 >= 0 && ww + 1 < W) v.y = sp[1];
+                        if (ww + 2 >= 0 && ww + 2 < W) v.z = sp[2];
+                        if (ww + 3 >= 0 && ww + 3 < W) v.w = sp[3];
+                    }
+                }
+                dv[i] = v;
+            }
+        }
+        __syncthreads();
+        const float *wv = wb + ((long)(co0 + (blockIdx.z % znb)*PCO)*C_in + ci)*9;
+#pragma unroll
+        for (int j = 0; j < PCO; j++) {
+#pragma unroll
+            for (int kh = 0; kh < 3; kh++) {
+                const float w0f = wv[j*C_in*9 + kh*3], w1f = wv[j*C_in*9 + kh*3+1], w2f = wv[j*C_in*9 + kh*3+2];
+                const int rb = ty*NRA + kh*dilH, cb = tx*NCB;
+#pragma unroll
+                for (int a = 0; a < NRA; a++) {
+                    const float *sr = &S[rb + a][cb];
+#pragma unroll
+                    for (int bq = 0; bq < NCB; bq++) {
+                        acc[j][a][bq] = fmaf(sr[bq], w0f, acc[j][a][bq]);
+                        acc[j][a][bq] = fmaf(sr[bq+1], w1f, acc[j][a][bq]);
+                        acc[j][a][bq] = fmaf(sr[bq+2], w2f, acc[j][a][bq]);
+                    }
+                }
+            }
+        }
+    }
+    const int wc = w0 + tx*NCB;
+#pragma unroll
+    for (int j = 0; j < PCO; j++) {
+        float *yo = yh + (long)(co0 + (blockIdx.z % znb)*PCO + j)*H*W;
+#pragma unroll
+        for (int a = 0; a < NRA; a++) {
+            int hh = h0 + ty*NRA + a;
+            if (hh >= H) continue;
+            float *d2 = yo + (long)hh*W;
+#pragma unroll
+            for (int bq = 0; bq < NCB; bq++) if (wc + bq < W) d2[wc + bq] = acc[j][a][bq];
+        }
+    }
+}
+
+__global__ void k_inorm_prelu2(const float *x, float *y, int C, int HW, long hoff,
+                               const float *w0, const float *b0, const float *a0,
+                               const float *w1, const float *b1, const float *a1, float eps)
+{
+    const int hd = blockIdx.x / C;
+    const int nc = blockIdx.x % C;
+    const float *ws = hd ? w1 : w0;
+    const float *bs = hd ? b1 : b0;
+    const float *as = hd ? a1 : a0;
+    const float *xs = x + (long)hd * hoff + (long)nc * HW;
+    float *ys = y + (long)hd * hoff + (long)nc * HW;
+    __shared__ float red[INORM_THREADS * 2];
+    __shared__ float s_mean, s_inv;
+
+    float s = 0.0f, c = 0.0f;
+    for (int i = threadIdx.x; i < HW; i += INORM_THREADS) kahan_add(&s, &c, xs[i]);
+    red[threadIdx.x*2] = s; red[threadIdx.x*2+1] = c;
+    __syncthreads();
+    for (int off = INORM_THREADS/2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) {
+            red[threadIdx.x*2]   += red[(threadIdx.x+off)*2];
+            red[threadIdx.x*2+1] += red[(threadIdx.x+off)*2+1];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) s_mean = (red[0] + red[1]) / HW;
+    __syncthreads();
+    float mean = s_mean;
+
+    float q = 0.0f, cq = 0.0f;
+    for (int i = threadIdx.x; i < HW; i += INORM_THREADS) {
+        float d = xs[i] - mean;
+        kahan_add(&q, &cq, d*d);
+    }
+    red[threadIdx.x*2] = q; red[threadIdx.x*2+1] = cq;
+    __syncthreads();
+    for (int off = INORM_THREADS/2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) {
+            red[threadIdx.x*2]   += red[(threadIdx.x+off)*2];
+            red[threadIdx.x*2+1] += red[(threadIdx.x+off)*2+1];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) s_inv = rsqrtf(fmaxf((red[0] + red[1]) / HW, 0.0f) + eps);
+    __syncthreads();
+    float inv = s_inv;
+    float ww = ws ? ws[nc % C] : 1.0f;
+    float bb = bs ? bs[nc % C] : 0.0f;
+    float aa = as ? as[nc % C] : 0.25f;
+    for (int i = threadIdx.x; i < HW; i += INORM_THREADS) {
+        float v = (xs[i] - mean) * inv * ww + bb;
+        ys[i] = v < 0.0f ? aa * v : v;
+    }
+}
+
+__global__ void k_transpose2(const float *__restrict__ x, float *__restrict__ y, int C, int H, int W, long hoff)
+{
+    __shared__ float tile[32][33];
+    const int hd = blockIdx.z / C;
+    const int c = blockIdx.z % C;
+    const long choff = (long)hd * hoff + (long)c*H*W;
+    const float *xc = x + choff;
+    float *yc = y + choff;                               /* y is [head][C][W][H] */
+    const int h0 = blockIdx.y*32, w0 = blockIdx.x*32;
+    for (int k = threadIdx.y; k < 32; k += 8) {
+        const int h = h0 + k, w = w0 + threadIdx.x;
+        tile[k][threadIdx.x] = (h < H && w < W) ? xc[(long)h*W + w] : 0.0f;
+    }
+    __syncthreads();
+    for (int k = threadIdx.y; k < 32; k += 8) {
+        const int w = w0 + k, h = h0 + threadIdx.x;
+        if (w < W && h < H) yc[(long)w*H + h] = tile[threadIdx.x][k];
+    }
+}
+
 template<int R, int PCO, int NCB>
 __global__ void k_conv2d_r9(const float *x, const float *w, const float *b,
                             int C_in, int H, int W, int padH, int padW, int dilH,
@@ -3000,6 +3242,246 @@ static int dectile(void)
     static int t = -1;
     if (t < 0) { const char *e = getenv("REUSE_DEC_TILE"); t = e ? atoi(e) : 644; }
     return t;
+}
+
+static int conv_chunk(void);
+static int launch_conv2d_pair(reuse_gpu_t *g, const float *x, const float *w, const float *b,
+                              const float *w2, const float *b2,
+                              int C_in, int H, int W, int C_out, int padH, int dilH,
+                              float *y, int tilehint, const float *x2, int ng,
+                              long hoff_out, long hoff_x);
+static int sp_up(reuse_gpu_t *g, const char *prefix, const float *x, int H, int W, int r, float *y);
+static int inorm(reuse_gpu_t *g, const float *x, float *y, int N, int C, int H, int W,
+                 const char *nkey, const char *akey);
+
+// Paired dense block: both heads' DEPTH layers run each launch jointly.
+// slots/tmp are single 2-head buffers (head h at +h*headstride); the conv
+// gets head0's w/b (head1 = +hoff_w, caller-verified blob neighbours) and
+// the shared x_in (enc) as x2. Returns 0 for shapes the paired kernels do
+// not cover (caller falls back to dense_block_gpu twice).
+static int dense_block_pair(reuse_gpu_t *g, const char *pfx0, const char *pfx1,
+                            const float *x_in, int T, int F,
+                            float *out0, float *out1, int tilehint,
+                            long hoff_out_pair)
+{
+    if (DEPTH > 4) return 0;                       // dil 16/32 have no paired tile
+    float *slots = wallc(g, (size_t)2*HID*(DEPTH-1)*T*F);
+    float *tmp   = wallc(g, (size_t)2*HID*T*F);
+    if (!slots || !tmp) return 1;
+    const long hslot = (long)(DEPTH-1)*HID*T*F;    // head-to-head stride of slots
+    const long htf = (long)HID*T*F;
+    char key0[256], key1[256], nk0[256], nk1[256], ak0[256], ak1[256], b0[256], b1[256];
+    for (int i = 0; i < DEPTH; i++) {
+        snprintf(key0, sizeof(key0), "%s.%d.0.weight", pfx0, i);
+        snprintf(key1, sizeof(key1), "%s.%d.0.weight", pfx1, i);
+        const float *wm = reuse_gpu_w(g, key0), *wp = reuse_gpu_w(g, key1);
+        snprintf(key0, sizeof(key0), "%s.%d.0.bias", pfx0, i);
+        snprintf(key1, sizeof(key1), "%s.%d.0.bias", pfx1, i);
+        const float *bm = reuse_gpu_w(g, key0), *bp = reuse_gpu_w(g, key1);
+        if (g->bad) return 1;
+        const int dil = 1 << i;
+        if (!launch_conv2d_pair(g, slots, wm, bm, wp, bp, (i+1)*HID, T, F, HID, dil, dil, tmp,
+                                tilehint, x_in, i, htf, hslot)) return 0;
+        snprintf(nk0, sizeof(nk0), "%s.%d.1.weight", pfx0, i);
+        snprintf(nk1, sizeof(nk1), "%s.%d.1.weight", pfx1, i);
+        snprintf(b0, sizeof(b0), "%s.%d.1.bias", pfx0, i);
+        snprintf(b1, sizeof(b1), "%s.%d.1.bias", pfx1, i);
+        snprintf(ak0, sizeof(ak0), "%s.%d.2.weight", pfx0, i);
+        snprintf(ak1, sizeof(ak1), "%s.%d.2.weight", pfx1, i);
+        const float *nw0 = reuse_gpu_w(g, nk0), *nw1 = reuse_gpu_w(g, nk1);
+        const float *nb0 = reuse_gpu_w(g, b0),  *nb1 = reuse_gpu_w(g, b1);
+        const float *pa0 = reuse_gpu_w(g, ak0), *pa1 = reuse_gpu_w(g, ak1);
+        if (g->bad) return 1;
+        // layer i's inorm output lands directly in slot i of each head (the
+        // #74 zero-copy convention): head1 = ybase + hslot, per-head stride
+        // hslot, ybase advanced by i planes for the slot index.
+        if (i == DEPTH-1)
+            k_inorm_prelu2<<<2*HID, INORM_THREADS>>>(tmp, out0, HID, T*F, hoff_out_pair,
+                                                     nw0, nb0, pa0, nw1, nb1, pa1, 1e-5f);
+        else
+            k_inorm_prelu2<<<2*HID, INORM_THREADS>>>(tmp, slots + (long)i*htf, HID, T*F, hslot,
+                                                     nw0, nb0, pa0, nw1, nb1, pa1, 1e-5f);
+        if (reuse_gpu_ok(g, "inorm_pair")) return 1;
+    }
+    return !g->bad;
+}
+
+static int sp_up_pair(reuse_gpu_t *g, const char *pfx0, const char *pfx1,
+                      const float *x, int H, int W, int r, float *y,
+                      long hoff_in, long hoff_out)
+{
+    static int RW_ = 0, RC_ = 0, TW_ = 0, NC_ = 0;
+    static int t8 = -1;
+    if (t8 < 0) t8 = getenv("REUSE_SPUP") ? atoi(getenv("REUSE_SPUP")) : 4;
+    if (t8 != 4) return 0;                          // paired form is the tiled kernel only
+    if (RW_ == 0) {
+        RW_ = 4; RC_ = 8; TW_ = 32; NC_ = 64;
+        const char *e = getenv("REUSE_SPUP_T"); int a=0,b=0,c=0,d=0;
+        if (e && sscanf(e, "%d,%d,%d,%d", &a,&b,&c,&d) == 4 && a) { RW_ = a; RC_ = b; TW_ = c; NC_ = d; }
+    }
+    char key[256];
+    const int CO = 64*r;
+    snprintf(key, sizeof(key), "%s.0.conv.weight", pfx0); const float *w0 = reuse_gpu_w(g, key);
+    snprintf(key, sizeof(key), "%s.0.conv.bias",   pfx0); const float *b0 = reuse_gpu_w(g, key);
+    snprintf(key, sizeof(key), "%s.0.conv.weight", pfx1); const float *w1 = reuse_gpu_w(g, key);
+    snprintf(key, sizeof(key), "%s.0.conv.bias",   pfx1); const float *b1 = reuse_gpu_w(g, key);
+    if (g->bad) return 1;
+    if (NC_ != 64) return 0;
+    float *wt = wallc(g, (size_t)2*CO*HID*3);
+    if (!wt) return 1;
+    k_wtrans_sp<<<(unsigned)((CO*HID*3+255)/256), 256>>>(w0, wt, CO);
+    k_wtrans_sp<<<(unsigned)((CO*HID*3+255)/256), 256>>>(w1, wt + (long)CO*HID*3, CO);
+    const int zheads = CO/NC_;
+    #define SPUP2(RWv,RCv,TWv,NCv) do { if (RW_==RWv && RC_==RCv && TW_==TWv && NC_==NCv) \
+        k_sp_up8t2<RWv,RCv,TWv,NCv><<<dim3((unsigned)((W+TWv-1)/TWv),(unsigned)H,(unsigned)(2*(CO/NCv))), dim3(TWv/RWv,NCv/RCv)>>>(x,wt,b0,b1,y,H,W,r,CO,hoff_in,hoff_out,zheads,(long)CO*HID*3); } while(0)
+    SPUP2(4,8,32,64); SPUP2(8,8,32,64); SPUP2(4,8,64,64); SPUP2(4,16,32,64);
+    SPUP2(8,16,32,64); SPUP2(8,8,16,64); SPUP2(8,8,32,128); SPUP2(4,8,32,128);
+    SPUP2(4,8,64,128); SPUP2(8,8,64,128);
+    #undef SPUP2
+    launch_kick();
+    return !g->bad;
+}
+
+// 0 = paired path ran, 1 = error, 2 = unsupported shape (caller falls back).
+extern "C" int reuse_gpu_decoders_pair(reuse_gpu_t *g, const float *enc,
+                                       float *dm, float *dp, int T, int F)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("REUSE_DEC_PAIR"); on = e ? atoi(e) : (gpu_is_maxwell() ? 0 : 1); }
+    if (!on) return 2;
+    if (dp <= dm) return 2;                          // heads must be contiguous
+    g->ws_off = 0;
+    const long htf = (long)HID*T*F;
+    const long hoff_dp = dp - dm;
+    // weight-neighbourhood probes (mask vs phase decoder, same layout):
+    // verify the two decoders' parameter tensors are equal-length pairs so a
+    // single hoff works for every conv/norm weight. Checked at every use in
+    // dense_block_pair; a cheap precheck here is the up_conv biases.
+    char k0[256], k1[256];
+    snprintf(k0, sizeof(k0), "mask_decoder.up_conv1.0.conv.bias");
+    snprintf(k1, sizeof(k1), "phase_decoder.up_conv1.0.conv.bias");
+    const float *mub = reuse_gpu_w(g, k0), *pub = reuse_gpu_w(g, k1);
+    if (g->bad) return 1;
+    if (!mub || !pub) return 2;
+
+    float *d_pair = wallc(g, (size_t)2*HID*T*F);
+    if (!d_pair) return 1;
+    snprintf(k0, sizeof(k0), "%s.dense_block.dense_block", "mask_decoder");
+    snprintf(k1, sizeof(k1), "%s.dense_block.dense_block", "phase_decoder");
+    int rc = dense_block_pair(g, k0, k1, enc, T, F, d_pair, d_pair + htf, dectile(), htf);
+    if (rc < 0) return 1;
+    if (!rc) return 2;
+    gdump("d_db", d_pair, (size_t)2*HID*T*F);
+
+    const long hu1 = (long)HID*T*(F*2);
+    float *u1  = wallc(g, (size_t)2*hu1);
+    float *u1n = wallc(g, (size_t)2*hu1);
+    if (!u1 || !u1n) return 1;
+    if (!sp_up_pair(g, "mask_decoder.up_conv1", "phase_decoder.up_conv1", d_pair, T, F, 2, u1, htf, hu1)) return 2;
+    gdump("d_u1", u1, (size_t)2*hu1);
+    {
+        snprintf(k0, sizeof(k0), "%s", "mask_decoder.up_conv1.1.weight");
+        snprintf(k1, sizeof(k1), "%s", "phase_decoder.up_conv1.1.weight");
+        const float *nw0 = reuse_gpu_w(g, k0), *nw1 = reuse_gpu_w(g, k1);
+        char b0[256], b1[256];
+        snprintf(b0, sizeof(b0), "%s", "mask_decoder.up_conv1.1.bias");
+        snprintf(b1, sizeof(b1), "%s", "phase_decoder.up_conv1.1.bias");
+        const float *nb0 = reuse_gpu_w(g, b0), *nb1 = reuse_gpu_w(g, b1);
+        snprintf(k0, sizeof(k0), "%s", "mask_decoder.up_conv1.2.weight");
+        snprintf(k1, sizeof(k1), "%s", "phase_decoder.up_conv1.2.weight");
+        const float *pa0 = reuse_gpu_w(g, k0), *pa1 = reuse_gpu_w(g, k1);
+        if (g->bad) return 1;
+        k_inorm_prelu2<<<2*HID, INORM_THREADS>>>(u1, u1n, HID, T*(F*2), hu1, nw0, nb0, pa0, nw1, nb1, pa1, 1e-5f);
+        if (reuse_gpu_ok(g, "inorm_pair")) return 1;
+    }
+    const int Tt = F*2, Ft = T;
+    const long hsw = (long)HID*Tt*Ft;
+    float *sw = wallc(g, (size_t)2*hsw);
+    if (!sw) return 1;
+    k_transpose2<<<dim3((unsigned)((F*2+31)/32), (unsigned)((T+31)/32), (unsigned)(2*HID)), dim3(32,8)>>>(u1n, sw, HID, T, F*2, hsw);
+    gdump("d_sw", sw, (size_t)2*hsw);
+    // up_conv2 (r=4) + inorm + final transpose run per head: its u2 buffer is
+    // 8x the block tensor, and doubling it would raise the arena peak above
+    // the Nano's budget for a marginal launch-count gain.
+    float *u2  = wallc(g, (size_t)HID*Tt*(size_t)(Ft*4));
+    float *u2n = wallc(g, (size_t)HID*Tt*(size_t)(Ft*4));
+    if (!u2 || !u2n) return 1;
+    for (int hnd = 0; hnd < 2; hnd++) {
+        const char *pref = hnd ? "phase_decoder" : "mask_decoder";
+        snprintf(k0, sizeof(k0), "%s.up_conv2", pref);
+        if (sp_up(g, k0, sw + (long)hnd*hsw, Tt, Ft, 4, u2)) return 1;
+        char nk[256], ak[256];
+        snprintf(nk, sizeof(nk), "%s.up_conv2.1.weight", pref);
+        snprintf(ak, sizeof(ak), "%s.up_conv2.2.weight", pref);
+        if (inorm(g, u2, u2n, 1, HID, Tt, Ft*4, nk, ak)) return 1;
+        launch_transpose(HID, Tt, Ft*4, u2n, hnd ? dp : dm);
+    }
+    gdump("d_pre", dm, (size_t)HID*Tt*(Ft*4));
+    (void)hoff_dp;
+    return g->bad ? 1 : 0;
+}
+
+// Paired-dense conv launcher: only the r8/r6 register-tile paths (the dense
+// block's 3x3 dilated shapes), grid.z doubled, head = z / znb. Returns 0 if
+// the shape is outside what the paired kernels cover (caller falls back to
+// the sequential path). All paired tensors must be head-contiguous: x = the
+// 2-head slots buffer, y = the 2-head tmp, x2 = shared enc, w/b = head0's
+// (blob neighbours verified by the caller, head1 = +hoff_w).
+static int launch_conv2d_pair(reuse_gpu_t *g, const float *x, const float *w, const float *b,
+                              const float *w2, const float *b2,
+                              int C_in, int H, int W, int C_out, int padH, int dilH,
+                              float *y, int tilehint, const float *x2, int ng,
+                              long hoff_out, long hoff_x)
+{
+    const long shw = (long)H*W;
+    const bool regtile = dilH == 1 || dilH == 2 || dilH == 4 || dilH == 8;
+    if (!regtile || C_out % conv_chunk() != 0) return 0;
+    const int H_out = H, W_out = W;
+    int big = tilehint ? tilehint : 645;
+    static int bigenv = -1;
+    if (bigenv < 0) { const char *e = getenv("REUSE_CONV_TILE"); bigenv = e ? atoi(e) : 645; }
+    if (!tilehint) big = bigenv;
+    if (big >= 644 && big <= 646 && gpu_is_maxwell()) big = 82;
+    if (big == 92) big = 82;                       // r9 has no paired form
+    int pco, ncb, nra;
+    if (big == 644) { pco = 8; ncb = 2; nra = 4; }
+    else if (big == 645) { pco = 8; ncb = 4; nra = 2; }
+    else if (big == 646) { pco = 16; ncb = 2; nra = 2; }
+    else if (big == 81) { pco = 4; ncb = 4; nra = 2; }
+    else if (big == 82) { pco = 8; ncb = 2; nra = 2; }
+    else return 0;
+    const int trh = 16*nra;
+    const int CH = conv_chunk();
+    const float *S[16];
+    for (int t = 0; t < 16; t++)
+        S[t] = (t < ng) ? (x + (long)(ng-1-t)*HID*shw)
+                        : (x2 ? x2 + (long)(t-ng)*HID*shw : (const float*)0);
+    const float *s0=S[0],*s1=S[1],*s2=S[2],*s3=S[3],*s4=S[4],*s5=S[5],*s6=S[6],*s7=S[7];
+    const float *s8=S[8],*s9=S[9],*s10=S[10],*s11=S[11],*s12=S[12],*s13=S[13],*s14=S[14],*s15=S[15];
+    for (int co0 = 0; co0 < C_out; co0 += CH) {
+        int n = (C_out - co0 < CH) ? C_out - co0 : CH;
+        if (n % pco) return 0;
+        const int znb = n/pco;
+        const dim3 grdb((unsigned)((W_out + 16*ncb - 1) / (16*ncb)), (unsigned)((H_out + trh - 1) / trh), (unsigned)(2*(n/pco)));
+        const dim3 blkb(16, 16);
+        #define LAUNCHP1(RV,PC_,NC_,NR_) k_conv2d_r8p<RV,PC_,NC_,NR_,true,true><<<grdb,blkb>>>(x,w,b,w2,b2,C_in,H,W,padH,1,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,hoff_out,znb,hoff_x)
+        #define LAUNCHP(RV) do { \
+            if      (pco == 4) LAUNCHP1(RV,4,4,32/(4*4)); \
+            else if (big == 644) LAUNCHP1(RV,8,2,4); \
+            else if (big == 645) LAUNCHP1(RV,8,4,2); \
+            else if (big == 646) LAUNCHP1(RV,16,2,2); \
+            else LAUNCHP1(RV,8,2,2); } while (0)
+        switch (dilH) {
+        case 1: if (big == 644) LAUNCHP(66); else LAUNCHP(34); break;
+        case 2: if (big == 644) LAUNCHP(68); else LAUNCHP(36); break;
+        case 4: if (big == 644) LAUNCHP(72); else LAUNCHP(40); break;
+        default: if (big == 644) LAUNCHP(80); else LAUNCHP(48); break;
+        }
+        #undef LAUNCHP
+        launch_kick();
+        (void)hoff_x;
+    }
+    return !g->bad;
 }
 
 static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const float *b,
@@ -3797,8 +4279,12 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
     float *fr = (float*)dalloc((size_t)Tx*Fx);
     float *fi = (float*)dalloc((size_t)Tx*Fx);
     if (!dm || !dp || !fa || !fr || !fi) return 1;
-    if (reuse_gpu_decoder_pre(g, "mask_decoder", enc, dm, T2, F2)) return 1;
-    if (reuse_gpu_decoder_pre(g, "phase_decoder", enc, dp, T2, F2)) return 1;
+    int dp_rc = reuse_gpu_decoders_pair(g, enc, dm, dp, T2, F2);
+    if (dp_rc == 1) return 1;
+    if (dp_rc == 2) {
+        if (reuse_gpu_decoder_pre(g, "mask_decoder", enc, dm, T2, F2)) return 1;
+        if (reuse_gpu_decoder_pre(g, "phase_decoder", enc, dp, T2, F2)) return 1;
+    }
     cudaDeviceSynchronize(); double t3 = gt_now(); g_t_dec = t3-t2;
     if (reuse_gpu_conv1x1_to1(g, dm, "mask_decoder.final_conv", fa, HID, Tx, Fx)) return 1;
     if (reuse_gpu_conv1x1_to1(g, dp, "phase_decoder.phase_conv_r", fr, HID, Tx, Fx)) return 1;

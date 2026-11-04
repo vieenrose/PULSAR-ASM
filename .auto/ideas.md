@@ -18,7 +18,9 @@ python3, the nsys report scripts are missing in this install):
   outproj_ln_g (4x4 + LN)               9.6 ms 30 launches — CLOSED (#59: 8x8 neutral; launch-quantisation bound)
   sp_up8t (tiled, #52)                  6.3 ms  2 launches — OPEN (shape sweeps only)
   resid scatters + gather              ~2 ms               — mostly gone (#57 fused out_proj, #58 tower fusion)
-  encoder skip concays/copies          ~1.6 ms             — OPEN (idea #3)
+  encoder skip concats/copies          0 ms (was 1.4)      — CLOSED #74: param-delivery table
+     mode (REUSE_DENSE_SLOTS default 1 on non-Maxwell, 0 on Maxwell: the 32-acc shapes corrupt
+     under sm_53 codegen, 0.234 signature, delivery-independent). 11 memcpys/444 MB gone.
   heads (3x conv1x1, atan2, crop, sweep) ~1 ms 7 launches  — OPEN, tiny
 
 ## OPEN items
