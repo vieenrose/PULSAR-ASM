@@ -91,6 +91,8 @@ extern "C" void reuse_gpu_print_kprof(void)
     }
 }
 
+__global__ void k_touch_pages(float *ws, long cap);
+
 extern "C" reuse_gpu_t *reuse_gpu_create(const reuse_blob_t *blob)
 {
     size_t total = 0;
@@ -129,8 +131,15 @@ extern "C" reuse_gpu_t *reuse_gpu_create(const reuse_blob_t *blob)
         // kernel touching an unbacked page produces a poisoned-page MMU fault
         // reported as a launch timeout. Touch the arena now so the failure, if
         // any, is a clean allocation failure at startup.
-        if (cudaMemset(g->ws, 0, cap * sizeof(float)) != cudaSuccess) {
-            cudaGetLastError(); cudaFree(g->ws); g->ws = NULL; continue;
+        if (getenv("REUSE_WS_TOUCH") && atoi(getenv("REUSE_WS_TOUCH")) == 0) {
+            if (cudaMemset(g->ws, 0, cap * sizeof(float)) != cudaSuccess) {
+                cudaGetLastError(); cudaFree(g->ws); g->ws = NULL; continue;
+            }
+        } else {
+            k_touch_pages<<<(unsigned)((cap/1024 + 255)/256), 256>>>(g->ws, (long)cap);
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                cudaGetLastError(); cudaFree(g->ws); g->ws = NULL; continue;
+            }
         }
         g->ws_cap = cap;
         if (mb != want_mb) fprintf(stderr, "workspace: %zu MiB (requested %zu MiB)\n", mb, want_mb);
@@ -138,6 +147,21 @@ extern "C" reuse_gpu_t *reuse_gpu_create(const reuse_blob_t *blob)
     }
     if (!g->ws) { fprintf(stderr, "gpu workspace OOM (requested %zu MiB)\n", want_mb); reuse_gpu_destroy(g); return NULL; }
     return g;
+}
+
+// Touch one float per 4 KiB page to force the driver to back the arena.
+// Tegra backs pages lazily, so the arena has to be touched at startup (see the
+// call site); it does NOT have to be zeroed - every consumer writes its whole
+// wallc() slice before reading it, and the arena is reused across reps, so any
+// kernel that needs zeros already memsets its own target. Zeroing all 1 GiB
+// costs 6.7 ms of GPU time, and because the STFT's first pageable H2D copy is
+// synchronous with the device, the whole STFT phase waited for it: 4.5 ms of
+// the 7.1 ms rtf_stft. Touching one float per page is the same page-fault
+// coverage in ~0.05 ms. REUSE_WS_TOUCH=0 restores the cudaMemset.
+__global__ void k_touch_pages(float *ws, long cap)
+{
+    long j = ((long)blockIdx.x * blockDim.x + threadIdx.x) * 1024;   // 4 KiB
+    if (j < cap) ws[j] = 0.0f;
 }
 
 extern "C" const float *reuse_gpu_w(reuse_gpu_t *g, const char *name)
