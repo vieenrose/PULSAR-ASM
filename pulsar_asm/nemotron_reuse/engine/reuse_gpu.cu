@@ -689,8 +689,7 @@ __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const 
                 fv[b4] = fmaf((j < 3 ? v[j][b4] : acc[j-3][b4]),
                               Wc[(long)(c0 + b4)*DCONV + k], fv[b4]);
         }
-#pragma unroll
-        for (int b4 = 0; b4 < 4; b4++) xc[m*DINNER + c0 + b4] = dsilu(fv[b4]);
+        *(float4*)(xc + m*DINNER + c0) = make_float4(dsilu(fv[0]), dsilu(fv[1]), dsilu(fv[2]), dsilu(fv[3]));
     }
 }
 
