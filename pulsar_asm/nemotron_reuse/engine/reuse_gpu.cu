@@ -2086,6 +2086,115 @@ __global__ void k_stft_prep(const float *x, int T, double *xw, int n_fft, int ho
     xw[i] = (double)v * (double)w[k];            // the reference forms this product in double
 }
 
+// ---- two-float (DD) STFT -------------------------------------------------
+// k_stft_dft is a fp64 GEMM: 89 MFMA per call against a GP107 roof of 2 fp64
+// FMA/clk/SM = 1.98 ms, and the measured 2.02 ms says it is AT that roof. On
+// tegra210 fp64 is 1/64 rate, which is why the Nano runs the STFT on the CPU.
+// Double-float (dd: a float pair whose value is hi+lo, ~48 mantissa bits) runs
+// on the fp32 pipes at full rate. The inputs are conversion-exact: xw is the
+// product of two floats (Dekker: p = a*b and e = fmaf(a,b,-p) reproduce it
+// exactly), and a double twiddle split as hi=(float)c, lo=(float)(c-hi) carries
+// 2^-48 - 1e5 times tighter than the float mag/pha the STFT finally emits.
+typedef float2 dd;
+__device__ __forceinline__ void dd_mul(dd a, dd b, dd *p)
+{
+    p->x = a.x * b.x;
+    p->y = fmaf(a.x, b.x, -p->x);
+    p->y = fmaf(a.x, b.y, p->y);
+    p->y = fmaf(a.y, b.x, p->y);
+}
+__device__ __forceinline__ void dd_add(dd *s, dd a)
+{
+    // Knuth two-sum; the low halves are exact by construction (dd_add is the
+    // only place a sum rounds, so the running error stays at the dd floor).
+    float th = s->x + a.x;
+    float z  = s->x - th;
+    float t  = ((s->x - (th - z)) + (a.x - z)) + (s->y + a.y);
+    s->x = th; s->y = t;
+}
+__device__ __forceinline__ dd dd_split(double v)
+{
+    dd r; r.x = (float)v; r.y = (float)(v - (double)r.x); return r;
+}
+__device__ __forceinline__ double dd_to_double(dd v) { return (double)v.x + (double)v.y; }
+
+__global__ void k_stft_twiddles_dd(dd *w, dd *Cc, dd *Cs, int F, int n_fft, int win)
+{
+    const double pi = 3.14159265358979323846;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_fft) {
+        float v = (i < win) ? 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)win)) : 0.0f;
+        w[i].x = v; w[i].y = 0.0f;
+        return;
+    }
+    i -= n_fft;
+    long total = (long)F * n_fft;
+    if (i >= total) return;
+    int k = (int)(i / n_fft);
+    int n = (int)(i % n_fft);
+    double ang = -2.0 * pi * ((double)n * (double)k) / (double)n_fft;
+    Cc[i] = dd_split(cos(ang));
+    Cs[i] = dd_split(sin(ang));
+}
+
+__global__ void k_stft_prep_dd(const float *x, int T, dd *xw, int n_fft, int hop,
+                               int pad, const dd *w)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long n = (long)T * n_fft;
+    if (i >= n) return;
+    int t = (int)(i / n_fft), k = (int)(i % n_fft);
+    int idx = t*hop - pad + k;
+    float v;
+    if (idx < 0)        v = x[-idx - 1];
+    else if (idx >= T)  v = x[2*T - 2 - idx];
+    else                v = x[idx];
+    // the reference forms this product in double; Dekker's split is exact for
+    // a product of two floats, so (p, e) IS the double value.
+    float p = v * w[k].x;
+    xw[i].x = p;
+    xw[i].y = fmaf(v, w[k].x, -p);
+}
+
+__global__ void k_stft_dft_dd(const dd *xw, const dd *Cc, const dd *Cs,
+                              double *re_out, double *im_out, int F, int T, int n_fft)
+{
+    const int KT = 32;
+    __shared__ dd Ct[16][KT+1], St[16][KT+1], Xt[KT][16+1];
+    const int t0 = blockIdx.x * 16, k0 = blockIdx.y * 16;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty*16 + tx;
+    dd re, im;
+    re.x = re.y = im.x = im.y = 0.0f;
+    for (int n0 = 0; n0 < n_fft; n0 += KT) {
+        __syncthreads();
+        for (int i = tid; i < 16*KT; i += 256) {
+            int kk = i / KT, nn = i % KT;
+            int n = n0 + nn;
+            dd z; z.x = 0.0f; z.y = 0.0f;
+            if (k0 + kk < F && n < n_fft) {
+                Ct[kk][nn] = Cc[(long)(k0+kk)*n_fft + n];
+                St[kk][nn] = Cs[(long)(k0+kk)*n_fft + n];
+            } else { Ct[kk][nn] = z; St[kk][nn] = z; }
+            Xt[nn][kk] = (t0 + kk < T && n < n_fft) ? xw[(long)(t0+kk)*n_fft + n] : z;
+        }
+        __syncthreads();
+        if (k0 + ty < F && t0 + tx < T) {
+#pragma unroll
+            for (int nn = 0; nn < KT; nn++) {
+                dd xv = Xt[nn][tx], p;
+                dd_mul(xv, Ct[ty][nn], &p); dd_add(&re, p);
+                dd_mul(xv, St[ty][nn], &p); dd_add(&im, p);
+            }
+        }
+    }
+    if (k0 + ty < F && t0 + tx < T) {
+        long off = (long)(k0+ty)*T + (t0+tx);
+        re_out[off] = dd_to_double(re);
+        im_out[off] = dd_to_double(im);
+    }
+}
+
 __global__ void k_stft_dft(const double *xw, const double *Cc, const double *Cs,
                            double *re_out, double *im_out, int F, int T, int n_fft)
 {
@@ -2143,6 +2252,18 @@ __global__ void k_stft_dc(const double *xw, double *re_out, double *im_out,
     im_out[(long)t] = 0.0;
 }
 
+__global__ void k_stft_dc_dd(const dd *xw, double *re_out, double *im_out,
+                             int T, int n_fft)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= T) return;
+    const dd *src = xw + (long)t * n_fft;
+    dd re; re.x = re.y = 0.0f;
+    for (int n = 0; n < n_fft; n++) dd_add(&re, src[n]);
+    re_out[(long)t] = dd_to_double(re);
+    im_out[(long)t] = 0.0;
+}
+
 __global__ void k_stft_twiddles(float *w, double *Cc, double *Cs, int F, int n_fft, int win)
 {
     const double pi = 3.14159265358979323846;
@@ -2181,26 +2302,40 @@ extern "C" int reuse_gpu_stft(reuse_gpu_t *g, const float *d_wav, int T, int n_f
     // 2*pi, and float twiddles cost ~1.8e-4 rad of phase, which the 30-block
     // tower amplifies down to 26 dB of output SNR.
     g->ws_off = 0;
+    static int stft_dd = -1;
+    if (stft_dd < 0) { const char *e = getenv("REUSE_STFT_DD"); stft_dd = (e && atoi(e) == 0) ? 0 : 1; }
     double *xw  = (double*)wallc(g, (size_t)num_frames*n_fft*2);
     double *Cc  = (double*)wallc(g, (size_t)F*n_fft*2);
     double *Cs  = (double*)wallc(g, (size_t)F*n_fft*2);
     double *dre = (double*)wallc(g, (size_t)F*num_frames*2);
     double *dim = (double*)wallc(g, (size_t)F*num_frames*2);
-    float  *w   = (float*) wallc(g, (size_t)n_fft);
+    float  *w   = (float*) wallc(g, (size_t)n_fft*2);   // 2 slots: the dd path reads it as pairs
     if (!xw || !Cc || !Cs || !dre || !dim || !w) return 1;
     /* Twiddles + window are generated ON DEVICE: the host loop (double
        cos/sin over F*n_fft = 824 KB of tables) cost 2.6 ms per call on the
        dev host - 25% of the whole STFT - and pushed 1.6 MB over PCIe.
        k_stft_twiddles computes the identical values (same double angle,
        cos/sin per element), so the DFT input is unchanged. */
+    long pn = (long)num_frames*n_fft;
+    long on = (long)F*num_frames;
+    if (stft_dd) {
+        // Same 8 bytes/element layout, read as (hi, lo) float pairs; see
+        // k_stft_dft_dd for why this is accurate enough.
+        dd *dxw = (dd*)xw, *dCc = (dd*)Cc, *dCs = (dd*)Cs, *dw = (dd*)w;
+        k_stft_twiddles_dd<<<(unsigned)(((long)(F+2)*n_fft+255)/256), 256>>>(dw, dCc, dCs, F, n_fft, win);
+        { cudaError_t e = cudaGetLastError(); if (e) { fprintf(stderr, "[stfterr] twiddles_dd %s\n", cudaGetErrorString(e)); return reuse_gpu_ok(g, "stft twiddles"); } }
+        k_stft_prep_dd<<<(unsigned)((pn+255)/256), 256>>>(d_wav, T, dxw, n_fft, hop, n_fft/2, dw);
+        k_stft_dft_dd<<<dim3((unsigned)((num_frames+15)/16), (unsigned)((F+15)/16)), dim3(16,16)>>>(
+            dxw, dCc, dCs, dre, dim, F, num_frames, n_fft);
+        k_stft_dc_dd<<<(unsigned)((num_frames+255)/256), 256>>>(dxw, dre, dim, num_frames, n_fft);
+    } else {
     k_stft_twiddles<<<(unsigned)(((long)(F+2)*n_fft+255)/256), 256>>>(w, Cc, Cs, F, n_fft, win);
     { cudaError_t e = cudaGetLastError(); if (e) { fprintf(stderr, "[stfterr] twiddles %s\n", cudaGetErrorString(e)); return reuse_gpu_ok(g, "stft twiddles"); } }
-    long pn = (long)num_frames*n_fft;
     k_stft_prep<<<(unsigned)((pn+255)/256), 256>>>(d_wav, T, xw, n_fft, hop, n_fft/2, w);
     k_stft_dft<<<dim3((unsigned)((num_frames+15)/16), (unsigned)((F+15)/16)), dim3(16,16)>>>(
         xw, Cc, Cs, dre, dim, F, num_frames, n_fft);
-    long on = (long)F*num_frames;
     k_stft_dc<<<(unsigned)((num_frames+255)/256), 256>>>(xw, dre, dim, num_frames, n_fft);
+    }
     k_stft_head<<<(unsigned)((on+255)/256), 256>>>(dre, dim, d_mag, d_pha, on);
     if (getenv("REUSE_DUMP_STFT_RAW")) {
         double *hr = (double*)malloc((size_t)on*sizeof(double)), *hi = (double*)malloc((size_t)on*sizeof(double));
