@@ -1,0 +1,8 @@
+sha256=10030311cd5afd7d04c4b7495410357bd9673f1a582d6cbb651e71b46cb33289
+prompt_text_len=127
+audio_placeholder=<|audio|>
+audio_token_id=125031
+prompt_audio_placeholder_tokens=1622
+prompt_tokens_total=1642
+audio_at=15
+eos_token_id=124900

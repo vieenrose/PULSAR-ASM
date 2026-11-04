@@ -1,0 +1,326 @@
+/* lfm3_asr.c -- S7-lite: one command from WAV to transcript, no Python, no HF, no /bin/sh.
+ *
+ *   lfm3_asr <dir> <clip.wav> [max_gen]
+ *
+ * <dir> holds the gated pieces, exactly as shipped:
+ *   lfm3_wav lfm3_mel lfm3_enc_gpu lfm3_nanode          (executables)
+ *   mel.bin lfm3-audio-2b-enc.lfm3q8 lfm3-audio-2b-q8.lfm3q8 tok.bin
+ *   asr_prompt.txt asr_manifest.txt                      (from asr_manifest.py)
+ *
+ * Stages: WAV -> PCM -> log-mel -> GPU encoder -> prompt ids built natively (sha256
+ * verified, tokenizer from the S1 blob) -> backbone with the audio-embedding override ->
+ * detokenized transcript.
+ *
+ * Every stage is the SAME binary the gates certify, run by execv with an argv array:
+ * no shell, so no quoting, no word splitting, no globbing -- the clip path is passed as
+ * one argument. Stages stay separate processes on purpose: collapsing the four mains
+ * into one binary is S7 proper, and doing it by editing gated sources would trade a
+ * verified pipeline for an unverified one. The shell prints a "STAGE n" line per stage
+ * and stops on the first non-zero exit -- a stage that silently produced nothing is the
+ * failure mode this pipeline has already been bitten by, so each stage's output file is
+ * size-checked before the next stage runs.
+ *
+ * The prompt is built here, not handed in: text from asr_prompt.txt, sha256 checked
+ * against asr_manifest.txt, encoded by the S1 tokenizer, split on the audio placeholder,
+ * and the placeholder expanded to prompt_audio_placeholder_tokens copies of
+ * audio_token_id. The totals are checked against the manifest (1642 ids, 1622 audio) and
+ * the encoder's row count must equal 1622 -- an id list one token off shifts every audio
+ * embedding by a position, which is the bug class that produces a subtly wrong transcript.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include "lfm3_tok.h"
+
+/* ------------------------------------------------------------------ sha256 (FIPS 180-4)
+ * The manifest carries the HF golden's sha256 for the prompt text, so verifying it here
+ * is what stops a stale, truncated or hand-edited prompt file from reaching the model.
+ */
+static const uint32_t K256[64] = {
+  0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+  0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+  0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+  0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+  0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+  0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+  0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+  0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u };
+#define ROT(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+static void sha256_block(uint32_t *h, const uint8_t *p) {
+  uint32_t w[64], a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+  for (int i = 0; i < 16; i++)
+    w[i] = ((uint32_t)p[i*4]<<24)|((uint32_t)p[i*4+1]<<16)|((uint32_t)p[i*4+2]<<8)|p[i*4+3];
+  for (int i = 16; i < 64; i++) {
+    uint32_t s0 = ROT(w[i-15],7)^ROT(w[i-15],18)^(w[i-15]>>3);
+    uint32_t s1 = ROT(w[i-2],17)^ROT(w[i-2],19)^(w[i-2]>>10);
+    w[i] = w[i-16] + s0 + w[i-7] + s1;
+  }
+  for (int i = 0; i < 64; i++) {
+    uint32_t S1 = ROT(e,6)^ROT(e,11)^ROT(e,25);
+    uint32_t ch = (e & f) ^ ((~e) & g);
+    uint32_t t1 = hh + S1 + ch + K256[i] + w[i];
+    uint32_t S0 = ROT(a,2)^ROT(a,13)^ROT(a,22);
+    uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+    uint32_t t2 = S0 + mj;
+    hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+  }
+  h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+}
+static void sha256_hex(const uint8_t *msg, size_t n, char out[65]) {
+  uint32_t h[8] = {0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+                   0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u};
+  size_t full = n / 64, i;
+  for (i = 0; i < full; i++) sha256_block(h, msg + i*64);
+  uint8_t tailb[128]; memset(tailb, 0, sizeof tailb);
+  size_t rem = n - full*64;
+  memcpy(tailb, msg + full*64, rem);
+  tailb[rem] = 0x80;
+  size_t pad = (rem < 56) ? 64 : 128;
+  uint64_t bits = (uint64_t)n * 8;
+  for (int k = 0; k < 8; k++) tailb[pad - 1 - k] = (uint8_t)(bits >> (8*k));
+  for (i = 0; i < pad/64; i++) sha256_block(h, tailb + i*64);
+  for (i = 0; i < 8; i++) sprintf(out + i*8, "%08x", h[i]);
+  out[64] = 0;
+}
+
+/* ------------------------------------------------------------------ helpers */
+static char DIR[1024];
+static char TMP[1024], TMPD[1024];
+static int stage_no = 0;
+
+static void die(const char *fmt, ...) __attribute__((noreturn));
+#include <stdarg.h>
+static void die(const char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  fprintf(stderr, "lfm3_asr: "); vfprintf(stderr, fmt, ap); fputc('\n', stderr); va_end(ap);
+  exit(2);
+}
+static void* xmalloc(size_t n) { void *p = malloc(n); if (!p) die("out of memory (%zu bytes)", n); return p; }
+
+static void path_of(char *dst, size_t dn, const char *name) {
+  snprintf(dst, dn, "%s/%s", DIR, name);
+}
+static long file_size(const char *p) {
+  struct stat st; if (stat(p, &st) != 0) return -1; return (long)st.st_size;
+}
+static uint8_t* read_file(const char *p, size_t *len) {
+  FILE *f = fopen(p, "rb"); if (!f) die("cannot open %s", p);
+  fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+  if (n < 0) die("cannot size %s", p);
+  uint8_t *b = xmalloc((size_t)n + 1);
+  if (fread(b, 1, (size_t)n, f) != (size_t)n) die("short read of %s", p);
+  fclose(f); b[n] = 0; *len = (size_t)n; return b;
+}
+/* argv-only child: no shell, so the clip path is one argument and nothing is expanded. */
+static void run(char *const argv[]) {
+  pid_t pid = fork();
+  if (pid < 0) die("fork failed");
+  if (pid == 0) {
+    char prog[1200]; path_of(prog, sizeof prog, argv[0]);
+    execv(prog, argv);
+    fprintf(stderr, "lfm3_asr: cannot exec %s\n", prog); _exit(127);
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) < 0) die("waitpid failed");
+  if (!WIFEXITED(st)) die("%s terminated by signal %d", argv[0], WIFSIGNALED(st) ? WTERMSIG(st) : -1);
+  if (WEXITSTATUS(st) != 0) die("%s exited %d", argv[0], WEXITSTATUS(st));
+}
+static void run_capture(char *const argv[], const char *out) {
+  pid_t pid = fork();
+  if (pid < 0) die("fork failed");
+  if (pid == 0) {
+    int fd = open(out, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (fd < 0) { fprintf(stderr, "lfm3_asr: cannot write %s\n", out); _exit(127); }
+    dup2(fd, 1); dup2(fd, 2);
+    char prog[1200]; path_of(prog, sizeof prog, argv[0]);
+    execv(prog, argv);
+    fprintf(stderr, "lfm3_asr: cannot exec %s\n", prog); _exit(127);
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) < 0) die("waitpid failed");
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) die("%s failed (exit %d) -- see %s",
+                                                  argv[0], WIFEXITED(st) ? WEXITSTATUS(st) : -1, out);
+}
+static void stage(const char *what) { printf("STAGE %d  %s\n", ++stage_no, what); fflush(stdout); }
+static void need_file(const char *p, long min_bytes, const char *what) {
+  long n = file_size(p);
+  if (n < min_bytes) die("%s produced %ld bytes at %s (expected >= %ld)", what, n, p, min_bytes);
+}
+
+/* manifest: key=value lines */
+static const char* man_get(char *man, const char *key, char *buf, size_t bn) {
+  size_t kl = strlen(key);
+  char *p = man;
+  while (p && *p) {
+    if (!strncmp(p, key, kl) && p[kl] == '=') {
+      char *e = strchr(p + kl + 1, '\n'); size_t n = e ? (size_t)(e - p - kl - 1) : strlen(p + kl + 1);
+      if (n >= bn) n = bn - 1;
+      memcpy(buf, p + kl + 1, n); buf[n] = 0;
+      return buf;
+    }
+    p = strchr(p, '\n'); while (p && *p == '\n') p++;
+  }
+  return NULL;
+}
+static long man_long(char *man, const char *key) {
+  char b[64]; if (!man_get(man, key, b, sizeof b)) die("manifest has no %s", key);
+  return strtol(b, NULL, 10);
+}
+
+int main(int argc, char **argv) {
+  if (argc < 3) {
+    fprintf(stderr, "usage: %s <dir> <clip.wav> [max_gen]\n", argv[0]);
+    return 2;
+  }
+  snprintf(DIR, sizeof DIR, "%s", argv[1]);
+  const char *wav = argv[2];
+  int max_gen = (argc > 3) ? atoi(argv[3]) : 256;
+  if (max_gen < 1 || max_gen > 4096) die("max_gen %d out of range 1..4096", max_gen);
+  if (file_size(wav) < 44) die("%s is missing or smaller than a WAV header", wav);
+
+  snprintf(TMP, sizeof TMP, "/tmp/lfm3_asr.%ld.pcm.f32", (long)getpid());
+  char MEL[1024], OUT[1024], PROMPT[1024], MANI[1024], TOKB[1024], MELB[1024],
+       ENCB[1024], BB[1024];
+  snprintf(MEL, sizeof MEL, "%s", TMP); strcat(MEL, ".mel.f32");
+  snprintf(TMPD, sizeof TMPD, "/tmp/lfm3_asr.%ld.d", (long)getpid());
+  snprintf(OUT, sizeof OUT, "%s/proj_out.bin", TMPD);
+  path_of(PROMPT, sizeof PROMPT, "asr_prompt.txt");
+  path_of(MANI, sizeof MANI, "asr_manifest.txt");
+  path_of(TOKB, sizeof TOKB, "tok.bin");
+  path_of(MELB, sizeof MELB, "mel.bin");
+  path_of(ENCB, sizeof ENCB, "lfm3-audio-2b-enc.lfm3q8");
+  path_of(BB, sizeof BB, "lfm3-audio-2b-q8.lfm3q8");
+  for (int i = 0; i < 4; i++) {
+    const char *need = (i == 0) ? PROMPT : (i == 1) ? MANI : (i == 2) ? TOKB : MELB;
+    if (file_size(need) <= 0) die("missing %s in %s (run .auto/lfm3/asr_manifest.py; mel.bin/tok.bin ship with the model dir)", need, DIR);
+  }
+  if (mkdir(TMPD, 0755) != 0 && file_size(TMPD) < 0) die("cannot create %s", TMPD);
+
+  /* ---- manifest + prompt text, sha256 verified ------------------------------ */
+  size_t mlen; uint8_t *manb = read_file(MANI, &mlen);
+  char *man = (char*)manb;
+  char want_sha[128], got_sha[65];
+  if (!man_get(man, "sha256", want_sha, sizeof want_sha)) die("manifest has no sha256");
+  size_t plen; uint8_t *prompt = read_file(PROMPT, &plen);
+  sha256_hex(prompt, plen, got_sha);
+  if (strcmp(want_sha, got_sha) != 0)
+    die("%s sha256 is %s, manifest demands %s -- refusing to run on an unverified prompt",
+        PROMPT, got_sha, want_sha);
+  long text_len = man_long(man, "prompt_text_len");
+  if ((long)plen != text_len) die("%s is %ld bytes, manifest says %ld", PROMPT, (long)plen, text_len);
+  char ph[64]; if (!man_get(man, "audio_placeholder", ph, sizeof ph)) die("manifest has no audio_placeholder");
+  long audio_id = man_long(man, "audio_token_id");
+  long n_audio = man_long(man, "prompt_audio_placeholder_tokens");
+  long n_total = man_long(man, "prompt_tokens_total");
+  long audio_at = man_long(man, "audio_at");
+  long eos = man_long(man, "eos_token_id");
+  char *split = strstr((char*)prompt, ph);
+  if (!split) die("placeholder %s not found in %s", ph, PROMPT);
+  size_t pre_len = (size_t)(split - (char*)prompt);
+  size_t post_off = pre_len + strlen(ph);
+  size_t post_len = plen - post_off;
+  if (strstr(split + 1, ph)) die("placeholder %s occurs more than once; the manifest describes a single-slot prompt", ph);
+  printf("prompt: %ld bytes, sha256 verified, placeholder at %zu, %ld audio rows at position %ld\n",
+         (long)plen, pre_len, n_audio, audio_at);
+
+  /* ---- stage 1: WAV -> PCM ---------------------------------------------------- */
+  stage("WAV -> PCM16/float32 mono 16 kHz");
+  { char *av[] = { (char*)"lfm3_wav", (char*)wav, TMP, NULL }; run(av); }
+  need_file(TMP, 4, "lfm3_wav");
+
+  /* ---- stage 2: PCM -> log-mel ------------------------------------------------ */
+  stage("log-mel front end");
+  { char *av[] = { (char*)"lfm3_mel", MELB, TMP, MEL, NULL }; run(av); }
+  need_file(MEL, 128 * 4, "lfm3_mel");
+  long mel_bytes = file_size(MEL);
+  if (mel_bytes % (128 * 4) != 0)
+    die("%s is %ld bytes, not a multiple of the 128-row f32 frame (%ld)", MEL, mel_bytes, (long)(128*4));
+  long Tm = mel_bytes / (128 * 4);
+  printf("mel frames Tm = %ld (%.3f audio seconds; %ld audio tokens = ceil(Tm/8))\n",
+         Tm, (double)Tm / 100.0, (Tm + 7) / 8);
+
+  /* ---- stage 3: encoder tower ------------------------------------------------ */
+  stage("audio encoder tower (GPU) -> 2048-d rows");
+  { char tm[32]; snprintf(tm, sizeof tm, "%ld", Tm);
+    char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, tm, TMPD, NULL }; run(av); }
+  need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
+  { long rows = file_size(OUT) / (2048 * 4);
+    if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",
+                             rows, n_audio); }
+
+  /* ---- stage 4: prompt ids, built natively ----------------------------------- */
+  stage("ASR prompt ids (S1 tokenizer, manifest-expanded audio slot)");
+  LTok tok; memset(&tok, 0, sizeof tok);
+  if (ltok_load(&tok, TOKB) != 0) die("cannot load tokenizer blob %s", TOKB);
+  int cap = (int)(plen * 2 + 16);
+  uint32_t *pre_ids = xmalloc((size_t)cap * 4), *post_ids = xmalloc((size_t)cap * 4);
+  int npre = ltok_encode(&tok, prompt, pre_len, pre_ids, cap);
+  int npost = ltok_encode(&tok, prompt + post_off, post_len, post_ids, cap);
+  if (npre < 0 || npost < 0) die("tokenizer failed on the prompt (pre %d, post %d)", npre, npost);
+  long n_ids = (long)npre + n_audio + npost;
+  if (n_ids != n_total)
+    die("built %ld ids (%d + %ld audio + %d), manifest says %ld -- refusing",
+        n_ids, npre, n_audio, npost, n_total);
+  if (npre != audio_at)
+    die("%d ids precede the audio slot, manifest says audio starts at %ld", npre, audio_at);
+  uint32_t *ids = xmalloc((size_t)n_ids * 4);
+  memcpy(ids, pre_ids, (size_t)npre * 4);
+  for (long i = 0; i < n_audio; i++) ids[npre + i] = (uint32_t)audio_id;
+  memcpy(ids + npre + n_audio, post_ids, (size_t)npost * 4);
+  char *idstr = xmalloc((size_t)n_ids * 12);
+  size_t used = 0;
+  for (long i = 0; i < n_ids; i++)
+    used += (size_t)sprintf(idstr + used, "%s%u", i ? "," : "", ids[i]);
+  printf("prompt ids: %ld built, %ld audio rows, matches the manifest totals\n", n_ids, n_audio);
+  if (getenv("LFM_ASR_PRINT_IDS")) printf("IDS %s\n", idstr);
+
+  /* ---- stage 5: backbone ----------------------------------------------------- */
+  stage("backbone prefill + greedy decode");
+  char embp[1100]; snprintf(embp, sizeof embp, "--audio-emb");
+  char ata[64], atv[32], stq[64], stv[32], pp[64];
+  snprintf(ata, sizeof ata, "--audio-at"); snprintf(atv, sizeof atv, "%ld", audio_at);
+  /* --steps is the TOTAL step count, prompt steps included (checks_asr.py uses
+     n_prompt + len(want) + 2): the head only runs once s >= nprompt-1, so passing
+     the generation budget alone makes every step a prompt step and every printed
+     token a -1. Cost a full run to learn; the engine prints -1 rather than a fake id. */
+  snprintf(stq, sizeof stq, "--steps"); snprintf(stv, sizeof stv, "%ld", n_ids + (long)max_gen);
+  printf("steps: %ld prompt + %d generation = %s\n", n_ids, max_gen, stv);
+  snprintf(pp, sizeof pp, "--prompt");
+  char eng[1100]; snprintf(eng, sizeof eng, "/tmp/lfm3_asr.%ld.engine.txt", (long)getpid());
+  { char *av[] = { (char*)"lfm3_nanode", BB, embp, OUT, ata, atv, pp, idstr, stq, stv, NULL };
+    run_capture(av, eng); }
+  size_t elen; uint8_t *eb = read_file(eng, &elen);
+
+  /* ---- stage 6: collect the generated ids, detokenize ------------------------ */
+  stage("detokenize");
+  uint32_t *gen = xmalloc((size_t)(max_gen + 8) * 4);
+  int ngen = 0;
+  char *line = strtok((char*)eb, "\n");
+  while (line) {
+    long step, tok_id; double ms, tps;
+    /* the engine's step lines are "  <step>  <token>  <ms>  <tps>"; gen steps are the
+       ones whose index has passed the prompt, and token -1 marks a skipped head. */
+    if (sscanf(line, "%ld %ld %lf %lf", &step, &tok_id, &ms, &tps) == 4 &&
+        step >= n_total - 1 && tok_id >= 0) {
+      if (tok_id == eos) break;
+      if (ngen < max_gen) gen[ngen++] = (uint32_t)tok_id;
+    }
+    line = strtok(NULL, "\n");
+  }
+  if (ngen == 0) die("no generated tokens in %s -- refusing to print an empty transcript", eng);
+  size_t dcap = (size_t)ngen * 16 + 64;
+  uint8_t *txt = xmalloc(dcap);
+  int dn = ltok_decode(&tok, gen, (size_t)ngen, txt, dcap);
+  if (dn < 0) die("detokenizer failed on %d ids", ngen);
+  txt[dn] = 0;
+  printf("TRANSCRIPT (%d tokens, %.1f chars/KB): %s\n", ngen, (double)dn, txt);
+  free(eb); free(txt); free(gen); free(ids); free(pre_ids); free(post_ids);
+  free(prompt); free(manb); ltok_free(&tok);
+  return 0;
+}

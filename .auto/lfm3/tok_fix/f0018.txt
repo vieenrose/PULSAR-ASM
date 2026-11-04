@@ -1,1 +1,2 @@
-العربية فارسية
+Perform ASR in English.<|im_end|>
+<|im_start|>user

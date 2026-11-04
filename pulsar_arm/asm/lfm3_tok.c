@@ -283,8 +283,14 @@ int ltok_encode(const LTok *t, const uint8_t *text, size_t n, uint32_t *ids, int
         }
         /* next added occurrence (byte search) */
         size_t next = n; 
-        for (uint32_t a = 0; a < t->n_added && next == n; a++) {
-            /* naive search is fine: 140 short ASCII needles, inputs are short */
+        /* Every needle must be searched: the array is length-sorted, so an early
+           ``next == n`` exit finds the longest token's occurrence and misses a
+           SHORTER token that starts earlier. That is exactly the ASR prompt:
+           '<|im_end|>' (10 B) precedes '<|im_start|>' (12 B), and the early exit
+           left it to byte-BPE (ids 28212,100,333,... instead of 124900), which
+           shifts every audio position. Cost is 140 memcmp probes over a short
+           prompt; keep the naive search and drop the guard. */
+        for (uint32_t a = 0; a < t->n_added; a++) {
             for (size_t p = pos; p + t->add_len[a] <= n; p++) {
                 if (memcmp(text + p, t->add_bytes[a], t->add_len[a]) == 0) {
                     if (p < next) next = p;

@@ -36,6 +36,20 @@ CORPUS = [
     "emoji 😀🎧 audio 🎵", "def f(x): return x**2  # code",
     "a" * 300, "12" * 200,
     "<|im_start|>user<|im_end|>",
+    # Ordering regression: added tokens are length-sorted longest-first, so a
+    # SHORTER added token appearing BEFORE a longer one was invisible to the
+    # "next added occurrence" scan (early exit on the first hit). '<|im_end|>'
+    # (10 B) is scanned after '<|im_start|>' (12 B), so with a longer token later
+    # in the string the shorter one fell through to byte-BPE. That is the real ASR
+    # prompt tail, and it cost 5 extra ids at the wrong positions.
+    "<|im_end|>user<|im_start|>",
+    "x<|im_end|>y<|im_start|>z",
+    "<|im_end|>\n<|im_start|>user\n",
+    "Perform ASR in English.<|im_end|>\n<|im_start|>user\n",
+    # and the same class with the 7-byte tokens ahead of 15-byte ones
+    "<|pad|><|startoftext|>", "<|pad|> a <|startoftext|> b",
+    "<|video|><|audio|><|image|>", "<|audio|><|video|>",
+    "<|image|>mid<|audio|>end<|video|>",
     "e.g. U.S.A. 3.14159", "don't  can't  I'd  you're",
     "Ω≈ç√∫˜µ≤≥÷", "العربية فارسية", "עברית", "हिन्दी संस्कृतम्", "ไทย",
     "አማርኛ", "ᚠᚢᚦᚨᚱᚲ", "ⅫⅬⅭⅮ ⑫⑬⑭ ①②③", "١٢٣٤٥ ༡༢༣",
