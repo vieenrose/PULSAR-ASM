@@ -155,7 +155,6 @@ static float gelu(float x) {
 
 // RoPE
 static void rope(float* q, float* k, int pos, int HD, float theta, float partial) {
-  if (pos == 0 && q) { printf("rope called q=%p\n", (void*)q); fflush(stdout); }
   int angles = (int)(partial * HD) / 2;
   for (int i = 0; i < HD/2; i++) {
     float freq = (i < angles) ? 1.0f / powf(theta, (float)(2*i) / (float)HD) : 0.0f;
@@ -203,7 +202,6 @@ static void attention(float* q, float* k, float* v, float* out, int pos, int NQ,
 }
 
 int main(int argc, char** argv) {
-  printf("START\n"); fflush(stdout);
   if (argc < 6) {
     printf("usage: %s <depth.lfm3q8> <hidden.f32> <codes.i32> <masked.u8> <out.f32>\n", argv[0]);
     return 2;
@@ -211,26 +209,20 @@ int main(int argc, char** argv) {
   std::vector<Ent> ents;
   std::map<std::string, Ent*> by;
   char* js = nullptr;
-  printf("loading blob...\n"); fflush(stdout);
   if (!load_blob(argv[1], ents, by, js)) return 1;
-  printf("loaded %zu tensors\n", ents.size()); fflush(stdout);
 
   // read hidden
-  printf("reading hidden...\n"); fflush(stdout);
   FILE* fh = fopen(argv[2], "rb");
   float hidden[2048];
   fread(hidden, 4, 2048, fh); fclose(fh);
-  printf("hidden read ok\n"); fflush(stdout);
   // read codes
   FILE* fc = fopen(argv[3], "rb");
   int codes[12];
   fread(codes, 4, 12, fc); fclose(fc);
-  printf("codes read ok\n"); fflush(stdout);
   // read masked
   FILE* fm = fopen(argv[4], "rb");
   unsigned char masked[12];
   fread(masked, 1, 12, fm); fclose(fm);
-  printf("masked read ok\n"); fflush(stdout);
 
   const int DH = 1024;  // depth hidden
   const int SH = 2048;  // src hidden
@@ -250,26 +242,13 @@ int main(int argc, char** argv) {
   };
 
   // depth_linear: [12288, 2048] Q8 -> f32 [12, 1024, 2048]
-  for (auto& e : ents) if (e.name == "depth_linear.weight") {
-    printf("parsed: name=%s dtype=%d ne=[%d,%d] nd=%d off=%zu nc=%zu ns=%zu\n",
-           e.name.c_str(), e.dtype, e.ne[0], e.ne[1], e.nd, e.file_off, e.nc, e.ns);
-    fflush(stdout);
-  }
   Ent* dl = get("depth_linear.weight");
   Ent* dl_bias = get("depth_linear.bias");
-  printf("dl=%p dl_bias=%p\n", (void*)dl, (void*)dl_bias); fflush(stdout);
 
   // depth_linear forward: out[12, 1024] = W[12*1024, 2048] @ hidden[2048] + bias
   float depth_in[12 * 1024];
-  printf("alloc ok\n"); fflush(stdout);
-  printf("dl dq=%p ds=%p ne=[%d,%d]\n", (void*)dl->dq, (void*)dl->ds, dl->ne[0], dl->ne[1]); fflush(stdout);
-  printf("calling q8_gemv dl...\n"); fflush(stdout);
   q8_gemv(dl->dq, dl->ds, hidden, depth_in, 12 * DH, SH);
-  printf("depth_linear done\n"); fflush(stdout);
   for (int i = 0; i < 12 * DH; i++) depth_in[i] += dl_bias->df[i];
-  // dump depth_in (depth_linear output + embeddings)
-  FILE* fdi = fopen("/tmp/depth_in.f32", "wb");
-  fwrite(depth_in, 4, 12*DH, fdi); fclose(fdi);
 
   // add mask/codebook embeddings
   // depth_in = depth_in + where(masked, mask_embedding, codebook_embedding(codes))
@@ -310,26 +289,21 @@ int main(int argc, char** argv) {
       char name[256]; snprintf(name, sizeof name, "%s.operator_norm.weight", prefix);
       rmsnorm(x + t*DH, get(name)->df, h1 + t*DH, DH, 1e-5f);
     }
-    printf("layer%d op_norm done\n", L); fflush(stdout);
-    // q, k, v projections
+      // q, k, v projections
     char wname[256];
     snprintf(wname, sizeof wname, "%s.self_attn.q_proj.weight", prefix);
-    printf("q_proj name=%s\n", wname); fflush(stdout);
-    for (int t = 0; t < 12; t++) {
+      for (int t = 0; t < 12; t++) {
       q8_gemv(get(wname)->dq, get(wname)->ds, h1 + t*DH, q + t*NHEADS*HD, NHEADS*HD, DH);
     }
-    printf("q_proj done\n"); fflush(stdout);
-    snprintf(wname, sizeof wname, "%s.self_attn.k_proj.weight", prefix);
+      snprintf(wname, sizeof wname, "%s.self_attn.k_proj.weight", prefix);
     for (int t = 0; t < 12; t++) {
       q8_gemv(get(wname)->dq, get(wname)->ds, h1 + t*DH, k + t*NKV*HD, NKV*HD, DH);
     }
-    printf("k_proj done\n"); fflush(stdout);
-    snprintf(wname, sizeof wname, "%s.self_attn.v_proj.weight", prefix);
+      snprintf(wname, sizeof wname, "%s.self_attn.v_proj.weight", prefix);
     for (int t = 0; t < 12; t++) {
       q8_gemv(get(wname)->dq, get(wname)->ds, h1 + t*DH, v + t*NKV*HD, NKV*HD, DH);
     }
-    printf("v_proj done\n"); fflush(stdout);
-    // q_norm, k_norm (per head)
+      // q_norm, k_norm (per head)
     for (int t = 0; t < 12; t++) {
       for (int h = 0; h < NHEADS; h++) {
         char qn[256]; snprintf(qn, sizeof qn, "%s.self_attn.q_norm.weight", prefix);
@@ -339,8 +313,7 @@ int main(int argc, char** argv) {
         for (int d = 0; d < HD; d++) q[t*NHEADS*HD + h*HD + d] = tmp[d];
       }
     }
-    printf("q_norm done\n"); fflush(stdout);
-    for (int t = 0; t < 12; t++) {
+      for (int t = 0; t < 12; t++) {
       for (int h = 0; h < NHEADS; h++) {
         // placeholder
       }
@@ -352,9 +325,7 @@ int main(int argc, char** argv) {
         for (int d = 0; d < HD; d++) k[t*NKV*HD + h*HD + d] = tmp[d];
       }
     }
-    printf("k_norm done\n"); fflush(stdout);
-    printf("starting RoPE\n"); fflush(stdout);
-    // RoPE (full rotation, theta 1e6) - apply once per q head and once per kv head
+        // RoPE (full rotation, theta 1e6) - apply once per q head and once per kv head
     for (int t = 0; t < 12; t++) {
       for (int h = 0; h < NHEADS; h++) {
         rope(q + t*NHEADS*HD + h*HD, nullptr, t, HD, 1e6f, 1.0f);
@@ -424,7 +395,6 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 12*DH; i++) x[i] += h4[i];
     // per-layer rms
     double acc = 0; for (int i = 0; i < 12*DH; i++) acc += (double)x[i]*x[i];
-    printf("layer%d rms=%.4f first4=[%.4f,%.4f,%.4f,%.4f]\n", L, sqrt(acc/(12*DH)), x[0], x[1], x[2], x[3]); fflush(stdout);
   }
   // final embedding_norm (once, after all layers)
   {
@@ -442,7 +412,9 @@ int main(int argc, char** argv) {
   Ent* head = get("depth_head_stacked.weight");
   float out_logits[12 * 2017];
   for (int c = 0; c < NCB; c++) {
-    q8_gemv(head->dq, head->ds, x + c*DH, out_logits + c*CBS, CBS, DH);
+    q8_gemv(head->dq + (size_t)(c*CBS)*DH,
+            head->ds + (size_t)(c*CBS)*(DH/Q8_BLK),
+            x + c*DH, out_logits + c*CBS, CBS, DH);
   }
 
   // write output
