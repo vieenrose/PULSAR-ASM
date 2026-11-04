@@ -246,12 +246,27 @@ int main(int argc, char** argv) {
         q8_gemv(wk->dq, wk->ds, &h[(size_t)t * HID], &K[(size_t)t * NKV * HD], NKV * HD, HID);
         q8_gemv(wv->dq, wv->ds, &h[(size_t)t * HID], &V[(size_t)t * NKV * HD], NKV * HD, HID);
         q8_gemv(wg->dq, wg->ds, &h[(size_t)t * HID], &G[(size_t)t * NH], NH, HID);
-        for (int hh = 0; hh < NH; hh++) rmsnorm(&Q[(size_t)t * NH * HD + hh * HD], qnw, qh.data(), HD, EPS);
-        for (int hh = 0; hh < NH; hh++) memcpy(&Q[(size_t)t * NH * HD + hh * HD], qh.data(), HD * 4);
-        for (int kv = 0; kv < NKV; kv++) rmsnorm(&K[(size_t)t * NKV * HD + kv * HD], knw, kh.data(), HD, EPS);
-        for (int kv = 0; kv < NKV; kv++) memcpy(&K[(size_t)t * NKV * HD + kv * HD], kh.data(), HD * 4);
+        // rmsnorm per head into a scratch row, copied back INSIDE the same iteration:
+        // a split loop left the last head's values in every head slot (found by staged dump).
+        std::vector<float> tn(HD);
+        for (int hh = 0; hh < NH; hh++) {
+          rmsnorm(&Q[(size_t)t * NH * HD + hh * HD], qnw, tn.data(), HD, EPS);
+          memcpy(&Q[(size_t)t * NH * HD + hh * HD], tn.data(), HD * 4);
+        }
+        for (int kv = 0; kv < NKV; kv++) {
+          rmsnorm(&K[(size_t)t * NKV * HD + kv * HD], knw, tn.data(), HD, EPS);
+          memcpy(&K[(size_t)t * NKV * HD + kv * HD], tn.data(), HD * 4);
+        }
         for (int hh = 0; hh < NH; hh++) rope_head(&Q[(size_t)t * NH * HD + hh * HD], t, HD, THETA);
         for (int kv = 0; kv < NKV; kv++) rope_head(&K[(size_t)t * NKV * HD + kv * HD], t, HD, THETA);
+      }
+      if (const char* d = getenv("LFM_CODEC_DUMP")) {
+        char p[512];
+        snprintf(p, sizeof p, "%s/L%d_Q.f32", d, L); FILE* g = fopen(p, "wb"); if (g) { fwrite(Q.data(), 4, Q.size(), g); fclose(g); }
+        snprintf(p, sizeof p, "%s/L%d_K.f32", d, L); g = fopen(p, "wb"); if (g) { fwrite(K.data(), 4, K.size(), g); fclose(g); }
+        snprintf(p, sizeof p, "%s/L%d_V.f32", d, L); g = fopen(p, "wb"); if (g) { fwrite(V.data(), 4, V.size(), g); fclose(g); }
+        snprintf(p, sizeof p, "%s/L%d_G.f32", d, L); g = fopen(p, "wb"); if (g) { fwrite(G.data(), 4, G.size(), g); fclose(g); }
+        snprintf(p, sizeof p, "%s/L%d_h.f32", d, L); g = fopen(p, "wb"); if (g) { fwrite(h.data(), 4, h.size(), g); fclose(g); }
       }
       const float scale = 1.0f / sqrtf((float)HD);
       const int WIN = 30;                              // causal + sliding window of 30
@@ -281,6 +296,10 @@ int main(int argc, char** argv) {
           for (int d = 0; d < HD; d++) attn[hh * HD + d] *= g;
         }
         q8_gemv(wo->dq, wo->ds, attn.data(), &tmp[(size_t)t * HID], HID, NH * HD);
+      }
+      if (const char* d = getenv("LFM_CODEC_DUMP")) {
+        char p[512]; snprintf(p, sizeof p, "%s/L%d_attn.f32", d, L);
+        FILE* g = fopen(p, "wb"); if (g) { fwrite(tmp.data(), 4, tmp.size(), g); fclose(g); }
       }
     } else {
       Ent* win_ = get((P + ".conv.in_proj.weight").c_str());
