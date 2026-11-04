@@ -647,8 +647,8 @@ __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const 
         for (int a4 = 0; a4 < RA; a4++) {
             long m = m0 + tx*RA + a4;
             if (m >= SL) continue;
-#pragma unroll
-            for (int b4 = 0; b4 < 4; b4++) z[m*DINNER + (n0 - DINNER) + ty*4 + b4] = acc[a4][b4];
+            *(float4*)(z + m*DINNER + (n0 - DINNER) + ty*4) =
+                make_float4(acc[a4][0], acc[a4][1], acc[a4][2], acc[a4][3]);
         }
         return;
     }
