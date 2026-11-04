@@ -2327,15 +2327,18 @@ extern "C" int reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *
     if (g->bad) return 1;
     /* tables are generated ON DEVICE (k_istft_tables): removes the host
        double-cos/sin loop and 826 KB of PCIe traffic per call (#81 lever). */
-    float *d_Cc, *d_Cs, *d_w, *d_Cr, *d_Ci, *d_Y, *d_wsum;
+    /* One arena allocation instead of 7 cudaMalloc + 7 cudaFree per call:
+       each driver call is a synchronized operation, measurable under the
+       Nano's CUDA_LAUNCH_BLOCKING and ~15 us each on the dev host. */
+    float *d_Cc, *d_Cs, *d_w, *d_Cr, *d_Ci, *d_Y, *d_wsum, *istft_base = NULL;
     size_t nf = (size_t)n_fft*F, ft = (size_t)F*T, nt = (size_t)n_fft*T;
-    if (cudaMalloc(&d_Cc, nf*sizeof(float)) || cudaMalloc(&d_Cs, nf*sizeof(float)) ||
-        cudaMalloc(&d_w, n_fft*sizeof(float)) || cudaMalloc(&d_Cr, ft*sizeof(float)) ||
-        cudaMalloc(&d_Ci, ft*sizeof(float)) || cudaMalloc(&d_Y, nt*sizeof(float)) ||
-        cudaMalloc(&d_wsum, (size_t)out_len*sizeof(float))) {
+    size_t istft_total = 2*nf + n_fft + 2*ft + nt + (size_t)out_len;
+    if (cudaMalloc(&istft_base, istft_total*sizeof(float))) {
         fprintf(stderr, "istft: gpu OOM\n"); cudaGetLastError();
         return 1;
     }
+    d_Cc = istft_base; d_Cs = d_Cc + nf; d_w = d_Cs + nf; d_Cr = d_w + n_fft;
+    d_Ci = d_Cr + ft;  d_Y = d_Ci + ft;  d_wsum = d_Y + nt;
     k_istft_tables<<<(unsigned)(((long)nf+n_fft+255)/256), 256>>>(d_Cc, d_Cs, d_w, F, n_fft, win);
     { cudaError_t e = cudaGetLastError(); if (e) fprintf(stderr, "[istfterr] tables %s\n", cudaGetErrorString(e)); }
     // mag -> linear (expm1(relu)) then split phase
@@ -2349,8 +2352,7 @@ extern "C" int reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *
         d_Y, d_w, d_out, d_wsum, F, T, n_fft, hop, n_fft/2, out_len);
     k_norm_ola<<<(unsigned)((out_len+255)/256), 256>>>(d_out, d_wsum, out_len);
     int rc = reuse_gpu_ok(g, "istft_gpu");
-    cudaFree(d_Cc); cudaFree(d_Cs); cudaFree(d_w); cudaFree(d_Cr); cudaFree(d_Ci);
-    cudaFree(d_Y); cudaFree(d_wsum);
+    cudaFree(istft_base);
     return rc;
 }
 
