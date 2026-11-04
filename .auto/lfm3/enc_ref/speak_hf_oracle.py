@@ -143,11 +143,24 @@ def main():
     ts, asr = TextStreamer(), AudioStreamer()
     # randperm drives the MaskGIT reveal order and is the only RNG in greedy temp-0 decoding;
     # unseeded, two runs gave 4 and 17 frames. Seed it so the recording is reproducible.
+    # record each frame's reveal order: sample_audio_frame draws one randperm(num_codebooks)
+    # per frame, and the depth engine takes that order as data. Wrap randperm only for the
+    # call, then restore it.
+    orders = []
+    real_randperm = torch.randperm
+    def rec_randperm(n, *a, **k):
+        p = real_randperm(n, *a, **k)
+        if int(n) == int(cf("codebooks")):
+            orders.append(p.cpu().numpy().astype(np.int32).copy())
+        return p
+    torch.randperm = rec_randperm
     torch.manual_seed(SEED)
-    with torch.no_grad():
+    try:
+      with torch.no_grad():
         out = model.generate(
             ids,
-            generation_mode=MODE,
+            # "none" infers the mode from the prompt (text, with the model free to switch to speech)
+            generation_mode=None if MODE == "none" else MODE,
             audio_temperature=0.0,
             max_new_tokens=MAXSLOTS,
             do_sample=False,
@@ -155,6 +168,10 @@ def main():
             streamer=ts,
             audio_streamer=asr,
         )
+    finally:
+        torch.randperm = real_randperm
+    for i, o in enumerate(orders):
+        wi32(os.path.join(OUT, "order.%d.i32" % i), o)
 
     codes = out.audio_codes[0].numpy()          # [12, n_frames] incl. the eos frame
     frames = [np.asarray(f, dtype=np.int32) for f in asr.frames]
