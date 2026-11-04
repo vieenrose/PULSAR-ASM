@@ -212,11 +212,38 @@ void gdump(const char *tag, const float *d, size_t n)
     free(h);
 }
 
+// Grow-only device allocation cache for the per-forward scratch buffers.
+// The model's forward and the iSTFT allocated ~11 buffers per call with
+// cudaMalloc/cudaFree; nsys shows the driver calls alone costing ~2.5 ms per
+// forward (a cudaFree of the iSTFT's 11 MB arena measured 1.1-2.2 ms, and it
+// sat in a gap between kernels). The sizes are fixed per shape, so cache them
+// for the process lifetime: first call allocates, later calls hit the cache and
+// dfree() is a no-op. Peak device memory grows by the ~150 MB of scratch, which
+// fits the Nano's 3 GiB alongside the 1 GiB workspace and the weights.
+struct dcache_ent { size_t n; void *p; int in_use; };
+static dcache_ent dcache[24];
+static int dcache_n = 0;
+
 static void *dalloc(size_t n)
 {
+    // An entry is only reusable once its dfree() has released it: the model
+    // allocates several identical-sized buffers live at once (xa/xb ping-pong,
+    // dm/dp, fa/fr/fi), so the size alone does not identify a free slot.
+    for (int i = 0; i < dcache_n; i++)
+        if (dcache[i].n == n && !dcache[i].in_use) { dcache[i].in_use = 1; return dcache[i].p; }
     void *p = NULL;
     if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) { fprintf(stderr, "gpu OOM %zu\n", n); return NULL; }
+    if (dcache_n < (int)(sizeof dcache / sizeof dcache[0])) {
+        dcache[dcache_n].n = n; dcache[dcache_n].p = p; dcache[dcache_n].in_use = 1; dcache_n++;
+    } else cudaFree(p);          // cache full: fall back to the old behaviour
     return p;
+}
+
+static void dfree(void *p)
+{
+    for (int i = 0; i < dcache_n; i++)
+        if (dcache[i].p == p) { dcache[i].in_use = 0; return; }
+    cudaFree(p);                 // not from the cache (cache was full)
 }
 
 // ================================================================= kernels
@@ -2543,7 +2570,8 @@ extern "C" int reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *
     float *d_Cc, *d_Cs, *d_w, *d_Cr, *d_Ci, *d_Y, *d_wsum, *istft_base = NULL;
     size_t nf = (size_t)n_fft*F, ft = (size_t)F*T, nt = (size_t)n_fft*T;
     size_t istft_total = 2*nf + n_fft + 2*ft + nt + (size_t)out_len;
-    if (cudaMalloc(&istft_base, istft_total*sizeof(float))) {
+    istft_base = (float*)dalloc(istft_total);
+    if (!istft_base) {
         fprintf(stderr, "istft: gpu OOM\n"); cudaGetLastError();
         return 1;
     }
@@ -2568,7 +2596,7 @@ extern "C" int reuse_gpu_istft(reuse_gpu_t *g, const float *d_mag, const float *
         d_Y, d_w, d_out, d_wsum, F, T, n_fft, hop, n_fft/2, out_len);
     k_norm_ola<<<(unsigned)((out_len+255)/256), 256>>>(d_out, d_wsum, out_len);
     int rc = reuse_gpu_ok(g, "istft_gpu");
-    cudaFree(istft_base);
+    dfree(istft_base);
     return rc;
 }
 
@@ -4503,7 +4531,7 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
                 float *sw = xa; xa = xb; xb = sw;
             }
             cur = enc;                                       /* B-layout output for decoders */
-            cudaFree(xa); cudaFree(xb);
+            dfree(xa); dfree(xb);
             xa = xb = NULL;
         } else {
             for (int i = 0; i < NBLK; i++) {
@@ -4539,7 +4567,7 @@ extern "C" int reuse_gpu_forward(reuse_gpu_t *g, const float *mag, const float *
     k_crop_ft<<<(unsigned)(((long)T*F+255)/256), 256>>>(fa, amp_out, T, F, Fx);
     k_sweep_mask<<<(unsigned)((T+255)/256), 256>>>(amp_out, T, F);
     cudaDeviceSynchronize(); g_t_head = gt_now()-t3;
-    cudaFree(dm); cudaFree(dp); cudaFree(fa); cudaFree(fr); cudaFree(fi);
-    cudaFree(xin); cudaFree(enc); cudaFree(blk);
+    dfree(dm); dfree(dp); dfree(fa); dfree(fr); dfree(fi);
+    dfree(xin); dfree(enc); dfree(blk);
     return reuse_gpu_ok(g, "forward");
 }

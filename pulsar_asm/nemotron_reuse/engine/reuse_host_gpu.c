@@ -79,8 +79,17 @@ int main(int argc, char **argv)
         // The waveform upload is inside the timed region: it is part of the
         // work the CPU STFT does not have to pay.
         double t0 = now_s();
-        float *d_wav = NULL;
-        if (cudaMalloc(&d_wav, nsp*0 + (size_t)nf*sizeof(float)) == cudaSuccess) {
+        /* Grow-only cache for the waveform upload buffer: a cudaMalloc/cudaFree
+           pair inside the timed STFT region measured ~0.15 ms of a 0.5 ms phase
+           (the driver calls, not the copy), and the size is fixed per shape. */
+        static float *wav_buf = NULL; static size_t wav_cap = 0;
+        float *d_wav = wav_buf;
+        if (wav_cap < (size_t)nf) {
+            if (wav_buf) cudaFree(wav_buf);
+            if (cudaMalloc(&d_wav, (size_t)nf*sizeof(float)) != cudaSuccess) d_wav = NULL;
+            wav_buf = d_wav; wav_cap = d_wav ? (size_t)nf : 0;
+        }
+        if (d_wav) {
             cudaMemcpy(d_wav, wav, (size_t)nf*sizeof(float), cudaMemcpyHostToDevice);
             printf("[stft] nfft=%d hop=%d wsize=%d F=%d T=%d nf=%d\n", nfft, hop, wsize, F, T, nf);
             cudaMemset(d_mag, 0, nsp*sizeof(float));
@@ -88,7 +97,6 @@ int main(int argc, char **argv)
             if (reuse_gpu_stft(g, d_wav, nf, nfft, hop, wsize, F, T, d_mag, d_pha))
                 printf("gpu stft failed\n");
             cudaDeviceSynchronize();
-            cudaFree(d_wav);
         }
         t_stft = now_s() - t0;
         gpu_stft = 1;
