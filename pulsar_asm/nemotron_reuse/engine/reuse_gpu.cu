@@ -2119,6 +2119,24 @@ __global__ void k_stft_dc(const double *xw, double *re_out, double *im_out,
     im_out[(long)t] = 0.0;
 }
 
+__global__ void k_stft_twiddles(float *w, double *Cc, double *Cs, int F, int n_fft, int win)
+{
+    const double pi = 3.14159265358979323846;
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_fft) {
+        w[i] = (i < win) ? 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)win)) : 0.0f;
+        return;
+    }
+    i -= n_fft;
+    long total = (long)F * n_fft;
+    if (i >= total) return;
+    int k = (int)(i / n_fft);
+    int n = (int)(i % n_fft);
+    double ang = -2.0 * pi * ((double)n * (double)k) / (double)n_fft;
+    Cc[i] = cos(ang);
+    Cs[i] = sin(ang);
+}
+
 __global__ void k_stft_head(const double *re, const double *im, float *mag, float *pha, long n)
 {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -2146,25 +2164,13 @@ extern "C" int reuse_gpu_stft(reuse_gpu_t *g, const float *d_wav, int T, int n_f
     double *dim = (double*)wallc(g, (size_t)F*num_frames*2);
     float  *w   = (float*) wallc(g, (size_t)n_fft);
     if (!xw || !Cc || !Cs || !dre || !dim || !w) return 1;
-    float *hw = (float*)malloc((size_t)n_fft*sizeof(float));
-    double *hc = (double*)malloc((size_t)F*n_fft*sizeof(double));
-    double *hs = (double*)malloc((size_t)F*n_fft*sizeof(double));
-    if (!hw || !hc || !hs) { free(hw); free(hc); free(hs); return 1; }
-    for (int i = 0; i < n_fft; i++)
-        hw[i] = (i < win) ? 0.5f*(1.0f - cosf(2.0f*(float)M_PI*i/(float)win)) : 0.0f;
-    const double pi = 3.14159265358979323846;
-    for (int k = 0; k < F; k++)
-        for (int n = 0; n < n_fft; n++) {
-            double ang = -2.0*pi*((double)n*(double)k)/(double)n_fft;
-            hc[(size_t)k*n_fft+n] = cos(ang);
-            hs[(size_t)k*n_fft+n] = sin(ang);
-        }
-    if (cudaMemcpy(w, hw, (size_t)n_fft*sizeof(float), cudaMemcpyHostToDevice) ||
-        cudaMemcpy(Cc, hc, (size_t)F*n_fft*sizeof(double), cudaMemcpyHostToDevice) ||
-        cudaMemcpy(Cs, hs, (size_t)F*n_fft*sizeof(double), cudaMemcpyHostToDevice)) {
-        free(hw); free(hc); free(hs); return reuse_gpu_ok(g, "stft memcpy");
-    }
-    free(hw); free(hc); free(hs);
+    /* Twiddles + window are generated ON DEVICE: the host loop (double
+       cos/sin over F*n_fft = 824 KB of tables) cost 2.6 ms per call on the
+       dev host - 25% of the whole STFT - and pushed 1.6 MB over PCIe.
+       k_stft_twiddles computes the identical values (same double angle,
+       cos/sin per element), so the DFT input is unchanged. */
+    k_stft_twiddles<<<(unsigned)(((long)(F+2)*n_fft+255)/256), 256>>>(w, Cc, Cs, F, n_fft, win);
+    { cudaError_t e = cudaGetLastError(); if (e) { fprintf(stderr, "[stfterr] twiddles %s\n", cudaGetErrorString(e)); return reuse_gpu_ok(g, "stft twiddles"); } }
     long pn = (long)num_frames*n_fft;
     k_stft_prep<<<(unsigned)((pn+255)/256), 256>>>(d_wav, T, xw, n_fft, hop, n_fft/2, w);
     k_stft_dft<<<dim3((unsigned)((num_frames+15)/16), (unsigned)((F+15)/16)), dim3(16,16)>>>(
