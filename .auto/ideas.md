@@ -158,6 +158,19 @@ python3, the nsys report scripts are missing in this install):
    (e) (4b) is therefore NOT worth building (its 2.7 FMA/load sits between OP=2's 2.0 and OP=3's
    4.0, and 4.0 is already neutral there). The instrumentation knob REUSE_INCONV_LB={2,3,4,6} is in
    the tree (default = the shipped LBV=3, bit-identical).
+4c. Nano deployment ops (new, #142): the Nano's eMMC is 100% full (13 G/14 G, root-reserved
+   blocks leave pesi 0 bytes), so `./build_nano.sh` in ~/reuse_port FAILS at link ("No space left
+   on device", also rsync of engine/ fails). Workaround in use: `cp -a ~/reuse_port /dev/shm/rp`
+   (tmpfs, 2.0 G) then rsync engine/ there, `rm -f engine/*.o engine/reuse_nano_gpu`,
+   `NVCC=/usr/local/cuda-10.2/bin/nvcc ./build_nano.sh`, and run /dev/shm/rp/run_bench2.sh - a
+   copy of run_bench.sh with `cd /dev/shm/rp` and REUSE_DUMP_* pointing at /dev/shm (the /tmp dumps
+   would also fail on the full disk). tmpfs is wiped on reboot: re-create run_bench2.sh after a
+   reboot. User data (b2 590 M, vc 410 M, exp 141 M, primetts 129 M) is NOT ours to delete.
+4d. CLOSED: the #70 "fast CPU STFT" (parallel pre-pass + 4 double accumulator chains, -22% Nano
+   stft(cpu)) no longer needs re-applying before an engine/ rsync - since #138 the Nano runs the
+   GPU DD STFT, so the CPU path is only reached by REUSE_CPU_STFT=1 A/B runs. If such an A/B is
+   ever run, expect the Nano's CPU STFT to read 0.087 s (serial) not 0.065 s (fast form).
+
 5. Nano: the Nano's remaining model time is the TOWER (RTF 11.88 of 16.0 s = 74% at 8 kHz).
    Its kernels are at their dev-host floors, so the Nano-specific lever is Maxwell occupancy
    (64 KB smem/SM, 24 blocks/SM, 255 regs/thread): sweep tile/LB/KC knobs under
