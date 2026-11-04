@@ -53,6 +53,7 @@ PROMPTS = [
      "<|im_start|>user\nGood morning, how are you today?<|im_end|>\n<|im_start|>assistant\n"),
 ]
 PROMPT_TEXT = PROMPTS[FIXTURE]
+SEED = 1234
 
 
 def w32(path, a):
@@ -113,14 +114,17 @@ def main():
     class TextStreamer:
         def __init__(self):
             self.ids = []
-            self.skip = len(ids_list)
+            self.primed = False
 
         def put(self, value):
+            # HF's first put is the whole prompt, INCLUDING any marker generate() appended
+            # (audio mode adds <|audio_start|>), so drop the entire first call. Skipping only
+            # len(prompt) recorded the marker as generated text (run 1).
+            if not self.primed:
+                self.primed = True
+                return
             for t in value.reshape(-1).tolist():
-                if self.skip > 0:
-                    self.skip -= 1
-                else:
-                    self.ids.append(int(t))
+                self.ids.append(int(t))
 
         def end(self):
             pass
@@ -137,6 +141,9 @@ def main():
             pass
 
     ts, asr = TextStreamer(), AudioStreamer()
+    # randperm drives the MaskGIT reveal order and is the only RNG in greedy temp-0 decoding;
+    # unseeded, two runs gave 4 and 17 frames. Seed it so the recording is reproducible.
+    torch.manual_seed(SEED)
     with torch.no_grad():
         out = model.generate(
             ids,
