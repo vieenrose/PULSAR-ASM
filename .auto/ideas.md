@@ -252,3 +252,10 @@ The STFT/iSTFT were declared "at their floors" (#59) but were fp64 GEMMs on hard
    (flat - not load-bound), split-k x2/x4/x8 = 1.57/1.50/1.53 ms (best, -21%), multi-chain
    (k mod 2/4/8) = 5.8-6.1 ms (register pressure kills occupancy). Best compensated form is
    -0.4 ms = 0.08% of rtf_total = below the 0.24% noise floor -> not landed.
+7. CLOSED (#144): in_conv's per-item 64-bit m/L divide is NOT a lever - a shared
+   row-table (one divide per block, identity map for rev=0, m-2*(m%L)-1 for rev=1,
+   compute loop untouched so its register allocation is shipped-identical) measured
+   0.4066 vs 0.4062 s model = flat. ptxas already LICMs the divide out of the k0
+   loop, so the in-code note's "3% for hoisting" is unreachable from this direction
+   (it came from a restructure that also moved register allocation, and failed the
+   gate at 1.8e-4). Do not retry divide hoisting in k_in_conv_r/r2.
