@@ -1,6 +1,6 @@
 # Ideas backlog — RE-USE RTF
 
-Dev host best: rtf_total **0.0885** (rtf_model 0.0845 | enc 0.078 | tower 0.318 | dec 0.032 | heads 0.001 | stft 0.002 | istft 0.002).
+Dev host best: rtf_total **0.0831** (rtf_model 0.0802 | enc 0.071 | tower 0.306 | dec 0.030 | heads 0.001 | stft 0.0014 | istft 0.0015).
 Nano (deployment target, tegra210, CUDA_LAUNCH_BLOCKING=1, REUSE_CPU_STFT=1):
 RTF_model **3.1346** @ 8 kHz (enc 3.285 | tower 11.566 | dec 1.113 | heads 0.011), **6.1243** @ 16 kHz. Cumulative 44.34 -> 3.13 = **14.1x**.
 
