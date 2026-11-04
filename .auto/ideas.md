@@ -230,3 +230,12 @@ The STFT/iSTFT were declared "at their floors" (#59) but were fp64 GEMMs on hard
    Also k_stft_twiddles_dd (0.065 ms) and the window: same argument. Cheap, ~-0.03%.
 5. Model side is unchanged and closed: tower 0.306 s (in_conv 288 ms/240, scan 209/240,
    out_proj 153/240, x_proj 58/240 per profile), enc 0.070, dec 0.030, heads 0.001.
+6. CLOSED (#139 measurement, no code landed): k_idft_k (1.83 ms, 61% of the STFT+iSTFT) is
+   latency-bound on Kahan's 4-op serial dependency, 5x off its 0.37 ms op roof. Standalone
+   harness (/tmp/idft_bench.cu, shapes 320/161/1021, best of 7): plain fp32 0.53 ms
+   (rel rms 8.5e-9 - NOT compensated, so rule 4 forbids it), shipped Kahan+exact-product-residual
+   1.90 ms (1.0e-9), Kahan-on-rounded-product 3.67 ms (compiler quirk, slower), fp64 4.69 ms,
+   register tiling 4x4/2x8/8x2/2x4/4x2/8x4/4x8/2x2/8x8/1x4/4x1 ALL 0.0022-0.0023 ms in-app
+   (flat - not load-bound), split-k x2/x4/x8 = 1.57/1.50/1.53 ms (best, -21%), multi-chain
+   (k mod 2/4/8) = 5.8-6.1 ms (register pressure kills occupancy). Best compensated form is
+   -0.4 ms = 0.08% of rtf_total = below the 0.24% noise floor -> not landed.
