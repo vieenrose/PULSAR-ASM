@@ -640,3 +640,23 @@ What remains is STRUCTURAL, not knob-sized:
   - Winograd F(2,3): closed permanently (#185 arithmetic) unless someone produces a
     batched transform core that beats direct-conv issue efficiency.
 Everything else measured this session sits at a documented floor.
+
+## #266: conv profile revelation + a shape that produced garbage
+- PER-LAUNCH conv timings (3 reps, nsys) instead of the old per-kernel AVERAGE:
+    5.6 / 11.1 / 16.8 / 22.7 ms   <- encoder dense layers 0..3, linear in C_in (64/128/192/256)
+    0.76 / 1.44 / 2.15 / 2.85 ms x2  <- the two decoders (same C_in ladder)
+  The old "5.8 ms x 12 launches" view hid that ONE launch (dil=8, C_in=256) is
+  22.7 ms = 6% of the entire model, and that all four encoder convs are the SAME
+  lever at different C_in. Per-channel cost is constant.
+  => Any future conv work must be evaluated against the dil-8 launch specifically,
+     not against an average that dilutes it 4x.
+- Weight-broadcast accounting: per ci per thread the compute does 24 LDS.128 (384 B)
+  for 24 float4 that are IDENTICAL across all 256 threads of the block; the A-tile
+  staging is 45 B. Weights are ~62% of the block's shared traffic and their GPU-wide
+  total scales with grid_xy. Tried tile 647 = (PCO=4, NCB=2, NRA=8), R=130/132/136/144,
+  which halves grid_xy at the same 64 accumulators.
+- RESULT: garbage (rel_rms 1.256) + encoder 5.5x slower + 166 registers (past the
+  2-blocks/SM cliff). Root cause of the garbage NOT found by inspection - R = TH+2*dil,
+  hbase = h0-padH, grid (6,8,16) vs kernel steps, and shared = R*LS all check out.
+  If anyone retries: FIRST isolate with tests/gpu_block_bench.c (trap #65(d)), and note
+  the register cliff makes it unattractive anyway (cf. #263: crossing it cost 8.7%).
