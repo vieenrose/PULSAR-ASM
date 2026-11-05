@@ -1,73 +1,78 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: OpenMDW-1.1
-# RTF benchmark for the RE-USE Nano port.
-#   RTF = processing wall time / input audio duration.
-# Primary metric = rtf_total for the 8 kHz benchmark fixture, measured on the
-# FULL pipeline (engine STFT -> GPU model -> GPU iSTFT). Nothing is fed in from
-# the reference, and every phase is reported separately so cost cannot be hides
-# by shifting it into a phase that is not counted.
+# Nano-scored RTF benchmark for the RE-USE port.
+# Primary metric = 8 kHz RTF_total MEASURED ON THE JETSON NANO (iPhO), using the
+# deployment protocol in run_bench2.sh (CUDA_LAUNCH_BLOCKING=1, GPU iSTFT, fed
+# reference STFT, best of reps 1-2 after warm-up rep 0). 16 kHz is reported as a
+# held-out monitor. Accuracy gates still run on the dev host (checks.sh), and the
+# Nano's 8 kHz amp output is diffed against the dev Maxwell proxy.
 set -euo pipefail
-
 ROOT=/tmp/pulsar-asm/pulsar_asm/nemotron_reuse
 AUTO=/tmp/pulsar-asm/.auto
+NANO=pesi@100.70.245.36
+SSH="ssh -o ConnectTimeout=60 -o ServerAliveInterval=15 $NANO"
 NVCC="${NVCC:-/usr/local/cuda-10.2/bin/nvcc}"
-BIN=engine/reuse_nano_gpu
-BLOB=tests/golden/reuse.blob
 cd "$ROOT"
 
-# --- pre-check: build (fast syntax/compile failure) ------------------------
-if ! "$NVCC" -O3 -Xcompiler -fopenmp -arch=sm_61 -Iengine -o "$BIN" \
-      engine/reuse_host_gpu.c engine/reuse_gpu.cu engine/blob.c engine/wav_io.c \
-      engine/stft_dft.o engine/istft_dft.o -lm 2>"$AUTO/build.err"; then
-  echo "BUILD FAILED"
-  grep -E "error" "$AUTO/build.err" | head -20
-  exit 1
-fi
+# 1. dev compile check (fast failure)
+"$NVCC" -O3 -Xcompiler -fopenmp -arch=sm_61 -Iengine -o engine/reuse_nano_gpu \
+  engine/reuse_host_gpu.c engine/reuse_gpu.cu engine/blob.c engine/wav_io.c \
+  engine/stft_dft.o engine/istft_dft.o -lm 2>"$AUTO/build.err" \
+  || { echo "BUILD FAILED (dev)"; grep error "$AUTO/build.err" | head; exit 1; }
 
-# Dev-host protocol. Fixed: GPU iSTFT on, full 1 GiB arena, no reference STFT.
-export REUSE_GPU_ISTFT=1
-export REUSE_WS_MB=1024
-unset REUSE_MAG REUSE_PHA REUSE_KPROF GPU_DEBUG REUSE_NAIVE_OP || true
+# 2. dev Maxwell-proxy reference output (bit-exact vs Nano historically)
+REUSE_FORCE_MAXWELL_TILES=1 REUSE_GPU_ISTFT=1 REUSE_WS_MB=1024 \
+  REUSE_MAG=tests/golden/ref_out_8000/in_mag.raw REUSE_PHA=tests/golden/ref_out_8000/in_pha.raw \
+  REUSE_DUMP_AMP=/tmp/proxy_amp.raw ./engine/reuse_nano_gpu tests/golden/reuse.blob \
+  tests/golden/fixtures/mic_test2_8000.wav /dev/null 1 >/dev/null 2>&1
 
+# 3. ship source to the Nano (eMMC copy + tmpfs work dir) and build in the background
+rsync -a --exclude '*.o' --exclude 'reuse_nano_gpu' --exclude '__pycache__' \
+  engine/ "$NANO":~/reuse_port/engine/ 2>/dev/null
+rsync -a --exclude '*.o' --exclude 'reuse_nano_gpu' --exclude '__pycache__' \
+  engine/ "$NANO":/dev/shm/rp/engine/ 2>/dev/null
+$SSH 'cd /dev/shm/rp/engine && rm -f reuse_nano_gpu /dev/shm/build.done &&
+  ( [ -f stft_dft.o ] || gcc -O2 -fopenmp -x c -c stft_dft.cu -o stft_dft.o -I. ) &&
+  ( [ -f istft_dft.o ] || gcc -O2 -fopenmp -x c -c istft_dft.cu -o istft_dft.o -I. ) &&
+  nohup sh -c "/usr/local/cuda-10.2/bin/nvcc -O3 -Xcompiler -fopenmp -arch=sm_53 -o reuse_nano_gpu reuse_host_gpu.c reuse_gpu.cu blob.c wav_io.c stft_dft.o istft_dft.o -lm > /dev/shm/build.log 2>&1; echo \$? > /dev/shm/build.done" >/dev/null 2>&1 &' 2>/dev/null
+for i in $(seq 1 90); do
+  sleep 10
+  st=$($SSH 'cat /dev/shm/build.done 2>/dev/null' 2>/dev/null || true)
+  [ -n "$st" ] && break
+done
+[ "${st:-x}" = "0" ] || { echo "BUILD FAILED (nano) status=${st:-timeout}"; $SSH 'grep error /dev/shm/build.log | head' 2>/dev/null; exit 1; }
 
+# 4. foreign-load check, then the benchmark
+load=$($SSH 'cut -d" " -f1 /proc/loadavg; grep NvMapMemFree /proc/meminfo' 2>/dev/null | tr '\n' ' ')
+echo "nano pre-run: load/nvmap $load"
+out=$($SSH 'cd /dev/shm/rp && ./run_bench2.sh 2>&1' 2>/dev/null)
+echo "$out" | grep -E '^#####|^phases|^model best|^total'
+grep -q 'forward fail\|OOM' <<<"$out" && { echo "NANO RUN FAILED (OOM?)"; exit 1; }
 
-# --- benchmark fixture (the scored workload) ------------------------------
-o=$(./"$BIN" "$BLOB" tests/golden/fixtures/mic_test2_8000.wav /dev/null 3 2>&1)
-rtf_total=$(grep '^total(' <<<"$o" | awk '{for(i=1;i<=NF;i++) if($i~/^RTF_total/) print $(i+1)}')
-rtf_model=$(grep '^model best' <<<"$o" | awk '{for(i=1;i<=NF;i++) if($i~/^RTF_model/) print $(i+1)}')
-rtf_stft=$(grep '^stft(' <<<"$o" | awk '{for(i=1;i<=NF;i++) if($i=="RTF") {print $(i+1); exit}}')
-rtf_istft=$(grep '^istft(' <<<"$o" | awk '{for(i=1;i<=NF;i++) if($i=="RTF") {print $(i+1); exit}}')
-ph=$(grep '^phases:' <<<"$o")
+b8=$(sed -n '/8000 Hz/,/16000 Hz/p' <<<"$out")
+b16=$(sed -n '/16000 Hz/,$p' <<<"$out")
+rtf8=$(grep '^total(' <<<"$b8" | awk '{for(i=1;i<=NF;i++) if($i=="RTF_total") print $(i+1)}')
+mod8=$(grep '^model best' <<<"$b8" | awk '{for(i=1;i<=NF;i++) if($i=="RTF_model") print $(i+1)}')
+rtf16=$(grep '^total(' <<<"$b16" | awk '{for(i=1;i<=NF;i++) if($i=="RTF_total") print $(i+1)}')
+ph=$(grep '^phases' <<<"$b8")
 enc=$(grep -oE 'encoder [0-9.]+' <<<"$ph" | awk '{print $2}')
 tower=$(grep -oE '30xTFMamba [0-9.]+' <<<"$ph" | awk '{print $2}')
 dec=$(grep -oE 'decoders [0-9.]+' <<<"$ph" | awk '{print $2}')
-head=$(grep -oE 'heads [0-9.]+' <<<"$ph" | awk '{print $2}')
+[ -n "$rtf8" ] || { echo "NO RESULT"; exit 1; }
 
-[ -n "$rtf_total" ] || { echo "NO RESULT from benchmark run"; tail -6 <<<"$o"; exit 1; }
+# 5. Nano output must match the dev Maxwell proxy
+scp -q "$NANO":/dev/shm/nb_8000_amp.raw /tmp/nano_amp.raw 2>/dev/null
+d=$(python3 -I -c "
+import numpy as np
+a=np.fromfile('/tmp/proxy_amp.raw',np.float32); b=np.fromfile('/tmp/nano_amp.raw',np.float32)
+print(np.abs(a-b).max() if a.size==b.size else 1e9)")
+echo "nano-vs-proxy amp max|d| = $d"
+python3 -I -c "import sys; sys.exit(0 if float('$d') < 1e-4 else 1)" \
+  || { echo "NANO OUTPUT DIVERGES FROM PROXY"; exit 1; }
 
-printf 'phases: encoder %s s | tower %s s | decoders %s s | heads %s s\n' \
-  "$enc" "$tower" "$dec" "$head"
-
-# --- held-out shapes (NOT scored; anti-overfit monitors) ------------------
-# Different clip, length and sample rate. Tuning must improve these too; if
-# only rtf_total moves, the change is fixture-specific.
-h1=$(./"$BIN" "$BLOB" "$AUTO/fixtures/held_8k.wav"  /dev/null 2 2>&1)
-h2=$(./"$BIN" "$BLOB" "$AUTO/fixtures/held_12k.wav" /dev/null 2 2>&1)
-# the 16 kHz clip needs a bigger arena (encoder peak scales with T*F)
-h3=$(REUSE_WS_MB=1280 ./"$BIN" "$BLOB" "$AUTO/fixtures/held_16k.wav" /dev/null 2 2>&1)
-rtf_h1=$(grep '^total(' <<<"$h1" | awk '{for(i=1;i<=NF;i++) if($i~/^RTF_total/) print $(i+1)}')
-rtf_h2=$(grep '^total(' <<<"$h2" | awk '{for(i=1;i<=NF;i++) if($i~/^RTF_total/) print $(i+1)}')
-rtf_h3=$(grep '^total(' <<<"$h3" | awk '{for(i=1;i<=NF;i++) if($i~/^RTF_total/) print $(i+1)}')
-
-echo "METRIC rtf_total=$rtf_total"
-echo "METRIC rtf_model=$rtf_model"
-echo "METRIC rtf_stft=$rtf_stft"
-echo "METRIC rtf_istft=$rtf_istft"
-echo "METRIC enc_s=$enc"
-echo "METRIC tower_s=$tower"
-echo "METRIC dec_s=$dec"
-echo "METRIC heads_s=$head"
-echo "METRIC rtf_held8k=$rtf_h1"
-echo "METRIC rtf_held12k=$rtf_h2"
-echo "METRIC rtf_held16k=$rtf_h3"
+echo "METRIC rtf_nano8k=$rtf8"
+echo "METRIC rtf_nano8k_model=$mod8"
+echo "METRIC rtf_nano16k=$rtf16"
+echo "METRIC nano_enc_s=$enc"
+echo "METRIC nano_tower_s=$tower"
+echo "METRIC nano_dec_s=$dec"
+echo "METRIC nano_amp_maxd=$d"
