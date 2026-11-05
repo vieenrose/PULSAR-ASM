@@ -192,17 +192,19 @@ python3, the nsys report scripts are missing in this install):
    GPU DD STFT, so the CPU path is only reached by REUSE_CPU_STFT=1 A/B runs. If such an A/B is
    ever run, expect the Nano's CPU STFT to read 0.087 s (serial) not 0.065 s (fast form).
 
-5. Nano: the Nano's remaining model time is the TOWER (RTF 11.88 of 16.0 s = 74% at 8 kHz).
-   Its kernels are at their dev-host floors, so the Nano-specific lever is Maxwell occupancy
-   (64 KB smem/SM, 24 blocks/SM, 255 regs/thread): sweep tile/LB/KC knobs under
+5. Nano: the Nano's remaining model time is the TOWER (9.73 of 14.02 s = 69% at 8 kHz,
+   #211). Its kernels are at their dev-host floors, so the Nano-specific lever is Maxwell
+   occupancy (64 KB smem/SM, 24 blocks/SM, 255 regs/thread): sweep tile/LB/KC knobs under
    REUSE_FORCE_MAXWELL_TILES=1 on the dev host - REUSE_OP 2 vs 3, LBV 2/3/4 on k_in_conv_r
    (#45 picked 3 for sm_61), conv tile 82 vs 645, scan REUSE_SCAN 1 vs 2. Memory-pattern wins
-   transfer ~1:1 (verified cross-arch: max|d| 1.2e-07 vs the dev host), FMA-ratio wins do not.
-   Latest Nano validation: 8 kHz model best 15.96-16.12 s = RTF_model 3.13-3.17 (was 3.2384 at #53)
-   = -3.4% transfer of #55/#56/#57/#58/#60. Cumulative Nano RTF_model 44.34 -> 3.13 = 14.2x.
+   transfer ~1:1 (verified cross-arch: Nano-vs-dev amp BIT-IDENTICAL, #193/#196/#211),
+   FMA-ratio wins do not. Cumulative Nano RTF_model 44.34 -> 2.75 = 16.1x (#211). The
+   Nano-only backlog at the bottom of this file is the current list - this item's
+   general advice stands, its old numbers (RTF 11.88/16.0, validation 15.96 s) are retired.
 
-5. Nano: REUSE_CPU_STFT=1 is the right setting (GPU STFT costs 0.100 s vs 0.091 s, Maxwell fp64
-   is 1/64 rate). Dev host: GPU STFT is default (0.0020 s, and it killed the metric's noise).
+5. RETIRED (#211): REUSE_CPU_STFT=1 vs GPU STFT on Nano is moot - the Nano bench feeds
+   the reference STFT (fed protocol), so no STFT runs at all in the timed region
+   (stft(cpu) 0.0000 s). The DD GPU STFT (#137) stands as the faster live-input path.
 
 ## CLOSED chapters — do not retry (measured, numbers in the experiment log)
 - in_conv (141 ms): 5x4 accumulators OPTIMAL; 4x8 +8%, 8x8 +23%, 256-row tile +48%; latency-bound.
@@ -247,11 +249,9 @@ python3, the nsys report scripts are missing in this install):
 ## OPEN (new chapter: STFT/iSTFT fp64 -> compensated fp32, opened #134-#137)
 The STFT/iSTFT were declared "at their floors" (#59) but were fp64 GEMMs on hardware with
 1/32-1/64-rate fp64. Four keeps: rtf_total 0.0832 -> 0.0810.
-1. **Nano: switch to the GPU STFT.** run_bench.sh exports REUSE_CPU_STFT=1 (CPU fp64 STFT,
-   0.091 s) precisely because the GPU STFT's fp64 GEMM is 1/64-rate-bound (0.100 s). With the
-   DD form (#137) the GPU STFT should be ~10 ms on the Nano = -0.5% Nano RTF. Verify on-device
-   SNR/rel-rms with the GPU STFT before editing run_bench.sh (the gates feed the reference STFT
-   so they cannot see STFT regressions).
+1. RETIRED (#211): Nano GPU-vs-CPU STFT is moot - the Nano bench feeds the reference
+   STFT (fed protocol), so no STFT runs in the timed region. The DD GPU STFT (#137)
+   stands as the faster live-input path.
 2. k_idft (~1.0 ms of the 2.0 ms iSTFT): grid is 4 x ceil(T/16) = 80 blocks on 15 SMs, 128
    threads each = 680 threads/SM. Split-k over 2-4 partials + a reduction, or a 2D tiling over
    n, raises occupancy. Ceiling -0.2% rtf_total. fp32-Kahan accumulation makes a split-k
