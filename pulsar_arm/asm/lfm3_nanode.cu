@@ -1240,6 +1240,17 @@ static int g_prefill_phase = 0;   // 1 while the prompt is being fed (S8 arm sco
 static float* g_aemb = nullptr;
 static int g_aemb_n = 0, g_aemb_at = 0;
 static long g_aemb_fed = 0;      // rows actually consumed, printed at the end as proof
+// SPEAK path (--speak-emb FILE [--speak-tok ID]): the speech-out loop's backbone feedback.
+// A teacher-forced speak run feeds prompt + marker + slot tokens where every speech slot
+// is the audio_out placeholder; at each step whose token is the placeholder the embedding
+// comes from the next row of this file (frame-major fp32 [nf,2048]), not the token table.
+// That is HF's own placeholder mechanism (masked_scatter of get_audio_out_embeds over the
+// audio_out_token_id positions). Without --speak-emb the table row is used (old behavior).
+static float* g_semb = nullptr;
+static int g_semb_n = 0;
+static long g_speak_fed = 0;     // placeholder steps actually served, printed as proof
+static int g_speak_tok = 125032;  // config.json audio_out_token_id
+static const char* g_dump_hidden_all = nullptr;  // every step's post-norm hidden, appended
 struct CapRec { std::string name; int N = 0, K = 0; std::vector<uint16_t> x, y; };
 static int g_cap_on = 0;
 static std::vector<CapRec> g_caps;
@@ -3483,6 +3494,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> clip_files;  // --clip SPEC repeated: resident multi-clip ASR
   const char* dump_logits = nullptr;
   const char* dump_logits_all = nullptr;   // every decode step, appended (gate: top-k vs HF)
+  const char* speak_emb_file = nullptr;  // --speak-emb (speech-out teacher forcing)
   std::vector<int> prompt;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--steps") && i + 1 < argc) steps = atoi(argv[++i]);
@@ -3508,6 +3520,9 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--clip") && i + 1 < argc) clip_files.push_back(argv[++i]);
     else if (!strcmp(argv[i], "--audio-emb") && i + 1 < argc) audio_emb_file = argv[++i];
     else if (!strcmp(argv[i], "--audio-at") && i + 1 < argc) g_aemb_at = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--speak-emb") && i + 1 < argc) speak_emb_file = argv[++i];
+    else if (!strcmp(argv[i], "--speak-tok") && i + 1 < argc) g_speak_tok = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--dump-hidden-all") && i + 1 < argc) g_dump_hidden_all = argv[++i];
   }
   printf("prompt: %zu ids:", prompt.size());
   for (size_t i = 0; i < prompt.size() && i < 8; i++) printf(" %d", prompt[i]);
@@ -3664,6 +3679,23 @@ int main(int argc, char** argv) {
     return 0;
   };
   if (audio_emb_file && load_emb(audio_emb_file)) return 2;
+  if (speak_emb_file) {
+    // Frame count from the file size, same rule as --audio-emb: no hand-typed counts.
+    FILE* sf = fopen(speak_emb_file, "rb");
+    if (!sf) { printf("--speak-emb: cannot open %s\n", speak_emb_file); return 2; }
+    fseek(sf, 0, SEEK_END); long ssz = ftell(sf); fseek(sf, 0, SEEK_SET);
+    if (ssz <= 0 || ssz % ((long)H * 4)) { printf("--speak-emb: %s is %ld bytes, not rows of %d floats\n", speak_emb_file, ssz, H); return 2; }
+    g_semb_n = (int)(ssz / ((long)H * 4));
+    std::vector<float> sh((size_t)g_semb_n * H);
+    if (fread(sh.data(), 4, sh.size(), sf) != sh.size()) { printf("--speak-emb: short read\n"); return 2; }
+    fclose(sf);
+    for (size_t i = 0; i < sh.size(); i++) if (!isfinite(sh[i])) { printf("--speak-emb: non-finite at %zu\n", i); return 2; }
+    if (cudaMalloc(&g_semb, sh.size() * 4) != cudaSuccess) { printf("--speak-emb: OOM (%.1f MB)\n", sh.size() * 4 / 1e6); return 1; }
+    if (cudaMemcpy(g_semb, sh.data(), sh.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { printf("--speak-emb: copy failed\n"); return 1; }
+    printf("SPEAK-EMB armed: %s = %d rows x %d, served at audio_out token %d in slot order (%.1f MB)\n",
+           speak_emb_file, g_semb_n, H, g_speak_tok, sh.size() * 4 / 1e6);
+    fflush(stdout);
+  }
   if (M.emb_mode >= 1) {
     if (!lm_host_init(M, M.hemb, argv[1])) return 1;
     if (lm_rows_override > 0 && (VOCAB % lm_rows_override) == 0) M.hemb.rows = lm_rows_override;
@@ -3828,7 +3860,22 @@ int main(int argc, char** argv) {
     if (g_graphs && M.gx) g_launch = M.stRun;   // embedding, layers, lm_head all on stRun
     cudaEventRecord(evA, g_launch);
     phBegin();
-    if (g_aemb && pos >= g_aemb_at && pos - g_aemb_at < g_aemb_n) {
+    if (g_semb && tok == g_speak_tok && g_speak_fed < g_semb_n) {
+      // Speech slot: the embedding is the frame row, in slot order. More placeholders
+      // than rows is a script error, not a silent table lookup: fail loudly.
+      k_bf16_from_f32<<<(H + 255) / 256, 256, 0, g_launch>>>(
+          g_semb + (size_t)g_speak_fed * H, (bf16*)M.x, H);
+      cudaError_t se = cudaGetLastError();     // read it HERE, same rule as audio-emb
+      if (se != cudaSuccess) {
+        printf("speak embedding launch failed at pos %d (frame %ld): %s\n", pos, g_speak_fed, cudaGetErrorString(se));
+        return 1;
+      }
+      g_speak_fed++;
+    } else if (g_semb && tok == g_speak_tok) {
+      printf("FAIL speak slot at pos %d: %ld frame rows served, file holds %d (script longer than audio)\n",
+             pos, g_speak_fed, g_semb_n);
+      return 1;
+    } else if (g_aemb && pos >= g_aemb_at && pos - g_aemb_at < g_aemb_n) {
       // Audio position: the embedding comes from the encoder, not the token table.
       k_bf16_from_f32<<<(H + 255) / 256, 256, 0, g_launch>>>(
           g_aemb + (size_t)(pos - g_aemb_at) * H, (bf16*)M.x, H);
@@ -3956,6 +4003,21 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
       Ent* fn = T(M, "lfm.model.embedding_norm.weight");
       rms1(M, M.x, fn ? fn->df : nullptr, M.h1);
       lm_head_input = M.h1;
+    }
+    // --dump-hidden-all appends every step's post-final-norm hidden (the quantity HF's
+    // sample_audio_frame receives). cudaMemcpy synchronizes, mirroring the logits dumps.
+    // s>=0 only: the warm-up step also runs the norm block, but its state is discarded
+    // by the reset below, so its hidden would be anextra row of garbage (seen: N+1 rows).
+    if (g_dump_hidden_all && s >= 0) {
+      std::vector<bf16> hb((size_t)H);
+      if (cudaMemcpy(hb.data(), M.h1, (size_t)H * 2, cudaMemcpyDeviceToHost) != cudaSuccess) { printf("hidden dump copy failed at step %d\n", s); return 1; }
+      std::vector<float> hf((size_t)H);
+      for (int i = 0; i < H; i++) { uint32_t u = ((uint32_t)hb[i]) << 16; memcpy(&hf[i], &u, 4); }
+      for (int i = 0; i < H; i++) if (!isfinite(hf[i])) { printf("hidden dump non-finite at step %d dim %d\n", s, i); return 1; }
+      FILE* hh = fopen(g_dump_hidden_all, "ab");
+      if (!hh) { printf("hidden dump cannot open %s\n", g_dump_hidden_all); return 1; }
+      if (fwrite(hf.data(), 4, H, hh) != (size_t)H) { printf("hidden dump short write at step %d\n", s); fclose(hh); return 1; }
+      fclose(hh);
     }
     if (trace && s == g_probe_step) printf("  final rms %.4f\n", rms_host(M, M.x));
     // NOT T(M, EMBNAME): under --emb-host the loader skips the embedding's
@@ -4097,6 +4159,8 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
   if (g_aemb_n)
     printf("AUDIO-EMB fed %ld of %d rows (positions %d..%d); steady-state steps counted: %d\n",
            g_aemb_fed, g_aemb_n, g_aemb_at, g_aemb_at + g_aemb_n - 1, ng);
+  if (g_semb_n)
+    printf("SPEAK-EMB fed %ld of %d rows at audio_out token %d\n", g_speak_fed, g_semb_n, g_speak_tok);
   fflush(stdout);
   if (nclip) { printf("CLIP %d DONE steps=%d\n", cl, ng); fflush(stdout); }
   }  // resident-process clip loop
