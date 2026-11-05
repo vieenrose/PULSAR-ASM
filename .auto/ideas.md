@@ -588,3 +588,27 @@ audited with this lens. NEXT CANDIDATES on the same lens:
   - sp_up8w/sp_up8t: check the weight staging.
 README: measure by interleaving a knob; dump-diff BEFORE timing (#261 rule); check
 nvidia-smi compute-apps AND /proc/loadavg before trusting any absolute number.
+
+## #263 CLOSED: dense-conv loader hoist - two hard constraints learned
+Tried hoisting k_conv2d_r8's A-tile geometry (i/RS divide, q, hh/ww, 6 guards) out of the
+ci loop (it runs up to C_in = 384 times). SASS: 929 XMAD + 374 integer + 105 ISETP against
+only 535 FFMA, so it looked like the biggest remaining win in the #1-dense kernel.
+
+1. **REGISTER CLIFF (new hard constraint).** k_conv2d_r8<80,8,2,4,true,true> = 126 registers.
+   126*256 = 32256 of the 65536 per SM = exactly 2 blocks/SM with **2 registers of slack**.
+   Storing the hoisted geometry per-thread took it to 159 -> 1 block/SM -> encoder +39%,
+   model +8.7%. ANY change to this kernel that adds >2 registers/thread halves occupancy.
+   Check ptxas register count BEFORE building anything here.
+2. **NOT ADDRESS-ISSUE-BOUND.** The same geometry in SHARED keeps 128 registers and
+   occupancy (21.5 KB/block) and genuinely cut total instructions 2966 -> 2580 (-13%,
+   XMAD -20%) with bit-identical output - and measured FLAT-to-worse (+0.27%).
+   The loader's address math is fully hidden under memory latency.
+
+## Where "cut instructions" works vs does not (3 data points now)
+  WORKS:   k_scan_dts (#259 -0.79% from removing 11 FMUL/step; the loop IS issue-bound)
+  DOES NOT: resid relayouts (#257 - 5.6x fewer instructions, flat)
+  DOES NOT: dense convs (#263 - 13% fewer, flat; they are memory/latency-bound)
+Rule of thumb: instruction reductions pay only in kernels whose SASS shows the FMA/memory
+mix already tight AND whose measured throughput is far below the memory roof. For the
+convs, #186 already measured 41% of the fp32 roof with the op mix to match - despite the
+inflated XMAD count, the kernel is waiting on memory, so integer work is free.
