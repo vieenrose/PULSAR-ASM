@@ -409,3 +409,14 @@ OP2 epilogue, tile-82 WS, launch fusion) - unscored, build only with Nano A/B.
    profile matches 16 kHz rate-scaling, mine matches 8 kHz halves; gap fractions
    and rankings are scale-free and trustworthy, absolute ms are not. Do NOT use
    nsys ms for roof arithmetic; use ratios and counts only.
+
+## Rejected structural idea (reasoned, no build, #220-turn)
+- Share ONE in_proj GEMM across both scan directions (it is direction-independent
+  math; today in_conv recomputes the 256->512 GEMM twice per block, 60 launches):
+  REJECTED. The rev time-flip is baked into the fused kernel's row indexing
+  (perm(m)), so sharing means unfusing (write 42 MB x0/z + 2x42 MB rereads per
+  block = ~30 ms traffic) plus re-engineering the dual-direction halo/shuffle
+  plumbing that carries three historical scars (rel-rms 0.57 shfl_up, NaN compact
+  indexing, all-NaN padded-stride). Expected net: wash to negative at high risk.
+  The fusion won for a reason (#58 era). Do not attempt without a new mechanism
+  for the flipped-halo problem.
