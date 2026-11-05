@@ -34,6 +34,15 @@ WAV="/home/picard/lfm3/gate_60s_16k_mono.wav"
 IDS=$(cat .auto/lfm3/speech/asr_prompt_ids.txt 2>/dev/null | tr -d '\n')
 [ -z "$IDS" ] && IDS=$(python3 -c "import json;print(','.join(map(str,json.load(open('.auto/lfm3/speech/hf_asr_golden.json'))['prompt']['prompt_ids'] if 'prompt_ids' in json.load(open('.auto/lfm3/speech/hf_asr_golden.json'))['prompt'] else ''))" 2>/dev/null)
 
+# Cold start, every iteration: drop the model files from the page cache (no root needed for
+# clean pages). Without this a previous run or a probe can leave the 1.95 GB blob cached and
+# the load looks 20 s faster than a real first invocation.
+ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" "cd $DIR && python3 -c \"
+import os
+for p in ['lfm3-audio-2b-q8.lfm3q8','lfm3-audio-2b-enc.lfm3q8','tok.bin','mel.bin','$(basename $WAV)']:
+    fd=os.open(os.path.realpath(p),os.O_RDONLY); os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED); os.close(fd)
+print('page cache: model files evicted (cold start)')
+\"" 2>/dev/null | grep -v setlocale
 T0=$(date +%s%N)
 OUT=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
   "cd $DIR && timeout 1800 ./lfm3_asr . $WAV 40 --tokens-only 2>&1" 2>/dev/null | grep -vi setlocale)
