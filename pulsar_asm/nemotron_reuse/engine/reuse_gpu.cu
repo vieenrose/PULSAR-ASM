@@ -1389,7 +1389,12 @@ __global__ void k_out_proj_r(const float *y, const float *z, const float *W,
  * 4-column group is one LDS.128. Writes `out` exactly like k_out_proj_r (the
  * separate k_concat_f is kept: fusing it was slower on the Nano, #269).
  * Accumulation order over k is unchanged, so the output is bit-compatible. */
-__global__ void __launch_bounds__(256, 2) k_out_proj_r84(const float *y, const float *z, const float *W,
+// LB3: 73 regs, 0 spill on sm_53 -> 3 blocks/SM (LB2 gave 86 regs = 2 blocks/SM,
+// one allocation step over the cliff). Occupancy is what pays on the Nano (#280).
+#ifndef OP84LB
+#define OP84LB 3
+#endif
+__global__ void __launch_bounds__(256, OP84LB) k_out_proj_r84(const float *y, const float *z, const float *W,
                                                         float *out, int SL)
 {
     const int KC = 16, MT = 128;
