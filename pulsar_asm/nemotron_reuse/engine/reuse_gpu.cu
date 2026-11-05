@@ -1232,6 +1232,84 @@ __global__ void k_out_proj_r8c(const float *y, const float *z, const float *W,
     }
 }
 
+/* A-tile transposed through shared memory.
+ *
+ * k_out_proj_r8c keeps As as [m][k], so the thread's 8-value a[] group costs 8
+ * scalar LDS at an 80 B row stride, while its w[] group is already vectorised
+ * out of WsT. Staging shared as AsT[k][m] instead puts those 8 values
+ * contiguous and 16 B aligned (MT+4 = 260 floats = 1040 B keeps every k-row
+ * 16 B aligned), so the a[] group becomes 2 LDS.128: 6 fewer LSU issue slots
+ * per k, ~96 per chunk of ~1300 instructions. The staging side pays 4 scalar
+ * STS instead of 1 STS.128 per float4, which the coalesced global load along k
+ * keeps cheap. Accumulation order is unchanged, so the output is bit-identical
+ * to k_out_proj_r8c. Selected by REUSE_APT=1 (0 = shipped path). */
+__global__ void k_out_proj_r8c_t(const float *y, const float *z, const float *W,
+                              const float *xres, float *cat, int coff, int L, int rev, int SL)
+{
+    const int KC = 16, MT = 256;
+    __shared__ __align__(16) float AsT[KC][MT+4];
+    __shared__ __align__(16) float WsT[KC][HID+4];
+    const long m0 = (long)blockIdx.x * MT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (8,32)
+    const int tid = ty*8 + tx;
+    float acc[8][8];
+#pragma unroll
+    for (int a = 0; a < 8; a++)
+#pragma unroll
+        for (int b = 0; b < 8; b++) acc[a][b] = 0.f;
+    for (int k0 = 0; k0 < DINNER; k0 += KC) {
+        for (int i = tid; i < MT*(KC/4); i += 256) {              /* 4 float4/thread */
+            const int r = i / (KC/4), q = 4*(i - r*(KC/4));
+            const long o_ = (m0 + r)*DINNER + k0 + q;
+            float4 v = make_float4(0.f,0.f,0.f,0.f);
+            if (m0 + r < SL) {
+                const float4 yy = *(const float4*)(y + o_);
+                const float4 zz = *(const float4*)(z + o_);
+                v.x = yy.x * dsilu(zz.x); v.y = yy.y * dsilu(zz.y);
+                v.z = yy.z * dsilu(zz.z); v.w = yy.w * dsilu(zz.w);
+            }
+            AsT[q+0][r] = v.x; AsT[q+1][r] = v.y;
+            AsT[q+2][r] = v.z; AsT[q+3][r] = v.w;
+        }
+        for (int i = tid; i < KC*(HID/4); i += 256) {             /* transpose W tile */
+            const int co = i / (KC/4), q = 4*(i - co*(KC/4));
+            const float4 wv = *(const float4*)(W + (long)co*DINNER + k0 + q);
+            WsT[q+0][co] = wv.x; WsT[q+1][co] = wv.y;
+            WsT[q+2][co] = wv.z; WsT[q+3][co] = wv.w;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KC; k++) {
+            float a[8], w[8];
+            const float4 a_lo = *(const float4*)&AsT[k][ty*8];
+            const float4 a_hi = *(const float4*)&AsT[k][ty*8 + 4];
+            a[0] = a_lo.x; a[1] = a_lo.y; a[2] = a_lo.z; a[3] = a_lo.w;
+            a[4] = a_hi.x; a[5] = a_hi.y; a[6] = a_hi.z; a[7] = a_hi.w;
+#pragma unroll
+            for (int b4 = 0; b4 < 8; b4++) w[b4] = WsT[k][tx*8 + b4];
+#pragma unroll
+            for (int a4 = 0; a4 < 8; a4++)
+#pragma unroll
+                for (int b4 = 0; b4 < 8; b4++) acc[a4][b4] = fmaf(a[a4], w[b4], acc[a4][b4]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int a4 = 0; a4 < 8; a4++) {
+        const long m = m0 + ty*8 + a4;
+        if (m >= SL) continue;
+        int mr = (int)m;
+        if (rev) { const int sh = mr / L, tt = mr - sh*L; mr = sh*L + (L-1-tt); }
+        const float4 xa = *(const float4*)(xres + (long)mr*HID + tx*8);
+        const float4 xb = *(const float4*)(xres + (long)mr*HID + tx*8 + 4);
+        float *d = cat + (long)mr*(2*HID) + coff + tx*8;
+        *(float4*)d = make_float4(acc[a4][0] + xa.x, acc[a4][1] + xa.y,
+                                  acc[a4][2] + xa.z, acc[a4][3] + xa.w);
+        *(float4*)(d+4) = make_float4(acc[a4][4] + xb.x, acc[a4][5] + xb.y,
+                                      acc[a4][6] + xb.z, acc[a4][7] + xb.w);
+    }
+}
+
 __global__ void k_out_proj_r(const float *y, const float *z, const float *W,
                              float *out, int SL)
 {
@@ -4260,7 +4338,10 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
             dim3 g((HID+GT-1)/GT, (unsigned)((SL+GT-1)/GT));
             static int cf = -1;
             if (cf < 0) cf = getenv("REUSE_CONCAT_FUSE") ? atoi(getenv("REUSE_CONCAT_FUSE")) : 1;
-            if      (tiled == 3 && cf && cat) k_out_proj_r8c<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, x, cat, coff, L, rev, (int)SL);
+            static int apt = -1;
+            if (apt < 0) apt = getenv("REUSE_APT") ? atoi(getenv("REUSE_APT")) : 1;
+            if      (tiled == 3 && cf && cat && apt) k_out_proj_r8c_t<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, x, cat, coff, L, rev, (int)SL);
+            else if (tiled == 3 && cf && cat) k_out_proj_r8c<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, x, cat, coff, L, rev, (int)SL);
             else if (tiled == 3) k_out_proj_r8<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, out, (int)SL);
             else if (tiled == 2) k_out_proj_r<<<(unsigned)((SL+63)/64), dim3(16,16), 0, st>>>(y, z, W_op, out, (int)SL);
             else            k_out_proj_tiled<<<g, dim3(GT/2, GT/2), 0, st>>>(y, z, W_op, out, (int)SL);
