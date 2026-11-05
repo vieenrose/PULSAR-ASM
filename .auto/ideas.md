@@ -372,7 +372,12 @@ NEW closures from this profile:
   (stride-5 rows + halo-3 vs 16B alignment).
 
 ## Nano-only backlog (unscored on dev - build only with Nano A/B, never keep on dev metric)
-1. Fuse the concat+residual epilogue into k_out_proj_r (OP=2, the Nano path):
+1. TRIED #269, REVERTED - SLOWER ON THE NANO. Fused concat epilogue in k_out_proj_r
+   was correct and -2.1% on the dev Maxwell proxy, but an interleaved ON-DEVICE A/B
+   showed +4.8% model / +6.3% tower on the Nano (same regs/smem on sm_53, so likely
+   the split 256 B half-row stores, one direction to time-flipped rows). Do not retry
+   without a different store layout. Original note:
+   Fuse the concat+residual epilogue into k_out_proj_r (OP=2, the Nano path):
    writes `out` today + separate k_concat_f (~0.6% Nano tower). r8c shows the
    epilogue pattern (coff/rev/xres/float4 stores); risk is regs (sm_53 launch
    ceiling 63/thread - the #73 TABLE saga). A/B on Nano only.
@@ -685,3 +690,16 @@ blocks are paid for with extra W-tile re-reads. KT TRIED #268: KT=16 -> 13,440 B
 (ptxas-verified) but +1.2% SLOWER (3/3 pairs, bit-compatible): 2x chunks/barriers cost more
 than +50% warps, because 20 accumulators/thread already hide latency. x_proj shape space
 (MT, NT, TX, KT) is now EXHAUSTED - do not re-sweep.
+
+
+## RULE (#269): the Maxwell proxy predicts CORRECTNESS, not PERFORMANCE
+REUSE_FORCE_MAXWELL_TILES=1 on the dev host has been bit-exact against the Nano every
+time (#193/#196/#211/#255/#260/#262) - keep using it for correctness. But in #269 its
+timing had the WRONG SIGN (-2.1% on the proxy, +4.8% on the Nano). The proxy runs the
+Maxwell code paths on a Pascal memory system, so memory-pattern changes do not transfer.
+Any change that only affects Nano-path kernels must be timed with an interleaved A/B ON
+THE NANO (same binary, knob only), e.g.:
+  ssh ... 'cd /dev/shm/rp && for p in 1 2; do for k in 0 1; do CUDA_LAUNCH_BLOCKING=1 \
+    REUSE_GPU_ISTFT=1 <KNOB>=$k REUSE_WS_MB=640 REUSE_MAG=... REUSE_PHA=... \
+    ./engine/reuse_nano_gpu ... 3 | grep "model best"; done; done'
+(#255 and #260 passed this test; #269 failed it.)
