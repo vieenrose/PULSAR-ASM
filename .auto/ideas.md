@@ -703,3 +703,16 @@ THE NANO (same binary, knob only), e.g.:
     REUSE_GPU_ISTFT=1 <KNOB>=$k REUSE_WS_MB=640 REUSE_MAG=... REUSE_PHA=... \
     ./engine/reuse_nano_gpu ... 3 | grep "model best"; done; done'
 (#255 and #260 passed this test; #269 failed it.)
+
+## WIN #270 (small): ex2.approx.ftz for the scan's decay exponentials
+- Non-ftz ex2.approx.f32 wraps each MUFU.EX2 in a denormal fix-up: FSETP (x < -126),
+  @!P FMUL x*0.5 before, @!P FMUL r*r after. 16 decay exps/step -> 48 wasted instructions
+  per step (SASS 576 -> 528, MUFU unchanged). .ftz removes it; only results < 2^-126 flush
+  to 0 (they multiply h, so the effect is < 1.2e-38*|h|).
+- dev -0.47% model (4/4 pairs), Nano -0.27% (3/3 pairs, same-source binaries); bit-compat
+  to the float floor; gate margin unchanged. Scored reading tied the best point (0.0659).
+- REMAINING in the same family: dsoftplus = log1pf(__expf(v)) per step still uses non-ftz
+  __expf (17 FSETP remain) and log1pf (a long software polynomial). Do NOT replace log1pf
+  with __logf(1+x): that loses accuracy for small x and would be a looser softplus, which
+  rule 4 forbids. A ftz-only __expf inside softplus would be legitimate but is ~1 exp per
+  step vs the 16 already done - expected gain ~1/16 of #270, i.e. below the noise floor.
