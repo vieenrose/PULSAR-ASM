@@ -612,3 +612,31 @@ Rule of thumb: instruction reductions pay only in kernels whose SASS shows the F
 mix already tight AND whose measured throughput is far below the memory roof. For the
 convs, #186 already measured 41% of the fp32 roof with the op mix to match - despite the
 inflated XMAD count, the kernel is waiting on memory, so integer work is free.
+
+## #265 CLOSED: k_inorm_prelu Kahan-chain parallelism (4 chains) - negative
+- Hypothesis: each thread walks its strided range with ONE serial Kahan chain, which
+  serializes add latency AND memory-level parallelism. Built k_inorm_prelu4: 4 chains
+  over the identical element set (chain r takes i = tid + r*NT, stride 4*NT), partials
+  combined with a compensated 8-value Kahan pass so accuracy is NOT degraded to plain
+  adds. Numerics held (max|d| 2.38e-07, rel_rms 5.13e-07 = 200x under the gate) and it
+  used FEWER registers (28 vs 31).
+- Result: flat-to-worse (+0.18%, 3 pairs). So the chain was not latency-bound: a rough
+  per-thread instruction budget at ~4 IPC matches the measured 0.587 ms, i.e. the kernel
+  is issue-bound at near-peak IPC. No ILP to unlock; the only remaining lever would be
+  fewer instructions per element, and the Kahan adds are mandated by rule 4.
+  The E[x^2]-mean^2 InstanceNorm formula (-25% traffic) would be a precision tradeoff,
+  i.e. off-limits under "accuracy is a hard gate, not a tradeoff". DO NOT attempt it
+  without an explicit accuracy-waiver decision.
+
+## State of the levers after #263-#265 (three consecutive negative probes)
+Every remaining kernel has now been probed for the three boundness classes:
+  k_conv2d_r8    -> address-issue (#263, -13% inst, flat), barriers (#264, halved, flat),
+                    shape (#197/#258, 644 optimal)
+  k_inorm_prelu  -> latency/MLP (#265, flat)
+  resid pair     -> instructions (#257, 5.6x, flat), float4 (#257, noise)
+What remains is STRUCTURAL, not knob-sized:
+  - k_conv2d_r8: split the C_in reduction into partial sums to expose ILP (a tile
+    restructuring; needs a correctness harness first per trap #65(d)).
+  - Winograd F(2,3): closed permanently (#185 arithmetic) unless someone produces a
+    batched transform core that beats direct-conv issue efficiency.
+Everything else measured this session sits at a documented floor.
