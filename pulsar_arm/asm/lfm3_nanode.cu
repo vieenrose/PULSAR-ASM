@@ -965,9 +965,22 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   const size_t need = M.need_q + M.need_s + M.need_f + (size_t)48 * 1024 * 1024;   // arena is KV 25 MB + ring 0.4 + partials 4.5 MB
   for (int tw = 0; tw < 60; tw++) {
     size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
-    if (fb >= need) {
-      printf("device free %zu MB of %zu MB (need %zu MB) -- loading\n",
-           fb / 1048576, tb / 1048576, need / 1048576);
+    // Tegra is unified memory: cudaMemGetInfo's free excludes reclaimable page cache,
+    // which cudaMalloc DOES get back. Gating on it alone made every single-shot ASR run
+    // sleep the full 60 x 5 s = 300 s (free sat at ~1.08 GB with ~0.9 GB of cache from
+    // the encoder stage) and then load fine anyway. MemAvailable is the kernel's own
+    // estimate of free + reclaimable, i.e. what an allocation can actually obtain; a
+    // board genuinely occupied by another process still waits.
+    size_t avail = 0;
+    if (FILE* mi = fopen("/proc/meminfo", "r")) {
+      char ln[160]; long long v;
+      while (fgets(ln, sizeof ln, mi))
+        if (sscanf(ln, "MemAvailable: %lld kB", &v) == 1) { avail = (size_t)v * 1024; break; }
+      fclose(mi);
+    }
+    if (fb >= need || avail >= need) {
+      printf("device free %zu MB of %zu MB, MemAvailable %zu MB (need %zu MB) -- loading\n",
+           fb / 1048576, tb / 1048576, avail / 1048576, need / 1048576);
       break;
     }
     if (tw == 0)
