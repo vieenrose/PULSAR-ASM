@@ -12,7 +12,7 @@ NVCC="export PATH=/usr/local/cuda/bin:\$PATH && nvcc -std=c++11 -gencode arch=co
 ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" "cd $DIR && rm -f lfm3_nanode.new lfm3_enc_gpu.new lfm3_wav lfm3_mel mo 2>/dev/null; as -o mo pulsar_arm/asm/lfm3_mel.S && echo ASM_OK" >/dev/null 2>&1
 
 # Simpler: just build nanode and enc on the Nano from the synced sources
-for f in pulsar_arm/asm/lfm3_nanode.cu pulsar_arm/asm/lfm3_enc_gpu.cu pulsar_arm/asm/lfm3_wav.c pulsar_arm/asm/lfm3_mel.c pulsar_arm/asm/lfm3_mel.S; do
+for f in pulsar_arm/asm/lfm3_nanode.cu pulsar_arm/asm/lfm3_enc_gpu.cu pulsar_arm/asm/lfm3_wav.c pulsar_arm/asm/lfm3_mel.c pulsar_arm/asm/lfm3_mel.S pulsar_arm/asm/lfm3_asr.c pulsar_arm/asm/lfm3_tok.c pulsar_arm/asm/lfm3_tok.h; do
   scp -q -o ConnectTimeout=20 "$f" "$NANO:$DIR/$(basename $f)" 2>/dev/null
 done
 
@@ -23,6 +23,7 @@ BUILD=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
    nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o lfm3_nanode.new lfm3_nanode.cu -lz 2>&1 && \
    nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o lfm3_enc_gpu.new lfm3_enc_gpu.cu -lz 2>&1 && \
    gcc -O2 -std=c99 -o lfm3_wav lfm3_wav.c 2>&1 && gcc -O2 -std=c99 -o lfm3_mel lfm3_mel.c mo -lm 2>&1 && \
+   rm -f lfm3_asr.new && gcc -O2 -o lfm3_asr.new lfm3_asr.c lfm3_tok.c -lm 2>/dev/null && test -s lfm3_asr.new && mv -f lfm3_asr.new lfm3_asr && \
    test -x lfm3_nanode.new && mv -f lfm3_nanode.new lfm3_nanode && \
    test -x lfm3_enc_gpu.new && mv -f lfm3_enc_gpu.new lfm3_enc_gpu && echo BUILT_OK" 2>/dev/null | grep -vi setlocale)
 echo "$BUILD" | grep -i "error:" | head -5
@@ -39,4 +40,14 @@ OUT=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
 T1=$(date +%s%N)
 WALL=$(python3 -c "print(($T1-$T0)/1e9)")
 echo "$OUT" | tail -3
+# Quality gate: the first 40 greedy ids must equal HF's golden (the engine's greedy
+# prefix matches HF for 207 tokens, so any change here is a real regression).
+GOT=$(echo "$OUT" | sed -n 's/^IDS_PLAIN //p' | tr -s ' ' | sed 's/ *$//')
+WANT=$(tr -s ' ' < .auto/lfm3/speech/hf_first40.txt | sed 's/ *$//')
+if [ "$GOT" != "$WANT" ]; then
+  echo "QUALITY FAIL: first 40 ids differ from the HF golden"
+  echo " got:  $GOT"; echo " want: $WANT"; exit 3
+fi
+echo "QUALITY OK: 40/40 ids equal the HF golden"
 echo "METRIC s2t_wall_s=$WALL"
+python3 -c "print('METRIC s2t_rt=%.4f' % ($WALL/129.72))"
