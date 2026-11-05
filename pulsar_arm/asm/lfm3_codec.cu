@@ -26,6 +26,15 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <time.h>
+// LFM_CODEC_TIME=1: wall time per section, accumulated over the 8 layers and printed once.
+// The codec is a CPU reference, so a host clock is the profiler that applies here.
+static double ck_now() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec * 1e-6; }
+static double ck_t[8];
+static const char* ck_n[8] = {"op_norm", "qkv_gate", "qknorm_rope", "attention", "o_proj", "conv_op", "ffn", "post_ffn"};
+static const bool ck_on = getenv("LFM_CODEC_TIME") != nullptr;
+#define CK(i) do { if (ck_on) { double _n = ck_now(); ck_t[i] += _n - _ck; _ck = _n; } } while (0)
+
 #include <string>
 #include <map>
 
@@ -125,6 +134,36 @@ static void q8_gemv(const int8_t* q, const float* s, const float* x, float* y, i
     const float* sc = s + (size_t)n * (K / Q8_BLK);
     for (int k = 0; k < K; k++) acc += ((float)row[k] * sc[k / Q8_BLK]) * x[k];
     y[n] = acc;
+  }
+}
+
+// Batched over passes. The codec runs T6 passes through the same weights, and the per-pass
+// GEMV streamed every weight row T6 times, each output one dependent fp32 chain (measured
+// ~37 cycles/MAC). Here 12 passes go at once: each weight row is streamed once per 12
+// passes, through the same NEON kernel the depth engine was gated with. Per output the
+// arithmetic is unchanged (fmul by the block scale, then fmadd, k ascending), so the
+// samples must come out byte-identical -- checked against the pre-change binary.
+extern "C" void lfm3_q8_gemm12_kmajor(const int8_t* q, const float* s, const float* XT,
+                                      float* Y, int ldy, int N, int K);
+static void q8_gemm_tiles(const int8_t* q, const float* s, const float* X, int ldx,
+                          float* Y, int ldy, int N, int K, int T) {
+  static std::vector<float> xt;
+  xt.resize((size_t)K * 12);
+  std::vector<float> tail;
+  for (int base = 0; base < T; base += 12) {
+    const int cnt = (T - base < 12) ? (T - base) : 12;
+    for (int i = 0; i < 12; i++) {
+      const float* srow = X + (size_t)(base + (i < cnt ? i : cnt - 1)) * ldx;
+      for (int k = 0; k < K; k++) xt[(size_t)k * 12 + i] = srow[k];
+    }
+    if (cnt == 12) {
+      lfm3_q8_gemm12_kmajor(q, s, xt.data(), Y + (size_t)base * ldy, ldy, N, K);
+    } else {                       // pad the tail tile, keep only the real rows
+      tail.assign((size_t)12 * ldy, 0.f);
+      lfm3_q8_gemm12_kmajor(q, s, xt.data(), tail.data(), ldy, N, K);
+      for (int i = 0; i < cnt; i++)
+        for (int n = 0; n < N; n++) Y[(size_t)(base + i) * ldy + n] = tail[(size_t)i * ldy + n];
+    }
   }
 }
 
@@ -229,7 +268,9 @@ int main(int argc, char** argv) {
     Ent* pfn = get((P + ".post_ffn_norm.weight").c_str());
     bool is_attn = (L == 2 || L == 4 || L == 6);
 
+    double _ck = ck_now();
     for (int t = 0; t < T6; t++) rmsnorm(&X[(size_t)t * HID], on->df, &h[(size_t)t * HID], HID, EPS);
+    CK(0);
 
     if (is_attn) {
       Ent* wq = get((P + ".self_attn.q_proj.weight").c_str());
@@ -240,12 +281,13 @@ int main(int argc, char** argv) {
       float* qnw = get((P + ".self_attn.q_norm.weight").c_str())->df;
       float* knw = get((P + ".self_attn.k_norm.weight").c_str())->df;
       std::vector<float> K((size_t)T6 * NKV * HD), V((size_t)T6 * NKV * HD), G((size_t)T6 * NH);
-      std::vector<float> Q((size_t)T6 * NH * HD);
+      std::vector<float> Q((size_t)T6 * NH * HD), A((size_t)T6 * NH * HD);
+      q8_gemm_tiles(wq->dq, wq->ds, h.data(), HID, Q.data(), NH * HD, NH * HD, HID, T6);
+      q8_gemm_tiles(wk->dq, wk->ds, h.data(), HID, K.data(), NKV * HD, NKV * HD, HID, T6);
+      q8_gemm_tiles(wv->dq, wv->ds, h.data(), HID, V.data(), NKV * HD, NKV * HD, HID, T6);
+      q8_gemm_tiles(wg->dq, wg->ds, h.data(), HID, G.data(), NH, NH, HID, T6);
+      CK(1);
       for (int t = 0; t < T6; t++) {
-        q8_gemv(wq->dq, wq->ds, &h[(size_t)t * HID], &Q[(size_t)t * NH * HD], NH * HD, HID);
-        q8_gemv(wk->dq, wk->ds, &h[(size_t)t * HID], &K[(size_t)t * NKV * HD], NKV * HD, HID);
-        q8_gemv(wv->dq, wv->ds, &h[(size_t)t * HID], &V[(size_t)t * NKV * HD], NKV * HD, HID);
-        q8_gemv(wg->dq, wg->ds, &h[(size_t)t * HID], &G[(size_t)t * NH], NH, HID);
         // rmsnorm per head into a scratch row, copied back INSIDE the same iteration:
         // a split loop left the last head's values in every head slot (found by staged dump).
         std::vector<float> tn(HD);
@@ -268,6 +310,7 @@ int main(int argc, char** argv) {
         snprintf(p, sizeof p, "%s/L%d_G.f32", d, L); g = fopen(p, "wb"); if (g) { fwrite(G.data(), 4, G.size(), g); fclose(g); }
         snprintf(p, sizeof p, "%s/L%d_h.f32", d, L); g = fopen(p, "wb"); if (g) { fwrite(h.data(), 4, h.size(), g); fclose(g); }
       }
+      CK(2);
       const float scale = 1.0f / sqrtf((float)HD);
       const int WIN = 30;                              // causal + sliding window of 30
       for (int t = 0; t < T6; t++) {
@@ -291,24 +334,28 @@ int main(int argc, char** argv) {
             attn[hh * HD + d] = acc / sum;
           }
         }
+        CK(3);
         for (int hh = 0; hh < NH; hh++) {                             // per-head sigmoid gate
           float g = 1.0f / (1.0f + expf(-G[(size_t)t * NH + hh]));
           for (int d = 0; d < HD; d++) attn[hh * HD + d] *= g;
         }
-        q8_gemv(wo->dq, wo->ds, attn.data(), &tmp[(size_t)t * HID], HID, NH * HD);
+        memcpy(&A[(size_t)t * NH * HD], attn.data(), (size_t)NH * HD * 4);
       }
+      q8_gemm_tiles(wo->dq, wo->ds, A.data(), NH * HD, tmp.data(), HID, HID, NH * HD, T6);
+      CK(4);
       if (const char* d = getenv("LFM_CODEC_DUMP")) {
         char p[512]; snprintf(p, sizeof p, "%s/L%d_attn.f32", d, L);
         FILE* g = fopen(p, "wb"); if (g) { fwrite(tmp.data(), 4, tmp.size(), g); fclose(g); }
       }
     } else {
+      CK(1); CK(2); CK(3); CK(4);
       Ent* win_ = get((P + ".conv.in_proj.weight").c_str());
       Ent* wout = get((P + ".conv.out_proj.weight").c_str());
       Ent* wc = get((P + ".conv.conv.weight").c_str());           // [512,1,7] f32
       const float* cw = wc->df;
       std::vector<float> z((size_t)T6 * HID), conv((size_t)T6 * HID);
+      q8_gemm_tiles(win_->dq, win_->ds, h.data(), HID, proj.data(), 3 * HID, 3 * HID, HID, T6);
       for (int t = 0; t < T6; t++) {
-        q8_gemv(win_->dq, win_->ds, &h[(size_t)t * HID], &proj[(size_t)t * 3 * HID], 3 * HID, HID);
         const float* B = &proj[(size_t)t * 3 * HID];
         const float* XG = &proj[(size_t)t * 3 * HID + 2 * HID];   // BCx chunk order: B, C, x
         for (int i = 0; i < HID; i++) z[(size_t)t * HID + i] = B[i] * XG[i];
@@ -325,10 +372,12 @@ int main(int argc, char** argv) {
       for (int t = 0; t < T6; t++) {
         const float* Cg = &proj[(size_t)t * 3 * HID + HID];       // y = C * conv(z): the middle chunk gates
         for (int i = 0; i < HID; i++) conv[(size_t)t * HID + i] *= Cg[i];
-        q8_gemv(wout->dq, wout->ds, &conv[(size_t)t * HID], &tmp[(size_t)t * HID], HID, HID);
       }
+      q8_gemm_tiles(wout->dq, wout->ds, conv.data(), HID, tmp.data(), HID, HID, HID, T6);
+      CK(5);
     }
 
+    CK(5); CK(6); CK(7);
     for (int t = 0; t < T6; t++) {                                  // sandwich: post_operator_norm
       rmsnorm(&tmp[(size_t)t * HID], pon->df, h.data(), HID, EPS);
       for (int i = 0; i < HID; i++) X[(size_t)t * HID + i] += h[i];
@@ -337,15 +386,17 @@ int main(int argc, char** argv) {
     Ent* w1 = get((P + ".feed_forward.w1.weight").c_str());
     Ent* w2 = get((P + ".feed_forward.w2.weight").c_str());
     Ent* w3 = get((P + ".feed_forward.w3.weight").c_str());
-    std::vector<float> u(INTER), gate(INTER), ffn(HID);
+    std::vector<float> U((size_t)T6 * INTER), GA((size_t)T6 * INTER);
+    CK(6);
+    for (int t = 0; t < T6; t++) rmsnorm(&X[(size_t)t * HID], fn->df, &h[(size_t)t * HID], HID, EPS);
+    q8_gemm_tiles(w1->dq, w1->ds, h.data(), HID, U.data(), INTER, INTER, HID, T6);
+    q8_gemm_tiles(w3->dq, w3->ds, h.data(), HID, GA.data(), INTER, INTER, HID, T6);
+    for (size_t i = 0; i < (size_t)T6 * INTER; i++) U[i] = silu(U[i]) * GA[i];
+    q8_gemm_tiles(w2->dq, w2->ds, U.data(), INTER, tmp.data(), HID, HID, INTER, T6);
+    CK(7);
     for (int t = 0; t < T6; t++) {
-      rmsnorm(&X[(size_t)t * HID], fn->df, h.data(), HID, EPS);
-      q8_gemv(w1->dq, w1->ds, h.data(), u.data(), INTER, HID);
-      q8_gemv(w3->dq, w3->ds, h.data(), gate.data(), INTER, HID);
-      for (int i = 0; i < INTER; i++) u[i] = silu(u[i]) * gate[i];
-      q8_gemv(w2->dq, w2->ds, u.data(), ffn.data(), HID, INTER);
-      rmsnorm(ffn.data(), pfn->df, h.data(), HID, EPS);
-      for (int i = 0; i < HID; i++) X[(size_t)t * HID + i] += h[i];
+      rmsnorm(&tmp[(size_t)t * HID], pfn->df, &h[(size_t)t * HID], HID, EPS);
+      for (int i = 0; i < HID; i++) X[(size_t)t * HID + i] += h[(size_t)t * HID + i];
     }
     if (const char* d = getenv("LFM_CODEC_DUMP")) {
       char p[512]; snprintf(p, sizeof p, "%s/layer%d.f32", d, L);
@@ -364,11 +415,16 @@ int main(int argc, char** argv) {
   std::vector<float> lin((size_t)T6 * 2 * NBIN);
   Ent* wlin = get("decoder.lin.weight");
   float* blin = get("decoder.lin.bias")->df;
-  std::vector<float> hn(HID);
-  for (int t = 0; t < T6; t++) {
-    rmsnorm(&X[(size_t)t * HID], enorm, hn.data(), HID, EPS);
-    q8_gemv(wlin->dq, wlin->ds, hn.data(), &lin[(size_t)t * 2 * NBIN], 2 * NBIN, HID);
+  std::vector<float> HN((size_t)T6 * HID);
+  for (int t = 0; t < T6; t++) rmsnorm(&X[(size_t)t * HID], enorm, &HN[(size_t)t * HID], HID, EPS);
+  q8_gemm_tiles(wlin->dq, wlin->ds, HN.data(), HID, lin.data(), 2 * NBIN, 2 * NBIN, HID, T6);
+  for (int t = 0; t < T6; t++)
     for (int i = 0; i < 2 * NBIN; i++) lin[(size_t)t * 2 * NBIN + i] += blin[i];
+  if (ck_on) {
+    double tot = 0; for (int i = 0; i < 8; i++) tot += ck_t[i];
+    printf("CODEC_TIME ms (T=%d, %d passes):", T, T6);
+    for (int i = 0; i < 8; i++) printf(" %s=%.0f", ck_n[i], ck_t[i]);
+    printf("  sum=%.0f\n", tot); fflush(stdout);
   }
 
   if (const char* d = getenv("LFM_CODEC_DUMP")) {
@@ -380,28 +436,46 @@ int main(int argc, char** argv) {
   std::vector<float> audio(L, 0.f), envelope(L, 0.f);
   std::vector<float> win(NFFT);
   for (int n = 0; n < NFFT; n++) win[n] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * n / (NFFT - 1));
-  std::vector<float> frame(NFFT);
-  for (int f = 0; f < T6; f++) {
-    const float* lm = &lin[(size_t)f * 2 * NBIN];
-    const float* an = lm + NBIN;
-    for (int n = 0; n < NFFT; n++) {                                  // irfft, k ascending, DC/Nyquist last
-      double acc = 0;
+  // The irfft below is a direct DFT: O(NFFT*NBIN) per frame, 1280*639 = 818k terms, and the
+  // k-only work (expf, the magnitude's cos/sin, the DC and Nyquist bins) was recomputed for
+  // every n -- 295M transcendental calls per run, which had become the codec's whole cost
+  // once the GEMVs were batched. Hoisting them into per-frame tables and splitting frames
+  // across cores changes no arithmetic: every output element is computed by the same
+  // expression in the same order (verified byte-identical against the pre-change binary).
+  // Frames are computed in parallel but overlap-added SERIALLY: hop 320 < frame 1280, so
+  // consecutive frames write the same samples and a parallel += there is a data race (it
+  // produced a wrong first sample on the first attempt -- caught by the byte comparison).
+  std::vector<float> frames((size_t)T6 * NFFT);
+  #pragma omp parallel
+  {
+    std::vector<float> av(NBIN), bv(NBIN);      // per-thread: shared tables raced here
+    #pragma omp for schedule(dynamic, 1)
+    for (int f = 0; f < T6; f++) {
+      const float* lm = &lin[(size_t)f * 2 * NBIN];
+      const float* an = lm + NBIN;
       for (int k = 1; k < NBIN - 1; k++) {
         float mag = expf(lm[k]);
-        float a = mag * cosf(an[k]), b = mag * sinf(an[k]);
-        float th = 2.0f * (float)M_PI * k * n / (float)NFFT;
-        acc += 2.0 * ((double)a * cosf(th) - (double)b * sinf(th));
+        av[k] = mag * cosf(an[k]);
+        bv[k] = mag * sinf(an[k]);
       }
-      acc += (double)expf(lm[0]);
-      acc += (double)((n & 1) ? -1.0f : 1.0f) * expf(lm[NBIN - 1]);  // (-1)^n * a_{N/2}
-      frame[n] = (float)(acc / NFFT) * win[n];
+      const float dc = expf(lm[0]), ny = expf(lm[NBIN - 1]);
+      for (int n = 0; n < NFFT; n++) {                                // irfft, k ascending, DC/Nyquist last
+        double acc = 0;
+        for (int k = 1; k < NBIN - 1; k++) {
+          float th = 2.0f * (float)M_PI * k * n / (float)NFFT;
+          acc += 2.0 * ((double)av[k] * cosf(th) - (double)bv[k] * sinf(th));
+        }
+        acc += (double)dc;
+        acc += (double)((n & 1) ? -1.0f : 1.0f) * ny;                 // (-1)^n * a_{N/2}
+        frames[(size_t)f * NFFT + n] = (float)(acc / NFFT) * win[n];
+      }
     }
+  }
+  for (int f = 0; f < T6; f++)
     for (int n = 0; n < NFFT; n++) {
-      audio[(size_t)f * NHOP + n] += frame[n];
+      audio[(size_t)f * NHOP + n] += frames[(size_t)f * NFFT + n];
       envelope[(size_t)f * NHOP + n] += win[n] * win[n];
     }
-    if (getenv("LFM_CODEC_TRACE") && f % 90 == 0) { printf("istft frame %d\n", f); fflush(stdout); }
-  }
   FILE* fo = fopen(argv[4], "wb");
   if (!fo) { printf("cannot write %s\n", argv[4]); return 2; }
   for (int i = 0; i < T6 * NHOP; i++) {
