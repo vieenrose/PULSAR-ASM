@@ -22,11 +22,12 @@ See [doc/NEMOTRON_REUSE_NANO_PLAN.md](../../doc/NEMOTRON_REUSE_NANO_PLAN.md) for
 - [x] S6: drivers (CPU `reuse_host.c`, GPU `reuse_host_gpu.c`) + RTF reporting
 - [x] S7: CUDA kernels; **verified on the Jetson Nano itself** (sm_53):
       complex rel-rms 1.104e-06, waveform SNR 119.91 dB, gate PASS
-- [x] S8 (partial): out_proj tiled+fused gate -> tower 47.5 s -> 8.6 s on the
-      dev host; GPU iSTFT (123x); Nano RTF_model 44.34 (8 kHz) / 88.86 (16 kHz)
-- [ ] S8 (open): real-time (RTF < 1) is NOT achieved (~45x short at 8 kHz);
-      the profile says the 45x has to come from the tower (74%) and the
-      encoder convolutions (19%). See next steps.
+- [x] S8: out_proj tiled+fused gate -> tower 47.5 s -> 8.6 s on the dev host;
+      GPU iSTFT (123x); autoresearch session (~270 kept experiments)
+- [x] Dev host real time: RTF_total 0.0656 at 8 kHz (~15x faster than real time)
+- [ ] Nano real time (RTF < 1) NOT yet achieved: RTF_total 2.23 at 8 kHz,
+      4.38 at 16 kHz (was 44.36 / 92.9 at the first on-device run; 19.9x)
+- [x] Nano profiling via an audited nvprof spool server (see Profiling)
 
 ## Accuracy Gates
 Unlike other PULSAR-ASM ports, bit-exactness vs PyTorch is not required (exp/atan2/log1p). Gates:
@@ -42,21 +43,27 @@ Unlike other PULSAR-ASM ports, bit-exactness vs PyTorch is not required (exp/ata
 - S3-S5: **Done and gated** (encoder, 30x TFMamba, both decoders, sweep mask) in
   C (`tfmamba.c`, `model_full.c`) and CUDA (`reuse_gpu.cu`)
 - S6: Done (CPU + GPU drivers, RTF reporting)
-- S7: **Done** (CUDA kernels pass all model gates)
-- S8: Blocked on device access (RTF on the requested `ipho` Nano is unmeasured)
+- S7: **Done** (CUDA kernels pass all model gates, verified on the Nano)
+- S8: Done for the dev host; Nano real-time still open (see Status)
+
+## Device
+Target: **NVIDIA Jetson Nano Developer Kit** (tegra210, 4x A57, 1 SM / 128 cores,
+3 GiB shared memory, L4T R32.5.1, CUDA 10.2, `sm_53`). The development host is
+an x86 box with a GTX 1070 (`sm_61`, 15 SMs).
 
 ## Verified results (dev host, x86 + GTX 1070, CUDA 10.2)
 
 Gates are run with the **reference STFT fed in**, so the model and iSTFT are
-measured on their own (`tests/gate_full.py`):
+measured on their own (`tests/gate_full.py`). Current code (commit `645df5f` and later):
 
 | stage | 8 kHz | 16 kHz | gate |
 |---|---|---|---|
-| DenseEncoder (all sub-stages) | <= 6.8e-7 | -- | 1e-4 |
-| one TFMamba block | 2.31e-7 | -- | 1e-4 |
-| full model, complex spectrum rel-rms | **1.10e-6** | **7.82e-7** | 1e-4 |
-| waveform SNR (GPU model + iSTFT) | **119.91 dB** | **123.99 dB** | 50 dB |
+| full model, complex spectrum rel-rms | **1.23e-6** | **7.68e-7** | 1e-4 |
+| waveform SNR (GPU model + iSTFT) | **117.9 dB** | **~124 dB** | 50 dB |
 | verdict | GATE PASS | GATE PASS | |
+
+The same gates also run on the Maxwell code path (`REUSE_FORCE_MAXWELL_TILES=1`),
+which is what the Nano executes: identical numbers. `checks.sh` runs both.
 
 STFT accuracy against an independent float64 reference: our DFT complex rel-rms
 9.2e-8 / phase rms 1.31e-5 rad vs PyTorch's 1.2e-7 / 2.77e-5 -- our STFT is the
@@ -71,32 +78,72 @@ end-to-end requires reproducing the reference FFT's float32 rounding bit-for-bit
 
 ## RTF (RTF = processing wall time / audio duration; <1 = faster than real time)
 
-Jetson Nano Gen1 (tegra210, 1 SM / 128 cores @ 921 MHz, CUDA 10.2, L4T R32.5.1,
-`sm_53`, `CUDA_LAUNCH_BLOCKING=1`, GPU model + GPU iSTFT, CPU STFT):
+### Jetson Nano (tegra210, 1 SM, CUDA 10.2, `sm_53`, `CUDA_LAUNCH_BLOCKING=1`)
 
-| fixture | audio | model | **RTF_model** | STFT | iSTFT | **RTF_total** | gate on device |
-|---|---|---|---|---|---|---|---|
-| 8 kHz | 5.100 s | 226.12 s | **44.34** | 0.44 s | 0.09 s | **44.36** | 1.104e-06 / 119.88 dB PASS |
-| 16 kHz | 5.100 s | 453.16 s | **88.86** | 1.66 s | 0.35 s | **88.92** | 7.818e-07 / 123.99 dB PASS |
+Current code (commit `645df5f`), 8 kHz fixture, 5.100 s audio:
 
-8 kHz phase breakdown on the Nano: encoder 43.84 s (19%), 30x TFMamba
-167.42 s (74%), decoders 14.83 s (7%), heads 0.01 s.
-
-Real time (RTF < 1) is **not** achieved: the Nano is ~23x slower than the
-GTX 1070 (1 SM vs 15, 0.55x clock), and the naive-kernel model needs ~44x
-real time at 8 kHz. Getting to RTF < 1 needs ~45x more throughput; the
-profile says where it is: 74% tower, 19% encoder convolutions.
-
-Dev host (GTX 1070, 15 SMs, `sm_61`), same code:
-
-| fixture | model | RTF_model | iSTFT CPU -> GPU | RTF_total (GPU iSTFT) |
+| | model | **RTF_model** | iSTFT | **RTF_total** |
 |---|---|---|---|---|
-| 8 kHz | 9.73 s | 1.91 | 1.27 s -> 0.0103 s | **1.92** |
-| 16 kHz | 19.9 s | 3.91 | 4.29 s -> 0.0365 s | **3.90** |
+| 8 kHz | 11.34 s | **2.22** | 0.05 s | **2.23** |
+| 16 kHz | 22.2 s | 4.35 | 0.19 s | **4.38** |
 
-Nano is ~23x the 1070 model time (1 SM vs 15, 0.55x clock).
+8 kHz phase breakdown: encoder 2.38 s, 30x TFMamba 8.12 s, decoders 0.83 s,
+heads 0.01 s. Still **~2.2x slower than real time**; the tower is ~72% of the model.
 
-## Per-kernel profile of the tower (dev host, `REUSE_KPROF=1`)
+History on the same device: the first on-device run measured RTF_model 44.34
+(8 kHz) / 88.86 (16 kHz), before the dev-host optimizations were ported. The
+recent gains (19.9x overall) came from the Nano-path kernels: the 32-accumulator
+out_proj (`REUSE_OP=4`, the largest single step: -10.8% RTF), weight staging in
+shared memory for the dense convolutions, the scan's register-resident decay
+constants, and the `in_conv` halo and dead-work removal.
+
+### Dev host (GTX 1070, 15 SMs, `sm_61`)
+
+The scored autoresearch metric (`rtf_total`, 8 kHz, full pipeline, no reference
+fed) is **0.0656** at this commit: model 0.33 s for 5.1 s of audio, held-out
+clips at 0.0674 / 0.0991 / 0.1327 (8 / 12 / 16 kHz).
+
+### Nano-only gotchas that shaped the code
+- `REUSE_OP=4` (32-accumulator out_proj) is the Maxwell default: the 64-accumulator
+  kernels cannot launch on sm_53.
+- Dev-host timing does not predict Nano timing. Several dev-host wins were
+  slower on the Nano (for example a fused concat, and an ftz `silu`), so every
+  change that only touches Nano-path kernels is timed on the device before it
+  lands.
+- The dev-host Maxwell proxy (`REUSE_FORCE_MAXWELL_TILES=1`) is bit-exact with the
+  Nano for correctness, but not for speed.
+
+## Profiling
+
+**Nano (the target):** `nvprof` needs root on L4T, so `tools/nvprof_server.py`
+provides an audited spool server. It runs one fixed binary under nvprof when a
+request file appears, and it only accepts whitelisted env switches.
+
+- Install and start it: `sudo sh tools/install_nvprof_server.sh` (Ctrl-C stops it).
+- Request: write `{"rate": 8000, "mode": "summary"}` to `/dev/shm/reuse_nvprof/req/<id>.json`.
+- Result: `/dev/shm/reuse_nvprof/out/<id>.txt` plus `<id>.status`.
+- Audit: every binary run as root is logged with its sha256.
+
+Security: the profiled binary runs as root. While the server is running, anyone
+who can write the binary can run code as root, so stop it when you're done.
+
+Nano kernel shares, 8 kHz, four forwards (`mode=summary`):
+
+| kernel | share of GPU time | calls per forward |
+|---|---|---|
+| `k_in_conv_r` | 33.6% | 60 |
+| `k_scan_dts` | 15.2% | 60 |
+| `k_out_proj_r84` | 10.9% | 60 |
+| `k_conv2d_r8` (dilation 8) | 10.0% | ~1.5 |
+| `k_x_proj_g` | 6.8% | 60 |
+
+GPU kernels take about half of the model time. The other half is launch and sync
+overhead under `CUDA_LAUNCH_BLOCKING=1`, which is the next thing to reduce.
+
+**Dev host:** `REUSE_KPROF=1` gives a per-stage breakdown; the old table below is
+kept for the record.
+
+### Historical per-kernel profile of the tower (dev host, `REUSE_KPROF=1`)
 
 Time between instrumentation marks, one Mamba scan direction
 (S=81, L=256, 8 kHz):
@@ -168,8 +215,9 @@ front-end (still CPU, 0.44 s on the Nano).
 ./build_nano.sh              # Jetson Nano: sm_53, CUDA 10.2 (JetPack R32.5.1)
 ./bench_rtf.sh               # RTF over the golden fixtures
 ```
-`sm_53` compilation is verified; **execution on Nano hardware is not** (the
-requested `ipho` device is unreachable from the dev environment).
+`sm_53` compilation is verified, and so is **execution on the Nano itself**
+(`iPhO`, 100.70.245.36, reached over SSH; the build runs from `/dev/shm`, because
+the device's root filesystem is nearly full). See `tools/install_nvprof_server.sh`.
 
 ## Reference-weight warning (critical for anyone regenerating references)
 The PyTorch reference needs a `mamba_ssm.Mamba` whose **parameter names match
@@ -179,20 +227,21 @@ every downstream number is meaningless. Verify with
 `load_state_dict(..., strict=False)` reporting **0 missing / 0 unexpected**.
 
 ## Next steps
-Ordered by expected RTF impact on the Nano:
-1. **(done) iSTFT on the GPU** - see the iSTFT section above; `REUSE_GPU_ISTFT=1`.
-   The STFT front-end is still on the CPU (0.44 s on the Nano) and is the same
-   DFT-GEMM shape, so it is a small follow-on.
-2. **Encoder convolutions.** 43.5 s of Nano time (19%) in naive convs; tiled
-   shared-memory convolutions, and the dense-block concat in shared memory.
-3. **in_proj + the concat/residual scatters.** in_proj is 163 GFLOPS (at the
-   tiled-GEMM rate, so it needs register blocking + double buffering, not just
-   tiling); concat/resid are pure transposes (0.14 s windows each on the host).
-4. **Fusion / launch reduction.** 30 blocks x ~12 launches; CUDA graph capture
-   per block would cut launch overhead, which matters most on the Nano where
-   the async path is currently forced to serialize (blocker 2 above).
-5. fp16/half2 storage for weights (38.6 MB -> 19 MB) to cut memory traffic;
-   gate at SNR >= 30 dB + perceptual delta <= 0.02.
-6. 44.1 / 48 kHz: gates not run (GPU cost ~44x the 8 kHz model); the STFT
-   scales with the sample rate, so all rates run ~200 frames/s.
+Ordered by expected RTF impact on the Nano (currently RTF_total 2.23 at 8 kHz):
+1. **Launch count.** About half of the Nano's model time is launch and sync
+   overhead, about 371 kernel launches per forward. Batching the forward and
+   backward directions into one launch per kernel is estimated at ~16% of the
+   model. This must be timed on the device.
+2. **The tower** (~72% of the Nano model): `in_conv` (34% of GPU time) and the
+   scan (15%). The scan's per-step work is mostly issue-bound.
+3. **Dense convolutions:** the dilation-8 layer is the single largest launch
+   (~378 ms per call, ~10% of GPU time). Tile 82 is confirmed best on the device.
+4. **STFT front-end** is still on the CPU (0.44 s on the Nano earlier; a DD-GPU
+   STFT exists on the dev host and needs on-device timing).
+5. fp16/half2 weight storage (38.6 MB -> 19 MB), gated at SNR >= 30 dB plus a
+   perceptual delta <= 0.02.
+6. 44.1 / 48 kHz: gates not run; cost scales with the sample rate.
 7. Chunked/streaming mode for true streaming RTF (plan S6, not started).
+
+Open decisions and the full experiment log live in `.auto/ideas.md` and
+`.auto/log.jsonl` at the repository root.
