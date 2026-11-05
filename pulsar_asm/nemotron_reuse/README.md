@@ -51,7 +51,7 @@ Target: **NVIDIA Jetson Nano Developer Kit** (tegra210, 4x A57, 1 SM / 128 cores
 3 GiB shared memory, L4T R32.5.1, CUDA 10.2, `sm_53`). The development host is
 an x86 box with a GTX 1070 (`sm_61`, 15 SMs).
 
-## Nano kernel shares (8 kHz, 4 forwards, `mode=summary`)
+## Nano kernel shares (8 kHz, 2 forwards, `mode=summary`)
 
 Measured on the device with the audited nvprof spool server (see Profiling):
 
