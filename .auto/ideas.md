@@ -375,3 +375,25 @@ NEW closures from this profile:
 3. Launch-count fusion for CUDA_LAUNCH_BLOCKING (Nano pays full launch latency):
    count launches per forward and fuse the cheapest boundaries first (heads
    conv1x1 batching was FLOP-bound #62 - pick glue kernels, not GEMMs).
+
+## Session state (2026-11-05, run #200)
+Dev-host band **rtf_total 0.0684-0.0688** (rtf_model 0.0678-0.0684 | stft 0.0002 |
+istft 0.0005; enc 0.062 | tower 0.257-0.258 | dec 0.026 | heads 0.001;
+held-outs 0.0701-0.0706 / 0.1027-0.1035 / 0.1392-0.1452). Noise floor ~0.25%.
+Nano (deployment target, /dev/shm/rp, run_bench2.sh): **RTF_total 2.7574 @ 8 kHz**
+(model 2.7477: enc 3.252 | tower 9.702 | dec 1.047 | heads 0.011),
+**5.3707 @ 16 kHz** (model 5.3332); amp+pha BIT-IDENTICAL to dev every validation.
+Cumulative: dev 0.0731 -> 0.0684 (-6.4% this session); Nano RTF_model 44.34 -> 2.75 = 16.1x.
+Wins this session: #189 out_proj A-tile transpose (-3.0%), #193 Nano concat-fuse
+protocol fix (deployment correctness, dev-neutral), #194 conv r8 weight staging
+(-2.7%), #197 encoder retile 645->644 post-WS (-0.6%).
+Discards: #188 OP-sweep (3<2<1 confirmed), #190 inconv-Ws (+3.5%: compiler already
+vectorizes k-direction), #191 scan broadcast (+5%: MUFU-bound), #192 ck4 (noise:
+manual k-interchange = compiler's own transform), #195 r8p-WS (flat: remainder too
+small), #198 KC-sweep (32 optimal). Validations: #196 Nano (+dump-diff), #199/#200 band.
+Standing rules learned: SASS-first (check LDS mixes before building - k-direction
+groups are always compiler-vectorized; only strided row-groups reward transposes);
+re-sweep shape knobs after every memory-hierarchy change; Nano validation must
+diff audio (timing-only retired); checks.sh now gates Maxwell paths every iteration.
+Scored levers: EXHAUSTED (see closures above). Remaining: Nano-only backlog (fused
+OP2 epilogue, tile-82 WS, launch fusion) - unscored, build only with Nano A/B.
