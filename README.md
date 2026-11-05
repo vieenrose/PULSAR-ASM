@@ -13,22 +13,27 @@ the HF reference's own outputs certify it.
 
 ```
 PORTED AND GATED    text backbone — 24 layers, 286 tensors, 1946 MB at Q8
-                    112.8 ms/token (8.9 tok/s) · 2280 ms to first token on a 23-token
-                    prompt · 307 MB RSS on a 4 GB board
-                    at the board's ~17 GB/s streaming ceiling — bandwidth-saturated
+                    113.8 ms/token (8.8 tok/s) · 307 MB RSS on a 4 GB board
+                    17.1 GB/s achieved against a 21.8 GB/s streaming roof I measured
+                    on this board with a pure-read kernel — 78% of it
                     log-mel front end — NEON, 0.554 ms/frame, 19 fixtures;
                     as accurate as HF against an exact-f64 referee
                     liquid7.1 tokenizer — 531/531 fixtures id-for-id vs HF
                     AND byte-exact round-trip (encode+decode, 5.4 MB blob)
-                    iSTFT spike — SNR 103–130 dB vs torch on 9 cases (S5's first step)
-BUILT, NOT WIRED    audio blob (encoder + downsample + projector) — 130 MB,
-                    176 tensors, every dtype decision cross-checked against Liquid's
-                    own mmproj GGUF table (176/176)
-IN PROGRESS         batched prefill (realtime-ASR challenge) — CT=4 banked:
-                    1.35–2.07× at 29–32 GMAC/s, bit-exact at T=24; budget 0.53×
-                    realtime with ×2.6 to go (see plan §14)
-NOT STARTED         encoder tower · MaskGIT depth head + 12 codebook heads
-                    LiquidCodec decoder transformer · interleaved text/audio controller
+                    audio encoder tower — 17 layers + projector, GPU, 130 MB blob,
+                    176/176 dtype decisions cross-checked against Liquid's own GGUF
+                    MaskGIT depth head — 82/82 frames exact vs HF-on-Q8, 5 fixtures
+                    LiquidCodec decoder — 45.26 dB vs HF-on-Q8, = the Q8 floor
+                    iSTFT — SNR 103–130 dB vs torch on 9 cases
+                    interleaved text/audio controller — mode machine PASS on HF traces
+
+END TO END          speech in -> text out (M1)   260/262 tokens vs HF, token-WER 0.008
+                    text in -> speech out (M2)   60-slot turn in 5m34s, 2.80 s of audio,
+                                                 records byte-identical across builds
+REFUTED             batched backbone prefill — built, bit-exact, and ~4x SLOWER than
+                    the shipped T=1 path at ASR shapes; kept flag-gated, not shipped
+NOT MET             realtime ASR (ASR_RT <= 1.00): 1.33 best case, engine alone 0.65
+NOT STARTED         S7 shell polish (streaming mic) · S9 packaging
 ```
 
 The staged plan for the rest of the port — every remaining component with its gate, its
@@ -53,11 +58,31 @@ except where marked.
 | log-mel front end | *(no weights)* | — | **ported, gated** (bit-exact vs its C mirror; HF tolerance 8.3e-6 live-cell) |
 | liquid7.1 tokenizer | — | 5.4 MB blob | **ported, gated** (531/531 id parity + byte round-trip; `tokenizer_config.json`'s `pre_tokenizer:null` is wrong — see plan §12) |
 | iSTFT + overlap-add (S5 spike) | *(no weights)* | — | **gated** (SNR 103–130 dB; `__sincosf` arm) |
-| audio encoder (LFM2, 17 layers) | 158 | ~119 MB | blob built (S3); tower not started |
-| downsample front end + projector | 18 | fp32 + ~6 MB | blob built; 176/176 GGUF cross-check |
-| MaskGIT head, depth embeddings, depth_linear, codebook | 77 | ~169 MB | not started |
-| LiquidCodec decoder transformer | — | 73 MB (vendor mmproj carries it) | iSTFT spiked; stack not started |
-| batched prefill (backbone, audio path) | — | — | **CT=4 in-engine, bit-exact, 1.35–2.07×**; S8 integration gate pending (w2 chunk config) |
+| audio encoder (LFM2, 17 layers) | 158 | ~119 MB | **ported, gated** (all 17 layers + projector, GPU) |
+| downsample front end + projector | 18 | fp32 + ~6 MB | **ported**; 176/176 GGUF cross-check |
+| MaskGIT head, depth embeddings, depth_linear, codebook | 66 | 243 MB blob | **ported, gated** — 82/82 frames exact vs HF-on-Q8 across 5 fixtures |
+| LiquidCodec decoder transformer | 100 | 41 MB blob | **ported, gated** — 45.26 dB vs HF-on-Q8, 32.04 dB vs fp32 (= the Q8 floor, so no code gap) |
+| interleaved controller + shell | — | — | **ported** — `lfm3_ctrl.c` mode machine PASS on 2 HF traces; `lfm3_speak` runs the live loop |
+| batched prefill (backbone, audio path) | — | — | **REFUTED**: bit-exact but ~4x slower than T=1 at ASR shapes; flag-gated, not shipped |
+
+Every row above is certified by a gate that scores the engine against HF **on the same
+Q8 weights**, not against fp32 — the fp32 comparison is kept as the quantization-error
+record, because an engine more accurate than its reference can never match it.
+
+**Where the time goes on the speech path.** A 60-slot interleaved turn (36 audio frames,
+2.80 s of audio) runs in **5m34s**, down from 27 min, and its token stream, frame codes
+and WAV are byte-identical across that change. The split: 87 s one-time backbone load +
+prefill, 200 s over the frames (3.2 s depth MaskGIT, 1.3 s depth blob reload, 1.4 s
+backbone at 12 tokens/frame), 47 s codec. Two things got it there and both were found by
+reading disassembly after a timing table pointed at them, not by guessing: the depth and
+codec GEMMs were one dependent fp32 chain per output (the depth engine's 12 positions are
+now one batched pass through a NEON kernel — 13.4 s -> 6.5 s per forward, bit-exact), and
+the codec iSTFT was recomputing k-only work for all 1280 output samples (~736 M
+transcendentals per turn), which had become the whole codec cost once the GEMMs were
+batched. **Two data races surfaced only in the byte comparison, not as crashes** — a
+parallel overlap-add over a hop-320/frame-1280 layout, and magnitude tables shared across
+threads. That is why the rule in this repository is that a speed change ships with a byte
+comparison against the pre-change binary.
 
 **Why the port is ordered this way — and the correction that changed the budget.**
 Time on this board follows bytes at 11–17 GB/s, so a component's cost can be budgeted
@@ -95,9 +120,10 @@ realtime: borderline, not yet demonstrated end to end**.
 ## Why the backbone is fast, in one paragraph
 
 Per decode step the engine streams every linear it owns plus the tied 128 000-row head:
-1946 MB. At 112.8 ms that is ~17.3 GB/s, at the ceiling a pure-read probe measures on
-this GPU, so the backbone is bandwidth-saturated and arithmetic levers are capped at
-~2% — measured, not assumed: doubling GEMV FLOPs costs +1.8%. The wins that got here
+1946 MB. At 113.8 ms that is ~17.1 GB/s. A pure-read probe on this board tops out at
+**21.8 GB/s**, so the backbone sits at 78% of the streaming roof — 1.26x of headroom left
+in the kernel, no more. Arithmetic levers are capped at ~2%: doubling GEMV FLOPs costs
++1.8%, measured, not assumed. The wins that got here
 were the ones that removed *time not bytes*: `__launch_bounds__(256,6)` on the Q8 GEMV
 (−17.3%, a resource hint that changed no value), `__fmaf_rn` accumulation (−2.0%, one
 rounding per product, as ggml's own reference dot product compiles to), fusing the
@@ -134,6 +160,15 @@ each other at ~4.5% of teacher-forced positions (argmax ties where precision fli
 answer), and the engine tracks the fp16 reference on magnitudes while matching the bf16
 one on argmax. Both are true; a gate says which question it asks.
 
+The depth and codec engines share one NEON kernel file, because nvcc 10.2's front end
+cannot parse GCC's `arm_neon.h` even in the host pass — it is compiled by gcc and linked:
+
+```sh
+gcc -O2 -fopenmp -c pulsar_arm/asm/lfm3_depth_neon.c -o lfm3_depth_neon.o
+nvcc -gencode arch=compute_53,code=sm_53 -O2 -Xcompiler -fopenmp \
+     pulsar_arm/asm/lfm3_depth.cu lfm3_depth_neon.o -lgomp
+```
+
 Engine: `nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca
 lfm3_nanode.cu -lz`. The engine itself takes and prints token ids; the tokenizer is now
 a separately gated component (`pulsar_arm/asm/lfm3_tok.c`, id parity with HF proven) not
@@ -149,6 +184,14 @@ pulsar_arm/asm/lfm3_elem.S             rmsnorm / mul / add on bf16, AArch64 NEON
 pulsar_arm/asm/lfm3_mel.S/.c           S2 log-mel front end, AArch64 NEON (gated)
 pulsar_arm/asm/lfm3_tok.c/.h           S1 liquid7.1 tokenizer, C (gated, encode+decode)
 pulsar_arm/asm/lfm3_istft.cu           S5 iSTFT spike, CUDA (gated, SNR 103–130 dB)
+pulsar_arm/asm/lfm3_enc_gpu.cu         S3 audio encoder tower, CUDA (gated)
+pulsar_arm/asm/lfm3_depth.cu           S4 depth head + in-engine MaskGIT (gated, 82/82 frames)
+pulsar_arm/asm/lfm3_depth_neon.c       shared Q8 GEMV/GEMM kernels, NEON + OpenMP
+pulsar_arm/asm/lfm3_codec.cu           S5 LiquidCodec decoder (gated, 45.26 dB)
+pulsar_arm/asm/lfm3_ctrl.c             S6 interleaved mode-machine checker
+pulsar_arm/asm/lfm3_asr.c              M1 shell: WAV -> text
+pulsar_arm/asm/lfm3_speak.c            M2 shell: text -> 24 kHz WAV (resident backbone)
+pulsar_arm/asm/lfm3_wav.c/.wavout.c    WAV reader (no resampling) / 24 kHz writer
 pulsar_arm/asm/lfm3_gemm.cu            batched Q8 GEMM instrument, audio shapes (fp64-gated)
 pulsar_arm/tools/mkmel.py/.mktok.py/.mkaudio.py  build-time: mel tables, tokenizer blob, audio blob
 pulsar_arm/asm/README-lfm3-audio.md    the porting document (status, contract, recipes, budgets)
