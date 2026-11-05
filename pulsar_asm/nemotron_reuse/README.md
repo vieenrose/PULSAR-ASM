@@ -78,6 +78,41 @@ end-to-end requires reproducing the reference FFT's float32 rounding bit-for-bit
 
 ## RTF (RTF = processing wall time / audio duration; <1 = faster than real time)
 
+### Reading the numbers
+
+RTF is **processing time divided by audio duration**. The test clip is 5.1 s of
+audio, so:
+
+- RTF 0.5 means it takes 0.5 s to enhance 1 s of audio. That is 2x real time.
+- RTF 2.0 means it takes 2 s per 1 s of audio, so it can't keep up with a live stream.
+- The inverse, 1 / RTF, is the speed in multiples of real time.
+
+The numbers reported here use the same clip for both machines:
+
+| term | meaning |
+|---|---|
+| `RTF_model` | GPU model time only (the 30 Mamba blocks, encoder, decoders, heads) |
+| `RTF_total` | model + STFT + iSTFT, the full pipeline; this is the headline number |
+| 8 kHz / 16 kHz | sample rate of the fixture. Same 5.1 s clip, twice the samples at 16 kHz |
+
+Worked example, dev host at commit `645df5f`:
+
+- Model: 0.331 s for 5.1 s of audio, so `RTF_model` = 0.331 / 5.1 = 0.0649.
+- STFT and iSTFT add about 0.004 s, so `RTF_total` = 0.0656.
+- 1 / 0.0656 = **15.2x faster than real time**.
+
+Nano at commit `645df5f`, 8 kHz:
+
+- Model: 11.34 s for 5.1 s of audio, so `RTF_model` = 2.22.
+- `RTF_total` = 11.39 / 5.1 = **2.23**, which is 2.2x **slower** than real time.
+- To reach real time (RTF 1.0) the Nano needs another 2.23x speedup.
+
+Taking the first on-device measurement as the baseline (`RTF_total` 44.36 at 8 kHz),
+the Nano's speedup so far is 44.36 / 2.23 = **19.9x**.
+
+The 16 kHz fixture has the same duration but twice the samples, so it costs
+roughly twice as much (Nano `RTF_total` 4.38, about 4.4x slower than real time).
+
 ### Jetson Nano (tegra210, 1 SM, CUDA 10.2, `sm_53`, `CUDA_LAUNCH_BLOCKING=1`)
 
 Current code (commit `645df5f`), 8 kHz fixture, 5.100 s audio:
