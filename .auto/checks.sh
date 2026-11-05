@@ -36,4 +36,21 @@ done
 "$NVCC" -O3 -Xcompiler -fopenmp -arch=sm_53 -Iengine -c engine/reuse_gpu.cu \
   -o /tmp/reuse_sm53_check.o 2>/tmp/reuse_sm53.err || {
     echo "sm_53 COMPILE FAILED"; grep -E "error" /tmp/reuse_sm53.err | head -15; exit 1; }
+
+# The Nano runs arch-dependent kernels (out_proj OP=2, tile-82 convs, dense
+# slots off, decoder pairing off) that the default-gate path never executes:
+# incident #193 shipped garbage Nano audio while every dev gate passed, so the
+# full Maxwell path set is gated here too (same thresholds, 8 kHz only). The
+# Maxwell proxy is bit-exact vs Nano hardware, so this covers deployment.
+DM=/tmp/reuse_gate_mw
+mkdir -p "$DM"
+REUSE_WS_MB=1024 \
+REUSE_MAG="tests/golden/ref_out_8000/in_mag.raw" \
+REUSE_PHA="tests/golden/ref_out_8000/in_pha.raw" \
+REUSE_FORCE_MAXWELL_TILES=1 \
+REUSE_DUMP_AMP="$DM/c_amp.raw" REUSE_DUMP_PHA="$DM/c_pha.raw" \
+REUSE_DUMP_AUDIO="$DM/c_audio.f32" \
+  ./"$BIN" "$BLOB" "tests/golden/fixtures/mic_test2_8000.wav" /dev/null 1 >/dev/null
+python3 tests/gate_full.py --ref "tests/golden/ref_out_8000" --c "$DM" --mode model \
+  --label "maxwell-paths 8k" | tail -2
 echo "gates ok"

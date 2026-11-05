@@ -313,3 +313,28 @@ NEW closures from this profile:
    -> only 2 blocks/SM; cutting PCO to 4 to halve weight loads needs R=66..80 rows = 18-22 KB
    shared (still 2 blocks/SM) but pushes regs past 136 -> 1 block/SM. Tile codes 644/645/646/81/82
    (PCO 4-16, NCB 1-4, NRA 1-4) already cover the feasible frontier. CLOSED for shapes.
+
+## INCIDENT #193: Nano shipped garbage audio since the concat-fuse (#57/#58 era) - CAUGHT 2026-11-05
+- Symptom: Nano-vs-dev amp diff rel_rms 0.95 (max|d| 1.88) on identical inputs+fed reference.
+- Root cause (host protocol, not kernels): mamba_block_gpu's `cfuse` (REUSE_CONCAT_FUSE,
+  default 1) skipped the separate concat whenever set, but only the tiled==3 kernels
+  (k_out_proj_r8c[_t]) have the fused epilogue. OP=2 = k_out_proj_r writes `out`, so on the
+  Nano (tiled forced 3->2 by the Maxwell guard) `cat` was NEVER filled - every Nano timing
+  run since the fuse measured garbage at full speed. k_out_proj_r itself is FINE (gate
+  rel_rms 1.34e-06 with the concat restored).
+- Fix: shared `outproj_tiled()` helper (single home for the REUSE_OP default-3 +
+  Maxwell->2 resolution); mamba_block_gpu forces cfuse=0 unless resolved tiled==3;
+  mamba_dir_gpu uses the helper for its launch branch. tiled==3 paths byte-untouched.
+- Verification: dev REUSE_OP=2 gate PASS (1.34e-06 / 117.9 dB); dev REUSE_FORCE_MAXWELL_TILES=1
+  (ALL Maxwell paths: tile-82 convs, slots-0, dec-pair-0, OP=2) gate PASS (1.34e-06);
+  Nano rebuilt: amp AND pha BIT-IDENTICAL to dev (max|d| 0.0), audio max|d| 1.79e-07
+  (iSTFT atomic floor). Nano RTF_total 2.7541 @ 8 kHz / 5.3800 @ 16 kHz (wasTiming-only
+  garbage 2.7432/5.3533; +0.4% is the now-running k_concat_f). Cumulative Nano
+  RTF_model 44.34 -> 2.7444 = 16.2x.
+- LESSONS: (1) periodic Nano VALIDATION must diff audio, not just time - timing-only
+  runs are blind to correctness; (2) checks.sh now carries a REUSE_FORCE_MAXWELL_TILES=1
+  model gate at 8 kHz (same thresholds) so the deployment path is gated on every
+  iteration; (3) any kernel family with arch-dependent dispatch needs its non-default
+  branch gated (OP=1/2, r2 convs were never gated before); (4) dev REUSE_FORCE_MAXWELL_TILES=1
+  output == Nano output bit-exact (max|d| 0.0) - the proxy is perfect for correctness,
+  use it before every Nano rsync.

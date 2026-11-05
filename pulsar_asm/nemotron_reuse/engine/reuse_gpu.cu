@@ -4200,6 +4200,17 @@ extern "C" int reuse_gpu_encoder(reuse_gpu_t *g, const float *xin, float *enc, i
 
 // ================================================================= Mamba
 
+static int outproj_tiled(void)
+{
+    static int t = -1;
+    if (t < 0) {
+        t = getenv("REUSE_OP") ? atoi(getenv("REUSE_OP")) : (getenv("REUSE_NAIVE_OP") ? 0 : 3);
+        /* k_out_proj_r8's 64 accumulators exceed Maxwell's per-thread
+           register limit: it compiles for sm_53 and fails to launch. */
+        if (t == 3 && gpu_is_maxwell()) t = 2;
+    }
+    return t;
+}
 static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float *out,
                          int S, int L, int rev, cudaStream_t st,
                          float *cat = NULL, int coff = 0)
@@ -4326,14 +4337,17 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
     }
     kp_mark("scan", &klast);
     GDBG("gscan", y, (size_t)SL*DINNER);
+/* Resolved out_proj kernel selector, shared by mamba_dir_gpu (which kernel
+ * to launch) and mamba_block_gpu (whether the tower may skip the separate
+ * concat). The fused concat epilogue exists ONLY in the tiled==3 kernels
+ * (k_out_proj_r8c[_t]); k_out_proj_r/r8/tiled and the naive gate kernel all
+ * write `out`, so the tower must run the separate concat for them. OP=2 is
+ * the Maxwell production path, and with REUSE_CONCAT_FUSE defaulting to 1
+ * the tower skipped the concat while k_out_proj_r wrote `out`, leaving
+ * `cat` unfilled (model rel-rms 2.2 on every Nano run since the fuse was
+ * introduced - invisible to the dev gates, which run OP=3). */
     {
-        static int tiled = -1;
-        if (tiled < 0) {
-            tiled = getenv("REUSE_OP") ? atoi(getenv("REUSE_OP")) : (getenv("REUSE_NAIVE_OP") ? 0 : 3);
-            /* k_out_proj_r8's 64 accumulators exceed Maxwell's per-thread
-               register limit: it compiles for sm_53 and fails to launch. */
-            if (tiled == 3 && gpu_is_maxwell()) tiled = 2;
-        }
+        int tiled = outproj_tiled();
         if (tiled) {
             dim3 g((HID+GT-1)/GT, (unsigned)((SL+GT-1)/GT));
             static int cf = -1;
@@ -4360,7 +4374,13 @@ static int mamba_block_gpu(reuse_gpu_t *g, const char *pfx, const float *x, floa
 {
     long SL = (long)S * L;
     static int cfuse = -1;
-    if (cfuse < 0) cfuse = getenv("REUSE_CONCAT_FUSE") ? atoi(getenv("REUSE_CONCAT_FUSE")) : 1;
+    if (cfuse < 0) {
+        cfuse = getenv("REUSE_CONCAT_FUSE") ? atoi(getenv("REUSE_CONCAT_FUSE")) : 1;
+        /* The fused epilogue lives only in the tiled==3 kernels: with any
+           other out_proj kernel the tower must run the separate concat,
+           even if fusion was requested (see outproj_tiled). */
+        if (cfuse && outproj_tiled() != 3) cfuse = 0;
+    }
     static double klast = 0;
     if (g_kprof < 0) g_kprof = getenv("REUSE_KPROF") ? 1 : 0;
     if (g_kprof) { cudaDeviceSynchronize(); klast = gt_now(); }
