@@ -338,3 +338,40 @@ NEW closures from this profile:
   branch gated (OP=1/2, r2 convs were never gated before); (4) dev REUSE_FORCE_MAXWELL_TILES=1
   output == Nano output bit-exact (max|d| 0.0) - the proxy is perfect for correctness,
   use it before every Nano rsync.
+
+## Closures session 2026-11-05 (#193-#198)
+- #194 conv r8 weight staging (Ws[j][kh] float4, existing syncs): -2.7% rtf_total.
+  Template for spotting the next one: SASS LDG(.E/.32) in the HUNDREDS on a kernel
+  whose hot loop indexes weights by (output-group, tap) only = block-uniform
+  traffic with 256x redundancy. Checked and clean since: x_proj (LDS128-only),
+  outproj_ln_g (LDS128=66), scan (MUFU-bound, delivery hidden), in_conv Ws
+  (compiler vectorizes k-direction), inorm/sp_up/conv1x1/heads (floors).
+- #195 r8p WS: FLAT (decoders already ride r8 through fallbacks; r8p-exclusive
+  remainder too small). Do not extend staging ideas to small-launch kernels.
+- #197 encoder retile 645->644 post-WS (enc -6.6%, held16k -2.4% best): ALWAYS
+  re-sweep tile/shape knobs after a memory-hierarchy change - the FMA/LSU balance
+  moves the optimum. Decoder confirmed 644. 646 dead everywhere (168 regs).
+- #198 KC re-sweep: 32 optimal (16 +2%, 8 +5%). Unchanged by tower reshaping.
+- Winograd F(2x2,3x3) dilH=1: CLOSED PERMANENTLY (3rd verdict). Arithmetic:
+  4 mults+~8 adds per output vs 9 mults direct - it only wins via the 16-way
+  batched GEMM running at direct-conv efficiency, and #185 proved the batched
+  form merely TIES at 41%-of-roof issue efficiency. No changed assumption can
+  move this (WS helps direct and Winograd equally; tiles moved on). Do not retry.
+- SASS-first rule (from #190/#192): check LDS mixes BEFORE building. k-direction
+  groups in [row][k] shared are ALWAYS already vectorized by nvcc (manual
+  interchange = no-op re-spelling, identical LDS counts). Only row-direction
+  groups within one k iteration (strided, unvectorizable) reward layout
+  transposes (#189). in_conv's 65 Xs scalars are the textbook unfixable case
+  (stride-5 rows + halo-3 vs 16B alignment).
+
+## Nano-only backlog (unscored on dev - build only with Nano A/B, never keep on dev metric)
+1. Fuse the concat+residual epilogue into k_out_proj_r (OP=2, the Nano path):
+   writes `out` today + separate k_concat_f (~0.6% Nano tower). r8c shows the
+   epilogue pattern (coff/rev/xres/float4 stores); risk is regs (sm_53 launch
+   ceiling 63/thread - the #73 TABLE saga). A/B on Nano only.
+2. R8LAUNCH-WS twin for tile-82 (Maxwell dense): same 256x weight redundancy as
+   #194, Nano encoder/decoder dense all run tile 82. A/B on dev with
+   REUSE_CONV_TILE=82 for speed, confirm transfer on Nano.
+3. Launch-count fusion for CUDA_LAUNCH_BLOCKING (Nano pays full launch latency):
+   count launches per forward and fuse the cheapest boundaries first (heads
+   conv1x1 batching was FLOP-bound #62 - pick glue kernels, not GEMMs).
