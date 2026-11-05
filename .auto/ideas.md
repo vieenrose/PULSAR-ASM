@@ -660,3 +660,26 @@ Everything else measured this session sits at a documented floor.
   hbase = h0-padH, grid (6,8,16) vs kernel steps, and shared = R*LS all check out.
   If anyone retries: FIRST isolate with tests/gpu_block_bench.c (trap #65(d)), and note
   the register cliff makes it unattractive anyway (cf. #263: crossing it cost 8.7%).
+
+## #267 CLOSED: in_conv launch-bound sweep re-done on current code (+ the spill table)
+Last swept at #61 on old code; in_conv has since gained halo skips (#154/#155), float4
+stores (#180/#181) and the ICW hoist (#262). Three-way A/B, BIT-IDENTICAL output across
+all three (max|d| 0.000e+00 - register allocation cannot move these fmaf chains):
+    LB=2  90 regs, 0 spills,        2 blocks/SM (16 warps)  -> 0.34617 mean  (+3.7%)
+    LB=3  80 regs, 16 B spill,      3 blocks/SM (24 warps)  -> 0.33393 mean  BEST
+    LB=4  64 regs, 64 B spill (4x), 4 blocks/SM (32 warps)  -> 0.33623 mean  (+0.75%)
+=> LB=3 confirmed; the 16-byte spill (32 stores/48 loads, in the epilogue) is NOT worth
+removing. GENERAL LESSON: a small L1-cached spill is nearly free while a lost block/SM
+costs 3-4% - check the blocks/SM count BEFORE chasing spills in an occupancy-limited
+kernel. (#61's +0.8% for LB=4 reproduced almost exactly, so that old reading holds.)
+Spill table for k_in_conv_r (useful when touching this kernel):
+    KC=8   0 B (both ICW states)         KC=16 16 B spill when ICW=0, CLEAN when ICW=1
+    KC=32  16 B spill (both ICW states) - the default, pre-existing
+
+## Also noted (#267): k_x_proj_g<128,40,8> is SHARED-MEMORY-limited to 2 blocks/SM
+24,192 B (As[128][36] + Bs[40][36]) x 3 = 72 KB > 64 KB. A shape with <=21.3 KB shared
+(e.g. MT=96 -> 19,584 B) would allow 3 blocks/SM = 24 warps (+50%).
+CAUTION: #68's shape data argues the opposite - MT=64 (4 blocks possible) was 0.7% WORSE
+and MT=192 (1 block) also worse, so MT=128 looks like a local optimum where the extra
+blocks are paid for with extra W-tile re-reads. Untried: KT (hardcoded 32) - KT=16 would
+give As[128][20]+Bs[40][20] = 13,440 B (4 blocks) at 2x the chunk count.
