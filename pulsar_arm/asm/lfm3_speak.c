@@ -100,6 +100,63 @@ static void run_cap(char *const argv[], const char *out) {
   if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) die("%s failed (exit %d) -- see %s",
       argv[0], WIFEXITED(st) ? WEXITSTATUS(st) : -1, out);
 }
+/* ---- resident backbone (nanode --serve) --------------------------------------------
+ * One nanode process for the whole turn: it loads the blob once, keeps KV/conv state,
+ * and after each step reads the next input from its stdin (T <id> | A <row.f32> | Q).
+ * Every line it prints goes to the nanode log as well, for forensics. */
+static pid_t srv_pid = -1;
+static FILE *srv_in = NULL, *srv_out = NULL, *srv_log = NULL;
+static void serve_start(char *const argv[], const char *logpath) {
+  int pin[2], pout[2];
+  if (pipe(pin) != 0 || pipe(pout) != 0) die("pipe failed");
+  srv_pid = fork();
+  if (srv_pid < 0) die("fork failed");
+  if (srv_pid == 0) {
+    dup2(pin[0], 0); dup2(pout[1], 1); dup2(pout[1], 2);
+    close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]);
+    char prog[1200]; path_of(prog, sizeof prog, argv[0]);
+    execv(prog, argv);
+    fprintf(stderr, "lfm3_speak: cannot exec %s\n", prog); _exit(127);
+  }
+  close(pin[0]); close(pout[1]);
+  srv_in = fdopen(pin[1], "w");
+  srv_out = fdopen(pout[0], "r");
+  srv_log = fopen(logpath, "w");
+  if (!srv_in || !srv_out || !srv_log) die("cannot set up the backbone server pipes");
+}
+/* Read server lines until the step line for `want` (exactly "step tok ms tps"); returns
+   that step's argmax token. Dies on server exit or on a step past `want` (lost sync). */
+static int serve_wait_step(int want) {
+  char line[4096];
+  while (fgets(line, sizeof line, srv_out)) {
+    fputs(line, srv_log); fflush(srv_log);
+    int st, tk; double ms, tps; char extra;
+    if (sscanf(line, "%d %d %lf %lf %c", &st, &tk, &ms, &tps, &extra) == 4) {
+      if (st == want) return tk;
+      if (st > want) die("backbone server is at step %d, expected %d (lost sync)", st, want);
+    }
+    if (!strncmp(line, "SERVE: ", 7) && strncmp(line, "SERVE: quit", 11))
+      die("backbone server refused input: %s", line);
+  }
+  die("backbone server exited before step %d (see the nanode log)", want);
+}
+static void serve_send(const char *cmd) {
+  if (fputs(cmd, srv_in) < 0 || fflush(srv_in) != 0) die("cannot write to the backbone server");
+}
+static void serve_stop(void) {
+  if (srv_pid <= 0) return;
+  serve_send("Q\n");
+  fclose(srv_in); srv_in = NULL;
+  char line[4096];
+  while (fgets(line, sizeof line, srv_out)) fputs(line, srv_log);
+  fclose(srv_out); fclose(srv_log);
+  int st = 0;
+  if (waitpid(srv_pid, &st, 0) < 0) die("waitpid on the backbone server failed");
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+    die("backbone server ended badly (exit %d)", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+  srv_pid = -1;
+}
+
 /* last row of a frame-major f32 file -> dst (proves the file has >= 1 row) */
 static void tail_row_f32(const char *p, float *dst, int cols) {
   long n = file_size(p);
@@ -167,6 +224,30 @@ int main(int argc, char **argv) {
   char csv[1100 * 64], lgf[1100], hdf[1100], hid1[1100], ordf[1100],
        histf[1100], codef[1100], embf[1100], nanolog[1100];
   snprintf(nanolog, sizeof nanolog, "%s.nanode.log", TMPD);
+  snprintf(lgf, sizeof lgf, "%s.last.f32", TMPD);
+  snprintf(hdf, sizeof hdf, "%s.hidden.f32", TMPD);
+
+  /* Resident by default; LFM_SPEAK_RELAUNCH=1 is the A/B control arm (one nanode launch
+     per slot, the path the first live gate ran). The two must produce identical records. */
+  const int resident = getenv("LFM_SPEAK_RELAUNCH") == NULL;
+  int last_nt = -1;
+  char srvlog[1100]; snprintf(srvlog, sizeof srvlog, "%s.serve.log", TMPD);
+  if (resident) {
+    unlink(hdf);
+    size_t u0 = 0;
+    for (int i = 0; i < ntoks; i++)
+      u0 += (size_t)snprintf(csv + u0, sizeof csv - u0, "%s%d", i ? "," : "", toks[i]);
+    if (u0 >= sizeof csv - 64) die("prefix csv overflow at %d tokens", ntoks);
+    char *avs[] = { (char*)"lfm3_nanode", BB, (char*)"--prompt", csv, (char*)"--serve",
+                    (char*)"--dump-hidden-all", hdf, NULL };
+    serve_start(avs, srvlog);
+    last_nt = serve_wait_step(ntoks - 1);
+    printf("backbone: resident (nanode --serve, one load for the turn)\n");
+  } else {
+    printf("backbone: relaunch per slot (LFM_SPEAK_RELAUNCH=1)\n");
+  }
+  fflush(stdout);
+  char feed[1300];
 
   for (int slot = 0; slot < max_slots; slot++) {
     int want_audio = interleaving ? speaking : is_audio;
@@ -188,6 +269,10 @@ int main(int argc, char **argv) {
     int have_emb = nframes > 0;
     if (!want_audio) {
       /* ---- text slot: greedy argmax of the last logits row ------------------ */
+      int tok;
+      if (resident) {
+        tok = last_nt;    /* the server's argmax after the last fed step */
+      } else {
       char *av[] = { (char*)"lfm3_nanode", BB, (char*)"--prompt", csv,
                      (char*)"--steps", steps,
                      have_emb ? av_semb[0] : (char*)"--dump-logits", have_emb ? av_semb[1] : lgf,
@@ -200,12 +285,14 @@ int main(int argc, char **argv) {
       FILE *lf = fopen(lgf, "rb");
       if (fread(lv, 1, (size_t)ln, lf) != (size_t)ln) die("short read of %s", lgf);
       fclose(lf);
-      int tok = argmax_f32(lv, V);
+      tok = argmax_f32(lv, V);
       free(lv);
+      }
       /* plausibility: sampled id inside the text vocabulary, never a codebook id */
       if (tok < 0 || tok >= 128000) die("slot %d sampled out-of-range id %d", slot, tok);
       toks[ntoks++] = tok;
       texts[ntext++] = tok;
+      snprintf(feed, sizeof feed, "T %d\n", tok);
       printf("slot %d T %d%s\n", slot, tok,
              tok == IM_END ? " (im_end, turn ends)" : (tok == TEXT_END ? " (text_end)" : ""));
       fflush(stdout);
@@ -213,11 +300,14 @@ int main(int argc, char **argv) {
       if (interleaving && tok == TEXT_END) { text_done = 1; speaking = 1; }
     } else {
       /* ---- audio slot: last hidden -> MaskGIT -> codes -> embed feedback ---- */
+      if (!resident) {
       char *av[] = { (char*)"lfm3_nanode", BB, (char*)"--prompt", csv,
                      (char*)"--steps", steps,
                      have_emb ? av_semb[0] : (char*)"--dump-hidden-all", have_emb ? av_semb[1] : hdf,
                      have_emb ? (char*)"--dump-hidden-all" : NULL, have_emb ? hdf : NULL, NULL };
       run_cap(av, nanolog);
+      }
+      /* resident: the server appended this step's hidden before printing its step line */
       need_file(hdf, (long)HDIM * 4, "hidden dump");
       float *h = xmalloc((size_t)HDIM * 4);
       tail_row_f32(hdf, h, HDIM);
@@ -294,6 +384,7 @@ int main(int argc, char **argv) {
       }
       toks[ntoks++] = AUDIO_OUT;
       nframes++;
+      snprintf(feed, sizeof feed, "A %s\n", embf);
       if (iseos) { eos_seen = 1; interleaving = 0; }
     }
 
@@ -305,7 +396,15 @@ int main(int argc, char **argv) {
       }
     }
     if (ntoks + 2 > cap) die("slot %d: token buffer exhausted", slot);
+    /* resident: hand this slot's input to the server and collect the next step. Skipped
+       after the final slot -- nothing would consume that step. */
+    if (resident && slot + 1 < max_slots) {
+      serve_send(feed);
+      last_nt = serve_wait_step(ntoks - 1);
+    }
   }
+
+  if (resident) serve_stop();
 
   /* ---- records ---------------------------------------------------------------- */
   char sp[1100]; snprintf(sp, sizeof sp, "%s.slots.txt", outp);

@@ -122,27 +122,29 @@ static void rmsnorm(const float* x, const float* w, float* y, int D, float eps) 
   for (int i = 0; i < D; i++) y[i] = x[i] * rms * w[i];
 }
 
-// Q8 GEMV: y[n] = sum_k dequant(q[n,k], s[n,k/32]) * x[k]
-static void q8_gemv(const int8_t* q, const float* s, const float* x, float* y, int N, int K) {
-  for (int n = 0; n < N; n++) {
-    float acc = 0;
-    for (int k = 0; k < K; k++) {
-      float w = (float)q[n*K + k] * s[n*(K/32) + k/32];
-      acc += w * x[k];
-    }
-    y[n] = acc;
-  }
+// Q8 GEMM over T positions: Y[t*ldy + n] = sum_k dequant(q[n,k], s[n,k/32]) * X[t*ldx + k].
+// The kernels live in lfm3_depth_neon.c (NEON + OpenMP; nvcc 10.2 cannot parse arm_neon.h).
+// Per output the arithmetic is the original per-position loop's (fmadd, k ascending), so the
+// logits are bit-identical to the pre-change engine. Build:
+//   gcc -O2 -fopenmp -c lfm3_depth_neon.c -o lfm3_depth_neon.o
+//   nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O2 -Xcompiler -fopenmp \
+//        -o lfm3_depth lfm3_depth.cu lfm3_depth_neon.o -lgomp
+extern "C" void lfm3_q8_gemm12_kmajor(const int8_t* q, const float* s, const float* XT,
+                                      float* Y, int ldy, int N, int K);
+extern "C" void lfm3_q8_gemv1(const int8_t* q, const float* s, const float* x, float* y, int N, int K);
+static void q8_gemm(const int8_t* q, const float* s, const float* X, int ldx,
+                    float* Y, int ldy, int N, int K, int T) {
+  if (T == 1) { lfm3_q8_gemv1(q, s, X, Y, N, K); return; }
+  if (T != 12) { printf("q8_gemm: T=%d unsupported (1 or 12)\n", T); exit(2); }
+  static std::vector<float> xt;
+  xt.resize((size_t)K * 12);
+  for (int t = 0; t < 12; t++)
+    for (int k = 0; k < K; k++) xt[(size_t)k * 12 + t] = X[(size_t)t * ldx + k];
+  lfm3_q8_gemm12_kmajor(q, s, xt.data(), Y, ldy, N, K);
 }
-
-// bf16 GEMV (for bf16 weights)
-static void bf16_gemv(const uint16_t* w, const float* x, float* y, int N, int K) {
-  for (int n = 0; n < N; n++) {
-    float acc = 0;
-    for (int k = 0; k < K; k++) {
-      acc += bf16_to_f32(w[n*K + k]) * x[k];
-    }
-    y[n] = acc;
-  }
+// Q8 GEMV: one position (the head slices and depth_linear).
+static void q8_gemv(const int8_t* q, const float* s, const float* x, float* y, int N, int K) {
+  q8_gemm(q, s, x, K, y, N, N, K, 1);
 }
 
 // SiLU
@@ -204,6 +206,12 @@ static void attention(float* q, float* k, float* v, float* out, int pos, int NQ,
   }
 }
 
+// LFM_DEPTH_TIME=1: wall time per forward section (host clock), printed per call.
+#include <time.h>
+static double dt_now() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec * 1e-6; }
+static double g_dt[8];
+static const char* g_dtn[8] = {"depth_linear", "embed", "norm+qkv", "qk_norm+rope+attn", "gate+o", "ffn", "final_norm", "head"};
+#define DT_MARK(i) do { double _n = dt_now(); g_dt[i] += _n - _dt_last; _dt_last = _n; } while (0)
 static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& by,
                       const float* hidden, const int* codes, const unsigned char* masked,
                       float* out_logits) {
@@ -231,9 +239,12 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
   Ent* dl_bias = get("depth_linear.bias");
 
   // depth_linear forward: out[12, 1024] = W[12*1024, 2048] @ hidden[2048] + bias
+  for (int i = 0; i < 8; i++) g_dt[i] = 0;
+  double _dt_last = dt_now();
   float depth_in[12 * 1024];
   q8_gemv(dl->dq, dl->ds, hidden, depth_in, 12 * DH, SH);
   for (int i = 0; i < 12 * DH; i++) depth_in[i] += dl_bias->df[i];
+  DT_MARK(0);
 
   // add mask/codebook embeddings
   // depth_in = depth_in + where(masked, mask_embedding, codebook_embedding(codes))
@@ -255,6 +266,7 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
     }
   }
 
+  DT_MARK(1);
   // reshape to [12, 1024] for the trunk (bidirectional attention over 12 positions)
   // trunk: 3 layers, all full_attention
   float* x = depth_in;  // [12, 1024] in-place
@@ -277,17 +289,12 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
       // q, k, v projections
     char wname[256];
     snprintf(wname, sizeof wname, "%s.self_attn.q_proj.weight", prefix);
-      for (int t = 0; t < 12; t++) {
-      q8_gemv(get(wname)->dq, get(wname)->ds, h1 + t*DH, q + t*NHEADS*HD, NHEADS*HD, DH);
-    }
+    q8_gemm(get(wname)->dq, get(wname)->ds, h1, DH, q, NHEADS*HD, NHEADS*HD, DH, 12);
       snprintf(wname, sizeof wname, "%s.self_attn.k_proj.weight", prefix);
-    for (int t = 0; t < 12; t++) {
-      q8_gemv(get(wname)->dq, get(wname)->ds, h1 + t*DH, k + t*NKV*HD, NKV*HD, DH);
-    }
+    q8_gemm(get(wname)->dq, get(wname)->ds, h1, DH, k, NKV*HD, NKV*HD, DH, 12);
       snprintf(wname, sizeof wname, "%s.self_attn.v_proj.weight", prefix);
-    for (int t = 0; t < 12; t++) {
-      q8_gemv(get(wname)->dq, get(wname)->ds, h1 + t*DH, v + t*NKV*HD, NKV*HD, DH);
-    }
+    q8_gemm(get(wname)->dq, get(wname)->ds, h1, DH, v, NKV*HD, NKV*HD, DH, 12);
+    DT_MARK(2);
       // q_norm, k_norm (per head)
     for (int t = 0; t < 12; t++) {
       for (int h = 0; h < NHEADS; h++) {
@@ -325,30 +332,27 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
     for (int t = 0; t < 12; t++) {
       attention(q + t*NHEADS*HD, k, v, attn + t*NHEADS*HD, t, NHEADS, NKV, HD, 12, nullptr);
     }
-    // gate
-    for (int t = 0; t < 12; t++) {
+    DT_MARK(3);
+    // gate (Q8). A leftover first loop here ran bf16_gemv over this Q8 tensor -- reading
+    // 64 KB from its 32 KB code buffer, out of bounds -- and discarded the result; removed.
+    {
       char gn[256]; snprintf(gn, sizeof gn, "%s.self_attn.gate_proj.weight", prefix);
-      float gate[NHEADS];
-      bf16_gemv((uint16_t*)get(gn)->dq, h1 + t*DH, gate, NHEADS, DH);  // wait, gate_proj is Q8 not bf16
-      // actually gate_proj is Q8
-    }
-    // redo gate properly with Q8
-    for (int t = 0; t < 12; t++) {
-      char gn[256]; snprintf(gn, sizeof gn, "%s.self_attn.gate_proj.weight", prefix);
-      float gate[NHEADS];
-      q8_gemv(get(gn)->dq, get(gn)->ds, h1 + t*DH, gate, NHEADS, DH);
-      for (int h = 0; h < NHEADS; h++) {
-        float g = 1.0f / (1.0f + expf(-gate[h]));
-        for (int d = 0; d < HD; d++) attn[t*NHEADS*HD + h*HD + d] *= g;
-      }
+      float gate[12 * NHEADS];
+      q8_gemm(get(gn)->dq, get(gn)->ds, h1, DH, gate, NHEADS, NHEADS, DH, 12);
+      for (int t = 0; t < 12; t++)
+        for (int h = 0; h < NHEADS; h++) {
+          float g = 1.0f / (1.0f + expf(-gate[t*NHEADS + h]));
+          for (int d = 0; d < HD; d++) attn[t*NHEADS*HD + h*HD + d] *= g;
+        }
     }
     // o_proj
-    for (int t = 0; t < 12; t++) {
+    {
       char on[256]; snprintf(on, sizeof on, "%s.self_attn.o_proj.weight", prefix);
-      q8_gemv(get(on)->dq, get(on)->ds, attn + t*NHEADS*HD, h4 + t*DH, DH, NHEADS*HD);
+      q8_gemm(get(on)->dq, get(on)->ds, attn, NHEADS*HD, h4, DH, DH, NHEADS*HD, 12);
     }
     // residual add
     for (int i = 0; i < 12*DH; i++) x[i] += h4[i];
+    DT_MARK(4);
     // ffn
     for (int t = 0; t < 12; t++) {
       char fn[256]; snprintf(fn, sizeof fn, "%s.operator_norm.weight", prefix);
@@ -360,23 +364,24 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
       rmsnorm(x + t*DH, get(fn)->df, h1 + t*DH, DH, 1e-5f);
     }
     // w1, w3
-    for (int t = 0; t < 12; t++) {
+    {
       char w1n[256], w3n[256];
       snprintf(w1n, sizeof w1n, "%s.feed_forward.w1.weight", prefix);
       snprintf(w3n, sizeof w3n, "%s.feed_forward.w3.weight", prefix);
-      q8_gemv(get(w1n)->dq, get(w1n)->ds, h1 + t*DH, h2 + t*INTER, INTER, DH);
-      q8_gemv(get(w3n)->dq, get(w3n)->ds, h1 + t*DH, h3 + t*INTER, INTER, DH);
+      q8_gemm(get(w1n)->dq, get(w1n)->ds, h1, DH, h2, INTER, INTER, DH, 12);
+      q8_gemm(get(w3n)->dq, get(w3n)->ds, h1, DH, h3, INTER, INTER, DH, 12);
     }
     // silu_mul
     for (int i = 0; i < 12*INTER; i++) h2[i] = silu(h2[i]) * h3[i];
     // w2
-    for (int t = 0; t < 12; t++) {
+    {
       char w2n[256]; snprintf(w2n, sizeof w2n, "%s.feed_forward.w2.weight", prefix);
-      q8_gemv(get(w2n)->dq, get(w2n)->ds, h2 + t*INTER, h4 + t*DH, DH, INTER);
+      q8_gemm(get(w2n)->dq, get(w2n)->ds, h2, INTER, h4, DH, DH, INTER, 12);
     }
     // post_ffn_norm (no sandwich, so just ffn_norm? Actually no post_ffn_norm in non-sandwich)
     // residual add
     for (int i = 0; i < 12*DH; i++) x[i] += h4[i];
+    DT_MARK(5);
     // per-layer rms
     // LFM_DEPTH_TRACE=1: per-layer rms of the 12-position trunk state, the same quantity
     // the oracle's forward hooks record (tf/layers_*.json), so a layer can be localised.
@@ -401,6 +406,7 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
   // HF Lfm3AudioCodebookEmbedding.logits(): F.linear(embedding_norm(h), embedding.weight).
   // Each codebook has its OWN embedding_norm before the tied head. Missing this step was
   // the cause of the final-logit error (layer rms matched; logits did not).
+  DT_MARK(6);
   Ent* head = get("depth_head_stacked.weight");
   float xn[DH];
   for (int c = 0; c < NCB; c++) {
@@ -409,6 +415,12 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
     q8_gemv(head->dq + (size_t)(c*CBS)*DH,
             head->ds + (size_t)(c*CBS)*(DH/Q8_BLK),
             xn, out_logits + c*CBS, CBS, DH);
+  }
+  DT_MARK(7);
+  if (getenv("LFM_DEPTH_TIME")) {
+    printf("DEPTH_TIME ms:");
+    for (int i = 0; i < 8; i++) printf(" %s=%.1f", g_dtn[i], g_dt[i]);
+    printf("\n"); fflush(stdout);
   }
 
 }

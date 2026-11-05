@@ -329,7 +329,7 @@ own run, exactly as the backbone did.
 | M | after | what it does | gate |
 |---|---|---|---|
 | **M1 audio → text** | S1, S2, S3, S7-lite | 16 kHz WAV in, detokenized text out | HF greedy text equal on 5 clips |
-| **M2 text → speech** | S4, S5, S6, S7 | text prompt in, 24 kHz WAV out | codebook-stream equality + waveform SNR ≥40 dB |
+| **M2 text → speech** | S4, S5, S6, S7 | text prompt in, 24 kHz WAV out | **corrected**: text ids exact + mode-machine kinds exact + non-silent audio + audio SNR ≥ (HF-fp32 vs HF-on-Q8 SNR) − 2 dB. Codebook-stream equality is NOT a valid bar: measured on this model, two runs of identical HF code differing only in weight quantisation agree on 10.65% of codes (−2.83 dB audio), so no quantised engine can be held to a stream the reference does not reproduce against itself |
 | **M3 speech → speech** | all of the above | audio in, audio out (the model's actual product) | end-to-end on 5 fixtures |
 | **M4 usable latency** | S8 | audio-length input without the 2.45 s/audio-second penalty | batched-vs-sequential logit gates |
 

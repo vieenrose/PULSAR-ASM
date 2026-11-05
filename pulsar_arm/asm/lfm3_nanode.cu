@@ -1251,6 +1251,18 @@ static int g_semb_n = 0;
 static long g_speak_fed = 0;     // placeholder steps actually served, printed as proof
 static int g_speak_tok = 125032;  // config.json audio_out_token_id
 static const char* g_dump_hidden_all = nullptr;  // every step's post-norm hidden, appended
+// --serve: resident speech-out backbone. After the prompt, each step waits on stdin for
+// the NEXT input instead of feeding its own argmax:
+//   T <id>      feed text token <id>
+//   A <path>    feed the audio_out placeholder; its embedding is the 2048-float row in
+//               <path> (appended to g_semb, served by the --speak-emb branch)
+//   Q           stop
+// KV and conv state persist, so a slot costs one decode step, not a relaunch (a relaunch
+// re-reads the 1.95 GB blob: 76 s of a 78 s launch, measured). The per-step computation
+// is the T=1 path either way, so a served run must reproduce a relaunched run's records
+// exactly -- that equality is the gate for this mode.
+static bool g_serve = false;
+static const int SERVE_MAXFR = 2048;     // frame-row capacity: 16 MB at 2048 x 2048 x 4
 struct CapRec { std::string name; int N = 0, K = 0; std::vector<uint16_t> x, y; };
 static int g_cap_on = 0;
 static std::vector<CapRec> g_caps;
@@ -3523,6 +3535,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--speak-emb") && i + 1 < argc) speak_emb_file = argv[++i];
     else if (!strcmp(argv[i], "--speak-tok") && i + 1 < argc) g_speak_tok = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--dump-hidden-all") && i + 1 < argc) g_dump_hidden_all = argv[++i];
+    else if (!strcmp(argv[i], "--serve")) g_serve = true;
   }
   printf("prompt: %zu ids:", prompt.size());
   for (size_t i = 0; i < prompt.size() && i < 8; i++) printf(" %d", prompt[i]);
@@ -3534,7 +3547,16 @@ int main(int argc, char** argv) {
   else if (g_emb && !strcmp(g_emb, "host")) emb_mode_req = 1;
   M.emb_mode = emb_mode_req;        // flags are parsed before M exists
   M.path = argv[1];
-  if (!load_blob(argv[1], M, js)) return 1;
+  { struct timespec _t0; clock_gettime(CLOCK_MONOTONIC, &_t0);
+    if (!load_blob(argv[1], M, js)) return 1;
+    struct timespec _t1; clock_gettime(CLOCK_MONOTONIC, &_t1);
+    // LFM_LOADTIME=1: measured 76 s of a 78 s 3-step launch on the board (the GPU arena
+    // leaves too little RAM to keep the 1.95 GB blob in page cache between launches).
+    if (getenv("LFM_LOADTIME")) {
+      printf("LOADTIMING blob(read+parse+upload): %.1f ms\n",
+             (_t1.tv_sec - _t0.tv_sec) * 1e3 + (_t1.tv_nsec - _t0.tv_nsec) * 1e-6);
+      fflush(stdout);
+    } }
 
   // layer_types, parsed from the blob header (the conv layers carry the
   // operator branch, the attention layers carry self_attn).
@@ -3601,6 +3623,7 @@ int main(int argc, char** argv) {
     {(void**)&M.invf_full, (HD / 2) * 4, "invf_full"},
     {(void**)&M.invf_slide, (HD / 2) * 4, "invf_slide"},
   };
+  { struct timespec _t0; clock_gettime(CLOCK_MONOTONIC, &_t0);
   for (const Al& a : als) {
     if (cudaMalloc(a.p, a.n) != cudaSuccess) {
       printf("arena cudaMalloc(%s, %zu B) FAILED -- device free %.2f GB\n",
@@ -3609,6 +3632,13 @@ int main(int argc, char** argv) {
     }
     for (int L = 0; L < NLAYER; L++) { is_attn_g[L] = is_attn[L]; is_slide_g[L] = is_slide[L]; }
   }
+  { struct timespec _t1; clock_gettime(CLOCK_MONOTONIC, &_t1);
+    if (getenv("LFM_LOADTIME")) {
+      printf("LOADTIMING arena(cudaMalloc+memset): %.1f ms\n",
+             (_t1.tv_sec - _t0.tv_sec) * 1e3 + (_t1.tv_nsec - _t0.tv_nsec) * 1e-6);
+      fflush(stdout);
+    } }
+  }   // closes the _t0 timing scope opened before the arena loop
   cudaMemset(M.ring, 0, (size_t)NCONV * 7 * H * 2);
   cudaMemset(M.x, 0, H * 2);
   float hf[HD / 2], hs2[HD / 2];
@@ -3694,6 +3724,17 @@ int main(int argc, char** argv) {
     if (cudaMemcpy(g_semb, sh.data(), sh.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { printf("--speak-emb: copy failed\n"); return 1; }
     printf("SPEAK-EMB armed: %s = %d rows x %d, served at audio_out token %d in slot order (%.1f MB)\n",
            speak_emb_file, g_semb_n, H, g_speak_tok, sh.size() * 4 / 1e6);
+    fflush(stdout);
+  }
+  if (g_serve) {
+    if (speak_emb_file) { printf("--serve takes frame rows over stdin; do not combine with --speak-emb\n"); return 2; }
+    if (!clip_files.empty()) { printf("--serve is single-sequence; do not combine with --clip\n"); return 2; }
+    if (cudaMalloc(&g_semb, (size_t)SERVE_MAXFR * H * 4) != cudaSuccess) {
+      printf("--serve: frame buffer OOM (%.1f MB)\n", (double)SERVE_MAXFR * H * 4 / 1e6); return 1;
+    }
+    g_semb_n = 0;
+    steps = MAXTOK;                       // the loop ends on Q, EOF, or the KV cap
+    printf("SERVE armed: commands on stdin (T <id> | A <row.f32> | Q), %d frame rows max\n", SERVE_MAXFR);
     fflush(stdout);
   }
   if (M.emb_mode >= 1) {
@@ -4132,6 +4173,36 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
     if (s >= 2) { tot += ms; ng++; }
     cudaError_t e2 = cudaGetLastError();
     if (e2 != cudaSuccess) { printf("CUDA ERROR after step %d: %s\n", s, cudaGetErrorString(e2)); return 1; }
+    if (g_serve && s >= nprompt - 1) {
+      // toks already holds this step's argmax at s+1 (the shipped feed); overwrite it with
+      // the controller's choice. Anything other than exactly s+2 entries is a feed bug.
+      if (toks.size() != (size_t)s + 2) { printf("SERVE: toks has %zu entries after step %d, want %d\n", toks.size(), s, s + 2); return 1; }
+      char cmd[1200];
+      if (!fgets(cmd, sizeof cmd, stdin)) { printf("SERVE: stdin closed after step %d\n", s); fflush(stdout); break; }
+      if (cmd[0] == 'Q') { printf("SERVE: quit after step %d\n", s); fflush(stdout); break; }
+      if (cmd[0] == 'T' && cmd[1] == ' ') {
+        char* endp = nullptr;
+        long id = strtol(cmd + 2, &endp, 10);
+        if (endp == cmd + 2 || id < 0 || id >= VOCAB) { printf("SERVE: bad text id in '%s'\n", cmd); return 1; }
+        toks[s + 1] = (int)id;
+      } else if (cmd[0] == 'A' && cmd[1] == ' ') {
+        char* nl = strchr(cmd, '\n'); if (nl) *nl = 0;
+        if (g_semb_n >= SERVE_MAXFR) { printf("SERVE: frame buffer full (%d rows)\n", SERVE_MAXFR); return 1; }
+        FILE* rf = fopen(cmd + 2, "rb");
+        if (!rf) { printf("SERVE: cannot open frame row %s\n", cmd + 2); return 1; }
+        std::vector<float> row((size_t)H);
+        size_t got = fread(row.data(), 4, (size_t)H, rf);
+        int extra = fgetc(rf);
+        fclose(rf);
+        if (got != (size_t)H || extra != EOF) { printf("SERVE: %s is not exactly %d floats\n", cmd + 2, H); return 1; }
+        for (int i = 0; i < H; i++) if (!isfinite(row[i])) { printf("SERVE: frame row non-finite at %d\n", i); return 1; }
+        if (cudaMemcpy(g_semb + (size_t)g_semb_n * H, row.data(), (size_t)H * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+          printf("SERVE: frame row upload failed\n"); return 1;
+        }
+        g_semb_n++;
+        toks[s + 1] = g_speak_tok;
+      } else { printf("SERVE: unknown command '%s'\n", cmd); return 1; }
+    }
   }
   if (pfprobe >= 0) {
     if (pfpass == 0) pf_base = toks;
