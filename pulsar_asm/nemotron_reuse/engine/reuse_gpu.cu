@@ -3558,13 +3558,19 @@ __global__ void k_scan_dt(const float *xc, const float *Wdt, const float *Bdt,
  * ASSOCIATION changes (a*L then d, and (d*u)*Bt vs (d*Bt)*u), i.e. ~1 ulp of
  * the decay/beta terms - no precision is dropped and no approximation is
  * swapped in. The gate decides. Selected with REUSE_SCANF=1. */
-/* ex2.approx.f32 - the exact instruction __expf(x) lowers to after its
- * multiply by log2(e), written as PTX because CUDA 10.2 device code has no
- * __exp2f intrinsic. */
+/* ex2.approx.ftz.f32 - the instruction __expf(x) lowers to after its multiply
+ * by log2(e), written as PTX because CUDA 10.2 device code has no __exp2f
+ * intrinsic. The .ftz form is used deliberately: the non-ftz form wraps every
+ * MUFU.EX2 in a denormal fix-up (FSETP input < -126, @!P FMUL x0.5, then
+ * @!P FMUL r*r on the result) - 3 extra instructions on each of the 16 decay
+ * exponentials per scan step, in a loop that is partly issue-bound (#259).
+ * The only semantic difference is that results below 2^-126 (~1.2e-38) flush
+ * to 0 instead of being denormal; the decay factor multiplies h, so the
+ * change in h is < 1.2e-38 * |h| - far below fp32 resolution of the outputs. */
 __device__ __forceinline__ float dex2(float v)
 {
     float r;
-    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(v));
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(v));
     return r;
 }
 /* REG moves the 16 per-thread decay constants from shared into registers.
