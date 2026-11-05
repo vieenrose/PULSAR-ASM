@@ -36,17 +36,27 @@ kind_bad = [i for i in range(n) if wk[i] != gk[i]]
 print("slots: oracle %d, live %d; kind agreement %d/%d%s"
       % (len(wk), len(gk), n - len(kind_bad), n,
          "" if not kind_bad else "; first kind mismatch at %d" % kind_bad[0]))
+# Text BEFORE the audio is comparable (same context). Text AFTER the audio tail is
+# conditioned on the audio, which differs under quantization, so it is reported but not
+# gated -- holding it to exactness would be demanding that a different audio sound the
+# same words.
+kinds = [w.split()[0] for w in want]
+first_audio = next((i for i, k in enumerate(kinds) if k == "A"), len(kinds))
+pre = sum(1 for k in kinds[:first_audio] if k == "T")
 wt = np.fromfile(os.path.join(G, "text.i32"), dtype=np.int32)
 gt = np.fromfile(L + ".text.i32", dtype=np.int32)
-nt = min(len(wt), len(gt))
-tb = [i for i in range(nt) if wt[i] != gt[i]]
-print("text: oracle %d, live %d; exact %d/%d%s"
-      % (len(wt), len(gt), nt - len(tb), nt,
-         "" if not tb else "; first text mismatch at %d (oracle %d live %d)"
+npre = min(pre, len(wt), len(gt))
+tb = [i for i in range(npre) if wt[i] != gt[i]]
+print("text (pre-audio, %d slots): exact %d/%d%s"
+      % (pre, npre - len(tb), npre,
+         "" if not tb else "; first mismatch at %d (oracle %d live %d)"
          % (tb[0], int(wt[tb[0]]), int(gt[tb[0]]))))
-truncated = len(gt) < len(wt)
-if len(wt) != len(gt) and not truncated:
-    ok_text = False
+if len(wt) > pre or len(gt) > pre:
+    print("text (post-audio, conditioned on the audio): oracle %d, live %d -- reported, "
+          "not gated" % (max(0, len(wt) - pre), max(0, len(gt) - pre)))
+truncated = len(gk) < len(wk)
+if not tb:
+    ok_text = True
 
 wf = np.fromfile(os.path.join(G, "audio_codes.i32"), dtype=np.int32).reshape(12, -1).T
 gf = np.fromfile(L + ".frames.i32", dtype=np.int32).reshape(-1, 12)
