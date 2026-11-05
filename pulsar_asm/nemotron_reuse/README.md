@@ -51,6 +51,28 @@ Target: **NVIDIA Jetson Nano Developer Kit** (tegra210, 4x A57, 1 SM / 128 cores
 3 GiB shared memory, L4T R32.5.1, CUDA 10.2, `sm_53`). The development host is
 an x86 box with a GTX 1070 (`sm_61`, 15 SMs).
 
+## Nano kernel shares (8 kHz, 4 forwards, `mode=summary`)
+
+Measured on the device with the audited nvprof spool server (see Profiling):
+
+| kernel | share of GPU time | calls per forward |
+|---|---|---|
+| `k_in_conv_r` | 33.6% | 60 |
+| `k_scan_dts` | 15.2% | 60 |
+| `k_out_proj_r84` | 10.9% | 60 |
+| `k_conv2d_r8` (dilation 8) | 10.0% | ~1.5 |
+| `k_x_proj_g` | 6.8% | 60 |
+| `k_conv2d_r8` (dilation 4) | 7.3% | ~1.5 |
+| `k_conv2d_r8` (dilation 2) | 4.8% | ~1.5 |
+| `k_outproj_ln_g` | 2.6% | 30 |
+| `k_sp_up8t` | 1.8% | ~2 |
+| `k_conv2d_r8` (dilation 1) | 2.7% | ~1.5 |
+| `k_concat_f`, `k_inorm_prelu`, `k_resid_*` | < 1% each | -- |
+
+GPU kernels are about 99% of the wall time on the Nano (`CUDA_LAUNCH_BLOCKING=1`),
+so these shares are directly the model-time shares. `in_conv` + `out_proj` together
+are ~44% of the device time; the scan is 15%.
+
 ## Verified results (dev host, x86 + GTX 1070, CUDA 10.2)
 
 Gates are run with the **reference STFT fed in**, so the model and iSTFT are
