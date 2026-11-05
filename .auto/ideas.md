@@ -748,3 +748,37 @@ Dev-host nsys for comparison: in_conv 28.6% | scan 19.6% | out_proj 15.6% | x_pr
    79 regs on sm_53. A 32-acc shape should land ~100-110 regs - check launch on-device.
 => Also reopened: in_conv on Maxwell. Dev-side in_conv sweeps (#45/#51 accumulator
    shapes, LBV) were all judged on the dev host. Re-time the best candidates on the Nano.
+
+## NANO TRUE KERNEL PROFILE (#273) - via the nvprof spool server. SUPERSEDES #272's ablation map
+How to use it: the user starts it with `sudo /usr/local/sbin/reuse-nvprof-server`; drop
+`{"rate":8000,"mode":"summary"}` (mode in summary|trace|api) into
+/dev/shm/reuse_nvprof/req/<id>.json and read out/<id>.txt + out/<id>.status. ~25 s per
+request. nb the profiled binary runs as root - stop the server when not in use.
+Real per-kernel shares (22.80 s kernel time over 4 forwards, OP=4 build):
+    k_in_conv_r<32,3,ICW>  33.6%   31.9 ms/launch  x60/forward
+    k_scan_dts             15.2%   14.5 ms/launch  x60/forward
+    k_out_proj_r84 (new)   10.9%   10.4 ms/launch  x60/forward
+    k_conv2d_r8 dil=8      10.0%  378 ms/launch    x1.5/forward   <- biggest single launch
+    k_conv2d_r8 dil=4       7.3%
+    k_x_proj_g              6.8%    6.5 ms/launch  x60/forward
+    k_conv2d_r8 dil=2       4.8%  | dil=1 2.7% | k_outproj_ln_G 2.6% | sp_up8t 1.8%
+    k_concat_f 0.8% | k_inorm_prelu 0.8% | resid_a pair 0.8%
+
+## KEY DISCOVERY (#273): ~50% of the Nano's model time is NOT kernel time
+    GPU kernel time   5.70 s/forward
+    model wall       11.46 s/forward
+    => 5.76 s/forward (50%) is launch/sync/driver overhead over ~371 kernel launches
+       = ~15.5 ms per launch. That is the CUDA_LAUNCH_BLOCKING=1 price.
+    NOTE the profile's wall (11.46) ~= the unprofiled wall (11.34), so nvprof did not
+    inflate it: the number is real.
+Consequences:
+  * On the Nano, LAUNCH COUNT is as important as kernel speed. Every future Nano change
+    should report its launch-count delta.
+  * This is why dev and Nano disagree (#269 +4.8% Nano on a change that was -2.1% on the
+    dev proxy; #271 same shape). Dev launches async and hides all of this. The dev
+    primary metric is simply blind to the Nano's dominant cost.
+  * Biggest removable cluster: in_conv, scan, out_proj and x_proj each launch 60x per
+    forward (30 blocks x 2 directions). Batching both directions into ONE launch per
+    kernel (direction picks the row permutation / output offset) removes ~120 launches
+    per forward ~= 1.9 s ~= 16% of the Nano's model. Dev-invisible; time it on-device.
+  * The one-time 1406-call weight-blob upload is NOT per-forward - do not "fix" it.
