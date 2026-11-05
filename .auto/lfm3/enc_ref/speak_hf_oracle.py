@@ -206,6 +206,13 @@ def main():
     for i, c in enumerate(rec["codes"]):
         wi32(os.path.join(OUT, "codes.%d.i32" % i), c)
     wi32(os.path.join(OUT, "audio_codes.i32"), codes)
+    # HF's own code -> backbone-input path: codebook_embedding(codes + arange*codebook_size).sum.
+    # Recorded from HF's function (not re-derived here) so the native gather+sum can be gated
+    # against it, offset convention included.
+    with torch.no_grad():
+        e = model.model.get_audio_out_embeds(torch.tensor(codes.T, dtype=torch.long))
+    w32(os.path.join(OUT, "audio_embeds.f32"), e[0].float().numpy() if e.ndim == 3 else e.float().numpy())
+    print("audio_embeds", tuple(e.shape))
     wi32(os.path.join(OUT, "frames.i32"), np.asarray(frames, dtype=np.int32).reshape(-1)
          if frames else np.zeros(0, dtype=np.int32))
 

@@ -419,15 +419,70 @@ int main(int argc, char** argv) {
   //   order.i32: n_pass*4 int32, pass-major reveal order (the oracle's order.<f>.i32, fed as data)
   //   hist.i32 : n_hist*12 int32, frame-major per-codebook history (may be empty); the
   //              repetition penalty is applied over the last `window` frames, default 64, penalty 1.1
-  if (argc < 6) {
+  if (argc < 6 && !(argc >= 5 && !strcmp(argv[2], "--embeds"))) {
     printf("usage: %s <depth.lfm3q8> <hidden.f32> <codes.i32> <masked.u8> <out.f32>\n", argv[0]);
     printf("       %s <depth.lfm3q8> <hidden.f32> --maskgit <order.i32> <hist.i32> <out_codes.i32> [penalty] [window]\n", argv[0]);
+    printf("       %s <depth.lfm3q8> --embeds <codes.i32> <out.f32> [nframes]\n", argv[0]);
     return 2;
   }
   std::vector<Ent> ents;
   std::map<std::string, Ent*> by;
   char* js = nullptr;
   if (!load_blob(argv[1], ents, by, js)) return 1;
+
+  /* code -> backbone input embedding (the S6 speech-out loop feeds this at each
+     audio_out_token_id position):
+       lfm3_depth <blob> --embeds <codes.i32> <out.f32> [nframes]
+     codes.i32 is frame-major n*NCB (the oracle's per-frame codes concatenated); out.f32 is
+     n*SRC_H. Mirrors HF get_audio_out_embeds: codebook_embedding(codes + arange(NCB)*CBS).sum(-2),
+     codebooks summed in ascending order in f32, exactly as HF reduces dim -2. */
+  if (argc >= 5 && !strcmp(argv[2], "--embeds")) {
+    const int NCB = 12, CBS = 2017, SH = 2048;   // same values depth_forward uses
+    Ent* cb = by.count("codebook_embedding.weight") ? by["codebook_embedding.weight"] : nullptr;
+    if (!cb) { printf("MISSING TENSOR: codebook_embedding.weight\n"); return 3; }
+    if (cb->dtype != 3 || cb->ne[0] != NCB * CBS || cb->ne[1] != SH) {
+      printf("FAIL codebook_embedding.weight: want bf16 [%d,%d], got dtype %d [%d,%d]\n",
+             NCB * CBS, SH, cb->dtype, cb->ne[0], cb->ne[1]);
+      return 3;
+    }
+    FILE* fc = fopen(argv[3], "rb");
+    if (!fc) { printf("cannot open %s\n", argv[3]); return 2; }
+    fseek(fc, 0, SEEK_END); long nc = ftell(fc) / 4; fseek(fc, 0, SEEK_SET);
+    std::vector<int> codes((size_t)nc);
+    if (nc <= 0 || fread(codes.data(), 4, (size_t)nc, fc) != (size_t)nc) { printf("short codes\n"); fclose(fc); return 2; }
+    fclose(fc);
+    if (nc % NCB) { printf("FAIL codes count %ld not a multiple of %d\n", nc, NCB); return 3; }
+    long n = nc / NCB;
+    if (argc > 5) { long want = atol(argv[5]); if (want != n) { printf("FAIL nframes given %ld != %ld from file\n", want, n); return 3; } }
+    const uint16_t* E = (const uint16_t*)cb->dq;
+    std::vector<float> out((size_t)n * SH);
+    for (long j = 0; j < n; j++) {
+      for (int d = 0; d < SH; d++) {
+        float acc = 0.f;
+        for (int i = 0; i < NCB; i++) {
+          long code = codes[(size_t)j * NCB + i];
+          if (code < 0 || code >= CBS) {
+            printf("FAIL code %ld outside [0,%d) at frame %ld codebook %d\n", code, CBS, j, i);
+            return 3;
+          }
+          acc += bf16_to_f32(E[((size_t)code + (size_t)i * CBS) * SH + d]);
+        }
+        out[(size_t)j * SH + d] = acc;
+      }
+      // plausibility: a real embedding is never the zero vector (HF's own table is random-init-free)
+      double rms = 0;
+      for (int d = 0; d < SH; d++) rms += (double)out[(size_t)j * SH + d] * out[(size_t)j * SH + d];
+      if (!(rms > 0.0)) { printf("FAIL frame %ld embedding rms is zero\n", j); return 3; }
+      if (!(rms == rms)) { printf("FAIL frame %ld embedding not finite\n", j); return 3; }
+      if (j == 0) printf("EMBEDS frame0 rms %.6f\n", sqrt(rms));
+    }
+    FILE* fw = fopen(argv[4], "wb");
+    if (!fw) { printf("cannot write %s\n", argv[4]); return 2; }
+    if (fwrite(out.data(), 4, out.size(), fw) != out.size()) { printf("short write\n"); fclose(fw); return 2; }
+    fclose(fw);
+    printf("LFM3DEPTH-EMBEDS-1 frames=%ld dim=%d table=%dx%d bf16\n", n, SH, NCB * CBS, SH);
+    return 0;
+  }
 
   float hidden[2048];
   FILE* fh = fopen(argv[2], "rb");
