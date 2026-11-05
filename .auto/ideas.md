@@ -782,3 +782,14 @@ Consequences:
     kernel (direction picks the row permutation / output offset) removes ~120 launches
     per forward ~= 1.9 s ~= 16% of the Nano's model. Dev-invisible; time it on-device.
   * The one-time 1406-call weight-blob upload is NOT per-forward - do not "fix" it.
+
+## Nano probes after #273 (no code landed)
+- Tile 82 re-confirmed ON DEVICE (81 +28%, 83 +18%, 92 +16%). Dev proxy agreed here.
+- REUSE_STREAMS=0/1 on the Nano: flat (11.37 vs 11.39 s, 3 pairs). Two-stream overlap
+  is not contributing under CUDA_LAUNCH_BLOCKING.
+- REUSE_SKIP_CONCAT=1 on the Nano: ~-0.7% (11.31 vs 11.40 s, 3 pairs) - within noise.
+  The separate concat launch is NOT a meaningful share of the 50% launch overhead.
+  Do not chase concat fusion further.
+- Ablation vs nvprof disagree on per-launch cost (#272 ablation implied ~2x the kernel
+  time was saved by skips). Treat the "15.5 ms per launch" figure as unvalidated until
+  a trace (mode=trace, queued as p274, not yet run) measures inter-kernel gaps directly.
