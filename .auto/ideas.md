@@ -474,3 +474,20 @@ a fake +31% tower regression). Signature: bench wall time >55s when the normal i
 - Dispatch audit (also from #255's lesson) now COMPLETE for convs: R64LAUNCH and
   R8LAUNCH both select the WS twin, R8ONE has no call site, R9LAUNCH (tile 92) is
   env-only and remapped to 82 on Maxwell. No further missed twins.
+
+## #258 CLOSED: Maxwell dense-conv tile re-sweep AFTER the #255 weight staging
+- Discipline check from #197 ("re-sweep shape knobs after a memory-hierarchy change"),
+  applied to the Maxwell path #255 just changed. Swept the 32-accumulator tiles the
+  hardcoded Maxwell fallback chooses from, encoder phase, WS staged, 2 pairs each:
+      82  (8co x 2col x 2row)  0.064 / 0.064 s   <-- SHIPPED, best
+      83  (16co x 2col x 1row) 0.079 / 0.080
+      81  (4co x 4col x 2row)  0.084 / 0.085
+      92  (r9, 16co)           0.098 / 0.098
+- So the optimum is an INVERTED-U in the co dimension peaking at 8, not a monotone
+  "more channels per block is better" trend (the initial read of 82 > 81 suggested a
+  trend; 83 refuted it). #255 left no Maxwell shape on the table; tile 82 stands.
+- Do not re-sweep this set again: 4 of the 4 Maxwell-launchable shapes are measured.
+- sm_53 register note: all four 32-acc tiles compile to 92-96 regs (81: 92, 82: 96,
+  83: 96-111), so STATIC register counts do not predict the documented 64-acc
+  launch failure - that is a different mechanism. Do not use -Xptxas -v as a
+  Maxwell launch-viability oracle; only an on-device launch is.
