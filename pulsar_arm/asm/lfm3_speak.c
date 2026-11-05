@@ -341,8 +341,13 @@ int main(int argc, char **argv) {
         die("cannot write %s", histf);
       fclose(hf2);
       snprintf(codef, sizeof codef, "%s.codes.i32", TMPD);
+      snprintf(embf, sizeof embf, "%s.emb1.f32", TMPD);
       char pen[32], win[32];
       snprintf(pen, sizeof pen, "1.1"); snprintf(win, sizeof win, "4096");
+      /* One process per frame, not two: the maskgit call also emits the frame embedding
+         (LFM_DEPTH_EMBEDS_OUT). Forking lfm3_depth twice paid the 1.3 s blob load twice
+         per frame; the embedding itself is a 24k-entry table reduction. */
+      setenv("LFM_DEPTH_EMBEDS_OUT", embf, 1);
       char *av2[] = { (char*)"lfm3_depth", DB, hid1, (char*)"--maskgit",
                       ordf, histf, codef, pen, win, NULL };
       run_cap(av2, nanolog);
@@ -360,11 +365,7 @@ int main(int argc, char **argv) {
       /* HF's rule: any codebook hitting EOS overrides the WHOLE frame (found when
          raw-vs-returned codes gave cos 0.529 in the --embeds gate). */
       if (iseos) for (int i = 0; i < NCB; i++) codes[i] = AUDIO_EOS;
-      /* embed feedback row for the next backbone launch */
-      snprintf(embf, sizeof embf, "%s.emb1.f32", TMPD);
-      char one[32]; snprintf(one, sizeof one, "1");
-      char *av3[] = { (char*)"lfm3_depth", DB, (char*)"--embeds", codef, embf, one, NULL };
-      run_cap(av3, nanolog);
+      /* the embedding came out of the maskgit process above */
       need_file(embf, (long)HDIM * 4, "frame embedding");
       FILE *e1 = fopen(embf, "rb"), *ea = fopen(embfile, "ab");
       if (!e1 || !ea) die("cannot append frame embedding");

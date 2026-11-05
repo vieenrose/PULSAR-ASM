@@ -574,6 +574,36 @@ int main(int argc, char** argv) {
     printf("maskgit: codes = [");
     for (int c = 0; c < 12; c++) printf("%d%s", codes[c], c == 11 ? "]" : ",");
     printf("\n");
+    /* LFM_DEPTH_EMBEDS_OUT=<file>: also emit this frame's backbone input embedding, in the
+       same form --embeds produces. The speech loop used to fork lfm3_depth twice per frame
+       (maskgit, then --embeds), paying the 1.3 s blob load twice; the computation is tiny
+       next to the maskgit passes, so one process does both. Same table, same reduction
+       order as the gated --embeds path. */
+    if (const char* eo = getenv("LFM_DEPTH_EMBEDS_OUT")) {
+      const int NCB2 = 12, CBS2 = 2017, SH2 = 2048;
+      Ent* cb2 = by.count("codebook_embedding.weight") ? by["codebook_embedding.weight"] : nullptr;
+      if (!cb2) { printf("MISSING TENSOR: codebook_embedding.weight\n"); return 3; }
+      const uint16_t* E = (const uint16_t*)cb2->dq;
+      std::vector<float> o((size_t)SH2);
+      for (int d = 0; d < SH2; d++) {
+        float acc = 0.f;
+        for (int i = 0; i < NCB2; i++) {
+          int code = codes[i];
+          if (code < 0 || code >= CBS2) { printf("FAIL code %d outside [0,%d)\n", code, CBS2); return 3; }
+          acc += bf16_to_f32(E[((size_t)code + (size_t)i * CBS2) * SH2 + d]);
+        }
+        o[d] = acc;
+      }
+      double rms = 0;
+      for (int d = 0; d < SH2; d++) rms += (double)o[d] * o[d];
+      if (!(rms > 0.0) || !(rms == rms)) { printf("FAIL maskgit embedding rms %.6f\n", rms); return 3; }
+      FILE* fe = fopen(eo, "wb");
+      if (!fe) { printf("cannot write %s\n", eo); return 2; }
+      if (fwrite(o.data(), 4, o.size(), fe) != o.size()) { printf("short write\n"); fclose(fe); return 2; }
+      fclose(fe);
+      printf("maskgit: embedding rms %.6f -> %s\n", sqrt(rms), eo);
+      fflush(stdout);
+    }
     return 0;
   }
 
