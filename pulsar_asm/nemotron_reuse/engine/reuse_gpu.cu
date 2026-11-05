@@ -3841,7 +3841,7 @@ static int launch_conv2d_pair(reuse_gpu_t *g, const float *x, const float *w, co
     const int H_out = H, W_out = W;
     int big = tilehint ? tilehint : 645;
     static int bigenv = -1;
-    if (bigenv < 0) { const char *e = getenv("REUSE_CONV_TILE"); bigenv = e ? atoi(e) : 645; }
+    if (bigenv < 0) { const char *e = getenv("REUSE_CONV_TILE"); bigenv = e ? atoi(e) : 644; }
     if (!tilehint) big = bigenv;
     if (big >= 644 && big <= 646 && gpu_is_maxwell()) big = 82;
     if (big == 92) big = 82;                       // r9 has no paired form
@@ -3901,9 +3901,9 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
     const float *s0=S[0],*s1=S[1],*s2=S[2],*s3=S[3],*s4=S[4],*s5=S[5],*s6=S[6],*s7=S[7];
     const float *s8=S[8],*s9=S[9],*s10=S[10],*s11=S[11],*s12=S[12],*s13=S[13],*s14=S[14],*s15=S[15];
     // tilehint: 0 = use REUSE_CONV_TILE, else a tile code for this call site.
-    // The encoder's dense block prefers 645 (8co x 4col x 2row) and the
-    // decoders' prefer 644 (8x2x4, a 64-row tile); measured 0.082/0.041 vs
-    // 0.082/0.037 for the two phases.
+    // The encoder's dense block prefers 644 (8co x 2col x 4row) and the
+    // decoders' prefer 644 (8x2x4, a 64-row tile); re-swept after the WS
+    // weight staging landed (#194), which moved the encoder optimum from 645.
     const int tileuse = tilehint;
     int H_out = (H + 2*padH - dilH*(kH-1) - 1)/strideH + 1;
     int W_out = (W + 2*padW - dilW*(kW-1) - 1)/strideW + 1;
@@ -3921,7 +3921,7 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
         const bool regtile = !getenv("REUSE_NAIVE_CONV2D") && kH == 3 && kW == 3 &&
                              dilW == 1 && strideH == 1 && strideW == 1 && padW == 1 && padH == dilH;
         static int bigenv = -1;
-        if (bigenv < 0) { const char *e = getenv("REUSE_CONV_TILE"); bigenv = e ? atoi(e) : 645; }
+        if (bigenv < 0) { const char *e = getenv("REUSE_CONV_TILE"); bigenv = e ? atoi(e) : 644; }
         int big = tileuse ? tileuse : bigenv;
         // Maxwell (sm_53, the Jetson Nano) cannot launch the 64-accumulator
         // tiles: ptxas hands back a kernel whose per-thread register demand
