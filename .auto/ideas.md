@@ -290,3 +290,26 @@ step instead of scalars inside the unrolled DSTATE loop) - tower 0.305 -> 0.298 
 rtf_total 0.0801 -> 0.0791 (-1.2%). Bit-compatible (max|d| 1.19e-07).
 Remaining above-noise candidate: **Winograd F(2x2,3x3) on dilH=1 dense convs** (~0.5-1% of
 rtf_total, hours, gate risk). Everything else measured is sub-noise or closed.
+
+## Profile of the committed tree at rtf_total 0.0731 (#186, nsys, 2 forwards, per-forward kernel ms)
+in_conv 110.8 (28%) | scan_dts 94.0 | conv2d_r8 family 84.5 (21%) | out_proj_r8c 76.4 (19%) |
+x_proj 25.6 | inorm_prelu 5.3 | outproj_ln 4.9 | sp_up 3.2 | resid_freq 3.3 | resid_out 3.2 |
+conv1x1 1.7 | transpose 1.4 | idft 0.9 | stft_dd 0.5 | misc ~2. GPU busy ~= wall (slight overlap)
+=> NO launch-idle lever; #145's "syncs are free" holds.
+NEW closures from this profile:
+1. -Xptxas -dlcm=cg = +8% model, -dlcm=cs = +4%, default (ca) best; --extra-device-vectorization
+   does not exist in CUDA 10.2 ptxas. Compile-flag lever CLOSED.
+2. k_resid_freq_a + k_resid_out_a CANNOT be fused: the freq mamba block consumes xf between them.
+   Each is add+relayout at 57% of the bandwidth roof (0.11 ms per 1.33M elements, grid 5184x256,
+   16 regs). CLOSED.
+3. Encoder dense convs are the largest single launches in the model: k_conv2d_r8p<48,8,4,2,true>
+   (dil=8, C_in=384) = 29.5 ms for ONE conv; grid (3,32,8), 128 regs, 13 KB shared, 2 blocks/SM.
+   FLOPs analysis: 70 GFlop => 2.4 TFLOPS = 41% of the 5.78 TFLOPS fp32 roof. The R shared tile is
+   exactly TH+2*dilH (34/36/40/48 for dil 1/2/4/8) - the loader is optimal (every loaded row is
+   used by some output row). Instruction mix per ci per thread = 576 FFMA + 72 weight-LDS
+   (PCO=8 x 9 taps) + ~18 A-LDS + addressing = 87% FFMA -> issue-limited ceiling ~86% of roof,
+   so the 41% gap is LSU/latency/register-bound, not multiply-bound (consistent with Winograd
+   tying at #185). Shape space is nearly exhausted by shared+registers: accs=64 costs 128 regs
+   -> only 2 blocks/SM; cutting PCO to 4 to halve weight loads needs R=66..80 rows = 18-22 KB
+   shared (still 2 blocks/SM) but pushes regs past 136 -> 1 block/SM. Tile codes 644/645/646/81/82
+   (PCO 4-16, NCB 1-4, NRA 1-4) already cover the feasible frontier. CLOSED for shapes.
