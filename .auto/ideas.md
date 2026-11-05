@@ -534,3 +534,27 @@ a fake +31% tower regression). Signature: bench wall time >55s when the normal i
 - NEXT on this thread: the same "thread-private data in shared" audit. Remaining candidates
   seen in SASS: k_inorm_prelu (LDS32=66, STS=34) and k_scan_dt/k_scan (non-fused A/B paths).
   k_scan_dts is now LDS-free in the hot loop - re-check its SASS mix before any further work.
+
+## #261: x_proj occupancy lever CLOSED + 3 BROKEN instantiations found (LANDMINE)
+- x_proj launches only 8 blocks (grid (1,8)) on a 15-SM GPU, which looked like the
+  unclaimed lever. Swept everything via REUSE_XPROJ = MT*10000 + NT*100 + TX.
+- Among CORRECT shapes the shipped default wins outright:
+      128,40,8  (8 blocks)  0.3386 model   <- shipped
+       64,40,8 (16 blocks)  +1.5%
+       32,40,8 (32 blocks)  +5.7%
+      256,40,8  (4 blocks)  +7.0%
+  Mechanism: every row-block re-reads the whole 36x256 W tile (8 blocks = 288 KB of W
+  traffic, 32 blocks = 1.15 MB), so extra blocks multiply weight traffic; below 8 blocks
+  the 15 SMs go unfilled. 8 is the sweet spot. OCCUPANCY LEVER CLOSED - do not re-sweep.
+- **LANDMINE**: all three TX=16 instantiations are SILENTLY WRONG.
+  (128,32,16), (128,48,16), (128,64,16) each give rel_rms 0.89 vs the default on the same
+  input (audio becomes near-noise, std 0.031 instead of speech-like).
+  (128,64,16) presents as a **7.2% MODEL WIN** (0.3143 vs 0.3386) and is pure garbage -
+  it "wins" by not doing the work. The default dispatches TX=8 so nothing shipped is
+  broken, but REUSE_XPROJ can select them.
+  => This is the SECOND occurrence of the #64 trap in this project's history. RULE (now
+  mandatory): for any swept shape, run a dump-diff against the current default BEFORE
+  comparing timings. A timing win larger than the kernel's entire share of the profile is
+  proof of a bug, not a discovery. x_proj is ~6% of the model; a "7% model win" from it is
+  arithmetically impossible.
+- Verified-correct alternatives that lose: 64,40,8 and 32,40,8 (both bit-compatible).
