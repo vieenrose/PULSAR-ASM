@@ -1376,6 +1376,76 @@ __global__ void k_out_proj_r(const float *y, const float *z, const float *W,
     }
 }
 
+/* 32-accumulator out_proj for Maxwell (REUSE_OP=4).
+ *
+ * The Nano cannot launch the 64-accumulator tiled==3 kernels (sm_53 register
+ * limit), so it falls back to k_out_proj_r's 4x4 tile - and on the Nano that
+ * stage is ~41% of the tower (#272 ablation). This is the middle shape: each
+ * thread owns 8 rows x 4 columns (32 accumulators), block (16,16) covers a
+ * 128-row x 64-column tile, so each staged A element feeds 4 FMAs and each W
+ * element 8 (vs 4 and 4 in the 4x4 kernel) - half the shared loads per FMA.
+ * A is staged transposed (AsT[k][m]) so the 8-row a[] group is two aligned
+ * LDS.128 (#189's pattern); W is staged transposed too (WsT[k][o]) so the
+ * 4-column group is one LDS.128. Writes `out` exactly like k_out_proj_r (the
+ * separate k_concat_f is kept: fusing it was slower on the Nano, #269).
+ * Accumulation order over k is unchanged, so the output is bit-compatible. */
+__global__ void __launch_bounds__(256, 2) k_out_proj_r84(const float *y, const float *z, const float *W,
+                                                        float *out, int SL)
+{
+    const int KC = 16, MT = 128;
+    __shared__ __align__(16) float AsT[KC][MT+4];
+    __shared__ __align__(16) float WsT[KC][HID+4];
+    const long m0 = (long)blockIdx.x * MT;
+    const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
+    const int tid = ty*16 + tx;
+    float acc[8][4];
+#pragma unroll
+    for (int a = 0; a < 8; a++)
+#pragma unroll
+        for (int b = 0; b < 4; b++) acc[a][b] = 0.f;
+    for (int k0 = 0; k0 < DINNER; k0 += KC) {
+        for (int i = tid; i < MT*(KC/4); i += 256) {              /* 2 float4/thread */
+            const int r = i / (KC/4), q = 4*(i - r*(KC/4));
+            const long o_ = (m0 + r)*DINNER + k0 + q;
+            float4 v = make_float4(0.f,0.f,0.f,0.f);
+            if (m0 + r < SL) {
+                const float4 yy = *(const float4*)(y + o_);
+                const float4 zz = *(const float4*)(z + o_);
+                v.x = yy.x * dsilu(zz.x); v.y = yy.y * dsilu(zz.y);
+                v.z = yy.z * dsilu(zz.z); v.w = yy.w * dsilu(zz.w);
+            }
+            AsT[q+0][r] = v.x; AsT[q+1][r] = v.y;
+            AsT[q+2][r] = v.z; AsT[q+3][r] = v.w;
+        }
+        for (int i = tid; i < KC*(HID/4); i += 256) {             /* 1 float4/thread */
+            const int co = i / (KC/4), q = 4*(i - co*(KC/4));
+            const float4 wv = *(const float4*)(W + (long)co*DINNER + k0 + q);
+            WsT[q+0][co] = wv.x; WsT[q+1][co] = wv.y;
+            WsT[q+2][co] = wv.z; WsT[q+3][co] = wv.w;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < KC; k++) {
+            const float4 alo = *(const float4*)&AsT[k][ty*8];
+            const float4 ahi = *(const float4*)&AsT[k][ty*8 + 4];
+            const float4 w4  = *(const float4*)&WsT[k][tx*4];
+            const float a[8] = {alo.x, alo.y, alo.z, alo.w, ahi.x, ahi.y, ahi.z, ahi.w};
+            const float w[4] = {w4.x, w4.y, w4.z, w4.w};
+#pragma unroll
+            for (int a4 = 0; a4 < 8; a4++)
+#pragma unroll
+                for (int b4 = 0; b4 < 4; b4++) acc[a4][b4] = fmaf(a[a4], w[b4], acc[a4][b4]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int a4 = 0; a4 < 8; a4++) {
+        const long m = m0 + ty*8 + a4;
+        if (m >= SL) continue;
+        *(float4*)(out + m*HID + tx*4) = make_float4(acc[a4][0], acc[a4][1], acc[a4][2], acc[a4][3]);
+    }
+}
+
 __global__ void k_out_proj_tiled(const float *y, const float *z, const float *W, float *out,
                                  int SL)
 {
@@ -4312,8 +4382,11 @@ static int outproj_tiled(void)
     if (t < 0) {
         t = getenv("REUSE_OP") ? atoi(getenv("REUSE_OP")) : (getenv("REUSE_NAIVE_OP") ? 0 : 3);
         /* k_out_proj_r8's 64 accumulators exceed Maxwell's per-thread
-           register limit: it compiles for sm_53 and fails to launch. */
-        if (t == 3 && gpu_is_maxwell()) t = 2;
+           register limit: it compiles for sm_53 and fails to launch. Maxwell
+           takes the 32-accumulator k_out_proj_r84 (OP=4, 86 regs on sm_53)
+           instead of the 16-accumulator OP=2: -8.7% model / -11.6% tower ON
+           THE NANO, bit-identical output (#273). */
+        if (t == 3 && gpu_is_maxwell()) t = 4;
     }
     return t;
 }
@@ -4484,6 +4557,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
             else if (tiled == 3 && cf && cat) k_out_proj_r8c<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, x, cat, coff, L, rev, (int)SL);
             else if (tiled == 3) k_out_proj_r8<<<(unsigned)((SL+255)/256), dim3(8,32), 0, st>>>(y, z, W_op, out, (int)SL);
             else if (tiled == 2) k_out_proj_r<<<(unsigned)((SL+63)/64), dim3(16,16), 0, st>>>(y, z, W_op, out, (int)SL);
+            else if (tiled == 4) k_out_proj_r84<<<(unsigned)((SL+127)/128), dim3(16,16), 0, st>>>(y, z, W_op, out, (int)SL);
             else            k_out_proj_tiled<<<g, dim3(GT/2, GT/2), 0, st>>>(y, z, W_op, out, (int)SL);
         } else {
             if (!getenv("REUSE_SKIP_GATEOP"))
