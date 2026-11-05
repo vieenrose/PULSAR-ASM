@@ -491,3 +491,26 @@ a fake +31% tower regression). Signature: bench wall time >55s when the normal i
   83: 96-111), so STATIC register counts do not predict the documented 64-acc
   launch failure - that is a different mechanism. Do not use -Xptxas -v as a
   Maxwell launch-viability oracle; only an on-device launch is.
+
+## WIN #259: scan recurrence - hoist the per-step multiplies (-0.79% model)
+- The fused scan (k_scan_dts, 24% of the model) spends two FMULs per state element on
+  hoistable work:
+    __expf(d*a[n])  = FMUL(d*a) + FMUL(*log2e) + MUFU.EX2      -> FMUL(d*(a*log2e)) + MUFU
+    d*Bt[n]*u       = FMUL(d*Bt) + FMUL(*u)                    -> FMUL(du*Bt),  du = d*u
+  Folding log2(e) into the once-per-thread decay fill and hoisting du out of the n-loop
+  is 32 fewer FMULs per step (SASS: FMUL 100->89, total 555->533, MUFU unchanged 33).
+- Clean 4-pair A/B: model 0.34975 -> 0.34700 mean (-0.79%), 4/4 pairs; tower 0.262->0.259.
+  Numerics: association only, end-to-end max|d| 1.6e-07 / rel_rms 3.9e-07 (floor ~9e-08),
+  gate margin still 75x. REUSE_SCANF=0 restores the shipped form.
+- CORRECTION to a long-standing note: "the scan is MUFU-bound" is only mostly true. MUFU
+  count is unchanged here yet the model got 0.79% faster, so a slice of the loop IS
+  issue-bound. Instruction-count reductions DO pay in the scan, unlike the resid kernels
+  (#257) where a 5.6x cut was free. Always separate those two conclusions per kernel.
+- NEXT IDEAS ON THIS THREAD (not yet tried, same "hoist what is loop-invariant" family):
+  1. In the same loop, `u = xc[sl*DINNER + c]` is loaded per step; c is thread-fixed but
+     sl advances by DINNER, so the address is already a running offset - probably fine.
+  2. The dt path still computes dsoftplus = log1pf(__expf(v)) per step: __logf-based
+     dsoftplus could drop a MUFU per step if the gate tolerates 1 ulp (v>20 branch already
+     exists). That is a PRECISION-adjacent change - only attempt with the gate as arbiter.
+  3. k_scan_dt / k_scan (the non-fused ts!=2 paths) never got #157's float4 row loads or
+     this hoist; they are A/B-only paths, leave them.
