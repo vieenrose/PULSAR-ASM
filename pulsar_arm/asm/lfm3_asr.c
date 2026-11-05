@@ -175,12 +175,23 @@ static long man_long(char *man, const char *key) {
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    fprintf(stderr, "usage: %s <dir> <clip.wav> [max_gen]\n", argv[0]);
+    fprintf(stderr, "usage: %s <dir> <clip.wav> [max_gen] [--out-ids FILE] [--tokens-only]\n", argv[0]);
+    fprintf(stderr, "  --out-ids FILE  write the generated ids as int32 (feeds lfm3_speak: M3)\n");
+    fprintf(stderr, "  --tokens-only   print ids, skip the detokenized transcript\n");
     return 2;
   }
   snprintf(DIR, sizeof DIR, "%s", argv[1]);
   const char *wav = argv[2];
   int max_gen = (argc > 3) ? atoi(argv[3]) : 256;
+  /* --out-ids / --tokens-only complete the speech->speech chain: the transcript ids this
+     shell generates are exactly the prompt ids lfm3_speak consumes, so M3 is this program
+     followed by that one, with no Python in between. */
+  const char *out_ids = NULL;
+  int tokens_only = 0;
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--out-ids") && i + 1 < argc) out_ids = argv[++i];
+    else if (!strcmp(argv[i], "--tokens-only")) tokens_only = 1;
+  }
   if (max_gen < 1 || max_gen > 4096) die("max_gen %d out of range 1..4096", max_gen);
   if (file_size(wav) < 44) die("%s is missing or smaller than a WAV header", wav);
 
@@ -319,7 +330,20 @@ int main(int argc, char **argv) {
   int dn = ltok_decode(&tok, gen, (size_t)ngen, txt, dcap);
   if (dn < 0) die("detokenizer failed on %d ids", ngen);
   txt[dn] = 0;
-  printf("TRANSCRIPT (%d tokens, %.1f chars/KB): %s\n", ngen, (double)dn, txt);
+  if (out_ids) {
+    FILE *f = fopen(out_ids, "wb");
+    if (!f) die("cannot write %s", out_ids);
+    if (fwrite(gen, 4, (size_t)ngen, f) != (size_t)ngen) die("short write to %s", out_ids);
+    fclose(f);
+    printf("IDS -> %s (%d ids, %ld bytes)\n", out_ids, ngen, (long)ngen * 4);
+  }
+  if (tokens_only) {
+    printf("IDS_PLAIN");
+    for (int i = 0; i < ngen; i++) printf(" %u", gen[i]);
+    printf("\n");
+  } else {
+    printf("TRANSCRIPT (%d tokens, %.1f chars/KB): %s\n", ngen, (double)dn, txt);
+  }
   free(eb); free(txt); free(gen); free(ids); free(pre_ids); free(post_ids);
   free(prompt); free(manb); ltok_free(&tok);
   return 0;
