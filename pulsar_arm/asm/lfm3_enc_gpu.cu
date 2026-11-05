@@ -481,9 +481,17 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
 __global__ void k_rmsnorm_f32(float* __restrict__ x, const float* __restrict__ w, int D) {
   const int t = blockIdx.x;
   float* r = x + (size_t)t * D;
-  double v = 0;
-  for (int i = 0; i < D; i++) v += (double)r[i] * r[i];
-  __syncthreads();                      // nobody writes until every warp has summed
+  // Every thread used to run this same serial fp64 sum (256x redundant fp64 on a GPU with
+  // 1/32-rate fp64: 266 ms per call at Tt=1622, 9.3 s of the encoder). Thread 0 now runs
+  // it once, in the same order, and shares it: the value every thread used is unchanged.
+  __shared__ double sv;
+  if (threadIdx.x == 0) {
+    double v = 0;
+    for (int i = 0; i < D; i++) v += (double)r[i] * r[i];
+    sv = v;
+  }
+  __syncthreads();                      // nobody writes until the sum is done (and shared)
+  const double v = sv;
   const float inv = 1.0f / sqrtf((float)(v / D) + EEPS);
   for (int i = threadIdx.x; i < D; i += blockDim.x) r[i] = __fmul_rn(w[i], __fmul_rn(r[i], inv));
 }

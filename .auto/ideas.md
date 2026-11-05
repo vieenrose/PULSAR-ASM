@@ -2379,3 +2379,8 @@ One paired A/B each order on the current tree: shipped 2265.88/2269.00 vs H2=1 2
 (R = 1.057/1.056, H2 faster 2/2). The -5.6% survives the intervening changes, as expected: the
 RoPE fix adds identical work to both arms and MAXTOK only enlarges an allocation. Same first
 token. This was the last un-re-measured number in the H2 decision table; it is now current.
+
+## LFM3 S2T latency (session 2026-11-06)
+- REJECTED w/o run: overlap encoder (GPU, 33 s) with backbone load (48 s). Encoder peak = ~1.1 GB
+  (MemAvailable 3189 -> 2074 MB) + backbone 2.15 GB device + ~0.3 GB host > board. OOM hung picard once (run 281).
+  Revisit only if encoder activation memory is cut (e.g. free x1/x2 buffers early, bf16 activations).
