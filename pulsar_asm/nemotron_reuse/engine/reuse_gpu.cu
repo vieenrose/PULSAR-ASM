@@ -3532,6 +3532,26 @@ __global__ void k_scan_dt(const float *xc, const float *Wdt, const float *Bdt,
 // blocks (32 of 64 warps) per SM; the kernel is latency-bound (72 GB/s of the
 // 158 GB/s ceiling, 3x off its DRAM floor), so trading 16 registers for 16
 // warp-broadcast shared loads per L step buys in-flight capacity.
+/* FAST folds the two per-element multiplies out of the recurrence step:
+ *   shipped: __expf(d*aAs[n])  = FMUL(d*a) + FMUL(*log2e) + MUFU.EX2   (2 FMUL)
+ *            d*Bt[n]*u         = FMUL(d*Bt) + FMUL(*u)                 (2 FMUL)
+ *   FAST:    __exp2f(d*bAs[n]) = FMUL(d*b)  + MUFU.EX2                 (1 FMUL)
+ *            du*Bt[n]          = FMUL(du*Bt)                           (1 FMUL)
+ * with bAs[n] = aAs[n]*log2(e) folded into the once-per-thread fill and
+ * du = d*u hoisted out of the n-loop: 32 FMUL fewer per step. Only the
+ * ASSOCIATION changes (a*L then d, and (d*u)*Bt vs (d*Bt)*u), i.e. ~1 ulp of
+ * the decay/beta terms - no precision is dropped and no approximation is
+ * swapped in. The gate decides. Selected with REUSE_SCANF=1. */
+/* ex2.approx.f32 - the exact instruction __expf(x) lowers to after its
+ * multiply by log2(e), written as PTX because CUDA 10.2 device code has no
+ * __exp2f intrinsic. */
+__device__ __forceinline__ float dex2(float v)
+{
+    float r;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(v));
+    return r;
+}
+template<bool FAST>
 __global__ void __launch_bounds__(256, 4) k_scan_dts(const float *xc, const float *Wdt, const float *Bdt,
                           const float *A_log, const float *Dv, const float *xdbl,
                           float *y, int S, int L, int rev)
@@ -3548,7 +3568,8 @@ __global__ void __launch_bounds__(256, 4) k_scan_dts(const float *xc, const floa
     for (int n = 0; n < DSTATE; n++) h[n] = 0.0f;
     const int lane = (int)threadIdx.x % 32;
 #pragma unroll
-    for (int n = 0; n < DSTATE; n++) aAs[lane][n] = -__expf(A_log[c * DSTATE + n]);
+    for (int n = 0; n < DSTATE; n++)
+        aAs[lane][n] = -__expf(A_log[c * DSTATE + n]) * (FAST ? 1.4426950408889634f : 1.0f);
     __syncthreads();
     const float Dc = Dv[c];
     const float4 w = Ws[c];
@@ -3568,10 +3589,19 @@ __global__ void __launch_bounds__(256, 4) k_scan_dts(const float *xc, const floa
         float Bt_[16] = {Bv0.x,Bv0.y,Bv0.z,Bv0.w,Bv1.x,Bv1.y,Bv1.z,Bv1.w,Bv2.x,Bv2.y,Bv2.z,Bv2.w,Bv3.x,Bv3.y,Bv3.z,Bv3.w};
         float Ct_[16] = {Cv0.x,Cv0.y,Cv0.z,Cv0.w,Cv1.x,Cv1.y,Cv1.z,Cv1.w,Cv2.x,Cv2.y,Cv2.z,Cv2.w,Cv3.x,Cv3.y,Cv3.z,Cv3.w};
         float acc = 0.0f;
+        if (FAST) {
+            const float du = d * u;
 #pragma unroll
-        for (int n = 0; n < DSTATE; n++) {
-            h[n] = __expf(d * aAs[lane][n]) * h[n] + d * Bt_[n] * u;
-            acc = fmaf(h[n], Ct_[n], acc);
+            for (int n = 0; n < DSTATE; n++) {
+                h[n] = dex2(d * aAs[lane][n]) * h[n] + du * Bt_[n];
+                acc = fmaf(h[n], Ct_[n], acc);
+            }
+        } else {
+#pragma unroll
+            for (int n = 0; n < DSTATE; n++) {
+                h[n] = __expf(d * aAs[lane][n]) * h[n] + d * Bt_[n] * u;
+                acc = fmaf(h[n], Ct_[n], acc);
+            }
         }
         y[sl * DINNER + c] = acc + u * Dc;
     }
@@ -4357,7 +4387,10 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         if (fused) {
             static int ts = -1;
             if (ts < 0) ts = getenv("REUSE_SCAN") ? atoi(getenv("REUSE_SCAN")) : 2;
-            if (ts == 2) k_scan_dts<<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
+            static int scanf_ = -1;
+            if (scanf_ < 0) scanf_ = getenv("REUSE_SCANF") ? atoi(getenv("REUSE_SCANF")) : 1;
+            if (ts == 2 && scanf_) k_scan_dts<true ><<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
+            else if (ts == 2)     k_scan_dts<false><<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
             else         k_scan_dt<<<dim3((unsigned)((S+7)/8), DINNER/32), 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
         } else if (getenv("REUSE_SKIP_DTPROJ")) { } else
         if (t == 2) k_dt_proj_r<<<(unsigned)((SL+7)/8), 256, 0, st>>>(xdbl, W_dt, B_dt, dtt, SL);
