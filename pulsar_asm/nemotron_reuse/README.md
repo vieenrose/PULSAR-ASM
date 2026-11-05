@@ -172,8 +172,10 @@ Nano kernel shares, 8 kHz, four forwards (`mode=summary`):
 | `k_conv2d_r8` (dilation 8) | 10.0% | ~1.5 |
 | `k_x_proj_g` | 6.8% | 60 |
 
-GPU kernels take about half of the model time. The other half is launch and sync
-overhead under `CUDA_LAUNCH_BLOCKING=1`, which is the next thing to reduce.
+These shares are of GPU kernel time, which is ~99% of the wall time on the Nano
+(the profile covers 2 forwards: 22.8 s of kernels vs 2 x 11.4 s of wall). Launch
+overhead is negligible, so the Nano is **kernel-bound**; `in_conv` alone is ~34%
+of the model.
 
 **Dev host:** `REUSE_KPROF=1` gives a per-stage breakdown; the old table below is
 kept for the record.
@@ -263,12 +265,11 @@ every downstream number is meaningless. Verify with
 
 ## Next steps
 Ordered by expected RTF impact on the Nano (currently RTF_total 2.23 at 8 kHz):
-1. **Launch count.** About half of the Nano's model time is launch and sync
-   overhead, about 371 kernel launches per forward. Batching the forward and
-   backward directions into one launch per kernel is estimated at ~16% of the
-   model. This must be timed on the device.
-2. **The tower** (~72% of the Nano model): `in_conv` (34% of GPU time) and the
-   scan (15%). The scan's per-step work is mostly issue-bound.
+1. **`in_conv`** (`k_in_conv_r`, 34% of the Nano model, ~32 ms per launch, 120
+   launches per forward). The fused in_proj + causal conv GEMM is the largest cost.
+2. **The rest of the tower** (~72% of the Nano model in total): the scan (15%),
+   out_proj (11%) and x_proj (7%). Launch overhead is NOT a lever: kernels are
+   ~99% of the wall time.
 3. **Dense convolutions:** the dilation-8 layer is the single largest launch
    (~378 ms per call, ~10% of GPU time). Tile 82 is confirmed best on the device.
 4. **STFT front-end** is still on the CPU (0.44 s on the Nano earlier; a DD-GPU

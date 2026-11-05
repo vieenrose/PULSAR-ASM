@@ -793,3 +793,16 @@ Consequences:
 - Ablation vs nvprof disagree on per-launch cost (#272 ablation implied ~2x the kernel
   time was saved by skips). Treat the "15.5 ms per launch" figure as unvalidated until
   a trace (mode=trace, queued as p274, not yet run) measures inter-kernel gaps directly.
+
+
+## CORRECTION (retracts the "KEY DISCOVERY" in the #273 section above)
+The claim that ~50% of the Nano's model time is launch/sync overhead is WRONG. I
+assumed the nvprof run covered 4 forwards; I had requested reps=2, so it covered 2
+(240 in_conv launches / 120 per forward = 2). Correct arithmetic:
+    GPU kernel time 22.80 s / 2 forwards = 11.40 s per forward
+    wall time                              11.46 s per forward
+    => ~1% outside kernels. The Nano is KERNEL-BOUND.
+Cross-check: in_conv = 120 launches x 31.95 ms = 3.834 s/forward vs the #272 ablation
+3.807 s. Consequences: direction-batching to cut launches is NOT worth building;
+"count launches" is not a Nano lever; the 15.5 ms/launch figure is void. The other
+numbers in that section (kernel shares per launch) are fine.
