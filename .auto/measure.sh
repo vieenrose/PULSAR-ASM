@@ -59,12 +59,16 @@ tower=$(grep -oE '30xTFMamba [0-9.]+' <<<"$ph" | awk '{print $2}')
 dec=$(grep -oE 'decoders [0-9.]+' <<<"$ph" | awk '{print $2}')
 [ -n "$rtf8" ] || { echo "NO RESULT"; exit 1; }
 
-# 5. Nano output must match the dev Maxwell proxy
-scp -q "$NANO":/dev/shm/nb_8000_c_amp.raw /tmp/nano_amp.raw 2>/dev/null
+# 5. Nano output must match the dev Maxwell proxy (stdlib only: the harness
+#    python may lack numpy)
+scp -q "$NANO":/dev/shm/nb_8000_c_amp.raw /tmp/nano_amp.raw \
+  || { echo "SCP OF NANO OUTPUT FAILED"; exit 1; }
 d=$(python3 -I -c "
-import numpy as np
-a=np.fromfile('/tmp/proxy_amp.raw',np.float32); b=np.fromfile('/tmp/nano_amp.raw',np.float32)
-print(np.abs(a-b).max() if a.size==b.size else 1e9)")
+from array import array
+a=array('f'); b=array('f')
+a.frombytes(open('/tmp/proxy_amp.raw','rb').read()); b.frombytes(open('/tmp/nano_amp.raw','rb').read())
+print(max(abs(x-y) for x,y in zip(a,b)) if len(a)==len(b) and len(a)>0 else 1e9)") \
+  || { echo "OUTPUT DIFF SCRIPT FAILED"; exit 1; }
 echo "nano-vs-proxy amp max|d| = $d"
 python3 -I -c "import sys; sys.exit(0 if float('$d') < 1e-4 else 1)" \
   || { echo "NANO OUTPUT DIVERGES FROM PROXY"; exit 1; }
