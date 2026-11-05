@@ -554,7 +554,7 @@ __global__ void k_in_proj_r(const float *x, const float *W, float *x0, float *z,
 #ifndef LBV
 #define LBV 3
 #endif
-template<int KC, int LBMIN = 2>
+template<int KC, int LBMIN = 2, bool ICW = false>
 __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const float *W, float *z, float *xc,
                             const float *Wc, const float *Bc,
                             int S, int L, int rev, int zhalo = 1)
@@ -668,6 +668,22 @@ __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const 
             for (int b4 = 0; b4 < 4; b4++) v[h][b4] = Hl[h][ty*4 + b4];
     }
     const int c0 = n0 + ty*4;
+    /* ICW hoists the depthwise-conv bias and taps out of the row loop. Wc and
+       Bc index only (c0, k), both thread constants, yet the shipped form
+       reloads them on every one of the RA=5 row iterations: 5*4 bias +
+       5*4*4 tap loads = 100 scalar LDGs per thread for 20 distinct values
+       (SASS confirms LDG.E x100). They are L1-resident, so this is issue
+       pressure rather than traffic. Same values, same FMA order, so the
+       output is bit-identical. */
+    float bcw[4], wcw[4][DCONV];
+    if (ICW) {
+#pragma unroll
+        for (int b4 = 0; b4 < 4; b4++) {
+            bcw[b4] = Bc[c0 + b4];
+#pragma unroll
+            for (int k = 0; k < DCONV; k++) wcw[b4][k] = Wc[(long)(c0 + b4)*DCONV + k];
+        }
+    }
 #pragma unroll
     for (int a4 = 0; a4 < RA; a4++) {
         long m = m0 + tx*RA + a4;
@@ -676,7 +692,7 @@ __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const 
         const int ntap = (t >= DCONV-1) ? DCONV : t + 1;
         float fv[4];
 #pragma unroll
-        for (int b4 = 0; b4 < 4; b4++) fv[b4] = Bc[c0 + b4];
+        for (int b4 = 0; b4 < 4; b4++) fv[b4] = ICW ? bcw[b4] : Bc[c0 + b4];
         // Fully unrolled with a predicate, never a runtime trip count: with
         // "k = DCONV - ntap" as the loop start, j = a4+k is a runtime index and
         // v[]/acc[] spill to local memory (128-176 byte stack frames).
@@ -687,7 +703,7 @@ __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const 
 #pragma unroll
             for (int b4 = 0; b4 < 4; b4++)
                 fv[b4] = fmaf((j < 3 ? v[j][b4] : acc[j-3][b4]),
-                              Wc[(long)(c0 + b4)*DCONV + k], fv[b4]);
+                              ICW ? wcw[b4][k] : Wc[(long)(c0 + b4)*DCONV + k], fv[b4]);
         }
         *(float4*)(xc + m*DINNER + c0) = make_float4(dsilu(fv[0]), dsilu(fv[1]), dsilu(fv[2]), dsilu(fv[3]));
     }
@@ -4334,16 +4350,27 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
         if (getenv("REUSE_SKIP_INPROJ")) { } else
         if (fuse_conv()) {
             const int kc = fuse_kc();
+            static int icw2 = -2;
+            if (icw2 == -2) icw2 = getenv("REUSE_ICW") ? atoi(getenv("REUSE_ICW")) : 1;
             if (fuse_tile() == 128) {          // 128 measured slower (0.638 vs 0.555 s):
                                                // the traffic model lost to 110 registers/block
                 k_in_conv_r2<32><<<dim3((unsigned)((SL+FUSE_MT2-1)/FUSE_MT2), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
             }
+            else if (kc == 16 && icw2)
+                k_in_conv_r<16, LBV, true><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
+                    x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
             else if (kc == 16)
                 k_in_conv_r<16, LBV><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
+            else if (kc == 8 && icw2)
+                k_in_conv_r<8, LBV, true><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
+                    x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
             else if (kc == 8)
                 k_in_conv_r<8, LBV><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
+                    x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
+            else if (icw2)
+                k_in_conv_r<32, LBV, true><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
                     x, W_in, z, xc, W_c, B_c, S, L, rev, zhalo);
             else
                 k_in_conv_r<32, LBV><<<dim3((unsigned)((SL+FUSE_MT-1)/FUSE_MT), (2*DINNER)/64), dim3(16,16), 0, st>>>(
