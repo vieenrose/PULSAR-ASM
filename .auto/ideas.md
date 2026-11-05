@@ -397,3 +397,14 @@ re-sweep shape knobs after every memory-hierarchy change; Nano validation must
 diff audio (timing-only retired); checks.sh now gates Maxwell paths every iteration.
 Scored levers: EXHAUSTED (see closures above). Remaining: Nano-only backlog (fused
 OP2 epilogue, tile-82 WS, launch fusion) - unscored, build only with Nano A/B.
+
+## Nano-only backlog, continued (unscored - see policy above)
+4. REUSE_CONV_CHUNK sweep on Nano (default 64): chunks C_out per conv launch for
+   the watchdog. 128 halves the conv launch count under CUDA_LAUNCH_BLOCKING at
+   identical work Grids get bigger (better occupancy on 1 SM?) or smaller-count...
+   measure on-device, never on dev (dev is launch-hidden: expect flat).
+5. Profiling calibration note (#201): nsys 2021.1 absolute kernel durations read
+   ~2x below wall-implied values on this stack (GTX 1070, CUDA 10.2) - the #186
+   profile matches 16 kHz rate-scaling, mine matches 8 kHz halves; gap fractions
+   and rankings are scale-free and trustworthy, absolute ms are not. Do NOT use
+   nsys ms for roof arithmetic; use ratios and counts only.
