@@ -514,3 +514,23 @@ a fake +31% tower regression). Signature: bench wall time >55s when the normal i
      exists). That is a PRECISION-adjacent change - only attempt with the gate as arbiter.
   3. k_scan_dt / k_scan (the non-fused ts!=2 paths) never got #157's float4 row loads or
      this hoist; they are A/B-only paths, leave them.
+
+## WIN #260: scan decay constants shared -> registers (-1.5% rtf_total, -1.6% Nano)
+- The 16 per-thread decay constants (aAs[lane][n]) were re-read as 16 LDS.U.32 on EVERY
+  step - 16 of ~90 instructions per step, for data that never changes.
+- WHY they were in shared: __launch_bounds__(256,4) pins ptxas at exactly 64 regs/thread
+  and k_scan_dts already used 64, so a 16-value per-thread array there would have spilled.
+  The shared copy was forced by the launch bound, NOT chosen for speed. This is a general
+  smell worth grepping for: "thread-private data staged in __shared__" almost always means
+  an LB/register ceiling pushed it there, and relaxing the bound can be the cheaper trade.
+- Relaxing to LB(256,2): 90 registers, no spills, shared 6272 -> 4096 B. Removes 16 LDS/step.
+- Clean 3-group A/B (model): shared/LB4 0.34523 -> regs/LB2 0.33943 = -1.7%.
+  regs/LB1 (0.33940) was a 0.01% tie, so LB2 was taken for the Nano's single SM headroom.
+  Halving occupancy cost NOTHING on either arch: the 16 LDS were the binding constraint.
+- Scored: rtf_total 0.0673 (band was 0.0683-0.0688) = -1.5%, tower 0.251, all 3 held-outs
+  better. Nano: 8 kHz model 12.9292 -> 12.7217 (-1.6%), RTF_total 2.5041, 16 kHz 4.8867;
+  output BIT-identical to the dev Maxwell proxy. Cumulative Nano 44.34 -> 2.4945 = 17.8x.
+- Knob: REUSE_SCANR 0 = shipped shared/LB4, 1 = regs LB3, 2 = regs LB2 (default), 3 = LB1.
+- NEXT on this thread: the same "thread-private data in shared" audit. Remaining candidates
+  seen in SASS: k_inorm_prelu (LDS32=66, STS=34) and k_scan_dt/k_scan (non-fused A/B paths).
+  k_scan_dts is now LDS-free in the hot loop - re-check its SASS mix before any further work.
