@@ -60,7 +60,7 @@ dec=$(grep -oE 'decoders [0-9.]+' <<<"$ph" | awk '{print $2}')
 [ -n "$rtf8" ] || { echo "NO RESULT"; exit 1; }
 
 # 5. Nano output must match the dev Maxwell proxy
-scp -q "$NANO":/dev/shm/nb_8000_amp.raw /tmp/nano_amp.raw 2>/dev/null
+scp -q "$NANO":/dev/shm/nb_8000_c_amp.raw /tmp/nano_amp.raw 2>/dev/null
 d=$(python3 -I -c "
 import numpy as np
 a=np.fromfile('/tmp/proxy_amp.raw',np.float32); b=np.fromfile('/tmp/nano_amp.raw',np.float32)
