@@ -716,3 +716,14 @@ THE NANO (same binary, knob only), e.g.:
   with __logf(1+x): that loses accuracy for small x and would be a looser softplus, which
   rule 4 forbids. A ftz-only __expf inside softplus would be legitimate but is ~1 exp per
   step vs the 16 already done - expected gain ~1/16 of #270, i.e. below the noise floor.
+
+## #271 CLOSED: ftz exp inside dsilu - bit-identical, yet SLOWER on the Nano
+- Provably exact (silu's exp feeds 1.0f + e; e < 2^-126 -> sum is exactly 1.0f). Verified
+  bit-identical model output on dev (amp+pha, 8+16 kHz) and on the Nano (amp cmp).
+- dev -0.20% (4/4, below floor) but Nano +1.5% model / +1.9% tower (3/3). Reverted.
+- Second dev/Nano disagreement in 3 iterations (#269 sign flip, #271 sign flip). The
+  on-device A/B rule (see #269) is now a HARD requirement for any change that touches
+  a kernel the Nano runs (k_in_conv_r, k_out_proj_r, k_scan_dts, k_conv2d_r8 tile 82,
+  inorm, sp_up). "Fewer static instructions" is not a usable proxy on sm_53.
+- Note #270 (scan ftz) passed the same test (-0.27% Nano), so the difference is not ftz
+  itself; it is what the inline asm does to sm_53 codegen in these particular kernels.
