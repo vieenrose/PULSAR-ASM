@@ -1883,7 +1883,9 @@ static int fuse_tile(void)
 static int fuse_kc(void)
 {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("REUSE_FUSE_KC"); v = e ? atoi(e) : 32; if (v != 8 && v != 16) v = 32; }
+    // Maxwell (Nano) default 16: -2.5% model on-device (2/2 pairs, bit-identical);
+    // KC=16 with ICW has no spill while KC=32 spills 16 B (#267). Dev host keeps 32.
+    if (v < 0) { const char *e = getenv("REUSE_FUSE_KC"); v = e ? atoi(e) : (gpu_is_maxwell() ? 16 : 32); if (v != 8 && v != 16) v = 32; }
     return v;
 }
 
