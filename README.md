@@ -30,6 +30,12 @@ PORTED AND GATED    text backbone — 24 layers, 286 tensors, 1946 MB at Q8
 END TO END          speech in -> text out (M1)   260/262 tokens vs HF, token-WER 0.008
                     text in -> speech out (M2)   60-slot turn in 5m34s, 2.80 s of audio,
                                                  records byte-identical across builds
+                    speech in -> speech out (M3) cascaded path runs end to end:
+                                                 lfm3_asr --out-ids -> lfm3_m3prompt ->
+                                                 lfm3_speak; 100-slot turn, 36 text + 64 audio
+                                                 frames, 5.12 s of 24 kHz audio, exit 0.
+                                                 Native M3 (audio rows into the speech prompt)
+                                                 is not wired yet.
 REFUTED             batched backbone prefill — built, bit-exact, and ~4x SLOWER than
                     the shipped T=1 path at ASR shapes; kept flag-gated, not shipped
 NOT MET             realtime ASR (ASR_RT <= 1.00): 1.33 best case, engine alone 0.65
