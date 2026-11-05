@@ -558,3 +558,33 @@ a fake +31% tower regression). Signature: bench wall time >55s when the normal i
   proof of a bug, not a discovery. x_proj is ~6% of the model; a "7% model win" from it is
   arithmetically impossible.
 - Verified-correct alternatives that lose: 64,40,8 and 32,40,8 (both bit-compatible).
+
+## WIN #262: in_conv epilogue - hoist the depthwise-conv weights (-1.1% model, -2.2% Nano)
+- k_in_conv_r's epilogue reloaded Wc[(c0+b4)*DCONV+k] and Bc[c0+b4] on EVERY one of the
+  RA=5 row iterations, though both index only (c0, k) = thread constants:
+  5*4 bias + 5*4*4 tap loads = 100 scalar LDGs per thread for 20 distinct values.
+  Now loaded once into 20 registers before the loop. ptxas stayed at 80 registers (the
+  values are live only in the epilogue, after the main loop's a[]/w[] die), so occupancy
+  did not change. SASS scalar LDGs 100 -> 20, total 3282 -> 3222.
+- Clean 3-pair A/B: model 0.33930 -> 0.33553 (-1.11%), tower 0.253 -> 0.2485. Bit-compat.
+- Scored NEW BEST rtf_total 0.0663, tower 0.246, held12k under 0.10 for the first time.
+- Nano: model 12.7217 -> 12.4421 (-2.2%), RTF_total 2.4492, 16 kHz 4.7812; bit-identical
+  to the dev Maxwell proxy. Cumulative 44.34 -> 2.4396 = 18.2x.
+
+## THE LENS THAT IS WORKING (apply it systematically - 3 wins in a row)
+Search every hot kernel for **work re-done per iteration that depends only on thread
+constants**, then hoist it. Concretely, grep the inner loops for:
+  1. per-step multiplies of a scalar by a thread-constant table (#259: d*aAs, d*u -> -0.79%)
+  2. thread-private data parked in __shared__ (usually forced there by a launch bound, so
+     relaxing the bound is cheaper than the round-trip; #260 -> -1.5%)
+  3. loads indexed only by (thread id, tap) INSIDE a loop over rows/steps (#262 -> -1.1%)
+Each win was ~1%, each cost ~1 hour, and all three are still open for the kernels not yet
+audited with this lens. NEXT CANDIDATES on the same lens:
+  - k_conv2d_r8 / r8p: the weight tap loads `wv[j*C_in*9 + kh*3 + t]` sit inside the ci
+    loop; j and kh are unrolled constants but C_in*9 strides over ci, so this is NOT the
+    same pattern - verify with SASS before assuming.
+  - k_outproj_ln_g: B[c0+b4] and LW/LB[c0+b4] are loaded once already; check the inner k.
+  - k_inorm_prelu: 66 LDS32 / 34 STS - audit for thread-constant redundancy.
+  - sp_up8w/sp_up8t: check the weight staging.
+README: measure by interleaving a knob; dump-diff BEFORE timing (#261 rule); check
+nvidia-smi compute-apps AND /proc/loadavg before trusting any absolute number.
