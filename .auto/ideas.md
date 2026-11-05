@@ -806,3 +806,12 @@ Cross-check: in_conv = 120 launches x 31.95 ms = 3.834 s/forward vs the #272 abl
 3.807 s. Consequences: direction-batching to cut launches is NOT worth building;
 "count launches" is not a Nano lever; the 15.5 ms/launch figure is void. The other
 numbers in that section (kernel shares per launch) are fine.
+
+## #274 CLOSED: outproj_ln_g shared-layout (2.6% of Nano GPU time)
+- A-tile As[32][KC+1], W-tile Ws[64][KC+1]: the a[] group is contiguous but the w[]
+  group is loaded at a (KC+1)-float stride. Tried the dev-side A/B between the tiled
+  kernel and the naive k_outproj_ln (one thread per row, 0.3321-0.3340 vs 0.3326-0.3332,
+  2-1 split) - flat within noise; the tiled form is already at the naive floor.
+- CLOSED. The SASS mix (66 LDS.128, 481 FFMA, 28 STS) has no block-uniform redundancy
+  to stage (unlike k_conv2d_r8, which had 256x redundant weight loads); every load is
+  per-thread data. No headroom from the shared layout.
