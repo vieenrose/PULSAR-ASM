@@ -3055,13 +3055,27 @@ __global__ void k_conv2d_r5(const float *x, const float *w, const float *b,
 // global traffic 1.7x (the tile is half as tall), raises FMA per global load
 // 7 -> 22 and FMA per shared load 2 -> 6, and keeps registers at 32
 // accumulators + ~12.
-template<int R, int PCO, int NCB, int NRA = 32/(PCO*NCB), bool TABLE = false>
+template<int R, int PCO, int NCB, int NRA = 32/(PCO*NCB), bool TABLE = false, bool WS = false>
 __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
                             int C_in, int H, int W, int padH, int padW, int dilH,
                             float *y, int co0, const float *x2, int ng, CONV_SRCS_PARAMS)
 {
+    /* Weight-shared staging (WS=true, REUSE_WST=1).
+     *
+     * The (j,kh) weight wv[j*C_in*9 + kh*3 + t] depends only on the output
+     * channel group and tap - it is IDENTICAL for all 256 threads of the
+     * block - but the shipped loop has every thread load its PCO*9 weights
+     * privately as scalar LDGs (256x redundancy). With WS, one cooperative
+     * pass per ci stages the PCO*3 taps into Ws[j][kh] (padded to float4 so
+     * every slot is 16 B aligned) and the loop reads them back as LDS.128:
+     * PCO*3 shared loads replace PCO*9 global loads per ci per thread. The
+     * staging rides the existing per-ci __syncthreads pair, so no new syncs,
+     * and the FMAs run in exactly the shipped order (same floats), making
+     * output bit-identical to WS=false. WS=false instantiations fold the
+     * branch and ternaries away and are codegen-identical to shipped. */
     const int TW = 16*NCB, LS = TW+4;
     __shared__ __align__(16) float S[R][LS];
+    __shared__ __align__(16) float Ws[16][3][4];
     const int w0 = blockIdx.x*TW, h0 = blockIdx.y*(16*NRA);
     const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
     const int tid = ty*16 + tx;
@@ -3102,13 +3116,24 @@ __global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
                 dv[i] = v;
             }
         }
+        if (WS) {
+            const float *wbs = w + ((long)(co0 + blockIdx.z*PCO)*C_in + ci)*9;
+            for (int i = tid; i < PCO*3; i += 256) {
+                const int j = i / 3, kh = i - j*3;
+                Ws[j][kh][0] = wbs[(long)j*C_in*9 + kh*3];
+                Ws[j][kh][1] = wbs[(long)j*C_in*9 + kh*3 + 1];
+                Ws[j][kh][2] = wbs[(long)j*C_in*9 + kh*3 + 2];
+            }
+        }
         __syncthreads();
         const float *wv = w + ((long)(co0 + blockIdx.z*PCO)*C_in + ci)*9;
 #pragma unroll
         for (int j = 0; j < PCO; j++) {
 #pragma unroll
             for (int kh = 0; kh < 3; kh++) {
-                const float w0f = wv[j*C_in*9 + kh*3], w1f = wv[j*C_in*9 + kh*3+1], w2f = wv[j*C_in*9 + kh*3+2];
+                float4 ww4 = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (WS) ww4 = *(const float4*)&Ws[j][kh];
+                const float w0f = WS ? ww4.x : wv[j*C_in*9 + kh*3], w1f = WS ? ww4.y : wv[j*C_in*9 + kh*3+1], w2f = WS ? ww4.z : wv[j*C_in*9 + kh*3+2];
                 const int rb = ty*NRA + kh*dilH, cb = tx*NCB;
 #pragma unroll
                 for (int a = 0; a < NRA; a++) {
@@ -3588,11 +3613,17 @@ static int launch_conv1x1(reuse_gpu_t *g, const float *x, const float *w, const 
             else if (regtile && dilH == 2) { k_conv2d_r9<R2,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
             else if (regtile && dilH == 4) { k_conv2d_r9<R4,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); } \
             else if (regtile && dilH == 8) { k_conv2d_r9<R8,8,2><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0); }
+/* Weight-staged twin launcher (REUSE_WST=1, cws): picks the WS=true
+ * instantiation of k_conv2d_r8, which stages the block-uniform filter taps
+ * in shared once per ci instead of loading them redundantly per thread. */
+#define R8WS(R_,PC_,NC_,NR_,T_) do { \
+    if (cws) k_conv2d_r8<R_,PC_,NC_,NR_,T_,true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); \
+    else     k_conv2d_r8<R_,PC_,NC_,NR_,T_><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0)
 #define R64LAUNCH(PC_,NC_,NR_,R1,R2,R4,R8) \
-            if      (regtile && dilH == 1) { do { if (ng >= 0) k_conv2d_r8<R1,PC_,NC_,NR_,true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R1,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
-            else if (regtile && dilH == 2) { do { if (ng >= 0) k_conv2d_r8<R2,PC_,NC_,NR_,true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R2,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
-            else if (regtile && dilH == 4) { do { if (ng >= 0) k_conv2d_r8<R4,PC_,NC_,NR_,true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R4,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
-            else if (regtile && dilH == 8) { do { if (ng >= 0) k_conv2d_r8<R8,PC_,NC_,NR_,true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R8,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); }
+            if      (regtile && dilH == 1) { do { if (ng >= 0) R8WS(R1,PC_,NC_,NR_,true); else k_conv2d_r8<R1,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
+            else if (regtile && dilH == 2) { do { if (ng >= 0) R8WS(R2,PC_,NC_,NR_,true); else k_conv2d_r8<R2,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
+            else if (regtile && dilH == 4) { do { if (ng >= 0) R8WS(R4,PC_,NC_,NR_,true); else k_conv2d_r8<R4,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
+            else if (regtile && dilH == 8) { do { if (ng >= 0) R8WS(R8,PC_,NC_,NR_,true); else k_conv2d_r8<R8,PC_,NC_,NR_,false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); }
 #define R8LAUNCH(R1,R2,R4,R8) \
             if      (regtile && dilH == 1) { if (pco==4) do { if (ng >= 0) k_conv2d_r8<R1,4,4,32/(4*4),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R1,4,4,32/(4*4),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else if (pco==8) do { if (ng >= 0) k_conv2d_r8<R1,8,2,32/(8*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R1,8,2,32/(8*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else do { if (ng >= 0) k_conv2d_r8<R1,16,2,32/(16*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R1,16,2,32/(16*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
             else if (regtile && dilH == 2) { if (pco==4) do { if (ng >= 0) k_conv2d_r8<R2,4,4,32/(4*4),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R2,4,4,32/(4*4),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else if (pco==8) do { if (ng >= 0) k_conv2d_r8<R2,8,2,32/(8*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R2,8,2,32/(8*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); else do { if (ng >= 0) k_conv2d_r8<R2,16,2,32/(16*2),true><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); else k_conv2d_r8<R2,16,2,32/(16*2),false><<<grdb,blkb>>>(x,w,b,C_in,H,W,padH,padW,dilH,y,co0,x2,ng,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15); } while (0); } \
@@ -3861,6 +3892,8 @@ static int launch_conv2d(reuse_gpu_t *g, const float *x, const float *w, const f
                          float *y, int tilehint, const float *x2, int ng)
 {
     const long shw = (long)H*W;
+    static int cws = -2;
+    if (cws == -2) cws = getenv("REUSE_WST") ? atoi(getenv("REUSE_WST")) : 1;
     const float *S[16];
     for (int t = 0; t < 16; t++)
         S[t] = (t < ng) ? (x + (long)(ng-1-t)*HID*shw)
