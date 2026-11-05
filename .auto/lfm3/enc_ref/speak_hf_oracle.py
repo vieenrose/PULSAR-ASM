@@ -253,14 +253,29 @@ def main():
 
 def codec_oracle(outdir, codes):
     """Decode the frames with HF's codec into the 24 kHz target waveform (the M2 ear check)."""
+    import glob
+    import importlib
     import importlib.util
-    sys.path.insert(0, os.path.join(
-        "/home/louis/.cache/huggingface/modules/transformers_modules",
-        "LFM3_hyphen_Audio_hyphen_2B", "228cd04f9ca7b43e"))
-    from modeling_liquid_codec import LiquidCodecModel
+    # same importlib-as-package trick as codec_hf_oracle.py: the cached remote module
+    # uses relative imports, so a bare sys.path insert dies (seen: ImportError at the
+    # end of an otherwise complete oracle run).
+    cands = sorted(glob.glob("/home/louis/.cache/huggingface/modules/transformers_modules/"
+                             "LFM3_hyphen_Audio_hyphen_2B/*/modeling_liquid_codec.py"),
+                   key=os.path.getmtime)
+    if not cands:
+        raise SystemExit("no cached modeling_liquid_codec.py")
+    base = os.path.dirname(cands[-1])
+    pkg = "lfm3_remote_codec"
+    if pkg not in sys.modules:
+        spec = importlib.util.spec_from_file_location(pkg, os.path.join(base, "__init__.py"),
+                                                      submodule_search_locations=[base])
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[pkg] = mod
+        spec.loader.exec_module(mod)
+    m = importlib.import_module(pkg + ".modeling_liquid_codec")
     from transformers import AutoConfig
     cc = AutoConfig.from_pretrained(os.path.join(MODEL, "audio_tokenizer"), trust_remote_code=True)
-    codec = LiquidCodecModel.from_pretrained(
+    codec = m.LiquidCodecModel.from_pretrained(
         os.path.join(MODEL, "audio_tokenizer"), config=cc, trust_remote_code=True).eval()
     with torch.no_grad():
         audio = codec.decode(torch.tensor(codes)[None])
