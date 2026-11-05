@@ -727,3 +727,24 @@ THE NANO (same binary, knob only), e.g.:
   inorm, sp_up). "Fewer static instructions" is not a usable proxy on sm_53.
 - Note #270 (scan ftz) passed the same test (-0.27% Nano), so the difference is not ftz
   itself; it is what the inline asm does to sm_53 codegen in these particular kernels.
+
+## THE NANO MAP (#272) - measured ON the Nano by ablation; supersedes dev-profile guesses
+Method (nvprof needs root there - ERR_NVGPUCTRPERM - do not change the device's settings;
+REUSE_KPROF overflows its 512-mark buffer): drop one stage with REUSE_SKIP_<STAGE>=1 on
+the Nano, same binary, CUDA_LAUNCH_BLOCKING=1, fed reference, 8 kHz; tower delta = cost.
+    tower BASE                 9.188 s
+    in_conv (REUSE_SKIP_INPROJ) 3.807 s   41.4%
+    out_proj OP=2 (subtraction) ~3.81 s   ~41%
+    x_proj                      0.782 s    8.5%
+    scan                        0.606 s    6.6%
+    outproj_ln                  0.164 s    1.8%
+    concat / resid             ~0 (noise)
+Dev-host nsys for comparison: in_conv 28.6% | scan 19.6% | out_proj 15.6% | x_proj 6.8%.
+=> On the Nano, in_conv + out_proj = ~83% of the tower. The scan is a SIDE SHOW there.
+=> REOPENED by this map: a 32-accumulator out_proj for Maxwell (8x4 per thread). #63
+   rejected it as "neutral on the dev Maxwell proxy"; #269/#271 proved the proxy cannot
+   predict Nano timing, so that rejection no longer stands. Must be timed ON the Nano.
+   Register budget: OP=3's 64 accumulators fail to LAUNCH on sm_53; OP=2 (16 acc) uses
+   79 regs on sm_53. A 32-acc shape should land ~100-110 regs - check launch on-device.
+=> Also reopened: in_conv on Maxwell. Dev-side in_conv sweeps (#45/#51 accumulator
+   shapes, LBV) were all judged on the dev host. Re-time the best candidates on the Nano.
