@@ -174,6 +174,18 @@ static uint32_t lcg_state;
 static uint32_t lcg_next(void) { lcg_state = lcg_state * 1103515245u + 12345u; return (lcg_state >> 16) & 0x7fffu; }
 
 int main(int argc, char **argv) {
+  if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+    fprintf(stderr, "usage: %s <dir> <prompt_ids.i32> <mode> <out_prefix> [max_slots] [order_dir] [seed]\n", argv[0]);
+    fprintf(stderr, "  <dir>         directory with the lfm3 blobs\n");
+    fprintf(stderr, "  <prompt_ids.i32> int32 token ids (from lfm3_asr/m3prompt or a file)\n");
+    fprintf(stderr, "  <mode>        audio | interleaved | text\n");
+    fprintf(stderr, "  <out_prefix>  output path stem (slots.txt, text.i32, frames.i32, .wav)\n");
+    fprintf(stderr, "  [max_slots]   slot budget (default 150)\n");
+    fprintf(stderr, "  [order_dir]   dir with order.<f>.i32 reveal schedules (default: random)\n");
+    fprintf(stderr, "  [seed]        RNG seed (default 1234)\n");
+    fprintf(stderr, "  env: LFM_SPEAK_RELAUNCH=1  relaunch backbone per slot (A/B control arm)\n");
+    return 0;
+  }
   if (argc < 5) {
     fprintf(stderr, "usage: %s <dir> <prompt_ids.i32> <mode> <out_prefix> [max_slots] [order_dir] [seed]\n", argv[0]);
     return 2;

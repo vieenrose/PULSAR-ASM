@@ -174,6 +174,15 @@ static long man_long(char *man, const char *key) {
 }
 
 int main(int argc, char **argv) {
+  if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+    fprintf(stderr, "usage: %s <dir> <clip.wav> [max_gen] [--out-ids FILE] [--tokens-only]\n", argv[0]);
+    fprintf(stderr, "  <dir>         directory with the lfm3 blobs (backbone, enc, depth, codec, tok, mel)\n");
+    fprintf(stderr, "  <clip.wav>    16 kHz mono WAV input (refused otherwise)\n");
+    fprintf(stderr, "  [max_gen]     generated tokens (default 256)\n");
+    fprintf(stderr, "  --out-ids FILE write generated ids as int32 (feeds lfm3_m3prompt -> lfm3_speak)\n");
+    fprintf(stderr, "  --tokens-only  print IDS_PLAIN instead of the transcript\n");
+    return 0;
+  }
   if (argc < 3) {
     fprintf(stderr, "usage: %s <dir> <clip.wav> [max_gen] [--out-ids FILE] [--tokens-only]\n", argv[0]);
     fprintf(stderr, "  --out-ids FILE  write the generated ids as int32 (feeds lfm3_speak: M3)\n");
