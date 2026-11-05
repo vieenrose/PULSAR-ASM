@@ -300,8 +300,15 @@ NEW closures from this profile:
 1. -Xptxas -dlcm=cg = +8% model, -dlcm=cs = +4%, default (ca) best; --extra-device-vectorization
    does not exist in CUDA 10.2 ptxas. Compile-flag lever CLOSED.
 2. k_resid_freq_a + k_resid_out_a CANNOT be fused: the freq mamba block consumes xf between them.
-   Each is add+relayout at 57% of the bandwidth roof (0.11 ms per 1.33M elements, grid 5184x256,
-   16 regs). CLOSED.
+   CLOSED TWICE OVER (#186 fusion-impossible; #257 both speed levers measured):
+   (a) instruction count is NOT the limit - taking f/t/c from blockIdx/threadIdx cut SASS from
+       ~300 to 54 inst/thread (5.6x) and was EXACTLY FLAT over 4 interleaved pairs (0.3521 vs
+       0.3519 s). The per-element 64-bit index math is fully hidden under memory latency.
+   (b) float4 width: 2 of 3 pairs better, mean -0.31% model, but the scored run read 0.0691 vs a
+       0.0688 band top (opposite sign) => noise, not landed.
+   The old "57% of the bandwidth roof / ~43% headroom" figure was wrong: it normalised against a
+   2-stream (read+write) roof while the kernel moves 3 streams (2 reads + 1 write), i.e. it is
+   already ~85% of a real 3-stream roof. Do not retry this pair.
 3. Encoder dense convs are the largest single launches in the model: k_conv2d_r8p<48,8,4,2,true>
    (dil=8, C_in=384) = 29.5 ms for ONE conv; grid (3,32,8), 128 regs, 13 KB shared, 2 blocks/SM.
    FLOPs analysis: 70 GFlop => 2.4 TFLOPS = 41% of the 5.78 TFLOPS fp32 roof. The R shared tile is
@@ -420,3 +427,50 @@ OP2 epilogue, tile-82 WS, launch fusion) - unscored, build only with Nano A/B.
   indexing, all-NaN padded-stride). Expected net: wash to negative at high risk.
   The fusion won for a reason (#58 era). Do not attempt without a new mechanism
   for the flipped-halo problem.
+
+## WIN #255: weight staging reached the Nano (R8LAUNCH/tile-82) - Nano -7.7%
+- Root cause of a long-standing blind spot: #194 added the WS twin ONLY to R64LAUNCH.
+  Maxwell remaps 644/645/646 -> 82, and tile 82 dispatches through R8LAUNCH - so the
+  Nano's dense convs kept doing 256x-redundant per-thread weight LDGs for the whole
+  time the dev host was benefiting. R8LAUNCH now routes through an R8P helper that
+  picks the WS=true twin via the same `cws` switch (REUSE_WST).
+- Nano (MEASURED, /dev/shm/rp): 8 kHz model 14.0170 -> 12.9292 s (-7.8%;
+  encoder 3.250 -> 2.375 = -26.9%, decoders 1.046 -> 0.829 = -20.7%),
+  RTF_total 2.7581 -> 2.5448 (-7.7%). 16 kHz model 27.1978 -> 25.1555 (-7.5%),
+  RTF_total 5.3692 -> 4.9689. Cumulative RTF_model 44.34 -> 2.5351 = 17.5x.
+- Nano output BIT-IDENTICAL to the dev Maxwell proxy (amp max|d| 0.0).
+- Dev scored primary FLAT (0.0689 vs 0.0683-0.0688) by construction (dev runs 644).
+- GENERAL LESSON: after any optimization, grep ALL dispatch macros for the twin
+  (R8ONE / R9LAUNCH / R64LAUNCH / R8LAUNCH / R8LAUNCH / LAUNCHP / R8P). A win that is
+  wired into one macro silently misses every arch that dispatches through another.
+  This single oversight cost the deployment target ~8% for several sessions.
+- NANO AUDIT TODO: the same "which macro does Maxwell hit" question applies to the
+  stepped kernels - k_conv2d_r8p (pair) got WS in #195 and was FLAT there, and
+  REUSE_DEC_PAIR defaults to 0 on Maxwell so the pair path is dead on-device.
+
+## Process: measurement hygiene (learned the hard way #229/#255)
+Before trusting ANY reading, check BOTH:
+  nvidia-smi --query-compute-apps=pid,used_memory --format=csv   (foreign CUDA work)
+  uptime                                                          (CPU load for the host-side launches)
+A foreign CUDA process (1334 MiB, 96% util) and a CPU load of ~3 each inflated results by
+30-100% and produced two bogus conclusions in a single iteration (a fake -30% dev win and
+a fake +31% tower regression). Signature: bench wall time >55s when the normal is ~50s.
+
+## #256 CLOSED: #189's A-tile transpose does NOT transfer to k_out_proj_r (OP=2 / Nano)
+- Swept the same-class question raised by #255: #189's transpose landed only in
+  k_out_proj_r8c_t (tiled==3), and Maxwell forces tiled=2 -> k_out_proj_r, so the
+  Nano's out_proj never got it. Built k_out_proj_r_t (AsT[KC][MT+4], 272 B rows
+  so every k-row is 16 B aligned; staging stays element-wise so it costs ZERO
+  extra stores, unlike r8c which traded an STS.128 for 4 scalar STS).
+- Result: FLAT. 3 interleaved pairs on the OP=2 path split 0-1-1, mean -0.06%
+  (0.3867/0.3868/0.3851 off vs 0.3871/0.3863/0.3845 on), SASS byte-identical
+  (64 LDS.U.128, 531 FFMA, 14 STS both). Bit-compatible (8.9e-08).
+- WHY it differs from #189: r8c's a-group is 8 rows at an 80 B row stride; this
+  one is 4 rows at 144 B. #189's win was an access-pattern/transaction effect on
+  that specific group, not a general property of transposing A tiles. With only
+  4 accumulators the per-k group is small enough that the pattern cost is gone.
+- Transferable rule: an A-tile transpose is worth testing only when the group it
+  makes contiguous is >= 8 elements wide. Do not auto-port #189 to other kernels.
+- Dispatch audit (also from #255's lesson) now COMPLETE for convs: R64LAUNCH and
+  R8LAUNCH both select the WS twin, R8ONE has no call site, R9LAUNCH (tile 92) is
+  env-only and remapped to 82 on Maxwell. No further missed twins.
