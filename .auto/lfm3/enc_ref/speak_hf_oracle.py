@@ -35,8 +35,14 @@ MODEL = os.environ.get("SPEAK_MODEL", "/home/louis/models/lfm3/LFM3-Audio-2B")
 FIXTURE = int(os.environ.get("SPEAK_PROMPT", "0"))
 MAXSLOTS = int(os.environ.get("SPEAK_FRAMES", "40"))
 MODE = os.environ.get("SPEAK_MODE", "audio")
+# BACKBONE_Q8=<main blob> + DEPTH_Q8=<depth blob>: evaluate HF on the SAME dequantised Q8
+# weights the engine ships (HF-as-contract, the rule the S4 depth gate already follows).
+# The fp32 oracle measures the quantization error; the Q8 oracle is the gate reference.
+BACKBONE_Q8 = os.environ.get("BACKBONE_Q8")
+SPEAK_Q8 = os.environ.get("DEPTH_Q8")   # the depth blob also holds the bf16 codebook table
 OUT = os.environ.get("SPEAK_OUT", os.path.join(
-    HERE, "speech", "speak_gate" if FIXTURE == 0 else "speak_gate/p%d" % FIXTURE))
+    HERE, "speech",
+    ("speak_gate_q8" if BACKBONE_Q8 else "speak_gate") + ("" if FIXTURE == 0 else "/p%d" % FIXTURE)))
 
 # The chat template ends the generation prompt with "<|im_start|>assistant\n"; HF's generate
 # appends <|audio_start|> itself when generation_mode="audio", so it must NOT be in the text.
@@ -64,6 +70,85 @@ def wi32(path, a):
     np.ascontiguousarray(np.asarray(a, dtype=np.int32)).tofile(path)
 
 
+def load_q8_dq(path):
+    """Dequantise the dtype-1 tensors exactly as lfm3_depth.cu / the backbone do:
+    float(code) * scale per 32-wide block, fp32."""
+    import struct
+    out = {}
+    with open(path, "rb") as f:
+        assert f.read(8) == b"LFM3Q8\x01\x00", "bad magic"
+        n = struct.unpack("<I", f.read(4))[0]
+        hdr = json.loads(f.read(n))
+        base = 12 + n
+        for e in hdr["table"]:
+            if e["dtype"] != 1:
+                continue
+            f.seek(base + e["off"])
+            codes = np.frombuffer(f.read(e["ncodes"]), dtype=np.int8).reshape(e["ne"])
+            scales = np.frombuffer(f.read(e["nscales"]), dtype=np.float32).reshape(e["ne"][0], -1)
+            out[e["name"]] = (codes.astype(np.float32) *
+                              np.repeat(scales, codes.shape[1] // scales.shape[1], axis=1))
+    return out
+
+
+def load_bf16_table(path, name):
+    """A dtype-3 (bf16) tensor from the depth blob, widened to fp32 -- the engine reads the
+    codebook table at bf16, so the Q8 oracle must feed the backbone the same values."""
+    import struct
+    with open(path, "rb") as f:
+        assert f.read(8) == b"LFM3Q8\x01\x00", "bad magic"
+        n = struct.unpack("<I", f.read(4))[0]
+        hdr = json.loads(f.read(n))
+        base = 12 + n
+        for e in hdr["table"]:
+            if e["name"] != name:
+                continue
+            assert e["dtype"] == 3, (name, e["dtype"])
+            f.seek(base + e["off"])
+            u = np.frombuffer(f.read(e["ncodes"]), dtype=np.uint16).astype(np.uint32)
+            return (u << 16).view(np.float32).reshape(e["ne"])
+    raise KeyError(name)
+
+
+def _set(mod, dotted, tensor):
+    """Copy into the leaf the blob names with '.weight' appended. The leaf may be an
+    nn.Linear/nn.Embedding (has .weight) or -- for embed_tokens in some HF layouts -- a
+    bare nn.Parameter, so resolve both instead of assuming .weight."""
+    import functools
+    import torch.nn as nn
+    parts = dotted.split(".")
+    assert parts[-1] == "weight", dotted
+    # reduce over parts[:-1] already lands ON the holder (off-by-one first attempt looked
+    # for parts[-2] again on it: "leaf 'embed_tokens' missing on Embedding", 154/154 names)
+    holder = functools.reduce(getattr, parts[:-1], mod)
+    target = holder.weight if isinstance(holder, (nn.Linear, nn.Embedding)) else holder
+    if not isinstance(target, nn.Parameter):
+        raise AttributeError("%s resolved to %r; expected Linear/Embedding or Parameter"
+                             % (dotted, type(holder)))
+    assert target.shape == torch.Size(tensor.shape), (dotted, tuple(target.shape), tensor.shape)
+    with torch.no_grad():
+        target.copy_(torch.from_numpy(np.ascontiguousarray(tensor)))
+
+
+def apply_q8_backbone(model, q8):
+    """Blob names are HF names with the `lfm.model.` prefix (weight-rename rule
+    ^lfm\.model\. -> model.language_model\.). Every dtype-1 tensor is a Linear/Embedding
+    weight; copy the dequant in, and fail loudly on any name that does not resolve."""
+    lm = model.model.language_model
+    n = 0
+    for name, w in q8.items():
+        if not name.startswith("lfm.model."):
+            raise KeyError("unexpected Q8 tensor %r (only lfm.model.* is mapped)" % name)
+        _set(lm, name[len("lfm.model."):], w)
+        n += 1
+    if SPEAK_Q8:
+        cb = load_bf16_table(SPEAK_Q8, "codebook_embedding.weight")
+        with torch.no_grad():
+            model.model.codebook_embedding.weight.copy_(torch.from_numpy(np.ascontiguousarray(cb)))
+        print("codebook_embedding <- bf16 table of", SPEAK_Q8, flush=True)
+    print("backbone: %d weights replaced by Q8 dequant" % n, flush=True)
+
+
 def load_model():
     try:
         from transformers import AutoModelForMultimodalLM as Loader
@@ -72,6 +157,9 @@ def load_model():
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     model = Loader.from_pretrained(MODEL, dtype=torch.float32, trust_remote_code=True).eval()
+    if BACKBONE_Q8:
+        apply_q8_backbone(model, load_q8_dq(BACKBONE_Q8))
+        print("backbone weights replaced by the Q8 dequant of", BACKBONE_Q8, flush=True)
     return tok, model
 
 
@@ -218,6 +306,8 @@ def main():
 
     meta = {
         "fixture": FIXTURE, "mode": MODE, "max_new_tokens": MAXSLOTS,
+        "reference": ("hf-on-q8-weights" if BACKBONE_Q8 else "hf-on-fp32-weights"),
+        "backbone_q8": BACKBONE_Q8, "depth_q8": SPEAK_Q8,
         "prompt_text": PROMPT_TEXT, "prompt_ids": ids_list, "n_prompt": len(ids_list),
         "audio_start_token_id": int(cf("audio_start_token_id")),
         "mixed_start_token_id": int(cf("mixed_start_token_id")),

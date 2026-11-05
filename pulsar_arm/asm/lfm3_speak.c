@@ -31,6 +31,9 @@
  *     frame-embedding file that the NEXT backbone launch consumes at the audio_out
  *     placeholder (the --speak-emb path gate_speak.py certifies).
  * Every stage is the gated binary, run by execv; outputs are size-checked before use.
+ * After the last slot: the non-EOS frames go through lfm3_codec (24 kHz f32) and
+ * lfm3_wavout (RIFF/WAVE), so <out_prefix>.wav is the deliverable. Trailing all-EOS
+ * frames carry no audio and HF's decode rejects codes >= 2016, so they are dropped.
  * Cost: one nanode launch per slot (full prefix prefill each time -- the blob stays
  * in page cache after the first launch, so relaunches cost seconds, not the load).
  * A resident backbone (one process, KV kept) is the S7 optimization; this shell proves
@@ -332,6 +335,49 @@ int main(int argc, char **argv) {
   printf("SPEAK DONE slots=%d text=%d audio=%d eos=%d\n", ntext + nframes, ntext, nframes, eos_seen);
   printf("records: %s.{slots.txt,text.i32,frames.i32}\n", outp);
   fflush(stdout);
+
+  /* ---- audio: codes -> codec (24 kHz f32) -> WAV ---------------------------------- */
+  int n_audio_frames = nframes;
+  while (n_audio_frames > 0) {
+    int all_eos = 1;
+    for (int c = 0; c < NCB; c++)
+      if (frames[(n_audio_frames - 1) * NCB + c] != AUDIO_EOS) { all_eos = 0; break; }
+    if (!all_eos) break;
+    n_audio_frames--;
+  }
+  if (n_audio_frames > 0) {
+    stage("codec decode -> 24 kHz");
+    char cf[1100], af[1100];
+    snprintf(cf, sizeof cf, "%s.codes_audio.i32", TMPD);
+    FILE *cd = fopen(cf, "wb");
+    if (!cd) die("cannot write %s", cf);
+    if (fwrite(frames, 4, (size_t)n_audio_frames * NCB, cd) != (size_t)n_audio_frames * NCB)
+      die("cannot write %s", cf);
+    fclose(cd);
+    snprintf(af, sizeof af, "%s.audio24.f32", TMPD);
+    char nf2[32]; snprintf(nf2, sizeof nf2, "%d", n_audio_frames);
+    char *avc[] = { (char*)"lfm3_codec", CB, cf, nf2, af, NULL };
+    run_cap(avc, nanolog);
+    need_file(af, (long)n_audio_frames * 1920 * 4, "codec decode");
+    /* the codec emits frame_samples=1920 per frame at 24 kHz; a short file means a
+       partial decode, which would play as a truncated clip rather than an error */
+    { long got = file_size(af);
+      long want = (long)n_audio_frames * 1920 * 4;
+      if (got != want) die("codec wrote %ld bytes, expected %ld (%d frames x 1920 x 4)",
+                           got, want, n_audio_frames); }
+    stage("WAV 24 kHz");
+    char wv[1200], rt[32];
+    snprintf(wv, sizeof wv, "%s.wav", outp);
+    snprintf(rt, sizeof rt, "24000");
+    char *avw[] = { (char*)"lfm3_wavout", af, wv, rt, NULL };
+    run_cap(avw, nanolog);
+    need_file(wv, 44 + 100, "wav writer");
+    printf("AUDIO %s.wav from %d frames (%.2f s at 24 kHz, %d EOS frame(s) dropped)\n",
+           outp, n_audio_frames, n_audio_frames * 1920.0 / 24000.0, nframes - n_audio_frames);
+    fflush(stdout);
+  } else {
+    printf("AUDIO: no non-EOS frames -- no WAV written\n");
+  }
   free(toks); free(frames); free(texts);
   return 0;
 }
