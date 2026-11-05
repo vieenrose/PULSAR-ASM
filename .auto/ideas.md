@@ -399,10 +399,11 @@ Scored levers: EXHAUSTED (see closures above). Remaining: Nano-only backlog (fus
 OP2 epilogue, tile-82 WS, launch fusion) - unscored, build only with Nano A/B.
 
 ## Nano-only backlog, continued (unscored - see policy above)
-4. REUSE_CONV_CHUNK sweep on Nano (default 64): chunks C_out per conv launch for
-   the watchdog. 128 halves the conv launch count under CUDA_LAUNCH_BLOCKING at
-   identical work Grids get bigger (better occupancy on 1 SM?) or smaller-count...
-   measure on-device, never on dev (dev is launch-hidden: expect flat).
+4. REUSE_CONV_CHUNK sweep: CLOSED as no-op both places (#208: dev 64 0.3454/0.3472
+   vs 128 0.3462/0.3467 flat vs 32 0.3515/0.3516 +1.6%). All model convs have
+   C_out <= HID = 64 = one chunk at the default, so 128 changes nothing (same
+   single iteration, including on Nano - no fewer launches there either); 32
+   splits into 2 launches and loses. Default 64 confirmed. Do not retry.
 5. Profiling calibration note (#201): nsys 2021.1 absolute kernel durations read
    ~2x below wall-implied values on this stack (GTX 1070, CUDA 10.2) - the #186
    profile matches 16 kHz rate-scaling, mine matches 8 kHz halves; gap fractions
