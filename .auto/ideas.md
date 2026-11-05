@@ -681,5 +681,7 @@ Spill table for k_in_conv_r (useful when touching this kernel):
 (e.g. MT=96 -> 19,584 B) would allow 3 blocks/SM = 24 warps (+50%).
 CAUTION: #68's shape data argues the opposite - MT=64 (4 blocks possible) was 0.7% WORSE
 and MT=192 (1 block) also worse, so MT=128 looks like a local optimum where the extra
-blocks are paid for with extra W-tile re-reads. Untried: KT (hardcoded 32) - KT=16 would
-give As[128][20]+Bs[40][20] = 13,440 B (4 blocks) at 2x the chunk count.
+blocks are paid for with extra W-tile re-reads. KT TRIED #268: KT=16 -> 13,440 B, 3 blocks/SM
+(ptxas-verified) but +1.2% SLOWER (3/3 pairs, bit-compatible): 2x chunks/barriers cost more
+than +50% warps, because 20 accumulators/thread already hide latency. x_proj shape space
+(MT, NT, TX, KT) is now EXHAUSTED - do not re-sweep.
