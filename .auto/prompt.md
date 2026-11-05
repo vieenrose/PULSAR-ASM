@@ -33,6 +33,9 @@ this loop optimizes the runtime, not the numerics.
 
 ## Constraints
 - Board: picard@100.84.151.116 (Nano Gen1, sm_53, CUDA 10.2). No root clocks.
+- ipho-nano (pesi@100.70.245.36) is RESERVED for other users. Never ssh to it,
+  build on it, or run anything on it from this loop.
+- Never load the whole 1.95 GB blob into RAM: it took picard offline for >10 min (run 281).
 - Stale-binary discipline: build to /tmp, require RC=0 && test -s before mv.
 - No Python/HF/llama.cpp at runtime.
 - Build flags: nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca

@@ -30,6 +30,8 @@ The `bq1_*` and `pq2_*` files are earlier Nano paths (sign-projected binary, exa
 
 ## Commands (Nano objective)
 
+**Board reservation (2026-11-06): `ipho-nano` (`pesi@100.70.245.36`) is reserved for other users. Do not ssh to it, build on it, or run anything on it without explicit permission from the user. LFM3 work runs on `picard@100.84.151.116` only.**
+
 Everything builds and runs **on the Nano** over ssh (`pesi@100.70.245.36`, engine dir `/home/pesi/exp`, model `/home/pesi/b8q1.gguf`). The scripts scp the seven `pq1_*`/`fwd8.c` sources, build with `nvcc` (CUDA 10.2, `-gencode arch=compute_53,code=sm_53 -O3 -maxrregcount=48 --use_fast_math -Xptxas -O3,-dlcm=ca`) and `gcc -O2 -fopenmp -mcpu=cortex-a57`, then run. Links need `-fopenmp`.
 
 ```bash
