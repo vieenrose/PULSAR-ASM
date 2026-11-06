@@ -4541,7 +4541,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
             static int scanr = -1;
             // Maxwell (Nano) default LB3: -0.36% model in 3/3 on-device pairs, bit-identical;
             // LB2 vs LB3 tie on the dev host (#260), so the Pascal default stays 2.
-            if (scanr < 0) scanr = getenv("REUSE_SCANR") ? atoi(getenv("REUSE_SCANR")) : (gpu_is_maxwell() ? 1 : 2);
+            if (scanr < 0) scanr = getenv("REUSE_SCANR") ? atoi(getenv("REUSE_SCANR")) : (gpu_is_maxwell() ? 2 : 2);
             dim3 sg((unsigned)((S+7)/8), DINNER/32);
             if (ts == 2 && scanf_ && scanr == 3)   k_scan_dts<true, true, 1><<<sg, 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
             else if (ts == 2 && scanf_ && scanr == 1)   k_scan_dts<true, true, 3><<<sg, 256, 0, st>>>(xc, W_dt, B_dt, A_log, Dv, xdbl, y, S, L, rev);
