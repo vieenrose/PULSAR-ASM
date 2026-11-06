@@ -688,7 +688,12 @@ __global__ void __launch_bounds__(256, LBMIN) k_in_conv_r(const float *x, const 
     for (int a4 = 0; a4 < RA; a4++) {
         long m = m0 + tx*RA + a4;
         if (m >= SL) continue;
-        const int t = (int)(m % L);
+        // m is in [0, SL) and SL = S*L < 2^31: the 32-bit remainder gives the same
+        // t, and sm_53 has no integer divide unit, so the 64-bit form is a
+        // subroutine call per row (Nano -0.6% model). The loader's m / L above
+        // stays 64-bit: narrowing it too cut 18% of SASS but added a 16 B
+        // spill and measured +1.1% on the Nano.
+        const int t = (int)m % L;
         const int ntap = (t >= DCONV-1) ? DCONV : t + 1;
         float fv[4];
 #pragma unroll
