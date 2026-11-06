@@ -25,9 +25,11 @@ See [doc/NEMOTRON_REUSE_NANO_PLAN.md](../../doc/NEMOTRON_REUSE_NANO_PLAN.md) for
 - [x] S8: out_proj tiled+fused gate -> tower 47.5 s -> 8.6 s on the dev host;
       GPU iSTFT (123x); autoresearch session (~270 kept experiments)
 - [x] Dev host real time: RTF_total 0.0656 at 8 kHz (~15x faster than real time)
-- [ ] Nano real time (RTF < 1) NOT yet achieved: RTF_total 2.23 at 8 kHz,
-      4.38 at 16 kHz (was 44.36 / 92.9 at the first on-device run; 19.9x)
+- [ ] Nano real time (RTF < 1) NOT achieved: RTF_total 1.91 at 8 kHz,
+      3.77 at 16 kHz (was 44.36 / 92.9 at the first on-device run; 23.2x)
 - [x] Nano profiling via an audited nvprof spool server (see Profiling)
+- [x] Final verdict for live IP-PBX / VoIP use: **not viable on a Jetson Nano**
+      with this model (see [Conclusion: IP-PBX / live VoIP](#conclusion-ip-pbx--live-voip))
 
 ## Accuracy Gates
 Unlike other PULSAR-ASM ports, bit-exactness vs PyTorch is not required (exp/atan2/log1p). Gates:
@@ -123,29 +125,45 @@ Worked example, dev host at commit `645df5f`:
 - STFT and iSTFT add about 0.004 s, so `RTF_total` = 0.0656.
 - 1 / 0.0656 = **15.2x faster than real time**.
 
-Nano at commit `645df5f`, 8 kHz:
+Nano at commit `0fa348c`, 8 kHz:
 
-- Model: 11.34 s for 5.1 s of audio, so `RTF_model` = 2.22.
-- `RTF_total` = 11.39 / 5.1 = **2.23**, which is 2.2x **slower** than real time.
-- To reach real time (RTF 1.0) the Nano needs another 2.23x speedup.
+- Model: 9.72 s for 5.1 s of audio, so `RTF_model` = 1.905.
+- `RTF_total` = 9.76 / 5.1 = **1.91**, which is 1.9x **slower** than real time.
+- To reach real time (RTF 1.0) the Nano needs another 1.91x speedup.
 
 Taking the first on-device measurement as the baseline (`RTF_total` 44.36 at 8 kHz),
-the Nano's speedup so far is 44.36 / 2.23 = **19.9x**.
+the Nano's speedup so far is 44.36 / 1.91 = **23.2x**.
 
 The 16 kHz fixture has the same duration but twice the samples, so it costs
-roughly twice as much (Nano `RTF_total` 4.38, about 4.4x slower than real time).
+roughly twice as much (Nano `RTF_total` 3.77, about 3.8x slower than real time).
 
 ### Jetson Nano (tegra210, 1 SM, CUDA 10.2, `sm_53`, `CUDA_LAUNCH_BLOCKING=1`)
 
-Current code (commit `645df5f`), 8 kHz fixture, 5.100 s audio:
+Current code (commit `0fa348c`), 5.100 s audio, `./run_bench.sh` protocol:
 
-| | model | **RTF_model** | iSTFT | **RTF_total** |
-|---|---|---|---|---|
-| 8 kHz | 11.34 s | **2.22** | 0.05 s | **2.23** |
-| 16 kHz | 22.2 s | 4.35 | 0.19 s | **4.38** |
+| | model | **RTF_model** | **RTF_total** |
+|---|---|---|---|
+| 8 kHz | 9.72 s | **1.905** | **1.91** |
+| 16 kHz | 19.0 s | 3.73 | **3.77** |
 
-8 kHz phase breakdown: encoder 2.38 s, 30x TFMamba 8.12 s, decoders 0.83 s,
-heads 0.01 s. Still **~2.2x slower than real time**; the tower is ~72% of the model.
+8 kHz phase breakdown: encoder 1.67 s, 30x TFMamba 7.37 s, decoders 0.66 s,
+heads 0.01 s. Still **~1.9x slower than real time**; the tower is ~76% of the model.
+Nano output is bit-identical to the dev-host Maxwell proxy (amp max|d| 0.0) and
+passes the accuracy gates at both rates.
+
+The last stretch was scored **on the Nano itself** (`rtf_nano8k`, 2.258 -> 1.915,
+-15.2%), because dev-host timing proved unable to predict it. What paid there:
+
+| change | Nano effect |
+|---|---|
+| conv launch bound for the 32-acc shapes (2 -> 3 -> 4 blocks/SM) | encoder -21%, -5% |
+| in_conv k-chunk 32 -> 16 (removes a 16 B spill) | model -2.5% |
+| out_proj (`k_out_proj_r84`) and x_proj launch bounds / KT=16 | model -2.0%, -1.9%, -0.3% |
+| dense conv double buffer by input-channel parity (one barrier, not two) | encoder -6.5%, decoders -3.5% |
+| 32-bit `m % L` in the in_conv epilogue (sm_53 has no integer divide) | model -0.6% |
+
+Rule of thumb on the single Maxwell SM: an extra block/SM is usually worth a small
+(< ~30 B) register spill, not a large one (~150 B).
 
 History on the same device: the first on-device run measured RTF_model 44.34
 (8 kHz) / 88.86 (16 kHz), before the dev-host optimizations were ported. The
@@ -169,6 +187,10 @@ clips at 0.0674 / 0.0991 / 0.1327 (8 / 12 / 16 kHz).
   lands.
 - The dev-host Maxwell proxy (`REUSE_FORCE_MAXWELL_TILES=1`) is bit-exact with the
   Nano for correctness, but not for speed.
+- The reverse also happens: ideas rejected as flat on the dev host can win on the
+  Nano (the conv double buffer was flat on the GTX 1070, -6.5% encoder on the Nano).
+- Closed on the device: `-Xptxas -dlcm=ca` (+3.7%; the sm_53 default is already
+  L2-only), a 64-row in_conv tile (+25%), launch bound 2 for out_proj (+2.6%).
 
 ## Profiling
 
@@ -285,21 +307,55 @@ the checkpoint exactly**. A shim that nests them (e.g. under `.mixer.`) makes
 every downstream number is meaningless. Verify with
 `load_state_dict(..., strict=False)` reporting **0 missing / 0 unexpected**.
 
+## Conclusion: IP-PBX / live VoIP
+
+Question asked at the end of the work: can this model run on a Jetson-Nano-based
+IP-PBX and enhance every VoIP call in real time? **No, not realistically.**
+
+1. **Throughput.** One audio stream needs RTF <= 1; the Nano is at 1.91 (8 kHz).
+   A PBX enhancing both legs of N calls needs about RTF <= 1/(2N):
+
+   | load | streams | RTF needed | gap from 1.91 |
+   |---|---|---|---|
+   | 1 call | 2 | 0.5 | ~4x |
+   | 10 calls | 20 | 0.05 | ~40x |
+
+   Under this port's rules (fp32, PyTorch-matched to rel-rms 1e-4, no cuBLAS/cuDNN)
+   the remaining levers are worth a few percent each. fp16 (Maxwell has 2x-rate
+   fp16), TensorRT, pruning/distillation or a coarser frequency grid could plausibly
+   reach about one call, not a PBX's worth.
+2. **Latency / causality.** RE-USE scans time in both directions and processes the
+   whole utterance, so each output frame depends on future audio. A call needs each
+   10-20 ms packet back within tens of ms. Live use would need chunked processing
+   with look-ahead (latency plus a quality change) or a retrained causal model.
+3. **PBX side.** Enhancement forces RTP decode/re-encode of every call (no direct
+   media, extra CPU on the Nano's 4 ARM cores), and it only removes noise and
+   reverberation. It does not fix packet loss, jitter or echo, which are often the
+   real VoIP quality problems. (The 8 kHz path fits G.711 narrowband, which helps.)
+
+**What is realistic:**
+- **Live calls:** a streaming-native enhancer such as RNNoise (very light, CPU, many
+  streams per core) or DeepFilterNet (causal, low latency, higher quality). Measure
+  streams per device on the target hardware before committing.
+- **RE-USE on the Nano:** offline / near-line jobs where delay is acceptable, such as
+  cleaning call recordings, voicemail, or audio before speech-to-text. At RTF 1.91 a
+  Nano processes about 31 minutes of 8 kHz audio per hour.
+- **RE-USE live** would take a causal or distilled model, fp16/TensorRT and an
+  Orin-class Jetson, then a measured streams-per-device figure.
+
 ## Next steps
-Ordered by expected RTF impact on the Nano (currently RTF_total 2.23 at 8 kHz):
-1. **`in_conv`** (`k_in_conv_r`, 34% of the Nano model, ~32 ms per launch, 120
-   launches per forward). The fused in_proj + causal conv GEMM is the largest cost.
-2. **The rest of the tower** (~72% of the Nano model in total): the scan (15%),
-   out_proj (11%) and x_proj (7%). Launch overhead is NOT a lever: kernels are
-   ~99% of the wall time.
-3. **Dense convolutions:** the dilation-8 layer is the single largest launch
-   (~378 ms per call, ~10% of GPU time). Tile 82 is confirmed best on the device.
-4. **STFT front-end** is still on the CPU (0.44 s on the Nano earlier; a DD-GPU
-   STFT exists on the dev host and needs on-device timing).
-5. fp16/half2 weight storage (38.6 MB -> 19 MB), gated at SNR >= 30 dB plus a
-   perceptual delta <= 0.02.
-6. 44.1 / 48 kHz: gates not run; cost scales with the sample rate.
-7. Chunked/streaming mode for true streaming RTF (plan S6, not started).
+Only relevant if offline Nano throughput matters (currently RTF_total 1.91 at 8 kHz):
+1. **`in_conv`** (`k_in_conv_r`, ~34% of the Nano GPU time). Closed on the device:
+   tile height (64 and 128 rows lose to 80), loader index math (latency-hidden),
+   launch bound 4 (spills). A double buffer at KC=8 recovers 4% over KC=8 but is
+   still ~0.9% behind KC=16; KC=16 with a double buffer (2 blocks/SM) is untested.
+2. **The rest of the tower:** the scan (~15%), out_proj (~11%) and x_proj (~7%).
+   Launch overhead is NOT a lever: kernels are ~99% of the wall time.
+3. fp16/half2 compute and storage. This is the largest remaining lever on Maxwell,
+   but it needs an explicit accuracy decision (the fp32 gates would not hold as is).
+4. 44.1 / 48 kHz: gates not run; cost scales with the sample rate.
+5. Chunked/streaming mode for true streaming RTF (plan S6, not started); see the
+   IP-PBX conclusion for why it matters.
 
 Open decisions and the full experiment log live in `.auto/ideas.md` and
 `.auto/log.jsonl` at the repository root.
