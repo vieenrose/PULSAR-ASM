@@ -279,6 +279,58 @@ static void chk_final(const char* what) {
 // LayerNorm weights -- the same dtype table as Liquid's mmproj GGUF, cross-checked in
 // plan section 13a), so the Q8 arms cannot serve them. 16x16-tiled SGEMM: one output
 // per thread, k ascending in one accumulator, which is the C reference's order.
+// k_sgemm8: 128x128 output tile, 256 threads, 8x8 outputs per thread (rows ty*4+i and
+// 64+ty*4+i, cols tx*4+j and 64+tx*4+j: float4 shared reads, conflict-free). Each output
+// still accumulates k ascending in ONE register with fmaf, exactly as k_sgemm_f32: the
+// same values. Needs K % 16 == 0.
+__global__ void __launch_bounds__(256) k_sgemm8(const float* __restrict__ x, const float* __restrict__ w,
+                                                float* __restrict__ y, int T, int N, int K) {
+  const int t0 = blockIdx.y * 128, n0 = blockIdx.x * 128;
+  __shared__ __align__(16) float sx[16][132];        // [k][t]
+  __shared__ __align__(16) float sw[16][132];        // [k][n]
+  const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4, tid = threadIdx.x;
+  float acc[8][8];
+  #pragma unroll
+  for (int i = 0; i < 8; i++)
+    #pragma unroll
+    for (int j = 0; j < 8; j++) acc[i][j] = 0.f;
+  for (int k0 = 0; k0 < K; k0 += 16) {
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int idx = tid + i * 256;                   // 2048 = 128 rows x 16 k
+      const int r = idx >> 4, c = idx & 15;
+      const int t = t0 + r, n = n0 + r;
+      sx[c][r] = (t < T) ? x[(size_t)t * K + k0 + c] : 0.f;
+      sw[c][r] = (n < N) ? w[(size_t)n * K + k0 + c] : 0.f;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 16; k++) {
+      const float4 xa = *reinterpret_cast<const float4*>(&sx[k][ty * 4]);
+      const float4 xb = *reinterpret_cast<const float4*>(&sx[k][64 + ty * 4]);
+      const float4 wa = *reinterpret_cast<const float4*>(&sw[k][tx * 4]);
+      const float4 wb = *reinterpret_cast<const float4*>(&sw[k][64 + tx * 4]);
+      const float xv[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
+      const float wv[8] = { wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w };
+      #pragma unroll
+      for (int i = 0; i < 8; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc[i][j] = __fmaf_rn(xv[i], wv[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const int t = t0 + (i < 4 ? ty * 4 + i : 64 + ty * 4 + i - 4);
+    if (t >= T) continue;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const int n = n0 + (j < 4 ? tx * 4 + j : 64 + tx * 4 + j - 4);
+      if (n < N) y[(size_t)t * N + n] = acc[i][j];
+    }
+  }
+}
+
 __global__ void k_sgemm_f32(const float* __restrict__ x, const float* __restrict__ w,
                             float* __restrict__ y, int T, int N, int K) {
   // 64x64 output tile, 256 threads, 4x4 outputs per thread. Each output accumulates
@@ -574,8 +626,13 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
 static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
   const int TPB = 256;
   if (g.wf) {                                        // f32-weight path (no half2 arm)
+    static const int sg8 = getenv("LFM_ENC_SG8") ? atoi(getenv("LFM_ENC_SG8")) : 1;
+    if (sg8 && g.K % 16 == 0) {
+      k_sgemm8<<<dim3((g.N + 127) / 128, (T + 127) / 128), 256>>>(x, g.wf, y, T, g.N, g.K);
+    } else {
     const dim3 grid((g.N + 63) / 64, (T + 63) / 64), block(16, 16);
     k_sgemm_f32<<<grid, block>>>(x, g.wf, y, T, g.N, g.K);
+    }
     return;
   }
   if (g_ench2 && xb) {
