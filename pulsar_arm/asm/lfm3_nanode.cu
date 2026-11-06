@@ -63,6 +63,7 @@
 #include <map>
 #include <time.h>
 #include <zlib.h>
+#include <pthread.h>
 #include <cuda_fp16.h>
 
 #define Q8_BLK 32
@@ -842,6 +843,58 @@ struct Model {
   int* tok_dev;
 };
 
+// ---- pipelined blob reader (one producer thread, ring of 16 MB slots)
+struct LoadRing {
+  int fd = -1; size_t base = 0; std::vector<Ent>* ents = nullptr; const std::vector<size_t>* order = nullptr;
+  static const int NS = 4; static const size_t CH = (size_t)16 << 20;
+  char* buf[NS] = {}; size_t len[NS] = {}; int state[NS] = {};    // 0 free, 1 full, 2 eof/error
+  int head = 0, tail = 0; bool stop = false;
+  pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+};
+static void* load_reader(void* arg) {
+  LoadRing& R = *(LoadRing*)arg;
+  for (int k = 0; k < LoadRing::NS; k++) R.buf[k] = (char*)malloc(LoadRing::CH);
+  for (size_t oi = 0; oi < R.order->size(); oi++) {
+    const Ent& e = (*R.ents)[(*R.order)[oi]];
+    const size_t tot = e.nc + e.ns; const off_t off0 = (off_t)(R.base + e.file_off);
+    for (size_t done = 0; done < tot; ) {
+      const size_t n = tot - done < LoadRing::CH ? tot - done : LoadRing::CH;
+      pthread_mutex_lock(&R.mu);
+      while (R.state[R.head] != 0 && !R.stop) pthread_cond_wait(&R.cv, &R.mu);
+      const bool st = R.stop; const int k = R.head;
+      pthread_mutex_unlock(&R.mu);
+      if (st) return nullptr;
+      size_t got = 0;
+      while (got < n) { const ssize_t r = pread(R.fd, R.buf[k] + got, n - got, off0 + (off_t)(done + got));
+        if (r <= 0) break; got += (size_t)r; }
+      // DONTNEED after each read drops those pages (no root needed) -- see the
+      // comment at the up-front fadvise for why cache residency hurts here.
+      posix_fadvise(R.fd, off0 + (off_t)done, (off_t)got, POSIX_FADV_DONTNEED);
+      pthread_mutex_lock(&R.mu);
+      R.len[k] = got; R.state[k] = got == n ? 1 : 2; R.head = (k + 1) % LoadRing::NS;
+      pthread_cond_broadcast(&R.cv); pthread_mutex_unlock(&R.mu);
+      if (got != n) return nullptr;
+      done += n;
+    }
+  }
+  return nullptr;
+}
+static char* load_take(LoadRing& R, int& slot, size_t& len) {
+  pthread_mutex_lock(&R.mu);
+  while (R.state[R.tail] == 0) pthread_cond_wait(&R.cv, &R.mu);
+  slot = R.tail; const int st = R.state[slot]; len = R.len[slot];
+  pthread_mutex_unlock(&R.mu);
+  return st == 1 ? R.buf[slot] : nullptr;
+}
+static void load_give(LoadRing& R, int slot) {
+  pthread_mutex_lock(&R.mu);
+  R.state[slot] = 0; R.tail = (slot + 1) % LoadRing::NS;
+  pthread_cond_broadcast(&R.cv); pthread_mutex_unlock(&R.mu);
+}
+static void load_stop(LoadRing& R) {
+  pthread_mutex_lock(&R.mu); R.stop = true; pthread_cond_broadcast(&R.cv); pthread_mutex_unlock(&R.mu);
+}
+
 static bool load_blob(const char* path, Model& M, std::string& js) {
   FILE* f = fopen(path, "rb");
   if (!f) { printf("cannot open %s\n", path); return false; }
@@ -1012,78 +1065,76 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   if (cudaMalloc(&M.df, M.need_f) != cudaSuccess) {
     printf("f32 arena cudaMalloc(%.1f MB) failed\n", M.need_f / 1e6); fclose(f); return false;
   }
-  std::vector<char> buf;
   size_t oc = 0, os = 0, of = 0;
   // f32 payloads first. At the memory gate boundary the LAST cudaMemcpy is
   // the one that starves, and in the first builds that was a norm vector 16 MB
   // into a 1.6 MB arena -- the failure then looked like a blob/CRC problem
   // while it was really an out-of-memory one. Uploading the small tensors
   // first makes starvation happen while there is still room to say so.
+  std::vector<size_t> order;
   for (int pass = 0; pass < 2; pass++)
-  for (size_t i = 0; i < M.ents.size(); i++) {
+    for (size_t i = 0; i < M.ents.size(); i++)
+      if ((M.ents[i].dtype == 2) == (pass == 0)) order.push_back(i);
+  // Pipelined read: a reader thread preads 16 MB chunks into a 4-slot ring while
+  // this thread runs the incremental crc32 and the H2D copy of the previous chunk.
+  // The serial read -> crc -> copy loop left the eMMC idle during crc + copy:
+  // 34.9 s load against a 21.3 s cold dd of the same file. Bytes, order of the
+  // uploads and the per-tensor CRC assertion are unchanged.
+  LoadRing R; R.fd = bfd; R.base = base_data; R.ents = &M.ents; R.order = &order;
+  pthread_t rth; pthread_create(&rth, nullptr, load_reader, &R);
+  bool ok = true;
+  for (size_t oi = 0; oi < order.size() && ok; oi++) {
+    const size_t i = order[oi];
     Ent& e = M.ents[i];
-    if ((e.dtype == 2) != (pass == 0)) continue;
-    fseek(f, (long)(base_data + e.file_off), SEEK_SET);
     const size_t tot = e.nc + e.ns;
-    buf.resize(tot);
-    if (fread(buf.data(), 1, tot, f) != tot) { printf("short read %s\n", e.name.c_str()); fclose(f); return false; }
-    posix_fadvise(bfd, (off_t)(base_data + e.file_off), (off_t)tot, POSIX_FADV_DONTNEED);
-    // Recomputing the exporter's per-tensor crc32 is what turns "the engine
-    // runs the quantizer that was certified 8/8" into a load-time assertion.
-    const uint32_t c = (uint32_t)crc32(0, (const Bytef*)buf.data(), (uInt)tot);
-    if (c != e.crc) {
-      printf("CRC MISMATCH %s: file %08x want %08x\n", e.name.c_str(), c, e.crc);
-      fclose(f); return false;
-    }
-    cudaError_t ce = cudaSuccess;
     // The bf16 (dtype 3) embedding must be DEVICE-resident: lm_head_bf16
     // reads it directly, and the Q8 host-staging path has no bf16 form.
     // Under --emb-host the tied embedding lives in pinned host memory only,
     // for BOTH payload formats: Q8 (lm_head_host) and bf16 (lm_head_bf16_host).
-    if (M.emb_mode == 1 && e.name == EMBNAME) continue;   // CRC checked above
     // Mode 2 (selftest) needs ONLY the embedding resident, so the other 285
-    // tensors stay on disk: 262 MB + 270 MB pinned + arena fits, the full
-    // 1944 MB does not, and the selftest never touches a layer weight.
-    if (M.emb_mode == 2 && e.name != EMBNAME) continue;
-    if (e.dtype == 3) {
-      // raw bf16 payload, verbatim into the codes arena (ns == 0)
-      ce = cudaMemcpy(M.dq + oc, buf.data(), e.nc, cudaMemcpyHostToDevice);
-      e.dq = M.dq + oc; e.ds = nullptr;
-      oc += e.nc;
+    // tensors stay on disk... (they are still read here so the CRC is checked).
+    const bool skip = (M.emb_mode == 1 && e.name == EMBNAME) || (M.emb_mode == 2 && e.name != EMBNAME);
+    char* d0 = nullptr; char* d1 = nullptr;           // dst of bytes [0,nc) and [nc,tot)
+    if (!skip) {
+      if (e.dtype == 3) { d0 = (char*)(M.dq + oc); e.dq = M.dq + oc; e.ds = nullptr; oc += e.nc; }
+      else if (e.dtype == 1) { d0 = (char*)(M.dq + oc); d1 = (char*)M.ds + os;
+        e.dq = M.dq + oc; e.ds = (float*)((char*)M.ds + os); oc += e.nc; os += e.ns; }
+      else {
+        // `M.df + of` is float* arithmetic on a BYTE offset: it advanced 4*of,
+        // so the first ~48 norm vectors landed inside the arena by luck. Byte offsets.
+        d0 = (char*)M.df + of; e.df = (float*)((char*)M.df + of); of += e.nc; }
     }
-    else if (e.dtype == 1) {
-      ce = cudaMemcpy(M.dq + oc, buf.data(), e.nc, cudaMemcpyHostToDevice);
-      if (ce == cudaSuccess)
-        ce = cudaMemcpy((char*)M.ds + os, buf.data() + e.nc, e.ns, cudaMemcpyHostToDevice);
-      e.dq = M.dq + oc; e.ds = (float*)((char*)M.ds + os);
-      oc += e.nc; os += e.ns;
-    } else {
-      // `M.df + of` is float* arithmetic on a BYTE offset: it advanced 4*of,
-      // so the first ~48 norm vectors landed inside the arena by luck (4*of
-      // < 1.55 MB) and the 49th faulted. Every "UPLOAD FAIL ... invalid
-      // argument" in this session, and the memory misdiagnosis that came
-      // with it, traces to this one line -- the f32 arena is the last
-      // allocation, so it is where typed-pointer arithmetic first bites.
-      ce = cudaMemcpy((char*)M.df + of, buf.data(), e.nc, cudaMemcpyHostToDevice);
-      e.df = (float*)((char*)M.df + of);
-      of += e.nc;
+    uint32_t c = 0;
+    for (size_t done = 0; done < tot; ) {
+      int slot; size_t len; char* p = load_take(R, slot, len);
+      if (!p) { printf("short read %s\n", e.name.c_str()); ok = false; break; }
+      // Recomputing the exporter's per-tensor crc32 is what turns "the engine
+      // runs the quantizer that was certified 8/8" into a load-time assertion.
+      c = (uint32_t)crc32(c, (const Bytef*)p, (uInt)len);
+      cudaError_t ce = cudaSuccess;
+      if (!skip) {
+        const size_t lo = done, hi = done + len;
+        if (lo < e.nc) { const size_t n = (hi < e.nc ? hi : e.nc) - lo;
+          ce = cudaMemcpy(d0 + lo, p, n, cudaMemcpyHostToDevice); }
+        if (ce == cudaSuccess && hi > e.nc && d1) { const size_t s0 = lo > e.nc ? lo : e.nc;
+          ce = cudaMemcpy(d1 + (s0 - e.nc), p + (s0 - lo), hi - s0, cudaMemcpyHostToDevice); }
+      }
+      load_give(R, slot);
+      if (ce != cudaSuccess) {
+        printf("UPLOAD FAIL %s dtype=%d nc=%zu ns=%zu arenas: codes %zu/%zu scales %zu/%zu f32 %zu/%zu -> %s\n",
+               e.name.c_str(), e.dtype, e.nc, e.ns, oc, M.need_q, os, M.need_s, of, M.need_f,
+               cudaGetErrorString(ce));
+        ok = false; break;
+      }
+      done += len;
     }
-    if (ce != cudaSuccess) {
-      // The first version printed only dst, and every one of these failures
-      // was blamed on memory. Print the arena window so an out-of-range
-      // offset is obvious: it is the thing the gate boundary hid.
-      printf("UPLOAD FAIL %s dtype=%d nd=%d ne=[%d,%d,%d,%d] nc=%zu ns=%zu src=%p\n"
-             "  dst=%p  arenas: codes=%p/%zu used=%zu  scales=%p/%zu used=%zu  f32=%p/%zu used=%zu\n"
-             "  -> %s\n",
-             e.name.c_str(), e.dtype, e.nd, e.ne[0], e.ne[1], e.ne[2], e.ne[3], e.nc, e.ns,
-             (void*)buf.data(),
-             (void*)(e.dtype == 1 ? (void*)(M.dq + oc) : (void*)((char*)M.df + of)),
-             (void*)M.dq, M.need_q, oc, (void*)M.ds, M.need_s, os, (void*)M.df, M.need_f, of,
-             cudaGetErrorString(ce));
-      fclose(f); return false;
-    }
-    M.by[e.name] = &M.ents[i];
+    if (ok && c != e.crc) {
+      printf("CRC MISMATCH %s: file %08x want %08x\n", e.name.c_str(), c, e.crc); ok = false; }
+    if (ok && !skip) M.by[e.name] = &M.ents[i];
   }
+  load_stop(R); pthread_join(rth, nullptr);
+  for (int k = 0; k < LoadRing::NS; k++) free(R.buf[k]);
+  if (!ok) { fclose(f); return false; }
   for (size_t i = 0; i < M.ents.size(); i++)
     if (M.ents[i].name == EMBNAME) M.ents[i].host = (M.emb_mode == 1);
   fclose(f);  // Build the merged gate/up tensors (device-to-device copies of the Q8 rows
