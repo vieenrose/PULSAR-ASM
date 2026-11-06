@@ -1241,12 +1241,26 @@ __global__ void k_attn_prefill2(const float* __restrict__ q, const float* __rest
 // LayerNorm(768) for the projector, mean and variance accumulated in double over
 // ascending i exactly as lfm3_enc.c does. Serial in thread 0: the shared ps[tid&31]
 // tree aliased 8 threads per slot at blockDim 256 and corrupted both moments.
+// k_moments_rows: the same two ascending double loops, one row per LANE (the #75 fix:
+// a 1-lane fp64 loop holds a full warp slot of the 1/32-rate DP pipe).
+__global__ void k_moments_rows(const float* __restrict__ x, double* __restrict__ mv, int nrows) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= nrows) return;
+  const float* r = x + (size_t)row * EHID;
+  double mu = 0, var = 0;
+  for (int i = 0; i < EHID; i++) mu += (double)r[i];
+  mu /= EHID;
+  for (int i = 0; i < EHID; i++) { const double dv = (double)r[i] - mu; var += dv * dv; }
+  mv[2 * row] = mu; mv[2 * row + 1] = var / EHID;
+}
 __global__ void k_layernorm_f32(const float* __restrict__ x, const float* __restrict__ g,
-                               const float* __restrict__ b, float* __restrict__ y) {
+                               const float* __restrict__ b, float* __restrict__ y,
+                               const double* __restrict__ mv = nullptr) {
   const int t = blockIdx.x;
   const float* r = x + (size_t)t * EHID;
   __shared__ double sh[2];
-  if (threadIdx.x == 0) {
+  if (mv) { if (threadIdx.x == 0) { sh[0] = mv[2 * t]; sh[1] = mv[2 * t + 1]; } }
+  else if (threadIdx.x == 0) {
     double mu = 0, var = 0;
     for (int i = 0; i < EHID; i++) mu += (double)r[i];
     mu /= EHID;
@@ -1642,7 +1656,12 @@ int main(int argc, char** argv) {
     Ent* pw1 = need(M, "mlp.model.1.weight"), *pb1 = need(M, "mlp.model.1.bias");
     Ent* pw3 = need(M, "mlp.model.3.weight"), *pb3 = need(M, "mlp.model.3.bias");
     wallmark("17 layers");
-    k_layernorm_f32<<<Tt, 256>>>(hn, pw0->df, pb0->df, hp1); chk("proj ln");
+    // LFM_ENC_LNM (default 1): moments one row per lane (k_moments_rows); 0 = thread 0.
+    static double* mv = nullptr;
+    const bool lnm = !getenv("LFM_ENC_LNM") || atoi(getenv("LFM_ENC_LNM"));
+    if (lnm && !mv && cudaMalloc(&mv, (size_t)Tt * 16)) { printf("moments alloc\n"); exit(3); }
+    if (lnm) k_moments_rows<<<(Tt + 127) / 128, 128>>>(hn, mv, Tt);
+    k_layernorm_f32<<<Tt, 256>>>(hn, pw0->df, pb0->df, hp1, lnm ? mv : nullptr); chk("proj ln");
     gemm_to(pw1, hp1, hp2, Tt, xb2, "proj lin1");
     k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, pb1->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b1");
     wallmark("proj ln + gemms");
