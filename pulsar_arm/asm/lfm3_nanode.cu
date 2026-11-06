@@ -3785,6 +3785,11 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   {
   int ct = ctmax >= 8 ? 8 : (ctmax >= 4 ? 4 : (ctmax >= 2 ? 2 : 1));
   while (ct > 1 && ct * per > lim) ct /= 2;
+  // LFM_PF_R (default 512; 256 = decode's R): rows per prefill block. Tb has no sh[RMAX],
+  // so it can stage each x tile once for 512 rows (32 per warp). Rows only move between
+  // blocks: bit-identical. 128 / 1024 / 2048 measured slower.
+  static const int pfR = getenv("LFM_PF_R") ? atoi(getenv("LFM_PF_R")) : 512;
+  if (pfR >= 64 && pfR % 16 == 0 && N >= 1024) c.R = pfR;
   const int nblk = ((N + c.R - 1) / c.R) * nch;
   const dim3 grid(nblk, (Tn + ct - 1) / ct);
   if (ct == 8)      q8_partial_Tb<8><<<grid, 256, 8 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
