@@ -3152,8 +3152,10 @@ __global__ void k_conv2d_r5(const float *x, const float *w, const float *b,
 // shapes (tile 82, the Nano's dense convs) from 96 to 80 registers with no
 // spill, i.e. 2 -> 3 blocks/SM. On sm_61 any bound reshuffles the 64-acc
 // shapes (126 -> 128 regs, #263's cliff), so Pascal compiles unbounded as before.
+// 4 (64 regs, 24-28 B spill, 4 blocks/SM) beat 3 (80 regs, 0 spill) on the Nano:
+// model -1.1%, encoder -5%, 3/3 pairs, bit-identical (#283).
 #ifndef R8LB32
-#define R8LB32 3
+#define R8LB32 4
 #endif
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600
 #define R8_BOUNDS(acc) __launch_bounds__(256, (acc) <= 32 ? R8LB32 : 1)
