@@ -36,6 +36,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <signal.h>
 #include "lfm3_tok.h"
 
 /* ------------------------------------------------------------------ sha256 (FIPS 180-4)
@@ -94,7 +95,8 @@ static char DIR[1024];
 static char TMP[1024], TMPD[1024];
 static int stage_no = 0;
 
-static char WORK_MEL[1100], WORK_OUT[1100];
+static char WORK_MEL[1100], WORK_OUT[1100], WORK_MELP[1100];
+static pid_t g_enc_pid = 0;   /* encoder child, killed if this shell dies before reaping it */
 /* atexit: remove the per-run work files (PCM, mel, proj_out and its dir). Each run left
    ~115 MB under /tmp and 132 of them filled picard's root fs. The engine log (2 KB) stays.
    LFM_ASR_KEEP=1 keeps everything for debugging. */
@@ -102,6 +104,7 @@ static void cleanup_work(void) {
   if (getenv("LFM_ASR_KEEP")) return;
   if (TMP[0]) unlink(TMP);
   if (WORK_MEL[0]) unlink(WORK_MEL);
+  if (WORK_MELP[0]) unlink(WORK_MELP);
   if (WORK_OUT[0]) unlink(WORK_OUT);
   if (TMPD[0]) rmdir(TMPD);
 }
@@ -110,6 +113,7 @@ static void die(const char *fmt, ...) __attribute__((noreturn));
 static void die(const char *fmt, ...) {
   va_list ap; va_start(ap, fmt);
   fprintf(stderr, "lfm3_asr: "); vfprintf(stderr, fmt, ap); fputc('\n', stderr); va_end(ap);
+  if (g_enc_pid > 0) { kill(g_enc_pid, SIGKILL); waitpid(g_enc_pid, NULL, 0); }
   exit(2);
 }
 static void* xmalloc(size_t n) { void *p = malloc(n); if (!p) die("out of memory (%zu bytes)", n); return p; }
@@ -269,29 +273,36 @@ int main(int argc, char **argv) {
          (long)plen, pre_len, n_audio, audio_at);
 
   /* ---- stage 1: WAV -> PCM ---------------------------------------------------- */
+  /* The encoder starts first with Tm = auto: its CUDA init + blob load (~1.9 s) overlap
+     stages 1-2, and it waits for MEL, which appears only by rename after lfm3_mel
+     succeeded and the frame count was validated below. */
+  unlink(MEL);   /* a leftover from a killed run with a recycled pid must not be read as this clip's mel */
+  { char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, (char*)"auto", TMPD, (char*)"--only", (char*)"proj_out", NULL };
+    g_enc_pid = spawn(av); }
+  char MELP[1100]; snprintf(MELP, sizeof MELP, "%s.part", MEL);   /* MEL was unlinked before the spawn */
+  snprintf(WORK_MELP, sizeof WORK_MELP, "%s", MELP);
+
   stage("WAV -> PCM16/float32 mono 16 kHz");
   { char *av[] = { (char*)"lfm3_wav", (char*)wav, TMP, NULL }; run(av); }
   need_file(TMP, 4, "lfm3_wav");
 
   /* ---- stage 2: PCM -> log-mel ------------------------------------------------ */
   stage("log-mel front end");
-  { char *av[] = { (char*)"lfm3_mel", MELB, TMP, MEL, NULL }; run(av); }
-  need_file(MEL, 128 * 4, "lfm3_mel");
-  long mel_bytes = file_size(MEL);
+  { char *av[] = { (char*)"lfm3_mel", MELB, TMP, MELP, NULL }; run(av); }
+  need_file(MELP, 128 * 4, "lfm3_mel");
+  long mel_bytes = file_size(MELP);
   if (mel_bytes % (128 * 4) != 0)
-    die("%s is %ld bytes, not a multiple of the 128-row f32 frame (%ld)", MEL, mel_bytes, (long)(128*4));
+    die("%s is %ld bytes, not a multiple of the 128-row f32 frame (%ld)", MELP, mel_bytes, (long)(128*4));
+  if (rename(MELP, MEL) != 0) die("cannot publish %s", MEL);
   long Tm = mel_bytes / (128 * 4);
   printf("mel frames Tm = %ld (%.3f audio seconds; %ld audio tokens = ceil(Tm/8))\n",
          Tm, (double)Tm / 100.0, (Tm + 7) / 8);
 
   /* ---- stage 3: encoder tower ------------------------------------------------ */
   stage("audio encoder tower (GPU) -> 2048-d rows");
-  pid_t enc_pid;
-  { char tm[32]; snprintf(tm, sizeof tm, "%ld", Tm);
-    /* --only proj_out: the 19 other stage dumps (~100 MB of D2H + eMMC writes) are gate
-       instrumentation; this shell reads proj_out alone. checks_enc.sh keeps the full set. */
-    char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, tm, TMPD, (char*)"--only", (char*)"proj_out", NULL };
-    enc_pid = spawn(av); }
+  /* already running (spawned before stage 1). --only proj_out: the 19 other stage dumps
+     (~100 MB of D2H + eMMC writes) are gate instrumentation; this shell reads proj_out
+     alone. checks_enc.sh keeps the full set. */
   /* Stage 4 needs only the prompt text and the manifest, not the encoder's rows, so it
      runs here while the encoder child works; the encoder is reaped and its output checked
      before stage 5. */
@@ -322,7 +333,7 @@ int main(int argc, char **argv) {
   printf("prompt ids: %ld built, %ld audio rows, matches the manifest totals\n", n_ids, n_audio);
   if (getenv("LFM_ASR_PRINT_IDS")) printf("IDS %s\n", idstr);
 
-  reap(enc_pid, "lfm3_enc_gpu");
+  { pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu"); }
   need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
   { long rows = file_size(OUT) / (2048 * 4);
     if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",

@@ -929,7 +929,12 @@ int main(int argc, char** argv) {
   g_enc_win = getenv("LFM_ENC_WIN") ? atoi(getenv("LFM_ENC_WIN")) : 32;
   printf("ENC-ATTN layers=2,5,8,11,14,15,16 window=%d (encoder.sliding_window, all "
          "attention layers; section 42)\n", g_enc_win); fflush(stdout);
-  const int Tm = atoi(argv[3]);
+  // Tm = "auto": the ASR shell starts this process before the mel front end has run, so
+  // the CUDA init + blob load overlap WAV+mel. The input is then waited for after the load
+  // (the shell publishes it with an atomic rename once lfm3_mel succeeded and the file is
+  // validated) and Tm is its size / (128 x 4 B).
+  const bool tm_auto = !strcmp(argv[3], "auto");
+  int Tm = tm_auto ? 8 : atoi(argv[3]);
   // The 8192 that used to sit here was a bring-up guard, not a structural limit: every
   // per-position buffer is a dynamic cudaMalloc (dalloc) and the downsampler's strides
   // are computed from Tm, so the real constraint is device memory, which the loader's
@@ -950,6 +955,19 @@ int main(int argc, char** argv) {
       printf("poisoned arenas: f32 %.1f MB scales %.1f MB\n", M.need_f / 1e6, M.need_s / 1e6);
     } }
 
+  if (tm_auto) {
+    struct stat stt; int waited_ms = 0;
+    while (stat(argv[2], &stt) != 0) {
+      if (getppid() == 1) { printf("parent gone while waiting for %s\n", argv[2]); return 2; }
+      if (waited_ms > 600000) { printf("timed out waiting for %s\n", argv[2]); return 2; }
+      usleep(2000); waited_ms += 2;
+    }
+    if (stt.st_size % (128 * 4) != 0) { printf("%s: %ld bytes, not whole 128-row frames\n", argv[2], (long)stt.st_size); return 2; }
+    Tm = (int)(stt.st_size / (128 * 4));
+    if (Tm < 8 || Tm > 32768) { printf("Tm out of range: %d\n", Tm); return 2; }
+    printf("Tm=auto: %d mel frames (waited %d ms after the blob load)\n", Tm, waited_ms);
+    wallmark("mel wait");
+  }
   std::vector<float> hfeat((size_t)128 * Tm);
   int fd = open(argv[2], O_RDONLY);
   if (fd < 0) { printf("cannot open %s\n", argv[2]); return 2; }
