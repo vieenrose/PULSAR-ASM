@@ -587,6 +587,45 @@ __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q, 
   for (int g = 0; g < G; g++)
     #pragma unroll
     for (int j = 0; j < 4; j++) qv[g][j] = bf2f(q[(size_t)(h0 + g) * HD + lane * 4 + j]);
+  if (G == 2) {
+    // Transposed reduce: a warp scores 8 consecutive positions x 2 heads = 16 sums. xor
+    // stages 16, 8, 4, 2 each keep half the rows (lower lane: own + partner, upper lane:
+    // partner + own), then stage 1; every row gets exactly the shfl_down tree's pairings.
+    for (int p0 = lo + wid * 8; p0 < npos; p0 += 64) {
+      float v[16];
+      #pragma unroll
+      for (int pi = 0; pi < 8; pi++) {
+        const int p = p0 + pi;
+        float k0 = 0.f, k1 = 0.f, k2 = 0.f, k3 = 0.f;
+        if (p < npos) {
+          const uint2 kw = *reinterpret_cast<const uint2*>(kc + (size_t)p * nkv * HD + kvh * HD + lane * 4);
+          k0 = __uint_as_float(kw.x << 16); k1 = __uint_as_float(kw.x & 0xffff0000u);
+          k2 = __uint_as_float(kw.y << 16); k3 = __uint_as_float(kw.y & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int g = 0; g < 2; g++) {
+          float a = 0.f;
+          a = __fadd_rn(a, __fmul_rn(qv[g][0], k0));
+          a = __fadd_rn(a, __fmul_rn(qv[g][1], k1));
+          a = __fadd_rn(a, __fmul_rn(qv[g][2], k2));
+          a = __fadd_rn(a, __fmul_rn(qv[g][3], k3));
+          v[g * 8 + pi] = a;
+        }
+      }
+#define ATT_TSTEP(C, O) { const bool up = (lane & (O)) != 0; \
+        _Pragma("unroll") for (int i = 0; i < (C) / 2; i++) { \
+          const float snd = up ? v[i] : v[i + (C) / 2]; \
+          const float r = __shfl_xor_sync(~0u, snd, (O)); \
+          v[i] = up ? __fadd_rn(r, v[i + (C) / 2]) : __fadd_rn(v[i], r); } }
+      ATT_TSTEP(16, 16) ATT_TSTEP(8, 8) ATT_TSTEP(4, 4) ATT_TSTEP(2, 2)
+#undef ATT_TSTEP
+      const float r1 = __shfl_xor_sync(~0u, v[0], 1);
+      const float sc = (lane & 1) ? __fadd_rn(r1, v[0]) : __fadd_rn(v[0], r1);
+      const int row = ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
+      const int p = p0 + (row & 7);
+      if (!(lane & 1) && p < npos) sl[(row >> 3) * sln + p] = __fmul_rn(sc, scaling);
+    }
+  } else
   for (int p = lo + wid; p < npos; p += 8) {
     const uint2 kw = *reinterpret_cast<const uint2*>(kc + (size_t)p * nkv * HD + kvh * HD + lane * 4);
     const float k0 = __uint_as_float(kw.x << 16), k1 = __uint_as_float(kw.x & 0xffff0000u);
