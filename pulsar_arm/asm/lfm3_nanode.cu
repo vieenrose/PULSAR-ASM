@@ -938,6 +938,8 @@ struct LoadJob {
   bool lazy = false;      // LFM_PF_LAZY: tensors allocated by this thread right before their upload
 };
 static int g_ovl = 0;                   // LFM_PF_OVL: weight upload overlapped with the prefill
+static bool g_embfile = false;          // LFM_PF_EMBLAST: prefill text rows read from the blob file
+static const char* g_blob_path = nullptr;
 static LoadJob* g_lj = nullptr;
 static void* load_consume(void* arg);
 // Block until the first n tensors (upload order) are on the device; false on a load error.
@@ -1198,6 +1200,17 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   for (int pass = 0; pass < 2; pass++)
     for (size_t i = 0; i < M.ents.size(); i++)
       if ((M.ents[i].dtype == 2) == (pass == 0)) order.push_back(i);
+  // LFM_PF_EMBLAST (default 1 with lazy arenas): the tied embedding (~295 MB) moves to the
+  // END of the upload order. The prefill needs only its text-token rows, which
+  // pf4_embed_chunk then preads from the blob (g_embfile); the head waits for the whole
+  // blob (and its CRC) as before. It sat at index 133 of 286: 3.5 s of eMMC before layer 0.
+  if (lazy && !(getenv("LFM_PF_EMBLAST") && !atoi(getenv("LFM_PF_EMBLAST")))) {
+    for (size_t k = 0; k < order.size(); k++)
+      if (M.ents[order[k]].name == EMBNAME && M.ents[order[k]].dtype == 1) {
+        const size_t ei = order[k]; order.erase(order.begin() + k); order.push_back(ei);
+        g_embfile = true; g_blob_path = path; break;
+      }
+  }
   // Device addresses are a running offset in upload order, so they are all known
   // before a byte is read: assign them (and register the tensors) up front. That is
   // what lets LFM_PF_OVL run the copy loop on a thread while prefill starts.
@@ -3832,6 +3845,22 @@ static int pf4_embed_chunk(Model& M, PF4Arena& A, const std::vector<int>& prompt
       cudaMemcpyAsync(M.hemb.dc, M.hemb.hc + (size_t)tok * H, (size_t)H, cudaMemcpyHostToDevice, 0);
       cudaMemcpyAsync(M.hemb.dsl, M.hemb.hs + (size_t)tok * sb, (size_t)sb * 4, cudaMemcpyHostToDevice, 0);
       k_dequant_row<<<(H + 255) / 256, 256, 0, g_launch>>>(M.hemb.dc, M.hemb.dsl, dst, H);
+    } else if (g_embfile) {
+      // The embedding is still uploading (it is last in the order): read this row's codes
+      // and scales -- the same bytes the upload copies, CRC-checked before the head -- and
+      // run the same dequant kernel on a scratch copy.
+      static int fd = -1; static int8_t* dc = nullptr; static float* dsl = nullptr;
+      const int sb = H / Q8_BLK;
+      if (fd < 0) { fd = open(g_blob_path, O_RDONLY);
+        if (fd < 0 || cudaMalloc(&dc, H) || cudaMalloc(&dsl, sb * 4)) { printf("PF4: embedding row reader setup failed\n"); return 1; } }
+      int8_t hc[H]; float hs[H / Q8_BLK];
+      const off_t o = (off_t)M.emb_file_off;
+      if (pread(fd, hc, H, o + (off_t)tok * H) != H ||
+          pread(fd, hs, sb * 4, o + (off_t)emb->nc + (off_t)tok * sb * 4) != sb * 4) {
+        printf("PF4: embedding row %d short read\n", tok); return 1; }
+      cudaMemcpy(dc, hc, H, cudaMemcpyHostToDevice);
+      cudaMemcpy(dsl, hs, sb * 4, cudaMemcpyHostToDevice);
+      k_dequant_row<<<(H + 255) / 256, 256, 0, g_launch>>>(dc, dsl, dst, H);
     } else {
       k_dequant_row<<<(H + 255) / 256, 256, 0, g_launch>>>(emb->dq + (size_t)tok * H,
                                              emb->ds + (size_t)tok * (H / Q8_BLK), dst, H);
@@ -4357,7 +4386,7 @@ int main(int argc, char** argv) {
       if (pf_lm) {
         static bf16* xall = nullptr;
         if (!xall && cudaMalloc(&xall, (size_t)NP * H * 2) != cudaSuccess) { printf("PF4-RUN: xall alloc failed\n"); return 1; }
-        if (g_lj && !load_wait(g_lj->need_emb)) { printf("PF4-RUN: weight load failed (embedding)\n"); return 1; }
+        if (g_lj && !g_embfile && !load_wait(g_lj->need_emb)) { printf("PF4-RUN: weight load failed (embedding)\n"); return 1; }
         for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
           Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
           A.xb = xall + (size_t)c0 * H;
@@ -4375,6 +4404,7 @@ int main(int argc, char** argv) {
           if (!load_wait((int)g_lj->order.size())) { printf("PF4-RUN: weight load failed\n"); return 1; }
           pthread_join(g_lj->th, nullptr);
           printf("PF4-RUN: weights uploaded during the prefill (%zu tensors, CRC ok)\n", g_lj->order.size());
+          g_embfile = false;          // embedding resident from here on
           g_lj = nullptr;
         }
       } else
