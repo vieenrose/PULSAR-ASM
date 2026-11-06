@@ -3174,6 +3174,9 @@ __global__ void k_conv2d_r5(const float *x, const float *w, const float *b,
 #endif
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600
 #define R8_BOUNDS(acc) __launch_bounds__(256, (acc) <= 32 ? R8LB32 : 1)
+#ifndef R8_DB
+#define R8_DB 1
+#endif
 #else
 #define R8_BOUNDS(acc)
 #endif
@@ -3196,8 +3199,17 @@ __global__ void R8_BOUNDS(PCO*NCB*NRA) k_conv2d_r8(const float *x, const float *
      * output bit-identical to WS=false. WS=false instantiations fold the
      * branch and ternaries away and are codegen-identical to shipped. */
     const int TW = 16*NCB, LS = TW+4;
-    __shared__ __align__(16) float S[R][LS];
-    __shared__ __align__(16) float Ws[16][3][4];
+    /* Maxwell 32-acc shapes double-buffer S/Ws by ci parity: the barrier after
+     * iteration ci-1's load already orders every read of the buffer that ci
+     * overwrites (last read at ci-2), so the pre-load barrier goes. sm_61 and
+     * the 64-acc shapes keep the single buffer (codegen unchanged). */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600 && R8_DB
+    constexpr int NB = (PCO*NCB*NRA <= 32) ? 2 : 1;
+#else
+    constexpr int NB = 1;
+#endif
+    __shared__ __align__(16) float S[NB][R][LS];
+    __shared__ __align__(16) float Ws[NB][16][3][4];
     const int w0 = blockIdx.x*TW, h0 = blockIdx.y*(16*NRA);
     const int tx = threadIdx.x, ty = threadIdx.y;                 // (16,16)
     const int tid = ty*16 + tx;
@@ -3216,10 +3228,11 @@ __global__ void R8_BOUNDS(PCO*NCB*NRA) k_conv2d_r8(const float *x, const float *
             xin = conv_src_pick(g, CONV_SRCS_ARGS) + (long)(ci%HID)*H*W;
             pl = (g < ng) ? (long)(ng-1-g)*HID + ci%HID : (long)(g-ng)*HID + ci%HID;
         }
-        if (ci) __syncthreads();
+        const int bf = (NB == 2) ? (ci & 1) : 0;
+        if (NB == 1 && ci) __syncthreads();
         {
             const int RS = LS/4, wbase = w0 - padW, hbase = h0 - padH;
-            float4 *dv = (float4*)&S[0][0];
+            float4 *dv = (float4*)&S[bf][0][0];
             for (int i = tid; i < R*RS; i += 256) {
                 const int r = i / RS, q = 4*(i - r*RS);
                 const int hh = hbase + r, ww = wbase + q;
@@ -3242,9 +3255,9 @@ __global__ void R8_BOUNDS(PCO*NCB*NRA) k_conv2d_r8(const float *x, const float *
             const float *wbs = w + ((long)(co0 + blockIdx.z*PCO)*C_in + ci)*9;
             for (int i = tid; i < PCO*3; i += 256) {
                 const int j = i / 3, kh = i - j*3;
-                Ws[j][kh][0] = wbs[(long)j*C_in*9 + kh*3];
-                Ws[j][kh][1] = wbs[(long)j*C_in*9 + kh*3 + 1];
-                Ws[j][kh][2] = wbs[(long)j*C_in*9 + kh*3 + 2];
+                Ws[bf][j][kh][0] = wbs[(long)j*C_in*9 + kh*3];
+                Ws[bf][j][kh][1] = wbs[(long)j*C_in*9 + kh*3 + 1];
+                Ws[bf][j][kh][2] = wbs[(long)j*C_in*9 + kh*3 + 2];
             }
         }
         __syncthreads();
@@ -3254,12 +3267,12 @@ __global__ void R8_BOUNDS(PCO*NCB*NRA) k_conv2d_r8(const float *x, const float *
 #pragma unroll
             for (int kh = 0; kh < 3; kh++) {
                 float4 ww4 = make_float4(0.f, 0.f, 0.f, 0.f);
-                if (WS) ww4 = *(const float4*)&Ws[j][kh];
+                if (WS) ww4 = *(const float4*)&Ws[bf][j][kh];
                 const float w0f = WS ? ww4.x : wv[j*C_in*9 + kh*3], w1f = WS ? ww4.y : wv[j*C_in*9 + kh*3+1], w2f = WS ? ww4.z : wv[j*C_in*9 + kh*3+2];
                 const int rb = ty*NRA + kh*dilH, cb = tx*NCB;
 #pragma unroll
                 for (int a = 0; a < NRA; a++) {
-                    const float *sr = &S[rb + a][cb];
+                    const float *sr = &S[bf][rb + a][cb];
 #pragma unroll
                     for (int bq = 0; bq < NCB; bq++) {
                         acc[j][a][bq] = fmaf(sr[bq], w0f, acc[j][a][bq]);
