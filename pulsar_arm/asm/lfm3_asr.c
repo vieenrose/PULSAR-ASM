@@ -94,6 +94,17 @@ static char DIR[1024];
 static char TMP[1024], TMPD[1024];
 static int stage_no = 0;
 
+static char WORK_MEL[1100], WORK_OUT[1100];
+/* atexit: remove the per-run work files (PCM, mel, proj_out and its dir). Each run left
+   ~115 MB under /tmp and 132 of them filled picard's root fs. The engine log (2 KB) stays.
+   LFM_ASR_KEEP=1 keeps everything for debugging. */
+static void cleanup_work(void) {
+  if (getenv("LFM_ASR_KEEP")) return;
+  if (TMP[0]) unlink(TMP);
+  if (WORK_MEL[0]) unlink(WORK_MEL);
+  if (WORK_OUT[0]) unlink(WORK_OUT);
+  if (TMPD[0]) rmdir(TMPD);
+}
 static void die(const char *fmt, ...) __attribute__((noreturn));
 #include <stdarg.h>
 static void die(const char *fmt, ...) {
@@ -221,6 +232,8 @@ int main(int argc, char **argv) {
     if (file_size(need) <= 0) die("missing %s in %s (run .auto/lfm3/asr_manifest.py; mel.bin/tok.bin ship with the model dir)", need, DIR);
   }
   if (mkdir(TMPD, 0755) != 0 && file_size(TMPD) < 0) die("cannot create %s", TMPD);
+  snprintf(WORK_MEL, sizeof WORK_MEL, "%s", MEL); snprintf(WORK_OUT, sizeof WORK_OUT, "%s", OUT);
+  atexit(cleanup_work);
 
   /* ---- manifest + prompt text, sha256 verified ------------------------------ */
   size_t mlen; uint8_t *manb = read_file(MANI, &mlen);
@@ -268,7 +281,9 @@ int main(int argc, char **argv) {
   /* ---- stage 3: encoder tower ------------------------------------------------ */
   stage("audio encoder tower (GPU) -> 2048-d rows");
   { char tm[32]; snprintf(tm, sizeof tm, "%ld", Tm);
-    char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, tm, TMPD, NULL }; run(av); }
+    /* --only proj_out: the 19 other stage dumps (~100 MB of D2H + eMMC writes) are gate
+       instrumentation; this shell reads proj_out alone. checks_enc.sh keeps the full set. */
+    char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, tm, TMPD, (char*)"--only", (char*)"proj_out", NULL }; run(av); }
   need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
   { long rows = file_size(OUT) / (2048 * 4);
     if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",

@@ -892,6 +892,7 @@ static void wallmark(const char* what) {
   fflush(stdout);
   g_tw_prev = now;
 }
+static const char* g_only = NULL;
 static void dump(const char* dir, const char* name, const float* dptr, size_t n) {
   // LFM_ENC_NODUMP=1 is the shipping path: the 20 stage dumps are the GATE's
   // instrumentation (~100 MB of device-to-host copies and file writes on a 4 GB Tegra
@@ -900,6 +901,9 @@ static void dump(const char* dir, const char* name, const float* dptr, size_t n)
   // timing runs only -- a gate run must never set it.
   if (g_nodump == -2) g_nodump = getenv("LFM_ENC_NODUMP") ? atoi(getenv("LFM_ENC_NODUMP")) : 0;
   if (g_nodump) return;
+  // `--only <stage>` (argv 5-6): the ASR shell consumes proj_out alone, so every other
+  // stage dump is skipped; the kept one still gets the plausibility check below.
+  if (g_only && strcmp(name, g_only) != 0) return;
   std::vector<float> h(n);
   cudaMemcpy(h.data(), dptr, n * 4, cudaMemcpyDeviceToHost);
   char path[512]; snprintf(path, sizeof path, "%s/%s.bin", dir, name);
@@ -919,7 +923,8 @@ static Ent* need(Model& M, const char* name) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 5) { printf("usage: %s <enc blob> <input.bin> <Tm> <outdir>\n", argv[0]); return 2; }
+  if (argc == 7 && !strcmp(argv[5], "--only")) g_only = argv[6];
+  else if (argc != 5) { printf("usage: %s <enc blob> <input.bin> <Tm> <outdir> [--only <stage>]\n", argv[0]); return 2; }
   g_ench2 = getenv("LFM_ENC_H2") ? atoi(getenv("LFM_ENC_H2")) : 0;
   g_enc_win = getenv("LFM_ENC_WIN") ? atoi(getenv("LFM_ENC_WIN")) : 32;
   printf("ENC-ATTN layers=2,5,8,11,14,15,16 window=%d (encoder.sliding_window, all "
