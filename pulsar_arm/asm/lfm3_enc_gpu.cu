@@ -580,7 +580,14 @@ __device__ __forceinline__ void tl_leaf(const int4* __restrict__ qt, const float
   #pragma unroll
   for (int p = 0; p < CT; p++) v[p] = __fmaf_rn(sb, dot[p], 0.f);
 }
-template <int CT>
+__device__ __noinline__ float4 tl_leaf4(const int4* __restrict__ qt, const float* __restrict__ st_s,
+                                        const float* xs, int b) {
+  float v[4];
+  tl_leaf<4>(qt, st_s, xs, b, v);
+  return make_float4(v[0], v[1], v[2], v[3]);
+}
+static const int g_tlni = getenv("LFM_ENC_TLNI") ? atoi(getenv("LFM_ENC_TLNI")) : 1;
+template <int CT, bool NI = false>
 __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                         const float* __restrict__ x, float* __restrict__ part,
                                                         int N, int K, int KCHUNK, int R, int nb, int T) {
@@ -613,9 +620,16 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict
   for (int k = 0; k < 16; k++) {
     const int i = ((k & 1) << 3) | ((k & 2) << 1) | ((k & 4) >> 1) | ((k & 8) >> 3);
     float lo[CT], hi[CT];
-    tl_leaf<CT>(qt, st_s, xs, i, lo);
-    if (i + 16 < 24) tl_leaf<CT>(qt, st_s, xs, i + 16, hi);
-    else {
+    if (NI) {
+      const float4 a = tl_leaf4(qt, st_s, xs, i);
+      lo[0] = a.x; lo[1 % CT] = a.y; lo[2 % CT] = a.z; lo[3 % CT] = a.w;
+    } else tl_leaf<CT>(qt, st_s, xs, i, lo);
+    if (i + 16 < 24) {
+      if (NI) {
+        const float4 a = tl_leaf4(qt, st_s, xs, i + 16);
+        hi[0] = a.x; hi[1 % CT] = a.y; hi[2 % CT] = a.z; hi[3 % CT] = a.w;
+      } else tl_leaf<CT>(qt, st_s, xs, i + 16, hi);
+    } else {
       #pragma unroll
       for (int p = 0; p < CT; p++) hi[p] = 0.f;
     }
@@ -808,7 +822,10 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
         const dim3 grid(g.nblk, (Tl + ct - 1) / ct);
         if (g_encts == -2) g_encts = getenv("LFM_ENC_TS") ? atoi(getenv("LFM_ENC_TS")) : 1;
         if (g.tl && !(ct == 4 && g.R == TPB)) { printf("tiled tensor needs q8_partial_TL\n"); exit(2); }
-        if (g.tl)   // 4 blocks/SM: 64 regs with ~580 B of spills beats 2 blocks at 128 regs (17.4 vs 15.0 s)
+        if (g.tl && g_tlni)
+          q8_partial_TL<4, true><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
+        else if (g.tl)   // 4 blocks/SM: 64 regs with ~580 B of spills beats 2 blocks at 128 regs (17.4 vs 15.0 s)
           q8_partial_TL<4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
                          g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
         else if (ct == 4 && g_encts && g.nb == 24 && (g.R / 8) % 4 == 0)
