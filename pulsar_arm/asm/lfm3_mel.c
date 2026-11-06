@@ -21,7 +21,11 @@
    the kernel's fmul-then-fadd, and lfm3_mel_test.c asserts BIT equality with
    the kernel.
 */
+#define _DEFAULT_SOURCE
 #include <stdio.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -75,6 +79,30 @@ void lfm3_mel_matmul(const float *pw, const float *filt, float *mel, int n_mels)
 void lfm3_mel_norm(const float *logmel, float *out, int n, float floor_v, float offset,
                    float divisor);
 
+/* Frames are independent (each reads only its own n_fft samples), so they are split into
+   contiguous ranges over LFM_MEL_THREADS forked workers (default 4; fork, not pthreads,
+   so the build line needs no libpthread) writing into one MAP_SHARED buffer;
+   every frame runs the same routines on the same inputs, so the output is byte-identical
+   to the single-threaded loop. Each worker writes its frames straight into the (m, t)
+   row-major output. */
+typedef struct { const mel_t *m; const float *x; float *rows; long frames, t0, t1; int ok; } mel_job;
+static void *mel_worker(void *a) {
+    mel_job *j = a; const mel_t *m = j->m;
+    float *pw = calloc(m->bins_pad, sizeof(float));               /* 208; tail stays zero */
+    float *mel = malloc(m->n_mels * sizeof(float)), *o = malloc(m->n_mels * sizeof(float));
+    if (!pw || !mel || !o) { j->ok = 0; return NULL; }
+    for (long t = j->t0; t < j->t1; t++) {
+        lfm3_mel_power(j->x + t * m->hop, m->window, m->twc, m->tws, pw, m->n_bins);
+        lfm3_mel_matmul(pw, m->filt, mel, m->n_mels);
+        for (int i = 0; i < m->n_mels; i++)
+            mel[i] = log10f(mel[i]);          /* log10(0) = -inf; the clamp below maps it to -12 */
+        lfm3_mel_norm(mel, o, m->n_mels, m->log_floor, m->offset, m->divisor);
+        for (int mi = 0; mi < m->n_mels; mi++) j->rows[(size_t)mi * j->frames + t] = o[mi];
+    }
+    free(pw); free(mel); free(o); j->ok = 1;
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) { fprintf(stderr, "usage: %s <mel.bin> <pcm.f32> <mel.f32>\n", argv[0]); return 2; }
     mel_t m;
@@ -94,25 +122,33 @@ int main(int argc, char **argv) {
                             : (int)n + (int)(((-(n - m.n_fft) % m.hop) + m.hop) % m.hop);
     long frames = 1 + (pad - m.n_fft) / m.hop;
 
-    float *pw = calloc(m.bins_pad, sizeof(float));                /* 208; tail stays zero */
-    float *mel = malloc(m.n_mels * sizeof(float));
-    float *out = malloc((size_t)m.n_mels * frames * sizeof(float));
-    if (!pw || !mel || !out) { fprintf(stderr, "oom\n"); return 2; }
-
-    for (long t = 0; t < frames; t++) {
-        lfm3_mel_power(x + t * m.hop, m.window, m.twc, m.tws, pw, m.n_bins);
-        lfm3_mel_matmul(pw, m.filt, mel, m.n_mels);
-        for (int i = 0; i < m.n_mels; i++)
-            mel[i] = log10f(mel[i]);          /* log10(0) = -inf; the clamp below maps it to -12 */
-        lfm3_mel_norm(mel, out + t * m.n_mels, m.n_mels, m.log_floor, m.offset, m.divisor);
+    float *rows = mmap(NULL, (size_t)m.n_mels * frames * sizeof(float), PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (rows == MAP_FAILED) { fprintf(stderr, "oom\n"); return 2; }
+    int nth = getenv("LFM_MEL_THREADS") ? atoi(getenv("LFM_MEL_THREADS")) : 4;
+    if (nth < 1) nth = 1;
+    if (nth > 16) nth = 16;
+    if (nth > frames) nth = (int)frames;
+    pid_t pid[16]; mel_job jb[16];
+    for (int i = 0; i < nth; i++)
+        jb[i] = (mel_job){ &m, x, rows, frames, frames * i / nth, frames * (i + 1) / nth, 0 };
+    for (int i = 1; i < nth; i++) {
+        fflush(stdout);
+        pid[i] = fork();
+        if (pid[i] < 0) { fprintf(stderr, "fork\n"); return 2; }
+        if (pid[i] == 0) { mel_worker(&jb[i]); _exit(jb[i].ok ? 0 : 3); }
     }
+    mel_worker(&jb[0]);
+    int bad = !jb[0].ok;
+    for (int i = 1; i < nth; i++) {
+        int st = 0;
+        if (waitpid(pid[i], &st, 0) != pid[i] || !WIFEXITED(st) || WEXITSTATUS(st) != 0) bad = 1;
+    }
+    if (bad) { fprintf(stderr, "mel worker failed\n"); return 2; }
 
     FILE *o = fopen(argv[3], "wb");
     if (!o) { fprintf(stderr, "open %s\n", argv[3]); return 2; }
     /* row-major (m, t) so the gate can reshape (128, T) directly */
-    float *rows = malloc((size_t)m.n_mels * frames * sizeof(float));
-    for (int mi = 0; mi < m.n_mels; mi++)
-        for (long t = 0; t < frames; t++) rows[(size_t)mi * frames + t] = out[t * m.n_mels + mi];
     fwrite(rows, sizeof(float), (size_t)m.n_mels * frames, o);
     fclose(o);
     printf("MEL n=%ld pad=%d frames=%ld mels=%d out=%s\n", n, pad, frames, m.n_mels, argv[3]);
