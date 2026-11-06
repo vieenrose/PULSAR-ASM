@@ -471,12 +471,19 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
   const int lo = (win > 0 && npos > win) ? npos - win : 0;
   const bf16* qr = q + (size_t)h * hd;
   const int kvh = h / (NH / nkv);
+  // Pre-load this thread's 4 Q values once (Q is constant across positions).
+  const float q0 = bf2f(qr[lane * (hd / 32) + 0]);
+  const float q1 = bf2f(qr[lane * (hd / 32) + 1]);
+  const float q2 = bf2f(qr[lane * (hd / 32) + 2]);
+  const float q3 = bf2f(qr[lane * (hd / 32) + 3]);
   for (int p = lo + wid; p < npos; p += 8) {
     const bf16* kr = kc + (size_t)p * nkv * hd + kvh * hd;
     float s = 0.f;
-    #pragma unroll
-    for (int j = 0; j < hd / 32; j++)
-      s = __fadd_rn(s, __fmul_rn(bf2f(qr[lane * (hd / 32) + j]), bf2f(kr[lane * (hd / 32) + j])));
+    const int base = lane * (hd / 32);
+    s = __fadd_rn(s, __fmul_rn(q0, bf2f(kr[base + 0])));
+    s = __fadd_rn(s, __fmul_rn(q1, bf2f(kr[base + 1])));
+    s = __fadd_rn(s, __fmul_rn(q2, bf2f(kr[base + 2])));
+    s = __fadd_rn(s, __fmul_rn(q3, bf2f(kr[base + 3])));
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_down_sync(~0u, s, o));
     if (lane == 0) sl[p] = __fmul_rn(s, scaling);
