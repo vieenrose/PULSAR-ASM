@@ -128,8 +128,10 @@ static uint8_t* read_file(const char *p, size_t *len) {
   if (fread(b, 1, (size_t)n, f) != (size_t)n) die("short read of %s", p);
   fclose(f); b[n] = 0; *len = (size_t)n; return b;
 }
-/* argv-only child: no shell, so the clip path is one argument and nothing is expanded. */
-static void run(char *const argv[]) {
+/* argv-only child: no shell, so the clip path is one argument and nothing is expanded.
+   spawn + reap split so independent host work can run while a child does (run = both). */
+static pid_t spawn(char *const argv[]) {
+  fflush(stdout); fflush(stderr);
   pid_t pid = fork();
   if (pid < 0) die("fork failed");
   if (pid == 0) {
@@ -137,11 +139,15 @@ static void run(char *const argv[]) {
     execv(prog, argv);
     fprintf(stderr, "lfm3_asr: cannot exec %s\n", prog); _exit(127);
   }
+  return pid;
+}
+static void reap(pid_t pid, const char *name) {
   int st = 0;
   if (waitpid(pid, &st, 0) < 0) die("waitpid failed");
-  if (!WIFEXITED(st)) die("%s terminated by signal %d", argv[0], WIFSIGNALED(st) ? WTERMSIG(st) : -1);
-  if (WEXITSTATUS(st) != 0) die("%s exited %d", argv[0], WEXITSTATUS(st));
+  if (!WIFEXITED(st)) die("%s terminated by signal %d", name, WIFSIGNALED(st) ? WTERMSIG(st) : -1);
+  if (WEXITSTATUS(st) != 0) die("%s exited %d", name, WEXITSTATUS(st));
 }
+static void run(char *const argv[]) { reap(spawn(argv), argv[0]); }
 static void run_capture(char *const argv[], const char *out) {
   pid_t pid = fork();
   if (pid < 0) die("fork failed");
@@ -280,14 +286,15 @@ int main(int argc, char **argv) {
 
   /* ---- stage 3: encoder tower ------------------------------------------------ */
   stage("audio encoder tower (GPU) -> 2048-d rows");
+  pid_t enc_pid;
   { char tm[32]; snprintf(tm, sizeof tm, "%ld", Tm);
     /* --only proj_out: the 19 other stage dumps (~100 MB of D2H + eMMC writes) are gate
        instrumentation; this shell reads proj_out alone. checks_enc.sh keeps the full set. */
-    char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, tm, TMPD, (char*)"--only", (char*)"proj_out", NULL }; run(av); }
-  need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
-  { long rows = file_size(OUT) / (2048 * 4);
-    if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",
-                             rows, n_audio); }
+    char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, tm, TMPD, (char*)"--only", (char*)"proj_out", NULL };
+    enc_pid = spawn(av); }
+  /* Stage 4 needs only the prompt text and the manifest, not the encoder's rows, so it
+     runs here while the encoder child works; the encoder is reaped and its output checked
+     before stage 5. */
 
   /* ---- stage 4: prompt ids, built natively ----------------------------------- */
   stage("ASR prompt ids (S1 tokenizer, manifest-expanded audio slot)");
@@ -314,6 +321,12 @@ int main(int argc, char **argv) {
     used += (size_t)sprintf(idstr + used, "%s%u", i ? "," : "", ids[i]);
   printf("prompt ids: %ld built, %ld audio rows, matches the manifest totals\n", n_ids, n_audio);
   if (getenv("LFM_ASR_PRINT_IDS")) printf("IDS %s\n", idstr);
+
+  reap(enc_pid, "lfm3_enc_gpu");
+  need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
+  { long rows = file_size(OUT) / (2048 * 4);
+    if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",
+                             rows, n_audio); }
 
   /* ---- stage 5: backbone ----------------------------------------------------- */
   stage("backbone prefill + greedy decode");
