@@ -3670,8 +3670,8 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 1) q8_partial_Tb(const i
 // The price is GRW rows' accumulators live across phases, so R = 8 * GRW rows per block.
 // GRW = 4 (R = 32): 64 regs/12 B spill (ptxas); ASR prefill 72.9 -> 65.9 ms/pos. GRW 8 spills harder
 // (75.5), GRW 2 is equal-or-slower (66.2). LFM_PF_PH=0 restores the CT=2 whole-row stage.
-template <int CT, int GRW>
-__global__ void __launch_bounds__(256) q8_partial_Tp(const int8_t* __restrict__ q, const float* __restrict__ s,
+template <int CT, int GRW, int TPB = 256>
+__global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 1) q8_partial_Tp(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                     const bf16* __restrict__ x, float* __restrict__ part,
                                                     int N, int K, int KCHUNK, int nb, int T) {
   __shared__ uint32_t xw[CT * 32 * 17];
@@ -3681,7 +3681,7 @@ __global__ void __launch_bounds__(256) q8_partial_Tp(const int8_t* __restrict__ 
   const int t0 = blockIdx.y * CT;
   const int NT = blockDim.x, tid = threadIdx.x;
   const int lane = tid & 31, wid = tid >> 5;
-  const int base = rowblk * (8 * GRW);
+  const int base = rowblk * ((TPB / 32) * GRW);
   float acc[GRW][CT];
   #pragma unroll
   for (int g = 0; g < GRW; g++)
@@ -3706,7 +3706,7 @@ __global__ void __launch_bounds__(256) q8_partial_Tp(const int8_t* __restrict__ 
       const uint32_t* wb0 = xw + lane * 17;
       #pragma unroll
       for (int g = 0; g < GRW; g++) {
-        const int row = base + wid + g * 8;
+        const int row = base + wid + g * (TPB / 32);
         if (row >= N) continue;                        // warp-uniform
         const int8_t* qr = q + (size_t)row * K + koff;
         const int4 a0 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK);
@@ -3735,7 +3735,7 @@ __global__ void __launch_bounds__(256) q8_partial_Tp(const int8_t* __restrict__ 
   }
   #pragma unroll
   for (int g = 0; g < GRW; g++) {
-    const int row = base + wid + g * 8;
+    const int row = base + wid + g * (TPB / 32);
     #pragma unroll
     for (int p = 0; p < CT; p++) {
       float a = acc[g][p];
@@ -3771,8 +3771,15 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   // below 4 run the phased kernel instead (bit-identical, see q8_partial_Tp).
   static const int pf_ph = getenv("LFM_PF_PH") ? atoi(getenv("LFM_PF_PH")) : 1;
   if (pf_ph && nch == 1 && 4 * per > lim && Tn >= 4) {
-    const dim3 gp((N + 31) / 32, (Tn + 3) / 4);
-    q8_partial_Tp<4, 4><<<gp, 256, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, nb, Tn);
+    // LFM_PF_TPTPB (default 512): 16 warps x GRW 4 rows per block; each row's chain unchanged.
+    static const int tptpb = getenv("LFM_PF_TPTPB") ? atoi(getenv("LFM_PF_TPTPB")) : 512;
+    if (tptpb == 512) {
+      const dim3 gp((N + 63) / 64, (Tn + 3) / 4);
+      q8_partial_Tp<4, 4, 512><<<gp, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, nb, Tn);
+    } else {
+      const dim3 gp((N + 31) / 32, (Tn + 3) / 4);
+      q8_partial_Tp<4, 4><<<gp, 256, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, nb, Tn);
+    }
     goto launched;
   }
   {
