@@ -3404,8 +3404,8 @@ static void layer_body(Model& M, int L, int pos, int step_s, int trace, int ci,
 // x is staged as bf16 PAIRS in 17-word rows (half the shared memory of the fp32 33-pad
 // layout, odd stride so lanes stay conflict-free). CT=1 is a plain q8_partial with a
 // position grid.
-template <int CT>
-__global__ void __launch_bounds__(256) q8_partial_Tb(const int8_t* __restrict__ q, const float* __restrict__ s,
+template <int CT, int TPB = 256>
+__global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 1) q8_partial_Tb(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                     const bf16* __restrict__ x, float* __restrict__ part,
                                                     int N, int K, int KCHUNK, int R, int nb, int T) {
   extern __shared__ uint32_t xw[];                    // [CT][nb][17] words, 16 used = 32 bf16
@@ -3579,6 +3579,7 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   // CT=4 @ 24 KB 71.1, CT=2 @ 40 KB 77.8, CT=8 @ 40 KB 115.2 (1 block/SM). 40 KB lets the
   // K=7680 w2 run at CT=2 instead of 1. Neither knob changes a bit, only the block shape.
   static const size_t lim = getenv("LFM_PF_SMEM") ? (size_t)atoi(getenv("LFM_PF_SMEM")) : 40000;
+  static const int pf_tpb = getenv("LFM_PF_TPB") ? atoi(getenv("LFM_PF_TPB")) : 512;
   static const int ctmax = getenv("LFM_PF_CT") ? atoi(getenv("LFM_PF_CT")) : 4;
   // LFM_PF_PH (default 1): wide single-chunk shapes whose full x stage would cap CT
   // below 4 run the phased kernel instead (bit-identical, see q8_partial_Tp).
@@ -3594,6 +3595,11 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   const int nblk = ((N + c.R - 1) / c.R) * nch;
   const dim3 grid(nblk, (Tn + ct - 1) / ct);
   if (ct == 8)      q8_partial_Tb<8><<<grid, 256, 8 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
+  // LFM_PF_TPB (default 512; 256 = the old shape): same kernel in 512-thread blocks. The 17.4 KB x tile caps 256-thread
+  // blocks at 3 per SM (24 warps); two 512-thread blocks hold 32. Rows map to warps
+  // differently, each row's chain is unchanged.
+  else if (ct == 4 && pf_tpb == 512 && c.R % 16 == 0)
+    q8_partial_Tb<4, 512><<<grid, 512, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
   else if (ct == 4) q8_partial_Tb<4><<<grid, 256, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
   else if (ct == 2) q8_partial_Tb<2><<<grid, 256, 2 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
   else              q8_partial_Tb<1><<<grid, 256, per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
