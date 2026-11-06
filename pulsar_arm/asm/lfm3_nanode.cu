@@ -935,6 +935,7 @@ struct LoadJob {
   std::vector<size_t> order; std::vector<char*> d0, d1; std::vector<char> skip;
   int need[64]; int need_emb = 0;
   volatile int done = 0, finished = 0; bool ok = true;
+  bool lazy = false;      // LFM_PF_LAZY: tensors allocated by this thread right before their upload
 };
 static int g_ovl = 0;                   // LFM_PF_OVL: weight upload overlapped with the prefill
 static LoadJob* g_lj = nullptr;
@@ -955,7 +956,24 @@ static void* load_consume(void* arg) {
   for (size_t oi = 0; oi < J.order.size() && ok; oi++) {
     Ent& e = M.ents[J.order[oi]];
     const size_t tot = e.nc + e.ns;
-    char* d0 = J.d0[oi]; char* d1 = J.d1[oi]; const bool skip = J.skip[oi];
+    const bool skip = J.skip[oi];
+    if (J.lazy && !skip) {
+      // Tegra's cudaMalloc backs and zeroes pages at ~0.86 ms/MB: the 2.15 GB of arenas
+      // cost 1.83 s before the first byte could move. Allocated here, per tensor, it runs
+      // behind the reader instead; the pointer is published with the same release store
+      // of `done` that load_wait acquires, so no consumer can see it before the bytes.
+      void* p0 = nullptr; void* p1 = nullptr;
+      cudaError_t ae = cudaMalloc(&p0, e.nc);
+      if (ae == cudaSuccess && e.dtype == 1) ae = cudaMalloc(&p1, e.ns);
+      if (ae != cudaSuccess) {
+        printf("LAZY ALLOC FAIL %s nc=%zu ns=%zu -> %s\n", e.name.c_str(), e.nc, e.ns, cudaGetErrorString(ae));
+        ok = false; break;
+      }
+      J.d0[oi] = (char*)p0; J.d1[oi] = (char*)p1;
+      if (e.dtype == 2) e.df = (float*)p0;
+      else { e.dq = (decltype(e.dq))p0; e.ds = (float*)p1; }
+    }
+    char* d0 = J.d0[oi]; char* d1 = J.d1[oi];
     uint32_t c = 0;
     for (size_t done = 0; done < tot; ) {
       int slot; size_t len; char* p = load_take(J.R, slot, len);
@@ -1154,6 +1172,11 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
       printf("  waiting... free %zu MB (need %zu)\n", f2 / 1048576, need / 1048576); fflush(stdout); }
     struct timespec ts; ts.tv_sec = 5; ts.tv_nsec = 0; nanosleep(&ts, nullptr);
   }
+  // LFM_PF_LAZY (default 1 under LFM_PF_OVL): no up-front arenas; load_consume allocates
+  // each tensor on the upload thread (see there). Offsets below are still accounted.
+  static const bool lazy = g_ovl && !g_merge && !(getenv("LFM_PF_LAZY") && !atoi(getenv("LFM_PF_LAZY")));
+  if (lazy) { M.dq = nullptr; M.ds = nullptr; M.df = nullptr; printf("LAZY arenas: tensors allocated on the upload thread\n"); }
+  else {
   if (cudaMalloc(&M.dq, M.need_q) != cudaSuccess) {
     printf("codes arena cudaMalloc(%.0f MB) failed\n", M.need_q / 1e6); fclose(f); return false;
   }
@@ -1162,6 +1185,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   }
   if (cudaMalloc(&M.df, M.need_f) != cudaSuccess) {
     printf("f32 arena cudaMalloc(%.1f MB) failed\n", M.need_f / 1e6); fclose(f); return false;
+  }
   }
   size_t oc = 0, os = 0, of = 0;
   // f32 payloads first. At the memory gate boundary the LAST cudaMemcpy is
@@ -1178,7 +1202,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   // before a byte is read: assign them (and register the tensors) up front. That is
   // what lets LFM_PF_OVL run the copy loop on a thread while prefill starts.
   J->M = &M; J->d0.assign(order.size(), nullptr); J->d1.assign(order.size(), nullptr);
-  J->skip.assign(order.size(), 0);
+  J->skip.assign(order.size(), 0); J->lazy = lazy;
   for (int L = 0; L < NLAYER; L++) J->need[L] = 0;
   for (size_t oi = 0; oi < order.size(); oi++) {
     Ent& e = M.ents[order[oi]];
@@ -1198,6 +1222,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
         // `M.df + of` is float* arithmetic on a BYTE offset: it advanced 4*of,
         // so the first ~48 norm vectors landed inside the arena by luck. Byte offsets.
         J->d0[oi] = (char*)M.df + of; e.df = (float*)((char*)M.df + of); of += e.nc; }
+      if (lazy) { J->d0[oi] = J->d1[oi] = nullptr; e.dq = nullptr; e.ds = nullptr; e.df = nullptr; }   // set by load_consume
       M.by[e.name] = &M.ents[order[oi]];
     }
     if (e.name == EMBNAME) J->need_emb = (int)oi + 1;
