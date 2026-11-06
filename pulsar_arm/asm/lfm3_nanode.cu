@@ -3476,6 +3476,91 @@ __global__ void __launch_bounds__(256) q8_partial_Tb(const int8_t* __restrict__ 
   }
 }
 
+// q8_partial_Tp<CT, GRW>: q8_partial_Tb for a wide single chunk (ffn.w2: K = KCHUNK =
+// 7680, nb = 240), whose whole-row x stage forced CT = 2 at 32.6 KB = one block per SM.
+// x is staged 32 blocks at a time (one per lane): in phase m lane L handles block
+// 32m + L, i.e. the same blocks L, L+32, ... in the same order as Tb, with the same
+// code-outer dot chain, acc = fmaf(s_b, dot, acc) and shuffle tree -- bit-identical.
+// The price is GRW rows' accumulators live across phases, so R = 8 * GRW rows per block.
+// GRW = 4 (R = 32): 64 regs/12 B spill (ptxas); ASR prefill 72.9 -> 65.9 ms/pos. GRW 8 spills harder
+// (75.5), GRW 2 is equal-or-slower (66.2). LFM_PF_PH=0 restores the CT=2 whole-row stage.
+template <int CT, int GRW>
+__global__ void __launch_bounds__(256) q8_partial_Tp(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                    const bf16* __restrict__ x, float* __restrict__ part,
+                                                    int N, int K, int KCHUNK, int nb, int T) {
+  __shared__ uint32_t xw[CT * 32 * 17];
+  const int nchunk = K / KCHUNK;
+  const int rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
+  const int koff = chunk * KCHUNK;
+  const int t0 = blockIdx.y * CT;
+  const int NT = blockDim.x, tid = threadIdx.x;
+  const int lane = tid & 31, wid = tid >> 5;
+  const int base = rowblk * (8 * GRW);
+  float acc[GRW][CT];
+  #pragma unroll
+  for (int g = 0; g < GRW; g++)
+    #pragma unroll
+    for (int p = 0; p < CT; p++) acc[g][p] = 0.f;
+  for (int m0 = 0; m0 < nb; m0 += 32) {
+    __syncthreads();                                   // previous phase's readers are done
+    #pragma unroll
+    for (int p = 0; p < CT; p++) {
+      const int t = t0 + p;
+      if (t < T) {
+        const uint32_t* xg = reinterpret_cast<const uint32_t*>(x + (size_t)t * K + koff);
+        for (int i = tid; i < 32 * 16; i += NT) {
+          const int blk = m0 + (i >> 4);
+          if (blk < nb) xw[p * 544 + (i >> 4) * 17 + (i & 15)] = xg[blk * 16 + (i & 15)];
+        }
+      }
+    }
+    __syncthreads();
+    const int b = m0 + lane;
+    if (b < nb) {
+      const uint32_t* wb0 = xw + lane * 17;
+      #pragma unroll
+      for (int g = 0; g < GRW; g++) {
+        const int row = base + wid + g * 8;
+        if (row >= N) continue;                        // warp-uniform
+        const int8_t* qr = q + (size_t)row * K + koff;
+        const int4 a0 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK);
+        const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
+        const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
+        const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+        const float sb = s[(size_t)row * (K / Q8_BLK) + (size_t)chunk * nb + b];
+        float dot[CT];
+        #pragma unroll
+        for (int p = 0; p < CT; p++) dot[p] = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+          const int8_t* cc = (j < 8) ? c0 : c1;
+          const float ca = (float)cc[(2 * j) & 15], cb = (float)cc[(2 * j + 1) & 15];
+          #pragma unroll
+          for (int p = 0; p < CT; p++) {
+            const uint32_t u = wb0[p * 544 + j];
+            dot[p] = __fmaf_rn(ca, __uint_as_float(u << 16), dot[p]);
+            dot[p] = __fmaf_rn(cb, __uint_as_float(u & 0xffff0000u), dot[p]);
+          }
+        }
+        #pragma unroll
+        for (int p = 0; p < CT; p++) acc[g][p] = __fmaf_rn(sb, dot[p], acc[g][p]);
+      }
+    }
+  }
+  #pragma unroll
+  for (int g = 0; g < GRW; g++) {
+    const int row = base + wid + g * 8;
+    #pragma unroll
+    for (int p = 0; p < CT; p++) {
+      float a = acc[g][p];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(~0u, a, o);
+      const int t = t0 + p;
+      if (lane == 0 && t < T && row < N) part[((size_t)t * N + row) * nchunk + chunk] = a;
+    }
+  }
+}
+
 static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
                      float* part, int Tn) {
   Ent* e = T(M, name);
@@ -3495,6 +3580,15 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   // K=7680 w2 run at CT=2 instead of 1. Neither knob changes a bit, only the block shape.
   static const size_t lim = getenv("LFM_PF_SMEM") ? (size_t)atoi(getenv("LFM_PF_SMEM")) : 40000;
   static const int ctmax = getenv("LFM_PF_CT") ? atoi(getenv("LFM_PF_CT")) : 4;
+  // LFM_PF_PH (default 1): wide single-chunk shapes whose full x stage would cap CT
+  // below 4 run the phased kernel instead (bit-identical, see q8_partial_Tp).
+  static const int pf_ph = getenv("LFM_PF_PH") ? atoi(getenv("LFM_PF_PH")) : 1;
+  if (pf_ph && nch == 1 && 4 * per > lim && Tn >= 4) {
+    const dim3 gp((N + 31) / 32, (Tn + 3) / 4);
+    q8_partial_Tp<4, 4><<<gp, 256, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, nb, Tn);
+    goto launched;
+  }
+  {
   int ct = ctmax >= 8 ? 8 : (ctmax >= 4 ? 4 : (ctmax >= 2 ? 2 : 1));
   while (ct > 1 && ct * per > lim) ct /= 2;
   const int nblk = ((N + c.R - 1) / c.R) * nch;
@@ -3503,9 +3597,11 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   else if (ct == 4) q8_partial_Tb<4><<<grid, 256, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
   else if (ct == 2) q8_partial_Tb<2><<<grid, 256, 2 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
   else              q8_partial_Tb<1><<<grid, 256, per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
+  }
+launched:
   cudaError_t le = cudaGetLastError();
   if (le != cudaSuccess) {   // no number for a kernel that did not run (the standing rule)
-    printf("PF4-E2E %s N=%d K=%d KC=%d CT=%d: LAUNCH ERROR %s\n", name.c_str(), N, K, c.KCHUNK, ct, cudaGetErrorString(le));
+    printf("PF4-E2E %s N=%d K=%d KC=%d: LAUNCH ERROR %s\n", name.c_str(), N, K, c.KCHUNK, cudaGetErrorString(le));
     return 1;
   }
   dim3 g((N + 255) / 256, Tn);
