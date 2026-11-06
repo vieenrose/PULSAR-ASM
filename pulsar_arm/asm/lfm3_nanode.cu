@@ -3978,14 +3978,26 @@ static void tlb_decode(const int8_t* q, const float* s, const bf16* x, bf16* y, 
 static bool pf_tile(Ent* e, int N, int K) {
   if (g_pftiled.count(e->dq)) return true;
   const int nb = K / Q8_BLK;
+  // One scratch buffer, grown to the largest tensor and reused (LFM_PF_TSCR=0: per-tensor
+  // cudaMalloc/cudaFree, which on this Tegra backs and zeroes pages at ~0.86 ms/MB).
+  static const int tscr = getenv("LFM_PF_TSCR") ? atoi(getenv("LFM_PF_TSCR")) : 1;
+  static void* scr = nullptr; static size_t scr_n = 0;
   void* tmp = nullptr;
-  if (cudaMalloc(&tmp, (size_t)N * K)) return false;
+  if (tscr) {
+    if (scr_n < (size_t)N * K) {
+      if (scr) cudaFree(scr);
+      scr = nullptr; scr_n = 0;
+      if (cudaMalloc(&scr, (size_t)N * K)) return false;
+      scr_n = (size_t)N * K;
+    }
+    tmp = scr;
+  } else if (cudaMalloc(&tmp, (size_t)N * K)) return false;
   k_tile_q<<<(unsigned)(((size_t)N * nb * 2 + 255) / 256), 256, 0, g_launch>>>(reinterpret_cast<const int4*>(e->dq), (int4*)tmp, N, nb);
   cudaMemcpyAsync((void*)e->dq, tmp, (size_t)N * K, cudaMemcpyDeviceToDevice, g_launch);
   k_tile_s<<<(unsigned)(((size_t)N * nb + 255) / 256), 256, 0, g_launch>>>(e->ds, (float*)tmp, N, nb);
   cudaMemcpyAsync((void*)e->ds, tmp, (size_t)N * nb * 4, cudaMemcpyDeviceToDevice, g_launch);
   if (cudaStreamSynchronize(g_launch) != cudaSuccess) { printf("pf_tile failed\n"); exit(2); }
-  cudaFree(tmp);
+  if (!tscr) cudaFree(tmp);
   g_pftiled.insert(e->dq);
   return true;
 }
