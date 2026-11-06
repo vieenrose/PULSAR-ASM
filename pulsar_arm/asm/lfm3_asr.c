@@ -303,6 +303,13 @@ int main(int argc, char **argv) {
   long Tm = mel_bytes / (128 * 4);
   printf("mel frames Tm = %ld (%.3f audio seconds; %ld audio tokens = ceil(Tm/8))\n",
          Tm, (double)Tm / 100.0, (Tm + 7) / 8);
+  /* The audio slot holds one row per encoder output, ceil(Tm/8), for THIS clip. The
+     manifest's prompt_audio_placeholder_tokens is the golden fixture's count: it still
+     pins the text part (n_total - n_audio ids around the slot), so a different clip
+     length changes only the slot, never the text ids. */
+  const long n_text = n_total - n_audio;
+  n_audio = (Tm + 7) / 8;
+  n_total = n_text + n_audio;
 
   /* ---- stage 3: encoder tower ------------------------------------------------ */
   stage("audio encoder tower (GPU) -> 2048-d rows");
@@ -349,6 +356,11 @@ int main(int argc, char **argv) {
      token a -1. Cost a full run to learn; the engine prints -1 rather than a fake id. */
   snprintf(stq, sizeof stq, "--steps"); snprintf(stv, sizeof stv, "%ld", n_ids + (long)max_gen);
   printf("steps: %ld prompt + %d generation = %s\n", n_ids, max_gen, stv);
+  /* lfm3_nanode's context cap (MAXTOK): refuse here, before 20+ s of encoder work is
+     wasted on a run the engine would truncate. */
+  if (n_ids + (long)max_gen > 4096)
+    die("%ld prompt ids + %d generation exceed the engine's 4096-position context "
+        "(%.0f s of audio max at this prompt)", n_ids, max_gen, (4096.0 - max_gen - n_text) * 8 / 100.0);
   snprintf(pp, sizeof pp, "--prompt");
   char eng[1100]; snprintf(eng, sizeof eng, "/tmp/lfm3_asr.%ld.engine.txt", (long)getpid());
   /* --prefill-run T: the prompt goes through the backbone T positions at a time (one
