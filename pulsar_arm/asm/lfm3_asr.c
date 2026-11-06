@@ -313,7 +313,16 @@ int main(int argc, char **argv) {
   printf("steps: %ld prompt + %d generation = %s\n", n_ids, max_gen, stv);
   snprintf(pp, sizeof pp, "--prompt");
   char eng[1100]; snprintf(eng, sizeof eng, "/tmp/lfm3_asr.%ld.engine.txt", (long)getpid());
-  { char *av[] = { (char*)"lfm3_nanode", BB, embp, OUT, ata, atv, pp, idstr, stq, stv, NULL };
+  /* --prefill-run T: the prompt goes through the backbone T positions at a time (one
+     T-wide launch per GEMV, sharing each weight load across positions; the per-position
+     passes run the T=1 kernels in the T=1 order). Bit-identical to the T=1 prefill on the
+     full ASR prompt (all generated ids and the final-step logits, byte for byte), ~30%
+     faster per prompt position. LFM_ASR_PFRUN=0 runs the T=1 path (A/B control). */
+  char pfr[32], pfv[32];
+  const int pfrun = getenv("LFM_ASR_PFRUN") ? atoi(getenv("LFM_ASR_PFRUN")) : 32;
+  snprintf(pfr, sizeof pfr, "--prefill-run"); snprintf(pfv, sizeof pfv, "%d", pfrun);
+  { char *av[] = { (char*)"lfm3_nanode", BB, embp, OUT, ata, atv, pp, idstr, stq, stv,
+                   pfrun >= 2 ? pfr : NULL, pfv, NULL };
     run_capture(av, eng); }
   size_t elen; uint8_t *eb = read_file(eng, &elen);
 

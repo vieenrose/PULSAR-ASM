@@ -3244,21 +3244,119 @@ static void layer_body(Model& M, int L, int pos, int step_s, int trace, int ci,
 // position matches bit for bit, every GEMV, norm, conv ring, RoPE and attention call in
 // between matched. Generated ids come when this driver is wired as the real prefill
 // (next tranche); they need lm_head, which is still inline in the step loop.
+// q8_partial_Tb<CT>: the T-wide twin of the SHIPPED T=1 backbone GEMV,
+// q8_partial<bf16, FMA=true, STREAM=false, UNROLL=1, H2=0>. For every (row, chunk,
+// position) the arithmetic is that kernel's exactly: x staged to fp32 by bf2f (exact),
+// lane L folds blocks b = L, L+32, ... with dot_b = the same 32-term fmaf chain and
+// acc = fmaf(s[b], dot_b, acc), then the same shuffle-down tree; the value lane 0 stores
+// is the value q8_partial stages in sh[]. KCHUNK/nchunk come from pick(), so k_combine_bf_T
+// sums the same partials in the same order. What changes: one weight-block load serves CT
+// positions (the prefill re-streams all 1.68 GB of weights once per prompt position), and
+// x is staged as bf16 PAIRS in 17-word rows (half the shared memory of the fp32 33-pad
+// layout, odd stride so lanes stay conflict-free). CT=1 is a plain q8_partial with a
+// position grid.
+template <int CT>
+__global__ void __launch_bounds__(256) q8_partial_Tb(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                    const bf16* __restrict__ x, float* __restrict__ part,
+                                                    int N, int K, int KCHUNK, int R, int nb, int T) {
+  extern __shared__ uint32_t xw[];                    // [CT][nb][17] words, 16 used = 32 bf16
+  const int nchunk = K / KCHUNK;
+  const int rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
+  const int koff = chunk * KCHUNK;
+  const int t0 = blockIdx.y * CT;
+  const int NT = blockDim.x, tid = threadIdx.x;
+  const int xstride = nb * 17;
+  #pragma unroll
+  for (int p = 0; p < CT; p++) {
+    const int t = t0 + p;
+    if (t < T) {
+      const uint32_t* xg = reinterpret_cast<const uint32_t*>(x + (size_t)t * K + koff);
+      for (int i = tid; i < KCHUNK / 2; i += NT) xw[p * xstride + (i >> 4) * 17 + (i & 15)] = xg[i];
+    }
+  }
+  __syncthreads();
+  const int base = rowblk * R;
+  const int lane = tid & 31, wid = tid >> 5;
+  const int WPB = NT >> 5, GR = R / WPB;
+  for (int g = 0; g < GR; g++) {
+    const int row = base + wid + g * WPB;
+    if (row >= N) continue;                            // warp-uniform
+    float acc[CT];
+    #pragma unroll
+    for (int p = 0; p < CT; p++) acc[p] = 0.f;
+    const int8_t* qr = q + (size_t)row * K + koff;
+    const float* sr = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb;
+    #pragma unroll 1
+    for (int b = lane; b < nb; b += 32) {
+      const int4 a0 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK);
+      const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
+      const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
+      const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+      const float sb = sr[b];
+      // Code-outer, position-inner: each code pair is converted to fp32 ONCE and applied
+      // to all CT positions, so only dot[CT] is live (a 32-float code array cost CT=4 its
+      // occupancy: 78 registers). Every dot_p still accumulates codes 0..31 in order --
+      // the same fmaf chain q8_partial runs -- so the bits are unchanged. (I2F per
+      // position per code made the first version compute-bound at ~5 GB/s.)
+      float dot[CT];
+      #pragma unroll
+      for (int p = 0; p < CT; p++) dot[p] = 0.f;
+      const uint32_t* wb0 = xw + b * 17;
+      #pragma unroll
+      for (int j = 0; j < 16; j++) {                   // word j = codes 2j, 2j+1
+        const int8_t* cc = (j < 8) ? c0 : c1;
+        const float ca = (float)cc[(2 * j) & 15], cb = (float)cc[(2 * j + 1) & 15];
+        #pragma unroll
+        for (int p = 0; p < CT; p++) {
+          const uint32_t u = wb0[p * xstride + j];
+          dot[p] = __fmaf_rn(ca, __uint_as_float(u << 16), dot[p]);
+          dot[p] = __fmaf_rn(cb, __uint_as_float(u & 0xffff0000u), dot[p]);
+        }
+      }
+      #pragma unroll
+      for (int p = 0; p < CT; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
+    }
+    #pragma unroll
+    for (int p = 0; p < CT; p++) {
+      float a = acc[p];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(~0u, a, o);
+      const int t = t0 + p;
+      if (lane == 0 && t < T) part[((size_t)t * N + row) * nchunk + chunk] = a;
+    }
+  }
+}
+
 static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
                      float* part, int Tn) {
   Ent* e = T(M, name);
   if (!e || !(e->dq && e->ds)) { printf("PF4-E2E %s: NOT IN BLOB\n", name.c_str()); return 1; }
   const int N = e->ne[0], K = e->ne[1];
-  const int CT = 4, RPB = 8, R = (256 / 32) * RPB, TPB = 256;
-  if (K % Q8_BLK) { printf("PF4-E2E %s: K=%d not a multiple of %d\n", name.c_str(), K, Q8_BLK); return 1; }
-  int KC = K, nb = K / Q8_BLK; size_t shm = (size_t)CT * nb * 33 * 4;
-  while (KC > 32 && (K % KC || shm > 49152)) { KC /= 2; nb = KC / Q8_BLK; shm = (size_t)CT * nb * 33 * 4; }
-  if (K % KC || shm > 49152) { printf("PF4-E2E %s: no KC fits (K=%d)\n", name.c_str(), K); return 1; }
-  const int nch = K / KC, nblk = ((N + R - 1) / R) * nch;
-  pf_launch(CT, 5, 1, RPB, e->dq, e->ds, x, part, N, K, KC, R, nb, Tn, nblk, TPB, shm);
+  // The SHIPPED geometry (pick): same KCHUNK -> same nchunk -> same combine order; R and
+  // TPB only map rows to blocks. Anything the shipped path would reject is rejected here.
+  GemvCfg c = pick(N, K);
+  if (K % c.KCHUNK || c.TPB != 256 || c.R % 8) {
+    printf("PF4-E2E %s: shape N=%d K=%d KC=%d TPB=%d R=%d not supported\n", name.c_str(), N, K, c.KCHUNK, c.TPB, c.R);
+    return 1;
+  }
+  const int nb = c.KCHUNK / Q8_BLK, nch = K / c.KCHUNK;
+  const size_t per = (size_t)nb * 17 * 4;             // one position's staged x
+  // Defaults from the 256-id sweep (ms/position, shipped T=1 = 99.6): CT=4 @ 40 KB 69.6,
+  // CT=4 @ 24 KB 71.1, CT=2 @ 40 KB 77.8, CT=8 @ 40 KB 115.2 (1 block/SM). 40 KB lets the
+  // K=7680 w2 run at CT=2 instead of 1. Neither knob changes a bit, only the block shape.
+  static const size_t lim = getenv("LFM_PF_SMEM") ? (size_t)atoi(getenv("LFM_PF_SMEM")) : 40000;
+  static const int ctmax = getenv("LFM_PF_CT") ? atoi(getenv("LFM_PF_CT")) : 4;
+  int ct = ctmax >= 8 ? 8 : (ctmax >= 4 ? 4 : (ctmax >= 2 ? 2 : 1));
+  while (ct > 1 && ct * per > lim) ct /= 2;
+  const int nblk = ((N + c.R - 1) / c.R) * nch;
+  const dim3 grid(nblk, (Tn + ct - 1) / ct);
+  if (ct == 8)      q8_partial_Tb<8><<<grid, 256, 8 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
+  else if (ct == 4) q8_partial_Tb<4><<<grid, 256, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
+  else if (ct == 2) q8_partial_Tb<2><<<grid, 256, 2 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
+  else              q8_partial_Tb<1><<<grid, 256, per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
   cudaError_t le = cudaGetLastError();
   if (le != cudaSuccess) {   // no number for a kernel that did not run (the standing rule)
-    printf("PF4-E2E %s N=%d K=%d KC=%d: LAUNCH ERROR %s\n", name.c_str(), N, K, KC, cudaGetErrorString(le));
+    printf("PF4-E2E %s N=%d K=%d KC=%d CT=%d: LAUNCH ERROR %s\n", name.c_str(), N, K, c.KCHUNK, ct, cudaGetErrorString(le));
     return 1;
   }
   dim3 g((N + 255) / 256, Tn);
@@ -3419,8 +3517,15 @@ static int pf4_embed_chunk(Model& M, PF4Arena& A, const std::vector<int>& prompt
                            int c0, int Tc, Ent* emb) {
   for (int t = 0; t < Tc; t++) {
     const int tok = prompt[c0 + t];
+    const int pos = c0 + t;
     bf16* dst = A.xb + (size_t)t * H;
-    if (emb->dtype == 3) {
+    if (g_semb) { printf("PF4: speech-embedding rows are not supported by the chunked prefill\n"); return 1; }
+    if (g_aemb && pos >= g_aemb_at && pos - g_aemb_at < g_aemb_n) {
+      // Audio position: the step loop's own override, the same kernel on the same row.
+      k_bf16_from_f32<<<(H + 255) / 256, 256, 0, g_launch>>>(g_aemb + (size_t)(pos - g_aemb_at) * H, dst, H);
+      if (cudaGetLastError() != cudaSuccess) { printf("PF4: audio embedding launch failed at pos %d\n", pos); return 1; }
+      g_aemb_fed++;
+    } else if (emb->dtype == 3) {
       const char* src = (M.emb_mode == 1 && M.hemb.hc) ? (const char*)M.hemb.hc : (const char*)emb->dq;
       cudaMemcpy(dst, src + (size_t)tok * H * 2, (size_t)H * 2,
                  M.emb_mode == 1 ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice);
@@ -3911,6 +4016,62 @@ int main(int argc, char** argv) {
     const int tok = s < 0 ? 124894 : toks[s];
     const bf16* lm_head_input = M.x;   // replaced by the embedding_norm output below
     if (pos >= MAXTOK) break;
+    // (Placed at the TOP of step 0, before its embedding and layer body. It used to sit
+    // after them, so position 0 went through the 24 layers twice: every conv ring took an
+    // extra shift, a chunk-invariant offset of ~2000/2048 cells in the prefill output
+    // that still produced plausible greedy tokens -- the "drift" runs 336-338 saw.)
+    // INTEGRATED CHUNKED PREFILL (--prefill-run T): run the whole prompt T positions at
+    // a time -- one T-wide launch per GEMV -- then hand the last row to M.x and jump the
+    // loop counter to the last prompt step, so the head, argmax and feed run through the
+    // EXACT shipped code path (they are not duplicated here). Reached only after the
+    // warm-up step, which has just zeroed the KV caches and the conv ring, so the chunked
+    // prefill starts from the same clean state the T=1 loop does.
+    if (g_pfChunk >= 2 && s == 0) {
+      const int NP = (int)prompt.size();
+      static PF4Arena A; static int A_T = 0;
+      if (A_T < g_pfChunk) { pf4_arena_alloc(A, g_pfChunk); A_T = g_pfChunk; }
+      { int c = 0; for (int L = 0; L < NLAYER; L++) { pf4_conv_idx[L] = c; if (!is_attn_g[L]) c++; } }
+      int Tc = 0;
+      struct timespec q0, q1; clock_gettime(CLOCK_MONOTONIC, &q0);
+      for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
+        Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+        if (pf4_embed_chunk(M, A, prompt, c0, Tc, emb)) { printf("PF4-RUN: embed failed at chunk %d\n", c0); return 1; }
+        for (int L = 0; L < NLAYER; L++)
+          if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+      }
+      cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &q1);
+      printf("PF4-RUN: prompt %d ids in chunks of %d, %.0f ms (%.2f ms/pos)\n",
+             NP, g_pfChunk, (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6,
+             ((q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6) / NP);
+      // Finish the last prompt step HERE: the body's layer loop runs before its head,
+      // so falling through would push the chunk's final residual through one extra
+      // 24-layer pass (observed: the first generated token came out 11 instead of 207).
+      // The head, the argmax and the queue append are the shipped ones -- head_logits_from
+      // is shared with the body, and toks is pre-filled from `prompt`, so step NP consumes
+      // toks[NP] = the token appended here exactly as the T=1 path does.
+      cudaMemcpy(M.x, A.xb + (size_t)(Tc - 1) * H, (size_t)H * 2, cudaMemcpyDeviceToDevice);
+      if (getenv("LFM_DUMPX") && atoi(getenv("LFM_DUMPX")) == NP - 1) {   // same acceptance dump
+        cudaDeviceSynchronize();
+        std::vector<bf16> hx((size_t)H);
+        cudaMemcpy(hx.data(), M.x, (size_t)H * 2, cudaMemcpyDeviceToHost);
+        FILE* df = fopen("/tmp/lfm_x_ref.bin", "wb");
+        if (df) { fwrite(hx.data(), 2, H, df); fclose(df); printf("LFM_DUMPX step %d -> /tmp/lfm_x_ref.bin (PF4-RUN)\n", NP - 1); }
+      }
+      {
+        Ent* fn = T(M, "lfm.model.embedding_norm.weight");
+        rms1(M, M.x, fn ? fn->df : nullptr, M.h1);
+        head_logits_from(M, M.h1, emb);
+        k_argmax<<<1, 256, 0, g_launch>>>(M.lgf, M.tok_dev, VOCAB);
+        cudaDeviceSynchronize();
+        int nt = -1; cudaMemcpy(&nt, M.tok_dev, 4, cudaMemcpyDeviceToHost);
+        toks.push_back(nt);   // this IS the last prompt step: the shipped body appends here too
+        printf("%4d %8d  %8.2f  %6.2f   <- PF4-RUN last prompt step\n", NP - 1, nt,
+               (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6, 0.0);
+        fflush(stdout);
+      }
+      s = NP - 1;                 // next iteration is the first decode step
+      continue;
+    }
     if (g_graphs && M.gx) g_launch = M.stRun;   // embedding, layers, lm_head all on stRun
     cudaEventRecord(evA, g_launch);
     phBegin();
@@ -4089,50 +4250,6 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
     // nothing anyone consumes, so it is skipped -- unless --dump-logits-all is
     // set: the logit gate compares every teacher-forced position against HF.
     // LFM_LEGACYFEED=1 restores the old loop as the A/B control.
-    // INTEGRATED CHUNKED PREFILL (--prefill-run T): run the whole prompt T positions at
-    // a time -- one T-wide launch per GEMV -- then hand the last row to M.x and jump the
-    // loop counter to the last prompt step, so the head, argmax and feed run through the
-    // EXACT shipped code path (they are not duplicated here). Reached only after the
-    // warm-up step, which has just zeroed the KV caches and the conv ring, so the chunked
-    // prefill starts from the same clean state the T=1 loop does.
-    if (g_pfChunk >= 2 && s == 0) {
-      const int NP = (int)prompt.size();
-      static PF4Arena A; static int A_T = 0;
-      if (A_T < g_pfChunk) { pf4_arena_alloc(A, g_pfChunk); A_T = g_pfChunk; }
-      { int c = 0; for (int L = 0; L < NLAYER; L++) { pf4_conv_idx[L] = c; if (!is_attn_g[L]) c++; } }
-      int Tc = 0;
-      struct timespec q0, q1; clock_gettime(CLOCK_MONOTONIC, &q0);
-      for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
-        Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
-        pf4_embed_chunk(M, A, prompt, c0, Tc, emb);
-        for (int L = 0; L < NLAYER; L++) layer_chunk_T(M, L, c0, Tc, A);
-      }
-      cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &q1);
-      printf("PF4-RUN: prompt %d ids in chunks of %d, %.0f ms (%.2f ms/pos)\n",
-             NP, g_pfChunk, (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6,
-             ((q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6) / NP);
-      // Finish the last prompt step HERE: the body's layer loop runs before its head,
-      // so falling through would push the chunk's final residual through one extra
-      // 24-layer pass (observed: the first generated token came out 11 instead of 207).
-      // The head, the argmax and the queue append are the shipped ones -- head_logits_from
-      // is shared with the body, and toks is pre-filled from `prompt`, so step NP consumes
-      // toks[NP] = the token appended here exactly as the T=1 path does.
-      cudaMemcpy(M.x, A.xb + (size_t)(Tc - 1) * H, (size_t)H * 2, cudaMemcpyDeviceToDevice);
-      {
-        Ent* fn = T(M, "lfm.model.embedding_norm.weight");
-        rms1(M, M.x, fn ? fn->df : nullptr, M.h1);
-        head_logits_from(M, M.h1, emb);
-        k_argmax<<<1, 256, 0, g_launch>>>(M.lgf, M.tok_dev, VOCAB);
-        cudaDeviceSynchronize();
-        int nt = -1; cudaMemcpy(&nt, M.tok_dev, 4, cudaMemcpyDeviceToHost);
-        toks.push_back(nt);   // this IS the last prompt step: the shipped body appends here too
-        printf("%4d %8d  %8.2f  %6.2f   <- PF4-RUN last prompt step\n", NP - 1, nt,
-               (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6, 0.0);
-        fflush(stdout);
-      }
-      s = NP - 1;                 // next iteration is the first decode step
-      continue;
-    }
     const int nprompt = (int)prompt.size();
     const bool need_head = s < 0 || g_legacy_feed || s >= nprompt - 1 || dump_logits_all;
     Ent* eemb = emb;
