@@ -486,10 +486,13 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
     const bf16* kr = kc + (size_t)p * nkv * hd + kvh * hd;
     float s = 0.f;
     const int base = lane * (hd / 32);
-    s = __fadd_rn(s, __fmul_rn(q0, bf2f(kr[base + 0])));
-    s = __fadd_rn(s, __fmul_rn(q1, bf2f(kr[base + 1])));
-    s = __fadd_rn(s, __fmul_rn(q2, bf2f(kr[base + 2])));
-    s = __fadd_rn(s, __fmul_rn(q3, bf2f(kr[base + 3])));
+    // The lane's 4 keys are one 8-byte load (hd/32 == 4, row and lane offsets 8-aligned);
+    // same values, same chain.
+    const uint2 kw = *reinterpret_cast<const uint2*>(kr + base);
+    s = __fadd_rn(s, __fmul_rn(q0, __uint_as_float(kw.x << 16)));
+    s = __fadd_rn(s, __fmul_rn(q1, __uint_as_float(kw.x & 0xffff0000u)));
+    s = __fadd_rn(s, __fmul_rn(q2, __uint_as_float(kw.y << 16)));
+    s = __fadd_rn(s, __fmul_rn(q3, __uint_as_float(kw.y & 0xffff0000u)));
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_down_sync(~0u, s, o));
     if (lane == 0) sl[p] = __fmul_rn(s, scaling);
