@@ -4246,7 +4246,11 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.h2, NW(M, L, "post_operator_norm.weight"), A.cy, NORM_EPS, H);
   if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d post_operator_norm launch failed\n", L); return 1; }
   P4("post_op_norm", A.cy, H);
-  for (int t = 0; t < Tn; t++) eadd(M, A.xb + (size_t)t * H, A.cy + (size_t)t * H, A.xb + (size_t)t * H, H);
+  // LFM_PF_EWB (default 1): the chunk's rows are contiguous, so each elementwise op runs
+  // as one launch over Tn * n elements (same per-element arithmetic); 0 = per position.
+  static const int ewb = getenv("LFM_PF_EWB") ? atoi(getenv("LFM_PF_EWB")) : 1;
+  if (ewb) eadd(M, A.xb, A.cy, A.xb, Tn * H);
+  else for (int t = 0; t < Tn; t++) eadd(M, A.xb + (size_t)t * H, A.cy + (size_t)t * H, A.xb + (size_t)t * H, H);
   P4("add1", A.xb, H);
   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "ffn_norm.weight"), A.h1, NORM_EPS, H);
   P4("ffn_norm", A.h1, H);
@@ -4254,7 +4258,8 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   P4("w1", A.w1, INTER);
   if (pf_gemv_T(M, LN(L, "feed_forward.w3.weight"), A.h1, A.w3, A.part, Tn)) return 1;
   P4("w3", A.w3, INTER);
-  for (int t = 0; t < Tn; t++)
+  if (ewb) k_silu_mul_bf<<<(Tn * INTER + 255) / 256, 256, 0, g_launch>>>(A.w1, A.w3, A.h2, Tn * INTER);
+  else for (int t = 0; t < Tn; t++)
     k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(A.w1 + (size_t)t * INTER,
                                                              A.w3 + (size_t)t * INTER,
                                                              A.h2 + (size_t)t * INTER, INTER);
@@ -4264,7 +4269,8 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   P4("w2", A.hout, H);
   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.hout, NW(M, L, "post_ffn_norm.weight"), A.h2, NORM_EPS, H);
   P4("post_ffn_norm", A.h2, H);
-  for (int t = 0; t < Tn; t++) eadd(M, A.xb + (size_t)t * H, A.h2 + (size_t)t * H, A.xb + (size_t)t * H, H);
+  if (ewb) eadd(M, A.xb, A.h2, A.xb, Tn * H);
+  else for (int t = 0; t < Tn; t++) eadd(M, A.xb + (size_t)t * H, A.h2 + (size_t)t * H, A.xb + (size_t)t * H, H);
   P4("add2", A.xb, H);
   return 0;
 }
