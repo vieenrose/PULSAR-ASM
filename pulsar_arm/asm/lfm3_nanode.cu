@@ -1668,9 +1668,17 @@ static void cap_add(const std::string& name, const bf16* xb, const bf16* yb, int
   cudaMemcpy(c.y.data() + o, yb, (size_t)N * 2, cudaMemcpyDeviceToHost);
 }
 
+#include <set>
+static std::set<const void*> g_pftiled;            // tensors repacked to the TLb tile layout
+static void tlb_decode(const int8_t* q, const float* s, const bf16* x, bf16* y, int N, int K, float* part);
 static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   Ent* e = T(M, name);
   const int N = e->ne[0], K = e->ne[1];
+  if (g_pftiled.count(e->dq)) {                      // tiled by the prefill: TLb at one position
+    tlb_decode(e->dq, e->ds, xb, yb, N, K, M.part);
+    if (g_cap_on) cap_add(name, xb, yb, N, K);
+    return;
+  }
   if (g_xrange) xrange_add(name, xb, K);
   GemvCfg c = pick(N, K);
   if (K % c.KCHUNK) { printf("%s: K=%d not divisible by KCHUNK=%d\n", name.c_str(), K, c.KCHUNK); exit(2); }
@@ -3382,6 +3390,7 @@ static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
 
 static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf) {
   Ent* e = T(M, name);
+  if (g_pftiled.count(e->dq)) { printf("gemv_f %s: tiled tensor\n", name.c_str()); exit(2); }
   const int N = e->ne[0], K = e->ne[1];
   GemvCfg c = pick(N, K);
   if (K % c.KCHUNK) { printf("%s: K=%d not divisible by KCHUNK=%d\n", name.c_str(), K, c.KCHUNK); exit(2); }
@@ -3786,6 +3795,121 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 1) q8_partial_Tp(const i
   }
 }
 
+// q8_partial_TLb: q8_partial_Tb<4>'s values for nchunk == 1, one row per THREAD. Lane L of
+// Tb chains blocks L, L+32, ... (acc = fmaf(s_b, dot_b, acc)) and a shuffle_down tree
+// (o = 16..1) reduces the 32 lane values; here leaf i is that lane-i chain and the leaves
+// are combined in 5-bit bit-reversed order by a binary counter (earlier operand left), so
+// every add has the tree's operands: bit-identical. Weights in 32-row tiles (per block b:
+// the tile's 32 first int4s, then its 32 second int4s; scales [tile][b][32]).
+template <int CT>
+__device__ __noinline__ float4 tlb_leaf(const int4* __restrict__ qt, const float* __restrict__ sts,
+                                        const uint32_t* xw, int i, int nb, int xstride) {
+  float acc[4] = { 0.f, 0.f, 0.f, 0.f };
+  for (int b = i; b < nb; b += 32) {
+    const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
+    const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                            (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+    const float sb = sts[b * 32];
+    float dot[4] = { 0.f, 0.f, 0.f, 0.f };
+    const uint32_t* wb0 = xw + b * 17;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+      const float ca = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1)));
+      const float cb = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1) + 8));
+      #pragma unroll
+      for (int p = 0; p < CT; p++) {
+        const uint32_t u = wb0[p * xstride + j];
+        dot[p] = __fmaf_rn(ca, __uint_as_float(u << 16), dot[p]);
+        dot[p] = __fmaf_rn(cb, __uint_as_float(u & 0xffff0000u), dot[p]);
+      }
+    }
+    #pragma unroll
+    for (int p = 0; p < CT; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
+  }
+  return make_float4(acc[0], acc[1], acc[2], acc[3]);
+}
+template <int TPB, int CT = 4>
+__global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLb(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                    const bf16* __restrict__ x, float* __restrict__ part,
+                                                    int N, int K, int nb, int T, bf16* __restrict__ yb) {
+  extern __shared__ uint32_t xw[];                    // [CT][nb][17]
+  const int t0 = blockIdx.y * CT, tid = threadIdx.x;
+  const int xstride = nb * 17;
+  #pragma unroll
+  for (int p = 0; p < CT; p++) {
+    const int t = t0 + p;
+    if (t < T) {
+      const uint32_t* xg = reinterpret_cast<const uint32_t*>(x + (size_t)t * K);
+      for (int i = tid; i < K / 2; i += TPB) xw[p * xstride + (i >> 4) * 17 + (i & 15)] = xg[i];
+    }
+  }
+  __syncthreads();
+  const int row = blockIdx.x * TPB + tid;
+  if (row >= N) return;
+  const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
+  const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
+  float st[5][4], pv[4];
+  #pragma unroll
+  for (int k = 0; k < 32; k++) {
+    const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+    const float4 a = tlb_leaf<CT>(qt, sts, xw, i, nb, xstride);
+    pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
+    bool done = false;
+    #pragma unroll
+    for (int l = 0; l < 5; l++) {
+      if (done) continue;
+      if ((k >> l) & 1) {
+        #pragma unroll
+        for (int p = 0; p < 4; p++) pv[p] = __fadd_rn(st[l][p], pv[p]);
+      } else {
+        #pragma unroll
+        for (int p = 0; p < 4; p++) st[l][p] = pv[p];
+        done = true;
+      }
+    }
+  }
+  #pragma unroll
+  for (int p = 0; p < CT; p++) {
+    const int t = t0 + p;
+    if (t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, pv[p])); else part[(size_t)t * N + row] = pv[p]; }
+  }
+}
+__global__ void k_tile_q(const int4* __restrict__ src, int4* __restrict__ dst, int N, int nb) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // (row, b, h)
+  if (i >= (size_t)N * nb * 2) return;
+  const int row = (int)(i / (nb * 2)), bh = (int)(i - (size_t)row * nb * 2);
+  dst[((size_t)(row >> 5) * nb * 2 + bh) * 32 + (row & 31)] = src[i];
+}
+__global__ void k_tile_s(const float* __restrict__ src, float* __restrict__ dst, int N, int nb) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // (row, b)
+  if (i >= (size_t)N * nb) return;
+  const int row = (int)(i / nb), b = (int)(i - (size_t)row * nb);
+  dst[((size_t)(row >> 5) * nb + b) * 32 + (row & 31)] = src[i];
+}
+// In place (y == x): blocks still staging x would see rows another block already wrote,
+// so the value goes through part and the shipped k_combine_bf (nchunk 1: f2bf(0.f + p)).
+static void tlb_decode(const int8_t* q, const float* s, const bf16* x, bf16* y, int N, int K, float* part) {
+  const int nb = K / Q8_BLK;
+  const bool inplace = (const void*)x == (const void*)y;
+  q8_partial_TLb<256, 1><<<(N + 255) / 256, 256, (size_t)nb * 17 * 4, g_launch>>>(q, s, x, part, N, K, nb, 1,
+                                                                                   inplace ? nullptr : y);
+  if (inplace) k_combine_bf<<<(N + 255) / 256, 256, 0, g_launch>>>(part, y, N, 1);
+}
+static bool pf_tile(Ent* e, int N, int K) {
+  if (g_pftiled.count(e->dq)) return true;
+  const int nb = K / Q8_BLK;
+  void* tmp = nullptr;
+  if (cudaMalloc(&tmp, (size_t)N * K)) return false;
+  k_tile_q<<<(unsigned)(((size_t)N * nb * 2 + 255) / 256), 256, 0, g_launch>>>(reinterpret_cast<const int4*>(e->dq), (int4*)tmp, N, nb);
+  cudaMemcpyAsync((void*)e->dq, tmp, (size_t)N * K, cudaMemcpyDeviceToDevice, g_launch);
+  k_tile_s<<<(unsigned)(((size_t)N * nb + 255) / 256), 256, 0, g_launch>>>(e->ds, (float*)tmp, N, nb);
+  cudaMemcpyAsync((void*)e->ds, tmp, (size_t)N * nb * 4, cudaMemcpyDeviceToDevice, g_launch);
+  if (cudaStreamSynchronize(g_launch) != cudaSuccess) { printf("pf_tile failed\n"); exit(2); }
+  cudaFree(tmp);
+  g_pftiled.insert(e->dq);
+  return true;
+}
+
 static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
                      float* part, int Tn) {
   Ent* e = T(M, name);
@@ -3830,6 +3954,17 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   {
   int ct = ctmax >= 8 ? 8 : (ctmax >= 4 ? 4 : (ctmax >= 2 ? 2 : 1));
   while (ct > 1 && ct * per > lim) ct /= 2;
+  // LFM_PF_TL (default 1): single-chunk CT=4 shapes run q8_partial_TLb (one row per thread,
+  // weights repacked once to 32-row tiles on first use; decode then reads them through
+  // tlb_decode). 2 = 256-thread blocks (slower), 0 = Tb on row-major weights.
+  static const int pftl = getenv("LFM_PF_TL") ? atoi(getenv("LFM_PF_TL")) : 1;
+  if (pftl && ct == 4 && nch == 1 && N % 32 == 0 && nb % 32 == 0 && Tn >= 2 && pf_tile(e, N, K)) {
+    const int tpb = pftl == 2 ? 256 : 512;
+    const dim3 gl((N + tpb - 1) / tpb, (Tn + 3) / 4);
+    if (tpb == 512) q8_partial_TLb<512><<<gl, 512, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+    else            q8_partial_TLb<256><<<gl, 256, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+    goto launched;
+  }
   // LFM_PF_R (default 512; 256 = decode's R): rows per prefill block. Tb has no sh[RMAX],
   // so it can stage each x tile once for 512 rows (32 per warp). Rows only move between
   // blocks: bit-identical. 128 / 1024 / 2048 measured slower.
