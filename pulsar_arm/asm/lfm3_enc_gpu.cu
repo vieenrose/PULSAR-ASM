@@ -324,6 +324,76 @@ __global__ void k_sgemm_f32(const float* __restrict__ x, const float* __restrict
 static int g_bat32 = -2;
 static void bat32_init() { if (g_bat32 == -2) g_bat32 = getenv("LFM_ENC_BAT32") ? atoi(getenv("LFM_ENC_BAT32")) : 0; }
 
+// q8_partial_T<CT>: q8_partial<float,FMA=true> for CT positions per block, sharing each
+// weight block's registers across the CT positions. Per (row, chunk, position) the
+// arithmetic is q8_partial's exactly: lane L folds blocks b = L, L+32, ..., dot_b is the
+// same 32-term fmaf chain over the 33-padded staged x, acc = fmaf(s[b], dot_b, acc), then
+// the same shuffle-down tree; lane 0 stores the value q8_partial would have staged in sh[].
+// So partials are bit-identical, and weight traffic drops CT-fold (the encoder re-streams
+// each layer's weights once per position: ~186 GB per pass at Tt=1622). No sh[] buffer
+// and CT <= 4 keep shared <= 16 KB/block, so the SM still holds several blocks (CT=8 with
+// 48 KB ran at 1 block/SM and lost 3.7 s). LFM_ENC_PT = 0 (per-position loop) | 2 | 4.
+static int g_encpt = -2;
+template <int CT>
+__global__ void __launch_bounds__(256, 4) q8_partial_T(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                       const float* __restrict__ x, float* __restrict__ part,
+                                                       int N, int K, int KCHUNK, int R, int nb, int T) {
+  extern __shared__ float xs[];                       // [CT][nb*33]
+  const int nchunk = K / KCHUNK;
+  const int rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
+  const int koff = chunk * KCHUNK;
+  const int t0 = blockIdx.y * CT;
+  const int NT = blockDim.x, tid = threadIdx.x;
+  const int xstride = nb * 33;
+  #pragma unroll
+  for (int p = 0; p < CT; p++) {
+    const int t = t0 + p;
+    if (t < T) {
+      const float* xg = x + (size_t)t * K + koff;
+      for (int i = tid; i < KCHUNK; i += NT) xs[p * xstride + (i >> 5) * 33 + (i & 31)] = xg[i];
+    }
+  }
+  __syncthreads();
+  const int base = rowblk * R;
+  const int lane = tid & 31, wid = tid >> 5;
+  const int WPB = NT >> 5, GR = R / WPB;
+  for (int g = 0; g < GR; g++) {
+    const int row = base + wid + g * WPB;
+    if (row >= N) continue;                           // warp-uniform: row depends on wid only
+    float acc[CT];
+    #pragma unroll
+    for (int p = 0; p < CT; p++) acc[p] = 0.f;
+    const int8_t* qr = q + (size_t)row * K + koff;
+    const float* sr = s + (size_t)row * (K / Q8_BLK) + (size_t)chunk * nb;
+    #pragma unroll 1
+    for (int b = lane; b < nb; b += 32) {
+      const int4 a0 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK);
+      const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
+      const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
+      const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+      const float sb = sr[b];
+      #pragma unroll
+      for (int p = 0; p < CT; p++) {
+        const float* xb = xs + p * xstride + (size_t)b * 33;
+        float dot = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c0[j], xb[j], dot);
+        #pragma unroll
+        for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c1[j], xb[16 + j], dot);
+        acc[p] = __fmaf_rn(sb, dot, acc[p]);
+      }
+    }
+    #pragma unroll
+    for (int p = 0; p < CT; p++) {
+      float a = acc[p];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(~0u, a, o);
+      const int t = t0 + p;
+      if (lane == 0 && t < T) part[((size_t)t * N + row) * nchunk + chunk] = a;
+    }
+  }
+}
+
 struct Gemm {
   const int8_t* q; const float* s; const float* wf;   // wf != null = f32 weights
   int N, K, KC, nb, nch, R, nblk, nblk256;
@@ -439,6 +509,29 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
     }
     printf("bat32 launch refused at N=%d K=%d KC=%d nb=%d nch=%d shm=%zu: %s -- per-position loop\n",
            g.N, g.K, g.KC, g.nb, g.nch, shmB, cudaGetErrorString(be));
+  }
+  if (g_encpt == -2) g_encpt = getenv("LFM_ENC_PT") ? atoi(getenv("LFM_ENC_PT")) : 4;
+  if (g_encpt && T > 1 && g.R == 256) {
+    const size_t per = (size_t)g.nb * 33 * 4;         // one position's staged x
+    int ct = g_encpt >= 4 ? 4 : 2;
+    while (ct > 1 && ct * per > 16384) ct /= 2;
+    if (ct >= 2) {
+      for (int t0 = 0; t0 < T; t0 += 65535 * ct) {    // gridDim.y <= 65535
+        const int Tl = (T - t0 < 65535 * ct) ? T - t0 : 65535 * ct;
+        const dim3 grid(g.nblk, (Tl + ct - 1) / ct);
+        if (ct == 4) q8_partial_T<4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
+        else         q8_partial_T<2><<<grid, TPB, 2 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
+        const cudaError_t le = cudaGetLastError();
+        if (le) { printf("q8_partial_T<%d> launch REFUSED at N=%d K=%d KC=%d nb=%d: %s\n",
+                         ct, g.N, g.K, g.KC, g.nb, cudaGetErrorString(le)); exit(3); }
+      }
+      chk("gemm fp32 T-wide");
+      k_combine_f<<<(unsigned)((T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, g.nch);
+      chk("gemm combine");
+      return;
+    }
   }
   for (int t = 0; t < T; t++) {
     q8_partial<float, true, false, 1, 0><<<g.nblk, TPB, shm>>>(g.q, g.s, x + (size_t)t * g.K,
