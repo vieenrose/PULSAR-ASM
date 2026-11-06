@@ -823,6 +823,7 @@ struct Ent {
   uint32_t crc;
   bool host = false;          // payload lives in pinned host memory, not device
   int8_t* dq = nullptr; float* ds = nullptr; float* df = nullptr;
+  bool tiled = false;         // dq/ds repacked to the 32-row tile layout (TLb/TLg/tlb_decode)
 };
 
 // The tied embedding, kept in PINNED HOST memory and streamed into a device
@@ -1125,8 +1126,16 @@ static bool load_wait(int n) {
   return g_lj->ok && __atomic_load_n(&g_lj->done, __ATOMIC_ACQUIRE) >= n;
 }
 
+static bool pf_tilable(const Ent& e);
+__global__ void k_tile_q(const int4* __restrict__ src, int4* __restrict__ dst, int N, int nb);
+__global__ void k_tile_s(const float* __restrict__ src, float* __restrict__ dst, int N, int nb);
 static void* load_consume(void* arg) {
   LoadJob& J = *(LoadJob*)arg;
+  // LFM_PF_TLOAD (default 1): tensors the prefill would tile are repacked here, on the
+  // loader's stream right after their upload and CRC, before `done` publishes them -- off
+  // the prefill's critical path. Same kernels and layout as pf_tile.
+  static const int tload = getenv("LFM_PF_TLOAD") ? atoi(getenv("LFM_PF_TLOAD")) : 1;
+  void* tscr = nullptr; size_t tscr_n = 0;
   Model& M = *J.M;
   pthread_t rth; pthread_create(&rth, nullptr, load_reader, &J.R);
   bool ok = true;
@@ -1177,8 +1186,25 @@ static void* load_consume(void* arg) {
     }
     if (ok && c != e.crc) {
       printf("CRC MISMATCH %s: file %08x want %08x\n", e.name.c_str(), c, e.crc); ok = false; }
+    if (ok && !skip && tload && pf_tilable(e)) {
+      const int N = e.ne[0], K = e.ne[1], nb = K / Q8_BLK;
+      if (tscr_n < e.nc) {
+        if (tscr) cudaFree(tscr);
+        tscr = nullptr; tscr_n = 0;
+        if (cudaMalloc(&tscr, e.nc) == cudaSuccess) tscr_n = e.nc;
+      }
+      if (tscr) {
+        k_tile_q<<<(unsigned)(((size_t)N * nb * 2 + 255) / 256), 256, 0, J.st>>>(reinterpret_cast<const int4*>(e.dq), (int4*)tscr, N, nb);
+        cudaMemcpyAsync((void*)e.dq, tscr, e.nc, cudaMemcpyDeviceToDevice, J.st);
+        k_tile_s<<<(unsigned)(((size_t)N * nb + 255) / 256), 256, 0, J.st>>>(e.ds, (float*)tscr, N, nb);
+        cudaMemcpyAsync((void*)e.ds, tscr, (size_t)N * nb * 4, cudaMemcpyDeviceToDevice, J.st);
+        if (cudaStreamSynchronize(J.st) != cudaSuccess) { printf("TILE FAIL %s\n", e.name.c_str()); ok = false; }
+        else e.tiled = true;
+      }
+    }
     if (ok) __atomic_store_n(&J.done, (int)oi + 1, __ATOMIC_RELEASE);
   }
+  if (tscr) cudaFree(tscr);
   load_stop(J.R); pthread_join(rth, nullptr);
   for (int k = 0; k < LoadRing::NS; k++) free(J.R.buf[k]);
   J.ok = ok;
@@ -1668,13 +1694,11 @@ static void cap_add(const std::string& name, const bf16* xb, const bf16* yb, int
   cudaMemcpy(c.y.data() + o, yb, (size_t)N * 2, cudaMemcpyDeviceToHost);
 }
 
-#include <set>
-static std::set<const void*> g_pftiled;            // tensors repacked to the TLb tile layout
 static void tlb_decode(const int8_t* q, const float* s, const bf16* x, bf16* y, int N, int K, float* part);
 static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   Ent* e = T(M, name);
   const int N = e->ne[0], K = e->ne[1];
-  if (g_pftiled.count(e->dq)) {                      // tiled by the prefill: TLb at one position
+  if (e->tiled) {                                    // tiled weights: TLb at one position
     tlb_decode(e->dq, e->ds, xb, yb, N, K, M.part);
     if (g_cap_on) cap_add(name, xb, yb, N, K);
     return;
@@ -3390,7 +3414,7 @@ static void lm_head_host(Model& M, HostEmb& E, const bf16* xb, float* yf) {
 
 static void gemv_f(Model& M, const std::string& name, const bf16* xb, float* yf) {
   Ent* e = T(M, name);
-  if (g_pftiled.count(e->dq)) { printf("gemv_f %s: tiled tensor\n", name.c_str()); exit(2); }
+  if (e->tiled) { printf("gemv_f %s: tiled tensor\n", name.c_str()); exit(2); }
   const int N = e->ne[0], K = e->ne[1];
   GemvCfg c = pick(N, K);
   if (K % c.KCHUNK) { printf("%s: K=%d not divisible by KCHUNK=%d\n", name.c_str(), K, c.KCHUNK); exit(2); }
@@ -3975,8 +3999,20 @@ static void tlb_decode(const int8_t* q, const float* s, const bf16* x, bf16* y, 
                                                                                    inplace ? nullptr : y);
   if (inplace) k_combine_bf<<<(N + 255) / 256, 256, 0, g_launch>>>(part, y, N, 1);
 }
+// The shapes pf_gemv_T runs on TLb / TLg: one K-chunk (pick), 32-row tiles, and either
+// a whole-row CT=4 stage within the 40 KB default (nb % 32 == 0) or the grouped TLg stage.
+static bool pf_tilable(const Ent& e) {
+  if (e.dtype != 1 || !e.dq || e.name.compare(0, 17, "lfm.model.layers.") != 0) return false;
+  const int N = e.ne[0], K = e.ne[1];
+  if (N % 32 || K % Q8_BLK) return false;
+  const GemvCfg c = pick(N, K);
+  if (K % c.KCHUNK || K / c.KCHUNK != 1) return false;
+  const int nb = K / Q8_BLK;
+  const size_t per = (size_t)nb * 17 * 4;
+  return nb <= 256 && (4 * per > 40000 || nb % 32 == 0);
+}
 static bool pf_tile(Ent* e, int N, int K) {
-  if (g_pftiled.count(e->dq)) return true;
+  if (e->tiled) return true;
   const int nb = K / Q8_BLK;
   // One scratch buffer, grown to the largest tensor and reused (LFM_PF_TSCR=0: per-tensor
   // cudaMalloc/cudaFree, which on this Tegra backs and zeroes pages at ~0.86 ms/MB).
@@ -3998,7 +4034,7 @@ static bool pf_tile(Ent* e, int N, int K) {
   cudaMemcpyAsync((void*)e->ds, tmp, (size_t)N * nb * 4, cudaMemcpyDeviceToDevice, g_launch);
   if (cudaStreamSynchronize(g_launch) != cudaSuccess) { printf("pf_tile failed\n"); exit(2); }
   if (!tscr) cudaFree(tmp);
-  g_pftiled.insert(e->dq);
+  e->tiled = true;
   return true;
 }
 
@@ -4032,7 +4068,7 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   // below 4 run the phased kernel instead (bit-identical, see q8_partial_Tp).
   static const int pf_ph = getenv("LFM_PF_PH") ? atoi(getenv("LFM_PF_PH")) : 1;
   static const int pftg = getenv("LFM_PF_TLG") ? atoi(getenv("LFM_PF_TLG")) : 1;
-  if (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K)) {
+  if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
     q8_partial_TLg<<<dim3((N + 511) / 512, (Tn + 3) / 4), 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     goto launched;
   }
@@ -4055,7 +4091,8 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   // weights repacked once to 32-row tiles on first use; decode then reads them through
   // tlb_decode). 2 = 256-thread blocks (slower), 0 = Tb on row-major weights.
   static const int pftl = getenv("LFM_PF_TL") ? atoi(getenv("LFM_PF_TL")) : 1;
-  if (pftl && ct == 4 && nch == 1 && N % 32 == 0 && nb % 32 == 0 && Tn >= 2 && pf_tile(e, N, K)) {
+  if (e->tiled && !(ct == 4 && nch == 1)) { printf("PF4-E2E %s: tiled tensor has no TL path\n", name.c_str()); return 1; }
+  if (e->tiled || (pftl && ct == 4 && nch == 1 && N % 32 == 0 && nb % 32 == 0 && Tn >= 2 && pf_tile(e, N, K))) {
     const int tpb = pftl == 2 ? 256 : 512;
     const dim3 gl((N + tpb - 1) / tpb, (Tn + 3) / 4);
     if (tpb == 512) q8_partial_TLb<512><<<gl, 512, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
