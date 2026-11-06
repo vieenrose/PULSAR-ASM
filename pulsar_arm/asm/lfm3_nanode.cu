@@ -894,6 +894,69 @@ static void load_give(LoadRing& R, int slot) {
 static void load_stop(LoadRing& R) {
   pthread_mutex_lock(&R.mu); R.stop = true; pthread_cond_broadcast(&R.cv); pthread_mutex_unlock(&R.mu);
 }
+struct Model;
+struct LoadJob {
+  Model* M = nullptr; LoadRing R; cudaStream_t st = 0; pthread_t th;
+  std::vector<size_t> order; std::vector<char*> d0, d1; std::vector<char> skip;
+  int need[64]; int need_emb = 0;
+  volatile int done = 0, finished = 0; bool ok = true;
+};
+static int g_ovl = 0;                   // LFM_PF_OVL: weight upload overlapped with the prefill
+static LoadJob* g_lj = nullptr;
+static void* load_consume(void* arg);
+// Block until the first n tensors (upload order) are on the device; false on a load error.
+static bool load_wait(int n) {
+  if (!g_lj) return true;
+  while (__atomic_load_n(&g_lj->done, __ATOMIC_ACQUIRE) < n && !__atomic_load_n(&g_lj->finished, __ATOMIC_ACQUIRE))
+    usleep(200);
+  return g_lj->ok && __atomic_load_n(&g_lj->done, __ATOMIC_ACQUIRE) >= n;
+}
+
+static void* load_consume(void* arg) {
+  LoadJob& J = *(LoadJob*)arg;
+  Model& M = *J.M;
+  pthread_t rth; pthread_create(&rth, nullptr, load_reader, &J.R);
+  bool ok = true;
+  for (size_t oi = 0; oi < J.order.size() && ok; oi++) {
+    Ent& e = M.ents[J.order[oi]];
+    const size_t tot = e.nc + e.ns;
+    char* d0 = J.d0[oi]; char* d1 = J.d1[oi]; const bool skip = J.skip[oi];
+    uint32_t c = 0;
+    for (size_t done = 0; done < tot; ) {
+      int slot; size_t len; char* p = load_take(J.R, slot, len);
+      if (!p) { printf("short read %s\n", e.name.c_str()); ok = false; break; }
+      // Recomputing the exporter's per-tensor crc32 is what turns "the engine
+      // runs the quantizer that was certified 8/8" into a load-time assertion.
+      c = (uint32_t)crc32(c, (const Bytef*)p, (uInt)len);
+      cudaError_t ce = cudaSuccess;
+      if (!skip) {
+        const size_t lo = done, hi = done + len;
+        if (lo < e.nc) { const size_t n = (hi < e.nc ? hi : e.nc) - lo;
+          ce = cudaMemcpyAsync(d0 + lo, p, n, cudaMemcpyHostToDevice, J.st); }
+        if (ce == cudaSuccess && hi > e.nc && d1) { const size_t s0 = lo > e.nc ? lo : e.nc;
+          ce = cudaMemcpyAsync(d1 + (s0 - e.nc), p + (s0 - lo), hi - s0, cudaMemcpyHostToDevice, J.st); }
+        if (ce == cudaSuccess) ce = cudaStreamSynchronize(J.st);   // slot reuse + visibility
+      }
+      load_give(J.R, slot);
+      if (ce != cudaSuccess) {
+        printf("UPLOAD FAIL %s dtype=%d nc=%zu ns=%zu -> %s\n", e.name.c_str(), e.dtype, e.nc, e.ns,
+               cudaGetErrorString(ce));
+        ok = false; break;
+      }
+      done += len;
+    }
+    if (ok && c != e.crc) {
+      printf("CRC MISMATCH %s: file %08x want %08x\n", e.name.c_str(), c, e.crc); ok = false; }
+    if (ok) __atomic_store_n(&J.done, (int)oi + 1, __ATOMIC_RELEASE);
+  }
+  load_stop(J.R); pthread_join(rth, nullptr);
+  for (int k = 0; k < LoadRing::NS; k++) free(J.R.buf[k]);
+  J.ok = ok;
+  if (g_ovl && J.R.fd >= 0) close(J.R.fd);
+  __atomic_store_n(&J.finished, 1, __ATOMIC_RELEASE);
+  if (!ok) fflush(stdout);
+  return nullptr;
+}
 
 static bool load_blob(const char* path, Model& M, std::string& js) {
   FILE* f = fopen(path, "rb");
@@ -1071,70 +1134,63 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   // into a 1.6 MB arena -- the failure then looked like a blob/CRC problem
   // while it was really an out-of-memory one. Uploading the small tensors
   // first makes starvation happen while there is still room to say so.
-  std::vector<size_t> order;
+  LoadJob* J = new LoadJob;
+  std::vector<size_t>& order = J->order;
   for (int pass = 0; pass < 2; pass++)
     for (size_t i = 0; i < M.ents.size(); i++)
       if ((M.ents[i].dtype == 2) == (pass == 0)) order.push_back(i);
-  // Pipelined read: a reader thread preads 16 MB chunks into a 4-slot ring while
-  // this thread runs the incremental crc32 and the H2D copy of the previous chunk.
-  // The serial read -> crc -> copy loop left the eMMC idle during crc + copy:
-  // 34.9 s load against a 21.3 s cold dd of the same file. Bytes, order of the
-  // uploads and the per-tensor CRC assertion are unchanged.
-  LoadRing R; R.fd = bfd; R.base = base_data; R.ents = &M.ents; R.order = &order;
-  pthread_t rth; pthread_create(&rth, nullptr, load_reader, &R);
-  bool ok = true;
-  for (size_t oi = 0; oi < order.size() && ok; oi++) {
-    const size_t i = order[oi];
-    Ent& e = M.ents[i];
-    const size_t tot = e.nc + e.ns;
+  // Device addresses are a running offset in upload order, so they are all known
+  // before a byte is read: assign them (and register the tensors) up front. That is
+  // what lets LFM_PF_OVL run the copy loop on a thread while prefill starts.
+  J->M = &M; J->d0.assign(order.size(), nullptr); J->d1.assign(order.size(), nullptr);
+  J->skip.assign(order.size(), 0);
+  for (int L = 0; L < NLAYER; L++) J->need[L] = 0;
+  for (size_t oi = 0; oi < order.size(); oi++) {
+    Ent& e = M.ents[order[oi]];
     // The bf16 (dtype 3) embedding must be DEVICE-resident: lm_head_bf16
     // reads it directly, and the Q8 host-staging path has no bf16 form.
     // Under --emb-host the tied embedding lives in pinned host memory only,
     // for BOTH payload formats: Q8 (lm_head_host) and bf16 (lm_head_bf16_host).
     // Mode 2 (selftest) needs ONLY the embedding resident, so the other 285
-    // tensors stay on disk... (they are still read here so the CRC is checked).
+    // tensors stay off the device (they are still read so the CRC is checked).
     const bool skip = (M.emb_mode == 1 && e.name == EMBNAME) || (M.emb_mode == 2 && e.name != EMBNAME);
-    char* d0 = nullptr; char* d1 = nullptr;           // dst of bytes [0,nc) and [nc,tot)
+    J->skip[oi] = skip;
     if (!skip) {
-      if (e.dtype == 3) { d0 = (char*)(M.dq + oc); e.dq = M.dq + oc; e.ds = nullptr; oc += e.nc; }
-      else if (e.dtype == 1) { d0 = (char*)(M.dq + oc); d1 = (char*)M.ds + os;
+      if (e.dtype == 3) { J->d0[oi] = (char*)(M.dq + oc); e.dq = M.dq + oc; e.ds = nullptr; oc += e.nc; }
+      else if (e.dtype == 1) { J->d0[oi] = (char*)(M.dq + oc); J->d1[oi] = (char*)M.ds + os;
         e.dq = M.dq + oc; e.ds = (float*)((char*)M.ds + os); oc += e.nc; os += e.ns; }
       else {
         // `M.df + of` is float* arithmetic on a BYTE offset: it advanced 4*of,
         // so the first ~48 norm vectors landed inside the arena by luck. Byte offsets.
-        d0 = (char*)M.df + of; e.df = (float*)((char*)M.df + of); of += e.nc; }
+        J->d0[oi] = (char*)M.df + of; e.df = (float*)((char*)M.df + of); of += e.nc; }
+      M.by[e.name] = &M.ents[order[oi]];
     }
-    uint32_t c = 0;
-    for (size_t done = 0; done < tot; ) {
-      int slot; size_t len; char* p = load_take(R, slot, len);
-      if (!p) { printf("short read %s\n", e.name.c_str()); ok = false; break; }
-      // Recomputing the exporter's per-tensor crc32 is what turns "the engine
-      // runs the quantizer that was certified 8/8" into a load-time assertion.
-      c = (uint32_t)crc32(c, (const Bytef*)p, (uInt)len);
-      cudaError_t ce = cudaSuccess;
-      if (!skip) {
-        const size_t lo = done, hi = done + len;
-        if (lo < e.nc) { const size_t n = (hi < e.nc ? hi : e.nc) - lo;
-          ce = cudaMemcpy(d0 + lo, p, n, cudaMemcpyHostToDevice); }
-        if (ce == cudaSuccess && hi > e.nc && d1) { const size_t s0 = lo > e.nc ? lo : e.nc;
-          ce = cudaMemcpy(d1 + (s0 - e.nc), p + (s0 - lo), hi - s0, cudaMemcpyHostToDevice); }
-      }
-      load_give(R, slot);
-      if (ce != cudaSuccess) {
-        printf("UPLOAD FAIL %s dtype=%d nc=%zu ns=%zu arenas: codes %zu/%zu scales %zu/%zu f32 %zu/%zu -> %s\n",
-               e.name.c_str(), e.dtype, e.nc, e.ns, oc, M.need_q, os, M.need_s, of, M.need_f,
-               cudaGetErrorString(ce));
-        ok = false; break;
-      }
-      done += len;
-    }
-    if (ok && c != e.crc) {
-      printf("CRC MISMATCH %s: file %08x want %08x\n", e.name.c_str(), c, e.crc); ok = false; }
-    if (ok && !skip) M.by[e.name] = &M.ents[i];
+    if (e.name == EMBNAME) J->need_emb = (int)oi + 1;
+    int L = -1;
+    if (sscanf(e.name.c_str(), "lfm.model.layers.%d.", &L) == 1 && L >= 0 && L < NLAYER && J->need[L] < (int)oi + 1)
+      J->need[L] = (int)oi + 1;
   }
-  load_stop(R); pthread_join(rth, nullptr);
-  for (int k = 0; k < LoadRing::NS; k++) free(R.buf[k]);
-  if (!ok) { fclose(f); return false; }
+  // Pipelined read: a reader thread preads 16 MB chunks into a 4-slot ring while the
+  // copy loop runs the incremental crc32 and the H2D copy of the previous chunk.
+  // The serial read -> crc -> copy loop left the eMMC idle during crc + copy:
+  // 34.9 s load against a 21.3 s cold dd of the same file. Bytes, order of the
+  // uploads and the per-tensor CRC assertion are unchanged.
+  J->R.base = base_data; J->R.ents = &M.ents; J->R.order = &order;
+  if (g_ovl) {
+    // LFM_PF_OVL: the copy loop continues on its own thread and its own non-blocking
+    // stream (g_launch is the legacy stream, which would otherwise serialize every
+    // upload behind queued prefill kernels); prefill waits per layer (load_wait).
+    J->R.fd = dup(bfd);
+    cudaStreamCreateWithFlags(&J->st, cudaStreamNonBlocking);
+    g_lj = J;
+    pthread_create(&J->th, nullptr, load_consume, J);
+  } else {
+    J->R.fd = bfd; J->st = (cudaStream_t)0;
+    load_consume(J);
+    const bool ok = J->ok;
+    delete J;
+    if (!ok) { fclose(f); return false; }
+  }
   for (size_t i = 0; i < M.ents.size(); i++)
     if (M.ents[i].name == EMBNAME) M.ents[i].host = (M.emb_mode == 1);
   fclose(f);  // Build the merged gate/up tensors (device-to-device copies of the Q8 rows
@@ -3725,6 +3781,13 @@ int main(int argc, char** argv) {
   M.emb_mode = emb_mode_req;        // flags are parsed before M exists
   M.path = argv[1];
   { struct timespec _t0; clock_gettime(CLOCK_MONOTONIC, &_t0);
+    // LFM_PF_OVL: upload the weights on a thread while the (layer-major) chunked prefill
+    // runs, each layer waiting for its own tensors. Only on the plain resident-embedding
+    // path: the merged gate/up copies, graphs and the host-staged embedding all need the
+    // whole blob before the first step.
+    // Default on; LFM_PF_OVL=0 restores the serial load (A/B control).
+    g_ovl = !(getenv("LFM_PF_OVL") && !atoi(getenv("LFM_PF_OVL"))) && g_pfChunk >= 2 &&
+            M.emb_mode == 0 && !g_merge && !g_graphs;
     if (!load_blob(argv[1], M, js)) return 1;
     struct timespec _t1; clock_gettime(CLOCK_MONOTONIC, &_t1);
     // LFM_LOADTIME=1: measured 76 s of a 78 s 3-step launch on the board (the GPU arena
@@ -4031,7 +4094,15 @@ int main(int argc, char** argv) {
   // Never enabled with graphs (the capture is keyed on step indices).
   // Measured (#138, paired 4/4, order-balanced, cold page cache): TTFT on
   // prompt A 2649.3 -> 2589.6 ms (-59.8 ms); 40-step streams identical.
-  const bool warm = getenv("LFM_NOWARM") == nullptr && !g_graphs;
+  // Under LFM_PF_OVL the weights are still arriving, so there is no warm-up forward;
+  // its only effect on the run, the zeroed conv rings and KV caches, is done here.
+  const bool warm = getenv("LFM_NOWARM") == nullptr && !g_graphs && !g_ovl;
+  if (g_ovl) {
+    cudaMemset(M.ring, 0, (size_t)NCONV * 7 * H * 2);
+    cudaMemset(M.kc, 0, kvbytes); cudaMemset(M.vc, 0, kvbytes);
+    cudaMemset(M.x, 0, H * 2);
+    cudaDeviceSynchronize();
+  }
   // LFM_WARMMS=N (default 0 = shipped behavior): keep running dummy forwards
   // at position 0 until N ms of wall-clock GPU load, absorbing the devfreq
   // DVFS ramp the same way the single step absorbs the page cache. Measured
@@ -4092,6 +4163,37 @@ int main(int argc, char** argv) {
       { int c = 0; for (int L = 0; L < NLAYER; L++) { pf4_conv_idx[L] = c; if (!is_attn_g[L]) c++; } }
       int Tc = 0;
       struct timespec q0, q1; clock_gettime(CLOCK_MONOTONIC, &q0);
+      // LFM_PF_LM=1: layer-major order. Every chunk's residual lives in its own slice of
+      // a [NP][H] buffer (A.xb is the only state layer_chunk_T carries across layers), so
+      // layer L runs over all chunks before layer L+1. Per position the arithmetic is the
+      // chunk-major path's exactly: attention at layer L reads only earlier positions'
+      // K/V at layer L, and the conv ring of layer L advances chunk by chunk in order.
+      static const int pf_lm = g_ovl || (getenv("LFM_PF_LM") && atoi(getenv("LFM_PF_LM")));
+      bf16* xb0 = A.xb;
+      if (pf_lm) {
+        static bf16* xall = nullptr;
+        if (!xall && cudaMalloc(&xall, (size_t)NP * H * 2) != cudaSuccess) { printf("PF4-RUN: xall alloc failed\n"); return 1; }
+        if (g_lj && !load_wait(g_lj->need_emb)) { printf("PF4-RUN: weight load failed (embedding)\n"); return 1; }
+        for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
+          Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+          A.xb = xall + (size_t)c0 * H;
+          if (pf4_embed_chunk(M, A, prompt, c0, Tc, emb)) { printf("PF4-RUN: embed failed at chunk %d\n", c0); return 1; }
+        }
+        for (int L = 0; L < NLAYER; L++) {
+          if (g_lj && !load_wait(g_lj->need[L])) { printf("PF4-RUN: weight load failed (layer %d)\n", L); return 1; }
+          for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
+            Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+            A.xb = xall + (size_t)c0 * H;
+            if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+          }
+        }
+        if (g_lj) {            // everything else (final norm, tied head) needs the whole blob
+          if (!load_wait((int)g_lj->order.size())) { printf("PF4-RUN: weight load failed\n"); return 1; }
+          pthread_join(g_lj->th, nullptr);
+          printf("PF4-RUN: weights uploaded during the prefill (%zu tensors, CRC ok)\n", g_lj->order.size());
+          g_lj = nullptr;
+        }
+      } else
       for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
         Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
         if (pf4_embed_chunk(M, A, prompt, c0, Tc, emb)) { printf("PF4-RUN: embed failed at chunk %d\n", c0); return 1; }
@@ -4109,6 +4211,7 @@ int main(int argc, char** argv) {
       // is shared with the body, and toks is pre-filled from `prompt`, so step NP consumes
       // toks[NP] = the token appended here exactly as the T=1 path does.
       cudaMemcpy(M.x, A.xb + (size_t)(Tc - 1) * H, (size_t)H * 2, cudaMemcpyDeviceToDevice);
+      A.xb = xb0;                 // the arena's own staging row block again
       if (getenv("LFM_DUMPX") && atoi(getenv("LFM_DUMPX")) == NP - 1) {   // same acceptance dump
         cudaDeviceSynchronize();
         std::vector<bf16> hx((size_t)H);
