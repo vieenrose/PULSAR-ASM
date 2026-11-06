@@ -177,6 +177,26 @@ __global__ void k_chw2phw(const float* __restrict__ in, float* __restrict__ out,
   const int c = i / HW, p = i % HW;
   out[(size_t)p * C + c] = in[i];
 }
+// out[c][r] = in[r][c] for a rows x cols matrix, 32x32 smem tiles (coalesced both sides).
+// Pure data movement: identical values to the one-thread-per-element kernels.
+__global__ void k_transpose(const float* __restrict__ in, float* __restrict__ out, int rows, int cols) {
+  __shared__ float t[32][33];
+  const int c0 = blockIdx.x * 32, r0 = blockIdx.y * 32;
+  const int tx = threadIdx.x, ty = threadIdx.y;
+  for (int k = ty; k < 32; k += 8) {
+    const int r = r0 + k, c = c0 + tx;
+    if (r < rows && c < cols) t[k][tx] = in[(size_t)r * cols + c];
+  }
+  __syncthreads();
+  for (int k = ty; k < 32; k += 8) {
+    const int c = c0 + k, r = r0 + tx;
+    if (r < rows && c < cols) out[(size_t)c * rows + r] = t[tx][k];
+  }
+}
+static void transpose(const float* in, float* out, int rows, int cols) {
+  k_transpose<<<dim3((cols + 31) / 32, (rows + 31) / 32), dim3(32, 8)>>>(in, out, rows, cols);
+}
+static const int g_enctr = getenv("LFM_ENC_TR") ? atoi(getenv("LFM_ENC_TR")) : 1;
 __global__ void k_phw2chw(const float* __restrict__ in, float* __restrict__ out, int C, int HW) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= C * HW) return;
@@ -1075,7 +1095,8 @@ int main(int argc, char** argv) {
   chk("conv_mid");
   // 3) lin_mid as a GEMM over P2 = EH2*EWo2 positions, then silu
   { const int P2 = EH2 * EWo2;
-    k_chw2phw<<<(unsigned)((n2 + 255) / 256), 256>>>(x2, perm, 256, P2);
+    if (g_enctr) transpose(x2, perm, 256, P2);
+    else k_chw2phw<<<(unsigned)((n2 + 255) / 256), 256>>>(x2, perm, 256, P2);
     chk("chw2phw");
     Gemm g;
     if (w_lmid->dtype == 2) gemm_setup_f32(g, w_lmid->df, 256, 256, P2);
@@ -1086,12 +1107,14 @@ int main(int argc, char** argv) {
     k_bias_silu<<<(unsigned)((n2 + 255) / 256), 256>>>(x2b, b_lmid->df, n2, 256, 1); }
   chk("lin_mid gemm");
   // 4) conv_end (depthwise) on the CHW view of x2b
-  k_phw2chw<<<(unsigned)((n2 + 255) / 256), 256>>>(x2b, perm, 256, EH2 * EWo2);
+  if (g_enctr) transpose(x2b, perm, EH2 * EWo2, 256);
+  else k_phw2chw<<<(unsigned)((n2 + 255) / 256), 256>>>(x2b, perm, 256, EH2 * EWo2);
   conv3x3(perm, w_end->df, b_end->df, x3, 256, EH2, EWo2, EH3, EWo3, 0, 0);
   chk("conv_end");
   // 5) lin_end as a GEMM over P3 = EH3*EWo3 positions, then silu
   { const int P3 = EH3 * EWo3;
-    k_chw2phw<<<(unsigned)((n3 + 255) / 256), 256>>>(x3, x2b, 256, P3);   // reuse x2b as the PHW source
+    if (g_enctr) transpose(x3, x2b, 256, P3);   // reuse x2b as the PHW source
+    else k_chw2phw<<<(unsigned)((n3 + 255) / 256), 256>>>(x3, x2b, 256, P3);
     Gemm g;
     if (w_lend->dtype == 2) gemm_setup_f32(g, w_lend->df, 256, 256, P3);
     else gemm_setup(g, w_lend->dq, w_lend->ds, 256, 256, P3, 1, 4);
