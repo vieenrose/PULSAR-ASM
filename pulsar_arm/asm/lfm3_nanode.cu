@@ -991,6 +991,28 @@ struct Model {
   int* tok_dev;
 };
 
+// LFM_AEMB_WAIT=1 (set by lfm3_asr, which starts this process while the encoder still runs):
+// --audio-emb names a file that appears (by rename, after the shell validated the encoder's
+// output) only when the encoder has exited. Until then the upload stops after layer 1
+// (g_load_gate) so the two processes never hold the full backbone plus the encoder's
+// activations at once (that combination took picard down, run 281).
+static const char* g_aemb_wait = nullptr;
+static volatile int g_load_gate = 0x7fffffff;
+static void aemb_wait_file() {
+  if (!g_aemb_wait) return;
+  struct timespec t0, t; clock_gettime(CLOCK_MONOTONIC, &t0);
+  while (access(g_aemb_wait, R_OK) != 0) {
+    if (getppid() == 1) { printf("--audio-emb wait: parent exited\n"); exit(3); }
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    if (t.tv_sec - t0.tv_sec > 900) { printf("--audio-emb wait: %s did not appear in 900 s\n", g_aemb_wait); exit(3); }
+    usleep(2000);
+  }
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  printf("--audio-emb: %s ready after %.2f s of waiting\n", g_aemb_wait, (t.tv_sec - t0.tv_sec) + 1e-9 * (t.tv_nsec - t0.tv_nsec));
+  __atomic_store_n(&g_load_gate, 0x7fffffff, __ATOMIC_RELEASE);
+  g_aemb_wait = nullptr;
+}
+
 // ---- pipelined blob reader (one producer thread, ring of 16 MB slots)
 struct LoadRing {
   int fd = -1; size_t base = 0; std::vector<Ent>* ents = nullptr; const std::vector<size_t>* order = nullptr;
@@ -1003,6 +1025,7 @@ static void* load_reader(void* arg) {
   LoadRing& R = *(LoadRing*)arg;
   for (int k = 0; k < LoadRing::NS; k++) R.buf[k] = (char*)malloc(LoadRing::CH);
   for (size_t oi = 0; oi < R.order->size(); oi++) {
+    while ((int)oi >= __atomic_load_n(&g_load_gate, __ATOMIC_ACQUIRE)) usleep(2000);
     const Ent& e = (*R.ents)[(*R.order)[oi]];
     const size_t tot = e.nc + e.ns; const off_t off0 = (off_t)(R.base + e.file_off);
     for (size_t done = 0; done < tot; ) {
@@ -1285,6 +1308,8 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
     }
     if (tw % 12 == 11) { size_t f2 = 0, t2 = 0; cudaMemGetInfo(&f2, &t2);
       printf("  waiting... free %zu MB (need %zu)\n", f2 / 1048576, need / 1048576); fflush(stdout); }
+    if (g_aemb_wait) { printf("memory gate: waiting for the encoder to finish first\n"); fflush(stdout);
+                       aemb_wait_file(); continue; }
     struct timespec ts; ts.tv_sec = 5; ts.tv_nsec = 0; nanosleep(&ts, nullptr);
   }
   // LFM_PF_LAZY (default 1 under LFM_PF_OVL): no up-front arenas; load_consume allocates
@@ -1378,6 +1403,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
     J->R.fd = dup(bfd);
     cudaStreamCreateWithFlags(&J->st, cudaStreamNonBlocking);
     g_lj = J;
+    if (g_aemb_wait) __atomic_store_n(&g_load_gate, lazy ? J->need[1] : 0x7fffffff, __ATOMIC_RELEASE);
     pthread_create(&J->th, nullptr, load_consume, J);
   } else {
     J->R.fd = bfd; J->st = (cudaStream_t)0;
@@ -4106,7 +4132,10 @@ int main(int argc, char** argv) {
       while (*s) { prompt.push_back((int)strtol(s, &s, 10)); if (*s == ',') s++; }
     }
     else if (!strcmp(argv[i], "--clip") && i + 1 < argc) clip_files.push_back(argv[++i]);
-    else if (!strcmp(argv[i], "--audio-emb") && i + 1 < argc) audio_emb_file = argv[++i];
+    else if (!strcmp(argv[i], "--audio-emb") && i + 1 < argc) {
+      audio_emb_file = argv[++i];
+      if (getenv("LFM_AEMB_WAIT") && atoi(getenv("LFM_AEMB_WAIT"))) g_aemb_wait = audio_emb_file;
+    }
     else if (!strcmp(argv[i], "--audio-at") && i + 1 < argc) g_aemb_at = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--speak-emb") && i + 1 < argc) speak_emb_file = argv[++i];
     else if (!strcmp(argv[i], "--speak-tok") && i + 1 < argc) g_speak_tok = atoi(argv[++i]);
@@ -4273,6 +4302,7 @@ int main(int argc, char** argv) {
   auto load_emb = [&](const char* audio_emb_file) -> int {
     // Row count comes from the file size, not from a flag: a count the caller typed
     // by hand is one more thing that can silently disagree with the encoder's output.
+    aemb_wait_file();
     FILE* af = fopen(audio_emb_file, "rb");
     if (!af) { printf("--audio-emb: cannot open %s\n", audio_emb_file); return 2; }
     fseek(af, 0, SEEK_END); long fsz = ftell(af); fseek(af, 0, SEEK_SET);

@@ -96,6 +96,7 @@ static char TMP[1024], TMPD[1024];
 static int stage_no = 0;
 
 static char WORK_MEL[1100], WORK_OUT[1100], WORK_MELP[1100];
+static pid_t g_bb_pid = 0;    /* backbone child (started early), killed the same way */
 static pid_t g_enc_pid = 0;   /* encoder child, killed if this shell dies before reaping it */
 /* atexit: remove the per-run work files (PCM, mel, proj_out and its dir). Each run left
    ~115 MB under /tmp and 132 of them filled picard's root fs. The engine log (2 KB) stays.
@@ -114,6 +115,7 @@ static void die(const char *fmt, ...) {
   va_list ap; va_start(ap, fmt);
   fprintf(stderr, "lfm3_asr: "); vfprintf(stderr, fmt, ap); fputc('\n', stderr); va_end(ap);
   if (g_enc_pid > 0) { kill(g_enc_pid, SIGKILL); waitpid(g_enc_pid, NULL, 0); }
+  if (g_bb_pid > 0) { kill(g_bb_pid, SIGKILL); waitpid(g_bb_pid, NULL, 0); }
   exit(2);
 }
 static void* xmalloc(size_t n) { void *p = malloc(n); if (!p) die("out of memory (%zu bytes)", n); return p; }
@@ -152,7 +154,8 @@ static void reap(pid_t pid, const char *name) {
   if (WEXITSTATUS(st) != 0) die("%s exited %d", name, WEXITSTATUS(st));
 }
 static void run(char *const argv[]) { reap(spawn(argv), argv[0]); }
-static void run_capture(char *const argv[], const char *out) {
+static pid_t spawn_capture(char *const argv[], const char *out) {
+  fflush(stdout); fflush(stderr);
   pid_t pid = fork();
   if (pid < 0) die("fork failed");
   if (pid == 0) {
@@ -163,6 +166,9 @@ static void run_capture(char *const argv[], const char *out) {
     execv(prog, argv);
     fprintf(stderr, "lfm3_asr: cannot exec %s\n", prog); _exit(127);
   }
+  return pid;
+}
+static void reap_capture(pid_t pid, char *const argv[], const char *out) {
   int st = 0;
   if (waitpid(pid, &st, 0) < 0) die("waitpid failed");
   if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) die("%s failed (exit %d) -- see %s",
@@ -333,14 +339,7 @@ int main(int argc, char **argv) {
   printf("prompt ids: %ld built, %ld audio rows, matches the manifest totals\n", n_ids, n_audio);
   if (getenv("LFM_ASR_PRINT_IDS")) printf("IDS %s\n", idstr);
 
-  { pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu"); }
-  need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
-  { long rows = file_size(OUT) / (2048 * 4);
-    if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",
-                             rows, n_audio); }
-
   /* ---- stage 5: backbone ----------------------------------------------------- */
-  stage("backbone prefill + greedy decode");
   char embp[1100]; snprintf(embp, sizeof embp, "--audio-emb");
   char ata[64], atv[32], stq[64], stv[32], pp[64];
   snprintf(ata, sizeof ata, "--audio-at"); snprintf(atv, sizeof atv, "%ld", audio_at);
@@ -360,9 +359,30 @@ int main(int argc, char **argv) {
   char pfr[32], pfv[32];
   const int pfrun = getenv("LFM_ASR_PFRUN") ? atoi(getenv("LFM_ASR_PFRUN")) : 32;
   snprintf(pfr, sizeof pfr, "--prefill-run"); snprintf(pfv, sizeof pfv, "%d", pfrun);
-  { char *av[] = { (char*)"lfm3_nanode", BB, embp, OUT, ata, atv, pp, idstr, stq, stv,
-                   pfrun >= 2 ? pfr : NULL, pfv, NULL };
-    run_capture(av, eng); }
+  /* LFM_ASR_EARLYBB (default 1): the backbone starts now, while the encoder still runs.
+     Its CUDA init, blob parse and the upload of layers 0-1 overlap the encoder; it then
+     waits (LFM_AEMB_WAIT) for PUB, which appears by rename only after the encoder was
+     reaped and its row count validated below, and uploads nothing past layer 1 until then
+     (memory: the encoder's activations plus the whole backbone do not fit, run 281). */
+  const int early = !(getenv("LFM_ASR_EARLYBB") && !atoi(getenv("LFM_ASR_EARLYBB")));
+  char PUB[1100]; snprintf(PUB, sizeof PUB, "%s.ready", OUT);
+  unlink(PUB);
+  char *av[] = { (char*)"lfm3_nanode", BB, embp, early ? PUB : OUT, ata, atv, pp, idstr, stq, stv,
+                 pfrun >= 2 ? pfr : NULL, pfv, NULL };
+  if (early) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
+  { pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu"); }
+  need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
+  { long rows = file_size(OUT) / (2048 * 4);
+    if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",
+                             rows, n_audio); }
+  stage("backbone prefill + greedy decode");
+  if (early) {
+    if (rename(OUT, PUB) != 0) die("cannot publish %s", PUB);
+    snprintf(WORK_OUT, sizeof WORK_OUT, "%s", PUB);
+    pid_t bp = g_bb_pid; g_bb_pid = 0; reap_capture(bp, av, eng);
+  } else {
+    reap_capture(spawn_capture(av, eng), av, eng);
+  }
   size_t elen; uint8_t *eb = read_file(eng, &elen);
 
   /* ---- stage 6: collect the generated ids, detokenize ------------------------ */
