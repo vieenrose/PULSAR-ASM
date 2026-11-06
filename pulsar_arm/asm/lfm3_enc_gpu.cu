@@ -372,16 +372,20 @@ __global__ void __launch_bounds__(256, 4) q8_partial_T(const int8_t* __restrict_
       const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
       const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
       const float sb = sr[b];
+      // Code-outer, position-inner: each code converted once for all CT positions; every
+      // dot[p] still runs codes 0..31 in order (same chain), so the bits are unchanged.
+      const float* xb = xs + (size_t)b * 33;
+      float dot[CT];
       #pragma unroll
-      for (int p = 0; p < CT; p++) {
-        const float* xb = xs + p * xstride + (size_t)b * 33;
-        float dot = 0.f;
+      for (int p = 0; p < CT; p++) dot[p] = 0.f;
+      #pragma unroll
+      for (int j = 0; j < 32; j++) {
+        const float c = (float)(j < 16 ? c0[j] : c1[j - 16]);
         #pragma unroll
-        for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c0[j], xb[j], dot);
-        #pragma unroll
-        for (int j = 0; j < 16; j++) dot = __fmaf_rn((float)c1[j], xb[16 + j], dot);
-        acc[p] = __fmaf_rn(sb, dot, acc[p]);
+        for (int p = 0; p < CT; p++) dot[p] = __fmaf_rn(c, xb[p * xstride + j], dot[p]);
       }
+      #pragma unroll
+      for (int p = 0; p < CT; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
     }
     #pragma unroll
     for (int p = 0; p < CT; p++) {
@@ -442,16 +446,18 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TS(const int8_t* __restrict
         const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
         const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
         const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+        const float* xb = xs + (size_t)b * 33;
+        float dot[CT];
         #pragma unroll
-        for (int p = 0; p < CT; p++) {
-          const float* xb = xs + p * xstride + (size_t)b * 33;
-          float dot = 0.f;
+        for (int p = 0; p < CT; p++) dot[p] = 0.f;
+        #pragma unroll
+        for (int jj = 0; jj < 32; jj++) {                // code-outer (see q8_partial_T)
+          const float c = (float)(jj < 16 ? c0[jj] : c1[jj - 16]);
           #pragma unroll
-          for (int jj = 0; jj < 16; jj++) dot = __fmaf_rn((float)c0[jj], xb[jj], dot);
-          #pragma unroll
-          for (int jj = 0; jj < 16; jj++) dot = __fmaf_rn((float)c1[jj], xb[16 + jj], dot);
-          v[j][p] = __fmaf_rn(sb, dot, 0.f);
+          for (int p = 0; p < CT; p++) dot[p] = __fmaf_rn(c, xb[p * xstride + jj], dot[p]);
         }
+        #pragma unroll
+        for (int p = 0; p < CT; p++) v[j][p] = __fmaf_rn(sb, dot[p], 0.f);
       }
     }
     #pragma unroll
