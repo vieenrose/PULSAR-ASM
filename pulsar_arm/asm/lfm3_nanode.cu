@@ -60,6 +60,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <map>
 #include <time.h>
 #include <zlib.h>
@@ -1200,6 +1201,15 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   for (int pass = 0; pass < 2; pass++)
     for (size_t i = 0; i < M.ents.size(); i++)
       if ((M.ents[i].dtype == 2) == (pass == 0)) order.push_back(i);
+  // LFM_PF_LORDER (default 1 with lazy arenas): the blob stores tensors in lexicographic
+  // name order (layers 0, 1, 10..19, 2, 20..23, 3..9), so the layer-major prefill's layer 2
+  // waited for ten later layers' uploads (+2.4 s measured). Within each pass (f32 first,
+  // unchanged), upload in numeric layer order; non-layer tensors keep their place first.
+  if (lazy && !(getenv("LFM_PF_LORDER") && !atoi(getenv("LFM_PF_LORDER")))) {
+    auto key = [&](size_t i) { int L = -1; sscanf(M.ents[i].name.c_str(), "lfm.model.layers.%d.", &L);
+                               return std::make_pair(M.ents[i].dtype == 2 ? 0 : 1, L); };
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return key(a) < key(b); });
+  }
   // LFM_PF_EMBLAST (default 1 with lazy arenas): the tied embedding (~295 MB) moves to the
   // END of the upload order. The prefill needs only its text-token rows, which
   // pf4_embed_chunk then preads from the blob (g_embfile); the head waits for the whole
