@@ -4148,6 +4148,14 @@ struct PF4Arena {
 // -> residual -> ffn_norm -> {w1,w3} -> silu -> w2 -> residual.
 #define P4(nm, ptr, n) if (pf4trace && L == 0) (cudaDeviceSynchronize(), \
     printf("PF4PROBE %-14s rms %9.5f\n", nm, rms_host_n((ptr), (n))), 0)
+// LFM_PF_SYNC (default 3): bound the layer-major prefill's GPU queue. Without it a 4000-id
+// prompt dies inside the first attention layer with "the launch timed out and was
+// terminated" (nvgpu channel watchdog: too much un-synced work queued in one layer, no
+// single kernel is long; CUDA_LAUNCH_BLOCKING=1 or a sync per chunk both run clean, a sync
+// per layer does not). 3 = before queueing chunk i, wait for the event recorded after chunk
+// i - K (LFM_PF_SYNCK, default 4): the queue never drains, so it costs nothing measurable
+// at 1642 positions. 1 = full sync per chunk (+3%), 2 = per layer (fails), 0 = unbounded.
+static const int g_pfsync = getenv("LFM_PF_SYNC") ? atoi(getenv("LFM_PF_SYNC")) : 3;
 static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   const int QDIM = NH * HD, KVDIM = NKV * HD;
   const int pf4trace = getenv("LFM_PF4_TRACE") ? 1 : 0;   // stage-by-stage rms for L0,
@@ -4890,7 +4898,19 @@ int main(int argc, char** argv) {
             Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
             A.xb = xall + (size_t)c0 * H;
             if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+            if (g_pfsync == 3) {     // bounded queue: wait for the chunk recorded K chunks ago
+              static cudaEvent_t ev[64]; static int nev = 0; static long ci = 0;
+              static const int K = getenv("LFM_PF_SYNCK") ? atoi(getenv("LFM_PF_SYNCK")) : 4;
+              if (!nev) { for (int k = 0; k < 64; k++) cudaEventCreateWithFlags(&ev[k], cudaEventDisableTiming); nev = 64; }
+              if (ci >= K) { const cudaError_t se = cudaEventSynchronize(ev[(ci - K) % 64]);
+                if (se != cudaSuccess) { printf("PF4-RUN: L%d chunk %d wait: %s\n", L, c0, cudaGetErrorString(se)); return 1; } }
+              cudaEventRecord(ev[ci % 64], g_launch); ci++;
+            }
+            if (g_pfsync == 1) { const cudaError_t se = cudaStreamSynchronize(g_launch);
+              if (se != cudaSuccess) { printf("PF4-RUN: L%d chunk %d sync: %s\n", L, c0, cudaGetErrorString(se)); return 1; } }
           }
+          if (g_pfsync == 2) { const cudaError_t se = cudaStreamSynchronize(g_launch);
+            if (se != cudaSuccess) { printf("PF4-RUN: L%d sync: %s\n", L, cudaGetErrorString(se)); return 1; } }
         }
         if (g_lj) {            // everything else (final norm, tied head) needs the whole blob
           if (!load_wait((int)g_lj->order.size())) { printf("PF4-RUN: weight load failed\n"); return 1; }
