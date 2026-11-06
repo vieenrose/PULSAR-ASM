@@ -563,6 +563,112 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
                                      __fadd_rn(segred[6][tid], segred[7][tid]))));
 }
 
+// k_attn_headG<G>: prefill form of k_attn_head for G q heads sharing one kv head
+// (blockIdx.x = head group, blockIdx.y = chunk position). Each K/V row word is loaded once
+// and feeds G heads' chains; every head's chains, trees and softmax are k_attn_head's, so
+// each head's output is bit-identical. Scores live in dynamic shared memory sized to the
+// chunk's last position (sln floats per head) instead of MAXTOK.
+template <int G>
+__global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q, const bf16* __restrict__ kc,
+                             const bf16* __restrict__ vc, bf16* __restrict__ out,
+                             int npos, int win, float scaling, int nkv, int sln) {
+  extern __shared__ float dyn[];
+  float* sl = dyn;                               // [G][sln]
+  float* segred = dyn + G * sln;                 // [G][8][HD]
+  __shared__ float red[8];
+  __shared__ float mxs[G], invs[G];
+  q += (size_t)blockIdx.y * NH * HD; out += (size_t)blockIdx.y * NH * HD; npos += blockIdx.y;
+  const int h0 = blockIdx.x * G, tid = threadIdx.x;
+  const int lane = tid & 31, wid = tid >> 5;
+  const int lo = (win > 0 && npos > win) ? npos - win : 0;
+  const int kvh = h0 / (NH / nkv);
+  float qv[G][4];
+  #pragma unroll
+  for (int g = 0; g < G; g++)
+    #pragma unroll
+    for (int j = 0; j < 4; j++) qv[g][j] = bf2f(q[(size_t)(h0 + g) * HD + lane * 4 + j]);
+  for (int p = lo + wid; p < npos; p += 8) {
+    const uint2 kw = *reinterpret_cast<const uint2*>(kc + (size_t)p * nkv * HD + kvh * HD + lane * 4);
+    const float k0 = __uint_as_float(kw.x << 16), k1 = __uint_as_float(kw.x & 0xffff0000u);
+    const float k2 = __uint_as_float(kw.y << 16), k3 = __uint_as_float(kw.y & 0xffff0000u);
+    #pragma unroll
+    for (int g = 0; g < G; g++) {
+      float s = 0.f;
+      s = __fadd_rn(s, __fmul_rn(qv[g][0], k0));
+      s = __fadd_rn(s, __fmul_rn(qv[g][1], k1));
+      s = __fadd_rn(s, __fmul_rn(qv[g][2], k2));
+      s = __fadd_rn(s, __fmul_rn(qv[g][3], k3));
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_down_sync(~0u, s, o));
+      if (lane == 0) sl[g * sln + p] = __fmul_rn(s, scaling);
+    }
+  }
+  __syncthreads();
+  const int np = npos - lo;
+  for (int g = 0; g < G; g++) {
+    float* sg = sl + g * sln;
+    float mx = -1e30f;
+    for (int i = tid; i < np; i += 256) mx = fmaxf(mx, sg[lo + i]);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_down_sync(~0u, mx, o));
+    if (lane == 0) red[wid] = mx;
+    __syncthreads();
+    if (tid < 8) {
+      float v = red[tid];
+      #pragma unroll
+      for (int o = 4; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(0xffu, v, o));
+      if (tid == 0) mxs[g] = v;
+    }
+    __syncthreads();
+    const float m = mxs[g];
+    float sum = 0.f;
+    for (int i = tid; i < np; i += 256) { const float e = expf(__fadd_rn(sg[lo + i], -m));
+      sg[lo + i] = e; sum = __fadd_rn(sum, e); }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum = __fadd_rn(sum, __shfl_down_sync(~0u, sum, o));
+    if (lane == 0) red[wid] = sum;
+    __syncthreads();
+    if (tid < 8) {
+      float v = red[tid];
+      #pragma unroll
+      for (int o = 4; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_down_sync(0xffu, v, o));
+      if (tid == 0) invs[g] = __fdiv_rn(1.0f, v);
+    }
+    __syncthreads();
+  }
+  const int e = lane, seg = wid;
+  float acc[G][4];
+  #pragma unroll
+  for (int g = 0; g < G; g++) { acc[g][0] = acc[g][1] = acc[g][2] = acc[g][3] = 0.f; }
+  float inv[G];
+  #pragma unroll
+  for (int g = 0; g < G; g++) inv[g] = invs[g];
+  for (int p = seg; p < np; p += 8) {
+    const uint2 vw = *reinterpret_cast<const uint2*>(vc + (size_t)(lo + p) * nkv * HD + kvh * HD + 4 * e);
+    const float v0 = __uint_as_float(vw.x << 16), v1 = __uint_as_float(vw.x & 0xffff0000u);
+    const float v2 = __uint_as_float(vw.y << 16), v3 = __uint_as_float(vw.y & 0xffff0000u);
+    #pragma unroll
+    for (int g = 0; g < G; g++) {
+      const float w = __fmul_rn(sl[g * sln + lo + p], inv[g]);
+      acc[g][0] = __fadd_rn(acc[g][0], __fmul_rn(w, v0));
+      acc[g][1] = __fadd_rn(acc[g][1], __fmul_rn(w, v1));
+      acc[g][2] = __fadd_rn(acc[g][2], __fmul_rn(w, v2));
+      acc[g][3] = __fadd_rn(acc[g][3], __fmul_rn(w, v3));
+    }
+  }
+  #pragma unroll
+  for (int g = 0; g < G; g++)
+    #pragma unroll
+    for (int j = 0; j < 4; j++) segred[(g * 8 + seg) * HD + 4 * e + j] = acc[g][j];
+  __syncthreads();
+  for (int i = tid; i < G * HD; i += 256) {
+    const int g = i / HD, d = i % HD;
+    const float* r = segred + g * 8 * HD + d;
+    out[(size_t)(h0 + g) * HD + d] = f2bf(__fadd_rn(__fadd_rn(__fadd_rn(r[0], r[HD]), __fadd_rn(r[2 * HD], r[3 * HD])),
+                                          __fadd_rn(__fadd_rn(r[4 * HD], r[5 * HD]), __fadd_rn(r[6 * HD], r[7 * HD]))));
+  }
+}
+
 __global__ void k_mul_bf(const bf16* __restrict__ a, const bf16* __restrict__ b,
                          bf16* __restrict__ y, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3720,6 +3826,14 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
       k_rope<<<dim3(NKV, Tn), 64, 0, g_launch>>>(A.k, invf, pos0, HD, rot, nullptr);
       cudaMemcpyAsync(kbase + (size_t)pos0 * KVDIM, A.k, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
       cudaMemcpyAsync(vbase + (size_t)pos0 * KVDIM, A.v, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
+      static const int attg = getenv("LFM_PF_ATTG") ? atoi(getenv("LFM_PF_ATTG")) : 2;
+      const int sln = pos0 + Tn;
+      const size_t shm = (size_t)attg * (sln + 8 * HD) * 4;
+      if ((attg == 2 || attg == 4) && shm <= 48 * 1024) {          // else the per-head kernel
+        if (attg == 2) k_attn_headG<2><<<dim3(NH / 2, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
+        else           k_attn_headG<4><<<dim3(NH / 4, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
+        if (cudaGetLastError() != cudaSuccess) { printf("PF4: k_attn_headG launch failed (G=%d, sln=%d)\n", attg, sln); return 1; }
+      } else
       k_attn_head<<<dim3(NH, Tn), 256, 0, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, HD, NKV, nullptr);
       k_sigmoid_gate<<<dim3(1, Tn), NH, 0, g_launch>>>(A.gate, A.attn, HD);
     } else
