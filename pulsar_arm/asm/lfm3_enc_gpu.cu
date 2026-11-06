@@ -394,6 +394,86 @@ __global__ void __launch_bounds__(256, 4) q8_partial_T(const int8_t* __restrict_
   }
 }
 
+// q8_partial_TS<CT, RW, NJ>: q8_partial_T for nb < 32 (K = 768: nb = 24), where the
+// one-block-per-lane mapping leaves lanes nb..31 idle through the whole dot phase. A warp
+// takes RW rows at once: the RW*nb (row, block) items are spread NJ per lane (RW*nb ==
+// 32*NJ), every lane runs the same NJ items, each item's code converted once for its CT
+// positions -- exactly q8_partial_T's per-(row, block) work, so the value an item yields,
+// fmaf(s_b, dot_b, 0.f), is the value lane b computed there (one block per lane: acc
+// starts at 0). Per (row, position) the slot values are then gathered into lanes 0..nb-1
+// (lanes >= nb hold 0.f, as before) and reduced by the same shuffle-down tree. Same
+// operands, same order: bit-identical. LFM_ENC_TS=0 disables it.
+static int g_encts = -2;
+template <int CT, int RW, int NJ>
+__global__ void __launch_bounds__(256, 4) q8_partial_TS(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                        const float* __restrict__ x, float* __restrict__ part,
+                                                        int N, int K, int KCHUNK, int R, int nb, int T) {
+  extern __shared__ float xs[];                       // [CT][nb*33]
+  const int nchunk = K / KCHUNK;
+  const int rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
+  const int koff = chunk * KCHUNK;
+  const int t0 = blockIdx.y * CT;
+  const int NT = blockDim.x, tid = threadIdx.x;
+  const int xstride = nb * 33;
+  #pragma unroll
+  for (int p = 0; p < CT; p++) {
+    const int t = t0 + p;
+    if (t < T) {
+      const float* xg = x + (size_t)t * K + koff;
+      for (int i = tid; i < KCHUNK; i += NT) xs[p * xstride + (i >> 5) * 33 + (i & 31)] = xg[i];
+    }
+  }
+  __syncthreads();
+  const int base = rowblk * R;
+  const int lane = tid & 31, wid = tid >> 5;
+  const int WPB = NT >> 5, GR = R / WPB;
+  for (int g0 = 0; g0 < GR; g0 += RW) {
+    float v[NJ][CT];
+    #pragma unroll
+    for (int j = 0; j < NJ; j++) {
+      const int i = lane + 32 * j, r = i / nb, b = i - r * nb;
+      const int row = base + wid + (g0 + r) * WPB;
+      #pragma unroll
+      for (int p = 0; p < CT; p++) v[j][p] = 0.f;
+      if (row < N) {
+        const int8_t* qr = q + (size_t)row * K + koff;
+        const float sb = s[(size_t)row * (K / Q8_BLK) + (size_t)chunk * nb + b];
+        const int4 a0 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK);
+        const int4 a1 = *reinterpret_cast<const int4*>(qr + (size_t)b * Q8_BLK + 16);
+        const int8_t* c0 = reinterpret_cast<const int8_t*>(&a0);
+        const int8_t* c1 = reinterpret_cast<const int8_t*>(&a1);
+        #pragma unroll
+        for (int p = 0; p < CT; p++) {
+          const float* xb = xs + p * xstride + (size_t)b * 33;
+          float dot = 0.f;
+          #pragma unroll
+          for (int jj = 0; jj < 16; jj++) dot = __fmaf_rn((float)c0[jj], xb[jj], dot);
+          #pragma unroll
+          for (int jj = 0; jj < 16; jj++) dot = __fmaf_rn((float)c1[jj], xb[16 + jj], dot);
+          v[j][p] = __fmaf_rn(sb, dot, 0.f);
+        }
+      }
+    }
+    #pragma unroll
+    for (int r = 0; r < RW; r++) {
+      const int row = base + wid + (g0 + r) * WPB;
+      if (row >= N) continue;                          // warp-uniform
+      const int i = r * nb + lane, srcl = i & 31, sj = i >> 5;
+      #pragma unroll
+      for (int p = 0; p < CT; p++) {
+        float a = 0.f;
+        #pragma unroll
+        for (int j = 0; j < NJ; j++) { const float t = __shfl_sync(~0u, v[j][p], srcl); if (sj == j) a = t; }
+        if (lane >= nb) a = 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(~0u, a, o);
+        const int t = t0 + p;
+        if (lane == 0 && t < T) part[((size_t)t * N + row) * nchunk + chunk] = a;
+      }
+    }
+  }
+}
+
 struct Gemm {
   const int8_t* q; const float* s; const float* wf;   // wf != null = f32 weights
   int N, K, KC, nb, nch, R, nblk, nblk256;
@@ -519,7 +599,11 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
       for (int t0 = 0; t0 < T; t0 += 65535 * ct) {    // gridDim.y <= 65535
         const int Tl = (T - t0 < 65535 * ct) ? T - t0 : 65535 * ct;
         const dim3 grid(g.nblk, (Tl + ct - 1) / ct);
-        if (ct == 4) q8_partial_T<4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+        if (g_encts == -2) g_encts = getenv("LFM_ENC_TS") ? atoi(getenv("LFM_ENC_TS")) : 1;
+        if (ct == 4 && g_encts && g.nb == 24 && (g.R / 8) % 4 == 0)
+          q8_partial_TS<4, 4, 3><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
+        else if (ct == 4) q8_partial_T<4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
                          g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
         else         q8_partial_T<2><<<grid, TPB, 2 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
                          g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
