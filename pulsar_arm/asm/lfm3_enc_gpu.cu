@@ -681,14 +681,36 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
 // downsampler has no in-place norm.
 // k_headnorm (96 threads) and k_layernorm_f32 (256 threads) do not have this bug: the
 // former has its barrier, the latter writes to a separate output so x is read-only.
-__global__ void k_rmsnorm_f32(float* __restrict__ x, const float* __restrict__ w, int D) {
+// Row sums of squares, one row per LANE: each row's serial fp64 sum is exactly the norm
+// kernels' thread-0 loop (same ascending order, same exact double products), but one fp64
+// warp instruction now serves 32 rows instead of one (fp64 is 1/32 rate on this GPU).
+__global__ void k_sumsq_rows(const float* __restrict__ x, double* __restrict__ ss, int nrows, int D) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= nrows) return;
+  const float* r = x + (size_t)row * D;
+  double v = 0;
+  for (int i = 0; i < D; i++) v += (double)r[i] * r[i];
+  ss[row] = v;
+}
+static double* g_ss = nullptr;
+static const int g_encss = getenv("LFM_ENC_SS") ? atoi(getenv("LFM_ENC_SS")) : 1;
+static const double* sumsq_rows(const float* x, int nrows, int D) {
+  if (!g_encss) return nullptr;
+  static int cap = 0;
+  if (nrows > cap) { if (g_ss) cudaFree(g_ss); cap = nrows; if (cudaMalloc(&g_ss, (size_t)cap * 8)) { printf("ss alloc\n"); exit(3); } }
+  k_sumsq_rows<<<(nrows + 127) / 128, 128>>>(x, g_ss, nrows, D);
+  return g_ss;
+}
+__global__ void k_rmsnorm_f32(float* __restrict__ x, const float* __restrict__ w, int D,
+                              const double* __restrict__ ss = nullptr) {
   const int t = blockIdx.x;
   float* r = x + (size_t)t * D;
   // Every thread used to run this same serial fp64 sum (256x redundant fp64 on a GPU with
   // 1/32-rate fp64: 266 ms per call at Tt=1622, 9.3 s of the encoder). Thread 0 now runs
   // it once, in the same order, and shares it: the value every thread used is unchanged.
   __shared__ double sv;
-  if (threadIdx.x == 0) {
+  if (ss) { if (threadIdx.x == 0) sv = ss[t]; }
+  else if (threadIdx.x == 0) {
     double v = 0;
     for (int i = 0; i < D; i++) v += (double)r[i] * r[i];
     sv = v;
@@ -744,11 +766,13 @@ __global__ void k_add(float* __restrict__ a, const float* __restrict__ b, size_t
 // SERIALLY in ascending d. (A shared ps[tid&31] tree was tried first: with blockDim 96
 // eight to twelve threads alias each slot, last writer wins, and 7/8 of the partials
 // vanish. The gate saw it as layer_02 rms rel 40 vs the C reference.)
-__global__ void k_headnorm(float* __restrict__ x, const float* __restrict__ w) {
+__global__ void k_headnorm(float* __restrict__ x, const float* __restrict__ w,
+                           const double* __restrict__ ss = nullptr) {
   const int row = blockIdx.x;
   float* r = x + (size_t)row * EHD;
   __shared__ double v;
-  if (threadIdx.x == 0) {
+  if (ss) { if (threadIdx.x == 0) v = ss[row]; }
+  else if (threadIdx.x == 0) {
     double acc = 0;
     for (int i = 0; i < EHD; i++) acc += (double)r[i] * r[i];
     v = acc;
@@ -1195,7 +1219,8 @@ int main(int argc, char** argv) {
     snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.operator_norm.weight", L);
     Ent* opn = need(M, nm);
     cudaMemcpy(hn, xr, (size_t)Tt * EHID * 4, cudaMemcpyDeviceToDevice);
-    k_rmsnorm_f32<<<Tt, 256>>>(hn, opn->df, EHID); chk("op_norm");
+    { const double* ss = sumsq_rows(hn, Tt, EHID);
+      k_rmsnorm_f32<<<Tt, 256>>>(hn, opn->df, EHID, ss); } chk("op_norm");
     if (ETYPES[L]) {
       // q/k/v, per-head rmsnorm, RoPE, causal attention, out_proj
       snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.self_attn.q_proj.weight", L);
@@ -1213,8 +1238,10 @@ int main(int argc, char** argv) {
       gemm_to(wq, hn, hq, Tt, xb2, "q_proj");
       gemm_to(wk, hn, hk, Tt, xb2, "k_proj");
       gemm_to(wv, hn, hv, Tt, xb2, "v_proj");
-      k_headnorm<<<Tt * ENH, 96>>>(hq, qn->df); chk("q headnorm");
-      k_headnorm<<<Tt * ENKV, 96>>>(hk, kn->df); chk("k headnorm");
+      { const double* ss = sumsq_rows(hq, Tt * ENH, EHD);
+        k_headnorm<<<Tt * ENH, 96>>>(hq, qn->df, ss); } chk("q headnorm");
+      { const double* ss = sumsq_rows(hk, Tt * ENKV, EHD);
+        k_headnorm<<<Tt * ENKV, 96>>>(hk, kn->df, ss); } chk("k headnorm");
       k_rope<<<(unsigned)((Tt * (EHD / 2) + 255) / 256), 256>>>(hq, hk, Tt); chk("rope");
       dim3 gA(Tt, ENH);
       float* dbg = nullptr; int ts = -1, hs = -1;
@@ -1259,7 +1286,8 @@ int main(int argc, char** argv) {
     snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.ffn_norm.weight", L);
     Ent* fn = need(M, nm);
     cudaMemcpy(hn, hout, (size_t)Tt * EHID * 4, cudaMemcpyDeviceToDevice);
-    k_rmsnorm_f32<<<Tt, 256>>>(hn, fn->df, EHID); chk("ffn_norm");
+    { const double* ss = sumsq_rows(hn, Tt, EHID);
+      k_rmsnorm_f32<<<Tt, 256>>>(hn, fn->df, EHID, ss); } chk("ffn_norm");
     snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.feed_forward.w1.weight", L);
     Ent* w1 = need(M, nm);
     snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.feed_forward.w3.weight", L);
@@ -1284,7 +1312,8 @@ int main(int argc, char** argv) {
   {
     Ent* en = need(M, "encoder.lfm.lfm.embedding_norm.weight");
     cudaMemcpy(hn, xr, (size_t)Tt * EHID * 4, cudaMemcpyDeviceToDevice);
-    k_rmsnorm_f32<<<Tt, 256>>>(hn, en->df, EHID); chk("embedding_norm");
+    { const double* ss = sumsq_rows(hn, Tt, EHID);
+      k_rmsnorm_f32<<<Tt, 256>>>(hn, en->df, EHID, ss); } chk("embedding_norm");
     dump(OD, "enc_out", hn, (size_t)Tt * EHID);
     Ent* pw0 = need(M, "mlp.model.0.weight"), *pb0 = need(M, "mlp.model.0.bias");
     Ent* pw1 = need(M, "mlp.model.1.weight"), *pb1 = need(M, "mlp.model.1.bias");
