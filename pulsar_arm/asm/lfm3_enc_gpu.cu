@@ -831,6 +831,46 @@ __global__ void k_attn_prefill(const float* __restrict__ q, const float* __restr
   ao[((size_t)i * ENH + hh) * EHD + d] = o;
 }
 
+// k_attn_prefill2: k_attn_prefill computing each score ONCE, one score per thread. Thread
+// t forms score j with the same 96 products summed in ascending dd order (the reference's
+// thread-0 loop), then scales; scores live in dynamic shared memory. Thread 0 takes the
+// max and the denominator in ascending j exactly as before; exps are formed per score with
+// the same expf(sc - mx); the output loop per d is unchanged. Bit-identical.
+__global__ void k_attn_prefill2(const float* __restrict__ q, const float* __restrict__ k,
+                                const float* __restrict__ v, float* __restrict__ ao,
+                                int T, float scale, float* dbg, int ts, int hs, int win) {
+  extern __shared__ float es[];                  // [i - jlo + 1]
+  __shared__ float qs[EHD];
+  __shared__ float mxs, dens;
+  const int i = blockIdx.x, hh = blockIdx.y, kv = hh / (ENH / ENKV);
+  const int jlo = (i >= win) ? (i - win + 1) : 0;
+  const int n = i - jlo + 1;
+  const int d = threadIdx.x;
+  qs[d] = q[((size_t)i * ENH + hh) * EHD + d];
+  __syncthreads();
+  for (int jj = d; jj < n; jj += EHD) {
+    const float* kr = k + ((size_t)(jlo + jj) * ENKV + kv) * EHD;
+    float s2 = 0.f;
+    for (int dd = 0; dd < EHD; dd++) s2 = __fadd_rn(s2, __fmul_rn(qs[dd], kr[dd]));
+    const float sc = __fmul_rn(s2, scale);
+    es[jj] = sc;
+    if (dbg && i == ts && hh == hs) dbg[jlo + jj] = sc;
+  }
+  __syncthreads();
+  if (d == 0) { float mx = -INFINITY; for (int jj = 0; jj < n; jj++) if (es[jj] > mx) mx = es[jj]; mxs = mx; }
+  __syncthreads();
+  const float mx = mxs;
+  for (int jj = d; jj < n; jj += EHD) es[jj] = expf(__fadd_rn(es[jj], -mx));
+  __syncthreads();
+  if (d == 0) { float den = 0.f; for (int jj = 0; jj < n; jj++) den = __fadd_rn(den, es[jj]); dens = den; }
+  __syncthreads();
+  const float den = dens;
+  float o = 0.f;
+  for (int jj = 0; jj < n; jj++)
+    o = __fadd_rn(o, __fmul_rn(__fdiv_rn(es[jj], den), v[((size_t)(jlo + jj) * ENKV + kv) * EHD + d]));
+  ao[((size_t)i * ENH + hh) * EHD + d] = o;
+}
+
 // LayerNorm(768) for the projector, mean and variance accumulated in double over
 // ascending i exactly as lfm3_enc.c does. Serial in thread 0: the shared ps[tid&31]
 // tree aliased 8 threads per slot at blockDim 256 and corrupted both moments.
@@ -1160,8 +1200,13 @@ int main(int argc, char** argv) {
           if (cudaMalloc((void**)&dbg, (size_t)Tt * 4) || cudaMemset(dbg, 0, (size_t)Tt * 4)) { printf("probe alloc\n"); return 3; }
           ts = atoi(strchr(sd, ',') ? strchr(sd, ',') + 1 : "0"); hs = atoi(strrchr(sd, ',') ? strrchr(sd, ',') + 1 : "0");
         } }
-      k_attn_prefill<<<gA, 96>>>(hq, hk, hv, hao, Tt, 1.0f / sqrtf((float)EHD), dbg, ts, hs,
-                                 g_enc_win); chk("attention");
+      { static const int att2 = getenv("LFM_ENC_ATT2") ? atoi(getenv("LFM_ENC_ATT2")) : 1;
+        const size_t smx = (size_t)((g_enc_win > 0 && g_enc_win < Tt) ? g_enc_win : Tt) * 4;
+        if (att2 && smx <= 40 * 1024)
+          k_attn_prefill2<<<gA, 96, smx>>>(hq, hk, hv, hao, Tt, 1.0f / sqrtf((float)EHD), dbg, ts, hs, g_enc_win);
+        else
+          k_attn_prefill<<<gA, 96>>>(hq, hk, hv, hao, Tt, 1.0f / sqrtf((float)EHD), dbg, ts, hs, g_enc_win);
+        chk("attention"); }
       if (dbg) { static float* hb = nullptr; if (!hb) hb = (float*)malloc((size_t)Tt * 4);
         cudaMemcpy(hb, dbg, (size_t)Tt * 4, cudaMemcpyDeviceToHost);
         printf("scores t=%d h=%d:", ts, hs); for (int j = 0; j <= ts; j++) printf(" %.6f", hb[j]); printf("\n"); }
