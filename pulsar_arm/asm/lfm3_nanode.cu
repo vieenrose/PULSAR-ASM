@@ -3874,6 +3874,86 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLb(const 
     if (t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, pv[p])); else part[(size_t)t * N + row] = pv[p]; }
   }
 }
+// q8_partial_TLg: q8_partial_Tp's values (ffn.w2, nb = 240) one row per thread on the TLb
+// tile layout. Leaf i = Tp's lane-i chain over blocks i, i+32, ... (same as TLb's leaf);
+// since every thread walks the leaves in the same bit-reversed order, the block stages x
+// only for the 4 leaves of the current group (blocks i + 32m, m < 8, 4 positions, bf16
+// pairs unpadded: all threads of a warp read the same word). Same leaves, same tree.
+__device__ __noinline__ float4 tlg_leaf(const int4* __restrict__ qt, const float* __restrict__ sts,
+                                        const uint32_t* xg, int i, int nb) {
+  float acc[4] = { 0.f, 0.f, 0.f, 0.f };
+  for (int m = 0; i + 32 * m < nb; m++) {
+    const int b = i + 32 * m;
+    const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
+    const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                            (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+    const float sb = sts[b * 32];
+    float dot[4] = { 0.f, 0.f, 0.f, 0.f };
+    const uint32_t* wb0 = xg + m * 64;
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+      const float ca = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1)));
+      const float cb = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1) + 8));
+      #pragma unroll
+      for (int p = 0; p < 4; p++) {
+        const uint32_t u = wb0[p * 16 + j];
+        dot[p] = __fmaf_rn(ca, __uint_as_float(u << 16), dot[p]);
+        dot[p] = __fmaf_rn(cb, __uint_as_float(u & 0xffff0000u), dot[p]);
+      }
+    }
+    #pragma unroll
+    for (int p = 0; p < 4; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
+  }
+  return make_float4(acc[0], acc[1], acc[2], acc[3]);
+}
+__global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                         const bf16* __restrict__ x, float* __restrict__ part,
+                                                         int N, int K, int nb, int T, bf16* __restrict__ yb) {
+  __shared__ uint32_t xs[4 * 8 * 64];                 // [leaf slot][m][position][16 words]
+  const int t0 = blockIdx.y * 4, tid = threadIdx.x;
+  const int row = blockIdx.x * 512 + tid;
+  const bool live = row < N;
+  const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
+  const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
+  float st[5][4], pv[4];
+  #pragma unroll
+  for (int k = 0; k < 32; k++) {
+    if ((k & 3) == 0) {
+      __syncthreads();
+      for (int w = tid; w < 4 * 8 * 64; w += 512) {
+        const int jj = w & 15, p = (w >> 4) & 3, m = (w >> 6) & 7, ls = w >> 9;
+        const int kk = k + ls;
+        const int i = ((kk & 1) << 4) | ((kk & 2) << 2) | (kk & 4) | ((kk & 8) >> 2) | ((kk & 16) >> 4);
+        const int b = i + 32 * m, t = t0 + p;
+        xs[w] = (b < nb && t < T) ? reinterpret_cast<const uint32_t*>(x + (size_t)t * K)[b * 16 + jj] : 0u;
+      }
+      __syncthreads();
+    }
+    const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+    float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (live) a = tlg_leaf(qt, sts, xs + (k & 3) * 512, i, nb);
+    pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
+    bool done = false;
+    #pragma unroll
+    for (int l = 0; l < 5; l++) {
+      if (done) continue;
+      if ((k >> l) & 1) {
+        #pragma unroll
+        for (int p = 0; p < 4; p++) pv[p] = __fadd_rn(st[l][p], pv[p]);
+      } else {
+        #pragma unroll
+        for (int p = 0; p < 4; p++) st[l][p] = pv[p];
+        done = true;
+      }
+    }
+  }
+  if (!live) return;
+  #pragma unroll
+  for (int p = 0; p < 4; p++) {
+    const int t = t0 + p;
+    if (t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, pv[p])); else part[(size_t)t * N + row] = pv[p]; }
+  }
+}
 __global__ void k_tile_q(const int4* __restrict__ src, int4* __restrict__ dst, int N, int nb) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // (row, b, h)
   if (i >= (size_t)N * nb * 2) return;
@@ -3939,6 +4019,11 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   // LFM_PF_PH (default 1): wide single-chunk shapes whose full x stage would cap CT
   // below 4 run the phased kernel instead (bit-identical, see q8_partial_Tp).
   static const int pf_ph = getenv("LFM_PF_PH") ? atoi(getenv("LFM_PF_PH")) : 1;
+  static const int pftg = getenv("LFM_PF_TLG") ? atoi(getenv("LFM_PF_TLG")) : 1;
+  if (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K)) {
+    q8_partial_TLg<<<dim3((N + 511) / 512, (Tn + 3) / 4), 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+    goto launched;
+  }
   if (pf_ph && nch == 1 && 4 * per > lim && Tn >= 4) {
     // LFM_PF_TPTPB (default 512): 16 warps x GRW 4 rows per block; each row's chain unchanged.
     static const int tptpb = getenv("LFM_PF_TPTPB") ? atoi(getenv("LFM_PF_TPTPB")) : 512;
