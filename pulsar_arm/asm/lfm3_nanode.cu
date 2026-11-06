@@ -3539,7 +3539,8 @@ static int pf4_embed_chunk(Model& M, PF4Arena& A, const std::vector<int>& prompt
                                              emb->ds + (size_t)tok * (H / Q8_BLK), dst, H);
     }
   }
-  cudaDeviceSynchronize();
+  // No sync needed: all launches are on g_launch, so the next launch serializes.
+  // cudaGetLastError() still reports launch errors from the async launches.
   return cudaGetLastError() != cudaSuccess;
 }
 
