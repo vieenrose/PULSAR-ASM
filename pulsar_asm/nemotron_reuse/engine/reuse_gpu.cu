@@ -3148,8 +3148,20 @@ __global__ void k_conv2d_r5(const float *x, const float *w, const float *b,
 // global traffic 1.7x (the tile is half as tall), raises FMA per global load
 // 7 -> 22 and FMA per shared load 2 -> 6, and keeps registers at 32
 // accumulators + ~12.
+// Maxwell only (sm_5x device pass): a launch bound takes the 32-accumulator
+// shapes (tile 82, the Nano's dense convs) from 96 to 80 registers with no
+// spill, i.e. 2 -> 3 blocks/SM. On sm_61 any bound reshuffles the 64-acc
+// shapes (126 -> 128 regs, #263's cliff), so Pascal compiles unbounded as before.
+#ifndef R8LB32
+#define R8LB32 3
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600
+#define R8_BOUNDS(acc) __launch_bounds__(256, (acc) <= 32 ? R8LB32 : 1)
+#else
+#define R8_BOUNDS(acc)
+#endif
 template<int R, int PCO, int NCB, int NRA = 32/(PCO*NCB), bool TABLE = false, bool WS = false>
-__global__ void k_conv2d_r8(const float *x, const float *w, const float *b,
+__global__ void R8_BOUNDS(PCO*NCB*NRA) k_conv2d_r8(const float *x, const float *w, const float *b,
                             int C_in, int H, int W, int padH, int padW, int dilH,
                             float *y, int co0, const float *x2, int ng, CONV_SRCS_PARAMS)
 {
