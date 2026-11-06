@@ -543,15 +543,18 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
   for (int p = seg; p < np; p += 8) {
     const bf16* vr = vc + (size_t)(lo + p) * nkv * hd + kvh * hd;
     const float w = __fmul_rn(sl[lo + p], inv);
-    acc0 = __fadd_rn(acc0, __fmul_rn(w, bf2f(vr[e])));
-    acc1 = __fadd_rn(acc1, __fmul_rn(w, bf2f(vr[e + 32])));
-    acc2 = __fadd_rn(acc2, __fmul_rn(w, bf2f(vr[e + 64])));
-    acc3 = __fadd_rn(acc3, __fmul_rn(w, bf2f(vr[e + 96])));
+    // Lane e owns dimensions 4e..4e+3 (one 8-byte load). Each dimension's chain is still
+    // p = seg, seg+8, ... in order, only the owning lane changed: same bits.
+    const uint2 vw = *reinterpret_cast<const uint2*>(vr + 4 * e);
+    acc0 = __fadd_rn(acc0, __fmul_rn(w, __uint_as_float(vw.x << 16)));
+    acc1 = __fadd_rn(acc1, __fmul_rn(w, __uint_as_float(vw.x & 0xffff0000u)));
+    acc2 = __fadd_rn(acc2, __fmul_rn(w, __uint_as_float(vw.y << 16)));
+    acc3 = __fadd_rn(acc3, __fmul_rn(w, __uint_as_float(vw.y & 0xffff0000u)));
   }
-  segred[seg][e] = acc0;
-  segred[seg][e + 32] = acc1;
-  segred[seg][e + 64] = acc2;
-  segred[seg][e + 96] = acc3;
+  segred[seg][4 * e] = acc0;
+  segred[seg][4 * e + 1] = acc1;
+  segred[seg][4 * e + 2] = acc2;
+  segred[seg][4 * e + 3] = acc3;
   __syncthreads();
   if (tid < HD)
     out[(size_t)h * hd + tid] = f2bf(__fadd_rn(__fadd_rn(__fadd_rn(segred[0][tid], segred[1][tid]),
