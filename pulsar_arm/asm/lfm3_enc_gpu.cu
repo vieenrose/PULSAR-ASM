@@ -668,12 +668,101 @@ __global__ void k_tile768_s(const float* __restrict__ src, float* __restrict__ d
   const int row = i / 24, b = i - row * 24;
   dst[((size_t)(row >> 5) * 24 + b) * 32 + (row & 31)] = src[i];
 }
+// q8_partial_TLe: q8_partial_T's values for 24 < nb <= 256 (K = 1792: nb = 56), one row
+// per thread on 32-row tiles, CT = 4 regardless of nb. Lane L of q8_partial_T chains blocks
+// L, L+32, ... (acc = fmaf(s_b, dot_b, acc)) and reduces with shfl_down o = 16..1; leaf i
+// here is that chain, leaves combined in 5-bit bit-reversed order by a binary counter
+// (earlier operand left): the same adds. x is staged 4 leaves at a time (blocks i + 32m,
+// fp32, unpadded: warp reads are broadcasts). Positions are independent, so CT = 4 gives
+// each position exactly the CT = 2 kernel's value.
+__device__ __noinline__ float4 tle_leaf(const int4* __restrict__ qt, const float* __restrict__ sts,
+                                        const float* xg, int i, int nb) {
+  float acc[4] = { 0.f, 0.f, 0.f, 0.f };
+  for (int m = 0; i + 32 * m < nb; m++) {
+    const int b = i + 32 * m;
+    const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
+    const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                            (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+    const float sb = sts[b * 32];
+    const float* xb = xg + m * 128;
+    float dot[4] = { 0.f, 0.f, 0.f, 0.f };
+    #pragma unroll
+    for (int jj = 0; jj < 32; jj++) {
+      const float c = (float)(int)(signed char)(w[jj >> 2] >> (8 * (jj & 3)));
+      #pragma unroll
+      for (int p = 0; p < 4; p++) dot[p] = __fmaf_rn(c, xb[p * 32 + jj], dot[p]);
+    }
+    #pragma unroll
+    for (int p = 0; p < 4; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
+  }
+  return make_float4(acc[0], acc[1], acc[2], acc[3]);
+}
+__global__ void __launch_bounds__(256, 4) q8_partial_TLe(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                         const float* __restrict__ x, float* __restrict__ part,
+                                                         int N, int K, int nb, int T) {
+  extern __shared__ float xe[];                       // [4 leaf slots][mm][4 positions][32]
+  const int mm = (nb + 31) / 32, slot = mm * 128;
+  const int t0 = blockIdx.y * 4, tid = threadIdx.x;
+  const int row = blockIdx.x * 256 + tid;
+  const bool live = row < N;
+  const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
+  const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
+  float st[5][4], pv[4];
+  #pragma unroll
+  for (int k = 0; k < 32; k++) {
+    if ((k & 3) == 0) {
+      __syncthreads();
+      for (int w = tid; w < 4 * slot; w += 256) {
+        const int jj = w & 31, p = (w >> 5) & 3, m = (w >> 7) % mm, ls = w / slot;
+        const int kk = k + ls;
+        const int i = ((kk & 1) << 4) | ((kk & 2) << 2) | (kk & 4) | ((kk & 8) >> 2) | ((kk & 16) >> 4);
+        const int b = i + 32 * m, t = t0 + p;
+        xe[w] = (b < nb && t < T) ? x[(size_t)t * K + b * 32 + jj] : 0.f;
+      }
+      __syncthreads();
+    }
+    const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+    float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (live) a = tle_leaf(qt, sts, xe + (k & 3) * slot, i, nb);
+    pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
+    bool done = false;
+    #pragma unroll
+    for (int l = 0; l < 5; l++) {
+      if (done) continue;
+      if ((k >> l) & 1) {
+        #pragma unroll
+        for (int p = 0; p < 4; p++) pv[p] = __fadd_rn(st[l][p], pv[p]);
+      } else {
+        #pragma unroll
+        for (int p = 0; p < 4; p++) st[l][p] = pv[p];
+        done = true;
+      }
+    }
+  }
+  if (!live) return;
+  #pragma unroll
+  for (int p = 0; p < 4; p++) { const int t = t0 + p; if (t < T) part[(size_t)t * N + row] = pv[p]; }
+}
+__global__ void k_tile_qg(const int4* __restrict__ src, int4* __restrict__ dst, int N, int nb) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)N * nb * 2) return;
+  const int row = (int)(i / (nb * 2)), bh = (int)(i - (size_t)row * nb * 2);
+  dst[((size_t)(row >> 5) * nb * 2 + bh) * 32 + (row & 31)] = src[i];
+}
+__global__ void k_tile_sg(const float* __restrict__ src, float* __restrict__ dst, int N, int nb) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)N * nb) return;
+  const int row = (int)(i / nb), b = (int)(i - (size_t)row * nb);
+  dst[((size_t)(row >> 5) * nb + b) * 32 + (row & 31)] = src[i];
+}
+static int g_enctle = -2;
 #include <set>
 static std::set<const void*> g_tiled;
 struct Gemm {
   const int8_t* q; const float* s; const float* wf;   // wf != null = f32 weights
   int N, K, KC, nb, nch, R, nblk, nblk256;
   bool tl = false;                  // weights repacked to the q8_partial_TL tile layout
+  bool tle = false;                 // weights repacked to the q8_partial_TLe tile layout
   float* part;                      // [T][N][nch] partials
   bool pooled;                      // part came from the process-wide pool
 };
@@ -747,6 +836,26 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
     }
     g.tl = true;
   }
+  // LFM_ENC_TLE (default 1): 24 < nb <= 62 single-chunk shapes (the ones q8_partial_T runs
+  // at CT = 2) go to q8_partial_TLe on generic 32-row tiles, repacked once in place.
+  if (g_enctle == -2) g_enctle = getenv("LFM_ENC_TLE") ? atoi(getenv("LFM_ENC_TLE")) : 1;
+  g.tle = false;
+  if (!g.tl && g_enctle && g.nch == 1 && g.nb > 24 && g.nb <= 62 && N % 32 == 0 &&
+      !g_ench2 && !g_bat32 && T > 1 && (!getenv("LFM_ENC_PT") || atoi(getenv("LFM_ENC_PT")) >= 4)) {
+    if (!g_tiled.count(q)) {
+      const int nbg = g.nb;
+      void* tmp = nullptr;
+      if (cudaMalloc(&tmp, (size_t)N * K)) { printf("tile scratch\n"); exit(2); }
+      k_tile_qg<<<(unsigned)(((size_t)N * nbg * 2 + 255) / 256), 256>>>(reinterpret_cast<const int4*>(q), (int4*)tmp, N, nbg);
+      cudaMemcpy((void*)q, tmp, (size_t)N * K, cudaMemcpyDeviceToDevice);
+      k_tile_sg<<<(unsigned)(((size_t)N * nbg + 255) / 256), 256>>>(s, (float*)tmp, N, nbg);
+      cudaMemcpy((void*)s, tmp, (size_t)N * nbg * 4, cudaMemcpyDeviceToDevice);
+      if (cudaDeviceSynchronize() != cudaSuccess) { printf("tile repack failed\n"); exit(2); }
+      cudaFree(tmp);
+      g_tiled.insert(q);
+    }
+    g.tle = true;
+  }
   const size_t need_f = (size_t)T * N * g.nch;
   g.part = part_get(need_f); g.pooled = true;
   if (g_poison && cudaMemset(g.part, 0xff, need_f * 4)) { printf("memset part\n"); exit(2); }
@@ -810,6 +919,18 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
     }
     printf("bat32 launch refused at N=%d K=%d KC=%d nb=%d nch=%d shm=%zu: %s -- per-position loop\n",
            g.N, g.K, g.KC, g.nb, g.nch, shmB, cudaGetErrorString(be));
+  }
+  if (g.tle) {
+    const size_t shm = (size_t)4 * ((g.nb + 31) / 32) * 128 * 4;
+    for (int t0 = 0; t0 < T; t0 += 65535 * 4) {
+      const int Tl = (T - t0 < 65535 * 4) ? T - t0 : 65535 * 4;
+      q8_partial_TLe<<<dim3((g.N + 255) / 256, (Tl + 3) / 4), 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K,
+                                                                          g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
+    }
+    k_combine_f<<<(unsigned)(((size_t)T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, 1);
+    const cudaError_t ce = cudaGetLastError();
+    if (ce) { printf("q8_partial_TLe launch failed: %s\n", cudaGetErrorString(ce)); exit(3); }
+    return;
   }
   if (g_encpt == -2) g_encpt = getenv("LFM_ENC_PT") ? atoi(getenv("LFM_ENC_PT")) : 4;
   if (g_encpt && T > 1 && g.R == 256) {
