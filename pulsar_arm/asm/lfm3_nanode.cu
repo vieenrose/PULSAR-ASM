@@ -3632,7 +3632,7 @@ static void layer_body(Model& M, int L, int pos, int step_s, int trace, int ci,
 template <int CT, int TPB = 256>
 __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 1) q8_partial_Tb(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                     const bf16* __restrict__ x, float* __restrict__ part,
-                                                    int N, int K, int KCHUNK, int R, int nb, int T) {
+                                                    int N, int K, int KCHUNK, int R, int nb, int T, bf16* __restrict__ yb = nullptr) {
   extern __shared__ uint32_t xw[];                    // [CT][nb][17] words, 16 used = 32 bf16
   const int nchunk = K / KCHUNK;
   const int rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
@@ -3696,7 +3696,7 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 1) q8_partial_Tb(const i
       #pragma unroll
       for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(~0u, a, o);
       const int t = t0 + p;
-      if (lane == 0 && t < T) part[((size_t)t * N + row) * nchunk + chunk] = a;
+      if (lane == 0 && t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, a)); else part[((size_t)t * N + row) * nchunk + chunk] = a; }
     }
   }
 }
@@ -3712,7 +3712,7 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 1) q8_partial_Tb(const i
 template <int CT, int GRW, int TPB = 256>
 __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 1) q8_partial_Tp(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                     const bf16* __restrict__ x, float* __restrict__ part,
-                                                    int N, int K, int KCHUNK, int nb, int T) {
+                                                    int N, int K, int KCHUNK, int nb, int T, bf16* __restrict__ yb = nullptr) {
   __shared__ uint32_t xw[CT * 32 * 17];
   const int nchunk = K / KCHUNK;
   const int rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
@@ -3781,7 +3781,7 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 1) q8_partial_Tp(const i
       #pragma unroll
       for (int o = 16; o > 0; o >>= 1) a += __shfl_down_sync(~0u, a, o);
       const int t = t0 + p;
-      if (lane == 0 && t < T && row < N) part[((size_t)t * N + row) * nchunk + chunk] = a;
+      if (lane == 0 && t < T && row < N) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, a)); else part[((size_t)t * N + row) * nchunk + chunk] = a; }
     }
   }
 }
@@ -3799,6 +3799,12 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
     return 1;
   }
   const int nb = c.KCHUNK / Q8_BLK, nch = K / c.KCHUNK;
+  // LFM_PF_FUSEC (default 1): one chunk and an output that is not the input -> the GEMV
+  // lane stores f2bf(0.f + a) itself, exactly k_combine_bf_T's value for nchunk == 1, and
+  // the combine launch is skipped. In-place calls (y == x) keep the partial buffer: a
+  // direct store would race blocks still staging x.
+  static const int fusec = getenv("LFM_PF_FUSEC") ? atoi(getenv("LFM_PF_FUSEC")) : 1;
+  bf16* yb = (fusec && nch == 1 && (const void*)y != (const void*)x) ? y : nullptr;
   const size_t per = (size_t)nb * 17 * 4;             // one position's staged x
   // Defaults from the 256-id sweep (ms/position, shipped T=1 = 99.6): CT=4 @ 40 KB 69.6,
   // CT=4 @ 24 KB 71.1, CT=2 @ 40 KB 77.8, CT=8 @ 40 KB 115.2 (1 block/SM). 40 KB lets the
@@ -3814,10 +3820,10 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
     static const int tptpb = getenv("LFM_PF_TPTPB") ? atoi(getenv("LFM_PF_TPTPB")) : 512;
     if (tptpb == 512) {
       const dim3 gp((N + 63) / 64, (Tn + 3) / 4);
-      q8_partial_Tp<4, 4, 512><<<gp, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, nb, Tn);
+      q8_partial_Tp<4, 4, 512><<<gp, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, nb, Tn, yb);
     } else {
       const dim3 gp((N + 31) / 32, (Tn + 3) / 4);
-      q8_partial_Tp<4, 4><<<gp, 256, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, nb, Tn);
+      q8_partial_Tp<4, 4><<<gp, 256, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, nb, Tn, yb);
     }
     goto launched;
   }
@@ -3831,15 +3837,15 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   if (pfR >= 64 && pfR % 16 == 0 && N >= 1024) c.R = pfR;
   const int nblk = ((N + c.R - 1) / c.R) * nch;
   const dim3 grid(nblk, (Tn + ct - 1) / ct);
-  if (ct == 8)      q8_partial_Tb<8><<<grid, 256, 8 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
+  if (ct == 8)      q8_partial_Tb<8><<<grid, 256, 8 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn, yb);
   // LFM_PF_TPB (default 512; 256 = the old shape): same kernel in 512-thread blocks. The 17.4 KB x tile caps 256-thread
   // blocks at 3 per SM (24 warps); two 512-thread blocks hold 32. Rows map to warps
   // differently, each row's chain is unchanged.
   else if (ct == 4 && pf_tpb == 512 && c.R % 16 == 0)
-    q8_partial_Tb<4, 512><<<grid, 512, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
-  else if (ct == 4) q8_partial_Tb<4><<<grid, 256, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
-  else if (ct == 2) q8_partial_Tb<2><<<grid, 256, 2 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
-  else              q8_partial_Tb<1><<<grid, 256, per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn);
+    q8_partial_Tb<4, 512><<<grid, 512, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn, yb);
+  else if (ct == 4) q8_partial_Tb<4><<<grid, 256, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn, yb);
+  else if (ct == 2) q8_partial_Tb<2><<<grid, 256, 2 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn, yb);
+  else              q8_partial_Tb<1><<<grid, 256, per, g_launch>>>(e->dq, e->ds, x, part, N, K, c.KCHUNK, c.R, nb, Tn, yb);
   }
 launched:
   cudaError_t le = cudaGetLastError();
@@ -3848,7 +3854,7 @@ launched:
     return 1;
   }
   dim3 g((N + 255) / 256, Tn);
-  k_combine_bf_T<<<g, 256, 0, g_launch>>>(part, y, N, nch, Tn);
+  if (!yb) k_combine_bf_T<<<g, 256, 0, g_launch>>>(part, y, N, nch, Tn);
   cudaError_t le2 = cudaGetLastError();
   if (le2 != cudaSuccess) { printf("PF4-E2E %s combine: LAUNCH ERROR %s\n", name.c_str(), cudaGetErrorString(le2)); return 1; }
   return 0;
