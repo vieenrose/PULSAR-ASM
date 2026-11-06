@@ -144,7 +144,7 @@ Current code (commit `0fa348c`), 5.100 s audio, `./run_bench.sh` protocol:
 | | model | **RTF_model** | **RTF_total** |
 |---|---|---|---|
 | 8 kHz | 9.72 s | **1.905** | **1.91** |
-| 16 kHz | 19.0 s | 3.73 | **3.77** |
+| 16 kHz | - | - | **3.77** (19.23 s total) |
 
 8 kHz phase breakdown: encoder 1.67 s, 30x TFMamba 7.37 s, decoders 0.66 s,
 heads 0.01 s. Still **~1.9x slower than real time**; the tower is ~76% of the model.
@@ -190,7 +190,7 @@ clips at 0.0674 / 0.0991 / 0.1327 (8 / 12 / 16 kHz).
 - The reverse also happens: ideas rejected as flat on the dev host can win on the
   Nano (the conv double buffer was flat on the GTX 1070, -6.5% encoder on the Nano).
 - Closed on the device: `-Xptxas -dlcm=ca` (+3.7%; the sm_53 default is already
-  L2-only), a 64-row in_conv tile (+25%), launch bound 2 for out_proj (+2.6%).
+  L2-only), a 64-row in_conv tile (+25%), launch bound 2 for out_proj (+2.3%).
 
 ## Profiling
 
