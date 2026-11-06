@@ -840,7 +840,7 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
   // at CT = 2) go to q8_partial_TLe on generic 32-row tiles, repacked once in place.
   if (g_enctle == -2) g_enctle = getenv("LFM_ENC_TLE") ? atoi(getenv("LFM_ENC_TLE")) : 1;
   g.tle = false;
-  if (!g.tl && g_enctle && g.nch == 1 && g.nb > 24 && g.nb <= 62 && N % 32 == 0 &&
+  if (!g.tl && g_enctle && g.nch == 1 && g.nb > 24 && g.nb <= (getenv("LFM_ENC_TLEMAX") ? atoi(getenv("LFM_ENC_TLEMAX")) : 256) && N % 32 == 0 &&
       !g_ench2 && !g_bat32 && T > 1 && (!getenv("LFM_ENC_PT") || atoi(getenv("LFM_ENC_PT")) >= 4)) {
     if (!g_tiled.count(q)) {
       const int nbg = g.nb;
