@@ -604,6 +604,36 @@ __global__ void k_conv7(const bf16* __restrict__ ring, const float* __restrict__
     acc = __fadd_rn(acc, __fmul_rn(tp[k], bf2f(ring[(size_t)k * H_ + i])));
   y[i] = f2bf(acc);
 }
+// Prefill conv branch for a whole chunk: one thread per channel walks the chunk's
+// positions in order with the 7 ring slots in registers. Per position it does exactly
+// k_mul_bf (B*x), k_shift_in, k_conv7 and k_mul_bf (C*y) -- same operands, same rounding,
+// same order -- so the outputs and the final ring are bit-identical to the per-position
+// launches. bx rows are [B | C | x] (3H), out rows H.
+__global__ void k_conv_chunk(bf16* __restrict__ ring, const float* __restrict__ taps,
+                             const bf16* __restrict__ bx, bf16* __restrict__ out, int H_, int Tn) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= H_) return;
+  bf16 r[7];
+  #pragma unroll
+  for (int k = 0; k < 7; k++) r[k] = ring[(size_t)k * H_ + i];
+  float tp[7];
+  #pragma unroll
+  for (int k = 0; k < 7; k++) tp[k] = taps[(size_t)i * 7 + k];
+  for (int t = 0; t < Tn; t++) {
+    const bf16* row = bx + (size_t)t * 3 * H_;
+    const bf16 bxv = f2bf(__fmul_rn(bf2f(row[i]), bf2f(row[2 * H_ + i])));     // B*x
+    #pragma unroll
+    for (int k = 0; k < 6; k++) r[k] = r[k + 1];                                // shift in
+    r[6] = bxv;
+    float acc = 0.f;
+    #pragma unroll
+    for (int k = 0; k < 7; k++) acc = __fadd_rn(acc, __fmul_rn(tp[k], bf2f(r[k])));
+    const bf16 cy = f2bf(acc);                                                  // conv7
+    out[(size_t)t * H_ + i] = f2bf(__fmul_rn(bf2f(row[H_ + i]), bf2f(cy)));    // C*y
+  }
+  #pragma unroll
+  for (int k = 0; k < 7; k++) ring[(size_t)k * H_ + i] = r[k];
+}
 __global__ void k_argmax(const float* __restrict__ lg, int* __restrict__ out, int n) {
   __shared__ float bv[8]; __shared__ int bi[8];
   const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
@@ -3555,6 +3585,13 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   } else {
     if (pf_gemv_T(M, LN(L, "conv.in_proj.weight"), A.h1, A.bx, A.part, Tn)) return 1;
     P4("in_proj", A.bx, 3 * H);
+    // LFM_PF_CONVB (default 1): the chunk's conv branch in one launch (k_conv_chunk,
+    // bit-identical); 0 = the per-position T=1 kernels below. The trace probes need 0.
+    static const int convb = getenv("LFM_PF_CONVB") ? atoi(getenv("LFM_PF_CONVB")) : 1;
+    if (convb && !pf4trace)
+      k_conv_chunk<<<(H + 127) / 128, 128, 0, g_launch>>>(M.ring + (size_t)pf4_conv_idx[L] * 7 * H,
+          T(M, LN(L, "conv.conv.weight"))->df, A.bx, A.h2, H, Tn);
+    else
     for (int t = 0; t < Tn; t++) {
       bf16* bx = A.bx + (size_t)t * 3 * H;
       bf16* cy = A.cy + (size_t)t * H;
