@@ -421,6 +421,7 @@ __global__ void k_rmsnorm_T(const bf16* __restrict__ x, const float* __restrict_
 __global__ void k_headnorm(bf16* __restrict__ x, const float* __restrict__ w,
                            float eps, int hd) {
   const int tid = threadIdx.x;
+  x += (size_t)blockIdx.y * gridDim.x * hd;          // batched prefill: row block per position
   bf16* xr = x + (size_t)blockIdx.x * hd;
   float ss[4];
   #pragma unroll
@@ -443,6 +444,7 @@ __global__ void k_headnorm(bf16* __restrict__ x, const float* __restrict__ w,
 __global__ void k_rope(bf16* __restrict__ x, const float* __restrict__ invf,
                        int pos, int hd, int rot, const int* __restrict__ posp = nullptr) {
   if (posp) pos = *posp;
+  x += (size_t)blockIdx.y * gridDim.x * hd; pos += blockIdx.y;   // batched prefill (y = position)
   const int half = rot / 2;
   bf16* xr = x + (size_t)blockIdx.x * hd;
   #pragma unroll 1
@@ -464,6 +466,8 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
                             int npos, int win, float scaling, int hd, int nkv,
                             const int* __restrict__ nposp = nullptr) {
   if (nposp) npos = *nposp;
+  // Batched prefill: blockIdx.y = position offset in the chunk (its q/out rows, one more key).
+  q += (size_t)blockIdx.y * gridDim.x * hd; out += (size_t)blockIdx.y * gridDim.x * hd; npos += blockIdx.y;
   const int h = blockIdx.x, tid = threadIdx.x;
   const int lane = tid & 31, wid = tid >> 5;
   __shared__ float sl[MAXTOK];
@@ -572,6 +576,7 @@ __global__ void k_silu_mul_bf(const bf16* __restrict__ w1, const bf16* __restric
   }
 }
 __global__ void k_sigmoid_gate(const bf16* __restrict__ g, bf16* __restrict__ attn, int hd) {
+  g += (size_t)blockIdx.y * gridDim.x * blockDim.x; attn += (size_t)blockIdx.y * gridDim.x * blockDim.x * hd;
   const int h = blockIdx.x * blockDim.x + threadIdx.x;
   const float s = __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-bf2f(g[h]))));
   bf16* a = attn + (size_t)h * hd;
@@ -3517,6 +3522,21 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
     const float scaling = 1.0f / sqrtf((float)HD);
     bf16* kbase = M.kc + (size_t)L * MAXTOK * KVDIM;
     bf16* vbase = M.vc + (size_t)L * MAXTOK * KVDIM;
+    // LFM_PF_ATTB (default 1): the chunk's positions in ONE launch per kernel, blockIdx.y =
+    // position. Each block computes exactly what the per-position launch computed; the
+    // chunk's K/V rows are all in the cache before attention, and position t reads keys
+    // 0..pos0+t only, so later rows are never read early. 0 = the per-position loop.
+    static const int attb = getenv("LFM_PF_ATTB") ? atoi(getenv("LFM_PF_ATTB")) : 1;
+    if (attb) {
+      k_headnorm<<<dim3(NH, Tn), 32, 0, g_launch>>>(A.q, NW(M, L, "self_attn.q_norm.weight"), NORM_EPS, HD);
+      k_headnorm<<<dim3(NKV, Tn), 32, 0, g_launch>>>(A.k, NW(M, L, "self_attn.k_norm.weight"), NORM_EPS, HD);
+      k_rope<<<dim3(NH, Tn), 64, 0, g_launch>>>(A.q, invf, pos0, HD, rot, nullptr);
+      k_rope<<<dim3(NKV, Tn), 64, 0, g_launch>>>(A.k, invf, pos0, HD, rot, nullptr);
+      cudaMemcpyAsync(kbase + (size_t)pos0 * KVDIM, A.k, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
+      cudaMemcpyAsync(vbase + (size_t)pos0 * KVDIM, A.v, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
+      k_attn_head<<<dim3(NH, Tn), 256, 0, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, HD, NKV, nullptr);
+      k_sigmoid_gate<<<dim3(1, Tn), NH, 0, g_launch>>>(A.gate, A.attn, HD);
+    } else
     for (int t = 0; t < Tn; t++) {
       const int pos = pos0 + t;
       bf16* q = A.q + (size_t)t * QDIM, *k = A.k + (size_t)t * KVDIM, *v = A.v + (size_t)t * KVDIM;
