@@ -845,10 +845,10 @@ __global__ void k_x_proj_r(const float *xc, const float *W, float *xdbl, long SL
  * one tile with 10% padding; more accumulators is the lever that moved every other
  * GEMM here. K order is unchanged (k0 chunks of 32, k ascending), so results are
  * bit-identical. REUSE_XPROJ=MT,NT,TX selects the shape; 2 = the shipped one. */
-template<int MT, int NT, int TX>
+template<int MT, int NT, int TX, int KT = 32>
 __global__ void k_x_proj_g(const float *xc, const float *W, float *xdbl, long SL)
 {
-    const int KT = 32, RS = (KT+4)/4, TY = 256/TX, RA = MT/TY, CB = NT/TX;
+    const int RS = (KT+4)/4, TY = 256/TX, RA = MT/TY, CB = NT/TX;
     static_assert(NT % TX == 0 && MT % (256/TX) == 0 && 256 % TX == 0, "tile must divide the block");
     __shared__ __align__(16) float As[MT][KT+4];
     __shared__ __align__(16) float Bs[NT][KT+4];
@@ -4505,6 +4505,13 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
             /* REUSE_XPROJ = MT*10000 + NT*100 + TX, e.g. 12804016 = MT=128 NT=40 TX=16 */
             const int gmt = tiled/10000, gnt = (tiled/100) % 100, gtx = tiled % 100;
             const dim3 grd((unsigned)((XP+gnt-1)/gnt), (unsigned)((SL+gmt-1)/gmt));
+            /* REUSE_XPROJ_KT=16 halves the k-chunk of the default shape: shared 24.2 ->
+               13.4 KB, i.e. 2 -> 3 blocks/SM where shared is the limit (Maxwell). */
+            static int xkt = -1;
+            if (xkt < 0) xkt = getenv("REUSE_XPROJ_KT") ? atoi(getenv("REUSE_XPROJ_KT")) : (gpu_is_maxwell() ? 16 : 32);  // Nano -0.7% (5/6 pairs); dev +1.2% (#268)
+            if (xkt == 16 && gmt == 128 && gnt == 40 && gtx == 8) {
+                k_x_proj_g<128,40,8,16><<<grd, dim3(8,32), 0, st>>>(xc, W_xp, xdbl, SL);
+            } else {
             #define XPG(MTv,NTv,TXv) do { if (gmt==MTv && gnt==NTv && gtx==TXv)                 k_x_proj_g<MTv,NTv,TXv><<<grd, dim3(TXv,256/TXv), 0, st>>>(xc, W_xp, xdbl, SL); } while (0)
             XPG(128,32,16); XPG(128,40,8);  XPG(256,40,8);  XPG(128,64,16);
             XPG(256,32,16); XPG(64,40,8);   XPG(128,48,16);
@@ -4512,6 +4519,7 @@ static int mamba_dir_gpu(reuse_gpu_t *g, const char *pfx, const float *x, float 
             XPG(192,40,8);  XPG(128,40,4);  XPG(64,72,8);   XPG(96,40,8);
             XPG(128,72,8);  XPG(256,40,8);
             #undef XPG
+            }
         }
         else if (tiled) k_x_proj_t<<<dim3((XP+31)/32, (unsigned)((SL+63)/64)), dim3(16,16), 0, st>>>(xc, W_xp, xdbl, SL);
         else       k_x_proj<<<dim3((unsigned)((SL+255)/256), XP), b1, 0, st>>>(xc, W_xp, xdbl, SL);
