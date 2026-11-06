@@ -845,8 +845,18 @@ __global__ void k_x_proj_r(const float *xc, const float *W, float *xdbl, long SL
  * one tile with 10% padding; more accumulators is the lever that moved every other
  * GEMM here. K order is unchanged (k0 chunks of 32, k ascending), so results are
  * bit-identical. REUSE_XPROJ=MT,NT,TX selects the shape; 2 = the shipped one. */
+/* Maxwell-only launch bound (sm_61 codegen untouched): KT=16 needs 13.4 KB of
+ * shared, so the 80-register allocation is what caps the Nano at 3 blocks/SM. */
+#ifndef XPLB
+#define XPLB 4
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600
+#define XP_BOUNDS __launch_bounds__(256, XPLB)
+#else
+#define XP_BOUNDS
+#endif
 template<int MT, int NT, int TX, int KT = 32>
-__global__ void k_x_proj_g(const float *xc, const float *W, float *xdbl, long SL)
+__global__ void XP_BOUNDS k_x_proj_g(const float *xc, const float *W, float *xdbl, long SL)
 {
     const int RS = (KT+4)/4, TY = 256/TX, RA = MT/TY, CB = NT/TX;
     static_assert(NT % TX == 0 && MT % (256/TX) == 0 && 256 % TX == 0, "tile must divide the block");
