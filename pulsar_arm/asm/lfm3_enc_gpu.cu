@@ -705,9 +705,54 @@ __global__ void k_tile768_s(const float* __restrict__ src, float* __restrict__ d
 // (earlier operand left): the same adds. x is staged 4 leaves at a time (blocks i + 32m,
 // fp32, unpadded: warp reads are broadcasts). Positions are independent, so CT = 4 gives
 // each position exactly the CT = 2 kernel's value.
+// XE (LFM_ENC_XE): 0 = x through the pointer argument (the shared space is lost at the
+// noinline boundary: generic LD.E); 1 = the dynamic shared array addressed by offset
+// (LDS.32); 4 = same, one LDS.128 per 4 codes and position. Every position's chain still
+// runs jj = 0..31 in order: bit-identical.
+template <int XE>
 __device__ __noinline__ float4 tle_leaf(const int4* __restrict__ qt, const float* __restrict__ sts,
-                                        const float* xg, int i, int nb) {
+                                        const float* xg, int xoff, int i, int nb) {
+  extern __shared__ float xe_dyn[];
   float acc[4] = { 0.f, 0.f, 0.f, 0.f };
+  if (XE) {
+    for (int m = 0; i + 32 * m < nb; m++) {
+      const int b = i + 32 * m;
+      const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
+      const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                              (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+      const float sb = sts[b * 32];
+      const float* xb = xe_dyn + xoff + m * 128;
+      float dot[4] = { 0.f, 0.f, 0.f, 0.f };
+      if (XE == 4) {
+        const float4* xv = reinterpret_cast<const float4*>(xb);
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+          const float c0 = (float)(int)(signed char)(w[q]);
+          const float c1 = (float)(int)(signed char)(w[q] >> 8);
+          const float c2 = (float)(int)(signed char)(w[q] >> 16);
+          const float c3 = (float)(int)(signed char)(w[q] >> 24);
+          #pragma unroll
+          for (int p = 0; p < 4; p++) {
+            const float4 u = xv[p * 8 + q];
+            dot[p] = __fmaf_rn(c0, u.x, dot[p]);
+            dot[p] = __fmaf_rn(c1, u.y, dot[p]);
+            dot[p] = __fmaf_rn(c2, u.z, dot[p]);
+            dot[p] = __fmaf_rn(c3, u.w, dot[p]);
+          }
+        }
+      } else {
+        #pragma unroll
+        for (int jj = 0; jj < 32; jj++) {
+          const float c = (float)(int)(signed char)(w[jj >> 2] >> (8 * (jj & 3)));
+          #pragma unroll
+          for (int p = 0; p < 4; p++) dot[p] = __fmaf_rn(c, xb[p * 32 + jj], dot[p]);
+        }
+      }
+      #pragma unroll
+      for (int p = 0; p < 4; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
+    }
+    return make_float4(acc[0], acc[1], acc[2], acc[3]);
+  }
   for (int m = 0; i + 32 * m < nb; m++) {
     const int b = i + 32 * m;
     const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
@@ -727,6 +772,7 @@ __device__ __noinline__ float4 tle_leaf(const int4* __restrict__ qt, const float
   }
   return make_float4(acc[0], acc[1], acc[2], acc[3]);
 }
+template <int XE>
 __global__ void __launch_bounds__(256, 4) q8_partial_TLe(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                          const float* __restrict__ x, float* __restrict__ part,
                                                          int N, int K, int nb, int T) {
@@ -753,7 +799,7 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TLe(const int8_t* __restric
     }
     const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
     float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (live) a = tle_leaf(qt, sts, xe + (k & 3) * slot, i, nb);
+    if (live) a = tle_leaf<XE>(qt, sts, xe + (k & 3) * slot, (k & 3) * slot, i, nb);
     pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
     bool done = false;
     #pragma unroll
@@ -954,8 +1000,11 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
     const size_t shm = (size_t)4 * ((g.nb + 31) / 32) * 128 * 4;
     for (int t0 = 0; t0 < T; t0 += 65535 * 4) {
       const int Tl = (T - t0 < 65535 * 4) ? T - t0 : 65535 * 4;
-      q8_partial_TLe<<<dim3((g.N + 255) / 256, (Tl + 3) / 4), 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K,
-                                                                          g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
+      static const int xe = getenv("LFM_ENC_XE") ? atoi(getenv("LFM_ENC_XE")) : 4;
+      const dim3 ge((g.N + 255) / 256, (Tl + 3) / 4);
+      if (xe == 4)      q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
+      else if (xe == 1) q8_partial_TLe<1><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
+      else              q8_partial_TLe<0><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
     }
     k_combine_f<<<(unsigned)(((size_t)T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, 1);
     const cudaError_t ce = cudaGetLastError();
