@@ -3898,6 +3898,97 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLb(const 
     if (t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, pv[p])); else part[(size_t)t * N + row] = pv[p]; }
   }
 }
+// q8_partial_TLf: q8_partial_TLb with x staged as f32 instead of bf16 pairs (LFM_PF_TLF).
+// Every thread walks the leaves in the same order, so all lanes read the same x address
+// (broadcast, no padding needed); the bf16 -> f32 unpack (a shift or a mask per product
+// pair per position, 8 of TLb's ~22 instructions per code pair x 4 positions) moves into
+// the staging loop, and each code pair reads its two x values with one LDS.64. bf16 ->
+// f32 is exact, so every fmaf sees the same operands in the same order: bit-identical.
+// Shared memory doubles (CT x K x 4 B: 32 KB at K = 2048). nvprof (instance 400 of the ASR
+// prefill): TLb IPC 4.20, 85% issue slots, 52.1 M instructions; TLf alone 34.3 M at IPC 2.86,
+// stalls now data request 42% / execution dependency 37%, so the speed did not move until
+// the leaf's next weight block is loaded before the current block's FMAs (PF = 1).
+template <int CT, int PF>
+__device__ __noinline__ float4 tlf_leaf(const int4* __restrict__ qt, const float* __restrict__ sts,
+                                        const float* xf, int i, int nb, int K) {
+  float acc[4] = { 0.f, 0.f, 0.f, 0.f };
+  // PF: the next block's weights and scale are loaded before this block's FMAs (1-deep
+  // software pipeline): the f32-staged leaf has issue slack, and its stalls are the loads.
+  int4 n0, n1; float nsb = 0.f;
+  if (PF) { n0 = qt[i * 64]; n1 = qt[i * 64 + 32]; nsb = sts[i * 32]; }
+  for (int b = i; b < nb; b += 32) {
+    int4 a0, a1; float sb;
+    if (PF) {
+      a0 = n0; a1 = n1; sb = nsb;
+      if (b + 32 < nb) { n0 = qt[(b + 32) * 64]; n1 = qt[(b + 32) * 64 + 32]; nsb = sts[(b + 32) * 32]; }
+    } else { a0 = qt[b * 64]; a1 = qt[b * 64 + 32]; sb = sts[b * 32]; }
+    const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                            (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+    float dot[4] = { 0.f, 0.f, 0.f, 0.f };
+    const float2* xb = reinterpret_cast<const float2*>(xf + b * 32);
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+      const float ca = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1)));
+      const float cb = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1) + 8));
+      #pragma unroll
+      for (int p = 0; p < CT; p++) {
+        const float2 u = xb[p * (K / 2) + j];
+        dot[p] = __fmaf_rn(ca, u.x, dot[p]);
+        dot[p] = __fmaf_rn(cb, u.y, dot[p]);
+      }
+    }
+    #pragma unroll
+    for (int p = 0; p < CT; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
+  }
+  return make_float4(acc[0], acc[1], acc[2], acc[3]);
+}
+template <int TPB, int CT = 4, int PF = 1>
+__global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                    const bf16* __restrict__ x, float* __restrict__ part,
+                                                    int N, int K, int nb, int T, bf16* __restrict__ yb) {
+  extern __shared__ float xs[];                       // [CT][K]
+  const int t0 = blockIdx.y * CT, tid = threadIdx.x;
+  #pragma unroll
+  for (int p = 0; p < CT; p++) {
+    const int t = t0 + p;
+    if (t < T) {
+      const uint32_t* xg = reinterpret_cast<const uint32_t*>(x + (size_t)t * K);
+      float2* d = reinterpret_cast<float2*>(xs + p * K);
+      for (int i = tid; i < K / 2; i += TPB) { const uint32_t u = xg[i];
+        d[i] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u)); }
+    }
+  }
+  __syncthreads();
+  const int row = blockIdx.x * TPB + tid;
+  if (row >= N) return;
+  const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
+  const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
+  float st[5][4], pv[4];
+  #pragma unroll
+  for (int k = 0; k < 32; k++) {
+    const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+    const float4 a = tlf_leaf<CT, PF>(qt, sts, xs, i, nb, K);
+    pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
+    bool done = false;
+    #pragma unroll
+    for (int l = 0; l < 5; l++) {
+      if (done) continue;
+      if ((k >> l) & 1) {
+        #pragma unroll
+        for (int p = 0; p < 4; p++) pv[p] = __fadd_rn(st[l][p], pv[p]);
+      } else {
+        #pragma unroll
+        for (int p = 0; p < 4; p++) st[l][p] = pv[p];
+        done = true;
+      }
+    }
+  }
+  #pragma unroll
+  for (int p = 0; p < CT; p++) {
+    const int t = t0 + p;
+    if (t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, pv[p])); else part[(size_t)t * N + row] = pv[p]; }
+  }
+}
 // q8_partial_TLg: q8_partial_Tp's values (ffn.w2, nb = 240) one row per thread on the TLb
 // tile layout. Leaf i = Tp's lane-i chain over blocks i, i+32, ... (same as TLb's leaf);
 // since every thread walks the leaves in the same bit-reversed order, the block stages x
@@ -4095,6 +4186,15 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   if (e->tiled || (pftl && ct == 4 && nch == 1 && N % 32 == 0 && nb % 32 == 0 && Tn >= 2 && pf_tile(e, N, K))) {
     const int tpb = pftl == 2 ? 256 : 512;
     const dim3 gl((N + tpb - 1) / tpb, (Tn + 3) / 4);
+    // LFM_PF_TLF (default 1): q8_partial_TLf, x staged as f32 with the leaf's weight loads
+    // pipelined one block ahead (bit-identical), when CT x K floats fit 48 KB. 2 = TLf
+    // without the prefetch, 0 = TLb.
+    static const int pftlf = getenv("LFM_PF_TLF") ? atoi(getenv("LFM_PF_TLF")) : 1;
+    if (pftlf && tpb == 512 && (size_t)4 * K * 4 <= 48 * 1024) {
+      if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+      else            q8_partial_TLf<512, 4, 1><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+      goto launched;
+    }
     if (tpb == 512) q8_partial_TLb<512><<<gl, 512, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else            q8_partial_TLb<256><<<gl, 256, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     goto launched;

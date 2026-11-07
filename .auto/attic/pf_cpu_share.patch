@@ -1,0 +1,315 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index de5aa7f..fab4cc1 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -1214,7 +1214,9 @@ static void* load_consume(void* arg) {
+   return nullptr;
+ }
+ 
++static const char* g_bpath = nullptr;   // the backbone blob (prefill CPU row share reads from it)
+ static bool load_blob(const char* path, Model& M, std::string& js) {
++  g_bpath = path;
+   FILE* f = fopen(path, "rb");
+   if (!f) { printf("cannot open %s\n", path); return false; }
+   const int bfd = fileno(f);
+@@ -4038,6 +4040,7 @@ static bool pf_tile(Ent* e, int N, int K) {
+   return true;
+ }
+ 
++static int g_pf_nrow = 0;   // > 0: TL launches compute only rows [0, g_pf_nrow) (multiple of 512)
+ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+                      float* part, int Tn) {
+   Ent* e = T(M, name);
+@@ -4057,6 +4060,7 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+   // direct store would race blocks still staging x.
+   static const int fusec = getenv("LFM_PF_FUSEC") ? atoi(getenv("LFM_PF_FUSEC")) : 1;
+   bf16* yb = (fusec && nch == 1 && (const void*)y != (const void*)x) ? y : nullptr;
++  if (g_pf_nrow && (!yb || !e->tiled || g_pf_nrow % 512)) { printf("PF4-E2E %s: row limit needs a tiled fused-store path\n", name.c_str()); return 1; }
+   const size_t per = (size_t)nb * 17 * 4;             // one position's staged x
+   // Defaults from the 256-id sweep (ms/position, shipped T=1 = 99.6): CT=4 @ 40 KB 69.6,
+   // CT=4 @ 24 KB 71.1, CT=2 @ 40 KB 77.8, CT=8 @ 40 KB 115.2 (1 block/SM). 40 KB lets the
+@@ -4069,7 +4073,7 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+   static const int pf_ph = getenv("LFM_PF_PH") ? atoi(getenv("LFM_PF_PH")) : 1;
+   static const int pftg = getenv("LFM_PF_TLG") ? atoi(getenv("LFM_PF_TLG")) : 1;
+   if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
+-    q8_partial_TLg<<<dim3((N + 511) / 512, (Tn + 3) / 4), 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++    q8_partial_TLg<<<dim3(((g_pf_nrow ? g_pf_nrow : N) + 511) / 512, (Tn + 3) / 4), 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     goto launched;
+   }
+   if (pf_ph && nch == 1 && 4 * per > lim && Tn >= 4) {
+@@ -4094,7 +4098,7 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+   if (e->tiled && !(ct == 4 && nch == 1)) { printf("PF4-E2E %s: tiled tensor has no TL path\n", name.c_str()); return 1; }
+   if (e->tiled || (pftl && ct == 4 && nch == 1 && N % 32 == 0 && nb % 32 == 0 && Tn >= 2 && pf_tile(e, N, K))) {
+     const int tpb = pftl == 2 ? 256 : 512;
+-    const dim3 gl((N + tpb - 1) / tpb, (Tn + 3) / 4);
++    const dim3 gl(((g_pf_nrow ? g_pf_nrow : N) + tpb - 1) / tpb, (Tn + 3) / 4);
+     if (tpb == 512) q8_partial_TLb<512><<<gl, 512, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     else            q8_partial_TLb<256><<<gl, 256, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     goto launched;
+@@ -4156,10 +4160,155 @@ struct PF4Arena {
+ // i - K (LFM_PF_SYNCK, default 4): the queue never drains, so it costs nothing measurable
+ // at 1642 positions. 1 = full sync per chunk (+3%), 2 = per layer (fails), 0 = unbounded.
+ static const int g_pfsync = getenv("LFM_PF_SYNC") ? atoi(getenv("LFM_PF_SYNC")) : 3;
++
++// LFM_PF_CPU=R (rows, multiple of 512; default 0 = off): during the layer-major prefill the
++// last R rows of ffn.w1 and ffn.w3 are computed by the A57s for all prompt positions while
++// the GPU computes rows [0, INTER - R). The CPU chain is q8_partial_TLb's exactly: per
++// position, leaf i = blocks i, i+32, ... with dot = fma(code_j, x_j, dot) over the 32 codes
++// in order, acc = fma(s_b, dot, acc); the 32 leaves combined bit-reversed by a binary counter
++// (earlier operand left); y = bf16_rn(0.f + acc). NEON lanes are 4 independent positions
++// (vfmaq_f32 is fused like __fmaf_rn); no plain multiplies, so contraction cannot change it.
++static int g_lc_mode = 0;                    // 0 whole layer; 1 operator half; 2 w1/w3; 3 rest
++static bf16 *g_h1all = nullptr, *g_w1all = nullptr, *g_w3all = nullptr;
++static uint16_t cpu_f2bf(float v) {          // the device f2bf, bit for bit
++  uint32_t u; memcpy(&u, &v, 4);
++  if (((u >> 23) & 0xffu) == 0xffu) return (uint16_t)(u >> 16);
++  return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
++}
++typedef float v4f __attribute__((vector_size(16)));
++static inline v4f splat(float c) { v4f r = { c, c, c, c }; return r; }
++static inline v4f v4fma(v4f acc, v4f a, v4f b) {   // acc + a * b, one rounding per lane (fmla)
++  asm("fmla %0.4s, %1.4s, %2.4s" : "+w"(acc) : "w"(a), "w"(b));
++  return acc;
++}
++struct CpuFF {
++  int R = 0, nth = 3, NP = 0, Tp = 0;
++  int8_t* q[NLAYER][2] = {}; float* sc[NLAYER][2] = {};   // last R rows, row-major
++  std::vector<bf16> h1;                      // [NP][H] from the device
++  std::vector<float> xt;                     // [Tp/4][H][4]
++  std::vector<uint16_t> y[2];                // [NP][R]
++  int L = 0; cudaEvent_t ev = nullptr; cudaStream_t st = nullptr; pthread_t th[8]; bool live = false;
++  int fail = 0;
++  pthread_barrier_t bar;
++};
++static CpuFF g_cf;
++static int cpuff_load(Model& M, int L) {
++  static int fd = -1;
++  if (fd < 0 && (fd = open(g_bpath, O_RDONLY)) < 0) return 1;
++  const char* nm[2] = { "feed_forward.w1.weight", "feed_forward.w3.weight" };
++  for (int w = 0; w < 2; w++) {
++    if (g_cf.q[L][w]) continue;
++    Ent* e = T(M, LN(L, nm[w]));
++    if (!e || e->dtype != 1 || e->ne[0] != INTER || e->ne[1] != H) return 1;
++    const int nb = H / Q8_BLK, r0 = INTER - g_cf.R;
++    Ent* em = T(M, EMBNAME);            // file_off is relative to the data section
++    if (!em) return 1;
++    const off_t base = (off_t)M.emb_file_off - (off_t)em->file_off;
++    g_cf.q[L][w] = (int8_t*)malloc((size_t)g_cf.R * H); g_cf.sc[L][w] = (float*)malloc((size_t)g_cf.R * nb * 4);
++    const size_t nq = (size_t)g_cf.R * H, ns = (size_t)g_cf.R * nb * 4;
++    if (pread(fd, g_cf.q[L][w], nq, base + e->file_off + (off_t)r0 * H) != (ssize_t)nq ||
++        pread(fd, g_cf.sc[L][w], ns, base + e->file_off + e->nc + (off_t)r0 * nb * 4) != (ssize_t)ns) return 1;
++  }
++  return 0;
++}
++// The CPU rows of every layer are read by this thread, in layer order, each after the loader
++// has published that layer: a synchronous pread on the launch thread (~100 ms per layer)
++// stalls the GPU, whose queue is bounded to a few chunks (LFM_PF_SYNC=3).
++static volatile int g_cf_ready = 0, g_cf_rfail = 0;
++static pthread_t g_cf_pth;
++static void* cpuff_prefetch(void* a) {
++  Model& M = *(Model*)a;
++  for (int L = 0; L < NLAYER; L++) {
++    if ((g_lj && !load_wait(g_lj->need[L])) || cpuff_load(M, L)) { __atomic_store_n(&g_cf_rfail, 1, __ATOMIC_RELEASE); break; }
++    __atomic_store_n(&g_cf_ready, L + 1, __ATOMIC_RELEASE);
++  }
++  return nullptr;
++}
++struct CpuArg { int id; };
++static void* cpuff_worker(void* a) {
++  {
++  const int id = ((CpuArg*)a)->id, nth = g_cf.nth, R = g_cf.R, Tp = g_cf.Tp, NP = g_cf.NP, nb = H / Q8_BLK;
++  struct timespec w0, w1, w2, w3; clock_gettime(CLOCK_MONOTONIC, &w0);
++  if (id == 0) {                       // the h1 rows of all positions, after the operator half
++    if (cudaEventSynchronize(g_cf.ev) != cudaSuccess ||
++        cudaMemcpyAsync(g_cf.h1.data(), g_h1all, (size_t)NP * H * 2, cudaMemcpyDeviceToHost, g_cf.st) != cudaSuccess ||
++        cudaStreamSynchronize(g_cf.st) != cudaSuccess) g_cf.fail = 1;
++  }
++  pthread_barrier_t& bar = g_cf.bar;
++  pthread_barrier_wait(&bar);
++  clock_gettime(CLOCK_MONOTONIC, &w1);
++  // bf16 [NP][H] -> f32 [Tp/4][H][4]: each 4-position group's K values contiguous, so the
++  // dot loop streams 32 KB per group instead of striding Tp floats per code (6.6 KB: 3x slower)
++  for (int g4 = id; g4 < Tp / 4; g4 += nth) {
++    float* d = &g_cf.xt[(size_t)g4 * H * 4];
++    for (int p = 0; p < 4; p++) {
++      const int t = g4 * 4 + p;
++      for (int k = 0; k < H; k++) {
++        uint32_t u = t < NP ? (uint32_t)g_cf.h1[(size_t)t * H + k] << 16 : 0u; memcpy(&d[(size_t)k * 4 + p], &u, 4); }
++    }
++  }
++  pthread_barrier_wait(&bar);
++  clock_gettime(CLOCK_MONOTONIC, &w2);
++  const int ngroups = 2 * (R / 8);
++  for (int g = id; g < ngroups; g += nth) {
++    const int w = g / (R / 8), r0 = (g % (R / 8)) * 8;
++    const int8_t* qw = g_cf.q[g_cf.L][w]; const float* sw = g_cf.sc[g_cf.L][w];
++    uint16_t* yw = g_cf.y[w].data();
++    for (int t0 = 0; t0 < Tp; t0 += 4) {
++      v4f st[5][8], pv[8];
++      for (int k = 0; k < 32; k++) {
++        const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
++        v4f acc[8];
++        for (int u = 0; u < 8; u++) acc[u] = splat(0.f);
++        for (int b = i; b < nb; b += 32) {
++          v4f dot[8];
++          for (int u = 0; u < 8; u++) dot[u] = splat(0.f);
++          const float* xb = &g_cf.xt[(size_t)(t0 / 4) * H * 4 + (size_t)b * 32 * 4];
++          const int8_t* qb = qw + (size_t)r0 * H + b * 32;
++          for (int j = 0; j < 32; j++) {
++            v4f xv; __builtin_memcpy(&xv, xb + (size_t)j * 4, 16);
++            for (int u = 0; u < 8; u++) { const float c = (float)qb[(size_t)u * H + j];
++              dot[u] = v4fma(dot[u], splat(c), xv); }
++          }
++          for (int u = 0; u < 8; u++) { const float sb = sw[(size_t)(r0 + u) * nb + b];
++            acc[u] = v4fma(acc[u], splat(sb), dot[u]); }
++        }
++        for (int u = 0; u < 8; u++) {
++          v4f q4 = acc[u];
++          for (int l = 0; l < 5; l++) { if ((k >> l) & 1) q4 = st[l][u] + q4; else { st[l][u] = q4; break; } }
++          pv[u] = q4;
++        }
++      }
++      for (int u = 0; u < 8; u++) {
++        const v4f z = splat(0.f) + pv[u];
++        float v[4]; __builtin_memcpy(v, &z, 16);
++        for (int p = 0; p < 4; p++) if (t0 + p < NP) yw[(size_t)(t0 + p) * R + r0 + u] = cpu_f2bf(v[p]);
++      }
++    }
++  }
++  clock_gettime(CLOCK_MONOTONIC, &w3);
++  if (getenv("LFM_PF_CPUT_LOG") && (g_cf.L <= 4 || g_cf.L == 10))
++    printf("CPUW L%d id%d wait+d2h %.1f transpose %.1f compute %.1f ms\n", g_cf.L, id,
++           (w1.tv_sec - w0.tv_sec) * 1e3 + (w1.tv_nsec - w0.tv_nsec) * 1e-6,
++           (w2.tv_sec - w1.tv_sec) * 1e3 + (w2.tv_nsec - w1.tv_nsec) * 1e-6,
++           (w3.tv_sec - w2.tv_sec) * 1e3 + (w3.tv_nsec - w2.tv_nsec) * 1e-6);
++  }
++  return nullptr;
++}
+ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
+   const int QDIM = NH * HD, KVDIM = NKV * HD;
+   const int pf4trace = getenv("LFM_PF4_TRACE") ? 1 : 0;   // stage-by-stage rms for L0,
+   // to be read against the T=1 path's own --probe-layer 0 --probe-step 0 PROBE lines.
++  static const int ewb = getenv("LFM_PF_EWB") ? atoi(getenv("LFM_PF_EWB")) : 1;
++  if (g_lc_mode == 2) {                // GPU rows of w1 / w3 for this chunk, full-stride outputs
++    static const int chk = getenv("LFM_PF_CPUCHK") ? atoi(getenv("LFM_PF_CPUCHK")) : 0;
++    g_pf_nrow = chk ? 0 : INTER - g_cf.R;
++    const int r1 = pf_gemv_T(M, LN(L, "feed_forward.w1.weight"), g_h1all + (size_t)pos0 * H, g_w1all + (size_t)pos0 * INTER, A.part, Tn);
++    const int r3 = r1 ? 1 : pf_gemv_T(M, LN(L, "feed_forward.w3.weight"), g_h1all + (size_t)pos0 * H, g_w3all + (size_t)pos0 * INTER, A.part, Tn);
++    g_pf_nrow = 0;
++    return r1 || r3;
++  }
++  if (g_lc_mode == 3) { A.w1 = g_w1all + (size_t)pos0 * INTER; A.w3 = g_w3all + (size_t)pos0 * INTER; goto ffn_silu; }
+   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "operator_norm.weight"), A.h1, NORM_EPS, H);
+   if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d operator_norm launch failed\n", L); return 1; }
+   P4("operator_norm", A.h1, H);   // after the launch: the first version probed before it and printed 0.00000
+@@ -4256,16 +4405,20 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
+   P4("post_op_norm", A.cy, H);
+   // LFM_PF_EWB (default 1): the chunk's rows are contiguous, so each elementwise op runs
+   // as one launch over Tn * n elements (same per-element arithmetic); 0 = per position.
+-  static const int ewb = getenv("LFM_PF_EWB") ? atoi(getenv("LFM_PF_EWB")) : 1;
+   if (ewb) eadd(M, A.xb, A.cy, A.xb, Tn * H);
+   else for (int t = 0; t < Tn; t++) eadd(M, A.xb + (size_t)t * H, A.cy + (size_t)t * H, A.xb + (size_t)t * H, H);
+   P4("add1", A.xb, H);
+   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "ffn_norm.weight"), A.h1, NORM_EPS, H);
+   P4("ffn_norm", A.h1, H);
++  if (g_lc_mode == 1) {
++    cudaMemcpyAsync(g_h1all + (size_t)pos0 * H, A.h1, (size_t)Tn * H * 2, cudaMemcpyDeviceToDevice, g_launch);
++    return cudaGetLastError() != cudaSuccess;
++  }
+   if (pf_gemv_T(M, LN(L, "feed_forward.w1.weight"), A.h1, A.w1, A.part, Tn)) return 1;
+   P4("w1", A.w1, INTER);
+   if (pf_gemv_T(M, LN(L, "feed_forward.w3.weight"), A.h1, A.w3, A.part, Tn)) return 1;
+   P4("w3", A.w3, INTER);
++ffn_silu:
+   if (ewb) k_silu_mul_bf<<<(Tn * INTER + 255) / 256, 256, 0, g_launch>>>(A.w1, A.w3, A.h2, Tn * INTER);
+   else for (int t = 0; t < Tn; t++)
+     k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(A.w1 + (size_t)t * INTER,
+@@ -4887,6 +5040,21 @@ int main(int argc, char** argv) {
+         static bf16* xall = nullptr;
+         if (!xall && cudaMalloc(&xall, (size_t)NP * H * 2) != cudaSuccess) { printf("PF4-RUN: xall alloc failed\n"); return 1; }
+         if (g_lj && !g_embfile && !load_wait(g_lj->need_emb)) { printf("PF4-RUN: weight load failed (embedding)\n"); return 1; }
++        static const int cfR = getenv("LFM_PF_CPU") ? atoi(getenv("LFM_PF_CPU")) : 0;
++        if (cfR && !g_cf.R) {
++          if (cfR % 512 || cfR >= INTER) { printf("PF4-RUN: LFM_PF_CPU=%d must be a multiple of 512 below %d\n", cfR, INTER); return 1; }
++          g_cf.R = cfR; g_cf.NP = NP; g_cf.Tp = (NP + 3) & ~3;
++          g_cf.nth = getenv("LFM_PF_CPUT") ? atoi(getenv("LFM_PF_CPUT")) : 3;
++          if (g_cf.nth < 1 || g_cf.nth > 8) g_cf.nth = 3;
++          g_cf.h1.resize((size_t)NP * H); g_cf.xt.resize((size_t)H * g_cf.Tp);
++          g_cf.y[0].resize((size_t)NP * cfR); g_cf.y[1].resize((size_t)NP * cfR);
++          if (cudaMalloc(&g_h1all, (size_t)NP * H * 2) || cudaMalloc(&g_w1all, (size_t)NP * INTER * 2) ||
++              cudaMalloc(&g_w3all, (size_t)NP * INTER * 2) || cudaEventCreateWithFlags(&g_cf.ev, cudaEventDisableTiming) ||
++              cudaStreamCreateWithFlags(&g_cf.st, cudaStreamNonBlocking)) { printf("PF4-RUN: CPU share alloc failed\n"); return 1; }
++          pthread_barrier_init(&g_cf.bar, nullptr, g_cf.nth);
++          if (pthread_create(&g_cf_pth, nullptr, cpuff_prefetch, &M)) { printf("PF4-RUN: CPU share prefetch thread failed\n"); return 1; }
++          printf("PF4-RUN: CPU share: last %d rows of ffn.w1/w3 on %d threads\n", cfR, g_cf.nth);
++        }
+         for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
+           Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+           A.xb = xall + (size_t)c0 * H;
+@@ -4894,10 +5062,56 @@ int main(int argc, char** argv) {
+         }
+         for (int L = 0; L < NLAYER; L++) {
+           if (g_lj && !load_wait(g_lj->need[L])) { printf("PF4-RUN: weight load failed (layer %d)\n", L); return 1; }
++          bf16 *w1keep = A.w1, *w3keep = A.w3;
++          { struct timespec r0, r1; clock_gettime(CLOCK_MONOTONIC, &r0);
++          if (g_cf.R) {
++            while (__atomic_load_n(&g_cf_ready, __ATOMIC_ACQUIRE) <= L && !__atomic_load_n(&g_cf_rfail, __ATOMIC_ACQUIRE)) usleep(200);
++            if (__atomic_load_n(&g_cf_rfail, __ATOMIC_ACQUIRE)) { printf("PF4-RUN: CPU share weight read failed (layer %d)\n", L); return 1; }
++            if (L == NLAYER - 1) pthread_join(g_cf_pth, nullptr);
++          }
++          clock_gettime(CLOCK_MONOTONIC, &r1);
++          if (g_cf.R && getenv("LFM_PF_CPUT_LOG")) printf("CPUREAD L%d %.1f ms loader done=%d/%zu\n", L,
++              (r1.tv_sec - r0.tv_sec) * 1e3 + (r1.tv_nsec - r0.tv_nsec) * 1e-6, g_lj ? g_lj->done : -1, g_lj ? g_lj->order.size() : 0); }
++          for (int ph = (g_cf.R ? 1 : 0); ph <= (g_cf.R ? 3 : 0); ph++) {
++          g_lc_mode = ph;
++          if (ph == 2) {                         // CPU rows start once h1 of every position exists
++            cudaEventRecord(g_cf.ev, g_launch);
++            g_cf.L = L; g_cf.fail = 0;
++            static CpuArg args[8];
++            for (int k = 0; k < g_cf.nth; k++) { args[k].id = k;
++              if (pthread_create(&g_cf.th[k], nullptr, cpuff_worker, &args[k])) { printf("PF4-RUN: CPU share thread failed\n"); return 1; } }
++          }
++          if (ph == 3) {                         // CPU rows into the full-stride w1 / w3 rows
++            struct timespec j0, j1; clock_gettime(CLOCK_MONOTONIC, &j0);
++            cudaStreamSynchronize(g_launch);          // GPU rows done
++            struct timespec jg; clock_gettime(CLOCK_MONOTONIC, &jg);
++            for (int k = 0; k < g_cf.nth; k++) pthread_join(g_cf.th[k], nullptr);
++            clock_gettime(CLOCK_MONOTONIC, &j1);
++            if (getenv("LFM_PF_CPUT_LOG"))
++              printf("CPUJOIN L%d gpu-drain %.1f ms, then cpu wait %.1f ms\n", L,
++                     (jg.tv_sec - j0.tv_sec) * 1e3 + (jg.tv_nsec - j0.tv_nsec) * 1e-6,
++                     (j1.tv_sec - jg.tv_sec) * 1e3 + (j1.tv_nsec - jg.tv_nsec) * 1e-6);
++            if (g_cf.fail) { printf("PF4-RUN: CPU share failed (layer %d)\n", L); return 1; }
++            const size_t off = (size_t)(INTER - g_cf.R);
++            if (getenv("LFM_PF_CPUCHK")) {           // GPU computed every row: compare the CPU's
++              std::vector<uint16_t> g((size_t)NP * g_cf.R);
++              for (int w = 0; w < 2; w++) {
++                cudaMemcpy2D(g.data(), g_cf.R * 2, (w ? g_w3all : g_w1all) + off, INTER * 2, g_cf.R * 2, NP, cudaMemcpyDeviceToHost);
++                long bad = 0, first = -1;
++                for (size_t i = 0; i < g.size(); i++) if (g[i] != g_cf.y[w][i]) { if (first < 0) first = (long)i; bad++; }
++                printf("CPUCHK L%d w%d: %ld of %zu differ", L, w ? 3 : 1, bad, g.size());
++                if (first >= 0) printf(" (first t=%ld r=%ld gpu %04x cpu %04x)", first / g_cf.R, first % g_cf.R, g[first], g_cf.y[w][first]);
++                printf("\n");
++              }
++            }
++            if (cudaMemcpy2DAsync(g_w1all + off, INTER * 2, g_cf.y[0].data(), g_cf.R * 2, g_cf.R * 2, NP, cudaMemcpyHostToDevice, g_launch) ||
++                cudaMemcpy2DAsync(g_w3all + off, INTER * 2, g_cf.y[1].data(), g_cf.R * 2, g_cf.R * 2, NP, cudaMemcpyHostToDevice, g_launch)) {
++              printf("PF4-RUN: CPU share upload failed\n"); return 1; }
++          }
+           for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
+             Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+             A.xb = xall + (size_t)c0 * H;
+-            if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
++            if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d (phase %d)\n", L, c0, ph); return 1; }
+             if (g_pfsync == 3) {     // bounded queue: wait for the chunk recorded K chunks ago
+               static cudaEvent_t ev[64]; static int nev = 0; static long ci = 0;
+               static const int K = getenv("LFM_PF_SYNCK") ? atoi(getenv("LFM_PF_SYNCK")) : 4;
+@@ -4909,6 +5123,8 @@ int main(int argc, char** argv) {
+             if (g_pfsync == 1) { const cudaError_t se = cudaStreamSynchronize(g_launch);
+               if (se != cudaSuccess) { printf("PF4-RUN: L%d chunk %d sync: %s\n", L, c0, cudaGetErrorString(se)); return 1; } }
+           }
++          }
++          g_lc_mode = 0; A.w1 = w1keep; A.w3 = w3keep;
+           if (g_pfsync == 2) { const cudaError_t se = cudaStreamSynchronize(g_launch);
+             if (se != cudaSuccess) { printf("PF4-RUN: L%d sync: %s\n", L, cudaGetErrorString(se)); return 1; } }
+         }
