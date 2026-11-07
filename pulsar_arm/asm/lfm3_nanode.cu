@@ -1,3 +1,4 @@
+#include <type_traits>
 // lfm3_nanode.cu -- LFM3-Audio-2B text-backbone decode harness for Jetson Nano.
 //
 // PURPOSE. Everything measured so far prices the GEMV kernels in isolation
@@ -726,6 +727,28 @@ __global__ void k_silu_mul_bf(const bf16* __restrict__ w1, const bf16* __restric
     const float sg = __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-a)));
     y[i] = f2bf(__fmul_rn(__fmul_rn(a, sg), bf2f(w3[i])));   // silu(w1)*w3, one round
   }
+}
+// k_silu_mul_bfv<V>: k_silu_mul_bf with V consecutive elements per thread (one 4- or 8-byte
+// load of each input, one store): the per-element arithmetic is unchanged, only the access
+// width. Needs n % V == 0 and V*2-byte aligned rows. LFM_PF_SILV selects V for the prefill
+// batch launch (0 = k_silu_mul_bf).
+template <int V>
+__global__ void k_silu_mul_bfv(const bf16* __restrict__ w1, const bf16* __restrict__ w3,
+                               bf16* __restrict__ y, int n) {
+  typedef typename std::conditional<V == 2, uint32_t, uint2>::type VT;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i * V >= n) return;
+  VT a4 = reinterpret_cast<const VT*>(w1)[i], b4 = reinterpret_cast<const VT*>(w3)[i], o4;
+  const bf16* av = reinterpret_cast<const bf16*>(&a4);
+  const bf16* bv = reinterpret_cast<const bf16*>(&b4);
+  bf16* ov = reinterpret_cast<bf16*>(&o4);
+  #pragma unroll
+  for (int j = 0; j < V; j++) {
+    const float a = bf2f(av[j]);
+    const float sg = __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-a)));
+    ov[j] = f2bf(__fmul_rn(__fmul_rn(a, sg), bf2f(bv[j])));
+  }
+  reinterpret_cast<VT*>(y)[i] = o4;
 }
 __global__ void k_sigmoid_gate(const bf16* __restrict__ g, bf16* __restrict__ attn, int hd) {
   g += (size_t)blockIdx.y * gridDim.x * blockDim.x; attn += (size_t)blockIdx.y * gridDim.x * blockDim.x * hd;
@@ -4424,7 +4447,12 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   P4("w1", A.w1, INTER);
   if (pf_gemv_T(M, LN(L, "feed_forward.w3.weight"), A.h1, A.w3, A.part, Tn)) return 1;
   P4("w3", A.w3, INTER);
-  if (ewb) k_silu_mul_bf<<<(Tn * INTER + 255) / 256, 256, 0, g_launch>>>(A.w1, A.w3, A.h2, Tn * INTER);
+  static const int silv = getenv("LFM_PF_SILV") ? atoi(getenv("LFM_PF_SILV")) : 4;
+  if (ewb && silv == 4 && (Tn * INTER) % 4 == 0)
+    k_silu_mul_bfv<4><<<(Tn * INTER / 4 + 255) / 256, 256, 0, g_launch>>>(A.w1, A.w3, A.h2, Tn * INTER);
+  else if (ewb && silv == 2 && (Tn * INTER) % 2 == 0)
+    k_silu_mul_bfv<2><<<(Tn * INTER / 2 + 255) / 256, 256, 0, g_launch>>>(A.w1, A.w3, A.h2, Tn * INTER);
+  else if (ewb) k_silu_mul_bf<<<(Tn * INTER + 255) / 256, 256, 0, g_launch>>>(A.w1, A.w3, A.h2, Tn * INTER);
   else for (int t = 0; t < Tn; t++)
     k_silu_mul_bf<<<(INTER + 255) / 256, 256, 0, g_launch>>>(A.w1 + (size_t)t * INTER,
                                                              A.w3 + (size_t)t * INTER,
