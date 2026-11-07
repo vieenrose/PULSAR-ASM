@@ -758,6 +758,37 @@ __global__ void k_sigmoid_gate(const bf16* __restrict__ g, bf16* __restrict__ at
   #pragma unroll 4
   for (int j = 0; j < hd; j++) a[j] = f2bf(__fmul_rn(bf2f(a[j]), s));
 }
+// Vector forms (LFM_PF_EWV, default 1; 0 = the scalar kernels above). k_add_bf4: 4
+// consecutive elements per thread, one 8-byte load of each input and one store; same
+// per-element __fadd_rn and rounding. k_sigmoid_gate4: k_sigmoid_gate ran one thread per
+// head (16 threads per block, each walking its own 128-element head, so a warp's loads were
+// 256 B apart); now 256 threads per position, 4 consecutive elements each, and every thread
+// recomputes its head's s from the same g value with the same expression: same bits.
+__global__ void k_add_bf4(const bf16* __restrict__ a, const bf16* __restrict__ b,
+                          bf16* __restrict__ y, int n4) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n4) return;
+  uint2 a4 = reinterpret_cast<const uint2*>(a)[i], b4 = reinterpret_cast<const uint2*>(b)[i], o4;
+  const bf16* av = reinterpret_cast<const bf16*>(&a4);
+  const bf16* bv = reinterpret_cast<const bf16*>(&b4);
+  bf16* ov = reinterpret_cast<bf16*>(&o4);
+  #pragma unroll
+  for (int j = 0; j < 4; j++) ov[j] = f2bf(__fadd_rn(bf2f(av[j]), bf2f(bv[j])));
+  reinterpret_cast<uint2*>(y)[i] = o4;
+}
+__global__ void k_sigmoid_gate4(const bf16* __restrict__ g, bf16* __restrict__ attn, int nh, int hd) {
+  g += (size_t)blockIdx.y * nh; attn += (size_t)blockIdx.y * nh * hd;
+  const int e = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (e >= nh * hd) return;
+  const float s = __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-bf2f(g[e / hd]))));
+  uint2 a4 = *reinterpret_cast<const uint2*>(attn + e);
+  bf16* av = reinterpret_cast<bf16*>(&a4);
+  #pragma unroll
+  for (int j = 0; j < 4; j++) av[j] = f2bf(__fmul_rn(bf2f(av[j]), s));
+  *reinterpret_cast<uint2*>(attn + e) = a4;
+}
+static int g_ewv = -1;
+static bool ewv_on() { if (g_ewv < 0) g_ewv = getenv("LFM_PF_EWV") ? atoi(getenv("LFM_PF_EWV")) : 1; return g_ewv != 0; }
 // ring: slots 0..6, newest at 6 (tap 6 = the current column)
 __global__ void k_shift_in(bf16* __restrict__ ring, const bf16* __restrict__ xin, int H_) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3474,6 +3505,10 @@ static void emul(Model& M, const bf16* a, const bf16* b, bf16* y, int n) {
   k_mul_bf<<<(n + 255) / 256, 256, 0, g_launch>>>(a, b, y, n);
 }
 static void eadd(Model& M, const bf16* a, const bf16* b, bf16* y, int n) {
+  if (ewv_on() && n % 4 == 0 && (((uintptr_t)a | (uintptr_t)b | (uintptr_t)y) & 7) == 0) {
+    k_add_bf4<<<(n / 4 + 255) / 256, 256, 0, g_launch>>>(a, b, y, n / 4);
+    return;
+  }
   k_add_bf<<<(n + 255) / 256, 256, 0, g_launch>>>(a, b, y, n);
 }
 
@@ -4376,7 +4411,9 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
         if (cudaGetLastError() != cudaSuccess) { printf("PF4: k_attn_headG launch failed (G=%d, sln=%d)\n", attg, sln); return 1; }
       } else
       k_attn_head<<<dim3(NH, Tn), 256, 0, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, HD, NKV, nullptr);
-      k_sigmoid_gate<<<dim3(1, Tn), NH, 0, g_launch>>>(A.gate, A.attn, HD);
+      if (ewv_on() && (NH * HD) % 4 == 0 && HD % 4 == 0)
+        k_sigmoid_gate4<<<dim3((NH * HD / 4 + 255) / 256, Tn), 256, 0, g_launch>>>(A.gate, A.attn, NH, HD);
+      else k_sigmoid_gate<<<dim3(1, Tn), NH, 0, g_launch>>>(A.gate, A.attn, HD);
     } else
     for (int t = 0; t < Tn; t++) {
       const int pos = pos0 + t;
