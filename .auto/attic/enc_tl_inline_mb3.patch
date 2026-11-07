@@ -1,0 +1,92 @@
+diff --git a/pulsar_arm/asm/lfm3_enc_gpu.cu b/pulsar_arm/asm/lfm3_enc_gpu.cu
+index f6ab7ba..23a6eae 100644
+--- a/pulsar_arm/asm/lfm3_enc_gpu.cu
++++ b/pulsar_arm/asm/lfm3_enc_gpu.cu
+@@ -590,8 +590,8 @@ __device__ __noinline__ float4 tl_leaf4(const int4* __restrict__ qt, const float
+ // reads the same address, so the pad against bank conflicts is not needed) and read as one
+ // LDS.128 per 4 codes and position instead of one LDS.32 per code and position. Each
+ // position's chain still runs over jj = 0..31 in order: bit-identical.
+-__device__ __noinline__ float4 tl_leaf4v(const int4* __restrict__ qt, const float* __restrict__ st_s,
+-                                         const float* xs, int b) {
++__device__ __forceinline__ float4 tl_leaf4v_in(const int4* __restrict__ qt, const float* __restrict__ st_s,
++                                               const float* xs, int b) {
+   const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
+   const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                           (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+@@ -616,9 +616,15 @@ __device__ __noinline__ float4 tl_leaf4v(const int4* __restrict__ qt, const floa
+   return make_float4(__fmaf_rn(sb, dot[0], 0.f), __fmaf_rn(sb, dot[1], 0.f),
+                      __fmaf_rn(sb, dot[2], 0.f), __fmaf_rn(sb, dot[3], 0.f));
+ }
++__device__ __noinline__ float4 tl_leaf4v(const int4* __restrict__ qt, const float* __restrict__ st_s,
++                                         const float* xs, int b) {
++  return tl_leaf4v_in(qt, st_s, xs, b);
++}
+ static const int g_tlni = getenv("LFM_ENC_TLNI") ? atoi(getenv("LFM_ENC_TLNI")) : 1;
+-template <int CT, bool NI = false, int XV = 1>
+-__global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict__ q, const float* __restrict__ s,
++// MB (LFM_ENC_TLMB): minimum resident blocks per SM in the launch bounds, i.e. the register
++// cap (4 -> 64 registers, 3 -> 85). Code generation only: bit-identical.
++template <int CT, bool NI = false, int XV = 1, int MB = 4>
++__global__ void __launch_bounds__(256, MB) q8_partial_TL(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                         const float* __restrict__ x, float* __restrict__ part,
+                                                         int N, int K, int KCHUNK, int R, int nb, int T) {
+   extern __shared__ float xs[];                       // [CT][nb*33]
+@@ -653,11 +659,17 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict
+     if (NI) {
+       const float4 a = XV == 4 ? tl_leaf4v(qt, st_s, xs, i) : tl_leaf4(qt, st_s, xs, i);
+       lo[0] = a.x; lo[1 % CT] = a.y; lo[2 % CT] = a.z; lo[3 % CT] = a.w;
++    } else if (XV == 4) {
++      const float4 a = tl_leaf4v_in(qt, st_s, xs, i);
++      lo[0] = a.x; lo[1 % CT] = a.y; lo[2 % CT] = a.z; lo[3 % CT] = a.w;
+     } else tl_leaf<CT>(qt, st_s, xs, i, lo);
+     if (i + 16 < 24) {
+       if (NI) {
+         const float4 a = XV == 4 ? tl_leaf4v(qt, st_s, xs, i + 16) : tl_leaf4(qt, st_s, xs, i + 16);
+         hi[0] = a.x; hi[1 % CT] = a.y; hi[2 % CT] = a.z; hi[3 % CT] = a.w;
++      } else if (XV == 4) {
++        const float4 a = tl_leaf4v_in(qt, st_s, xs, i + 16);
++        hi[0] = a.x; hi[1 % CT] = a.y; hi[2 % CT] = a.z; hi[3 % CT] = a.w;
+       } else tl_leaf<CT>(qt, st_s, xs, i + 16, hi);
+     } else {
+       #pragma unroll
+@@ -772,8 +784,8 @@ __device__ __noinline__ float4 tle_leaf(const int4* __restrict__ qt, const float
+   }
+   return make_float4(acc[0], acc[1], acc[2], acc[3]);
+ }
+-template <int XE>
+-__global__ void __launch_bounds__(256, 4) q8_partial_TLe(const int8_t* __restrict__ q, const float* __restrict__ s,
++template <int XE, int MB = 4>
++__global__ void __launch_bounds__(256, MB) q8_partial_TLe(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                          const float* __restrict__ x, float* __restrict__ part,
+                                                          int N, int K, int nb, int T) {
+   extern __shared__ float xe[];                       // [4 leaf slots][mm][4 positions][32]
+@@ -1002,7 +1014,9 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
+       const int Tl = (T - t0 < 65535 * 4) ? T - t0 : 65535 * 4;
+       static const int xe = getenv("LFM_ENC_XE") ? atoi(getenv("LFM_ENC_XE")) : 4;
+       const dim3 ge((g.N + 255) / 256, (Tl + 3) / 4);
+-      if (xe == 4)      q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
++      static const int temb = getenv("LFM_ENC_TLMB") ? atoi(getenv("LFM_ENC_TLMB")) : 4;
++      if (xe == 4 && temb == 3) q8_partial_TLe<4, 3><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
++      else if (xe == 4) q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
+       else if (xe == 1) q8_partial_TLe<1><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
+       else              q8_partial_TLe<0><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
+     }
+@@ -1023,7 +1037,17 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
+         if (g_encts == -2) g_encts = getenv("LFM_ENC_TS") ? atoi(getenv("LFM_ENC_TS")) : 1;
+         if (g.tl && !(ct == 4 && g.R == TPB)) { printf("tiled tensor needs q8_partial_TL\n"); exit(2); }
+         static const int xv = getenv("LFM_ENC_XV") ? atoi(getenv("LFM_ENC_XV")) : 4;
+-        if (g.tl && g_tlni && xv == 4)
++        static const int tlmb = getenv("LFM_ENC_TLMB") ? atoi(getenv("LFM_ENC_TLMB")) : 4;
++        if (g.tl && g_tlni && xv == 4 && tlmb == 33)
++          q8_partial_TL<4, false, 4, 3><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
++                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
++        else if (g.tl && g_tlni && xv == 4 && tlmb == 34)
++          q8_partial_TL<4, false, 4, 4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
++                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
++        else if (g.tl && g_tlni && xv == 4 && tlmb == 3)
++          q8_partial_TL<4, true, 4, 3><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
++                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
++        else if (g.tl && g_tlni && xv == 4)
+           q8_partial_TL<4, true, 4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+                          g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
+         else if (g.tl && g_tlni)

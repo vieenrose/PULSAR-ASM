@@ -1,0 +1,84 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index bb457ea..2b8ed7e 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -3942,6 +3942,49 @@ __device__ __noinline__ float4 tlf_leaf(const int4* __restrict__ qt, const float
+   }
+   return make_float4(acc[0], acc[1], acc[2], acc[3]);
+ }
++// tlf_leaf2 (PF = 9): leaves i0 and i1 in one call, the 1-deep weight prefetch running
++// across all 2 * nb / 32 blocks, so only the first block's load of the pair is exposed
++// (at K = 2048 a single leaf has 2 blocks, so PF = 1 exposed every other load). Each leaf
++// keeps its own acc chain; needs nb % 32 == 0. Same operands, same order: bit-identical.
++struct tlf_f8 { float4 a, b; };
++template <int CT>
++__device__ __noinline__ tlf_f8 tlf_leaf2(const int4* __restrict__ qt, const float* __restrict__ sts,
++                                         const float* xf, int i0, int i1, int nb, int K) {
++  const int mm = nb >> 5, nt = 2 * mm;
++  float acc[4] = { 0.f, 0.f, 0.f, 0.f }, o0[4] = { 0.f, 0.f, 0.f, 0.f };
++  int4 n0 = qt[i0 * 64], n1 = qt[i0 * 64 + 32]; float nsb = sts[i0 * 32];
++  for (int n = 0; n < nt; n++) {
++    const int b = n < mm ? i0 + 32 * n : i1 + 32 * (n - mm);
++    const int4 a0 = n0, a1 = n1; const float sb = nsb;
++    if (n + 1 < nt) {
++      const int b2 = n + 1 < mm ? i0 + 32 * (n + 1) : i1 + 32 * (n + 1 - mm);
++      n0 = qt[b2 * 64]; n1 = qt[b2 * 64 + 32]; nsb = sts[b2 * 32];
++    }
++    const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
++                            (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
++    float dot[4] = { 0.f, 0.f, 0.f, 0.f };
++    const float2* xb = reinterpret_cast<const float2*>(xf + b * 32);
++    #pragma unroll
++    for (int j = 0; j < 16; j++) {
++      const float ca = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1)));
++      const float cb = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1) + 8));
++      #pragma unroll
++      for (int p = 0; p < CT; p++) {
++        const float2 u = xb[p * (K / 2) + j];
++        dot[p] = __fmaf_rn(ca, u.x, dot[p]);
++        dot[p] = __fmaf_rn(cb, u.y, dot[p]);
++      }
++    }
++    #pragma unroll
++    for (int p = 0; p < CT; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
++    if (n == mm - 1) {
++      #pragma unroll
++      for (int p = 0; p < 4; p++) { o0[p] = acc[p]; acc[p] = 0.f; }
++    }
++  }
++  tlf_f8 r; r.a = make_float4(o0[0], o0[1], o0[2], o0[3]); r.b = make_float4(acc[0], acc[1], acc[2], acc[3]);
++  return r;
++}
+ template <int TPB, int CT = 4, int PF = 1>
+ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                     const bf16* __restrict__ x, float* __restrict__ part,
+@@ -3964,10 +4007,18 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const
+   const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
+   const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
+   float st[5][4], pv[4];
++  float4 a2 = make_float4(0.f, 0.f, 0.f, 0.f);
+   #pragma unroll
+   for (int k = 0; k < 32; k++) {
+     const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+-    const float4 a = tlf_leaf<CT, PF>(qt, sts, xs, i, nb, K);
++    float4 a;
++    if (PF == 9) {
++      if ((k & 1) == 0) {
++        const int i1 = (((k + 1) & 1) << 4) | (((k + 1) & 2) << 2) | ((k + 1) & 4) | (((k + 1) & 8) >> 2) | (((k + 1) & 16) >> 4);
++        const tlf_f8 r = tlf_leaf2<CT>(qt, sts, xs, i, i1, nb, K);
++        a = r.a; a2 = r.b;
++      } else a = a2;
++    } else a = tlf_leaf<CT, PF>(qt, sts, xs, i, nb, K);
+     pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
+     bool done = false;
+     #pragma unroll
+@@ -4249,7 +4300,8 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+     // without the prefetch, 0 = TLb.
+     static const int pftlf = getenv("LFM_PF_TLF") ? atoi(getenv("LFM_PF_TLF")) : 1;
+     if (pftlf && tpb == 512 && (size_t)4 * K * 4 <= 48 * 1024) {
+-      if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++      if (pftlf == 9 && nb % 32 == 0) q8_partial_TLf<512, 4, 9><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++      else if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+       else            q8_partial_TLf<512, 4, 1><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+       goto launched;
+     }

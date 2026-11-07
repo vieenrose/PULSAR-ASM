@@ -1,0 +1,49 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index bb457ea..17c1500 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -3925,6 +3925,26 @@ __device__ __noinline__ float4 tlf_leaf(const int4* __restrict__ qt, const float
+     const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                             (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+     float dot[4] = { 0.f, 0.f, 0.f, 0.f };
++    if (PF & 4) {
++      // One LDS.128 per 4 codes and position (code c is byte c & 3 of word c >> 2); each
++      // position's chain still runs c = 0..31 in order.
++      const float4* xv = reinterpret_cast<const float4*>(xf + b * 32);
++      #pragma unroll
++      for (int qq = 0; qq < 8; qq++) {
++        const float c0 = (float)(int)(signed char)(w[qq]);
++        const float c1 = (float)(int)(signed char)(w[qq] >> 8);
++        const float c2 = (float)(int)(signed char)(w[qq] >> 16);
++        const float c3 = (float)(int)(signed char)(w[qq] >> 24);
++        #pragma unroll
++        for (int p = 0; p < CT; p++) {
++          const float4 u = xv[p * (K / 4) + qq];
++          dot[p] = __fmaf_rn(c0, u.x, dot[p]);
++          dot[p] = __fmaf_rn(c1, u.y, dot[p]);
++          dot[p] = __fmaf_rn(c2, u.z, dot[p]);
++          dot[p] = __fmaf_rn(c3, u.w, dot[p]);
++        }
++      }
++    } else {
+     const float2* xb = reinterpret_cast<const float2*>(xf + b * 32);
+     #pragma unroll
+     for (int j = 0; j < 16; j++) {
+@@ -3937,6 +3957,7 @@ __device__ __noinline__ float4 tlf_leaf(const int4* __restrict__ qt, const float
+         dot[p] = __fmaf_rn(cb, u.y, dot[p]);
+       }
+     }
++    }
+     #pragma unroll
+     for (int p = 0; p < CT; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
+   }
+@@ -4249,7 +4270,8 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+     // without the prefetch, 0 = TLb.
+     static const int pftlf = getenv("LFM_PF_TLF") ? atoi(getenv("LFM_PF_TLF")) : 1;
+     if (pftlf && tpb == 512 && (size_t)4 * K * 4 <= 48 * 1024) {
+-      if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++      if (pftlf == 5) q8_partial_TLf<512, 4, 5><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++      else if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+       else            q8_partial_TLf<512, 4, 1><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+       goto launched;
+     }
