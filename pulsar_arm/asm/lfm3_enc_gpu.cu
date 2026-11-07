@@ -586,8 +586,38 @@ __device__ __noinline__ float4 tl_leaf4(const int4* __restrict__ qt, const float
   tl_leaf<4>(qt, st_s, xs, b, v);
   return make_float4(v[0], v[1], v[2], v[3]);
 }
+// tl_leaf4v (LFM_ENC_XV=4): x staged unpadded (stride 32 per block: every thread of a warp
+// reads the same address, so the pad against bank conflicts is not needed) and read as one
+// LDS.128 per 4 codes and position instead of one LDS.32 per code and position. Each
+// position's chain still runs over jj = 0..31 in order: bit-identical.
+__device__ __noinline__ float4 tl_leaf4v(const int4* __restrict__ qt, const float* __restrict__ st_s,
+                                         const float* xs, int b) {
+  const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
+  const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                          (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+  const float sb = st_s[b * 32];
+  const float4* xb = reinterpret_cast<const float4*>(xs + b * 32);
+  float dot[4] = { 0.f, 0.f, 0.f, 0.f };
+  #pragma unroll
+  for (int q = 0; q < 8; q++) {
+    const float c0 = (float)(int)(signed char)(w[q]);
+    const float c1 = (float)(int)(signed char)(w[q] >> 8);
+    const float c2 = (float)(int)(signed char)(w[q] >> 16);
+    const float c3 = (float)(int)(signed char)(w[q] >> 24);
+    #pragma unroll
+    for (int p = 0; p < 4; p++) {
+      const float4 u = xb[p * (24 * 8) + q];
+      dot[p] = __fmaf_rn(c0, u.x, dot[p]);
+      dot[p] = __fmaf_rn(c1, u.y, dot[p]);
+      dot[p] = __fmaf_rn(c2, u.z, dot[p]);
+      dot[p] = __fmaf_rn(c3, u.w, dot[p]);
+    }
+  }
+  return make_float4(__fmaf_rn(sb, dot[0], 0.f), __fmaf_rn(sb, dot[1], 0.f),
+                     __fmaf_rn(sb, dot[2], 0.f), __fmaf_rn(sb, dot[3], 0.f));
+}
 static const int g_tlni = getenv("LFM_ENC_TLNI") ? atoi(getenv("LFM_ENC_TLNI")) : 1;
-template <int CT, bool NI = false>
+template <int CT, bool NI = false, int XV = 1>
 __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                         const float* __restrict__ x, float* __restrict__ part,
                                                         int N, int K, int KCHUNK, int R, int nb, int T) {
@@ -597,13 +627,13 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict
   const int koff = chunk * KCHUNK;
   const int t0 = blockIdx.y * CT;
   const int NT = blockDim.x, tid = threadIdx.x;
-  const int xstride = 24 * 33;
+  const int xstride = XV == 4 ? 24 * 32 : 24 * 33;
   #pragma unroll
   for (int p = 0; p < CT; p++) {
     const int t = t0 + p;
     if (t < T) {
       const float* xg = x + (size_t)t * K + koff;
-      for (int i = tid; i < KCHUNK; i += NT) xs[p * xstride + (i >> 5) * 33 + (i & 31)] = xg[i];
+      for (int i = tid; i < KCHUNK; i += NT) xs[p * xstride + (i >> 5) * (XV == 4 ? 32 : 33) + (i & 31)] = xg[i];
     }
   }
   __syncthreads();
@@ -621,12 +651,12 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict
     const int i = ((k & 1) << 3) | ((k & 2) << 1) | ((k & 4) >> 1) | ((k & 8) >> 3);
     float lo[CT], hi[CT];
     if (NI) {
-      const float4 a = tl_leaf4(qt, st_s, xs, i);
+      const float4 a = XV == 4 ? tl_leaf4v(qt, st_s, xs, i) : tl_leaf4(qt, st_s, xs, i);
       lo[0] = a.x; lo[1 % CT] = a.y; lo[2 % CT] = a.z; lo[3 % CT] = a.w;
     } else tl_leaf<CT>(qt, st_s, xs, i, lo);
     if (i + 16 < 24) {
       if (NI) {
-        const float4 a = tl_leaf4(qt, st_s, xs, i + 16);
+        const float4 a = XV == 4 ? tl_leaf4v(qt, st_s, xs, i + 16) : tl_leaf4(qt, st_s, xs, i + 16);
         hi[0] = a.x; hi[1 % CT] = a.y; hi[2 % CT] = a.z; hi[3 % CT] = a.w;
       } else tl_leaf<CT>(qt, st_s, xs, i + 16, hi);
     } else {
@@ -943,7 +973,11 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
         const dim3 grid(g.nblk, (Tl + ct - 1) / ct);
         if (g_encts == -2) g_encts = getenv("LFM_ENC_TS") ? atoi(getenv("LFM_ENC_TS")) : 1;
         if (g.tl && !(ct == 4 && g.R == TPB)) { printf("tiled tensor needs q8_partial_TL\n"); exit(2); }
-        if (g.tl && g_tlni)
+        static const int xv = getenv("LFM_ENC_XV") ? atoi(getenv("LFM_ENC_XV")) : 4;
+        if (g.tl && g_tlni && xv == 4)
+          q8_partial_TL<4, true, 4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
+        else if (g.tl && g_tlni)
           q8_partial_TL<4, true><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
                          g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
         else if (g.tl)   // 4 blocks/SM: 64 regs with ~580 B of spills beats 2 blocks at 128 regs (17.4 vs 15.0 s)
