@@ -40,7 +40,9 @@ echo "$BOUT" | grep -q BUILT_OK || { echo "BUILD FAILED (refusing to measure a s
 
 # Cold page cache, so every sample sees the same first-touch cost (the plan's
 # 740 MB/s eMMC finding is why this matters for --emb-host).
-ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" "sync; echo 31415 | sudo -S sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; true" 2>/dev/null
+# posix_fadvise(DONTNEED) on the blob needs no root (clean pages); the old sudo drop_caches
+# used a password that is wrong on picard and failed silently, so runs were not cold.
+ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" "cd $DIR && sync && python3 -c \"import os; fd=os.open(os.path.realpath('$BLOB'),os.O_RDONLY); os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED); os.close(fd)\" && echo 'page cache: blob evicted'" 2>/dev/null | grep -v setlocale
 
 OUT=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
   "cd $DIR && timeout 1800 env $EXTRA ./$BIN $BLOB --steps $N --prompt $PROMPT 2>&1" 2>/dev/null | grep -vi setlocale)

@@ -32,7 +32,7 @@ echo "$BOUT" | grep -q BUILT_OK || { echo "BUILD FAILED (refusing to measure a s
 run() {   # $1 = env string
   local out
   out=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
-    "cd $DIR && sync; echo 31415 | sudo -S sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; timeout 1800 env $1 ./$BIN $BLOB --steps $N --prompt $PROMPT 2>&1" 2>/dev/null | grep -vi setlocale)
+    "cd $DIR && sync && python3 -c \"import os; fd=os.open(os.path.realpath('$BLOB'),os.O_RDONLY); os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED); os.close(fd)\" && timeout 1800 env $1 ./$BIN $BLOB --steps $N --prompt $PROMPT 2>&1" 2>/dev/null | grep -vi setlocale)
   echo "$out" | grep -oE 'steady-state [0-9.]+ ms/token' | tail -1 | awk '{print $2}'
 }
 
