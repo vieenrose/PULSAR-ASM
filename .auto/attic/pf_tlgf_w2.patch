@@ -1,0 +1,170 @@
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -4069,6 +4069,151 @@
+     if (t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, pv[p])); else part[(size_t)t * N + row] = pv[p]; }
+   }
+ }
++// q8_partial_TLgf: q8_partial_TLg with the q8_partial_TLf changes (LFM_PF_TLGF): the group's
++// x is staged as f32 (exact; 16 KB instead of 8), each code pair reads its two values with
++// one LDS.64, and with PF = 1 the leaf loads block m+1's weights and scale before block m's
++// FMAs (a w2 leaf walks 7-8 blocks serially). Same operands, same order: bit-identical.
++template <int PF>
++__device__ __noinline__ float4 tlgf_leaf(const int4* __restrict__ qt, const float* __restrict__ sts,
++                                         const float2* xg, int i, int nb) {
++  float acc[4] = { 0.f, 0.f, 0.f, 0.f };
++  if (PF == 2) {
++    // Two blocks' dot products interleaved (8 independent FMA chains instead of 4); each
++    // block's chain and the ordered acc combines are unchanged.
++    int m = 0;
++    for (; i + 32 * (m + 1) < nb; m += 2) {
++      const int b = i + 32 * m;
++      const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32], c0 = qt[(b + 32) * 64], c1 = qt[(b + 32) * 64 + 32];
++      const float sb = sts[b * 32], sc = sts[(b + 32) * 32];
++      const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
++                              (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
++      const unsigned v[8] = { (unsigned)c0.x, (unsigned)c0.y, (unsigned)c0.z, (unsigned)c0.w,
++                              (unsigned)c1.x, (unsigned)c1.y, (unsigned)c1.z, (unsigned)c1.w };
++      float dot[4] = { 0.f, 0.f, 0.f, 0.f }, dut[4] = { 0.f, 0.f, 0.f, 0.f };
++      const float2* wb0 = xg + m * 64;
++      #pragma unroll
++      for (int j = 0; j < 16; j++) {
++        const float ca = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1)));
++        const float cb = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1) + 8));
++        const float da = (float)(int)(signed char)(v[j >> 1] >> (16 * (j & 1)));
++        const float db = (float)(int)(signed char)(v[j >> 1] >> (16 * (j & 1) + 8));
++        #pragma unroll
++        for (int p = 0; p < 4; p++) {
++          const float2 u = wb0[p * 16 + j], z = wb0[64 + p * 16 + j];
++          dot[p] = __fmaf_rn(ca, u.x, dot[p]);
++          dut[p] = __fmaf_rn(da, z.x, dut[p]);
++          dot[p] = __fmaf_rn(cb, u.y, dot[p]);
++          dut[p] = __fmaf_rn(db, z.y, dut[p]);
++        }
++      }
++      #pragma unroll
++      for (int p = 0; p < 4; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
++      #pragma unroll
++      for (int p = 0; p < 4; p++) acc[p] = __fmaf_rn(sc, dut[p], acc[p]);
++    }
++    if (i + 32 * m < nb) {
++      const int b = i + 32 * m;
++      const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
++      const float sb = sts[b * 32];
++      const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
++                              (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
++      float dot[4] = { 0.f, 0.f, 0.f, 0.f };
++      const float2* wb0 = xg + m * 64;
++      #pragma unroll
++      for (int j = 0; j < 16; j++) {
++        const float ca = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1)));
++        const float cb = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1) + 8));
++        #pragma unroll
++        for (int p = 0; p < 4; p++) {
++          const float2 u = wb0[p * 16 + j];
++          dot[p] = __fmaf_rn(ca, u.x, dot[p]);
++          dot[p] = __fmaf_rn(cb, u.y, dot[p]);
++        }
++      }
++      #pragma unroll
++      for (int p = 0; p < 4; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
++    }
++    return make_float4(acc[0], acc[1], acc[2], acc[3]);
++  }
++  int4 n0, n1; float nsb = 0.f;
++  if (PF) { n0 = qt[i * 64]; n1 = qt[i * 64 + 32]; nsb = sts[i * 32]; }
++  for (int m = 0; i + 32 * m < nb; m++) {
++    const int b = i + 32 * m;
++    int4 a0, a1; float sb;
++    if (PF) {
++      a0 = n0; a1 = n1; sb = nsb;
++      if (b + 32 < nb) { n0 = qt[(b + 32) * 64]; n1 = qt[(b + 32) * 64 + 32]; nsb = sts[(b + 32) * 32]; }
++    } else { a0 = qt[b * 64]; a1 = qt[b * 64 + 32]; sb = sts[b * 32]; }
++    const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
++                            (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
++    float dot[4] = { 0.f, 0.f, 0.f, 0.f };
++    const float2* wb0 = xg + m * 64;
++    #pragma unroll
++    for (int j = 0; j < 16; j++) {
++      const float ca = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1)));
++      const float cb = (float)(int)(signed char)(w[j >> 1] >> (16 * (j & 1) + 8));
++      #pragma unroll
++      for (int p = 0; p < 4; p++) {
++        const float2 u = wb0[p * 16 + j];
++        dot[p] = __fmaf_rn(ca, u.x, dot[p]);
++        dot[p] = __fmaf_rn(cb, u.y, dot[p]);
++      }
++    }
++    #pragma unroll
++    for (int p = 0; p < 4; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
++  }
++  return make_float4(acc[0], acc[1], acc[2], acc[3]);
++}
++template <int PF>
++__global__ void __launch_bounds__(512, 2) q8_partial_TLgf(const int8_t* __restrict__ q, const float* __restrict__ s,
++                                                          const bf16* __restrict__ x, float* __restrict__ part,
++                                                          int N, int K, int nb, int T, bf16* __restrict__ yb) {
++  __shared__ float2 xs[4 * 8 * 64];                   // [leaf slot][m][position][16 pairs]
++  const int t0 = blockIdx.y * 4, tid = threadIdx.x;
++  const int row = blockIdx.x * 512 + tid;
++  const bool live = row < N;
++  const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
++  const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
++  float st[5][4], pv[4];
++  #pragma unroll
++  for (int k = 0; k < 32; k++) {
++    if ((k & 3) == 0) {
++      __syncthreads();
++      for (int w = tid; w < 4 * 8 * 64; w += 512) {
++        const int jj = w & 15, p = (w >> 4) & 3, m = (w >> 6) & 7, ls = w >> 9;
++        const int kk = k + ls;
++        const int i = ((kk & 1) << 4) | ((kk & 2) << 2) | (kk & 4) | ((kk & 8) >> 2) | ((kk & 16) >> 4);
++        const int b = i + 32 * m, t = t0 + p;
++        const uint32_t u = (b < nb && t < T) ? reinterpret_cast<const uint32_t*>(x + (size_t)t * K)[b * 16 + jj] : 0u;
++        xs[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
++      }
++      __syncthreads();
++    }
++    const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
++    float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
++    if (live) a = tlgf_leaf<PF>(qt, sts, xs + (k & 3) * 512, i, nb);
++    pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
++    bool done = false;
++    #pragma unroll
++    for (int l = 0; l < 5; l++) {
++      if (done) continue;
++      if ((k >> l) & 1) {
++        #pragma unroll
++        for (int p = 0; p < 4; p++) pv[p] = __fadd_rn(st[l][p], pv[p]);
++      } else {
++        #pragma unroll
++        for (int p = 0; p < 4; p++) st[l][p] = pv[p];
++        done = true;
++      }
++    }
++  }
++  if (!live) return;
++  #pragma unroll
++  for (int p = 0; p < 4; p++) {
++    const int t = t0 + p;
++    if (t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, pv[p])); else part[(size_t)t * N + row] = pv[p]; }
++  }
++}
+ __global__ void k_tile_q(const int4* __restrict__ src, int4* __restrict__ dst, int N, int nb) {
+   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // (row, b, h)
+   if (i >= (size_t)N * nb * 2) return;
+@@ -4160,7 +4305,14 @@
+   static const int pf_ph = getenv("LFM_PF_PH") ? atoi(getenv("LFM_PF_PH")) : 1;
+   static const int pftg = getenv("LFM_PF_TLG") ? atoi(getenv("LFM_PF_TLG")) : 1;
+   if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
+-    q8_partial_TLg<<<dim3((N + 511) / 512, (Tn + 3) / 4), 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++    // LFM_PF_TLGF: 1 = q8_partial_TLgf (f32 stage + pipelined leaf), 2 = without the
++    // prefetch, 0 = q8_partial_TLg. All bit-identical.
++    static const int pftgf = getenv("LFM_PF_TLGF") ? atoi(getenv("LFM_PF_TLGF")) : 0;
++    const dim3 gg((N + 511) / 512, (Tn + 3) / 4);
++    if (pftgf == 3)      q8_partial_TLgf<2><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++    else if (pftgf == 1) q8_partial_TLgf<1><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++    else if (pftgf == 2) q8_partial_TLgf<0><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++    else                 q8_partial_TLg<<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     goto launched;
+   }
+   if (pf_ph && nch == 1 && 4 * per > lim && Tn >= 4) {
