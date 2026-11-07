@@ -219,6 +219,7 @@ int main(int argc, char **argv) {
   snprintf(DIR, sizeof DIR, "%s", argv[1]);
   const char *wav = argv[2];
   int max_gen = (argc > 3) ? atoi(argv[3]) : 256;
+  if (max_gen < 1) { fprintf(stderr, "max_gen must be >= 1\n"); return 2; }
   /* --out-ids / --tokens-only complete the speech->speech chain: the transcript ids this
      shell generates are exactly the prompt ids lfm3_speak consumes, so M3 is this program
      followed by that one, with no Python in between. */
@@ -354,8 +355,10 @@ int main(int argc, char **argv) {
      n_prompt + len(want) + 2): the head only runs once s >= nprompt-1, so passing
      the generation budget alone makes every step a prompt step and every printed
      token a -1. Cost a full run to learn; the engine prints -1 rather than a fake id. */
-  snprintf(stq, sizeof stq, "--steps"); snprintf(stv, sizeof stv, "%ld", n_ids + (long)max_gen);
-  printf("steps: %ld prompt + %d generation = %s\n", n_ids, max_gen, stv);
+  /* The last prompt step (index n_ids - 1) already predicts generated id 1, so max_gen ids
+     need n_ids + max_gen - 1 steps; one more step only computed an id that stage 6 drops. */
+  snprintf(stq, sizeof stq, "--steps"); snprintf(stv, sizeof stv, "%ld", n_ids + (long)max_gen - 1);
+  printf("steps: %ld prompt + %d generation = %s (the last prompt step yields id 1)\n", n_ids, max_gen, stv);
   /* lfm3_nanode's context cap (MAXTOK): refuse here, before 20+ s of encoder work is
      wasted on a run the engine would truncate. */
   if (n_ids + (long)max_gen > 4096)
