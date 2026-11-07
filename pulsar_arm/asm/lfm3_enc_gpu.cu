@@ -682,7 +682,10 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict
   #pragma unroll
   for (int p = 0; p < CT; p++) {
     const int t = t0 + p;
-    if (t < T) part[((size_t)t * N + row) * nchunk + chunk] = pv[p];
+    // Stored as 0.f + v, what k_combine_f produces for one chunk, so the caller may point
+    // part at y and skip the combine (LFM_ENC_FUSEC). If a combine does run, its sum
+    // starts at +0 and is never -0, so acc + (-0) == acc + (+0): unchanged either way.
+    if (t < T) part[((size_t)t * N + row) * nchunk + chunk] = __fadd_rn(0.f, pv[p]);
   }
 }
 
@@ -817,7 +820,7 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TLe(const int8_t* __restric
   }
   if (!live) return;
   #pragma unroll
-  for (int p = 0; p < 4; p++) { const int t = t0 + p; if (t < T) part[(size_t)t * N + row] = pv[p]; }
+  for (int p = 0; p < 4; p++) { const int t = t0 + p; if (t < T) part[(size_t)t * N + row] = __fadd_rn(0.f, pv[p]); }
 }
 __global__ void k_tile_qg(const int4* __restrict__ src, int4* __restrict__ dst, int N, int nb) {
   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -948,6 +951,12 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
 // measured fp32 arm, run #309); h2 path = batched q8_prefill_h2<bf16,ARM10,RB2>.
 static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
   const int TPB = 256;
+  // LFM_ENC_FUSEC (default 1): with one K-chunk the thread-per-row kernels (TL, TLe) write
+  // 0.f + v straight into y and the k_combine_f launch is skipped. Not when y overlaps x:
+  // a block would overwrite rows other blocks are still staging.
+  static const int fusec = getenv("LFM_ENC_FUSEC") ? atoi(getenv("LFM_ENC_FUSEC")) : 1;
+  const bool disj = (const char*)(y + (size_t)T * g.N) <= (const char*)x || (const char*)(x + (size_t)T * g.K) <= (const char*)y;
+  const bool fuse = fusec && g.nch == 1 && disj;
   if (g.wf) {                                        // f32-weight path (no half2 arm)
     static const int sg8 = getenv("LFM_ENC_SG8") ? atoi(getenv("LFM_ENC_SG8")) : 1;
     if (sg8 && g.K % 16 == 0) {
@@ -1002,11 +1011,12 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
       const int Tl = (T - t0 < 65535 * 4) ? T - t0 : 65535 * 4;
       static const int xe = getenv("LFM_ENC_XE") ? atoi(getenv("LFM_ENC_XE")) : 4;
       const dim3 ge((g.N + 255) / 256, (Tl + 3) / 4);
-      if (xe == 4)      q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
-      else if (xe == 1) q8_partial_TLe<1><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
-      else              q8_partial_TLe<0><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, g.part + (size_t)t0 * g.N, g.N, g.K, g.nb, Tl);
+      float* const po = (fuse ? y : g.part) + (size_t)t0 * g.N;
+      if (xe == 4)      q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
+      else if (xe == 1) q8_partial_TLe<1><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
+      else              q8_partial_TLe<0><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
     }
-    k_combine_f<<<(unsigned)(((size_t)T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, 1);
+    if (!fuse) k_combine_f<<<(unsigned)(((size_t)T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, 1);
     const cudaError_t ce = cudaGetLastError();
     if (ce) { printf("q8_partial_TLe launch failed: %s\n", cudaGetErrorString(ce)); exit(3); }
     return;
@@ -1023,15 +1033,16 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
         if (g_encts == -2) g_encts = getenv("LFM_ENC_TS") ? atoi(getenv("LFM_ENC_TS")) : 1;
         if (g.tl && !(ct == 4 && g.R == TPB)) { printf("tiled tensor needs q8_partial_TL\n"); exit(2); }
         static const int xv = getenv("LFM_ENC_XV") ? atoi(getenv("LFM_ENC_XV")) : 4;
+        float* const tlo = (fuse && g.tl) ? y + (size_t)t0 * g.N : g.part + (size_t)t0 * g.N * g.nch;
         if (g.tl && g_tlni && xv == 4)
           q8_partial_TL<4, true, 4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
-                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
+                         tlo, g.N, g.K, g.KC, g.R, g.nb, Tl);
         else if (g.tl && g_tlni)
           q8_partial_TL<4, true><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
-                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
+                         tlo, g.N, g.K, g.KC, g.R, g.nb, Tl);
         else if (g.tl)   // 4 blocks/SM: 64 regs with ~580 B of spills beats 2 blocks at 128 regs (17.4 vs 15.0 s)
           q8_partial_TL<4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
-                         g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
+                         tlo, g.N, g.K, g.KC, g.R, g.nb, Tl);
         else if (ct == 4 && g_encts && g.nb == 24 && (g.R / 8) % 4 == 0)
           q8_partial_TS<4, 4, 3><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
                          g.part + (size_t)t0 * g.N * g.nch, g.N, g.K, g.KC, g.R, g.nb, Tl);
@@ -1044,7 +1055,7 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
                          ct, g.N, g.K, g.KC, g.nb, cudaGetErrorString(le)); exit(3); }
       }
       chk("gemm fp32 T-wide");
-      k_combine_f<<<(unsigned)((T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, g.nch);
+      if (!(fuse && g.tl)) k_combine_f<<<(unsigned)((T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, g.nch);
       chk("gemm combine");
       return;
     }
