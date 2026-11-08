@@ -7,6 +7,12 @@ Pure-CUDA (`sm_53`, CUDA 10.2) inference path for **LFM3-Audio-2B** on a Jetson 
 ([`lfm3_conv.S`](lfm3_conv.S), [`lfm3_elem.S`](lfm3_elem.S)), and a Python gate suite in
 `.auto/lfm3/`.
 
+> **Status note (2026-11-08):** this document was written when only the backbone was ported
+> and its component table is historical. Every component is now ported and gated, and the
+> speech-to-text chain (`lfm3_asr`) runs end to end at ASR_RT 0.70 (129.7 s clip in
+> 90.25 s, cold start). The current status and latency record live in the
+> [root README](../../README.md); this file stays the backbone port's worked example.
+
 **This engine ports the text backbone only.** It takes token ids and returns token ids:
 everything left of the tokenizer (log-mel, the 17-layer audio encoder, the projector) and
 everything right of the backbone (MaskGIT depth head, LiquidCodec) is **not ported yet**.

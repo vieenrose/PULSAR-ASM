@@ -36,9 +36,12 @@ END TO END          speech in -> text out (M1)   260/262 tokens vs HF, token-WER
                                                  frames, 5.12 s of 24 kHz audio, exit 0.
                                                  Native M3 (audio rows into the speech prompt)
                                                  is not wired yet.
-REFUTED             batched backbone prefill — built, bit-exact, and ~4x SLOWER than
-                    the shipped T=1 path at ASR shapes; kept flag-gated, not shipped
-NOT MET             realtime ASR (ASR_RT <= 1.00): 1.33 best case, engine alone 0.65
+SUPERSEDED          first batched backbone prefill kernel — bit-exact but ~4x slower than
+                    T=1 at ASR shapes; replaced by the shipped thread-per-row tiled
+                    prefill (32-position chunks, 4 positions per thread, bit-exact)
+MET                 realtime ASR (ASR_RT <= 1.00): a 129.7 s clip -> 40 text ids in
+                    90.25 s wall, ASR_RT 0.696, cold start incl. model load
+                    (was 555.66 s; 40/40 ids == the HF golden on every kept run)
 NOT STARTED         S7 shell polish (streaming mic) · S9 packaging
 ```
 
@@ -69,7 +72,7 @@ except where marked.
 | MaskGIT head, depth embeddings, depth_linear, codebook | 66 | 243 MB blob | **ported, gated** — 82/82 frames exact vs HF-on-Q8 across 5 fixtures |
 | LiquidCodec decoder transformer | 100 | 41 MB blob | **ported, gated** — 45.26 dB vs HF-on-Q8, 32.04 dB vs fp32 (= the Q8 floor, so no code gap) |
 | interleaved controller + shell | — | — | **ported** — `lfm3_ctrl.c` mode machine PASS on 2 HF traces; `lfm3_speak` runs the live loop |
-| batched prefill (backbone, audio path) | — | — | **REFUTED**: bit-exact but ~4x slower than T=1 at ASR shapes; flag-gated, not shipped |
+| batched prefill (backbone, audio path) | — | — | **shipped** as thread-per-row tiled Q8 GEMVs over 32-position chunks (bit-exact); the first batched kernel (~4x slower than T=1) stays refuted |
 
 Every row above is certified by a gate that scores the engine against HF **on the same
 Q8 weights**, not against fp32 — the fp32 comparison is kept as the quantization-error
@@ -102,8 +105,54 @@ audio query and the mel front end is free. **The active target is speech-in/text
 realtime** (plan §14–18). The encoder emits **12.5 tokens per second of audio** (measured
 with HF; the earlier "25/s" misread the downsampler, plan §18), so prefill is 18.4 GMAC
 per audio-second. At the measured batched rates (30–33 GMAC/s, bit-exact) the budget is
-prefill 0.56–0.61 s + encoder ~0.06 s (estimate) + text decode 0.31–0.44 s ≈ **0.9–1.07×
-realtime: borderline, not yet demonstrated end to end**.
+prefill 0.56–0.61 s + encoder ~0.06 s (estimate) + text decode 0.31–0.44 s ≈ 0.9–1.07×
+realtime. **Measured end to end since: ASR_RT 0.70** (next section).
+
+## Speech-to-text latency: ASR_RT 0.70, measured end to end
+
+`lfm3_asr` runs the whole chain (WAV → 4-worker NEON log-mel → GPU encoder + projector →
+tokenizer → backbone prefill + greedy decode → detokenize) as argv-only stages, one cold
+start per clip (model files evicted from the page cache before every run). On the committed
+129.7 s fixture (`.auto/lfm3/speech/gate_60s_16k_mono.wav`, 1642-id prompt, 40 generated ids):
+
+```
+555.66 s  RT 4.28   loop baseline (same chain, before the latency work)
+ 90.25 s  RT 0.696  best sample, healthy board (autoresearch run #112)
+ 92.12 s  RT 0.710  current tree, on a CPU-throttled board (see below)
+```
+
+Where the ~92 s goes (stage timeline, run #138): WAV + mel ≈ 3 s (hidden behind the
+encoder's model load on a healthy board), encoder ≈ 10 s (17 layers ≈ 6.7 s), backbone
+≈ 76 s = prefill ≈ 72 s (≈ 43–46 ms per position, 32-position chunks, overlapped with the
+1.95 GB weight stream from eMMC) + 40 decode steps. The prefill GEMVs are the whole
+remaining budget.
+
+How it got there, all bit-exact against the pre-change binary (final logits or encoder
+output byte-identical) and kept only on same-job A/B numbers:
+- resident backbone and overlapped weight load; 32-position layer-major prefill on
+  thread-per-row tiled Q8 GEMVs (tile repack done by the loader, off the critical path);
+- shared-memory x staging fixes found in SASS: `__noinline__` leaves that took a shared
+  pointer issued generic `LD.E` (prefill `ffn.w2` −4.3%, encoder K=1792 GEMM −30%), wide
+  `LDS.128` x reads (encoder K=768 GEMM −35%), a 1-deep weight prefetch in the K=2048 leaf;
+- small kernels: encoder LayerNorm moments per lane, encoder GEMMs writing y directly,
+  4-wide silu*w3, residual adds and attention gate (each −0.1…−0.3 s);
+- correctness fixes found on the way: a bounded GPU queue for the nvgpu channel watchdog
+  (prompts near 4096 positions crashed), the audio slot sized per clip (only the fixture's
+  length used to work), one decode step too many.
+
+Measured out, with numbers in `.auto/ideas.md` / the run log: larger prefill chunks, f32
+x staging for `ffn.w2`, CPU co-processing of prefill rows (bit-exact, null in the real
+chain), page-cache prefetch of the backbone during the encoder (+15 s), magic-number
+int8→float, inlined leaves, more occupancy. fp16 (`HFMA2`) prefill is the remaining large
+lever and changes numerics, so it is an explicit decision, not a tuning step.
+
+**Board caveats.** picard's SoC latches its hardware ("heavy") throttle under sustained
+CPU + GPU load and does not release it on cooling; only a reboot clears it. In that state
+the CPU runs ~6–7× slower while the GPU is nearly unaffected, so same-code harness samples
+read 92–95 s instead of 90–92 s. Numbers above that state "throttled" are not comparable to
+the healthy-board best; every kept change was decided on a same-job A/B. Pending: a
+bit-exact vectorized RMSNorm (`.auto/attic/rmsnorm_vec.patch`, prefill norm 391 → 125 ms)
+measured just before the board went offline mid-harness; it is not in the tree yet.
 
 ## What makes the port mechanical
 
