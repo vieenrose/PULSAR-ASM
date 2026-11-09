@@ -1,0 +1,72 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index 6cc8006..527cd70 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -4173,7 +4173,7 @@ __device__ __noinline__ float4 tlg_leaf(const int4* __restrict__ qt, const float
+       float dot[4] = { 0.f, 0.f, 0.f, 0.f };
+       const uint32_t* wb0 = g_tlg_xs + xoff + m * 64;
+       if (XG >= 8) {
+-        const float4* fv = reinterpret_cast<const float4*>((XG == 9 ? g_tlg_xf8 : g_tlg_xf) + 2 * (xoff + m * 64));
++        const float4* fv = reinterpret_cast<const float4*>((XG >= 9 ? g_tlg_xf8 : g_tlg_xf) + 2 * (xoff + m * (XG == 11 ? 128 : 64)));
+         #pragma unroll
+         for (int q = 0; q < 8; q++) {
+           float4 f[4];
+@@ -4259,8 +4259,13 @@ __global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restric
+                                                          int N, int K, int nb, int T, bf16* __restrict__ yb) {
+   uint32_t* const xs = g_tlg_xs;
+   const int bx = g_pfgsw ? blockIdx.y : blockIdx.x, by = g_pfgsw ? blockIdx.x : blockIdx.y;
+-  const int t0 = by * 4, tid = threadIdx.x;
+-  const int row = bx * 512 + tid;
++  // XG = 11: 256 rows x 2 position groups per block (LFM_PF_TLGS=11): the two halves read the
++  // same weight words together, so a DRAM pass serves 8 positions per block. Stage
++  // [slot][m][8 positions][16 words] in f32, 4 leaf slots (32 KB). Same leaves, same tree.
++  constexpr int RPB = XG == 11 ? 256 : 512;
++  const int tid = threadIdx.x, hh = XG == 11 ? (tid >> 8) : 0;
++  const int tb = XG == 11 ? by * 8 : by * 4, t0 = tb + hh * 4;
++  const int row = bx * RPB + (XG == 11 ? (tid & 255) : tid);
+   const bool live = row < N;
+   const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
+   const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
+@@ -4268,15 +4273,16 @@ __global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restric
+   #pragma unroll
+   for (int k = 0; k < 32; k++) {
+     constexpr int NS = XG == 9 ? 8 : 4;
++    constexpr int PP = XG == 11 ? 8 : 4;               // positions per block stage
+     if ((k & (NS - 1)) == 0) {
+       __syncthreads();
+-      for (int w = tid; w < NS * 8 * 64; w += 512) {
+-        const int jj = w & 15, p = (w >> 4) & 3, m = (w >> 6) & 7, ls = w >> 9;
++      for (int w = tid; w < NS * 8 * 16 * PP; w += 512) {
++        const int jj = w & 15, p = (w >> 4) & (PP - 1), m = (w >> (PP == 8 ? 7 : 6)) & 7, ls = w >> (PP == 8 ? 10 : 9);
+         const int kk = k + ls;
+         const int i = ((kk & 1) << 4) | ((kk & 2) << 2) | (kk & 4) | ((kk & 8) >> 2) | ((kk & 16) >> 4);
+-        const int b = i + 32 * m, t = t0 + p;
++        const int b = i + 32 * m, t = tb + p;
+         const uint32_t u = (b < nb && t < T) ? reinterpret_cast<const uint32_t*>(x + (size_t)t * K)[b * 16 + jj] : 0u;
+-        if (XG == 9) reinterpret_cast<float2*>(g_tlg_xf8)[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
++        if (XG >= 9) reinterpret_cast<float2*>(g_tlg_xf8)[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+         else if (XG == 8) reinterpret_cast<float2*>(g_tlg_xf)[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+         else xs[w] = u;
+       }
+@@ -4284,7 +4290,7 @@ __global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restric
+     }
+     const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+     float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+-    if (live) a = tlg_leaf<XG>(qt, sts, xs + (k & 3) * 512, (k & (NS - 1)) * 512, i, nb);
++    if (live) a = tlg_leaf<XG>(qt, sts, xs + (k & 3) * 512, (k & (NS - 1)) * (XG == 11 ? 1024 : 512) + hh * 64, i, nb);
+     pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
+     bool done = false;
+     #pragma unroll
+@@ -4400,8 +4406,10 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+   if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
+     static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 9;
+     static const int gsw = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
+-    const dim3 gg = gsw ? dim3((Tn + 3) / 4, (N + 511) / 512) : dim3((N + 511) / 512, (Tn + 3) / 4);
+-    if (tlgs == 9)      q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++    const dim3 gg = tlgs == 11 ? (gsw ? dim3((Tn + 7) / 8, (N + 255) / 256) : dim3((N + 255) / 256, (Tn + 7) / 8))
++                  : gsw ? dim3((Tn + 3) / 4, (N + 511) / 512) : dim3((N + 511) / 512, (Tn + 3) / 4);
++    if (tlgs == 11)     q8_partial_TLg<11><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++    else if (tlgs == 9) q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     else if (tlgs == 8) q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     else if (tlgs == 4) q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     else if (tlgs == 1) q8_partial_TLg<1><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
