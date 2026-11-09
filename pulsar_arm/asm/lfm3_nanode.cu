@@ -603,6 +603,7 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
 // each head's output is bit-identical. Scores live in dynamic shared memory sized to the
 // chunk's last position (sln floats per head) instead of MAXTOK.
 __constant__ int g_attsm1 = 1;   // LFM_ATT_SM1
+__constant__ int g_attgsw = 1;   // LFM_ATT_GSW
 template <int G>
 __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q, const bf16* __restrict__ kc,
                              const bf16* __restrict__ vc, bf16* __restrict__ out,
@@ -612,8 +613,11 @@ __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q, 
   float* segred = dyn + G * sln;                 // [G][8][HD]
   __shared__ float red[8];
   __shared__ float mxs[G], invs[G];
-  q += (size_t)blockIdx.y * NH * HD; out += (size_t)blockIdx.y * NH * HD; npos += blockIdx.y;
-  const int h0 = blockIdx.x * G, tid = threadIdx.x;
+  // g_attgsw (LFM_ATT_GSW): grid launched (chunk positions, head groups), so the blocks
+  // resident together read the same kv head's cache rows; each block's work is unchanged.
+  const int abx = g_attgsw ? blockIdx.y : blockIdx.x, aby = g_attgsw ? blockIdx.x : blockIdx.y;
+  q += (size_t)aby * NH * HD; out += (size_t)aby * NH * HD; npos += aby;
+  const int h0 = abx * G, tid = threadIdx.x;
   const int lane = tid & 31, wid = tid >> 5;
   const int lo = (win > 0 && npos > win) ? npos - win : 0;
   const int kvh = h0 / (NH / nkv);
@@ -4537,8 +4541,9 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
       const int sln = pos0 + Tn;
       const size_t shm = (size_t)attg * (sln + 8 * HD) * 4;
       if ((attg == 2 || attg == 4) && shm <= 48 * 1024) {          // else the per-head kernel
-        if (attg == 2) k_attn_headG<2><<<dim3(NH / 2, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
-        else           k_attn_headG<4><<<dim3(NH / 4, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
+        static const int agsw = getenv("LFM_ATT_GSW") ? atoi(getenv("LFM_ATT_GSW")) : 1;
+        if (attg == 2) k_attn_headG<2><<<agsw ? dim3(Tn, NH / 2) : dim3(NH / 2, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
+        else           k_attn_headG<4><<<agsw ? dim3(Tn, NH / 4) : dim3(NH / 4, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
         if (cudaGetLastError() != cudaSuccess) { printf("PF4: k_attn_headG launch failed (G=%d, sln=%d)\n", attg, sln); return 1; }
       } else
       k_attn_head<<<dim3(NH, Tn), 256, 0, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, HD, NKV, nullptr);
@@ -4796,6 +4801,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (getenv("LFM_PF_GSW")) { const int v = atoi(getenv("LFM_PF_GSW")); cudaMemcpyToSymbol(g_pfgsw, &v, sizeof v); }
+  if (getenv("LFM_ATT_GSW")) { const int v = atoi(getenv("LFM_ATT_GSW")); cudaMemcpyToSymbol(g_attgsw, &v, sizeof v); }
   if (getenv("LFM_ATT_SM1")) { const int v = atoi(getenv("LFM_ATT_SM1")); cudaMemcpyToSymbol(g_attsm1, &v, sizeof v); }
   if (getenv("LFM_RMSV")) { const int v = atoi(getenv("LFM_RMSV")); cudaMemcpyToSymbol(c_rmsv, &v, sizeof v); }
   int steps = 8; bool trace = false;
