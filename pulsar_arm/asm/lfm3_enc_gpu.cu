@@ -617,15 +617,19 @@ __device__ __noinline__ float4 tl_leaf4v(const int4* __restrict__ qt, const floa
                      __fmaf_rn(sb, dot[2], 0.f), __fmaf_rn(sb, dot[3], 0.f));
 }
 static const int g_tlni = getenv("LFM_ENC_TLNI") ? atoi(getenv("LFM_ENC_TLNI")) : 1;
+__constant__ int g_encgsw = 1;   // LFM_ENC_GSW
 template <int CT, bool NI = false, int XV = 1>
 __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                         const float* __restrict__ x, float* __restrict__ part,
                                                         int N, int K, int KCHUNK, int R, int nb, int T) {
   extern __shared__ float xs[];                       // [CT][nb*33]
   const int nchunk = K / KCHUNK;
-  const int rowblk = blockIdx.x / nchunk, chunk = blockIdx.x % nchunk;
+  // g_encgsw (LFM_ENC_GSW): grid launched (position groups, row blocks); the block's work is
+  // unchanged, consecutive blocks share one row block's weights through L2.
+  const int gbx = (g_encgsw && XV == 4) ? blockIdx.y : blockIdx.x, gby = (g_encgsw && XV == 4) ? blockIdx.x : blockIdx.y;
+  const int rowblk = gbx / nchunk, chunk = gbx % nchunk;
   const int koff = chunk * KCHUNK;
-  const int t0 = blockIdx.y * CT;
+  const int t0 = gby * CT;
   const int NT = blockDim.x, tid = threadIdx.x;
   const int xstride = XV == 4 ? 24 * 32 : 24 * 33;
   #pragma unroll
@@ -781,8 +785,9 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TLe(const int8_t* __restric
                                                          int N, int K, int nb, int T) {
   extern __shared__ float xe[];                       // [4 leaf slots][mm][4 positions][32]
   const int mm = (nb + 31) / 32, slot = mm * 128;
-  const int t0 = blockIdx.y * 4, tid = threadIdx.x;
-  const int row = blockIdx.x * 256 + tid;
+  const int gbx = g_encgsw ? blockIdx.y : blockIdx.x, gby = g_encgsw ? blockIdx.x : blockIdx.y;
+  const int t0 = gby * 4, tid = threadIdx.x;
+  const int row = gbx * 256 + tid;
   const bool live = row < N;
   const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
   const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
@@ -1010,7 +1015,10 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
     for (int t0 = 0; t0 < T; t0 += 65535 * 4) {
       const int Tl = (T - t0 < 65535 * 4) ? T - t0 : 65535 * 4;
       static const int xe = getenv("LFM_ENC_XE") ? atoi(getenv("LFM_ENC_XE")) : 4;
-      const dim3 ge((g.N + 255) / 256, (Tl + 3) / 4);
+      static const int egsw = getenv("LFM_ENC_GSW") ? atoi(getenv("LFM_ENC_GSW")) : 1;
+      static bool egsw_set = false;
+      if (!egsw_set) { cudaMemcpyToSymbol(g_encgsw, &egsw, sizeof egsw); egsw_set = true; }
+      const dim3 ge = egsw ? dim3((Tl + 3) / 4, (g.N + 255) / 256) : dim3((g.N + 255) / 256, (Tl + 3) / 4);
       float* const po = (fuse ? y : g.part) + (size_t)t0 * g.N;
       if (xe == 4)      q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
       else if (xe == 1) q8_partial_TLe<1><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
@@ -1034,8 +1042,11 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
         if (g.tl && !(ct == 4 && g.R == TPB)) { printf("tiled tensor needs q8_partial_TL\n"); exit(2); }
         static const int xv = getenv("LFM_ENC_XV") ? atoi(getenv("LFM_ENC_XV")) : 4;
         float* const tlo = (fuse && g.tl) ? y + (size_t)t0 * g.N : g.part + (size_t)t0 * g.N * g.nch;
+        static const int egsw2 = getenv("LFM_ENC_GSW") ? atoi(getenv("LFM_ENC_GSW")) : 1;
+        static bool egsw2_set = false;
+        if (!egsw2_set) { cudaMemcpyToSymbol(g_encgsw, &egsw2, sizeof egsw2); egsw2_set = true; }
         if (g.tl && g_tlni && xv == 4)
-          q8_partial_TL<4, true, 4><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+          q8_partial_TL<4, true, 4><<<egsw2 ? dim3(grid.y, grid.x) : grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
                          tlo, g.N, g.K, g.KC, g.R, g.nb, Tl);
         else if (g.tl && g_tlni)
           q8_partial_TL<4, true><<<grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
