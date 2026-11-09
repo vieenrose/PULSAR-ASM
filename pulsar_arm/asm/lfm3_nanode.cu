@@ -375,9 +375,42 @@ __global__ void k_combine_f(const float* __restrict__ part, float* __restrict__ 
 // Rounding before the weight multiply is the most common way an rmsnorm
 // parity gate fails, so it is written as an explicit widen-after-round here.
 // blockDim = 256, 8 elements per thread, warp tree then 8 partials ascending.
+__constant__ int c_rmsv = 1;   // LFM_RMSV: 1 = vector loads/stores in rmsnorm_body, 0 = scalar
 __device__ __forceinline__ void rmsnorm_body(const bf16* __restrict__ x, const float* __restrict__ w,
                                              bf16* __restrict__ y, float eps, int H_) {
   const int tid = threadIdx.x;
+  // Vector form: the thread's 8 consecutive x values as one 16-byte load kept in registers
+  // (the scalar form loads them twice, 2 bytes at a time), w as two float4, y as one 16-byte
+  // store. Same values, same products, same tree: identical bits. Block-uniform alignment
+  // test; the scalar form below is the fallback. Reads all precede writes (__syncthreads).
+  if (c_rmsv && ((((uintptr_t)x | (uintptr_t)y) & 15) | ((uintptr_t)w & 15)) == 0) {
+    const uint4 xv = reinterpret_cast<const uint4*>(x)[tid];
+    const bf16* xe = reinterpret_cast<const bf16*>(&xv);
+    float xf[8], ss[8];
+    #pragma unroll
+    for (int j = 0; j < 8; j++) { xf[j] = bf2f(xe[j]); ss[j] = __fmul_rn(xf[j], xf[j]); }
+    float s = __fadd_rn(__fadd_rn(__fadd_rn(ss[0], ss[1]), __fadd_rn(ss[2], ss[3])),
+                        __fadd_rn(__fadd_rn(ss[4], ss[5]), __fadd_rn(ss[6], ss[7])));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_down_sync(~0u, s, o));
+    __shared__ float shv[8];
+    if ((tid & 31) == 0) shv[tid >> 5] = s;
+    __syncthreads();
+    float tot = shv[0];
+    #pragma unroll
+    for (int i = 1; i < 8; i++) tot = __fadd_rn(tot, shv[i]);
+    const float rs = rsqrtf(__fadd_rn(__fmul_rn(tot, 1.0f / (float)H_), eps));
+    const float4 w0 = reinterpret_cast<const float4*>(w)[tid * 2], w1 = reinterpret_cast<const float4*>(w)[tid * 2 + 1];
+    const float wf[8] = { w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w };
+    uint4 yv; bf16* ye = reinterpret_cast<bf16*>(&yv);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+      const float rounded = bf2f(f2bf(__fmul_rn(xf[j], rs)));
+      ye[j] = f2bf(__fmul_rn(wf[j], rounded));
+    }
+    reinterpret_cast<uint4*>(y)[tid] = yv;
+    return;
+  }
   const bf16* xr = x;
   float ss[8];
   #pragma unroll
@@ -4664,6 +4697,7 @@ int main(int argc, char** argv) {
            " lines: emb|-, ids, audio-at, ngen)\n", argv[0]);
     return 1;
   }
+  if (getenv("LFM_RMSV")) { const int v = atoi(getenv("LFM_RMSV")); cudaMemcpyToSymbol(c_rmsv, &v, sizeof v); }
   int steps = 8; bool trace = false;
   int lm_rows_override = 0, emb_mode_req = 0, probe_layer = 0, probe_step = 0;
   int chunkT = getenv("LFM_PF_T") ? atoi(getenv("LFM_PF_T")) : 4;   // --prefill-chunk T
