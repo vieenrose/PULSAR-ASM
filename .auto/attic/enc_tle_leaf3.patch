@@ -1,0 +1,92 @@
+diff --git a/pulsar_arm/asm/lfm3_enc_gpu.cu b/pulsar_arm/asm/lfm3_enc_gpu.cu
+index ad9e6c3..3e3d4f3 100644
+--- a/pulsar_arm/asm/lfm3_enc_gpu.cu
++++ b/pulsar_arm/asm/lfm3_enc_gpu.cu
+@@ -867,6 +867,52 @@ __device__ __noinline__ float4 tle_leaf(const int4* __restrict__ qt, const float
+   }
+   return make_float4(acc[0], acc[1], acc[2], acc[3]);
+ }
++// tle_leaf3 (LFM_ENC_XE=6): leaf A = blocks i, i + 32 (stage offset oa) and leaf B = block
++// i + 16 alone (offset ob), all three dot chains interleaved; A folds as
++// fma(s1, d1, fma(s0, d0, 0)) and B as fma(s2, d2, 0): tle_leaf<4>'s values.
++struct tle8 { float4 a, b; };
++__device__ __noinline__ tle8 tle_leaf3(const int4* __restrict__ qt, const float* __restrict__ sts,
++                                       int oa, int ob, int i) {
++  extern __shared__ float xe_dyn[];
++  const int bk[3] = { i, i + 32, i + 16 };
++  const int xo[3] = { oa, oa + 128, ob };
++  unsigned w[3][8]; float sc[3];
++  #pragma unroll
++  for (int r = 0; r < 3; r++) {
++    const int4 u0 = qt[bk[r] * 64], u1 = qt[bk[r] * 64 + 32];
++    w[r][0] = u0.x; w[r][1] = u0.y; w[r][2] = u0.z; w[r][3] = u0.w;
++    w[r][4] = u1.x; w[r][5] = u1.y; w[r][6] = u1.z; w[r][7] = u1.w;
++    sc[r] = sts[bk[r] * 32];
++  }
++  float d[3][4];
++  #pragma unroll
++  for (int r = 0; r < 3; r++)
++    #pragma unroll
++    for (int p = 0; p < 4; p++) d[r][p] = 0.f;
++  #pragma unroll
++  for (int q = 0; q < 8; q++) {
++    #pragma unroll
++    for (int r = 0; r < 3; r++) {
++      const float c0 = (float)(int)(signed char)(w[r][q]), c1 = (float)(int)(signed char)(w[r][q] >> 8);
++      const float c2 = (float)(int)(signed char)(w[r][q] >> 16), c3 = (float)(int)(signed char)(w[r][q] >> 24);
++      const float4* xv = reinterpret_cast<const float4*>(xe_dyn + xo[r]);
++      #pragma unroll
++      for (int p = 0; p < 4; p++) {
++        const float4 u = xv[p * 8 + q];
++        d[r][p] = __fmaf_rn(c0, u.x, d[r][p]); d[r][p] = __fmaf_rn(c1, u.y, d[r][p]);
++        d[r][p] = __fmaf_rn(c2, u.z, d[r][p]); d[r][p] = __fmaf_rn(c3, u.w, d[r][p]);
++      }
++    }
++  }
++  tle8 o; float A[4], B[4];
++  #pragma unroll
++  for (int p = 0; p < 4; p++) {
++    A[p] = __fmaf_rn(sc[1], d[1][p], __fmaf_rn(sc[0], d[0][p], 0.f));
++    B[p] = __fmaf_rn(sc[2], d[2][p], 0.f);
++  }
++  o.a = make_float4(A[0], A[1], A[2], A[3]); o.b = make_float4(B[0], B[1], B[2], B[3]);
++  return o;
++}
+ template <int XE>
+ __global__ void __launch_bounds__(256, 4) q8_partial_TLe(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                          const float* __restrict__ x, float* __restrict__ part,
+@@ -880,6 +926,7 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TLe(const int8_t* __restric
+   const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
+   const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
+   float st[5][4], pv[4];
++  float4 nb4 = make_float4(0.f, 0.f, 0.f, 0.f);
+   #pragma unroll
+   for (int k = 0; k < 32; k++) {
+     if ((k & 3) == 0) {
+@@ -895,7 +942,15 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TLe(const int8_t* __restric
+     }
+     const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+     float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+-    if (live) a = tle_leaf<XE>(qt, sts, xe + (k & 3) * slot, (k & 3) * slot, i, nb);
++    // XE 6: at even k with 8 <= i < 16 (nb == 56) leaf i+16 (odd k) is one block: both leaves
++    // come from one tle_leaf3 call; the odd step takes the stored value.
++    const bool tri = XE == 6 && nb == 56 && !(k & 1) && i >= 8 && i < 16;
++    const bool tri_b = XE == 6 && nb == 56 && (k & 1) && i >= 24;
++    if (live) {
++      if (tri) { const tle8 r = tle_leaf3(qt, sts, (k & 3) * slot, ((k + 1) & 3) * slot, i); a = r.a; nb4 = r.b; }
++      else if (tri_b) a = nb4;
++      else a = tle_leaf<XE == 6 ? 4 : XE>(qt, sts, xe + (k & 3) * slot, (k & 3) * slot, i, nb);
++    }
+     pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
+     bool done = false;
+     #pragma unroll
+@@ -1108,7 +1163,8 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
+       if (!egsw_set) { cudaMemcpyToSymbol(g_encgsw, &egsw, sizeof egsw); egsw_set = true; }
+       const dim3 ge = egsw ? dim3((Tl + 3) / 4, (g.N + 255) / 256) : dim3((g.N + 255) / 256, (Tl + 3) / 4);
+       float* const po = (fuse ? y : g.part) + (size_t)t0 * g.N;
+-      if (xe == 4)      q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
++      if (xe == 6)      q8_partial_TLe<6><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
++      else if (xe == 4) q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
+       else if (xe == 1) q8_partial_TLe<1><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
+       else              q8_partial_TLe<0><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
+     }
