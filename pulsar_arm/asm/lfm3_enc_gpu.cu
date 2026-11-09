@@ -616,6 +616,41 @@ __device__ __noinline__ float4 tl_leaf4v(const int4* __restrict__ qt, const floa
   return make_float4(__fmaf_rn(sb, dot[0], 0.f), __fmaf_rn(sb, dot[1], 0.f),
                      __fmaf_rn(sb, dot[2], 0.f), __fmaf_rn(sb, dot[3], 0.f));
 }
+// tl_leaf4v2 (LFM_ENC_XV=7): leaves b and b + 16 (single blocks, both live when b < 8)
+// with their dot chains interleaved (8 FMA chains); each leaf's value is tl_leaf4v's.
+struct tl8 { float4 lo, hi; };
+__device__ __noinline__ tl8 tl_leaf4v2(const int4* __restrict__ qt, const float* __restrict__ st_s,
+                                       const float* xs, int b) {
+  const int c = b + 16;
+  const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32], e0 = qt[c * 64], e1 = qt[c * 64 + 32];
+  const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                          (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+  const unsigned v[8] = { (unsigned)e0.x, (unsigned)e0.y, (unsigned)e0.z, (unsigned)e0.w,
+                          (unsigned)e1.x, (unsigned)e1.y, (unsigned)e1.z, (unsigned)e1.w };
+  const float sb = st_s[b * 32], sc = st_s[c * 32];
+  const float4* xb = reinterpret_cast<const float4*>(xs + b * 32);
+  const float4* xc = reinterpret_cast<const float4*>(xs + c * 32);
+  float d[4] = { 0.f, 0.f, 0.f, 0.f }, g[4] = { 0.f, 0.f, 0.f, 0.f };
+  #pragma unroll
+  for (int q = 0; q < 8; q++) {
+    const float c0 = (float)(int)(signed char)(w[q]), c1 = (float)(int)(signed char)(w[q] >> 8);
+    const float c2 = (float)(int)(signed char)(w[q] >> 16), c3 = (float)(int)(signed char)(w[q] >> 24);
+    const float h0 = (float)(int)(signed char)(v[q]), h1 = (float)(int)(signed char)(v[q] >> 8);
+    const float h2 = (float)(int)(signed char)(v[q] >> 16), h3 = (float)(int)(signed char)(v[q] >> 24);
+    #pragma unroll
+    for (int p = 0; p < 4; p++) {
+      const float4 u = xb[p * (24 * 8) + q], z = xc[p * (24 * 8) + q];
+      d[p] = __fmaf_rn(c0, u.x, d[p]); g[p] = __fmaf_rn(h0, z.x, g[p]);
+      d[p] = __fmaf_rn(c1, u.y, d[p]); g[p] = __fmaf_rn(h1, z.y, g[p]);
+      d[p] = __fmaf_rn(c2, u.z, d[p]); g[p] = __fmaf_rn(h2, z.z, g[p]);
+      d[p] = __fmaf_rn(c3, u.w, d[p]); g[p] = __fmaf_rn(h3, z.w, g[p]);
+    }
+  }
+  tl8 o;
+  o.lo = make_float4(__fmaf_rn(sb, d[0], 0.f), __fmaf_rn(sb, d[1], 0.f), __fmaf_rn(sb, d[2], 0.f), __fmaf_rn(sb, d[3], 0.f));
+  o.hi = make_float4(__fmaf_rn(sc, g[0], 0.f), __fmaf_rn(sc, g[1], 0.f), __fmaf_rn(sc, g[2], 0.f), __fmaf_rn(sc, g[3], 0.f));
+  return o;
+}
 static const int g_tlni = getenv("LFM_ENC_TLNI") ? atoi(getenv("LFM_ENC_TLNI")) : 1;
 __constant__ int g_encgsw = 1;   // LFM_ENC_GSW
 template <int CT, bool NI = false, int XV = 1>
@@ -626,18 +661,18 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict
   const int nchunk = K / KCHUNK;
   // g_encgsw (LFM_ENC_GSW): grid launched (position groups, row blocks); the block's work is
   // unchanged, consecutive blocks share one row block's weights through L2.
-  const int gbx = (g_encgsw && XV == 4) ? blockIdx.y : blockIdx.x, gby = (g_encgsw && XV == 4) ? blockIdx.x : blockIdx.y;
+  const int gbx = (g_encgsw && XV >= 4) ? blockIdx.y : blockIdx.x, gby = (g_encgsw && XV >= 4) ? blockIdx.x : blockIdx.y;
   const int rowblk = gbx / nchunk, chunk = gbx % nchunk;
   const int koff = chunk * KCHUNK;
   const int t0 = gby * CT;
   const int NT = blockDim.x, tid = threadIdx.x;
-  const int xstride = XV == 4 ? 24 * 32 : 24 * 33;
+  const int xstride = XV >= 4 ? 24 * 32 : 24 * 33;
   #pragma unroll
   for (int p = 0; p < CT; p++) {
     const int t = t0 + p;
     if (t < T) {
       const float* xg = x + (size_t)t * K + koff;
-      for (int i = tid; i < KCHUNK; i += NT) xs[p * xstride + (i >> 5) * (XV == 4 ? 32 : 33) + (i & 31)] = xg[i];
+      for (int i = tid; i < KCHUNK; i += NT) xs[p * xstride + (i >> 5) * (XV >= 4 ? 32 : 33) + (i & 31)] = xg[i];
     }
   }
   __syncthreads();
@@ -654,13 +689,18 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict
   for (int k = 0; k < 16; k++) {
     const int i = ((k & 1) << 3) | ((k & 2) << 1) | ((k & 4) >> 1) | ((k & 8) >> 3);
     float lo[CT], hi[CT];
-    if (NI) {
-      const float4 a = XV == 4 ? tl_leaf4v(qt, st_s, xs, i) : tl_leaf4(qt, st_s, xs, i);
+    if (XV == 7 && i < 8) {
+      const tl8 r = tl_leaf4v2(qt, st_s, xs, i);
+      lo[0] = r.lo.x; lo[1 % CT] = r.lo.y; lo[2 % CT] = r.lo.z; lo[3 % CT] = r.lo.w;
+      hi[0] = r.hi.x; hi[1 % CT] = r.hi.y; hi[2 % CT] = r.hi.z; hi[3 % CT] = r.hi.w;
+    } else if (NI) {
+      const float4 a = XV >= 4 ? tl_leaf4v(qt, st_s, xs, i) : tl_leaf4(qt, st_s, xs, i);
       lo[0] = a.x; lo[1 % CT] = a.y; lo[2 % CT] = a.z; lo[3 % CT] = a.w;
     } else tl_leaf<CT>(qt, st_s, xs, i, lo);
-    if (i + 16 < 24) {
+    if (XV == 7 && i < 8) {
+    } else if (i + 16 < 24) {
       if (NI) {
-        const float4 a = XV == 4 ? tl_leaf4v(qt, st_s, xs, i + 16) : tl_leaf4(qt, st_s, xs, i + 16);
+        const float4 a = XV >= 4 ? tl_leaf4v(qt, st_s, xs, i + 16) : tl_leaf4(qt, st_s, xs, i + 16);
         hi[0] = a.x; hi[1 % CT] = a.y; hi[2 % CT] = a.z; hi[3 % CT] = a.w;
       } else tl_leaf<CT>(qt, st_s, xs, i + 16, hi);
     } else {
@@ -1040,12 +1080,15 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
         const dim3 grid(g.nblk, (Tl + ct - 1) / ct);
         if (g_encts == -2) g_encts = getenv("LFM_ENC_TS") ? atoi(getenv("LFM_ENC_TS")) : 1;
         if (g.tl && !(ct == 4 && g.R == TPB)) { printf("tiled tensor needs q8_partial_TL\n"); exit(2); }
-        static const int xv = getenv("LFM_ENC_XV") ? atoi(getenv("LFM_ENC_XV")) : 4;
+        static const int xv = getenv("LFM_ENC_XV") ? atoi(getenv("LFM_ENC_XV")) : 7;
         float* const tlo = (fuse && g.tl) ? y + (size_t)t0 * g.N : g.part + (size_t)t0 * g.N * g.nch;
         static const int egsw2 = getenv("LFM_ENC_GSW") ? atoi(getenv("LFM_ENC_GSW")) : 1;
         static bool egsw2_set = false;
         if (!egsw2_set) { cudaMemcpyToSymbol(g_encgsw, &egsw2, sizeof egsw2); egsw2_set = true; }
-        if (g.tl && g_tlni && xv == 4)
+        if (g.tl && g_tlni && xv == 7)
+          q8_partial_TL<4, true, 7><<<egsw2 ? dim3(grid.y, grid.x) : grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+                         tlo, g.N, g.K, g.KC, g.R, g.nb, Tl);
+        else if (g.tl && g_tlni && xv == 4)
           q8_partial_TL<4, true, 4><<<egsw2 ? dim3(grid.y, grid.x) : grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
                          tlo, g.N, g.K, g.KC, g.R, g.nb, Tl);
         else if (g.tl && g_tlni)
