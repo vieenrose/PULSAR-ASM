@@ -1,0 +1,59 @@
+diff --git a/pulsar_arm/asm/lfm3_enc_gpu.cu b/pulsar_arm/asm/lfm3_enc_gpu.cu
+index 4c34475..0cc8458 100644
+--- a/pulsar_arm/asm/lfm3_enc_gpu.cu
++++ b/pulsar_arm/asm/lfm3_enc_gpu.cu
+@@ -721,6 +721,44 @@ __device__ __noinline__ float4 tle_leaf(const int4* __restrict__ qt, const float
+                                         const float* xg, int xoff, int i, int nb) {
+   extern __shared__ float xe_dyn[];
+   float acc[4] = { 0.f, 0.f, 0.f, 0.f };
++  if (XE == 5 && i + 64 >= nb) {
++    // <= 2 blocks (nb <= 64): with a second block both dot chains run interleaved (8 FMA
++    // chains); each dot from 0 in code order, folded in block order: same values as XE 4.
++    const int b = i, c = i + 32;
++    const bool two = c < nb;
++    const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
++    int4 e0 = a0, e1 = a1;
++    if (two) { e0 = qt[c * 64]; e1 = qt[c * 64 + 32]; }
++    const float sa = sts[b * 32], se = two ? sts[c * 32] : 0.f;
++    const unsigned wa[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
++                             (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
++    const unsigned we[8] = { (unsigned)e0.x, (unsigned)e0.y, (unsigned)e0.z, (unsigned)e0.w,
++                             (unsigned)e1.x, (unsigned)e1.y, (unsigned)e1.z, (unsigned)e1.w };
++    const float4* fa = reinterpret_cast<const float4*>(xe_dyn + xoff);
++    const float4* fe = reinterpret_cast<const float4*>(xe_dyn + xoff + (two ? 128 : 0));
++    float da[4] = { 0.f, 0.f, 0.f, 0.f }, de[4] = { 0.f, 0.f, 0.f, 0.f };
++    #pragma unroll
++    for (int q = 0; q < 8; q++) {
++      const float c0 = (float)(int)(signed char)(wa[q]), c1 = (float)(int)(signed char)(wa[q] >> 8);
++      const float c2 = (float)(int)(signed char)(wa[q] >> 16), c3 = (float)(int)(signed char)(wa[q] >> 24);
++      const float g0 = (float)(int)(signed char)(we[q]), g1 = (float)(int)(signed char)(we[q] >> 8);
++      const float g2 = (float)(int)(signed char)(we[q] >> 16), g3 = (float)(int)(signed char)(we[q] >> 24);
++      #pragma unroll
++      for (int p = 0; p < 4; p++) {
++        const float4 u = fa[p * 8 + q], v = fe[p * 8 + q];
++        da[p] = __fmaf_rn(c0, u.x, da[p]); de[p] = __fmaf_rn(g0, v.x, de[p]);
++        da[p] = __fmaf_rn(c1, u.y, da[p]); de[p] = __fmaf_rn(g1, v.y, de[p]);
++        da[p] = __fmaf_rn(c2, u.z, da[p]); de[p] = __fmaf_rn(g2, v.z, de[p]);
++        da[p] = __fmaf_rn(c3, u.w, da[p]); de[p] = __fmaf_rn(g3, v.w, de[p]);
++      }
++    }
++    #pragma unroll
++    for (int p = 0; p < 4; p++) {
++      acc[p] = __fmaf_rn(sa, da[p], 0.f);
++      if (two) acc[p] = __fmaf_rn(se, de[p], acc[p]);
++    }
++    return make_float4(acc[0], acc[1], acc[2], acc[3]);
++  }
+   if (XE) {
+     for (int m = 0; i + 32 * m < nb; m++) {
+       const int b = i + 32 * m;
+@@ -1020,7 +1058,8 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
+       if (!egsw_set) { cudaMemcpyToSymbol(g_encgsw, &egsw, sizeof egsw); egsw_set = true; }
+       const dim3 ge = egsw ? dim3((Tl + 3) / 4, (g.N + 255) / 256) : dim3((g.N + 255) / 256, (Tl + 3) / 4);
+       float* const po = (fuse ? y : g.part) + (size_t)t0 * g.N;
+-      if (xe == 4)      q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
++      if (xe == 5)      q8_partial_TLe<5><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
++      else if (xe == 4) q8_partial_TLe<4><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
+       else if (xe == 1) q8_partial_TLe<1><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
+       else              q8_partial_TLe<0><<<ge, 256, shm>>>(g.q, g.s, x + (size_t)t0 * g.K, po, g.N, g.K, g.nb, Tl);
+     }
