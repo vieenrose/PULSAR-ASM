@@ -4148,6 +4148,10 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const 
 // generic LD.E (SASS). XG (LFM_PF_TLGS): 0 = pointer form, 1 = shared (scalar source),
 // 4 = shared, one uint4 per 4 words. Same words, same fmaf order: bit-identical.
 __shared__ uint32_t g_tlg_xs[4 * 8 * 64];             // [leaf slot][m][position][16 words]
+// XG = 8 (LFM_PF_TLGS=8): the stage holds f32 (bf16 -> f32 is exact), word jj's low / high
+// halves at floats 2jj / 2jj + 1, so the leaf feeds the FMAs from one LDS.128 per two code
+// pairs without the per-product shift / mask. Same operands, same order: bit-identical.
+__shared__ float g_tlg_xf[4 * 8 * 64 * 2];
 template <int XG>
 __device__ __noinline__ float4 tlg_leaf(const int4* __restrict__ qt, const float* __restrict__ sts,
                                         const uint32_t* xg, int xoff, int i, int nb) {
@@ -4161,7 +4165,26 @@ __device__ __noinline__ float4 tlg_leaf(const int4* __restrict__ qt, const float
       const float sb = sts[b * 32];
       float dot[4] = { 0.f, 0.f, 0.f, 0.f };
       const uint32_t* wb0 = g_tlg_xs + xoff + m * 64;
-      if (XG == 4) {
+      if (XG == 8) {
+        const float4* fv = reinterpret_cast<const float4*>(g_tlg_xf + 2 * (xoff + m * 64));
+        #pragma unroll
+        for (int q = 0; q < 8; q++) {
+          float4 f[4];
+          #pragma unroll
+          for (int p = 0; p < 4; p++) f[p] = fv[p * 8 + q];
+          const float c0 = (float)(int)(signed char)(w[q]);
+          const float c1 = (float)(int)(signed char)(w[q] >> 8);
+          const float c2 = (float)(int)(signed char)(w[q] >> 16);
+          const float c3 = (float)(int)(signed char)(w[q] >> 24);
+          #pragma unroll
+          for (int p = 0; p < 4; p++) {
+            dot[p] = __fmaf_rn(c0, f[p].x, dot[p]);
+            dot[p] = __fmaf_rn(c1, f[p].y, dot[p]);
+            dot[p] = __fmaf_rn(c2, f[p].z, dot[p]);
+            dot[p] = __fmaf_rn(c3, f[p].w, dot[p]);
+          }
+        }
+      } else if (XG == 4) {
         const uint4* wv = reinterpret_cast<const uint4*>(wb0);
         #pragma unroll
         for (int jq = 0; jq < 4; jq++) {
@@ -4243,7 +4266,9 @@ __global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restric
         const int kk = k + ls;
         const int i = ((kk & 1) << 4) | ((kk & 2) << 2) | (kk & 4) | ((kk & 8) >> 2) | ((kk & 16) >> 4);
         const int b = i + 32 * m, t = t0 + p;
-        xs[w] = (b < nb && t < T) ? reinterpret_cast<const uint32_t*>(x + (size_t)t * K)[b * 16 + jj] : 0u;
+        const uint32_t u = (b < nb && t < T) ? reinterpret_cast<const uint32_t*>(x + (size_t)t * K)[b * 16 + jj] : 0u;
+        if (XG == 8) reinterpret_cast<float2*>(g_tlg_xf)[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+        else xs[w] = u;
       }
       __syncthreads();
     }
@@ -4363,9 +4388,10 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   static const int pf_ph = getenv("LFM_PF_PH") ? atoi(getenv("LFM_PF_PH")) : 1;
   static const int pftg = getenv("LFM_PF_TLG") ? atoi(getenv("LFM_PF_TLG")) : 1;
   if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
-    static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 4;
+    static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 8;
     const dim3 gg((N + 511) / 512, (Tn + 3) / 4);
-    if (tlgs == 4)      q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+    if (tlgs == 8)      q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+    else if (tlgs == 4) q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 1) q8_partial_TLg<1><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else                q8_partial_TLg<0><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     goto launched;
