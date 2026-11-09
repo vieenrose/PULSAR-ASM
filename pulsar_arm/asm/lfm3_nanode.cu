@@ -4596,12 +4596,13 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
       k_rope<<<dim3(NKV, Tn), 64, 0, g_launch>>>(A.k, invf, pos0, HD, rot, nullptr);
       cudaMemcpyAsync(kbase + (size_t)pos0 * KVDIM, A.k, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
       cudaMemcpyAsync(vbase + (size_t)pos0 * KVDIM, A.v, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
-      static const int attg = getenv("LFM_PF_ATTG") ? atoi(getenv("LFM_PF_ATTG")) : 2;
+      static const int attg = getenv("LFM_PF_ATTG") ? atoi(getenv("LFM_PF_ATTG")) : 1;
       const int sln = pos0 + Tn;
       const size_t shm = (size_t)attg * (sln + 8 * HD) * 4;
-      if ((attg == 2 || attg == 4) && shm <= 48 * 1024) {          // else the per-head kernel
+      if ((attg == 1 || attg == 2 || attg == 4) && shm <= 48 * 1024) {          // else the per-head kernel
         static const int agsw = getenv("LFM_ATT_GSW") ? atoi(getenv("LFM_ATT_GSW")) : 1;
-        if (attg == 2) k_attn_headG<2><<<agsw ? dim3(Tn, NH / 2) : dim3(NH / 2, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
+        if (attg == 1) k_attn_headG<1><<<agsw ? dim3(Tn, NH) : dim3(NH, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
+        else if (attg == 2) k_attn_headG<2><<<agsw ? dim3(Tn, NH / 2) : dim3(NH / 2, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
         else           k_attn_headG<4><<<agsw ? dim3(Tn, NH / 4) : dim3(NH / 4, Tn), 256, shm, g_launch>>>(A.q, kbase, vbase, A.attn, pos0 + 1, win, scaling, NKV, sln);
         if (cudaGetLastError() != cudaSuccess) { printf("PF4: k_attn_headG launch failed (G=%d, sln=%d)\n", attg, sln); return 1; }
       } else
