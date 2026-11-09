@@ -4057,6 +4057,7 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLb(const 
 // prefill): TLb IPC 4.20, 85% issue slots, 52.1 M instructions; TLf alone 34.3 M at IPC 2.86,
 // stalls now data request 42% / execution dependency 37%, so the speed did not move until
 // the leaf's next weight block is loaded before the current block's FMAs (PF = 1).
+__constant__ int g_pfgsw = 1;   // LFM_PF_GSW
 template <int CT, int PF>
 __device__ __noinline__ float4 tlf_leaf(const int4* __restrict__ qt, const float* __restrict__ sts,
                                         const float* xf, int i, int nb, int K) {
@@ -4096,7 +4097,10 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const 
                                                     const bf16* __restrict__ x, float* __restrict__ part,
                                                     int N, int K, int nb, int T, bf16* __restrict__ yb) {
   extern __shared__ float xs[];                       // [CT][K]
-  const int t0 = blockIdx.y * CT, tid = threadIdx.x;
+  // g_pfgsw (LFM_PF_GSW): grid launched (position groups, row blocks), so the blocks resident
+  // together share their weight rows through L2; the block's work is unchanged.
+  const int bx = g_pfgsw ? blockIdx.y : blockIdx.x, by = g_pfgsw ? blockIdx.x : blockIdx.y;
+  const int t0 = by * CT, tid = threadIdx.x;
   #pragma unroll
   for (int p = 0; p < CT; p++) {
     const int t = t0 + p;
@@ -4108,7 +4112,7 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const 
     }
   }
   __syncthreads();
-  const int row = blockIdx.x * TPB + tid;
+  const int row = bx * TPB + tid;
   if (row >= N) return;
   const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
   const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
@@ -4254,8 +4258,9 @@ __global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restric
                                                          const bf16* __restrict__ x, float* __restrict__ part,
                                                          int N, int K, int nb, int T, bf16* __restrict__ yb) {
   uint32_t* const xs = g_tlg_xs;
-  const int t0 = blockIdx.y * 4, tid = threadIdx.x;
-  const int row = blockIdx.x * 512 + tid;
+  const int bx = g_pfgsw ? blockIdx.y : blockIdx.x, by = g_pfgsw ? blockIdx.x : blockIdx.y;
+  const int t0 = by * 4, tid = threadIdx.x;
+  const int row = bx * 512 + tid;
   const bool live = row < N;
   const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
   const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
@@ -4394,7 +4399,8 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   static const int pftg = getenv("LFM_PF_TLG") ? atoi(getenv("LFM_PF_TLG")) : 1;
   if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
     static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 9;
-    const dim3 gg((N + 511) / 512, (Tn + 3) / 4);
+    static const int gsw = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
+    const dim3 gg = gsw ? dim3((Tn + 3) / 4, (N + 511) / 512) : dim3((N + 511) / 512, (Tn + 3) / 4);
     if (tlgs == 9)      q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 8) q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 4) q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
@@ -4430,6 +4436,8 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
     // without the prefetch, 0 = TLb.
     static const int pftlf = getenv("LFM_PF_TLF") ? atoi(getenv("LFM_PF_TLF")) : 1;
     if (pftlf && tpb == 512 && (size_t)4 * K * 4 <= 48 * 1024) {
+      static const int gswf = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
+      const dim3 gl = gswf ? dim3((Tn + 3) / 4, (N + tpb - 1) / tpb) : dim3((N + tpb - 1) / tpb, (Tn + 3) / 4);
       if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else            q8_partial_TLf<512, 4, 1><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       goto launched;
@@ -4787,6 +4795,7 @@ int main(int argc, char** argv) {
            " lines: emb|-, ids, audio-at, ngen)\n", argv[0]);
     return 1;
   }
+  if (getenv("LFM_PF_GSW")) { const int v = atoi(getenv("LFM_PF_GSW")); cudaMemcpyToSymbol(g_pfgsw, &v, sizeof v); }
   if (getenv("LFM_ATT_SM1")) { const int v = atoi(getenv("LFM_ATT_SM1")); cudaMemcpyToSymbol(g_attsm1, &v, sizeof v); }
   if (getenv("LFM_RMSV")) { const int v = atoi(getenv("LFM_RMSV")); cudaMemcpyToSymbol(c_rmsv, &v, sizeof v); }
   int steps = 8; bool trace = false;
