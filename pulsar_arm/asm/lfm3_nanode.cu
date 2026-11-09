@@ -602,6 +602,7 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
 // and feeds G heads' chains; every head's chains, trees and softmax are k_attn_head's, so
 // each head's output is bit-identical. Scores live in dynamic shared memory sized to the
 // chunk's last position (sln floats per head) instead of MAXTOK.
+__constant__ int g_attsm1 = 1;   // LFM_ATT_SM1
 template <int G>
 __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q, const bf16* __restrict__ kc,
                              const bf16* __restrict__ vc, bf16* __restrict__ out,
@@ -678,6 +679,63 @@ __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q, 
   }
   __syncthreads();
   const int np = npos - lo;
+  if (g_attsm1 && G <= 4) {
+    // All G heads' softmax passes interleaved in one loop each (LFM_ATT_SM1, default 1):
+    // every head's per-thread sequence, shuffle tree and 8-warp tree are the loop-per-head
+    // form's, so the values are identical; it saves (G-1) x 4 block barriers per call.
+    __shared__ float redG[G][8];
+    float mx[G];
+    #pragma unroll
+    for (int g = 0; g < G; g++) mx[g] = -1e30f;
+    for (int i = tid; i < np; i += 256) {
+      #pragma unroll
+      for (int g = 0; g < G; g++) mx[g] = fmaxf(mx[g], sl[g * sln + lo + i]);
+    }
+    #pragma unroll
+    for (int g = 0; g < G; g++) {
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) mx[g] = fmaxf(mx[g], __shfl_down_sync(~0u, mx[g], o));
+      if (lane == 0) redG[g][wid] = mx[g];
+    }
+    __syncthreads();
+    if (tid < 8) {
+      #pragma unroll
+      for (int g = 0; g < G; g++) {
+        float v = redG[g][tid];
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(0xffu, v, o));
+        if (tid == 0) mxs[g] = v;
+      }
+    }
+    __syncthreads();
+    float m[G], sum[G];
+    #pragma unroll
+    for (int g = 0; g < G; g++) { m[g] = mxs[g]; sum[g] = 0.f; }
+    for (int i = tid; i < np; i += 256) {
+      #pragma unroll
+      for (int g = 0; g < G; g++) {
+        const float e = expf(__fadd_rn(sl[g * sln + lo + i], -m[g]));
+        sl[g * sln + lo + i] = e; sum[g] = __fadd_rn(sum[g], e);
+      }
+    }
+    #pragma unroll
+    for (int g = 0; g < G; g++) {
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) sum[g] = __fadd_rn(sum[g], __shfl_down_sync(~0u, sum[g], o));
+      if (lane == 0) redG[g][wid] = sum[g];
+    }
+    __syncthreads();
+    if (tid < 8) {
+      #pragma unroll
+      for (int g = 0; g < G; g++) {
+        float v = redG[g][tid];
+        #pragma unroll
+        for (int o = 4; o > 0; o >>= 1) v = __fadd_rn(v, __shfl_down_sync(0xffu, v, o));
+        if (tid == 0) invs[g] = __fdiv_rn(1.0f, v);
+      }
+    }
+    __syncthreads();
+  } else
   for (int g = 0; g < G; g++) {
     float* sg = sl + g * sln;
     float mx = -1e30f;
@@ -4697,6 +4755,7 @@ int main(int argc, char** argv) {
            " lines: emb|-, ids, audio-at, ngen)\n", argv[0]);
     return 1;
   }
+  if (getenv("LFM_ATT_SM1")) { const int v = atoi(getenv("LFM_ATT_SM1")); cudaMemcpyToSymbol(g_attsm1, &v, sizeof v); }
   if (getenv("LFM_RMSV")) { const int v = atoi(getenv("LFM_RMSV")); cudaMemcpyToSymbol(c_rmsv, &v, sizeof v); }
   int steps = 8; bool trace = false;
   int lm_rows_override = 0, emb_mode_req = 0, probe_layer = 0, probe_step = 0;
