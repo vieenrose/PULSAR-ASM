@@ -651,6 +651,46 @@ __device__ __noinline__ tl8 tl_leaf4v2(const int4* __restrict__ qt, const float*
   o.hi = make_float4(__fmaf_rn(sc, g[0], 0.f), __fmaf_rn(sc, g[1], 0.f), __fmaf_rn(sc, g[2], 0.f), __fmaf_rn(sc, g[3], 0.f));
   return o;
 }
+// tl_leaf4v3 (LFM_ENC_XV=8): blocks b, b + 16 and b + 8 (b < 8) with interleaved chains;
+// lo / hi are leaf b / b + 16 (tl_leaf4v2's), nx is leaf b + 8, used at the next k.
+struct tl12 { float4 lo, hi, nx; };
+__device__ __noinline__ tl12 tl_leaf4v3(const int4* __restrict__ qt, const float* __restrict__ st_s,
+                                        const float* xs, int b) {
+  const int bk[3] = { b, b + 16, b + 8 };
+  unsigned w[3][8]; float sc[3];
+  #pragma unroll
+  for (int r = 0; r < 3; r++) {
+    const int4 u0 = qt[bk[r] * 64], u1 = qt[bk[r] * 64 + 32];
+    w[r][0] = u0.x; w[r][1] = u0.y; w[r][2] = u0.z; w[r][3] = u0.w;
+    w[r][4] = u1.x; w[r][5] = u1.y; w[r][6] = u1.z; w[r][7] = u1.w;
+    sc[r] = st_s[bk[r] * 32];
+  }
+  float d[3][4];
+  #pragma unroll
+  for (int r = 0; r < 3; r++)
+    #pragma unroll
+    for (int p = 0; p < 4; p++) d[r][p] = 0.f;
+  #pragma unroll
+  for (int q = 0; q < 8; q++) {
+    #pragma unroll
+    for (int r = 0; r < 3; r++) {
+      const float c0 = (float)(int)(signed char)(w[r][q]), c1 = (float)(int)(signed char)(w[r][q] >> 8);
+      const float c2 = (float)(int)(signed char)(w[r][q] >> 16), c3 = (float)(int)(signed char)(w[r][q] >> 24);
+      const float4* xb = reinterpret_cast<const float4*>(xs + bk[r] * 32);
+      #pragma unroll
+      for (int p = 0; p < 4; p++) {
+        const float4 u = xb[p * (24 * 8) + q];
+        d[r][p] = __fmaf_rn(c0, u.x, d[r][p]); d[r][p] = __fmaf_rn(c1, u.y, d[r][p]);
+        d[r][p] = __fmaf_rn(c2, u.z, d[r][p]); d[r][p] = __fmaf_rn(c3, u.w, d[r][p]);
+      }
+    }
+  }
+  tl12 o;
+  o.lo = make_float4(__fmaf_rn(sc[0], d[0][0], 0.f), __fmaf_rn(sc[0], d[0][1], 0.f), __fmaf_rn(sc[0], d[0][2], 0.f), __fmaf_rn(sc[0], d[0][3], 0.f));
+  o.hi = make_float4(__fmaf_rn(sc[1], d[1][0], 0.f), __fmaf_rn(sc[1], d[1][1], 0.f), __fmaf_rn(sc[1], d[1][2], 0.f), __fmaf_rn(sc[1], d[1][3], 0.f));
+  o.nx = make_float4(__fmaf_rn(sc[2], d[2][0], 0.f), __fmaf_rn(sc[2], d[2][1], 0.f), __fmaf_rn(sc[2], d[2][2], 0.f), __fmaf_rn(sc[2], d[2][3], 0.f));
+  return o;
+}
 static const int g_tlni = getenv("LFM_ENC_TLNI") ? atoi(getenv("LFM_ENC_TLNI")) : 1;
 __constant__ int g_encgsw = 1;   // LFM_ENC_GSW
 template <int CT, bool NI = false, int XV = 1>
@@ -685,11 +725,19 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict
   const float* st_s = s + (size_t)(row >> 5) * 24 * 32 + (row & 31);
   float st[4][CT];
   float pv[CT];
+  float4 nx4;
   #pragma unroll
   for (int k = 0; k < 16; k++) {
     const int i = ((k & 1) << 3) | ((k & 2) << 1) | ((k & 4) >> 1) | ((k & 8) >> 3);
     float lo[CT], hi[CT];
-    if (XV == 7 && i < 8) {
+    if (XV == 8 && i < 8) {
+      const tl12 r = tl_leaf4v3(qt, st_s, xs, i);
+      lo[0] = r.lo.x; lo[1 % CT] = r.lo.y; lo[2 % CT] = r.lo.z; lo[3 % CT] = r.lo.w;
+      hi[0] = r.hi.x; hi[1 % CT] = r.hi.y; hi[2 % CT] = r.hi.z; hi[3 % CT] = r.hi.w;
+      nx4 = r.nx;
+    } else if (XV == 8) {
+      lo[0] = nx4.x; lo[1 % CT] = nx4.y; lo[2 % CT] = nx4.z; lo[3 % CT] = nx4.w;
+    } else if (XV == 7 && i < 8) {
       const tl8 r = tl_leaf4v2(qt, st_s, xs, i);
       lo[0] = r.lo.x; lo[1 % CT] = r.lo.y; lo[2 % CT] = r.lo.z; lo[3 % CT] = r.lo.w;
       hi[0] = r.hi.x; hi[1 % CT] = r.hi.y; hi[2 % CT] = r.hi.z; hi[3 % CT] = r.hi.w;
@@ -697,7 +745,7 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TL(const int8_t* __restrict
       const float4 a = XV >= 4 ? tl_leaf4v(qt, st_s, xs, i) : tl_leaf4(qt, st_s, xs, i);
       lo[0] = a.x; lo[1 % CT] = a.y; lo[2 % CT] = a.z; lo[3 % CT] = a.w;
     } else tl_leaf<CT>(qt, st_s, xs, i, lo);
-    if (XV == 7 && i < 8) {
+    if (XV >= 7 && i < 8) {
     } else if (i + 16 < 24) {
       if (NI) {
         const float4 a = XV >= 4 ? tl_leaf4v(qt, st_s, xs, i + 16) : tl_leaf4(qt, st_s, xs, i + 16);
@@ -1080,12 +1128,15 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
         const dim3 grid(g.nblk, (Tl + ct - 1) / ct);
         if (g_encts == -2) g_encts = getenv("LFM_ENC_TS") ? atoi(getenv("LFM_ENC_TS")) : 1;
         if (g.tl && !(ct == 4 && g.R == TPB)) { printf("tiled tensor needs q8_partial_TL\n"); exit(2); }
-        static const int xv = getenv("LFM_ENC_XV") ? atoi(getenv("LFM_ENC_XV")) : 7;
+        static const int xv = getenv("LFM_ENC_XV") ? atoi(getenv("LFM_ENC_XV")) : 8;
         float* const tlo = (fuse && g.tl) ? y + (size_t)t0 * g.N : g.part + (size_t)t0 * g.N * g.nch;
         static const int egsw2 = getenv("LFM_ENC_GSW") ? atoi(getenv("LFM_ENC_GSW")) : 1;
         static bool egsw2_set = false;
         if (!egsw2_set) { cudaMemcpyToSymbol(g_encgsw, &egsw2, sizeof egsw2); egsw2_set = true; }
-        if (g.tl && g_tlni && xv == 7)
+        if (g.tl && g_tlni && xv == 8)
+          q8_partial_TL<4, true, 8><<<egsw2 ? dim3(grid.y, grid.x) : grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
+                         tlo, g.N, g.K, g.KC, g.R, g.nb, Tl);
+        else if (g.tl && g_tlni && xv == 7)
           q8_partial_TL<4, true, 7><<<egsw2 ? dim3(grid.y, grid.x) : grid, TPB, 4 * per>>>(g.q, g.s, x + (size_t)t0 * g.K,
                          tlo, g.N, g.K, g.KC, g.R, g.nb, Tl);
         else if (g.tl && g_tlni && xv == 4)
