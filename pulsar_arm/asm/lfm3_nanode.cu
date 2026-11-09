@@ -4152,6 +4152,9 @@ __shared__ uint32_t g_tlg_xs[4 * 8 * 64];             // [leaf slot][m][position
 // halves at floats 2jj / 2jj + 1, so the leaf feeds the FMAs from one LDS.128 per two code
 // pairs without the per-product shift / mask. Same operands, same order: bit-identical.
 __shared__ float g_tlg_xf[4 * 8 * 64 * 2];
+// XG = 9: the same f32 stage for 8 leaves at a time (32 KB, still 2 blocks/SM): half the
+// staging passes and block barriers per kernel. Same leaves, same order.
+__shared__ float g_tlg_xf8[8 * 8 * 64 * 2];
 template <int XG>
 __device__ __noinline__ float4 tlg_leaf(const int4* __restrict__ qt, const float* __restrict__ sts,
                                         const uint32_t* xg, int xoff, int i, int nb) {
@@ -4165,8 +4168,8 @@ __device__ __noinline__ float4 tlg_leaf(const int4* __restrict__ qt, const float
       const float sb = sts[b * 32];
       float dot[4] = { 0.f, 0.f, 0.f, 0.f };
       const uint32_t* wb0 = g_tlg_xs + xoff + m * 64;
-      if (XG == 8) {
-        const float4* fv = reinterpret_cast<const float4*>(g_tlg_xf + 2 * (xoff + m * 64));
+      if (XG >= 8) {
+        const float4* fv = reinterpret_cast<const float4*>((XG == 9 ? g_tlg_xf8 : g_tlg_xf) + 2 * (xoff + m * 64));
         #pragma unroll
         for (int q = 0; q < 8; q++) {
           float4 f[4];
@@ -4259,22 +4262,24 @@ __global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restric
   float st[5][4], pv[4];
   #pragma unroll
   for (int k = 0; k < 32; k++) {
-    if ((k & 3) == 0) {
+    constexpr int NS = XG == 9 ? 8 : 4;
+    if ((k & (NS - 1)) == 0) {
       __syncthreads();
-      for (int w = tid; w < 4 * 8 * 64; w += 512) {
+      for (int w = tid; w < NS * 8 * 64; w += 512) {
         const int jj = w & 15, p = (w >> 4) & 3, m = (w >> 6) & 7, ls = w >> 9;
         const int kk = k + ls;
         const int i = ((kk & 1) << 4) | ((kk & 2) << 2) | (kk & 4) | ((kk & 8) >> 2) | ((kk & 16) >> 4);
         const int b = i + 32 * m, t = t0 + p;
         const uint32_t u = (b < nb && t < T) ? reinterpret_cast<const uint32_t*>(x + (size_t)t * K)[b * 16 + jj] : 0u;
-        if (XG == 8) reinterpret_cast<float2*>(g_tlg_xf)[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+        if (XG == 9) reinterpret_cast<float2*>(g_tlg_xf8)[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+        else if (XG == 8) reinterpret_cast<float2*>(g_tlg_xf)[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
         else xs[w] = u;
       }
       __syncthreads();
     }
     const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
     float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (live) a = tlg_leaf<XG>(qt, sts, xs + (k & 3) * 512, (k & 3) * 512, i, nb);
+    if (live) a = tlg_leaf<XG>(qt, sts, xs + (k & 3) * 512, (k & (NS - 1)) * 512, i, nb);
     pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
     bool done = false;
     #pragma unroll
@@ -4388,9 +4393,10 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   static const int pf_ph = getenv("LFM_PF_PH") ? atoi(getenv("LFM_PF_PH")) : 1;
   static const int pftg = getenv("LFM_PF_TLG") ? atoi(getenv("LFM_PF_TLG")) : 1;
   if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
-    static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 8;
+    static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 9;
     const dim3 gg((N + 511) / 512, (Tn + 3) / 4);
-    if (tlgs == 8)      q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+    if (tlgs == 9)      q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+    else if (tlgs == 8) q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 4) q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 1) q8_partial_TLg<1><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else                q8_partial_TLg<0><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
