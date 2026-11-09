@@ -1280,11 +1280,16 @@ __global__ void k_tile_q(const int4* __restrict__ src, int4* __restrict__ dst, i
 __global__ void k_tile_s(const float* __restrict__ src, float* __restrict__ dst, int N, int nb);
 static void* load_consume(void* arg) {
   LoadJob& J = *(LoadJob*)arg;
-  // LFM_PF_TLOAD (default 1): tensors the prefill would tile are repacked here, on the
+  // LFM_PF_TLOAD (1 = GPU, default 2 = CPU, see below): tensors the prefill would tile are repacked here, on the
   // loader's stream right after their upload and CRC, before `done` publishes them -- off
   // the prefill's critical path. Same kernels and layout as pf_tile.
-  static const int tload = getenv("LFM_PF_TLOAD") ? atoi(getenv("LFM_PF_TLOAD")) : 1;
+  static const int tload = getenv("LFM_PF_TLOAD") ? atoi(getenv("LFM_PF_TLOAD")) : 2;
   void* tscr = nullptr; size_t tscr_n = 0;
+  // LFM_PF_TLOAD=2: the same tile layout built on the CPU (the loader thread has slack: the
+  // eMMC stream finishes well before the prefill needs the last layer); the tensor is
+  // gathered row-major in host memory, permuted, and uploaded once, so the GPU runs no
+  // k_tile_q / k_tile_s / DtoD copies on the one SM the prefill is using.
+  std::vector<char> hrow, htil;
   Model& M = *J.M;
   pthread_t rth; pthread_create(&rth, nullptr, load_reader, &J.R);
   bool ok = true;
@@ -1309,6 +1314,8 @@ static void* load_consume(void* arg) {
       else { e.dq = (decltype(e.dq))p0; e.ds = (float*)p1; }
     }
     char* d0 = J.d0[oi]; char* d1 = J.d1[oi];
+    const bool ctile = !skip && tload == 2 && pf_tilable(e);
+    if (ctile && hrow.size() < tot) { hrow.resize(tot); htil.resize(tot); }
     uint32_t c = 0;
     for (size_t done = 0; done < tot; ) {
       int slot; size_t len; char* p = load_take(J.R, slot, len);
@@ -1317,7 +1324,8 @@ static void* load_consume(void* arg) {
       // runs the quantizer that was certified 8/8" into a load-time assertion.
       c = (uint32_t)crc32(c, (const Bytef*)p, (uInt)len);
       cudaError_t ce = cudaSuccess;
-      if (!skip) {
+      if (ctile) memcpy(hrow.data() + done, p, len);
+      else if (!skip) {
         const size_t lo = done, hi = done + len;
         if (lo < e.nc) { const size_t n = (hi < e.nc ? hi : e.nc) - lo;
           ce = cudaMemcpyAsync(d0 + lo, p, n, cudaMemcpyHostToDevice, J.st); }
@@ -1335,7 +1343,24 @@ static void* load_consume(void* arg) {
     }
     if (ok && c != e.crc) {
       printf("CRC MISMATCH %s: file %08x want %08x\n", e.name.c_str(), c, e.crc); ok = false; }
-    if (ok && !skip && tload && pf_tilable(e)) {
+    if (ok && ctile) {
+      const int N = e.ne[0], K = e.ne[1], nb = K / Q8_BLK;
+      const int4* sq = reinterpret_cast<const int4*>(hrow.data());
+      int4* dq = reinterpret_cast<int4*>(htil.data());
+      for (int row = 0; row < N; row++)
+        for (int bh = 0; bh < nb * 2; bh++)
+          dq[((size_t)(row >> 5) * nb * 2 + bh) * 32 + (row & 31)] = sq[(size_t)row * nb * 2 + bh];
+      const float* ss = reinterpret_cast<const float*>(hrow.data() + e.nc);
+      float* ds = reinterpret_cast<float*>(htil.data() + e.nc);
+      for (int row = 0; row < N; row++)
+        for (int b = 0; b < nb; b++)
+          ds[((size_t)(row >> 5) * nb + b) * 32 + (row & 31)] = ss[(size_t)row * nb + b];
+      cudaError_t ce = cudaMemcpyAsync(d0, htil.data(), e.nc, cudaMemcpyHostToDevice, J.st);
+      if (ce == cudaSuccess) ce = cudaMemcpyAsync(d1, htil.data() + e.nc, e.ns, cudaMemcpyHostToDevice, J.st);
+      if (ce == cudaSuccess) ce = cudaStreamSynchronize(J.st);
+      if (ce != cudaSuccess) { printf("CPU TILE UPLOAD FAIL %s: %s\n", e.name.c_str(), cudaGetErrorString(ce)); ok = false; }
+      else e.tiled = true;
+    } else if (ok && !skip && tload && pf_tilable(e)) {
       const int N = e.ne[0], K = e.ne[1], nb = K / Q8_BLK;
       if (tscr_n < e.nc) {
         if (tscr) cudaFree(tscr);
