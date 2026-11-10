@@ -302,6 +302,10 @@ __global__ void k_fold(const float* frames, const float* win, float* out, int F,
     out[t] = divide ? e : a;
 }
 
+// LFM_CODEC_OMP (default 1): the per-position host loops (q/k norm + RoPE, attention, gate,
+// the conv branch, silu) split positions over the cores. Each position's chain is unchanged,
+// so the output is the same bytes; 0 = serial.
+static const bool g_comp = !(getenv("LFM_CODEC_OMP") && !atoi(getenv("LFM_CODEC_OMP")));
 static float silu(float v) { return v / (1.0f + expf(-v)); }
 
 // HF rotate_half: element i pairs with i + HD/2 (the lesson from the depth engine)
@@ -438,6 +442,7 @@ int main(int argc, char** argv) {
       q8_gemm_tiles(wv->dq, wv->ds, h.data(), HID, V.data(), NKV * HD, NKV * HD, HID, T6);
       q8_gemm_tiles(wg->dq, wg->ds, h.data(), HID, G.data(), NH, NH, HID, T6);
       CK(1);
+      #pragma omp parallel for schedule(static) if (g_comp)
       for (int t = 0; t < T6; t++) {
         // rmsnorm per head into a scratch row, copied back INSIDE the same iteration:
         // a split loop left the last head's values in every head slot (found by staged dump).
@@ -464,7 +469,9 @@ int main(int argc, char** argv) {
       CK(2);
       const float scale = 1.0f / sqrtf((float)HD);
       const int WIN = 30;                              // causal + sliding window of 30
+      #pragma omp parallel for schedule(static) if (g_comp)
       for (int t = 0; t < T6; t++) {
+        std::vector<float> scores(T6), attn(NH * HD);   // per position (were shared)
         for (int hh = 0; hh < NH; hh++) {
           int kvh = hh / (NH / NKV);
           int lo = t - WIN + 1; if (lo < 0) lo = 0;
@@ -485,13 +492,13 @@ int main(int argc, char** argv) {
             attn[hh * HD + d] = acc / sum;
           }
         }
-        CK(3);
         for (int hh = 0; hh < NH; hh++) {                             // per-head sigmoid gate
           float g = 1.0f / (1.0f + expf(-G[(size_t)t * NH + hh]));
           for (int d = 0; d < HD; d++) attn[hh * HD + d] *= g;
         }
         memcpy(&A[(size_t)t * NH * HD], attn.data(), (size_t)NH * HD * 4);
       }
+      CK(3);
       q8_gemm_tiles(wo->dq, wo->ds, A.data(), NH * HD, tmp.data(), HID, HID, NH * HD, T6);
       CK(4);
       if (const char* d = getenv("LFM_CODEC_DUMP")) {
@@ -511,6 +518,7 @@ int main(int argc, char** argv) {
         const float* XG = &proj[(size_t)t * 3 * HID + 2 * HID];   // BCx chunk order: B, C, x
         for (int i = 0; i < HID; i++) z[(size_t)t * HID + i] = B[i] * XG[i];
       }
+      #pragma omp parallel for schedule(static) if (g_comp)
       for (int t = 0; t < T6; t++)                                  // causal depthwise k=7
         for (int c = 0; c < HID; c++) {
           float acc = 0;
@@ -542,7 +550,8 @@ int main(int argc, char** argv) {
     for (int t = 0; t < T6; t++) rmsnorm(&X[(size_t)t * HID], fn->df, &h[(size_t)t * HID], HID, EPS);
     q8_gemm_tiles(w1->dq, w1->ds, h.data(), HID, U.data(), INTER, INTER, HID, T6);
     q8_gemm_tiles(w3->dq, w3->ds, h.data(), HID, GA.data(), INTER, INTER, HID, T6);
-    for (size_t i = 0; i < (size_t)T6 * INTER; i++) U[i] = silu(U[i]) * GA[i];
+    #pragma omp parallel for schedule(static) if (g_comp)
+    for (long i = 0; i < (long)T6 * INTER; i++) U[i] = silu(U[i]) * GA[i];
     q8_gemm_tiles(w2->dq, w2->ds, U.data(), INTER, tmp.data(), HID, HID, INTER, T6);
     CK(7);
     for (int t = 0; t < T6; t++) {
