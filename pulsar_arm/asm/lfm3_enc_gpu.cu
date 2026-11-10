@@ -1514,6 +1514,22 @@ static float* dalloc_w(size_t n, const char* what) {
   if (cudaMalloc(&p, n * 4)) { printf("OOM (%s, %.1f MB)\n", what, n * 4 / 1e6); exit(2); }
   return p;
 }
+// LFM_ENC_OVL (default 1): the blob upload continues on the loader thread (the backbone's
+// LFM_PF_OVL machinery: per-chunk stream sync + per-tensor CRC before `done` is published)
+// while the encoder starts; each stage waits for its own tensors (enc_need = 1 + the last
+// upload-order index of a name prefix, 0 when loading synchronously).
+static int enc_need(const char* prefix) {
+  if (!g_lj) return 0;
+  int n = 0; const size_t pl = strlen(prefix);
+  for (size_t oi = 0; oi < g_lj->order.size(); oi++)
+    if (!g_lj->M->ents[g_lj->order[oi]].name.compare(0, pl, prefix)) n = (int)oi + 1;
+  return n;
+}
+static bool enc_wait(const char* prefix) {
+  const int n = prefix ? enc_need(prefix) : (g_lj ? (int)g_lj->order.size() : 0);
+  if (!load_wait(n)) { printf("encoder: weight load failed (%s)\n", prefix ? prefix : "all"); return false; }
+  return true;
+}
 static int g_nodump = -2;
 // Wall-clock breakdown for the ASR path. The encoder's GPU time is 0.013 s per audio
 // second but its process wall time is ~0.6 s per audio second, and ASR_RT is charged
@@ -1583,10 +1599,13 @@ int main(int argc, char** argv) {
   mkdir(argv[4], 0777);
   { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g_tw_all = g_tw_prev = t.tv_sec + 1e-9 * t.tv_nsec; }
   Model M; std::string js;
+  { const char* ov = getenv("LFM_ENC_OVL");
+    if (!ov || atoi(ov)) { g_ovl = 1; setenv("LFM_PF_LAZY", "0", 1); } }
   if (!load_blob(argv[1], M, js)) return 1;
   wallmark("blob read+CRC+upload");
   { const char* pz = getenv("LFM_ENC_POISON_ARENA");        // hunt, not a shipping path
     if (pz && atoi(pz)) {
+      if (!enc_wait(nullptr)) return 1;
       if (M.df && M.need_f) cudaMemset(M.df, 0xff, M.need_f);
       if (M.ds && M.need_s) cudaMemset(M.ds, 0xff, M.need_s);
       printf("poisoned arenas: f32 %.1f MB scales %.1f MB\n", M.need_f / 1e6, M.need_s / 1e6);
@@ -1658,6 +1677,7 @@ int main(int argc, char** argv) {
   float best_ms = 1e30f;
   int nlay_last = 0;
 
+  if (!enc_wait("encoder.downsample.")) return 1;
   // 1) conv_in + silu
   conv3x3(feat, w_in->df, b_in->df, x1, 256, 128, Tm, EH1, EWo1, 1, 1);
   chk("conv_in");
@@ -1763,6 +1783,8 @@ int main(int argc, char** argv) {
   int nlayer_done = 0;
     for (int L = 0; L < ENLAYER; L++) {
     char nm[160];
+    snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.", L);
+    if (!enc_wait(nm)) return 1;
     snprintf(nm, sizeof nm, "encoder.lfm.lfm.layers.%d.operator_norm.weight", L);
     Ent* opn = need(M, nm);
     cudaMemcpy(hn, xr, (size_t)Tt * EHID * 4, cudaMemcpyDeviceToDevice);
@@ -1856,6 +1878,7 @@ int main(int argc, char** argv) {
     nlay_last = nlayer_done;
   }
   // embedding_norm -> enc_out, then the projector
+  if (!enc_wait(nullptr)) return 1;
   {
     Ent* en = need(M, "encoder.lfm.lfm.embedding_norm.weight");
     cudaMemcpy(hn, xr, (size_t)Tt * EHID * 4, cudaMemcpyDeviceToDevice);
