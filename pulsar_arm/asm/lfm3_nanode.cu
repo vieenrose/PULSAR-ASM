@@ -5217,6 +5217,13 @@ int main(int argc, char** argv) {
   cudaEvent_t evA, evB; cudaEventCreate(&evA); cudaEventCreate(&evB);
   if (g_time) { cudaEventCreate(&g_evA); cudaEventCreate(&g_evB); }
 
+  // The captured decode graph does not follow a batched prefill: on the ASR path it emitted
+  // 597 22 and stopped (2nd token wrong) and ran 95-104 s vs 69.4 s (run #202). Refuse the
+  // combination instead of printing a wrong transcript.
+  if (g_graphs && g_pfChunk > 1) {
+    printf("LFM_GRAPHS is not supported with --prefill-run %d (wrong tokens after the batched prefill); unset it\n", g_pfChunk);
+    return 2;
+  }
   if (g_graphs && trace) { printf("LFM_GRAPHS: --trace off (a D2H sync cannot happen inside a capture)\n"); trace = false; }
   printf("step tok        ms   tok/s\n");
   double tot = 0; int ng = 0;
