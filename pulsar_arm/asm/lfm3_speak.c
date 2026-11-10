@@ -334,6 +334,9 @@ int main(int argc, char **argv) {
     char *avs[] = { (char*)"lfm3_nanode", BB, (char*)"--prompt", csv, (char*)"--serve",
                     (char*)"--dump-hidden-all", hdf, NULL };
     serve_start(avs, srvlog);
+    /* the depth server loads while the backbone loads and prefills (its first frame used to
+       pay the 169 MB read + 120 MB upload); same server, same frames */
+    if (depthsrv && strcmp(mode, "text") != 0) { char dl[1100]; snprintf(dl, sizeof dl, "%s.depth.log", outp); dsrv_start(DB, dl); }
     last_nt = serve_wait_step(ntoks - 1);
     printf("backbone: resident (nanode --serve, one load for the turn)\n");
   } else {

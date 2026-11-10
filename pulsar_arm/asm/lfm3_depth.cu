@@ -656,6 +656,7 @@ int main(int argc, char** argv) {
     char line[8192];
     while (fgets(line, sizeof line, stdin)) {
       if (line[0] == 'Q') break;
+      const double f0 = dt_now();
       char hp[2048], op[2048], hsp[2048], cp[2048], ep[2048]; float PEN; int WIN;
       int rc = 0;
       if (sscanf(line, "M %2047s %2047s %2047s %2047s %2047s %f %d", hp, op, hsp, cp, ep, &PEN, &WIN) != 7) rc = 2;
@@ -666,6 +667,7 @@ int main(int argc, char** argv) {
       if (!rc) { FILE* t = fopen(hsp, "rb"); if (t) { fclose(t); if (!rd(hsp, hist)) rc = 2; } else hist.clear(); }
       if (!rc && hist.size() % 12) rc = 2;
       int codes[12];
+      const double f1 = dt_now();
       if (!rc) {
         const int n_hist = (int)(hist.size() / 12);
         int lo = n_hist - WIN; if (lo < 0) lo = 0;
@@ -679,7 +681,10 @@ int main(int argc, char** argv) {
         for (int c = 0; c < 12; c++) printf("%d%s", codes[c], c == 11 ? "]" : ",");
         printf("\n");
       }
+      const double f2 = dt_now();
       if (!rc) rc = frame_embed_out(by, codes, ep);
+      if (getenv("LFM_DEPTH_TIME"))
+        printf("DEPTH_FRAME ms: read=%.1f maskgit=%.1f embed+write=%.1f\n", f1 - f0, f2 - f1, dt_now() - f2);
       printf("DEPTH_DONE %d\n", rc); fflush(stdout);
     }
     return 0;
