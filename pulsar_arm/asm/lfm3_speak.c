@@ -394,6 +394,8 @@ int main(int argc, char **argv) {
       fflush(stdout);
       if (tok == IM_END) break;
       if (interleaving && tok == TEXT_END) { text_done = 1; speaking = 1; }
+      /* HF: outside an interleaved block <|text_end|> ends the turn (it is in eos_token_id) */
+      else if (!interleaving && tok == TEXT_END) break;
     } else {
       /* ---- audio slot: last hidden -> MaskGIT -> codes -> embed feedback ---- */
       if (!resident) {

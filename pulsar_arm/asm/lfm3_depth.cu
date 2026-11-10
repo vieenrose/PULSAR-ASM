@@ -750,10 +750,14 @@ static int frame_embed_out(std::map<std::string, Ent*>& by, const int* codes, co
       if (!cb2) { printf("MISSING TENSOR: codebook_embedding.weight\n"); return 3; }
       const uint16_t* E = (const uint16_t*)cb2->dq;
       std::vector<float> o((size_t)SH2);
+      // HF (_generate): a frame with any code == 2016 (audio EOS) is replaced by the all-EOS
+      // frame BEFORE get_audio_out_embeds, so that is the row the backbone must see next.
+      bool eos = false;
+      for (int i = 0; i < NCB2; i++) if (codes[i] == 2016) eos = true;
       for (int d = 0; d < SH2; d++) {
         float acc = 0.f;
         for (int i = 0; i < NCB2; i++) {
-          int code = codes[i];
+          int code = eos ? 2016 : codes[i];
           if (code < 0 || code >= CBS2) { printf("FAIL code %d outside [0,%d)\n", code, CBS2); return 3; }
           acc += bf16_to_f32(E[((size_t)code + (size_t)i * CBS2) * SH2 + d]);
         }
