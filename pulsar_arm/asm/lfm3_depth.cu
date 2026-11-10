@@ -919,6 +919,16 @@ int main(int argc, char** argv) {
       v.resize((size_t)n); bool ok = n == 0 || fread(v.data(), 4, (size_t)n, f) == (size_t)n;
       fclose(f); return ok;
     };
+    /* warm-up (LFM_DEPTH_WARM, default 1): the first depth_linear of a turn cost ~160 ms
+       vs ~4 ms later (OpenMP pool start, cold caches). Run one on a zero vector into a
+       scratch buffer while the backbone is still loading; nothing it computes is kept. */
+    if (!(getenv("LFM_DEPTH_WARM") && !atoi(getenv("LFM_DEPTH_WARM")))) {
+      auto it = by.find("depth_linear.weight");
+      if (it != by.end()) {
+        std::vector<float> z(2048, 0.f), y(12 * 1024);
+        q8_gemv(it->second->dq, it->second->ds, z.data(), y.data(), 12 * 1024, 2048);
+      }
+    }
     printf("DEPTH_READY\n"); fflush(stdout);
     char line[8192];
     while (fgets(line, sizeof line, stdin)) {
