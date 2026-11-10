@@ -134,24 +134,30 @@ int main(int argc, char** argv) {
   f = fopen(argv[1], "rb");
   if (!f || fseek(f, data_off, SEEK_SET) != 0) { fprintf(stderr, "lfm3_wav: reopen data failed\n"); return 2; }
 
-  unsigned char* buf = (unsigned char*)malloc(bpf);
-  if (!buf) { fprintf(stderr, "lfm3_wav: OOM\n"); return 2; }
-  /* One f32 write per sample, buffered by the stdio layer: a 60 s clip is 96000
-   * samples = 384 KB, so no need for a second buffer. */
+  /* The whole data chunk in one read, one f32 array out in one write (the per-sample
+   * fread/fwrite pair cost ~0.3 s for a 130 s clip). Same per-sample expressions. */
+  unsigned char* buf = (unsigned char*)malloc((size_t)data_len);
+  float* out = (float*)malloc((size_t)nframes * 4);
+  if (!buf || !out) { fprintf(stderr, "lfm3_wav: OOM\n"); return 2; }
+  if (fread(buf, 1, data_len, f) != data_len) {
+    fprintf(stderr, "lfm3_wav: truncated data (want %u bytes)\n", data_len); return 2; }
   for (long i = 0; i < nframes; i++) {
-    if (fread(buf, 1, bpf, f) != bpf) { fprintf(stderr, "lfm3_wav: truncated data at frame %ld\n", i); return 2; }
+    const unsigned char* fr = buf + (size_t)i * bpf;
     float v;
     if (format == 1) {
-      const short* s = (const short*)buf;
-      v = (channels == 2u) ? ((float)s[0] + (float)s[1]) * 0.5f / 32768.0f
-                           : (float)s[0] / 32768.0f;
+      short s0, s1;
+      memcpy(&s0, fr, 2);
+      if (channels == 2u) { memcpy(&s1, fr + 2, 2); v = ((float)s0 + (float)s1) * 0.5f / 32768.0f; }
+      else v = (float)s0 / 32768.0f;
     } else {
       float l, r;
-      memcpy(&l, buf, 4);
-      if (channels == 2u) { memcpy(&r, buf + 4, 4); v = (l + r) * 0.5f; } else v = l;
+      memcpy(&l, fr, 4);
+      if (channels == 2u) { memcpy(&r, fr + 4, 4); v = (l + r) * 0.5f; } else v = l;
     }
-    if (fwrite(&v, 4, 1, o) != 1) { fprintf(stderr, "lfm3_wav: write failed\n"); return 2; }
+    out[i] = v;
   }
+  if (fwrite(out, 4, (size_t)nframes, o) != (size_t)nframes) { fprintf(stderr, "lfm3_wav: write failed\n"); return 2; }
+  free(out);
   fclose(o); fclose(f); free(buf);
   printf("lfm3_wav: %s -> %s  rate=%u ch=%u bits=%u format=%u samples=%ld\n",
          argv[1], argv[2], rate, channels, bits, format, nframes);
