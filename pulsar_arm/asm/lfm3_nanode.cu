@@ -4213,6 +4213,31 @@ static void tlf_range_dump() {
   printf("TLF_RANGE nonzero %llu subnormal_fp16 %llu (%.3f%%) overflow %llu max|x| %g\n", h[0], h[1],
          h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], (double)__uint_as_float_host((unsigned)h[3]));
 }
+// Guard for tlf_leaf2h: a block whose staged x has max|x| > 32 (fp16 partial bound 8*127*32 =
+// 32512 < 65504; or every block under LFM_PF_H2FB=1, the test switch) runs this leaf instead:
+// the two blocks in f32 from the bf16 x in global memory, in tlf_leaf2b's exact order.
+__constant__ int c_h2fb;
+template <int CT>
+__device__ __noinline__ float4 tlf_leaf2g(const int4* __restrict__ qt, const float* __restrict__ sts,
+                                          const bf16* __restrict__ xg, int i, int K, int T) {
+  const int4 a0 = qt[i * 64], a1 = qt[i * 64 + 32], b0 = qt[(i + 32) * 64], b1 = qt[(i + 32) * 64 + 32];
+  const float sa = sts[i * 32], sb = sts[(i + 32) * 32];
+  const unsigned wa[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                           (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+  const unsigned wb[8] = { (unsigned)b0.x, (unsigned)b0.y, (unsigned)b0.z, (unsigned)b0.w,
+                           (unsigned)b1.x, (unsigned)b1.y, (unsigned)b1.z, (unsigned)b1.w };
+  float acc[4] = { 0.f, 0.f, 0.f, 0.f };
+  for (int p = 0; p < CT && p < T; p++) {
+    const bf16* xa = xg + (size_t)p * K + i * 32; const bf16* xb = xg + (size_t)p * K + (i + 32) * 32;
+    float da = 0.f, db = 0.f;
+    for (int j = 0; j < 32; j++) {
+      da = __fmaf_rn((float)(int)(signed char)(wa[j >> 2] >> (8 * (j & 3))), __uint_as_float((unsigned)xa[j] << 16), da);
+      db = __fmaf_rn((float)(int)(signed char)(wb[j >> 2] >> (8 * (j & 3))), __uint_as_float((unsigned)xb[j] << 16), db);
+    }
+    acc[p] = __fmaf_rn(sb, db, __fmaf_rn(sa, da, 0.f));
+  }
+  return make_float4(acc[0], acc[1], acc[2], acc[3]);
+}
 template <int TPB, int CT = 4, int PF = 1>
 __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                     const bf16* __restrict__ x, float* __restrict__ part,
@@ -4222,6 +4247,7 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const 
   // together share their weight rows through L2; the block's work is unchanged.
   const int bx = g_pfgsw ? blockIdx.y : blockIdx.x, by = g_pfgsw ? blockIdx.x : blockIdx.y;
   const int t0 = by * CT, tid = threadIdx.x;
+  float xmax = 0.f;
   #pragma unroll
   for (int p = 0; p < CT; p++) {
     const int t = t0 + p;
@@ -4230,6 +4256,7 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const 
       if (PF == 9) {
         __half2* d = reinterpret_cast<__half2*>(xs) + p * (K / 2);
         for (int i = tid; i < K / 2; i += TPB) { const uint32_t u = xg[i];
+          xmax = fmaxf(xmax, fmaxf(fabsf(__uint_as_float(u << 16)), fabsf(__uint_as_float(u & 0xffff0000u))));
           d[i] = __floats2half2_rn(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u)); }
       } else {
       float2* d = reinterpret_cast<float2*>(xs + p * K);
@@ -4238,7 +4265,8 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const 
       }
     }
   }
-  __syncthreads();
+  // NaN max also routes to f32 (!(xmax <= 32)).
+  const bool big = PF == 9 ? __syncthreads_or(!(xmax <= 32.f) || c_h2fb) : (__syncthreads(), false);
   const int row = bx * TPB + tid;
   if (row >= N) return;
   const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
@@ -4247,7 +4275,7 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const 
   #pragma unroll
   for (int k = 0; k < 32; k++) {
     const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
-    const float4 a = PF == 9 ? tlf_leaf2h<CT>(qt, sts, xs, i, K) : PF == 4 ? tlf_leaf2b<CT>(qt, sts, xs, i, K) : tlf_leaf<CT, PF ? 1 : 0>(qt, sts, xs, i, nb, K);
+    const float4 a = PF == 9 ? (big ? tlf_leaf2g<CT>(qt, sts, x + (size_t)t0 * K, i, K, T - t0) : tlf_leaf2h<CT>(qt, sts, xs, i, K)) : PF == 4 ? tlf_leaf2b<CT>(qt, sts, xs, i, K) : tlf_leaf<CT, PF ? 1 : 0>(qt, sts, xs, i, nb, K);
     pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
     bool done = false;
     #pragma unroll
@@ -4568,6 +4596,8 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
       static const bool rng = getenv("LFM_TLF_RANGE") != nullptr;
       if (rng && nb == 64) { static bool r = false; if (!r) { atexit(tlf_range_dump); r = true; }
         k_tlf_range<<<64, 256, 0, g_launch>>>(x, (long)Tn * K); }
+      static bool fbset = false;
+      if (!fbset) { const int fb = getenv("LFM_PF_H2FB") ? atoi(getenv("LFM_PF_H2FB")) : 0; cudaMemcpyToSymbol(c_h2fb, &fb, 4); fbset = true; }
       if (pftlf == 9 && nb == 64) q8_partial_TLf<512, 4, 9><<<gl, 512, (size_t)2 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else if (pftlf == 4 && nb == 64) q8_partial_TLf<512, 4, 4><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
