@@ -1,0 +1,14 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index 7e9eb02..b486080 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -5642,6 +5642,9 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
+     // by the reset below, so its hidden would be anextra row of garbage (seen: N+1 rows).
+     if (g_dump_hidden_all && s >= 0) {
+       std::vector<bf16> hb((size_t)H);
++      // LFM_GRAPHS runs the step on the non-blocking stRun, which the legacy-stream
++      // cudaMemcpy below does not wait for: without this it read the previous step's row.
++      if (g_graphs) cudaDeviceSynchronize();
+       if (cudaMemcpy(hb.data(), M.h1, (size_t)H * 2, cudaMemcpyDeviceToHost) != cudaSuccess) { printf("hidden dump copy failed at step %d\n", s); return 1; }
+       std::vector<float> hf((size_t)H);
+       for (int i = 0; i < H; i++) { uint32_t u = ((uint32_t)hb[i]) << 16; memcpy(&hf[i], &u, 4); }
