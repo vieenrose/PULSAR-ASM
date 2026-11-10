@@ -560,6 +560,21 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TS(const int8_t* __restrict
 // binary counter (earlier operand on the left, as the lower lane is), so every add has
 // the shuffle tree's operands: bit-identical. Same staged x, same dot chains.
 static int g_enctl = -2;
+// LFM_ENC_RPA (default 1): the in-place tile repacks reuse one persistent scratch
+// (grown on demand): same kernels, same bytes and the same per-tensor sync,
+// minus the per-tensor cudaMalloc / cudaFree (102 repacks cost 0.19 s of wall). The fully
+// async form (no sync) gave +1-3 s outliers next to the overlapped loader (#188).
+static void* g_rps = nullptr; static size_t g_rpsz = 0;
+static int g_rpa = -2;
+static void* rp_scratch(size_t n) {
+  if (g_rpa == -2) g_rpa = getenv("LFM_ENC_RPA") ? atoi(getenv("LFM_ENC_RPA")) : 1;
+  if (n > g_rpsz) {
+    if (g_rps) cudaFree(g_rps);
+    if (cudaMalloc(&g_rps, n)) { printf("repack scratch\n"); exit(2); }
+    g_rpsz = n;
+  }
+  return g_rps;
+}
 template <int CT>
 __device__ __forceinline__ void tl_leaf(const int4* __restrict__ qt, const float* __restrict__ st_s,
                                         const float* xs, int b, float (&v)[CT]) {
@@ -997,13 +1012,14 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
   if (g_enctl && K == 768 && g.nch == 1 && N % 32 == 0 && !g_ench2 && !g_bat32 && T > 1 && (!getenv("LFM_ENC_PT") || atoi(getenv("LFM_ENC_PT")) >= 4)) {
     if (!g_tiled.count(q)) {
       void* tmp = nullptr;
-      if (cudaMalloc(&tmp, (size_t)N * K)) { printf("tile768 scratch\n"); exit(2); }
+      if (rp_scratch(0), g_rpa) tmp = rp_scratch((size_t)N * K);
+      else if (cudaMalloc(&tmp, (size_t)N * K)) { printf("tile768 scratch\n"); exit(2); }
       k_tile768_q<<<(N * 48 + 255) / 256, 256>>>(reinterpret_cast<const int4*>(q), (int4*)tmp, N);
       cudaMemcpy((void*)q, tmp, (size_t)N * K, cudaMemcpyDeviceToDevice);
       k_tile768_s<<<(N * 24 + 255) / 256, 256>>>(s, (float*)tmp, N);
       cudaMemcpy((void*)s, tmp, (size_t)N * 24 * 4, cudaMemcpyDeviceToDevice);
       if (cudaDeviceSynchronize() != cudaSuccess) { printf("tile768 repack failed\n"); exit(2); }
-      cudaFree(tmp);
+      if (!g_rpa) cudaFree(tmp);
       g_tiled.insert(q);
     }
     g.tl = true;
@@ -1017,13 +1033,14 @@ static void gemm_setup(Gemm& g, const int8_t* q, const float* s, int N, int K, i
     if (!g_tiled.count(q)) {
       const int nbg = g.nb;
       void* tmp = nullptr;
-      if (cudaMalloc(&tmp, (size_t)N * K)) { printf("tile scratch\n"); exit(2); }
+      if (rp_scratch(0), g_rpa) tmp = rp_scratch((size_t)N * K);
+      else if (cudaMalloc(&tmp, (size_t)N * K)) { printf("tile scratch\n"); exit(2); }
       k_tile_qg<<<(unsigned)(((size_t)N * nbg * 2 + 255) / 256), 256>>>(reinterpret_cast<const int4*>(q), (int4*)tmp, N, nbg);
       cudaMemcpy((void*)q, tmp, (size_t)N * K, cudaMemcpyDeviceToDevice);
       k_tile_sg<<<(unsigned)(((size_t)N * nbg + 255) / 256), 256>>>(s, (float*)tmp, N, nbg);
       cudaMemcpy((void*)s, tmp, (size_t)N * nbg * 4, cudaMemcpyDeviceToDevice);
       if (cudaDeviceSynchronize() != cudaSuccess) { printf("tile repack failed\n"); exit(2); }
-      cudaFree(tmp);
+      if (!g_rpa) cudaFree(tmp);
       g_tiled.insert(q);
     }
     g.tle = true;
