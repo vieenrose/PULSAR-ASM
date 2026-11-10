@@ -84,7 +84,29 @@ static void need_file(const char *p, long min_bytes, const char *what) {
   if (n < min_bytes) die("%s produced %ld bytes at %s (expected >= %ld)", what, n, p, min_bytes);
 }
 static void stage(const char *what) { printf("STAGE %d  %s\n", ++stage_no, what); fflush(stdout); }
+/* Stage timing (printed as STIME lines at exit): wall seconds per stage kind, keyed by
+   program and first flag, plus the backbone server step waits. Timing only. */
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+#define NTK 16
+static char tk_name[NTK][64]; static double tk_s[NTK]; static int tk_n[NTK], ntk = 0;
+static void tk_add(const char *name, double s) {
+  int i; for (i = 0; i < ntk; i++) if (!strcmp(tk_name[i], name)) break;
+  if (i == ntk) { if (ntk == NTK) return; snprintf(tk_name[ntk++], 64, "%s", name); }
+  tk_s[i] += s; tk_n[i]++;
+}
+static double t_start;
+static void tk_dump(void) {
+  for (int i = 0; i < ntk; i++) printf("STIME %-28s calls %4d  total %9.3f s  mean %8.3f s\n", tk_name[i], tk_n[i], tk_s[i], tk_s[i] / tk_n[i]);
+  printf("STIME wall %.3f s\n", now_s() - t_start);
+}
+static void run_cap_t(char *const argv[], const char *out);
 static void run_cap(char *const argv[], const char *out) {
+  const double t0 = now_s();
+  run_cap_t(argv, out);
+  char k[64]; snprintf(k, sizeof k, "%s %s", argv[0], argv[1] && argv[1][0] == '-' ? argv[1] : (argv[2] && argv[2][0] == '-' ? argv[2] : ""));
+  tk_add(k, now_s() - t0);
+}
+static void run_cap_t(char *const argv[], const char *out) {
   pid_t pid = fork();
   if (pid < 0) die("fork failed");
   if (pid == 0) {
@@ -126,7 +148,11 @@ static void serve_start(char *const argv[], const char *logpath) {
 }
 /* Read server lines until the step line for `want` (exactly "step tok ms tps"); returns
    that step's argmax token. Dies on server exit or on a step past `want` (lost sync). */
+static int serve_wait_step_t(int want);
 static int serve_wait_step(int want) {
+  const double t0 = now_s(); const int r = serve_wait_step_t(want); tk_add("backbone step (serve)", now_s() - t0); return r;
+}
+static int serve_wait_step_t(int want) {
   char line[4096];
   while (fgets(line, sizeof line, srv_out)) {
     fputs(line, srv_log); fflush(srv_log);
@@ -157,6 +183,59 @@ static void serve_stop(void) {
   srv_pid = -1;
 }
 
+/* ---- resident depth head (lfm3_depth --serve) ---------------------------------------
+ * One depth process for the turn (LFM_SPK_DEPTHSRV, default 1; 0 = one lfm3_depth
+ * --maskgit process per frame). Same frame computation, same files: codes and frame
+ * embedding are the same bytes; the per-frame process start and blob read go away. */
+static pid_t dsrv_pid = -1;
+static FILE *dsrv_in = NULL, *dsrv_out = NULL, *dsrv_log = NULL;
+static void dsrv_start(const char *blob, const char *logpath) {
+  int pin[2], pout[2];
+  if (pipe(pin) != 0 || pipe(pout) != 0) die("pipe failed");
+  dsrv_pid = fork();
+  if (dsrv_pid < 0) die("fork failed");
+  if (dsrv_pid == 0) {
+    dup2(pin[0], 0); dup2(pout[1], 1); dup2(pout[1], 2);
+    close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]);
+    char prog[1200]; path_of(prog, sizeof prog, "lfm3_depth");
+    char *av[] = { (char*)"lfm3_depth", (char*)blob, (char*)"--serve", NULL };
+    execv(prog, av);
+    fprintf(stderr, "lfm3_speak: cannot exec %s\n", prog); _exit(127);
+  }
+  close(pin[0]); close(pout[1]);
+  dsrv_in = fdopen(pin[1], "w"); dsrv_out = fdopen(pout[0], "r"); dsrv_log = fopen(logpath, "w");
+  if (!dsrv_in || !dsrv_out || !dsrv_log) die("cannot set up the depth server pipes");
+}
+static void dsrv_frame(const char *hid, const char *ord, const char *hist, const char *codes,
+                       const char *emb, const char *pen, const char *win) {
+  const double t0 = now_s();
+  if (fprintf(dsrv_in, "M %s %s %s %s %s %s %s\n", hid, ord, hist, codes, emb, pen, win) < 0 ||
+      fflush(dsrv_in) != 0) die("cannot write to the depth server");
+  char line[4096];
+  while (fgets(line, sizeof line, dsrv_out)) {
+    fputs(line, dsrv_log); fflush(dsrv_log);
+    int rc;
+    if (sscanf(line, "DEPTH_DONE %d", &rc) == 1) {
+      if (rc) die("depth server frame failed (rc %d) -- see its log", rc);
+      tk_add("lfm3_depth (serve)", now_s() - t0);
+      return;
+    }
+  }
+  die("depth server ended unexpectedly -- see its log");
+}
+static void dsrv_stop(void) {
+  if (dsrv_pid <= 0) return;
+  fputs("Q\n", dsrv_in); fclose(dsrv_in); dsrv_in = NULL;
+  char line[4096];
+  while (fgets(line, sizeof line, dsrv_out)) fputs(line, dsrv_log);
+  fclose(dsrv_out); fclose(dsrv_log);
+  int st = 0;
+  if (waitpid(dsrv_pid, &st, 0) < 0) die("waitpid on the depth server failed");
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+    die("depth server ended badly (exit %d)", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+  dsrv_pid = -1;
+}
+
 /* last row of a frame-major f32 file -> dst (proves the file has >= 1 row) */
 static void tail_row_f32(const char *p, float *dst, int cols) {
   long n = file_size(p);
@@ -174,6 +253,8 @@ static uint32_t lcg_state;
 static uint32_t lcg_next(void) { lcg_state = lcg_state * 1103515245u + 12345u; return (lcg_state >> 16) & 0x7fffu; }
 
 int main(int argc, char **argv) {
+  t_start = now_s(); atexit(tk_dump);
+  const int depthsrv = getenv("LFM_SPK_DEPTHSRV") ? atoi(getenv("LFM_SPK_DEPTHSRV")) : 1;
   if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
     fprintf(stderr, "usage: %s <dir> <prompt_ids.i32> <mode> <out_prefix> [max_slots] [order_dir] [seed]\n", argv[0]);
     fprintf(stderr, "  <dir>         directory with the lfm3 blobs\n");
@@ -359,10 +440,15 @@ int main(int argc, char **argv) {
       /* One process per frame, not two: the maskgit call also emits the frame embedding
          (LFM_DEPTH_EMBEDS_OUT). Forking lfm3_depth twice paid the 1.3 s blob load twice
          per frame; the embedding itself is a 24k-entry table reduction. */
+      if (depthsrv) {
+        if (dsrv_pid <= 0) { char dl[1100]; snprintf(dl, sizeof dl, "%s.depth.log", outp); dsrv_start(DB, dl); }
+        dsrv_frame(hid1, ordf, histf, codef, embf, pen, win);
+      } else {
       setenv("LFM_DEPTH_EMBEDS_OUT", embf, 1);
       char *av2[] = { (char*)"lfm3_depth", DB, hid1, (char*)"--maskgit",
                       ordf, histf, codef, pen, win, NULL };
       run_cap(av2, nanolog);
+      }
       need_file(codef, (long)NCB * 4, "frame codes");
       int32_t codes[NCB];
       FILE *cf = fopen(codef, "rb");
@@ -418,6 +504,7 @@ int main(int argc, char **argv) {
   }
 
   if (resident) serve_stop();
+  dsrv_stop();
 
   /* ---- records ---------------------------------------------------------------- */
   char sp[1100]; snprintf(sp, sizeof sp, "%s.slots.txt", outp);

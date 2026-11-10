@@ -425,13 +425,94 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
 
 }
 
+// One MaskGIT frame (shared by --maskgit and --serve): fills codes[12]. Returns 0 or an
+// exit code. The body is the original --maskgit loop, moved verbatim.
+static int maskgit_frame(std::vector<Ent>& ents, std::map<std::string, Ent*>& by,
+                         const float* hidden, const std::vector<int>& order, long no,
+                         const std::vector<int>& hist, int n_hist, int lo, float PEN,
+                         int* codes_out) {
+    int codes[12] = {0};
+    unsigned char revealed[12] = {0};
+    float logits[12 * 2017];
+    for (long p = 0; p + 4 <= no; p += 4) {
+      unsigned char masked[12];
+      for (int c = 0; c < 12; c++) masked[c] = (unsigned char)!revealed[c];
+      depth_forward(ents, by, hidden, codes, masked, logits);
+      for (int j = 0; j < 4; j++) {
+        int idx = order[p + j];
+        if (idx < 0 || idx >= 12) { printf("bad order entry %d\n", idx); return 2; }
+        float s[2017];
+        memcpy(s, logits + idx * 2017, sizeof s);
+        // HF RepetitionPenaltyLogitsProcessor, 2-D path: it GATHERS the history's scores
+        // from the unmodified row and scatters the penalised values back, so a code that
+        // appears k times in the window is penalised ONCE. Penalising per occurrence
+        // over-penalised repeated codes (found on fixture p3, frames 11/14/15).
+        static unsigned char seen[2017];
+        memset(seen, 0, sizeof seen);
+        for (int i = lo; i < n_hist; i++) {
+          int v = hist[(size_t)i * 12 + idx];                   // per-codebook history, window 64
+          if (v < 0 || v >= 2017) { printf("history code out of range %d\n", v); return 2; }
+          if (seen[v]) continue;
+          seen[v] = 1;
+          float g = s[v];
+          s[v] = (g < 0) ? g * PEN : g / PEN;
+        }
+        int best = 0;
+        for (int v = 1; v < 2017; v++) if (s[v] > s[best]) best = v;
+        codes[idx] = best;
+        revealed[idx] = 1;
+      }
+      if (getenv("LFM_DEPTH_TRACE")) {
+        printf("pass %ld codes = [", p);
+        for (int c = 0; c < 12; c++) printf("%d%s", revealed[c] ? codes[c] : -1, c == 11 ? "]" : ",");
+        printf("  order = [");
+        for (int j = 0; j < 4; j++) printf("%d%s", order[p + j], j == 3 ? "]" : ",");
+        printf("  n_hist=%d\n", n_hist);
+        fflush(stdout);
+      }
+    }
+    for (int c = 0; c < 12; c++)
+      if (!revealed[c]) { printf("codebook %d never scheduled by the reveal order\n", c); return 2; }
+    memcpy(codes_out, codes, sizeof codes);
+    return 0;
+}
+// The frame's backbone input embedding (the gated --embeds reduction), written to eo.
+static int frame_embed_out(std::map<std::string, Ent*>& by, const int* codes, const char* eo) {
+    {
+      const int NCB2 = 12, CBS2 = 2017, SH2 = 2048;
+      Ent* cb2 = by.count("codebook_embedding.weight") ? by["codebook_embedding.weight"] : nullptr;
+      if (!cb2) { printf("MISSING TENSOR: codebook_embedding.weight\n"); return 3; }
+      const uint16_t* E = (const uint16_t*)cb2->dq;
+      std::vector<float> o((size_t)SH2);
+      for (int d = 0; d < SH2; d++) {
+        float acc = 0.f;
+        for (int i = 0; i < NCB2; i++) {
+          int code = codes[i];
+          if (code < 0 || code >= CBS2) { printf("FAIL code %d outside [0,%d)\n", code, CBS2); return 3; }
+          acc += bf16_to_f32(E[((size_t)code + (size_t)i * CBS2) * SH2 + d]);
+        }
+        o[d] = acc;
+      }
+      double rms = 0;
+      for (int d = 0; d < SH2; d++) rms += (double)o[d] * o[d];
+      if (!(rms > 0.0) || !(rms == rms)) { printf("FAIL maskgit embedding rms %.6f\n", rms); return 3; }
+      FILE* fe = fopen(eo, "wb");
+      if (!fe) { printf("cannot write %s\n", eo); return 2; }
+      if (fwrite(o.data(), 4, o.size(), fe) != o.size()) { printf("short write\n"); fclose(fe); return 2; }
+      fclose(fe);
+      printf("maskgit: embedding rms %.6f -> %s\n", sqrt(rms), eo);
+      fflush(stdout);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
   // single pass:  lfm3_depth <blob> <hidden.f32> <codes.i32> <masked.u8> <out.f32>
   // MaskGIT:      lfm3_depth <blob> <hidden.f32> --maskgit <order.i32> <hist.i32> <out_codes.i32> [penalty] [window]
   //   order.i32: n_pass*4 int32, pass-major reveal order (the oracle's order.<f>.i32, fed as data)
   //   hist.i32 : n_hist*12 int32, frame-major per-codebook history (may be empty); the
   //              repetition penalty is applied over the last `window` frames, default 64, penalty 1.1
-  if (argc < 6 && !(argc >= 5 && !strcmp(argv[2], "--embeds"))) {
+  if (argc < 6 && !(argc >= 5 && !strcmp(argv[2], "--embeds")) && !(argc >= 3 && !strcmp(argv[2], "--serve"))) {
     printf("usage: %s <depth.lfm3q8> <hidden.f32> <codes.i32> <masked.u8> <out.f32>\n", argv[0]);
     printf("       %s <depth.lfm3q8> <hidden.f32> --maskgit <order.i32> <hist.i32> <out_codes.i32> [penalty] [window]\n", argv[0]);
     printf("       %s <depth.lfm3q8> --embeds <codes.i32> <out.f32> [nframes]\n", argv[0]);
@@ -441,6 +522,53 @@ int main(int argc, char** argv) {
   std::map<std::string, Ent*> by;
   char* js = nullptr;
   if (!load_blob(argv[1], ents, by, js)) return 1;
+
+  /* Resident mode: lfm3_depth <blob> --serve. The blob is loaded once; each stdin line
+       M <hidden.f32> <order.i32> <hist.i32> <codes_out.i32> <emb_out.f32> <penalty> <window>
+     runs exactly the --maskgit frame (maskgit_frame) and the LFM_DEPTH_EMBEDS_OUT embedding
+     (frame_embed_out), then prints "DEPTH_DONE <rc>". "Q" or EOF ends it. Per frame the
+     inputs, code and order of operations are the per-process path's, so codes and
+     embeddings are the same bytes; what goes away is the per-frame process start and blob
+     read (2.52 s per frame in the speech loop vs ~0.45 s of compute). */
+  if (argc >= 3 && !strcmp(argv[2], "--serve")) {
+    auto rd = [](const char* path, std::vector<int>& v) -> bool {
+      v.clear(); FILE* f = fopen(path, "rb"); if (!f) return false;
+      fseek(f, 0, SEEK_END); long n = ftell(f) / 4; fseek(f, 0, SEEK_SET);
+      v.resize((size_t)n); bool ok = n == 0 || fread(v.data(), 4, (size_t)n, f) == (size_t)n;
+      fclose(f); return ok;
+    };
+    printf("DEPTH_READY\n"); fflush(stdout);
+    char line[8192];
+    while (fgets(line, sizeof line, stdin)) {
+      if (line[0] == 'Q') break;
+      char hp[2048], op[2048], hsp[2048], cp[2048], ep[2048]; float PEN; int WIN;
+      int rc = 0;
+      if (sscanf(line, "M %2047s %2047s %2047s %2047s %2047s %f %d", hp, op, hsp, cp, ep, &PEN, &WIN) != 7) rc = 2;
+      float hidden[2048];
+      std::vector<int> order, hist;
+      if (!rc) { FILE* fh = fopen(hp, "rb"); if (!fh || fread(hidden, 4, 2048, fh) != 2048) rc = 2; if (fh) fclose(fh); }
+      if (!rc && (!rd(op, order) || order.empty() || order.size() % 4)) rc = 2;
+      if (!rc) { FILE* t = fopen(hsp, "rb"); if (t) { fclose(t); if (!rd(hsp, hist)) rc = 2; } else hist.clear(); }
+      if (!rc && hist.size() % 12) rc = 2;
+      int codes[12];
+      if (!rc) {
+        const int n_hist = (int)(hist.size() / 12);
+        int lo = n_hist - WIN; if (lo < 0) lo = 0;
+        rc = maskgit_frame(ents, by, hidden, order, (long)order.size(), hist, n_hist, lo, PEN, codes);
+      }
+      if (!rc) {
+        FILE* foc = fopen(cp, "wb");
+        if (!foc || fwrite(codes, 4, 12, foc) != 12) rc = 2;
+        if (foc) fclose(foc);
+        printf("maskgit: codes = [");
+        for (int c = 0; c < 12; c++) printf("%d%s", codes[c], c == 11 ? "]" : ",");
+        printf("\n");
+      }
+      if (!rc) rc = frame_embed_out(by, codes, ep);
+      printf("DEPTH_DONE %d\n", rc); fflush(stdout);
+    }
+    return 0;
+  }
 
   /* code -> backbone input embedding (the S6 speech-out loop feeds this at each
      audio_out_token_id position):
@@ -525,48 +653,8 @@ int main(int argc, char** argv) {
     int n_hist = (int)(hist.size() / 12);
     int lo = n_hist - WIN; if (lo < 0) lo = 0;
 
-    int codes[12] = {0};
-    unsigned char revealed[12] = {0};
-    float logits[12 * 2017];
-    for (long p = 0; p + 4 <= no; p += 4) {
-      unsigned char masked[12];
-      for (int c = 0; c < 12; c++) masked[c] = (unsigned char)!revealed[c];
-      depth_forward(ents, by, hidden, codes, masked, logits);
-      for (int j = 0; j < 4; j++) {
-        int idx = order[p + j];
-        if (idx < 0 || idx >= 12) { printf("bad order entry %d\n", idx); return 2; }
-        float s[2017];
-        memcpy(s, logits + idx * 2017, sizeof s);
-        // HF RepetitionPenaltyLogitsProcessor, 2-D path: it GATHERS the history's scores
-        // from the unmodified row and scatters the penalised values back, so a code that
-        // appears k times in the window is penalised ONCE. Penalising per occurrence
-        // over-penalised repeated codes (found on fixture p3, frames 11/14/15).
-        static unsigned char seen[2017];
-        memset(seen, 0, sizeof seen);
-        for (int i = lo; i < n_hist; i++) {
-          int v = hist[(size_t)i * 12 + idx];                   // per-codebook history, window 64
-          if (v < 0 || v >= 2017) { printf("history code out of range %d\n", v); return 2; }
-          if (seen[v]) continue;
-          seen[v] = 1;
-          float g = s[v];
-          s[v] = (g < 0) ? g * PEN : g / PEN;
-        }
-        int best = 0;
-        for (int v = 1; v < 2017; v++) if (s[v] > s[best]) best = v;
-        codes[idx] = best;
-        revealed[idx] = 1;
-      }
-      if (getenv("LFM_DEPTH_TRACE")) {
-        printf("pass %ld codes = [", p);
-        for (int c = 0; c < 12; c++) printf("%d%s", revealed[c] ? codes[c] : -1, c == 11 ? "]" : ",");
-        printf("  order = [");
-        for (int j = 0; j < 4; j++) printf("%d%s", order[p + j], j == 3 ? "]" : ",");
-        printf("  n_hist=%d\n", n_hist);
-        fflush(stdout);
-      }
-    }
-    for (int c = 0; c < 12; c++)
-      if (!revealed[c]) { printf("codebook %d never scheduled by the reveal order\n", c); return 2; }
+    int codes[12];
+    if (int rc = maskgit_frame(ents, by, hidden, order, no, hist, n_hist, lo, PEN, codes)) return rc;
     FILE* foc = fopen(argv[6], "wb");
     if (!foc) { printf("cannot write %s\n", argv[6]); return 2; }
     fwrite(codes, 4, 12, foc);
@@ -579,31 +667,8 @@ int main(int argc, char** argv) {
        (maskgit, then --embeds), paying the 1.3 s blob load twice; the computation is tiny
        next to the maskgit passes, so one process does both. Same table, same reduction
        order as the gated --embeds path. */
-    if (const char* eo = getenv("LFM_DEPTH_EMBEDS_OUT")) {
-      const int NCB2 = 12, CBS2 = 2017, SH2 = 2048;
-      Ent* cb2 = by.count("codebook_embedding.weight") ? by["codebook_embedding.weight"] : nullptr;
-      if (!cb2) { printf("MISSING TENSOR: codebook_embedding.weight\n"); return 3; }
-      const uint16_t* E = (const uint16_t*)cb2->dq;
-      std::vector<float> o((size_t)SH2);
-      for (int d = 0; d < SH2; d++) {
-        float acc = 0.f;
-        for (int i = 0; i < NCB2; i++) {
-          int code = codes[i];
-          if (code < 0 || code >= CBS2) { printf("FAIL code %d outside [0,%d)\n", code, CBS2); return 3; }
-          acc += bf16_to_f32(E[((size_t)code + (size_t)i * CBS2) * SH2 + d]);
-        }
-        o[d] = acc;
-      }
-      double rms = 0;
-      for (int d = 0; d < SH2; d++) rms += (double)o[d] * o[d];
-      if (!(rms > 0.0) || !(rms == rms)) { printf("FAIL maskgit embedding rms %.6f\n", rms); return 3; }
-      FILE* fe = fopen(eo, "wb");
-      if (!fe) { printf("cannot write %s\n", eo); return 2; }
-      if (fwrite(o.data(), 4, o.size(), fe) != o.size()) { printf("short write\n"); fclose(fe); return 2; }
-      fclose(fe);
-      printf("maskgit: embedding rms %.6f -> %s\n", sqrt(rms), eo);
-      fflush(stdout);
-    }
+    if (const char* eo = getenv("LFM_DEPTH_EMBEDS_OUT"))
+      if (int rc = frame_embed_out(by, codes, eo)) return rc;
     return 0;
   }
 
