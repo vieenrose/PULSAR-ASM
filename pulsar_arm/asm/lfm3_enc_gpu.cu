@@ -155,6 +155,62 @@ __global__ void k_conv_in_shared(const float* __restrict__ in, const float* __re
   }
 }
 
+// k_conv_in_shared2 (LFM_ENC_CI2, default 1): k_conv_in_shared with lane q owning outputs
+// x = xb + q + 32 jj, so each store is 32 consecutive floats (the old x = xb + 4q + jj
+// mapping wrote 4 floats per 16 B sector), and the thread's 3 x 3 window for its 4
+// outputs is read from shared once into registers (the old loop re-read it per channel
+// at a lane stride of 8 floats: 8-way bank conflicts). Per output: same bias start, same
+// taps in the same order (i rows, then j), same silu.
+__global__ void k_conv_in_shared2(const float* __restrict__ in, const float* __restrict__ w,
+                                  const float* __restrict__ b, float* __restrict__ out,
+                                  int nH, int nW, int nHo, int nWo) {
+  const int y = blockIdx.y;
+  const int xb = blockIdx.x * 128;
+  const int tid = threadIdx.x;                       // 256
+  __shared__ float sx[3][258 + 3];
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const int idx = tid + i * 256;
+    if (idx < 3 * 258) {
+      const int r = idx / 258, c = idx % 258;
+      const int iy = y * 2 - 1 + r, ix = xb * 2 - 1 + c;
+      sx[r][c] = (iy >= 0 && iy < nH && ix >= 0 && ix < nW) ? in[(size_t)iy * nW + ix] : 0.f;
+    }
+  }
+  __syncthreads();
+  const int q = tid & 31, sl = tid >> 5;
+  float xv[4][3][3];
+  #pragma unroll
+  for (int jj = 0; jj < 4; jj++) {
+    const int c0 = 2 * (q + 32 * jj);
+    #pragma unroll
+    for (int i = 0; i < 3; i++)
+      #pragma unroll
+      for (int j = 0; j < 3; j++) xv[jj][i][j] = sx[i][c0 + j];
+  }
+  #pragma unroll 2
+  for (int oo = 0; oo < 32; oo++) {
+    const int o = sl * 32 + oo;
+    const float* wr = w + (size_t)o * 9;
+    float wv[9];
+    #pragma unroll
+    for (int k = 0; k < 9; k++) wv[k] = wr[k];
+    const float bo = b[o];
+    float* orow = out + ((size_t)o * nHo + y) * nWo;
+    #pragma unroll
+    for (int jj = 0; jj < 4; jj++) {
+      const int x = xb + q + 32 * jj;
+      float a = bo;
+      #pragma unroll
+      for (int i = 0; i < 3; i++)
+        #pragma unroll
+        for (int j = 0; j < 3; j++) a = __fadd_rn(a, __fmul_rn(wv[i * 3 + j], xv[jj][i][j]));
+      if (g_probe_d != 2) a = __fdiv_rn(a, __fadd_rn(1.f, expf(-a)));
+      if (x < nWo) orow[x] = a;
+    }
+  }
+}
+
 static void conv3x3(const float* in, const float* w, const float* b, float* out,
                     int C, int nH, int nW, int nHo, int nWo, int silu, int in1) {
   const int items = C * nHo * ((nWo + 3) / 4);
@@ -162,7 +218,9 @@ static void conv3x3(const float* in, const float* w, const float* b, float* out,
   if (in1 && g_convIn1) {                             // shared-staged, 256 threads
     const int TPB2 = 256;
     dim3 g((nWo + 127) / 128, nHo);
-    k_conv_in_shared<<<g, TPB2>>>(in, w, b, out, nH, nW, nHo, nWo);
+    static const int ci2 = getenv("LFM_ENC_CI2") ? atoi(getenv("LFM_ENC_CI2")) : 1;
+    if (ci2) k_conv_in_shared2<<<g, TPB2>>>(in, w, b, out, nH, nW, nHo, nWo);
+    else     k_conv_in_shared<<<g, TPB2>>>(in, w, b, out, nH, nW, nHo, nWo);
   } else if (in1) {                                   // flat work-item grid (A/B arm)
     k_conv3x3<1><<<(C * nHo * ((nWo + 3) / 4) + 255) / 256, 256>>>(in, w, b, out, C, nH, nW, nHo, nWo, silu);
   } else {
