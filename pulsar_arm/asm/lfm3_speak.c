@@ -51,6 +51,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <signal.h>
+#include <glob.h>
 
 /* token ids (model config + frames.meta.json; nanode's --speak-tok defaults match) */
 #define AUDIO_START 125012
@@ -316,7 +317,13 @@ int main(int argc, char **argv) {
   if (pn <= 0 || pn % 4 != 0) die("%s is %ld bytes, not int32 ids", prompt_path, pn);
   int nprompt = (int)(pn / 4);
 
-  snprintf(TMPD, sizeof TMPD, "/tmp/lfm3_speak.%ld.d", (long)getpid());
+  /* scratch for the per-slot hand-off files (hidden rows, orders, codes, embeddings):
+     tmpfs when present (LFM_SPK_TMP overrides). On the Nano /tmp is ext4 on the eMMC, where
+     the per-frame create/write/read cost ~4 ms of journaled metadata per frame. */
+  { const char *tb = getenv("LFM_SPK_TMP");
+    struct stat sb;
+    if (!tb) tb = (stat("/dev/shm", &sb) == 0 && S_ISDIR(sb.st_mode) && access("/dev/shm", W_OK) == 0) ? "/dev/shm" : "/tmp";
+    snprintf(TMPD, sizeof TMPD, "%s/lfm3_speak.%ld.d", tb, (long)getpid()); }
   if (mkdir(TMPD, 0755) != 0) die("cannot create %s", TMPD);
 
   /* ---- token buffer: prompt + marker + slots -------------------------------- */
@@ -622,5 +629,16 @@ int main(int argc, char **argv) {
     printf("AUDIO: no non-EOS frames -- no WAV written\n");
   }
   free(toks); free(frames); free(texts);
+  /* a successful turn removes its scratch (on tmpfs it is RAM); failures die() before this
+     and keep it for forensics; LFM_SPK_KEEP=1 keeps it always */
+  if (!(getenv("LFM_SPK_KEEP") && atoi(getenv("LFM_SPK_KEEP")))) {
+    /* the scratch is the directory TMPD plus the sibling files TMPD.<name> */
+    char pat[1300]; glob_t gl;
+    snprintf(pat, sizeof pat, "%s/*", TMPD);
+    if (glob(pat, 0, NULL, &gl) == 0) { for (size_t i = 0; i < gl.gl_pathc; i++) unlink(gl.gl_pathv[i]); globfree(&gl); }
+    rmdir(TMPD);
+    snprintf(pat, sizeof pat, "%s.*", TMPD);
+    if (glob(pat, 0, NULL, &gl) == 0) { for (size_t i = 0; i < gl.gl_pathc; i++) unlink(gl.gl_pathv[i]); globfree(&gl); }
+  }
   return 0;
 }
