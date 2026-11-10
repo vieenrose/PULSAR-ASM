@@ -425,6 +425,14 @@ __global__ void k_silu_mul_ip(float* a, const float* b, int n) {    // silu(a) *
   if (i < n) { const float x = a[i]; a[i] = __fmul_rn(__fdiv_rn(x, __fadd_rn(1.0f, gm_expf(-x))), b[i]); }
 }
 // device-to-device T=12 GEMM: Y [12][N] = q8(W) X [12][K]
+// rows r[0..3] of a [*, n] matrix <-> a compact [4, n] matrix (dir 0 gather, 1 scatter)
+__global__ void k_rows4(float* full, float* cmp, int4 r, int n, int dir) {
+  const int j = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int row = j == 0 ? r.x : j == 1 ? r.y : j == 2 ? r.z : r.w;
+  if (dir == 0) cmp[(size_t)j * n + i] = full[(size_t)row * n + i];
+  else full[(size_t)row * n + i] = cmp[(size_t)j * n + i];
+}
 static void gpu_gemm_dd(const Ent* e, const float* dX, float* dY, int N, int K, size_t row0 = 0) {
   const int8_t* gq = e->gq + row0 * K; const float* gs = e->gs + row0 * (K / 32);
   if (N >= 1024) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0);
@@ -534,6 +542,31 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
       snprintf(qn, sizeof qn, "%s.self_attn.q_norm.weight", pf); snprintf(kn, sizeof kn, "%s.self_attn.k_norm.weight", pf);
       k_qknorm_rope<<<(12 * (NHEADS + NKV) + 127) / 128, 128>>>(dq, dk, gf(qn), gf(kn), dct, dst, NHEADS, NKV, HD);
       k_attn_gate<<<(12 * NHEADS + 127) / 128, 128>>>(dq, dk, dv, dg, dat, NHEADS, NKV, HD, 1.0f / sqrtf((float)HD));
+      // last layer: only the rows the head reads (g_head_need) go on past attention -- the
+      // position-wise o_proj/FFN of a row depend on that row alone (LFM_DEPTH_LSEL, default 1).
+      // T=4 GEMMs keep each output's chain (k_q8g<4,2>); the other rows are never read.
+      static const int lsel = getenv("LFM_DEPTH_LSEL") ? atoi(getenv("LFM_DEPTH_LSEL")) : 1;
+      if (lsel && L == NLAYERS - 1 && g_head_need && g_head_nneed == 4) {
+        const int4 r = make_int4(g_head_need[0], g_head_need[1], g_head_need[2], g_head_need[3]);
+        static float *cx, *cat, *c1, *c2, *c3, *c4;
+        if (!cx) { cudaMalloc(&cx, 4u*DH*4); cudaMalloc(&cat, 4u*NHEADS*HD*4); cudaMalloc(&c1, 4u*DH*4);
+                   cudaMalloc(&c2, 4u*INTER*4); cudaMalloc(&c3, 4u*INTER*4); cudaMalloc(&c4, 4u*DH*4); }
+        auto g4 = [&](const Ent* e, const float* X, float* Y, int N, int K) {
+          k_q8g<4, 2><<<(unsigned)((N + 255) / 256), 128>>>(e->gq, e->gs, X, Y, N, K, 0); };
+        k_rows4<<<dim3((DH + 255) / 256, 4), 256>>>(dx, cx, r, DH, 0);
+        k_rows4<<<dim3((NHEADS * HD + 255) / 256, 4), 256>>>(dat, cat, r, NHEADS * HD, 0);
+        snprintf(nm, sizeof nm, "%s.self_attn.o_proj.weight", pf); g4(get(nm), cat, c4, DH, NHEADS * HD);
+        k_add_ip<<<(4 * DH + 255) / 256, 256>>>(cx, c4, 4 * DH);
+        snprintf(nm, sizeof nm, "%s.ffn_norm.weight", pf);
+        rms_rows(cx, gf(nm), c1, 4, DH, 0);
+        snprintf(nm, sizeof nm, "%s.feed_forward.w1.weight", pf); g4(get(nm), c1, c2, INTER, DH);
+        snprintf(nm, sizeof nm, "%s.feed_forward.w3.weight", pf); g4(get(nm), c1, c3, INTER, DH);
+        k_silu_mul_ip<<<(4 * INTER + 255) / 256, 256>>>(c2, c3, 4 * INTER);
+        snprintf(nm, sizeof nm, "%s.feed_forward.w2.weight", pf); g4(get(nm), c2, c4, DH, INTER);
+        k_add_ip<<<(4 * DH + 255) / 256, 256>>>(cx, c4, 4 * DH);
+        k_rows4<<<dim3((DH + 255) / 256, 4), 256>>>(dx, cx, r, DH, 1);
+        continue;
+      }
       snprintf(nm, sizeof nm, "%s.self_attn.o_proj.weight", pf); gpu_gemm_dd(get(nm), dat, dh4, DH, NHEADS * HD);
       k_add_ip<<<(12 * DH + 255) / 256, 256>>>(dx, dh4, 12 * DH);
       snprintf(nm, sizeof nm, "%s.ffn_norm.weight", pf);
