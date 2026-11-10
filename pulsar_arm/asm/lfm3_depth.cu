@@ -135,105 +135,7 @@ static void rmsnorm(const float* x, const float* w, float* y, int D, float eps) 
 extern "C" void lfm3_q8_gemm12_kmajor(const int8_t* q, const float* s, const float* XT,
                                       float* Y, int ldy, int N, int K);
 extern "C" void lfm3_q8_gemv1(const int8_t* q, const float* s, const float* x, float* y, int N, int K);
-// ---- GPU GEMMs (LFM_DEPTH_GPU, default 1; 0 = the NEON kernels) -------------------------
-// k_q8g<T>: one thread per output row, T accumulators (one per position). Per output the
-// arithmetic is the NEON contract exactly: acc = 0; for k ascending: acc = fma(w_k, x_k, acc)
-// with w_k = (float)code_k * scale_{k/32} rounded once. Only the schedule differs: each
-// 32-code Q8 block of 128 rows is staged through shared memory with coalesced loads (8
-// threads read one row's 32 bytes; rows padded to 9 words so per-row reads are
-// conflict-free), and the block's 32 activations of all T positions sit in shared too.
-// Grouped launch (gridDim.y > 1, the 12 codebook heads): group g uses rows g*N.. of q/s,
-// activation row g of X and output row g of Y, i.e. one GEMV per group in one launch.
-// Activations are staged k-major (xs[k][t], T padded to a multiple of 4), so the T values
-// of one k arrive as T/4 broadcast LDS.128 instead of T scalar loads.
-template <int T, int RR = 1>
-__global__ void __launch_bounds__(128) k_q8g(const int8_t* __restrict__ q, const float* __restrict__ s,
-                                             const float* __restrict__ X, float* __restrict__ Y,
-                                             int N, int K) {
-  // RR rows per thread (rows r0 + r*128 + tid): the T activations of one k are loaded
-  // once from shared and feed RR*T independent chains; each chain is the contract above.
-  constexpr int TP = (T + 3) & ~3, BR = 128 * RR, NX = (T * 32 + 127) / 128;
-  __shared__ int wq[BR][9];
-  __shared__ float ws[BR];
-  __shared__ __align__(16) float xs[32][TP];
-  const int nb = K / 32;
-  { const int g = blockIdx.y;   // group offsets (0 for the plain GEMM)
-    q += (size_t)g * N * K; s += (size_t)g * N * nb; X += (size_t)g * K * T; Y += (size_t)g * N * T; }
-  const int r0 = blockIdx.x * BR, tid = threadIdx.x;
-  float acc[RR][T];
-  #pragma unroll
-  for (int r = 0; r < RR; r++)
-    #pragma unroll
-    for (int t = 0; t < T; t++) acc[r][t] = 0.f;
-  for (int b = 0; b < nb; b++) {
-    // staging: loads into registers first (unrolled), then shared stores
-    int pw[8 * RR]; float psc[RR]; float px[NX];
-    #pragma unroll
-    for (int i = 0; i < 8 * RR; i++) {
-      const int idx = tid + i * 128, row = idx >> 3, w = idx & 7, gr = r0 + row;
-      pw[i] = gr < N ? reinterpret_cast<const int*>(q + (size_t)gr * K + (size_t)b * 32)[w] : 0;
-    }
-    #pragma unroll
-    for (int r = 0; r < RR; r++) { const int n = r0 + r * 128 + tid; psc[r] = n < N ? s[(size_t)n * nb + b] : 0.f; }
-    #pragma unroll
-    for (int ii = 0; ii < NX; ii++) {
-      const int i = tid + ii * 128;
-      px[ii] = i < T * 32 ? X[(size_t)(i >> 5) * K + (size_t)b * 32 + (i & 31)] : 0.f;
-    }
-    #pragma unroll
-    for (int i = 0; i < 8 * RR; i++) { const int idx = tid + i * 128; wq[idx >> 3][idx & 7] = pw[i]; }
-    #pragma unroll
-    for (int r = 0; r < RR; r++) ws[r * 128 + tid] = psc[r];
-    #pragma unroll
-    for (int ii = 0; ii < NX; ii++) { const int i = tid + ii * 128; if (i < T * 32) xs[i & 31][i >> 5] = px[ii]; }
-    __syncthreads();
-    float sc[RR];
-    #pragma unroll
-    for (int r = 0; r < RR; r++) sc[r] = ws[r * 128 + tid];
-    #pragma unroll
-    for (int w = 0; w < 8; w++) {
-      int v[RR];
-      #pragma unroll
-      for (int r = 0; r < RR; r++) v[r] = wq[r * 128 + tid][w];
-      #pragma unroll
-      for (int j = 0; j < 4; j++) {
-        float wf[RR];
-        #pragma unroll
-        for (int r = 0; r < RR; r++) wf[r] = __fmul_rn((float)(signed char)(v[r] >> (8 * j)), sc[r]);
-        const int k = w * 4 + j;
-        if (T % 4 == 0) {
-          #pragma unroll
-          for (int t4 = 0; t4 < T / 4; t4++) {
-            const float4 xv = *reinterpret_cast<const float4*>(&xs[k][t4 * 4]);
-            #pragma unroll
-            for (int r = 0; r < RR; r++) {
-              acc[r][t4 * 4 + 0] = __fmaf_rn(wf[r], xv.x, acc[r][t4 * 4 + 0]);
-              acc[r][t4 * 4 + 1] = __fmaf_rn(wf[r], xv.y, acc[r][t4 * 4 + 1]);
-              acc[r][t4 * 4 + 2] = __fmaf_rn(wf[r], xv.z, acc[r][t4 * 4 + 2]);
-              acc[r][t4 * 4 + 3] = __fmaf_rn(wf[r], xv.w, acc[r][t4 * 4 + 3]);
-            }
-          }
-        } else {
-          #pragma unroll
-          for (int t = 0; t < T; t++) {
-            const float xv = xs[k][t];
-            #pragma unroll
-            for (int r = 0; r < RR; r++) acc[r][t] = __fmaf_rn(wf[r], xv, acc[r][t]);
-          }
-        }
-      }
-    }
-    __syncthreads();
-  }
-  #pragma unroll
-  for (int r = 0; r < RR; r++) {
-    const int n = r0 + r * 128 + tid;
-    if (n < N) {
-      #pragma unroll
-      for (int t = 0; t < T; t++) Y[(size_t)t * N + n] = acc[r][t];
-    }
-  }
-}
+#include "lfm3_q8g.cuh"
 static int g_gpu = 0;
 static std::vector<Ent>* g_ents = nullptr;
 // device address of a host pointer into some uploaded Q8 tensor (codes or scales)
@@ -269,13 +171,13 @@ static void gpu_gemm(const int8_t* q, const float* s, const float* X, int ldx,
   const int mg = rr_env ? rr_env : (N >= 1024 ? 2 : 1);
   static const int bench = getenv("LFM_DEPTH_BENCH") ? atoi(getenv("LFM_DEPTH_BENCH")) : 0;
   for (int rep = 0; rep < (bench && T == 12 ? 1 : 1); rep++) {
-    if (T == 12) { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K); }
-    else         { if (mg) k_q8g<1, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K);  else k_q8g<1, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K); }
+    if (T == 12) { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
+    else         { if (mg) k_q8g<1, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0);  else k_q8g<1, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
   }
   if (bench && T == 12) {   // timing probe: N back-to-back launches, then the real one
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
     cudaEventRecord(e0);
-    for (int rep = 0; rep < bench; rep++) { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K); }
+    for (int rep = 0; rep < bench; rep++) { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
     cudaEventRecord(e1); cudaEventSynchronize(e1);
     float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
     fprintf(stderr, "DEPTH_BENCH rr=%d N=%d K=%d %.4f ms/launch\n", mg, N, K, ms / bench);
@@ -290,7 +192,7 @@ static void gpu_heads(const int8_t* q, const float* s, const float* X, float* Y,
   static float *dX = nullptr, *dY = nullptr;
   if (!dX && (cudaMalloc(&dX, (size_t)G * K * 4) || cudaMalloc(&dY, (size_t)G * N * 4))) { printf("depth gpu: cudaMalloc failed\n"); exit(3); }
   cudaMemcpy(dX, X, (size_t)G * K * 4, cudaMemcpyHostToDevice);
-  k_q8g<1, 1><<<dim3((unsigned)((N + 127) / 128), (unsigned)G), 128>>>((const int8_t*)dev_of(q, false), (const float*)dev_of(s, true), dX, dY, N, K);
+  k_q8g<1, 1><<<dim3((unsigned)((N + 127) / 128), (unsigned)G), 128>>>((const int8_t*)dev_of(q, false), (const float*)dev_of(s, true), dX, dY, N, K, 0);
   cudaMemcpy(Y, dY, (size_t)G * N * 4, cudaMemcpyDeviceToHost);
   cudaError_t e = cudaGetLastError();
   if (e) { printf("depth gpu: %s\n", cudaGetErrorString(e)); exit(3); }

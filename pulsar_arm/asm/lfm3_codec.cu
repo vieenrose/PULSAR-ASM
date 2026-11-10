@@ -50,6 +50,7 @@ struct Ent {
   int dtype, ne[4], nd;
   size_t file_off, nc, ns;
   int8_t* dq; float* ds; float* df;
+  int8_t* gq = nullptr; float* gs = nullptr;   // device copies (GPU GEMM path)
 };
 
 static bool load_blob(const char* path, std::vector<Ent>& ents, std::map<std::string, Ent*>& by) {
@@ -145,8 +146,37 @@ static void q8_gemv(const int8_t* q, const float* s, const float* x, float* y, i
 // samples must come out byte-identical -- checked against the pre-change binary.
 extern "C" void lfm3_q8_gemm12_kmajor(const int8_t* q, const float* s, const float* XT,
                                       float* Y, int ldy, int N, int K);
+#include "lfm3_q8g.cuh"
+// GPU arm (LFM_CODEC_GPU, default 1): one launch per GEMM, grid y = 12-position tiles
+// (tile_mode 1), RR=2 rows per thread when N >= 1024. Same contract as the NEON kernel, so
+// the same bytes. The tail tile is zero-padded; padding rows have their own accumulators
+// and are dropped, exactly as the NEON path drops its padded rows.
+static std::vector<Ent>* g_cents = nullptr;
+static int g_cgpu = 0;
+static bool gpu_gemm_tiles(const int8_t* q, const float* s, const float* X, int ldx,
+                           float* Y, int ldy, int N, int K, int T) {
+  const Ent* e = nullptr;
+  for (auto& x : *g_cents) if (x.dtype == 1 && x.dq == q && x.gq) { e = &x; break; }
+  if (!e || s != e->ds || K % 32) return false;
+  const int tiles = (T + 11) / 12, TT = tiles * 12;
+  static float *dX = nullptr, *dY = nullptr; static size_t capX = 0, capY = 0;
+  static std::vector<float> hx, hy;
+  if ((size_t)TT * K > capX) { if (dX) cudaFree(dX); capX = (size_t)TT * K; if (cudaMalloc(&dX, capX * 4)) { printf("codec gpu: cudaMalloc\n"); exit(3); } }
+  if ((size_t)TT * N > capY) { if (dY) cudaFree(dY); capY = (size_t)TT * N; if (cudaMalloc(&dY, capY * 4)) { printf("codec gpu: cudaMalloc\n"); exit(3); } }
+  hx.assign((size_t)TT * K, 0.f); hy.resize((size_t)TT * N);
+  for (int t = 0; t < T; t++) memcpy(&hx[(size_t)t * K], X + (size_t)t * ldx, (size_t)K * 4);
+  cudaMemcpy(dX, hx.data(), (size_t)TT * K * 4, cudaMemcpyHostToDevice);
+  if (N >= 1024) k_q8g<12, 2><<<dim3((unsigned)((N + 255) / 256), (unsigned)tiles), 128>>>(e->gq, e->gs, dX, dY, N, K, 1);
+  else           k_q8g<12, 1><<<dim3((unsigned)((N + 127) / 128), (unsigned)tiles), 128>>>(e->gq, e->gs, dX, dY, N, K, 1);
+  cudaMemcpy(hy.data(), dY, (size_t)TT * N * 4, cudaMemcpyDeviceToHost);
+  cudaError_t ce = cudaGetLastError();
+  if (ce) { printf("codec gpu: %s\n", cudaGetErrorString(ce)); exit(3); }
+  for (int t = 0; t < T; t++) memcpy(Y + (size_t)t * ldy, &hy[(size_t)t * N], (size_t)N * 4);
+  return true;
+}
 static void q8_gemm_tiles(const int8_t* q, const float* s, const float* X, int ldx,
                           float* Y, int ldy, int N, int K, int T) {
+  if (g_cgpu && gpu_gemm_tiles(q, s, X, ldx, Y, ldy, N, K, T)) return;
   static std::vector<float> xt;
   xt.resize((size_t)K * 12);
   std::vector<float> tail;
@@ -261,6 +291,16 @@ int main(int argc, char** argv) {
   std::vector<Ent> ents;
   std::map<std::string, Ent*> by;
   if (!load_blob(argv[1], ents, by)) return 1;
+  g_cents = &ents;
+  g_cgpu = getenv("LFM_CODEC_GPU") ? atoi(getenv("LFM_CODEC_GPU")) : 1;
+  if (g_cgpu) {
+    for (auto& e : ents) if (e.dtype == 1 && e.dq && e.ds) {
+      if (cudaMalloc(&e.gq, e.nc) || cudaMalloc(&e.gs, e.ns * 4)) { printf("codec gpu: weight cudaMalloc failed\n"); return 3; }
+      cudaMemcpy(e.gq, e.dq, e.nc, cudaMemcpyHostToDevice);
+      cudaMemcpy(e.gs, e.ds, e.ns * 4, cudaMemcpyHostToDevice);
+    }
+    if (cudaGetLastError()) { printf("codec gpu: upload failed\n"); return 3; }
+  }
   auto get = [&](const char* n) -> Ent* {
     auto it = by.find(n);
     if (it == by.end()) { printf("MISSING TENSOR: %s\n", n); exit(2); }
