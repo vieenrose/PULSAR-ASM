@@ -516,3 +516,400 @@ lfm3_mel_power2:
         ret
         .size   lfm3_mel_power2, .-lfm3_mel_power2
 
+
+/* ------------------------------------------------------------------ */
+/* void lfm3_mel_power4(const float *x, const float *win, const float *twc,
+                        const float *tws, float *pw, int n_bins, long hop)
+   lfm3_mel_power for 4 consecutive frames (x + f*hop, f = 0..3), power of frame f
+   to pw + f*208: each cos/sin row is loaded once for all four. Per frame every
+   operation, operand and order is lfm3_mel_power's (fmul then fadd per 8 taps into
+   the same 4 accumulators, same house reduction, re*re + im*im): bit-identical. */
+        .global lfm3_mel_power4
+        .type   lfm3_mel_power4, %function
+        .p2align 5
+lfm3_mel_power4:
+        stp     x29, x30, [sp, #-160]!
+        mov     x29, sp
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        stp     x23, x24, [sp, #48]
+        stp     x25, x26, [sp, #64]
+        stp     x27, x28, [sp, #80]
+        stp     d8, d9, [sp, #96]
+        stp     d10, d11, [sp, #112]
+        stp     d12, d13, [sp, #128]
+        stp     d14, d15, [sp, #144]
+        sxtw    x15, w5
+        lsl     x27, x6, #2                   /* hop in bytes */
+        mov     x28, x4                       /* pw base */
+        sub     sp, sp, #3200
+        mov     x19, sp
+        sub     sp, sp, #3200
+        mov     x20, sp
+        sub     sp, sp, #3200
+        mov     x21, sp
+        sub     sp, sp, #3200
+        mov     x22, sp
+        mov     x10, x0
+        mov     x5, x10
+        mov     x6, x1
+        mov     x7, x19
+        mov     w8, #50
+.Lp4_y0:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fmul    v4.4s, v0.4s, v2.4s
+        fmul    v5.4s, v1.4s, v3.4s
+        st1     {v4.4s, v5.4s}, [x7], #32
+        subs    w8, w8, #1
+        b.ne    .Lp4_y0
+        mov     x5, x19
+        add     x6, x19, #800
+        add     x7, x19, #1600
+        add     x9, x19, #2400
+        mov     w8, #25
+.Lp4_pair0:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fadd    v4.4s, v0.4s, v2.4s
+        fsub    v5.4s, v0.4s, v2.4s
+        fadd    v6.4s, v1.4s, v3.4s
+        fsub    v7.4s, v1.4s, v3.4s
+        st1     {v4.4s}, [x7], #16
+        st1     {v6.4s}, [x7], #16
+        st1     {v5.4s}, [x9], #16
+        st1     {v7.4s}, [x9], #16
+        subs    w8, w8, #1
+        b.ne    .Lp4_pair0
+        add     x10, x10, x27
+        mov     x5, x10
+        mov     x6, x1
+        mov     x7, x20
+        mov     w8, #50
+.Lp4_y1:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fmul    v4.4s, v0.4s, v2.4s
+        fmul    v5.4s, v1.4s, v3.4s
+        st1     {v4.4s, v5.4s}, [x7], #32
+        subs    w8, w8, #1
+        b.ne    .Lp4_y1
+        mov     x5, x20
+        add     x6, x20, #800
+        add     x7, x20, #1600
+        add     x9, x20, #2400
+        mov     w8, #25
+.Lp4_pair1:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fadd    v4.4s, v0.4s, v2.4s
+        fsub    v5.4s, v0.4s, v2.4s
+        fadd    v6.4s, v1.4s, v3.4s
+        fsub    v7.4s, v1.4s, v3.4s
+        st1     {v4.4s}, [x7], #16
+        st1     {v6.4s}, [x7], #16
+        st1     {v5.4s}, [x9], #16
+        st1     {v7.4s}, [x9], #16
+        subs    w8, w8, #1
+        b.ne    .Lp4_pair1
+        add     x10, x10, x27
+        mov     x5, x10
+        mov     x6, x1
+        mov     x7, x21
+        mov     w8, #50
+.Lp4_y2:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fmul    v4.4s, v0.4s, v2.4s
+        fmul    v5.4s, v1.4s, v3.4s
+        st1     {v4.4s, v5.4s}, [x7], #32
+        subs    w8, w8, #1
+        b.ne    .Lp4_y2
+        mov     x5, x21
+        add     x6, x21, #800
+        add     x7, x21, #1600
+        add     x9, x21, #2400
+        mov     w8, #25
+.Lp4_pair2:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fadd    v4.4s, v0.4s, v2.4s
+        fsub    v5.4s, v0.4s, v2.4s
+        fadd    v6.4s, v1.4s, v3.4s
+        fsub    v7.4s, v1.4s, v3.4s
+        st1     {v4.4s}, [x7], #16
+        st1     {v6.4s}, [x7], #16
+        st1     {v5.4s}, [x9], #16
+        st1     {v7.4s}, [x9], #16
+        subs    w8, w8, #1
+        b.ne    .Lp4_pair2
+        add     x10, x10, x27
+        mov     x5, x10
+        mov     x6, x1
+        mov     x7, x22
+        mov     w8, #50
+.Lp4_y3:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fmul    v4.4s, v0.4s, v2.4s
+        fmul    v5.4s, v1.4s, v3.4s
+        st1     {v4.4s, v5.4s}, [x7], #32
+        subs    w8, w8, #1
+        b.ne    .Lp4_y3
+        mov     x5, x22
+        add     x6, x22, #800
+        add     x7, x22, #1600
+        add     x9, x22, #2400
+        mov     w8, #25
+.Lp4_pair3:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fadd    v4.4s, v0.4s, v2.4s
+        fsub    v5.4s, v0.4s, v2.4s
+        fadd    v6.4s, v1.4s, v3.4s
+        fsub    v7.4s, v1.4s, v3.4s
+        st1     {v4.4s}, [x7], #16
+        st1     {v6.4s}, [x7], #16
+        st1     {v5.4s}, [x9], #16
+        st1     {v7.4s}, [x9], #16
+        subs    w8, w8, #1
+        b.ne    .Lp4_pair3
+        add     x10, x10, x27
+        mov     x12, x2
+        mov     x13, x3
+        mov     x14, #0                       /* bin byte offset into each pw row */
+        mov     w16, #0
+.Lp4_bin:
+        add     x23, x19, #1600
+        add     x24, x20, #1600
+        add     x25, x21, #1600
+        add     x26, x22, #1600
+        tbz     w16, #0, .Lp4_have
+        add     x23, x19, #2400
+        add     x24, x20, #2400
+        add     x25, x21, #2400
+        add     x26, x22, #2400
+.Lp4_have:
+        mov     x5, x12
+        mov     x6, x13
+        movi    v12.4s, #0
+        movi    v13.4s, #0
+        movi    v14.4s, #0
+        movi    v15.4s, #0
+        movi    v16.4s, #0
+        movi    v17.4s, #0
+        movi    v18.4s, #0
+        movi    v19.4s, #0
+        movi    v20.4s, #0
+        movi    v21.4s, #0
+        movi    v22.4s, #0
+        movi    v23.4s, #0
+        movi    v24.4s, #0
+        movi    v25.4s, #0
+        movi    v26.4s, #0
+        movi    v27.4s, #0
+        mov     w8, #25
+.Lp4_tap:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        ld1     {v4.4s, v5.4s}, [x23], #32
+        ld1     {v6.4s, v7.4s}, [x24], #32
+        ld1     {v8.4s, v9.4s}, [x25], #32
+        ld1     {v10.4s, v11.4s}, [x26], #32
+        fmul    v28.4s, v0.4s, v4.4s
+        fmul    v29.4s, v1.4s, v5.4s
+        fmul    v30.4s, v2.4s, v4.4s
+        fmul    v31.4s, v3.4s, v5.4s
+        fadd    v12.4s, v12.4s, v28.4s
+        fadd    v13.4s, v13.4s, v29.4s
+        fadd    v14.4s, v14.4s, v30.4s
+        fadd    v15.4s, v15.4s, v31.4s
+        fmul    v28.4s, v0.4s, v6.4s
+        fmul    v29.4s, v1.4s, v7.4s
+        fmul    v30.4s, v2.4s, v6.4s
+        fmul    v31.4s, v3.4s, v7.4s
+        fadd    v16.4s, v16.4s, v28.4s
+        fadd    v17.4s, v17.4s, v29.4s
+        fadd    v18.4s, v18.4s, v30.4s
+        fadd    v19.4s, v19.4s, v31.4s
+        fmul    v28.4s, v0.4s, v8.4s
+        fmul    v29.4s, v1.4s, v9.4s
+        fmul    v30.4s, v2.4s, v8.4s
+        fmul    v31.4s, v3.4s, v9.4s
+        fadd    v20.4s, v20.4s, v28.4s
+        fadd    v21.4s, v21.4s, v29.4s
+        fadd    v22.4s, v22.4s, v30.4s
+        fadd    v23.4s, v23.4s, v31.4s
+        fmul    v28.4s, v0.4s, v10.4s
+        fmul    v29.4s, v1.4s, v11.4s
+        fmul    v30.4s, v2.4s, v10.4s
+        fmul    v31.4s, v3.4s, v11.4s
+        fadd    v24.4s, v24.4s, v28.4s
+        fadd    v25.4s, v25.4s, v29.4s
+        fadd    v26.4s, v26.4s, v30.4s
+        fadd    v27.4s, v27.4s, v31.4s
+        subs    w8, w8, #1
+        b.ne    .Lp4_tap
+        mov     s0, v12.s[0]
+        mov     s1, v12.s[1]
+        mov     s2, v12.s[2]
+        mov     s3, v12.s[3]
+        fadd    s0, s0, s1
+        fadd    s2, s2, s3
+        fadd    s0, s0, s2
+        mov     s28, v13.s[0]
+        mov     s29, v13.s[1]
+        mov     s30, v13.s[2]
+        mov     s31, v13.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s4, s0, s28
+        mov     s0, v14.s[0]
+        mov     s1, v14.s[1]
+        mov     s2, v14.s[2]
+        mov     s3, v14.s[3]
+        fadd    s0, s0, s1
+        fadd    s2, s2, s3
+        fadd    s0, s0, s2
+        mov     s28, v15.s[0]
+        mov     s29, v15.s[1]
+        mov     s30, v15.s[2]
+        mov     s31, v15.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s5, s0, s28
+        fmul    s6, s4, s4
+        fmul    s7, s5, s5
+        fadd    s6, s6, s7
+        add     x9, x28, #0
+        str     s6, [x9, x14]
+        mov     s0, v16.s[0]
+        mov     s1, v16.s[1]
+        mov     s2, v16.s[2]
+        mov     s3, v16.s[3]
+        fadd    s0, s0, s1
+        fadd    s2, s2, s3
+        fadd    s0, s0, s2
+        mov     s28, v17.s[0]
+        mov     s29, v17.s[1]
+        mov     s30, v17.s[2]
+        mov     s31, v17.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s4, s0, s28
+        mov     s0, v18.s[0]
+        mov     s1, v18.s[1]
+        mov     s2, v18.s[2]
+        mov     s3, v18.s[3]
+        fadd    s0, s0, s1
+        fadd    s2, s2, s3
+        fadd    s0, s0, s2
+        mov     s28, v19.s[0]
+        mov     s29, v19.s[1]
+        mov     s30, v19.s[2]
+        mov     s31, v19.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s5, s0, s28
+        fmul    s6, s4, s4
+        fmul    s7, s5, s5
+        fadd    s6, s6, s7
+        add     x9, x28, #832
+        str     s6, [x9, x14]
+        mov     s0, v20.s[0]
+        mov     s1, v20.s[1]
+        mov     s2, v20.s[2]
+        mov     s3, v20.s[3]
+        fadd    s0, s0, s1
+        fadd    s2, s2, s3
+        fadd    s0, s0, s2
+        mov     s28, v21.s[0]
+        mov     s29, v21.s[1]
+        mov     s30, v21.s[2]
+        mov     s31, v21.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s4, s0, s28
+        mov     s0, v22.s[0]
+        mov     s1, v22.s[1]
+        mov     s2, v22.s[2]
+        mov     s3, v22.s[3]
+        fadd    s0, s0, s1
+        fadd    s2, s2, s3
+        fadd    s0, s0, s2
+        mov     s28, v23.s[0]
+        mov     s29, v23.s[1]
+        mov     s30, v23.s[2]
+        mov     s31, v23.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s5, s0, s28
+        fmul    s6, s4, s4
+        fmul    s7, s5, s5
+        fadd    s6, s6, s7
+        add     x9, x28, #1664
+        str     s6, [x9, x14]
+        mov     s0, v24.s[0]
+        mov     s1, v24.s[1]
+        mov     s2, v24.s[2]
+        mov     s3, v24.s[3]
+        fadd    s0, s0, s1
+        fadd    s2, s2, s3
+        fadd    s0, s0, s2
+        mov     s28, v25.s[0]
+        mov     s29, v25.s[1]
+        mov     s30, v25.s[2]
+        mov     s31, v25.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s4, s0, s28
+        mov     s0, v26.s[0]
+        mov     s1, v26.s[1]
+        mov     s2, v26.s[2]
+        mov     s3, v26.s[3]
+        fadd    s0, s0, s1
+        fadd    s2, s2, s3
+        fadd    s0, s0, s2
+        mov     s28, v27.s[0]
+        mov     s29, v27.s[1]
+        mov     s30, v27.s[2]
+        mov     s31, v27.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s5, s0, s28
+        fmul    s6, s4, s4
+        fmul    s7, s5, s5
+        fadd    s6, s6, s7
+        add     x9, x28, #2496
+        str     s6, [x9, x14]
+        add     x14, x14, #4
+        add     x12, x12, #800
+        add     x13, x13, #800
+        add     w16, w16, #1
+        cmp     x16, x15
+        b.lt    .Lp4_bin
+        add     sp, sp, #3200
+        add     sp, sp, #3200
+        add     sp, sp, #3200
+        add     sp, sp, #3200
+        ldp     d8, d9, [sp, #96]
+        ldp     d10, d11, [sp, #112]
+        ldp     d12, d13, [sp, #128]
+        ldp     d14, d15, [sp, #144]
+        ldp     x19, x20, [sp, #16]
+        ldp     x21, x22, [sp, #32]
+        ldp     x23, x24, [sp, #48]
+        ldp     x25, x26, [sp, #64]
+        ldp     x27, x28, [sp, #80]
+        ldp     x29, x30, [sp], #160
+        ret
+        .size   lfm3_mel_power4, .-lfm3_mel_power4
+

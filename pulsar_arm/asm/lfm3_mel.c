@@ -77,6 +77,8 @@ void lfm3_mel_power(const float *x, const float *win, const float *twc,
                     const float *tws, float *pw, int n_bins);
 void lfm3_mel_power2(const float *xa, const float *win, const float *twc,
                      const float *tws, float *pwa, int n_bins, const float *xb, float *pwb);
+void lfm3_mel_power4(const float *x, const float *win, const float *twc,
+                     const float *tws, float *pw, int n_bins, long hop);
 void lfm3_mel_matmul(const float *pw, const float *filt, float *mel, int n_mels);
 void lfm3_mel_norm(const float *logmel, float *out, int n, float floor_v, float offset,
                    float divisor);
@@ -92,12 +94,24 @@ static void *mel_worker(void *a) {
     mel_job *j = a; const mel_t *m = j->m;
     float *pw = calloc(m->bins_pad, sizeof(float));               /* 208; tail stays zero */
     float *pw2 = calloc(m->bins_pad, sizeof(float));
+    float *pw4 = calloc((size_t)4 * m->bins_pad, sizeof(float));   /* 4 rows of 208 */
     /* LFM_MEL_P2 (default 1): frames in pairs through lfm3_mel_power2, which reads each
        twiddle row once for both frames (bit-identical to two lfm3_mel_power calls). */
-    const int p2 = getenv("LFM_MEL_P2") ? atoi(getenv("LFM_MEL_P2")) : 1;
+    /* 4 = groups of four through lfm3_mel_power4, the tail in pairs. */
+    const int p2 = getenv("LFM_MEL_P2") ? atoi(getenv("LFM_MEL_P2")) : 4;
     float *mel = malloc(m->n_mels * sizeof(float)), *o = malloc(m->n_mels * sizeof(float));
-    if (!pw || !pw2 || !mel || !o) { j->ok = 0; return NULL; }
+    if (!pw || !pw2 || !pw4 || !mel || !o) { j->ok = 0; return NULL; }
     for (long t = j->t0; t < j->t1; ) {
+        if (p2 == 4 && t + 3 < j->t1) {
+            lfm3_mel_power4(j->x + t * m->hop, m->window, m->twc, m->tws, pw4, m->n_bins, m->hop);
+            for (int u = 0; u < 4; u++, t++) {
+                lfm3_mel_matmul(pw4 + (size_t)u * m->bins_pad, m->filt, mel, m->n_mels);
+                for (int i = 0; i < m->n_mels; i++) mel[i] = log10f(mel[i]);
+                lfm3_mel_norm(mel, o, m->n_mels, m->log_floor, m->offset, m->divisor);
+                for (int mi = 0; mi < m->n_mels; mi++) j->rows[(size_t)mi * j->frames + t] = o[mi];
+            }
+            continue;
+        }
         const int two = p2 && t + 1 < j->t1;
         if (two) lfm3_mel_power2(j->x + t * m->hop, m->window, m->twc, m->tws, pw, m->n_bins,
                                  j->x + (t + 1) * m->hop, pw2);
@@ -110,7 +124,7 @@ static void *mel_worker(void *a) {
             for (int mi = 0; mi < m->n_mels; mi++) j->rows[(size_t)mi * j->frames + t] = o[mi];
         }
     }
-    free(pw); free(pw2); free(mel); free(o); j->ok = 1;
+    free(pw); free(pw2); free(pw4); free(mel); free(o); j->ok = 1;
     return NULL;
 }
 
