@@ -31,7 +31,7 @@ rm -f b_speak b_depth b_codec b_nanode
 gcc -O2 -o b_speak lfm3_speak.c > b.log 2>&1
 gcc -O2 -fopenmp -c lfm3_depth_neon.c -o depth_neon.o >> b.log 2>&1
 nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O2 -fmad=false -Xptxas -O3,-dlcm=ca -I. -Xcompiler -fopenmp -o b_depth lfm3_depth.cu depth_neon.o -lgomp >> b.log 2>&1
-nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O2 -fmad=false -Xptxas -O3,-dlcm=ca -I. -o b_codec lfm3_codec.cu >> b.log 2>&1
+nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O2 -fmad=false -Xptxas -O3,-dlcm=ca -I. -Xcompiler -fopenmp -o b_codec lfm3_codec.cu depth_neon.o -lgomp >> b.log 2>&1
 nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o b_nanode lfm3_nanode.cu -lz >> b.log 2>&1
 for b in b_speak b_depth b_codec b_nanode; do test -s \$b || { echo "BUILD FAILED: \$b"; grep -i error b.log | head; exit 1; }; done
 cd $DIR
