@@ -32,6 +32,7 @@ struct Ent {
   size_t file_off, nc, ns;
   uint32_t crc;
   int8_t* dq = nullptr; float* ds = nullptr; float* df = nullptr;
+  int8_t* gq = nullptr; float* gs = nullptr;   // device copies of a Q8 tensor (GPU path)
 };
 
 // (loader copied from lfm3_nanode.cu pattern - simplified)
@@ -127,13 +128,126 @@ static void rmsnorm(const float* x, const float* w, float* y, int D, float eps) 
 // Per output the arithmetic is the original per-position loop's (fmadd, k ascending), so the
 // logits are bit-identical to the pre-change engine. Build:
 //   gcc -O2 -fopenmp -c lfm3_depth_neon.c -o lfm3_depth_neon.o
-//   nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O2 -Xcompiler -fopenmp \
-//        -o lfm3_depth lfm3_depth.cu lfm3_depth_neon.o -lgomp
+//   nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O2 -fmad=false -Xptxas -O3,-dlcm=ca \
+//        -Xcompiler -fopenmp -o lfm3_depth lfm3_depth.cu lfm3_depth_neon.o -lgomp
+// Keep the HOST side at -O2: an -O3 host build changes the host elementwise numerics
+// (logits differ from the -O2 binary in the low bits), with or without the GPU path.
 extern "C" void lfm3_q8_gemm12_kmajor(const int8_t* q, const float* s, const float* XT,
                                       float* Y, int ldy, int N, int K);
 extern "C" void lfm3_q8_gemv1(const int8_t* q, const float* s, const float* x, float* y, int N, int K);
+// ---- GPU GEMMs (LFM_DEPTH_GPU, default 1; 0 = the NEON kernels) -------------------------
+// k_q8g<T>: one thread per output row, T accumulators (one per position). Per output the
+// arithmetic is the NEON contract exactly: acc = 0; for k ascending: acc = fma(w_k, x_k, acc)
+// with w_k = (float)code_k * scale_{k/32} rounded once. Only the schedule differs: each
+// 32-code Q8 block of 128 rows is staged through shared memory with coalesced loads (8
+// threads read one row's 32 bytes; rows padded to 9 words so per-row reads are
+// conflict-free), and the block's 32 activations of all T positions sit in shared too.
+// Grouped launch (gridDim.y > 1, the 12 codebook heads): group g uses rows g*N.. of q/s,
+// activation row g of X and output row g of Y, i.e. one GEMV per group in one launch.
+// Activations are staged k-major (xs[k][t], T padded to a multiple of 4), so the T values
+// of one k arrive as T/4 broadcast LDS.128 instead of T scalar loads.
+template <int T>
+__global__ void __launch_bounds__(128) k_q8g(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                             const float* __restrict__ X, float* __restrict__ Y,
+                                             int N, int K) {
+  constexpr int TP = (T + 3) & ~3;
+  __shared__ int wq[128][9];
+  __shared__ float ws[128];
+  __shared__ __align__(16) float xs[32][TP];
+  const int nb = K / 32;
+  { const int g = blockIdx.y;   // group offsets (0 for the plain GEMM)
+    q += (size_t)g * N * K; s += (size_t)g * N * nb; X += (size_t)g * K * T; Y += (size_t)g * N * T; }
+  const int r0 = blockIdx.x * 128, tid = threadIdx.x, n = r0 + tid;
+  float acc[T];
+  #pragma unroll
+  for (int t = 0; t < T; t++) acc[t] = 0.f;
+  for (int b = 0; b < nb; b++) {
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const int idx = tid + i * 128, row = idx >> 3, w = idx & 7, gr = r0 + row;
+      wq[row][w] = gr < N ? reinterpret_cast<const int*>(q + (size_t)gr * K + (size_t)b * 32)[w] : 0;
+    }
+    ws[tid] = n < N ? s[(size_t)n * nb + b] : 0.f;
+    for (int i = tid; i < T * 32; i += 128) xs[i & 31][i >> 5] = X[(size_t)(i >> 5) * K + (size_t)b * 32 + (i & 31)];
+    __syncthreads();
+    const float sc = ws[tid];
+    #pragma unroll
+    for (int w = 0; w < 8; w++) {
+      const int v = wq[tid][w];
+      #pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const float wf = __fmul_rn((float)(signed char)(v >> (8 * j)), sc);
+        const int k = w * 4 + j;
+        if (T % 4 == 0) {
+          #pragma unroll
+          for (int t4 = 0; t4 < T / 4; t4++) {
+            const float4 xv = *reinterpret_cast<const float4*>(&xs[k][t4 * 4]);
+            acc[t4 * 4 + 0] = __fmaf_rn(wf, xv.x, acc[t4 * 4 + 0]);
+            acc[t4 * 4 + 1] = __fmaf_rn(wf, xv.y, acc[t4 * 4 + 1]);
+            acc[t4 * 4 + 2] = __fmaf_rn(wf, xv.z, acc[t4 * 4 + 2]);
+            acc[t4 * 4 + 3] = __fmaf_rn(wf, xv.w, acc[t4 * 4 + 3]);
+          }
+        } else {
+          #pragma unroll
+          for (int t = 0; t < T; t++) acc[t] = __fmaf_rn(wf, xs[k][t], acc[t]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (n < N) {
+    #pragma unroll
+    for (int t = 0; t < T; t++) Y[(size_t)t * N + n] = acc[t];
+  }
+}
+static int g_gpu = 0;
+static std::vector<Ent>* g_ents = nullptr;
+// device address of a host pointer into some uploaded Q8 tensor (codes or scales)
+static const void* dev_of(const void* h, bool scales) {
+  for (auto& e : *g_ents) {
+    if (e.dtype != 1 || !e.gq) continue;
+    const char* b = scales ? (const char*)e.ds : (const char*)e.dq;
+    const size_t len = scales ? e.ns * 4 : e.nc;
+    if ((const char*)h >= b && (const char*)h < b + len)
+      return (scales ? (const char*)e.gs : (const char*)e.gq) + ((const char*)h - b);
+  }
+  printf("dev_of: pointer not in any uploaded tensor\n"); exit(3);
+}
+static void gpu_gemm(const int8_t* q, const float* s, const float* X, int ldx,
+                     float* Y, int ldy, int N, int K, int T) {
+  static float *dX = nullptr, *dY = nullptr;
+  static std::vector<float> hx, hy;
+  const size_t cap = (size_t)12 * 12288;
+  if (!dX) {
+    if (cudaMalloc(&dX, cap * 4) || cudaMalloc(&dY, cap * 4)) { printf("depth gpu: cudaMalloc failed\n"); exit(3); }
+    hx.resize(cap); hy.resize(cap);
+  }
+  if ((size_t)T * K > cap || (size_t)T * N > cap || K % 32) { printf("depth gpu: shape N=%d K=%d T=%d\n", N, K, T); exit(3); }
+  for (int t = 0; t < T; t++) memcpy(&hx[(size_t)t * K], X + (size_t)t * ldx, (size_t)K * 4);
+  cudaMemcpy(dX, hx.data(), (size_t)T * K * 4, cudaMemcpyHostToDevice);
+  const int8_t* gq = (const int8_t*)dev_of(q, false);
+  const float* gs = (const float*)dev_of(s, true);
+  const unsigned nbk = (unsigned)((N + 127) / 128);
+  if (T == 12) k_q8g<12><<<nbk, 128>>>(gq, gs, dX, dY, N, K);
+  else         k_q8g<1><<<nbk, 128>>>(gq, gs, dX, dY, N, K);
+  cudaMemcpy(hy.data(), dY, (size_t)T * N * 4, cudaMemcpyDeviceToHost);
+  cudaError_t e = cudaGetLastError();
+  if (e) { printf("depth gpu: %s\n", cudaGetErrorString(e)); exit(3); }
+  for (int t = 0; t < T; t++) memcpy(Y + (size_t)t * ldy, &hy[(size_t)t * N], (size_t)N * 4);
+}
+// The 12 codebook heads in one launch: rows c*N.. of q/s against X row c (ldx = K).
+static void gpu_heads(const int8_t* q, const float* s, const float* X, float* Y, int N, int K, int G) {
+  static float *dX = nullptr, *dY = nullptr;
+  if (!dX && (cudaMalloc(&dX, (size_t)G * K * 4) || cudaMalloc(&dY, (size_t)G * N * 4))) { printf("depth gpu: cudaMalloc failed\n"); exit(3); }
+  cudaMemcpy(dX, X, (size_t)G * K * 4, cudaMemcpyHostToDevice);
+  k_q8g<1><<<dim3((unsigned)((N + 127) / 128), (unsigned)G), 128>>>((const int8_t*)dev_of(q, false), (const float*)dev_of(s, true), dX, dY, N, K);
+  cudaMemcpy(Y, dY, (size_t)G * N * 4, cudaMemcpyDeviceToHost);
+  cudaError_t e = cudaGetLastError();
+  if (e) { printf("depth gpu: %s\n", cudaGetErrorString(e)); exit(3); }
+}
 static void q8_gemm(const int8_t* q, const float* s, const float* X, int ldx,
                     float* Y, int ldy, int N, int K, int T) {
+  if (g_gpu && (T == 1 || T == 12)) { gpu_gemm(q, s, X, ldx, Y, ldy, N, K, T); return; }
   if (T == 1) { lfm3_q8_gemv1(q, s, X, Y, N, K); return; }
   if (T != 12) { printf("q8_gemm: T=%d unsupported (1 or 12)\n", T); exit(2); }
   static std::vector<float> xt;
@@ -242,7 +356,16 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
   for (int i = 0; i < 8; i++) g_dt[i] = 0;
   double _dt_last = dt_now();
   float depth_in[12 * 1024];
-  q8_gemv(dl->dq, dl->ds, hidden, depth_in, 12 * DH, SH);
+  // depth_linear depends only on the frame's hidden vector, which is the same for all
+  // MaskGIT passes of a frame: reuse the previous result when the input bytes match
+  // (LFM_DEPTH_DLC, default 1). Same computation, so the same bytes either way.
+  static float dl_h[2048], dl_y[12 * 1024]; static bool dl_ok = false;
+  static const int dlc = getenv("LFM_DEPTH_DLC") ? atoi(getenv("LFM_DEPTH_DLC")) : 1;
+  if (dlc && dl_ok && !memcmp(dl_h, hidden, sizeof dl_h)) memcpy(depth_in, dl_y, sizeof dl_y);
+  else {
+    q8_gemv(dl->dq, dl->ds, hidden, depth_in, 12 * DH, SH);
+    if (dlc) { memcpy(dl_h, hidden, sizeof dl_h); memcpy(dl_y, depth_in, sizeof dl_y); dl_ok = true; }
+  }
   for (int i = 0; i < 12 * DH; i++) depth_in[i] += dl_bias->df[i];
   DT_MARK(0);
 
@@ -409,6 +532,14 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
   DT_MARK(6);
   Ent* head = get("depth_head_stacked.weight");
   float xn[DH];
+  if (g_gpu) {
+    static float xn12[12 * 1024];
+    for (int c = 0; c < NCB; c++) {
+      char en[256]; snprintf(en, sizeof en, "depth_embeddings.%d.embedding_norm.weight", c);
+      rmsnorm(x + c*DH, get(en)->df, xn12 + c*DH, DH, 1e-5f);
+    }
+    gpu_heads(head->dq, head->ds, xn12, out_logits, CBS, DH, NCB);
+  } else
   for (int c = 0; c < NCB; c++) {
     char en[256]; snprintf(en, sizeof en, "depth_embeddings.%d.embedding_norm.weight", c);
     rmsnorm(x + c*DH, get(en)->df, xn, DH, 1e-5f);
@@ -522,6 +653,19 @@ int main(int argc, char** argv) {
   std::map<std::string, Ent*> by;
   char* js = nullptr;
   if (!load_blob(argv[1], ents, by, js)) return 1;
+  g_ents = &ents;
+  g_gpu = getenv("LFM_DEPTH_GPU") ? atoi(getenv("LFM_DEPTH_GPU")) : 1;
+  if (g_gpu) {
+    size_t up = 0;
+    for (auto& e : ents) if (e.dtype == 1) {
+      if (cudaMalloc(&e.gq, e.nc) || cudaMalloc(&e.gs, e.ns * 4)) { printf("depth gpu: weight cudaMalloc failed\n"); return 3; }
+      cudaMemcpy(e.gq, e.dq, e.nc, cudaMemcpyHostToDevice);
+      cudaMemcpy(e.gs, e.ds, e.ns * 4, cudaMemcpyHostToDevice);
+      up += e.nc + e.ns * 4;
+    }
+    if (cudaGetLastError()) { printf("depth gpu: upload failed\n"); return 3; }
+    fprintf(stderr, "depth gpu: %.1f MB of Q8 weights resident\n", up / 1048576.0);
+  }
 
   /* Resident mode: lfm3_depth <blob> --serve. The blob is loaded once; each stdin line
        M <hidden.f32> <order.i32> <hist.i32> <codes_out.i32> <emb_out.f32> <penalty> <window>
