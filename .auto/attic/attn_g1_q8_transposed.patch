@@ -1,0 +1,65 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index 47f820b..914f18a 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -604,6 +604,7 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
+ // chunk's last position (sln floats per head) instead of MAXTOK.
+ __constant__ int g_attsm1 = 1;   // LFM_ATT_SM1
+ __constant__ int g_attgsw = 1;   // LFM_ATT_GSW
++__constant__ int g_attq8 = 1;    // LFM_ATT_Q8
+ template <int G>
+ __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q, const bf16* __restrict__ kc,
+                              const bf16* __restrict__ vc, bf16* __restrict__ out,
+@@ -626,7 +627,43 @@ __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q,
+   for (int g = 0; g < G; g++)
+     #pragma unroll
+     for (int j = 0; j < 4; j++) qv[g][j] = bf2f(q[(size_t)(h0 + g) * HD + lane * 4 + j]);
+-  if (G == 2) {
++  if (G == 1 && g_attq8) {
++    // LFM_ATT_Q8 (default 1): a warp scores 8 consecutive positions per pass; xor stages
++    // 16, 8, 4 are transposed (lower lane: own + partner, upper lane: partner + own, so
++    // every row keeps the shfl_down tree's lower-first pairings), stages 2 and 1 plain:
++    // 9 shuffles per 8 scores instead of 40, 8 live sums (#178's 16-row form spilled).
++    for (int p0 = lo + wid * 8; p0 < npos; p0 += 64) {
++      float v[8];
++      #pragma unroll
++      for (int pi = 0; pi < 8; pi++) {
++        const int p = p0 + pi;
++        float k0 = 0.f, k1 = 0.f, k2 = 0.f, k3 = 0.f;
++        if (p < npos) {
++          const uint2 kw = *reinterpret_cast<const uint2*>(kc + (size_t)p * nkv * HD + kvh * HD + lane * 4);
++          k0 = __uint_as_float(kw.x << 16); k1 = __uint_as_float(kw.x & 0xffff0000u);
++          k2 = __uint_as_float(kw.y << 16); k3 = __uint_as_float(kw.y & 0xffff0000u);
++        }
++        float a = 0.f;
++        a = __fadd_rn(a, __fmul_rn(qv[0][0], k0));
++        a = __fadd_rn(a, __fmul_rn(qv[0][1], k1));
++        a = __fadd_rn(a, __fmul_rn(qv[0][2], k2));
++        a = __fadd_rn(a, __fmul_rn(qv[0][3], k3));
++        v[pi] = a;
++      }
++#define ATT_TSTEP(C, O) { const bool up = (lane & (O)) != 0; \
++        _Pragma("unroll") for (int i = 0; i < (C) / 2; i++) { \
++          const float snd = up ? v[i] : v[i + (C) / 2]; \
++          const float r = __shfl_xor_sync(~0u, snd, (O)); \
++          v[i] = up ? __fadd_rn(r, v[i + (C) / 2]) : __fadd_rn(v[i], r); } }
++      ATT_TSTEP(8, 16) ATT_TSTEP(4, 8) ATT_TSTEP(2, 4)
++#undef ATT_TSTEP
++      { const float r = __shfl_xor_sync(~0u, v[0], 2); v[0] = (lane & 2) ? __fadd_rn(r, v[0]) : __fadd_rn(v[0], r); }
++      const float r1 = __shfl_xor_sync(~0u, v[0], 1);
++      const float sc = (lane & 1) ? __fadd_rn(r1, v[0]) : __fadd_rn(v[0], r1);
++      const int p = p0 + ((lane >> 4) & 1) * 4 + ((lane >> 3) & 1) * 2 + ((lane >> 2) & 1);
++      if (!(lane & 3) && p < npos) sl[p] = __fmul_rn(sc, scaling);
++    }
++  } else if (G == 2) {
+     // Transposed reduce: a warp scores 8 consecutive positions x 2 heads = 16 sums. xor
+     // stages 16, 8, 4, 2 each keep half the rows (lower lane: own + partner, upper lane:
+     // partner + own), then stage 1; every row gets exactly the shfl_down tree's pairings.
+@@ -4862,6 +4899,7 @@ int main(int argc, char** argv) {
+   }
+   if (getenv("LFM_PF_GSW")) { const int v = atoi(getenv("LFM_PF_GSW")); cudaMemcpyToSymbol(g_pfgsw, &v, sizeof v); }
+   if (getenv("LFM_ATT_GSW")) { const int v = atoi(getenv("LFM_ATT_GSW")); cudaMemcpyToSymbol(g_attgsw, &v, sizeof v); }
++  if (getenv("LFM_ATT_Q8")) { const int v = atoi(getenv("LFM_ATT_Q8")); cudaMemcpyToSymbol(g_attq8, &v, sizeof v); }
+   if (getenv("LFM_ATT_SM1")) { const int v = atoi(getenv("LFM_ATT_SM1")); cudaMemcpyToSymbol(g_attsm1, &v, sizeof v); }
+   if (getenv("LFM_RMSV")) { const int v = atoi(getenv("LFM_RMSV")); cudaMemcpyToSymbol(c_rmsv, &v, sizeof v); }
+   int steps = 8; bool trace = false;

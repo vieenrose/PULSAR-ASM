@@ -1,0 +1,17 @@
+diff --git a/pulsar_arm/asm/lfm3_enc_gpu.cu b/pulsar_arm/asm/lfm3_enc_gpu.cu
+index c3d11df..ae1297a 100644
+--- a/pulsar_arm/asm/lfm3_enc_gpu.cu
++++ b/pulsar_arm/asm/lfm3_enc_gpu.cu
+@@ -1666,8 +1666,10 @@ int main(int argc, char** argv) {
+   const size_t n1 = (size_t)256 * EH1 * EWo1, n2 = (size_t)256 * EH2 * EWo2, n3 = (size_t)256 * EH3 * EWo3;
+   float *feat, *x1, *x2, *x2b, *x3, *x3b, *perm, *flat, *ds, *xb = nullptr;
+   feat = dalloc(hfeat.size(), "feat"); cudaMemcpy(feat, &hfeat[0], hfeat.size() * 4, cudaMemcpyHostToDevice);
+-  x1 = dalloc_w(n1, "x1"); x2 = dalloc_w(n2, "x2"); x2b = dalloc(n2, "x2b");
+-  x3 = dalloc(n3, "x3"); x3b = dalloc(n3, "x3b"); perm = dalloc(n2, "perm");
++  x1 = dalloc_w(n1, "x1"); x2 = dalloc_w(n2, "x2"); x2b = dalloc_w(n2, "x2b");
++  // x2b, x3, x3b, perm: each is written in full (transpose / GEMM / conv3x3) before any
++  // read, like x1 and x2; LFM_ENC_POISON=1 NaN-fills them to prove it.
++  x3 = dalloc_w(n3, "x3"); x3b = dalloc_w(n3, "x3b"); perm = dalloc_w(n2, "perm");
+   flat = dalloc((size_t)Tt * 4096, "flat"); ds = dalloc((size_t)Tt * EHID, "ds");
+   if (g_ench2) {                                   // the biggest GEMM input in bf16
+     size_t xbn = (size_t)EH2 * EWo2 * 256;
