@@ -5565,6 +5565,11 @@ int main(int argc, char** argv) {
         cudaStreamBeginCapture(M.stCap, cudaStreamCaptureModeThreadLocal);
         cudaMemcpyAsync(M.dpos, M.hpos_pin, 2 * sizeof(int), cudaMemcpyHostToDevice, M.stCap);
         capturing = true;
+      } else {
+        // steps before the capture (s < 2) run the plain layer loop, whose attention and
+        // RoPE also read the position from M.dpos under LFM_GRAPHS: it was never uploaded
+        // for them, so steps 0-1 ran at an unset position.
+        cudaMemcpyAsync(M.dpos, M.hpos_pin, 2 * sizeof(int), cudaMemcpyHostToDevice, g_launch);
       }
     }
     if (!use_graph) {
@@ -5642,6 +5647,9 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
     // by the reset below, so its hidden would be anextra row of garbage (seen: N+1 rows).
     if (g_dump_hidden_all && s >= 0) {
       std::vector<bf16> hb((size_t)H);
+      // LFM_GRAPHS runs the step on the non-blocking stRun, which the legacy-stream
+      // cudaMemcpy below does not wait for: without this it read the previous step's row.
+      if (g_graphs) cudaDeviceSynchronize();
       if (cudaMemcpy(hb.data(), M.h1, (size_t)H * 2, cudaMemcpyDeviceToHost) != cudaSuccess) { printf("hidden dump copy failed at step %d\n", s); return 1; }
       std::vector<float> hf((size_t)H);
       for (int i = 0; i < H; i++) { uint32_t u = ((uint32_t)hb[i]) << 16; memcpy(&hf[i], &u, 4); }
