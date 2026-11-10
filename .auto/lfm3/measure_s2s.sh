@@ -59,9 +59,32 @@ print('TIMES load %.3f gen %.3f wall %.3f audio %.3f text_ms %.1f audio_ms %.1f'
 cmp -s /tmp/s2s.slots.txt speak_gate_q8/slots.txt && echo GATE_SLOTS_OK || echo GATE_SLOTS_FAIL
 cmp -s /tmp/s2s.text.i32 speak_gate_q8/text.i32 && echo GATE_TEXT_OK || echo GATE_TEXT_FAIL
 [ "\$(md5sum < /tmp/s2s.wav | cut -c1-32)" = "$REFMD5" ] && echo GATE_WAV_OK || echo GATE_WAV_FAIL
+# Independent WAV gates (#239). (1) The turn's WAV must equal a batch decode of the turn's own
+# frame record, transposed to the codec's codebook-major layout HERE, not by lfm3_speak (the
+# frame-major hand-off bug went unseen because the pinned md5 above was taken from the buggy
+# engine). (2) The codec on HF's own codes must reproduce HF's waveform (>= 30 dB SNR).
+python3 - <<'PYEOF'
+import numpy as np, subprocess
+fr = np.fromfile('/tmp/s2s.frames.i32', dtype=np.int32).reshape(-1, 12)
+while len(fr) and (fr[-1] == 2016).all(): fr = fr[:-1]
+np.ascontiguousarray(fr.T).tofile('/tmp/s2s.gate_cm.i32')
+subprocess.run(['./lfm3_codec', 'lfm3-audio-2b-codec.lfm3q8', '/tmp/s2s.gate_cm.i32', str(len(fr)), '/tmp/s2s.gate.f32'], stdout=subprocess.DEVNULL, check=True)
+subprocess.run(['./lfm3_wavout', '/tmp/s2s.gate.f32', '/tmp/s2s.gate.wav', '24000'], stdout=subprocess.DEVNULL, check=True)
+same = open('/tmp/s2s.gate.wav', 'rb').read() == open('/tmp/s2s.wav', 'rb').read()
+print('GATE_WAV_SELF_OK' if same else 'GATE_WAV_SELF_FAIL')
+A = np.fromfile('speak_gate_q8/audio_codes.i32', dtype=np.int32); TA = len(A) // 12
+A = A.reshape(12, TA)
+n = TA
+while n and (A[:, n - 1] == 2016).all(): n -= 1
+np.ascontiguousarray(A[:, :n]).tofile('/tmp/s2s.hf_cm.i32')
+subprocess.run(['./lfm3_codec', 'lfm3-audio-2b-codec.lfm3q8', '/tmp/s2s.hf_cm.i32', str(n), '/tmp/s2s.hf.f32'], stdout=subprocess.DEVNULL, check=True)
+y = np.fromfile('/tmp/s2s.hf.f32', dtype=np.float32); r = np.fromfile('speak_gate_q8/audio.f32', dtype=np.float32)
+m = min(len(y), len(r)); snr = 10 * np.log10((r[:m] ** 2).sum() / ((y[:m] - r[:m]) ** 2).sum())
+print('CODEC_HF_SNR %.1f' % snr); print('GATE_CODEC_HF_OK' if snr >= 30 else 'GATE_CODEC_HF_FAIL')
+PYEOF
 EOF
 )
 echo "$OUT" | tail -12
 echo "$OUT" | grep -q "BUILD FAILED\|RUN FAILED" && exit 1
-for g in SLOTS TEXT WAV; do echo "$OUT" | grep -q "GATE_${g}_OK" || { echo "GATE $g FAILED"; exit 1; }; done
+for g in SLOTS TEXT WAV WAV_SELF CODEC_HF; do echo "$OUT" | grep -q "GATE_${g}_OK" || { echo "GATE $g FAILED"; exit 1; }; done
 echo "$OUT" | awk '/^TIMES/{printf "METRIC s2s_rtf=%.4f\nMETRIC s2s_gen_s=%.3f\nMETRIC s2s_load_s=%.3f\nMETRIC s2s_wall_s=%.3f\nMETRIC s2s_text_ms=%.1f\nMETRIC s2s_audio_ms=%.1f\n", $5/$9, $5, $3, $7, $11, $13}'

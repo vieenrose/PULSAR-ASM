@@ -196,8 +196,26 @@ static void serve_stop(void) {
 static pid_t codec_pid = -1;
 static char codec_ready[1200], codec_out[1200], codec_log[1200];
 static int codec_pub = 0; static double codec_pub_t = 0;   /* frames published at the EOS frame */
-static void codec_early_start(const char *blob) {
+/* lfm3_codec reads codes CODEBOOK-major ([c * T + t], HF's [12, T]); frames[] is frame-major
+   ([t * 12 + c]). Writing frames[] as is handed the codec transposed codes (decoded audio
+   corr 0.005 vs HF's waveform; HF's own codes in the right layout: 32.9 dB SNR). */
+static void write_codes_cm(const char *path, const int *fr, int n) {
+  FILE *cd = fopen(path, "wb");
+  if (!cd) die("cannot write %s", path);
+  for (int c = 0; c < NCB; c++)
+    for (int t = 0; t < n; t++)
+      if (fwrite(&fr[t * NCB + c], 4, 1, cd) != 1) die("cannot write %s", path);
+  fclose(cd);
+}
+/* streaming codec (LFM_SPK_CODECSTREAM, default 1, interleaved turns): the codec reads one
+   line per audio frame on stdin and decodes in chunks during the turn (same bytes as the
+   batch decode); "E <n>" ends it. */
+static FILE *codec_in = NULL; static int codec_sent = 0;
+static void codec_early_start(const char *blob, int stream, int maxframes) {
   if (getenv("LFM_SPK_CODECEARLY") && !atoi(getenv("LFM_SPK_CODECEARLY"))) return;
+  if (getenv("LFM_SPK_CODECSTREAM") && !atoi(getenv("LFM_SPK_CODECSTREAM"))) stream = 0;
+  int pin[2] = { -1, -1 };
+  if (stream && pipe(pin) != 0) die("pipe failed");
   snprintf(codec_ready, sizeof codec_ready, "%s.codes_audio.i32.ready", TMPD);
   snprintf(codec_out, sizeof codec_out, "%s.audio24.f32", TMPD);
   snprintf(codec_log, sizeof codec_log, "%s.codec.log", TMPD);
@@ -209,10 +227,17 @@ static void codec_early_start(const char *blob) {
     if (fd < 0) _exit(127);
     dup2(fd, 1); dup2(fd, 2);
     char prog[1200]; path_of(prog, sizeof prog, "lfm3_codec");
-    char *av[] = { (char*)"lfm3_codec", (char*)blob, codec_ready, (char*)"wait", codec_out, NULL };
+    char sm[64]; snprintf(sm, sizeof sm, "stream:%d", maxframes > 0 ? maxframes : 256);
+    if (stream) { dup2(pin[0], 0); close(pin[0]); close(pin[1]); }
+    char *av[] = { (char*)"lfm3_codec", (char*)blob, codec_ready, stream ? sm : (char*)"wait", codec_out, NULL };
     execv(prog, av); _exit(127);
   }
   codec_pid = pid;
+  if (stream) {
+    close(pin[0]);
+    codec_in = fdopen(pin[1], "w");
+    if (!codec_in) die("cannot open the codec pipe");
+  }
 }
 static pid_t dsrv_pid = -1;
 static FILE *dsrv_in = NULL, *dsrv_out = NULL, *dsrv_log = NULL;
@@ -370,7 +395,7 @@ int main(int argc, char **argv) {
     /* the depth server loads while the backbone loads and prefills (its first frame used to
        pay the 169 MB read + 120 MB upload); same server, same frames */
     if (depthsrv && strcmp(mode, "text") != 0) { char dl[1100]; snprintf(dl, sizeof dl, "%s.depth.log", outp); dsrv_start(DB, dl); }
-    if (strcmp(mode, "text") != 0) codec_early_start(CB);
+    if (strcmp(mode, "text") != 0) codec_early_start(CB, is_il, max_slots);
     last_nt = serve_wait_step(ntoks - 1);
     printf("backbone: resident (nanode --serve, one load for the turn)\n");
   } else {
@@ -527,7 +552,21 @@ int main(int argc, char **argv) {
       /* after the EOS frame of an interleaved turn no audio slot can follow (the loop-top
          kind is then is_audio = 0), so the frames are final: publish them to the waiting
          codec now, overlapping the remaining text slot(s) (LFM_SPK_CODECEOS, default 1). */
-      if (iseos && !is_audio && !interleaving && codec_pid > 0 && !codec_pub &&
+      /* streaming: every non-EOS frame goes to the codec as it is made. An interleaved turn
+         has no audio slot after the EOS frame (see below), so a frame that follows an EOS
+         frame cannot happen; checked anyway. */
+      if (codec_in && !codec_pub) {
+        if (iseos) {
+          fprintf(codec_in, "E %d\n", codec_sent); fflush(codec_in); fclose(codec_in); codec_in = NULL;
+          codec_pub = codec_sent; codec_pub_t = now_s();
+        } else {
+          fprintf(codec_in, "F");
+          for (int c = 0; c < NCB; c++) fprintf(codec_in, " %d", codes[c]);
+          fprintf(codec_in, "\n"); fflush(codec_in);
+          codec_sent++;
+        }
+      }
+      if (iseos && !is_audio && !interleaving && codec_pid > 0 && !codec_pub && !codec_in &&
           !(getenv("LFM_SPK_CODECEOS") && !atoi(getenv("LFM_SPK_CODECEOS")))) {
         int na = nframes;
         while (na > 0) {
@@ -538,9 +577,7 @@ int main(int argc, char **argv) {
         }
         if (na > 0) {
           char cf[1100]; snprintf(cf, sizeof cf, "%s.codes_audio.i32", TMPD);
-          FILE *cd = fopen(cf, "wb");
-          if (!cd || fwrite(frames, 4, (size_t)na * NCB, cd) != (size_t)na * NCB) die("cannot write %s", cf);
-          fclose(cd);
+          write_codes_cm(cf, frames, na);
           if (rename(cf, codec_ready) != 0) die("cannot publish %s", codec_ready);
           codec_pub = na; codec_pub_t = now_s();
         }
@@ -611,20 +648,22 @@ int main(int argc, char **argv) {
     if (!all_eos) break;
     n_audio_frames--;
   }
+  if (n_audio_frames <= 0 && codec_in) { fclose(codec_in); codec_in = NULL; }
   if (n_audio_frames <= 0 && codec_pid > 0) { kill(codec_pid, SIGTERM); waitpid(codec_pid, NULL, 0); codec_pid = -1; }
   if (n_audio_frames > 0) {
     stage("codec decode -> 24 kHz");
     char cf[1100], af[1100];
     snprintf(cf, sizeof cf, "%s.codes_audio.i32", TMPD);
-    FILE *cd = fopen(cf, "wb");
-    if (!cd) die("cannot write %s", cf);
-    if (fwrite(frames, 4, (size_t)n_audio_frames * NCB, cd) != (size_t)n_audio_frames * NCB)
-      die("cannot write %s", cf);
-    fclose(cd);
+    write_codes_cm(cf, frames, n_audio_frames);
     snprintf(af, sizeof af, "%s.audio24.f32", TMPD);
     char nf2[32]; snprintf(nf2, sizeof nf2, "%d", n_audio_frames);
     if (codec_pid > 0) {
       double t0 = now_s();
+      if (codec_in) {                     /* stream ended without an EOS frame */
+        if (codec_sent != n_audio_frames) die("streamed %d frames, turn has %d", codec_sent, n_audio_frames);
+        fprintf(codec_in, "E %d\n", codec_sent); fclose(codec_in); codec_in = NULL;
+        codec_pub = codec_sent; codec_pub_t = now_s();
+      }
       if (codec_pub) {
         if (codec_pub != n_audio_frames) die("early codec got %d frames, turn has %d", codec_pub, n_audio_frames);
         unlink(cf); t0 = codec_pub_t;
