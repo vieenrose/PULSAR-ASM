@@ -1,0 +1,56 @@
+diff --git a/pulsar_arm/asm/lfm3_depth.cu b/pulsar_arm/asm/lfm3_depth.cu
+index f3c2b82..da897c7 100644
+--- a/pulsar_arm/asm/lfm3_depth.cu
++++ b/pulsar_arm/asm/lfm3_depth.cu
+@@ -417,6 +417,40 @@ __global__ void k_attn_gate(const float* q, const float* k, const float* v, cons
+     o[d] = __fmul_rn(acc, g);
+   }
+ }
++// k_attn_gate2: one block of HD threads per (pos, head). Thread j < 12 runs score j's chain
++// (acc = fma(q_d, k_d, acc), d ascending; * scale); thread 0 then the max, exp/sum in j order,
++// divides and the gate; thread d runs output d's chain over j ascending. Same ops and order
++// as k_attn_gate, only parallel. HD in [13, 128]. LFM_DEPTH_AG2=0 restores k_attn_gate.
++__global__ void __launch_bounds__(128) k_attn_gate2(const float* q, const float* k, const float* v, const float* gate,
++                                                    float* out, int NQ, int NKV, int HD, float scale) {
++  __shared__ float qs[128], ks[12][129], scs[12], gs;
++  const int t = blockIdx.x / NQ, h = blockIdx.x % NQ, kvh = h / (NQ / NKV), d = threadIdx.x;
++  qs[d] = q[((size_t)t * NQ + h) * HD + d];
++  for (int j = 0; j < 12; j++) ks[j][d] = k[((size_t)j * NKV + kvh) * HD + d];
++  __syncthreads();
++  if (d < 12) {
++    float acc = 0.f;
++    for (int i = 0; i < HD; i++) acc = __fmaf_rn(qs[i], ks[d][i], acc);
++    scs[d] = __fmul_rn(acc, scale);
++  }
++  __syncthreads();
++  // every j < 12 thread scans the max in the same order (same value), exps its own score;
++  // thread 0 sums in j order; thread 12 runs the gate. Same ops as the serial form.
++  __shared__ float es[12], sums;
++  if (d < 12) {
++    float mx = -1e9f;
++    for (int j = 0; j < 12; j++) { const float x = scs[j]; if (x > mx) mx = x; }
++    es[d] = gm_expf(__fsub_rn(scs[d], mx));
++  } else if (d == 12) gs = __fdiv_rn(1.0f, __fadd_rn(1.0f, gm_expf(-gate[(size_t)t * NQ + h])));
++  __syncthreads();
++  if (d == 0) { float sum = 0.f; for (int j = 0; j < 12; j++) sum = __fadd_rn(sum, es[j]); sums = sum; }
++  __syncthreads();
++  if (d < 12) scs[d] = __fdiv_rn(es[d], sums);
++  __syncthreads();
++  float acc = 0.f;
++  for (int j = 0; j < 12; j++) acc = __fmaf_rn(scs[j], v[((size_t)j * NKV + kvh) * HD + d], acc);
++  out[((size_t)t * NQ + h) * HD + d] = __fmul_rn(acc, gs);
++}
+ __global__ void k_add_ip(float* x, const float* y, int n) {
+   const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = __fadd_rn(x[i], y[i]);
+ }
+@@ -529,7 +563,9 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
+       char qn[256], kn[256];
+       snprintf(qn, sizeof qn, "%s.self_attn.q_norm.weight", pf); snprintf(kn, sizeof kn, "%s.self_attn.k_norm.weight", pf);
+       k_qknorm_rope<<<(12 * (NHEADS + NKV) + 127) / 128, 128>>>(dq, dk, gf(qn), gf(kn), dct, dst, NHEADS, NKV, HD);
+-      k_attn_gate<<<(12 * NHEADS + 127) / 128, 128>>>(dq, dk, dv, dg, dat, NHEADS, NKV, HD, 1.0f / sqrtf((float)HD));
++      { static const int ag2 = getenv("LFM_DEPTH_AG2") ? atoi(getenv("LFM_DEPTH_AG2")) : 1;
++        if (ag2 && HD >= 13 && HD <= 128) k_attn_gate2<<<12 * NHEADS, HD>>>(dq, dk, dv, dg, dat, NHEADS, NKV, HD, 1.0f / sqrtf((float)HD));
++        else k_attn_gate<<<(12 * NHEADS + 127) / 128, 128>>>(dq, dk, dv, dg, dat, NHEADS, NKV, HD, 1.0f / sqrtf((float)HD)); }
+       snprintf(nm, sizeof nm, "%s.self_attn.o_proj.weight", pf); gpu_gemm_dd(get(nm), dat, dh4, DH, NHEADS * HD);
+       k_add_ip<<<(12 * DH + 255) / 256, 256>>>(dx, dh4, 12 * DH);
+       snprintf(nm, sizeof nm, "%s.ffn_norm.weight", pf);

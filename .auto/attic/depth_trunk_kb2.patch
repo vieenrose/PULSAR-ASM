@@ -1,0 +1,18 @@
+diff --git a/pulsar_arm/asm/lfm3_depth.cu b/pulsar_arm/asm/lfm3_depth.cu
+index f3c2b82..4a0ada5 100644
+--- a/pulsar_arm/asm/lfm3_depth.cu
++++ b/pulsar_arm/asm/lfm3_depth.cu
+@@ -174,7 +174,12 @@ static void gpu_gemm(const int8_t* q, const float* s, const float* X, int ldx,
+   const int mg = rr_env ? rr_env : (N >= 1024 ? 2 : 1);
+   static const int bench = getenv("LFM_DEPTH_BENCH") ? atoi(getenv("LFM_DEPTH_BENCH")) : 0;
+   for (int rep = 0; rep < (bench && T == 12 ? 1 : 1); rep++) {
+-    if (T == 12) { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
++    // LFM_DEPTH_TKB: Q8 blocks per barrier pair for the T=12 trunk (1 or 2); same chains.
++    static const int tkb = getenv("LFM_DEPTH_TKB") ? atoi(getenv("LFM_DEPTH_TKB")) : 1;
++    if (T == 12) {
++      if (tkb == 2 && K % 64 == 0) { if (mg == 2) k_q8g<12, 2, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0); else k_q8g<12, 1, 2><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
++      else { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
++    }
+     else         q8g_t1(dim3(nbk), gq, gs, dX, dY, N, K);
+   }
+   if (bench && T == 12) {   // timing probe: N back-to-back launches, then the real one
