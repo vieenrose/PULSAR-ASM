@@ -176,6 +176,66 @@ static void f32_gemv(const float* w, const float* x, float* y, int N, int K) {
   }
 }
 
+// ---- GPU iSTFT (LFM_CODEC_GISTFT, default 1; 0 = the host DFT below). The kernels are
+// lfm3_istft.cu's, copied verbatim: the gated S5 form (direct inverse, k ascending, the
+// __sincosf arm that shipped at 103-130 dB SNR vs torch over 9 cases, fixed 4-term fold
+// order). The waveform contract is an SNR gate, never bits (the host DFT accumulates in
+// double, this one in float).
+__global__ void k_irfft_window(const float* logmag, const float* angle, const float* win,
+                               float* frames, int F, int use_table, const float* table) {
+    int f = blockIdx.x;                                    /* one block per frame */
+    __shared__ float sa[NBIN], sb[NBIN];
+    for (int k = threadIdx.x; k < NBIN; k += blockDim.x) {
+        float m = expf(logmag[(size_t)f * NBIN + k]);
+        float c, s;
+        __sincosf(angle[(size_t)f * NBIN + k], &s, &c);
+        sa[k] = m * c;
+        sb[k] = m * s;
+    }
+    __syncthreads();
+    float a0 = sa[0], ah = sa[NFFT / 2];
+    for (int n = blockIdx.x * 0 + threadIdx.x; n < NFFT; n += blockDim.x) {
+        float acc = 0.0f;
+        for (int k = 1; k < NFFT / 2; k++) {
+            float c, s;
+            if (use_table) {
+                c = table[(size_t)n * (NFFT / 2 - 1) + (k - 1)];
+                s = table[(size_t)(NFFT + n) * (NFFT / 2 - 1) + (k - 1)];
+            } else {
+                /* 32-bit: n,k < 1280 so n*k < 1.64e6 fits; a 64-bit % here is a software
+                   divide per tap and made the kernel 100x slower than its FLOP count. */
+                __sincosf(2.0f * 3.14159265358979f * (float)(((unsigned)n * (unsigned)k) % NFFT) / NFFT, &s, &c);
+            }
+            acc += sa[k] * c - sb[k] * s;
+        }
+        float x = (a0 + ((n & 1) ? -ah : ah) + 2.0f * acc) / NFFT;
+        frames[(size_t)f * NFFT + n] = x * win[n];
+    }
+}
+
+/* fold with a fixed contribution order: output t sums frames f ascending,
+   f in [ceil((t-1279)/320), floor(t/320)] -- 4 terms, no atomics, so the
+   result is reproducible run to run (atomics would make the sum order vary). */
+__global__ void k_fold(const float* frames, const float* win, float* out, int F, int divide) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int L = (F - 1) * NHOP + NFFT;
+    if (t >= L) return;
+    float a = 0.0f, e = 0.0f;
+    int f0 = (t - (NFFT - 1) + NHOP - 1) / NHOP; if (f0 < 0) f0 = 0;
+    int f1 = t / NHOP; if (f1 > F - 1) f1 = F - 1;
+    for (int f = f0; f <= f1; f++) {
+        int j = t - f * NHOP;
+        a += frames[(size_t)f * NFFT + j];
+        e += win[j] * win[j];
+    }
+    /* divide=1 -> store the ENVELOPE sum; divide=0 -> store the audio sum.
+       The first version wrote `a / e` here, so the envelope buffer held the
+       normalised waveform and main's division returned the envelope itself
+       (out == env, and NaN where the envelope was 0). Caught by the SNR gate:
+       the symptom was out == the reference's envelope column. */
+    out[t] = divide ? e : a;
+}
+
 static float silu(float v) { return v / (1.0f + expf(-v)); }
 
 // HF rotate_half: element i pairs with i + HD/2 (the lesson from the depth engine)
@@ -433,6 +493,35 @@ int main(int argc, char** argv) {
   }
   const size_t L = (size_t)(T6 - 1) * NHOP + NFFT;
   const int trim = (NFFT - NHOP) / 2;
+  static const int gistft = getenv("LFM_CODEC_GISTFT") ? atoi(getenv("LFM_CODEC_GISTFT")) : 1;
+  if (gistft) {
+    std::vector<float> in((size_t)2 * NBIN * T6), wv(NFFT);
+    for (int f = 0; f < T6; f++) {
+      memcpy(&in[(size_t)f * NBIN], &lin[(size_t)f * 2 * NBIN], NBIN * 4);                       // log-magnitudes
+      memcpy(&in[(size_t)(T6 + f) * NBIN], &lin[(size_t)f * 2 * NBIN + NBIN], NBIN * 4);          // angles
+    }
+    for (int n = 0; n < NFFT; n++) wv[n] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * n / (NFFT - 1));
+    float *d_win, *d_in, *d_frames, *d_audio, *d_env;
+    if (cudaMalloc(&d_win, NFFT * 4) || cudaMalloc(&d_in, in.size() * 4) || cudaMalloc(&d_frames, (size_t)T6 * NFFT * 4) ||
+        cudaMalloc(&d_audio, L * 4) || cudaMalloc(&d_env, L * 4)) { printf("codec gpu istft: cudaMalloc failed\n"); return 3; }
+    cudaMemcpy(d_win, wv.data(), NFFT * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_in, in.data(), in.size() * 4, cudaMemcpyHostToDevice);
+    const int thr = 256;
+    k_irfft_window<<<T6, thr>>>(d_in, d_in + (size_t)NBIN * T6, d_win, d_frames, T6, 0, nullptr);
+    k_fold<<<(int)((L + thr - 1) / thr), thr>>>(d_frames, d_win, d_audio, T6, 0);
+    k_fold<<<(int)((L + thr - 1) / thr), thr>>>(d_frames, d_win, d_env, T6, 1);
+    std::vector<float> au(L), ev(L);
+    cudaMemcpy(au.data(), d_audio, L * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(ev.data(), d_env, L * 4, cudaMemcpyDeviceToHost);
+    if (cudaGetLastError()) { printf("codec gpu istft: kernel failed\n"); return 3; }
+    std::vector<float> o((size_t)T6 * NHOP);
+    for (size_t t = 0; t < o.size(); t++) o[t] = au[t + trim] / ev[t + trim];
+    FILE* fo = fopen(argv[4], "wb");
+    if (!fo || fwrite(o.data(), 4, o.size(), fo) != o.size()) { printf("cannot write %s\n", argv[4]); return 2; }
+    fclose(fo);
+    printf("done: wrote %d samples (%.2f s at 24 kHz) [gpu istft]\n", T6 * NHOP, T6 * NHOP / 24000.0);
+    return 0;
+  }
   std::vector<float> audio(L, 0.f), envelope(L, 0.f);
   std::vector<float> win(NFFT);
   for (int n = 0; n < NFFT; n++) win[n] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * n / (NFFT - 1));
