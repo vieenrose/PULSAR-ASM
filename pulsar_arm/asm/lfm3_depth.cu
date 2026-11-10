@@ -151,6 +151,7 @@ static const void* dev_of(const void* h, bool scales) {
   }
   printf("dev_of: pointer not in any uploaded tensor\n"); exit(3);
 }
+static void q8g_t1(dim3 grid, const int8_t* q, const float* s, const float* X, float* Y, int N, int K);
 static void gpu_gemm(const int8_t* q, const float* s, const float* X, int ldx,
                      float* Y, int ldy, int N, int K, int T) {
   static float *dX = nullptr, *dY = nullptr;
@@ -174,7 +175,7 @@ static void gpu_gemm(const int8_t* q, const float* s, const float* X, int ldx,
   static const int bench = getenv("LFM_DEPTH_BENCH") ? atoi(getenv("LFM_DEPTH_BENCH")) : 0;
   for (int rep = 0; rep < (bench && T == 12 ? 1 : 1); rep++) {
     if (T == 12) { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
-    else         { if (mg) k_q8g<1, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0);  else k_q8g<1, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
+    else         q8g_t1(dim3(nbk), gq, gs, dX, dY, N, K);
   }
   if (bench && T == 12) {   // timing probe: N back-to-back launches, then the real one
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
@@ -194,12 +195,26 @@ static void gpu_gemm(const int8_t* q, const float* s, const float* X, int ldx,
   if (e) { printf("depth gpu: %s\n", cudaGetErrorString(e)); exit(3); }
   for (int t = 0; t < T; t++) memcpy(Y + (size_t)t * ldy, &hy[(size_t)t * N], (size_t)N * 4);
 }
+// T=1 GEMVs (depth_linear, the 12 heads): KB Q8 blocks per barrier pair (LFM_DEPTH_HKB,
+// 1|2|4|8, default 2; K must be a multiple of 32*KB, else 1). Per output the chain is unchanged.
+// Turn nvprof, 144 calls: KB 1 4.52 ms/call, 2 2.85, 4 4.23, 8 slower still; wav identical.
+template <int KB>
+static void q8g_t1_launch(dim3 grid, const int8_t* q, const float* s, const float* X, float* Y, int N, int K) {
+  k_q8g<1, 1, KB><<<grid, 128>>>(q, s, X, Y, N, K, 0);
+}
+static void q8g_t1(dim3 grid, const int8_t* q, const float* s, const float* X, float* Y, int N, int K) {
+  static const int hkb = getenv("LFM_DEPTH_HKB") ? atoi(getenv("LFM_DEPTH_HKB")) : 2;
+  if (hkb == 8 && K % 256 == 0) q8g_t1_launch<8>(grid, q, s, X, Y, N, K);
+  else if (hkb == 4 && K % 128 == 0) q8g_t1_launch<4>(grid, q, s, X, Y, N, K);
+  else if (hkb == 2 && K % 64 == 0) q8g_t1_launch<2>(grid, q, s, X, Y, N, K);
+  else q8g_t1_launch<1>(grid, q, s, X, Y, N, K);
+}
 // The 12 codebook heads in one launch: rows c*N.. of q/s against X row c (ldx = K).
 static void gpu_heads(const int8_t* q, const float* s, const float* X, float* Y, int N, int K, int G) {
   static float *dX = nullptr, *dY = nullptr;
   if (!dX && (cudaMalloc(&dX, (size_t)G * K * 4) || cudaMalloc(&dY, (size_t)G * N * 4))) { printf("depth gpu: cudaMalloc failed\n"); exit(3); }
   cudaMemcpy(dX, X, (size_t)G * K * 4, cudaMemcpyHostToDevice);
-  k_q8g<1, 1><<<dim3((unsigned)((N + 127) / 128), (unsigned)G), 128>>>((const int8_t*)dev_of(q, false), (const float*)dev_of(s, true), dX, dY, N, K, 0);
+  q8g_t1(dim3((unsigned)((N + 127) / 128), (unsigned)G), (const int8_t*)dev_of(q, false), (const float*)dev_of(s, true), dX, dY, N, K);
   cudaMemcpy(Y, dY, (size_t)G * N * 4, cudaMemcpyDeviceToHost);
   cudaError_t e = cudaGetLastError();
   if (e) { printf("depth gpu: %s\n", cudaGetErrorString(e)); exit(3); }
@@ -511,7 +526,7 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
     k_rms_rows<<<1, 32>>>(dh1, dcbn, dh4, 12, DH, DH);
     DT_MARK(6);
     Ent* head = get("depth_head_stacked.weight");
-    k_q8g<1, 1><<<dim3((unsigned)((CBS + 127) / 128), (unsigned)NCB), 128>>>(head->gq, head->gs, dh4, dlg, CBS, DH, 0);
+    q8g_t1(dim3((unsigned)((CBS + 127) / 128), (unsigned)NCB), head->gq, head->gs, dh4, dlg, CBS, DH);
     cudaMemcpy(out_logits, dlg, sizeof(float) * NCB * CBS, cudaMemcpyDeviceToHost);
     cudaError_t ce = cudaGetLastError();
     if (ce) { printf("depth gpu trunk: %s\n", cudaGetErrorString(ce)); exit(3); }
