@@ -536,6 +536,13 @@ int main(int argc, char **argv) {
     /* resident: hand this slot's input to the server and collect the next step. Skipped
        after the final slot -- nothing would consume that step. */
     if (resident && slot + 1 < max_slots) {
+      /* the next slot's kind, by the expression at the loop top: if it is audio, only the
+         hidden row of this step is read, so the server may skip its lm_head (lowercase
+         command). LFM_SPK_NOHEAD=0 always asks for the head. */
+      int nxt = interleaving ? speaking : is_audio;
+      if (is_tx) nxt = 0;
+      if (nxt && text_done && !interleaving) nxt = 0;
+      if (nxt && !(getenv("LFM_SPK_NOHEAD") && !atoi(getenv("LFM_SPK_NOHEAD")))) feed[0] = (char)(feed[0] + 32);
       serve_send(feed);
       last_nt = serve_wait_step(ntoks - 1);
     }

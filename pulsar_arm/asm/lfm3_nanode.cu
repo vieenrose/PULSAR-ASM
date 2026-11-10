@@ -1069,6 +1069,7 @@ static const bool g_stream = getenv("LFM_STREAM") != nullptr;
 // needs indirection and the lm_head (2 launches of 500 blocks) has no launch
 // overhead to save.
 static const bool g_graphs = getenv("LFM_GRAPHS") != nullptr;
+static int g_serve_nohead = -100;   // serve: step whose lm_head the controller does not need
 // Every kernel launch goes through this stream. It is 0 (the legacy stream)
 // for all normal execution, so enabling graphs is the only thing that changes
 // it: during capture it is set to a real (non-default) stream, which the
@@ -5676,7 +5677,11 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
     // set: the logit gate compares every teacher-forced position against HF.
     // LFM_LEGACYFEED=1 restores the old loop as the A/B control.
     const int nprompt = (int)prompt.size();
-    const bool need_head = s < 0 || g_legacy_feed || s >= nprompt - 1 || dump_logits_all;
+    // serve: a lowercase command ('t <id>' / 'a <row>') feeds the same input but tells the
+    // server nobody reads this step's logits (the controller's next slot is audio and uses
+    // only the hidden row), so the lm_head and argmax are skipped; nt prints as -1.
+    const bool need_head = (s < 0 || g_legacy_feed || s >= nprompt - 1 || dump_logits_all) &&
+                           !(g_serve && s == g_serve_nohead && !dump_logits_all);
     Ent* eemb = emb;
     if (!need_head) {}
     else head_logits_from(M, lm_head_input, eemb);   // the four arms, shared with the driver
@@ -5735,6 +5740,7 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
       char cmd[1200];
       if (!fgets(cmd, sizeof cmd, stdin)) { printf("SERVE: stdin closed after step %d\n", s); fflush(stdout); break; }
       if (cmd[0] == 'Q') { printf("SERVE: quit after step %d\n", s); fflush(stdout); break; }
+      if ((cmd[0] == 't' || cmd[0] == 'a') && cmd[1] == ' ') { cmd[0] = (char)(cmd[0] - 32); g_serve_nohead = s + 1; }
       if (cmd[0] == 'T' && cmd[1] == ' ') {
         char* endp = nullptr;
         long id = strtol(cmd + 2, &endp, 10);
