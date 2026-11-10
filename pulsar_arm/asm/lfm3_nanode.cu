@@ -4197,6 +4197,22 @@ __device__ __noinline__ float4 tlf_leaf2h(const int4* __restrict__ qt, const flo
   }
   return make_float4(acc[0], acc[1], acc[2], acc[3]);
 }
+// LFM_TLF_RANGE=1 (diagnostic): fp16 range of every TLf input element (bf16 bits).
+__device__ unsigned long long g_rng[4];   // nonzero, subnormal-in-fp16, overflow, max|x| bits
+__global__ void k_tlf_range(const bf16* __restrict__ x, long n) {
+  unsigned long long nz = 0, sub = 0, ov = 0; unsigned mx = 0;
+  for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x) {
+    const unsigned a = ((unsigned)x[i] << 16) & 0x7fffffffu; const float f = __uint_as_float(a);
+    if (a) { nz++; if (f < 6.103515625e-05f) sub++; if (f > 65504.f) ov++; if (a > mx) mx = a; }
+  }
+  atomicAdd(&g_rng[0], nz); atomicAdd(&g_rng[1], sub); atomicAdd(&g_rng[2], ov); atomicMax(&g_rng[3], (unsigned long long)mx);
+}
+static float __uint_as_float_host(unsigned u) { float f; memcpy(&f, &u, 4); return f; }
+static void tlf_range_dump() {
+  unsigned long long h[4]; cudaMemcpyFromSymbol(h, g_rng, sizeof h);
+  printf("TLF_RANGE nonzero %llu subnormal_fp16 %llu (%.3f%%) overflow %llu max|x| %g\n", h[0], h[1],
+         h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], (double)__uint_as_float_host((unsigned)h[3]));
+}
 template <int TPB, int CT = 4, int PF = 1>
 __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                     const bf16* __restrict__ x, float* __restrict__ part,
@@ -4549,6 +4565,9 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
     if (pftlf && tpb == 512 && (size_t)4 * K * 4 <= 48 * 1024) {
       static const int gswf = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
       const dim3 gl = gswf ? dim3((Tn + 3) / 4, (N + tpb - 1) / tpb) : dim3((N + tpb - 1) / tpb, (Tn + 3) / 4);
+      static const bool rng = getenv("LFM_TLF_RANGE") != nullptr;
+      if (rng && nb == 64) { static bool r = false; if (!r) { atexit(tlf_range_dump); r = true; }
+        k_tlf_range<<<64, 256, 0, g_launch>>>(x, (long)Tn * K); }
       if (pftlf == 9 && nb == 64) q8_partial_TLf<512, 4, 9><<<gl, 512, (size_t)2 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else if (pftlf == 4 && nb == 64) q8_partial_TLf<512, 4, 4><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
