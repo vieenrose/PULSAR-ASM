@@ -561,9 +561,10 @@ __global__ void __launch_bounds__(256, 4) q8_partial_TS(const int8_t* __restrict
 // the shuffle tree's operands: bit-identical. Same staged x, same dot chains.
 static int g_enctl = -2;
 // LFM_ENC_RPA (default 2; 1 = sync per tensor, 0 = old malloc/free): the in-place tile repacks reuse one persistent scratch
-// (grown on demand): same kernels, same bytes and the same per-tensor sync,
-// minus the per-tensor cudaMalloc / cudaFree (102 repacks cost 0.19 s of wall). The fully
-// async form (no sync) gave +1-3 s outliers next to the overlapped loader (#188).
+// (grown on demand), same kernels and bytes, no per-tensor cudaMalloc / cudaFree (102
+// repacks cost 0.19 s of wall). At 2 the copies are stream-ordered on the legacy stream
+// with no per-tensor sync; errors surface at the next chk / chk_final. (#188's +1-3 s
+// outliers were slow eMMC blob reads, seen in both arms, #189.)
 static void* g_rps = nullptr; static size_t g_rpsz = 0;
 static int g_rpa = -2;
 static void* rp_scratch(size_t n) {
