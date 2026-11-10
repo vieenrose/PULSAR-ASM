@@ -1,0 +1,38 @@
+diff --git a/pulsar_arm/asm/lfm3_mel.c b/pulsar_arm/asm/lfm3_mel.c
+index a467307..979193e 100644
+--- a/pulsar_arm/asm/lfm3_mel.c
++++ b/pulsar_arm/asm/lfm3_mel.c
+@@ -89,15 +89,25 @@ typedef struct { const mel_t *m; const float *x; float *rows; long frames, t0, t
+ static void *mel_worker(void *a) {
+     mel_job *j = a; const mel_t *m = j->m;
+     float *pw = calloc(m->bins_pad, sizeof(float));               /* 208; tail stays zero */
+-    float *mel = malloc(m->n_mels * sizeof(float)), *o = malloc(m->n_mels * sizeof(float));
++    /* MT frames are buffered and stored row by row as MT-float runs: storing each frame's
++       128 values at a stride of `frames` floats touched 128 pages per frame. */
++    enum { MT = 16 };
++    float *mel = malloc(m->n_mels * sizeof(float)), *o = malloc((size_t)MT * m->n_mels * sizeof(float));
+     if (!pw || !mel || !o) { j->ok = 0; return NULL; }
+-    for (long t = j->t0; t < j->t1; t++) {
+-        lfm3_mel_power(j->x + t * m->hop, m->window, m->twc, m->tws, pw, m->n_bins);
+-        lfm3_mel_matmul(pw, m->filt, mel, m->n_mels);
+-        for (int i = 0; i < m->n_mels; i++)
+-            mel[i] = log10f(mel[i]);          /* log10(0) = -inf; the clamp below maps it to -12 */
+-        lfm3_mel_norm(mel, o, m->n_mels, m->log_floor, m->offset, m->divisor);
+-        for (int mi = 0; mi < m->n_mels; mi++) j->rows[(size_t)mi * j->frames + t] = o[mi];
++    for (long tb = j->t0; tb < j->t1; tb += MT) {
++        const int nt = (int)(j->t1 - tb < MT ? j->t1 - tb : MT);
++        for (int u = 0; u < nt; u++) {
++            const long t = tb + u;
++            lfm3_mel_power(j->x + t * m->hop, m->window, m->twc, m->tws, pw, m->n_bins);
++            lfm3_mel_matmul(pw, m->filt, mel, m->n_mels);
++            for (int i = 0; i < m->n_mels; i++)
++                mel[i] = log10f(mel[i]);      /* log10(0) = -inf; the clamp below maps it to -12 */
++            lfm3_mel_norm(mel, o + (size_t)u * m->n_mels, m->n_mels, m->log_floor, m->offset, m->divisor);
++        }
++        for (int mi = 0; mi < m->n_mels; mi++) {
++            float *dst = j->rows + (size_t)mi * j->frames + tb;
++            for (int u = 0; u < nt; u++) dst[u] = o[(size_t)u * m->n_mels + mi];
++        }
+     }
+     free(pw); free(mel); free(o); j->ok = 1;
+     return NULL;
