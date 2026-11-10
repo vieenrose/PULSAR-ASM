@@ -195,6 +195,7 @@ static void serve_stop(void) {
  * rename, and the process is reaped like a normal run. */
 static pid_t codec_pid = -1;
 static char codec_ready[1200], codec_out[1200], codec_log[1200];
+static int codec_pub = 0; static double codec_pub_t = 0;   /* frames published at the EOS frame */
 static void codec_early_start(const char *blob) {
   if (getenv("LFM_SPK_CODECEARLY") && !atoi(getenv("LFM_SPK_CODECEARLY"))) return;
   snprintf(codec_ready, sizeof codec_ready, "%s.codes_audio.i32.ready", TMPD);
@@ -523,6 +524,27 @@ int main(int argc, char **argv) {
       nframes++;
       snprintf(feed, sizeof feed, "A %s\n", embf);
       if (iseos) { eos_seen = 1; interleaving = 0; }
+      /* after the EOS frame of an interleaved turn no audio slot can follow (the loop-top
+         kind is then is_audio = 0), so the frames are final: publish them to the waiting
+         codec now, overlapping the remaining text slot(s) (LFM_SPK_CODECEOS, default 1). */
+      if (iseos && !is_audio && !interleaving && codec_pid > 0 && !codec_pub &&
+          !(getenv("LFM_SPK_CODECEOS") && !atoi(getenv("LFM_SPK_CODECEOS")))) {
+        int na = nframes;
+        while (na > 0) {
+          int ae = 1;
+          for (int c = 0; c < NCB; c++) if (frames[(na - 1) * NCB + c] != AUDIO_EOS) { ae = 0; break; }
+          if (!ae) break;
+          na--;
+        }
+        if (na > 0) {
+          char cf[1100]; snprintf(cf, sizeof cf, "%s.codes_audio.i32", TMPD);
+          FILE *cd = fopen(cf, "wb");
+          if (!cd || fwrite(frames, 4, (size_t)na * NCB, cd) != (size_t)na * NCB) die("cannot write %s", cf);
+          fclose(cd);
+          if (rename(cf, codec_ready) != 0) die("cannot publish %s", codec_ready);
+          codec_pub = na; codec_pub_t = now_s();
+        }
+      }
     }
 
     /* HF: a slot in an interleaved block, before text_done, counts down; at 0 it flips */
@@ -602,7 +624,11 @@ int main(int argc, char **argv) {
     snprintf(af, sizeof af, "%s.audio24.f32", TMPD);
     char nf2[32]; snprintf(nf2, sizeof nf2, "%d", n_audio_frames);
     if (codec_pid > 0) {
-      const double t0 = now_s();
+      double t0 = now_s();
+      if (codec_pub) {
+        if (codec_pub != n_audio_frames) die("early codec got %d frames, turn has %d", codec_pub, n_audio_frames);
+        unlink(cf); t0 = codec_pub_t;
+      } else
       if (rename(cf, codec_ready) != 0) die("cannot publish %s", codec_ready);
       int st = 0;
       if (waitpid(codec_pid, &st, 0) < 0) die("waitpid codec failed");
