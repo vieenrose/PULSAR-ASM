@@ -258,6 +258,34 @@ static bool gpu_convblk(const Ent* win, const Ent* wout, const float* cw, const 
   if (ce) { printf("codec gpu conv: %s\n", cudaGetErrorString(ce)); exit(3); }
   return true;
 }
+// q/k/v/gate on the device with one upload of h (LFM_CODEC_QKV, default 1): the four
+// GEMMs read the same staged input; same kernels/chains as four gpu_gemm_tiles calls.
+static bool gpu_qkvg(const Ent* const w[4], const float* h, float* const out[4], const int N[4], int HID, int T) {
+  const Ent* e[4] = { nullptr, nullptr, nullptr, nullptr };
+  for (int i = 0; i < 4; i++) for (auto& x : *g_cents) if (&x == w[i] && x.dtype == 1 && x.gq) e[i] = &x;
+  for (int i = 0; i < 4; i++) if (!e[i]) return false;
+  if (HID % 32) return false;
+  const int tiles = (T + 11) / 12, TT = tiles * 12;
+  static float *dh = nullptr, *dy[4] = { nullptr, nullptr, nullptr, nullptr }; static size_t cap = 0;
+  if ((size_t)TT * HID > cap) {
+    if (dh) { cudaFree(dh); for (int i = 0; i < 4; i++) cudaFree(dy[i]); }
+    cap = (size_t)TT * HID;
+    if (cudaMalloc(&dh, cap * 4)) { printf("codec gpu: qkv cudaMalloc\n"); exit(3); }
+    for (int i = 0; i < 4; i++) if (cudaMalloc(&dy[i], (size_t)TT * 1024 * 4)) { printf("codec gpu: qkv cudaMalloc\n"); exit(3); }
+  }
+  for (int i = 0; i < 4; i++) if (N[i] > 1024) return false;
+  static std::vector<float> hx; hx.assign((size_t)TT * HID, 0.f);
+  memcpy(hx.data(), h, (size_t)T * HID * 4);
+  cudaMemcpy(dh, hx.data(), (size_t)TT * HID * 4, cudaMemcpyHostToDevice);
+  for (int i = 0; i < 4; i++) {
+    if (N[i] >= 1024) k_q8g<12, 2><<<dim3((unsigned)((N[i] + 255) / 256), (unsigned)tiles), 128>>>(e[i]->gq, e[i]->gs, dh, dy[i], N[i], HID, 1);
+    else              k_q8g<12, 1><<<dim3((unsigned)((N[i] + 127) / 128), (unsigned)tiles), 128>>>(e[i]->gq, e[i]->gs, dh, dy[i], N[i], HID, 1);
+  }
+  for (int i = 0; i < 4; i++) cudaMemcpy(out[i], dy[i], (size_t)T * N[i] * 4, cudaMemcpyDeviceToHost);
+  cudaError_t ce = cudaGetLastError();
+  if (ce) { printf("codec gpu qkv: %s\n", cudaGetErrorString(ce)); exit(3); }
+  return true;
+}
 static void q8_gemm_tiles(const int8_t* q, const float* s, const float* X, int ldx,
                           float* Y, int ldy, int N, int K, int T) {
   if (g_cgpu && gpu_gemm_tiles(q, s, X, ldx, Y, ldy, N, K, T)) return;
@@ -524,10 +552,15 @@ int main(int argc, char** argv) {
       float* knw = get((P + ".self_attn.k_norm.weight").c_str())->df;
       std::vector<float> K((size_t)T6 * NKV * HD), V((size_t)T6 * NKV * HD), G((size_t)T6 * NH);
       std::vector<float> Q((size_t)T6 * NH * HD), A((size_t)T6 * NH * HD);
+      static const int cqkv = getenv("LFM_CODEC_QKV") ? atoi(getenv("LFM_CODEC_QKV")) : 1;
+      const Ent* qw[4] = { wq, wk, wv, wg }; float* qo[4] = { Q.data(), K.data(), V.data(), G.data() };
+      const int qn[4] = { NH * HD, NKV * HD, NKV * HD, NH };
+      if (!(cqkv && g_cgpu && gpu_qkvg(qw, h.data(), qo, qn, HID, T6))) {
       q8_gemm_tiles(wq->dq, wq->ds, h.data(), HID, Q.data(), NH * HD, NH * HD, HID, T6);
       q8_gemm_tiles(wk->dq, wk->ds, h.data(), HID, K.data(), NKV * HD, NKV * HD, HID, T6);
       q8_gemm_tiles(wv->dq, wv->ds, h.data(), HID, V.data(), NKV * HD, NKV * HD, HID, T6);
       q8_gemm_tiles(wg->dq, wg->ds, h.data(), HID, G.data(), NH, NH, HID, T6);
+      }
       CK(1);
       #pragma omp parallel for schedule(static) if (g_comp)
       for (int t = 0; t < T6; t++) {
