@@ -433,6 +433,10 @@ static void gpu_gemm_dd(const Ent* e, const float* dX, float* dY, int N, int K, 
 }
 static int g_gpuew = 1;
 
+// MaskGIT passes read the logits of only the codebooks they reveal (order[p..p+3]);
+// maskgit_frame lists them here and the GPU head computes just those rows (same per-row
+// chain). nullptr = all 12. LFM_DEPTH_HSEL=0 always computes all.
+static const int* g_head_need = nullptr; static int g_head_nneed = 0;
 static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& by,
                       const float* hidden, const int* codes, const unsigned char* masked,
                       float* out_logits) {
@@ -556,6 +560,14 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
     rms_rows(dh1, dcbn, dh4, 12, DH, DH);
     DT_MARK(6);
     Ent* head = get("depth_head_stacked.weight");
+    static const int hsel = getenv("LFM_DEPTH_HSEL") ? atoi(getenv("LFM_DEPTH_HSEL")) : 1;
+    if (hsel && g_head_need) {
+      for (int j = 0; j < g_head_nneed; j++) {
+        const int c = g_head_need[j];
+        q8g_t1(dim3((unsigned)((CBS + 127) / 128), 1u), head->gq + (size_t)c * CBS * DH,
+               head->gs + (size_t)c * CBS * (DH / 32), dh4 + (size_t)c * DH, dlg + (size_t)c * CBS, CBS, DH);
+      }
+    } else
     q8g_t1(dim3((unsigned)((CBS + 127) / 128), (unsigned)NCB), head->gq, head->gs, dh4, dlg, CBS, DH);
     cudaMemcpy(out_logits, dlg, sizeof(float) * NCB * CBS, cudaMemcpyDeviceToHost);
     cudaError_t ce = cudaGetLastError();
@@ -748,7 +760,11 @@ static int maskgit_frame(std::vector<Ent>& ents, std::map<std::string, Ent*>& by
     for (long p = 0; p + 4 <= no; p += 4) {
       unsigned char masked[12];
       for (int c = 0; c < 12; c++) masked[c] = (unsigned char)!revealed[c];
+      int need[4];
+      for (int j = 0; j < 4; j++) { need[j] = order[p + j]; if (need[j] < 0 || need[j] >= 12) need[j] = 0; }
+      g_head_need = need; g_head_nneed = 4;
       depth_forward(ents, by, hidden, codes, masked, logits);
+      g_head_need = nullptr; g_head_nneed = 0;
       for (int j = 0; j < 4; j++) {
         int idx = order[p + j];
         if (idx < 0 || idx >= 12) { printf("bad order entry %d\n", idx); return 2; }
