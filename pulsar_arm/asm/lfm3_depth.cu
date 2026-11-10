@@ -341,6 +341,36 @@ __global__ void k_rms_rows(const float* x, const float* w, float* y, int rows, i
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r < rows) d_rms(x + (size_t)r * D, w + (size_t)r * wstride, y + (size_t)r * D, D, 1e-5f);
 }
+// k_rms_rows2: one 128-thread block per row (D <= 1024, D % 4 == 0). The row is staged in
+// shared memory with coalesced loads; thread 0 runs d_rms's serial chain from shared
+// (acc = fma(x_i, x_i, acc), i ascending; same r), then every thread writes
+// (x_i * r) * w_i. Same ops, same order as k_rms_rows. LFM_DEPTH_RMS2=0 restores it.
+__global__ void __launch_bounds__(128) k_rms_rows2(const float* x, const float* w, float* y, int D, int wstride) {
+  __shared__ __align__(16) float xs[1024];
+  __shared__ float rs;
+  const int r = blockIdx.x;
+  x += (size_t)r * D; y += (size_t)r * D; w += (size_t)r * wstride;
+  for (int i = threadIdx.x; i < D; i += 128) xs[i] = x[i];
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float acc = 0.f;
+    const float4* x4 = reinterpret_cast<const float4*>(xs);
+    for (int i = 0; i < D / 4; i++) {
+      const float4 v = x4[i];
+      acc = __fmaf_rn(v.x, v.x, acc); acc = __fmaf_rn(v.y, v.y, acc);
+      acc = __fmaf_rn(v.z, v.z, acc); acc = __fmaf_rn(v.w, v.w, acc);
+    }
+    rs = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(acc, (float)D), 1e-5f)));
+  }
+  __syncthreads();
+  const float rr = rs;
+  for (int i = threadIdx.x; i < D; i += 128) y[i] = __fmul_rn(__fmul_rn(xs[i], rr), w[i]);
+}
+static void rms_rows(const float* x, const float* w, float* y, int rows, int D, int wstride) {
+  static const int on = getenv("LFM_DEPTH_RMS2") ? atoi(getenv("LFM_DEPTH_RMS2")) : 1;
+  if (on && D <= 1024 && D % 4 == 0) k_rms_rows2<<<rows, 128>>>(x, w, y, D, wstride);
+  else k_rms_rows<<<1, 32>>>(x, w, y, rows, D, wstride);
+}
 // per (pos, head): head rmsnorm in place, then RoPE from the host table (cos/sin per pos, i)
 __global__ void k_qknorm_rope(float* q, float* k, const float* qnw, const float* knw,
                               const float* ct, const float* st, int NQ, int NKV, int HD) {
@@ -491,7 +521,7 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
     for (int L = 0; L < NLAYERS; L++) {
       char pf[128], nm[256]; snprintf(pf, sizeof pf, "depthformer.model.layers.%d", L);
       snprintf(nm, sizeof nm, "%s.operator_norm.weight", pf);
-      k_rms_rows<<<1, 32>>>(dx, gf(nm), dh1, 12, DH, 0);
+      rms_rows(dx, gf(nm), dh1, 12, DH, 0);
       snprintf(nm, sizeof nm, "%s.self_attn.q_proj.weight", pf); gpu_gemm_dd(get(nm), dh1, dq, NHEADS * HD, DH);
       snprintf(nm, sizeof nm, "%s.self_attn.k_proj.weight", pf); gpu_gemm_dd(get(nm), dh1, dk, NKV * HD, DH);
       snprintf(nm, sizeof nm, "%s.self_attn.v_proj.weight", pf); gpu_gemm_dd(get(nm), dh1, dv, NKV * HD, DH);
@@ -503,7 +533,7 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
       snprintf(nm, sizeof nm, "%s.self_attn.o_proj.weight", pf); gpu_gemm_dd(get(nm), dat, dh4, DH, NHEADS * HD);
       k_add_ip<<<(12 * DH + 255) / 256, 256>>>(dx, dh4, 12 * DH);
       snprintf(nm, sizeof nm, "%s.ffn_norm.weight", pf);
-      k_rms_rows<<<1, 32>>>(dx, gf(nm), dh1, 12, DH, 0);
+      rms_rows(dx, gf(nm), dh1, 12, DH, 0);
       snprintf(nm, sizeof nm, "%s.feed_forward.w1.weight", pf); gpu_gemm_dd(get(nm), dh1, dh2, INTER, DH);
       snprintf(nm, sizeof nm, "%s.feed_forward.w3.weight", pf); gpu_gemm_dd(get(nm), dh1, dh3, INTER, DH);
       k_silu_mul_ip<<<(12 * INTER + 255) / 256, 256>>>(dh2, dh3, 12 * INTER);
@@ -511,7 +541,7 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
       k_add_ip<<<(12 * DH + 255) / 256, 256>>>(dx, dh4, 12 * DH);
     }
     DT_MARK(5);
-    k_rms_rows<<<1, 32>>>(dx, gf("depthformer.model.embedding_norm.weight"), dh1, 12, DH, 0);   // x = norm(x)
+    rms_rows(dx, gf("depthformer.model.embedding_norm.weight"), dh1, 12, DH, 0);   // x = norm(x)
     // per-codebook embedding_norm (12 weight vectors, uploaded contiguously at load)
     static float* dcbn = nullptr;
     if (!dcbn) {
@@ -523,7 +553,7 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
       if (cudaMalloc(&dcbn, w.size() * 4)) { printf("depth gpu: cbn cudaMalloc\n"); exit(3); }
       cudaMemcpy(dcbn, w.data(), w.size() * 4, cudaMemcpyHostToDevice);
     }
-    k_rms_rows<<<1, 32>>>(dh1, dcbn, dh4, 12, DH, DH);
+    rms_rows(dh1, dcbn, dh4, 12, DH, DH);
     DT_MARK(6);
     Ent* head = get("depth_head_stacked.weight");
     q8g_t1(dim3((unsigned)((CBS + 127) / 128), (unsigned)NCB), head->gq, head->gs, dh4, dlg, CBS, DH);
