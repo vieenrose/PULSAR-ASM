@@ -50,6 +50,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <time.h>
+#include <signal.h>
 
 /* token ids (model config + frames.meta.json; nanode's --speak-tok defaults match) */
 #define AUDIO_START 125012
@@ -187,6 +188,30 @@ static void serve_stop(void) {
  * One depth process for the turn (LFM_SPK_DEPTHSRV, default 1; 0 = one lfm3_depth
  * --maskgit process per frame). Same frame computation, same files: codes and frame
  * embedding are the same bytes; the per-frame process start and blob read go away. */
+/* ---- early codec (LFM_SPK_CODECEARLY, default 1) -------------------------------------
+ * lfm3_codec <blob> <codes>.ready wait <out> starts with the turn: blob read, CUDA init and
+ * weight upload overlap the slot loop; at the end the codes are written and published by
+ * rename, and the process is reaped like a normal run. */
+static pid_t codec_pid = -1;
+static char codec_ready[1200], codec_out[1200], codec_log[1200];
+static void codec_early_start(const char *blob) {
+  if (getenv("LFM_SPK_CODECEARLY") && !atoi(getenv("LFM_SPK_CODECEARLY"))) return;
+  snprintf(codec_ready, sizeof codec_ready, "%s.codes_audio.i32.ready", TMPD);
+  snprintf(codec_out, sizeof codec_out, "%s.audio24.f32", TMPD);
+  snprintf(codec_log, sizeof codec_log, "%s.codec.log", TMPD);
+  unlink(codec_ready);
+  pid_t pid = fork();
+  if (pid < 0) die("fork failed");
+  if (pid == 0) {
+    int fd = open(codec_log, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (fd < 0) _exit(127);
+    dup2(fd, 1); dup2(fd, 2);
+    char prog[1200]; path_of(prog, sizeof prog, "lfm3_codec");
+    char *av[] = { (char*)"lfm3_codec", (char*)blob, codec_ready, (char*)"wait", codec_out, NULL };
+    execv(prog, av); _exit(127);
+  }
+  codec_pid = pid;
+}
 static pid_t dsrv_pid = -1;
 static FILE *dsrv_in = NULL, *dsrv_out = NULL, *dsrv_log = NULL;
 static void dsrv_start(const char *blob, const char *logpath) {
@@ -337,6 +362,7 @@ int main(int argc, char **argv) {
     /* the depth server loads while the backbone loads and prefills (its first frame used to
        pay the 169 MB read + 120 MB upload); same server, same frames */
     if (depthsrv && strcmp(mode, "text") != 0) { char dl[1100]; snprintf(dl, sizeof dl, "%s.depth.log", outp); dsrv_start(DB, dl); }
+    if (strcmp(mode, "text") != 0) codec_early_start(CB);
     last_nt = serve_wait_step(ntoks - 1);
     printf("backbone: resident (nanode --serve, one load for the turn)\n");
   } else {
@@ -549,6 +575,7 @@ int main(int argc, char **argv) {
     if (!all_eos) break;
     n_audio_frames--;
   }
+  if (n_audio_frames <= 0 && codec_pid > 0) { kill(codec_pid, SIGTERM); waitpid(codec_pid, NULL, 0); codec_pid = -1; }
   if (n_audio_frames > 0) {
     stage("codec decode -> 24 kHz");
     char cf[1100], af[1100];
@@ -560,8 +587,20 @@ int main(int argc, char **argv) {
     fclose(cd);
     snprintf(af, sizeof af, "%s.audio24.f32", TMPD);
     char nf2[32]; snprintf(nf2, sizeof nf2, "%d", n_audio_frames);
+    if (codec_pid > 0) {
+      const double t0 = now_s();
+      if (rename(cf, codec_ready) != 0) die("cannot publish %s", codec_ready);
+      int st = 0;
+      if (waitpid(codec_pid, &st, 0) < 0) die("waitpid codec failed");
+      codec_pid = -1;
+      if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) die("lfm3_codec failed (exit %d) -- see %s",
+          WIFEXITED(st) ? WEXITSTATUS(st) : -1, codec_log);
+      tk_add("lfm3_codec (early)", now_s() - t0);
+      snprintf(af, sizeof af, "%s", codec_out);
+    } else {
     char *avc[] = { (char*)"lfm3_codec", CB, cf, nf2, af, NULL };
     run_cap(avc, nanolog);
+    }
     need_file(af, (long)n_audio_frames * 1920 * 4, "codec decode");
     /* the codec emits frame_samples=1920 per frame at 24 kHz; a short file means a
        partial decode, which would play as a truncated clip rather than an error */

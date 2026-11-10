@@ -22,6 +22,8 @@
      out.f32  : 6*T*320 float32 waveform at 24 kHz
 */
 #include <cstdio>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -281,9 +283,12 @@ static void rope_head(float* v, int pos, int HD, float theta) {
 }
 
 int main(int argc, char** argv) {
-  if (argc < 5) { printf("usage: %s <codec.lfm3q8> <codes.i32> <T> <out.f32>\n", argv[0]); return 2; }
-  int T = atoi(argv[3]);
-  const int T6 = T * FSTACK;
+  if (argc < 5) { printf("usage: %s <codec.lfm3q8> <codes.i32> <T|wait> <out.f32>\n", argv[0]); return 2; }
+  // T = "wait": load and upload first, then wait for <codes.i32> to appear (the caller
+  // publishes it by rename, so it is complete when seen) and take T from its size. Lets the
+  // speech shell start the codec at the beginning of the turn instead of after the last frame.
+  const bool waitmode = !strcmp(argv[3], "wait");
+  int T = waitmode ? 0 : atoi(argv[3]);
   const int HID = 512, INTER = 2304, NH = 8, NKV = 2, HD = 64, NL = 8;
   const float EPS = 1e-5f, THETA = 1e6f;
   const int LEVELS[4] = {8, 7, 6, 6}, BASIS[4] = {1, 8, 56, 336};
@@ -307,6 +312,18 @@ int main(int argc, char** argv) {
     return it->second;
   };
 
+  if (waitmode) {
+    struct stat st; time_t t0 = time(nullptr);
+    while (stat(argv[2], &st) != 0) {
+      if (getppid() == 1) { printf("codec wait: parent exited\n"); return 3; }
+      if (time(nullptr) - t0 > 1800) { printf("codec wait: %s did not appear\n", argv[2]); return 3; }
+      usleep(2000);
+    }
+    if (st.st_size <= 0 || st.st_size % (4 * NQ)) { printf("codec wait: %s is %ld bytes\n", argv[2], (long)st.st_size); return 2; }
+    T = (int)(st.st_size / (4 * NQ));
+    printf("codec wait: %s ready, T=%d\n", argv[2], T); fflush(stdout);
+  }
+  const int T6 = T * FSTACK;
   std::vector<int32_t> codes((size_t)NQ * T);
   FILE* fc = fopen(argv[2], "rb");
   if (!fc) { printf("cannot open %s\n", argv[2]); return 2; }
