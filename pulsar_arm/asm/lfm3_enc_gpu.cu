@@ -1503,6 +1503,17 @@ static float* dalloc(size_t n, const char* what) {
   if (cudaMemset(p, g_poison ? 0xff : 0, n * 4)) { printf("memset failed (%s)\n", what); exit(2); }
   return p;
 }
+// dalloc_w: for buffers that the next kernel writes in full before anything reads them
+// (conv_in -> x1, conv_mid -> x2), the zero fill is skipped (LFM_ENC_NZ, default 1);
+// LFM_ENC_POISON=1 still fills them with NaN, which is how full coverage is checked.
+static float* dalloc_w(size_t n, const char* what) {
+  static const int nz = getenv("LFM_ENC_NZ") ? atoi(getenv("LFM_ENC_NZ")) : 1;
+  if (g_poison < 0) g_poison = getenv("LFM_ENC_POISON") ? atoi(getenv("LFM_ENC_POISON")) : 0;
+  if (!nz || g_poison) return dalloc(n, what);
+  float* p = nullptr;
+  if (cudaMalloc(&p, n * 4)) { printf("OOM (%s, %.1f MB)\n", what, n * 4 / 1e6); exit(2); }
+  return p;
+}
 static int g_nodump = -2;
 // Wall-clock breakdown for the ASR path. The encoder's GPU time is 0.013 s per audio
 // second but its process wall time is ~0.6 s per audio second, and ASR_RT is charged
@@ -1614,7 +1625,7 @@ int main(int argc, char** argv) {
   const size_t n1 = (size_t)256 * EH1 * EWo1, n2 = (size_t)256 * EH2 * EWo2, n3 = (size_t)256 * EH3 * EWo3;
   float *feat, *x1, *x2, *x2b, *x3, *x3b, *perm, *flat, *ds, *xb = nullptr;
   feat = dalloc(hfeat.size(), "feat"); cudaMemcpy(feat, &hfeat[0], hfeat.size() * 4, cudaMemcpyHostToDevice);
-  x1 = dalloc(n1, "x1"); x2 = dalloc(n2, "x2"); x2b = dalloc(n2, "x2b");
+  x1 = dalloc_w(n1, "x1"); x2 = dalloc_w(n2, "x2"); x2b = dalloc(n2, "x2b");
   x3 = dalloc(n3, "x3"); x3b = dalloc(n3, "x3b"); perm = dalloc(n2, "perm");
   flat = dalloc((size_t)Tt * 4096, "flat"); ds = dalloc((size_t)Tt * EHID, "ds");
   if (g_ench2) {                                   // the biggest GEMM input in bf16
