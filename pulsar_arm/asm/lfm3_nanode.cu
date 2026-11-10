@@ -4154,6 +4154,49 @@ __device__ __noinline__ float4 tlf_leaf2b(const int4* __restrict__ qt, const flo
   for (int p = 0; p < CT; p++) acc[p] = __fmaf_rn(sb, db[p], __fmaf_rn(sa, da[p], 0.f));
   return make_float4(acc[0], acc[1], acc[2], acc[3]);
 }
+// tlf_leaf2h (LFM_PF_TLF=9, NOT bit-exact, probe): the same two blocks on the fp16 pipe. x is
+// staged as half2; each code word becomes two exact half2 (byte ^ 0x80 under 0x64 = 1024 + b +
+// 128, minus 1152); per block two half2 chains of 4 words (|partial| <= 8 * 127 * max|x|),
+// widened to f32, then the same scale fold. Accumulation order and rounding differ from f32.
+template <int CT>
+__device__ __noinline__ float4 tlf_leaf2h(const int4* __restrict__ qt, const float* __restrict__ sts,
+                                          const float* xf, int i, int K) {
+  const int4 a0 = qt[i * 64], a1 = qt[i * 64 + 32], b0 = qt[(i + 32) * 64], b1 = qt[(i + 32) * 64 + 32];
+  const float sa = sts[i * 32], sb = sts[(i + 32) * 32];
+  const unsigned wa[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
+                           (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
+  const unsigned wb[8] = { (unsigned)b0.x, (unsigned)b0.y, (unsigned)b0.z, (unsigned)b0.w,
+                           (unsigned)b1.x, (unsigned)b1.y, (unsigned)b1.z, (unsigned)b1.w };
+  const __half2 off = __floats2half2_rn(1152.f, 1152.f);
+  __half2 ca[16], cb[16];
+  #pragma unroll
+  for (int m = 0; m < 8; m++) {
+    const unsigned u = wa[m] ^ 0x80808080u, v = wb[m] ^ 0x80808080u;
+    unsigned t;
+    t = __byte_perm(u, 0x64646464u, 0x4140); ca[2 * m] = __hsub2(*reinterpret_cast<__half2*>(&t), off);
+    t = __byte_perm(u, 0x64646464u, 0x4342); ca[2 * m + 1] = __hsub2(*reinterpret_cast<__half2*>(&t), off);
+    t = __byte_perm(v, 0x64646464u, 0x4140); cb[2 * m] = __hsub2(*reinterpret_cast<__half2*>(&t), off);
+    t = __byte_perm(v, 0x64646464u, 0x4342); cb[2 * m + 1] = __hsub2(*reinterpret_cast<__half2*>(&t), off);
+  }
+  const __half2* xh = reinterpret_cast<const __half2*>(xf);
+  float acc[4];
+  #pragma unroll
+  for (int p = 0; p < CT; p++) {
+    const __half2* xa = xh + p * (K / 2) + i * 16;
+    const __half2* xb = xh + p * (K / 2) + (i + 32) * 16;
+    __half2 ha0 = __float2half2_rn(0.f), ha1 = ha0, hb0 = ha0, hb1 = ha0;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+      ha0 = __hfma2(ca[j], xa[j], ha0);         hb0 = __hfma2(cb[j], xb[j], hb0);
+      ha1 = __hfma2(ca[j + 8], xa[j + 8], ha1); hb1 = __hfma2(cb[j + 8], xb[j + 8], hb1);
+    }
+    const float2 fa0 = __half22float2(ha0), fa1 = __half22float2(ha1);
+    const float2 fb0 = __half22float2(hb0), fb1 = __half22float2(hb1);
+    const float da = (fa0.x + fa0.y) + (fa1.x + fa1.y), db = (fb0.x + fb0.y) + (fb1.x + fb1.y);
+    acc[p] = __fmaf_rn(sb, db, __fmaf_rn(sa, da, 0.f));
+  }
+  return make_float4(acc[0], acc[1], acc[2], acc[3]);
+}
 template <int TPB, int CT = 4, int PF = 1>
 __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const int8_t* __restrict__ q, const float* __restrict__ s,
                                                     const bf16* __restrict__ x, float* __restrict__ part,
@@ -4168,9 +4211,15 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const 
     const int t = t0 + p;
     if (t < T) {
       const uint32_t* xg = reinterpret_cast<const uint32_t*>(x + (size_t)t * K);
+      if (PF == 9) {
+        __half2* d = reinterpret_cast<__half2*>(xs) + p * (K / 2);
+        for (int i = tid; i < K / 2; i += TPB) { const uint32_t u = xg[i];
+          d[i] = __floats2half2_rn(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u)); }
+      } else {
       float2* d = reinterpret_cast<float2*>(xs + p * K);
       for (int i = tid; i < K / 2; i += TPB) { const uint32_t u = xg[i];
         d[i] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u)); }
+      }
     }
   }
   __syncthreads();
@@ -4182,7 +4231,7 @@ __global__ void __launch_bounds__(TPB, TPB == 512 ? 2 : 4) q8_partial_TLf(const 
   #pragma unroll
   for (int k = 0; k < 32; k++) {
     const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
-    const float4 a = PF == 4 ? tlf_leaf2b<CT>(qt, sts, xs, i, K) : tlf_leaf<CT, PF ? 1 : 0>(qt, sts, xs, i, nb, K);
+    const float4 a = PF == 9 ? tlf_leaf2h<CT>(qt, sts, xs, i, K) : PF == 4 ? tlf_leaf2b<CT>(qt, sts, xs, i, K) : tlf_leaf<CT, PF ? 1 : 0>(qt, sts, xs, i, nb, K);
     pv[0] = a.x; pv[1] = a.y; pv[2] = a.z; pv[3] = a.w;
     bool done = false;
     #pragma unroll
@@ -4500,7 +4549,8 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
     if (pftlf && tpb == 512 && (size_t)4 * K * 4 <= 48 * 1024) {
       static const int gswf = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
       const dim3 gl = gswf ? dim3((Tn + 3) / 4, (N + tpb - 1) / tpb) : dim3((N + tpb - 1) / tpb, (Tn + 3) / 4);
-      if (pftlf == 4 && nb == 64) q8_partial_TLf<512, 4, 4><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+      if (pftlf == 9 && nb == 64) q8_partial_TLf<512, 4, 9><<<gl, 512, (size_t)2 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+      else if (pftlf == 4 && nb == 64) q8_partial_TLf<512, 4, 4><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else            q8_partial_TLf<512, 4, 1><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       goto launched;
