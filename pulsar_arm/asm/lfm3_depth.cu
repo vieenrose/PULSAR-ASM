@@ -179,10 +179,15 @@ static void gpu_gemm(const int8_t* q, const float* s, const float* X, int ldx,
   if (bench && T == 12) {   // timing probe: N back-to-back launches, then the real one
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
     cudaEventRecord(e0);
-    for (int rep = 0; rep < bench; rep++) { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
+    static const int kbe = getenv("LFM_DEPTH_KB") ? atoi(getenv("LFM_DEPTH_KB")) : 1;
+    const unsigned g2 = (unsigned)((N + 255) / 256);
+    for (int rep = 0; rep < bench; rep++) {
+      if (mg == 2) { if (kbe == 4) k_q8g<12, 2, 4><<<g2, 128>>>(gq, gs, dX, dY, N, K, 0); else if (kbe == 2) k_q8g<12, 2, 2><<<g2, 128>>>(gq, gs, dX, dY, N, K, 0); else k_q8g<12, 2, 1><<<g2, 128>>>(gq, gs, dX, dY, N, K, 0); }
+      else         { if (kbe == 4) k_q8g<12, 1, 4><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); else if (kbe == 2) k_q8g<12, 1, 2><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); else k_q8g<12, 1, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K, 0); }
+    }
     cudaEventRecord(e1); cudaEventSynchronize(e1);
     float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
-    fprintf(stderr, "DEPTH_BENCH rr=%d N=%d K=%d %.4f ms/launch\n", mg, N, K, ms / bench);
+    fprintf(stderr, "DEPTH_BENCH rr=%d kb=%d N=%d K=%d %.4f ms/launch\n", mg, kbe, N, K, ms / bench);
   }
   cudaMemcpy(hy.data(), dY, (size_t)T * N * 4, cudaMemcpyDeviceToHost);
   cudaError_t e = cudaGetLastError();
@@ -378,6 +383,7 @@ __global__ void k_silu_mul_ip(float* a, const float* b, int n) {    // silu(a) *
 static void gpu_gemm_dd(const Ent* e, const float* dX, float* dY, int N, int K, size_t row0 = 0) {
   const int8_t* gq = e->gq + row0 * K; const float* gs = e->gs + row0 * (K / 32);
   if (N >= 1024) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0);
+  else if (K % 64 == 0) k_q8g<12, 1, 2><<<(unsigned)((N + 127) / 128), 128>>>(gq, gs, dX, dY, N, K, 0);  // small shapes: 2 Q8 blocks per stage (256x1024 0.131 -> 0.108 ms)
   else           k_q8g<12, 1><<<(unsigned)((N + 127) / 128), 128>>>(gq, gs, dX, dY, N, K, 0);
 }
 static int g_gpuew = 1;

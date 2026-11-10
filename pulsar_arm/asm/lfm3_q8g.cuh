@@ -14,7 +14,7 @@
 // activation row g of X and output row g of Y, i.e. one GEMV per group in one launch.
 // Activations are staged k-major (xs[k][t], T padded to a multiple of 4), so the T values
 // of one k arrive as T/4 broadcast LDS.128 instead of T scalar loads.
-template <int T, int RR = 1>
+template <int T, int RR = 1, int KB = 1>
 __global__ void __launch_bounds__(128) k_q8g(const int8_t* __restrict__ q, const float* __restrict__ s,
                                              const float* __restrict__ X, float* __restrict__ Y,
                                              int N, int K, int tile_mode) {
@@ -22,10 +22,11 @@ __global__ void __launch_bounds__(128) k_q8g(const int8_t* __restrict__ q, const
   // tile_mode 1: grid y = position tiles of T over one weight matrix (X/Y advance by T rows).
   // RR rows per thread (rows r0 + r*128 + tid): the T activations of one k are loaded
   // once from shared and feed RR*T independent chains; each chain is the contract above.
-  constexpr int TP = (T + 3) & ~3, BR = 128 * RR, NX = (T * 32 + 127) / 128;
-  __shared__ int wq[BR][9];
-  __shared__ float ws[BR];
-  __shared__ __align__(16) float xs[32][TP];
+  // KB Q8 blocks (32 codes each) staged per barrier pair; K must be a multiple of 32*KB.
+  constexpr int TP = (T + 3) & ~3, BR = 128 * RR, NX = (T * 32 * KB + 127) / 128, WW = 8 * KB;
+  __shared__ int wq[BR][WW + 1];
+  __shared__ float ws[BR][KB];
+  __shared__ __align__(16) float xs[32 * KB][TP];
   const int nb = K / 32;
   { const int g = blockIdx.y;   // group / tile offsets (0 for the plain GEMM)
     if (!tile_mode) { q += (size_t)g * N * K; s += (size_t)g * N * nb; }
@@ -36,42 +37,50 @@ __global__ void __launch_bounds__(128) k_q8g(const int8_t* __restrict__ q, const
   for (int r = 0; r < RR; r++)
     #pragma unroll
     for (int t = 0; t < T; t++) acc[r][t] = 0.f;
-  for (int b = 0; b < nb; b++) {
+  for (int b0 = 0; b0 < nb; b0 += KB) {
     // staging: loads into registers first (unrolled), then shared stores
-    int pw[8 * RR]; float psc[RR]; float px[NX];
+    int pw[WW * RR]; float psc[RR][KB]; float px[NX];
     #pragma unroll
-    for (int i = 0; i < 8 * RR; i++) {
-      const int idx = tid + i * 128, row = idx >> 3, w = idx & 7, gr = r0 + row;
-      pw[i] = gr < N ? reinterpret_cast<const int*>(q + (size_t)gr * K + (size_t)b * 32)[w] : 0;
+    for (int i = 0; i < WW * RR; i++) {
+      const int idx = tid + i * 128, row = idx / WW, w = idx % WW, gr = r0 + row;
+      pw[i] = gr < N ? reinterpret_cast<const int*>(q + (size_t)gr * K + (size_t)b0 * 32)[w] : 0;
     }
     #pragma unroll
-    for (int r = 0; r < RR; r++) { const int n = r0 + r * 128 + tid; psc[r] = n < N ? s[(size_t)n * nb + b] : 0.f; }
+    for (int r = 0; r < RR; r++) {
+      const int n = r0 + r * 128 + tid;
+      #pragma unroll
+      for (int kb = 0; kb < KB; kb++) psc[r][kb] = n < N ? s[(size_t)n * nb + b0 + kb] : 0.f;
+    }
     #pragma unroll
     for (int ii = 0; ii < NX; ii++) {
-      const int i = tid + ii * 128;
-      px[ii] = i < T * 32 ? X[(size_t)(i >> 5) * K + (size_t)b * 32 + (i & 31)] : 0.f;
+      const int i = tid + ii * 128, kc = 32 * KB;
+      px[ii] = i < T * kc ? X[(size_t)(i / kc) * K + (size_t)b0 * 32 + (i % kc)] : 0.f;
     }
     #pragma unroll
-    for (int i = 0; i < 8 * RR; i++) { const int idx = tid + i * 128; wq[idx >> 3][idx & 7] = pw[i]; }
+    for (int i = 0; i < WW * RR; i++) { const int idx = tid + i * 128; wq[idx / WW][idx % WW] = pw[i]; }
     #pragma unroll
-    for (int r = 0; r < RR; r++) ws[r * 128 + tid] = psc[r];
+    for (int r = 0; r < RR; r++)
+      #pragma unroll
+      for (int kb = 0; kb < KB; kb++) ws[r * 128 + tid][kb] = psc[r][kb];
     #pragma unroll
-    for (int ii = 0; ii < NX; ii++) { const int i = tid + ii * 128; if (i < T * 32) xs[i & 31][i >> 5] = px[ii]; }
+    for (int ii = 0; ii < NX; ii++) { const int i = tid + ii * 128, kc = 32 * KB; if (i < T * kc) xs[i % kc][i / kc] = px[ii]; }
     __syncthreads();
+    #pragma unroll
+    for (int kb = 0; kb < KB; kb++) {
     float sc[RR];
     #pragma unroll
-    for (int r = 0; r < RR; r++) sc[r] = ws[r * 128 + tid];
+    for (int r = 0; r < RR; r++) sc[r] = ws[r * 128 + tid][kb];
     #pragma unroll
     for (int w = 0; w < 8; w++) {
       int v[RR];
       #pragma unroll
-      for (int r = 0; r < RR; r++) v[r] = wq[r * 128 + tid][w];
+      for (int r = 0; r < RR; r++) v[r] = wq[r * 128 + tid][kb * 8 + w];
       #pragma unroll
       for (int j = 0; j < 4; j++) {
         float wf[RR];
         #pragma unroll
         for (int r = 0; r < RR; r++) wf[r] = __fmul_rn((float)(signed char)(v[r] >> (8 * j)), sc[r]);
-        const int k = w * 4 + j;
+        const int k = kb * 32 + w * 4 + j;
         if (T % 4 == 0) {
           #pragma unroll
           for (int t4 = 0; t4 < T / 4; t4++) {
@@ -93,6 +102,7 @@ __global__ void __launch_bounds__(128) k_q8g(const int8_t* __restrict__ q, const
           }
         }
       }
+    }
     }
     __syncthreads();
   }
