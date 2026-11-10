@@ -304,3 +304,215 @@ lfm3_mel_norm:
 .Lmel_nrm_end:
         ret
         .size   lfm3_mel_norm, .-lfm3_mel_norm
+
+/* ------------------------------------------------------------------ */
+/* void lfm3_mel_power2(const float *xa, const float *win, const float *twc,
+                        const float *tws, float *pwa, int n_bins,
+                        const float *xb, float *pwb)
+   lfm3_mel_power for two frames at once: each cos/sin row is loaded once and feeds both
+   frames. Per frame every operation, operand and order is lfm3_mel_power's (same fmul
+   then fadd per 8 taps into the same 4 accumulators, same house reduction, same
+   re*re + im*im), so pwa / pwb are bit-identical to two lfm3_mel_power calls. */
+        .global lfm3_mel_power2
+        .type   lfm3_mel_power2, %function
+        .p2align 5
+lfm3_mel_power2:
+        stp     x29, x30, [sp, #-96]!
+        mov     x29, sp
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        str     x23, [sp, #48]
+        sub     sp, sp, #3200
+        sub     sp, sp, #3200
+        mov     x19, sp
+        add     x23, sp, #3200
+        sxtw    x15, w5
+        mov     x20, x6                       /* xb  */
+        mov     x21, x7                       /* pwb */
+        mov     x5, x0
+        mov     x6, x1
+        add     x7, x19, #0
+        mov     w8, #50
+.Lp2_ya:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fmul    v4.4s, v0.4s, v2.4s
+        fmul    v5.4s, v1.4s, v3.4s
+        st1     {v4.4s, v5.4s}, [x7], #32
+        subs    w8, w8, #1
+        b.ne    .Lp2_ya
+        add     x5, x19, #0
+        add     x6, x19, #800
+        add     x7, x19, #1600
+        add     x9, x19, #2400
+        mov     w8, #25
+.Lp2_paira:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fadd    v4.4s, v0.4s, v2.4s
+        fsub    v5.4s, v0.4s, v2.4s
+        fadd    v6.4s, v1.4s, v3.4s
+        fsub    v7.4s, v1.4s, v3.4s
+        st1     {v4.4s}, [x7], #16
+        st1     {v6.4s}, [x7], #16
+        st1     {v5.4s}, [x9], #16
+        st1     {v7.4s}, [x9], #16
+        subs    w8, w8, #1
+        b.ne    .Lp2_paira
+        mov     x5, x20
+        mov     x6, x1
+        add     x7, x23, #0
+        mov     w8, #50
+.Lp2_yb:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fmul    v4.4s, v0.4s, v2.4s
+        fmul    v5.4s, v1.4s, v3.4s
+        st1     {v4.4s, v5.4s}, [x7], #32
+        subs    w8, w8, #1
+        b.ne    .Lp2_yb
+        add     x5, x23, #0
+        add     x6, x23, #800
+        add     x7, x23, #1600
+        add     x9, x23, #2400
+        mov     w8, #25
+.Lp2_pairb:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        fadd    v4.4s, v0.4s, v2.4s
+        fsub    v5.4s, v0.4s, v2.4s
+        fadd    v6.4s, v1.4s, v3.4s
+        fsub    v7.4s, v1.4s, v3.4s
+        st1     {v4.4s}, [x7], #16
+        st1     {v6.4s}, [x7], #16
+        st1     {v5.4s}, [x9], #16
+        st1     {v7.4s}, [x9], #16
+        subs    w8, w8, #1
+        b.ne    .Lp2_pairb
+        mov     x12, x2
+        mov     x13, x3
+        mov     x14, x4
+        mov     w16, #0
+.Lp2_bin:
+        add     x17, x19, #1600
+        add     x22, x23, #1600
+        tbz     w16, #0, .Lp2_have
+        add     x17, x19, #2400
+        add     x22, x23, #2400
+.Lp2_have:
+        mov     x5, x12
+        mov     x6, x13
+        movi    v16.4s, #0
+        movi    v17.4s, #0
+        movi    v18.4s, #0
+        movi    v19.4s, #0
+        movi    v24.4s, #0
+        movi    v25.4s, #0
+        movi    v26.4s, #0
+        movi    v27.4s, #0
+        mov     w8, #25
+.Lp2_tap:
+        ld1     {v0.4s, v1.4s}, [x5], #32
+        ld1     {v2.4s, v3.4s}, [x6], #32
+        ld1     {v4.4s, v5.4s}, [x17], #32
+        ld1     {v6.4s, v7.4s}, [x22], #32
+        fmul    v20.4s, v0.4s, v4.4s
+        fmul    v21.4s, v1.4s, v5.4s
+        fmul    v22.4s, v2.4s, v4.4s
+        fmul    v23.4s, v3.4s, v5.4s
+        fmul    v28.4s, v0.4s, v6.4s
+        fmul    v29.4s, v1.4s, v7.4s
+        fmul    v30.4s, v2.4s, v6.4s
+        fmul    v31.4s, v3.4s, v7.4s
+        fadd    v16.4s, v16.4s, v20.4s
+        fadd    v17.4s, v17.4s, v21.4s
+        fadd    v18.4s, v18.4s, v22.4s
+        fadd    v19.4s, v19.4s, v23.4s
+        fadd    v24.4s, v24.4s, v28.4s
+        fadd    v25.4s, v25.4s, v29.4s
+        fadd    v26.4s, v26.4s, v30.4s
+        fadd    v27.4s, v27.4s, v31.4s
+        subs    w8, w8, #1
+        b.ne    .Lp2_tap
+        mov     s20, v16.s[0]
+        mov     s21, v16.s[1]
+        mov     s22, v16.s[2]
+        mov     s23, v16.s[3]
+        fadd    s20, s20, s21
+        fadd    s22, s22, s23
+        fadd    s20, s20, s22
+        mov     s28, v17.s[0]
+        mov     s29, v17.s[1]
+        mov     s30, v17.s[2]
+        mov     s31, v17.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s0, s20, s28
+        mov     s20, v18.s[0]
+        mov     s21, v18.s[1]
+        mov     s22, v18.s[2]
+        mov     s23, v18.s[3]
+        fadd    s20, s20, s21
+        fadd    s22, s22, s23
+        fadd    s20, s20, s22
+        mov     s28, v19.s[0]
+        mov     s29, v19.s[1]
+        mov     s30, v19.s[2]
+        mov     s31, v19.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s1, s20, s28
+        mov     s20, v24.s[0]
+        mov     s21, v24.s[1]
+        mov     s22, v24.s[2]
+        mov     s23, v24.s[3]
+        fadd    s20, s20, s21
+        fadd    s22, s22, s23
+        fadd    s20, s20, s22
+        mov     s28, v25.s[0]
+        mov     s29, v25.s[1]
+        mov     s30, v25.s[2]
+        mov     s31, v25.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s2, s20, s28
+        mov     s20, v26.s[0]
+        mov     s21, v26.s[1]
+        mov     s22, v26.s[2]
+        mov     s23, v26.s[3]
+        fadd    s20, s20, s21
+        fadd    s22, s22, s23
+        fadd    s20, s20, s22
+        mov     s28, v27.s[0]
+        mov     s29, v27.s[1]
+        mov     s30, v27.s[2]
+        mov     s31, v27.s[3]
+        fadd    s28, s28, s29
+        fadd    s30, s30, s31
+        fadd    s28, s28, s30
+        fadd    s3, s20, s28
+        fmul    s4, s0, s0
+        fmul    s5, s1, s1
+        fadd    s4, s4, s5
+        str     s4, [x14], #4
+        fmul    s6, s2, s2
+        fmul    s7, s3, s3
+        fadd    s6, s6, s7
+        str     s6, [x21], #4
+        add     x12, x12, #800
+        add     x13, x13, #800
+        add     w16, w16, #1
+        cmp     x16, x15
+        b.lt    .Lp2_bin
+        add     sp, sp, #3200
+        add     sp, sp, #3200
+        ldr     x23, [sp, #48]
+        ldp     x19, x20, [sp, #16]
+        ldp     x21, x22, [sp, #32]
+        ldp     x29, x30, [sp], #96
+        ret
+        .size   lfm3_mel_power2, .-lfm3_mel_power2
+

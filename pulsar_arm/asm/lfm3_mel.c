@@ -75,6 +75,8 @@ static int mel_load(const char *path, mel_t *m) {
 
 void lfm3_mel_power(const float *x, const float *win, const float *twc,
                     const float *tws, float *pw, int n_bins);
+void lfm3_mel_power2(const float *xa, const float *win, const float *twc,
+                     const float *tws, float *pwa, int n_bins, const float *xb, float *pwb);
 void lfm3_mel_matmul(const float *pw, const float *filt, float *mel, int n_mels);
 void lfm3_mel_norm(const float *logmel, float *out, int n, float floor_v, float offset,
                    float divisor);
@@ -89,17 +91,26 @@ typedef struct { const mel_t *m; const float *x; float *rows; long frames, t0, t
 static void *mel_worker(void *a) {
     mel_job *j = a; const mel_t *m = j->m;
     float *pw = calloc(m->bins_pad, sizeof(float));               /* 208; tail stays zero */
+    float *pw2 = calloc(m->bins_pad, sizeof(float));
+    /* LFM_MEL_P2 (default 1): frames in pairs through lfm3_mel_power2, which reads each
+       twiddle row once for both frames (bit-identical to two lfm3_mel_power calls). */
+    const int p2 = getenv("LFM_MEL_P2") ? atoi(getenv("LFM_MEL_P2")) : 1;
     float *mel = malloc(m->n_mels * sizeof(float)), *o = malloc(m->n_mels * sizeof(float));
-    if (!pw || !mel || !o) { j->ok = 0; return NULL; }
-    for (long t = j->t0; t < j->t1; t++) {
-        lfm3_mel_power(j->x + t * m->hop, m->window, m->twc, m->tws, pw, m->n_bins);
-        lfm3_mel_matmul(pw, m->filt, mel, m->n_mels);
-        for (int i = 0; i < m->n_mels; i++)
-            mel[i] = log10f(mel[i]);          /* log10(0) = -inf; the clamp below maps it to -12 */
-        lfm3_mel_norm(mel, o, m->n_mels, m->log_floor, m->offset, m->divisor);
-        for (int mi = 0; mi < m->n_mels; mi++) j->rows[(size_t)mi * j->frames + t] = o[mi];
+    if (!pw || !pw2 || !mel || !o) { j->ok = 0; return NULL; }
+    for (long t = j->t0; t < j->t1; ) {
+        const int two = p2 && t + 1 < j->t1;
+        if (two) lfm3_mel_power2(j->x + t * m->hop, m->window, m->twc, m->tws, pw, m->n_bins,
+                                 j->x + (t + 1) * m->hop, pw2);
+        else lfm3_mel_power(j->x + t * m->hop, m->window, m->twc, m->tws, pw, m->n_bins);
+        for (int u = 0; u <= two; u++, t++) {
+            lfm3_mel_matmul(u ? pw2 : pw, m->filt, mel, m->n_mels);
+            for (int i = 0; i < m->n_mels; i++)
+                mel[i] = log10f(mel[i]);      /* log10(0) = -inf; the clamp below maps it to -12 */
+            lfm3_mel_norm(mel, o, m->n_mels, m->log_floor, m->offset, m->divisor);
+            for (int mi = 0; mi < m->n_mels; mi++) j->rows[(size_t)mi * j->frames + t] = o[mi];
+        }
     }
-    free(pw); free(mel); free(o); j->ok = 1;
+    free(pw); free(pw2); free(mel); free(o); j->ok = 1;
     return NULL;
 }
 
