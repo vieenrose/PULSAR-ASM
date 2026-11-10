@@ -176,6 +176,44 @@ static bool gpu_gemm_tiles(const int8_t* q, const float* s, const float* X, int 
   for (int t = 0; t < T; t++) memcpy(Y + (size_t)t * ldy, &hy[(size_t)t * N], (size_t)N * 4);
   return true;
 }
+// Codec FFN on the device (LFM_CODEC_FFN, default 1): h uploaded once, w1 and w3 into device
+// buffers, silu(u) * g in place (glibc-2.27-exact gm_expf, the depth trunk's certified
+// kernel: x / (1 + expf(-x)) then * g, no contraction, as the host loop), w2, one download.
+// Same GEMM kernels and chains as three gpu_gemm_tiles calls; drops 2 downloads, 2 uploads
+// and the host silu pass per layer.
+#define GM_EXPF_ZFMA 0
+#include "glibc_mathf.h"
+__global__ void k_csilu_mul(float* a, const float* b, long n) {
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) { const float x = a[i]; a[i] = __fmul_rn(__fdiv_rn(x, __fadd_rn(1.0f, gm_expf(-x))), b[i]); }
+}
+static bool gpu_ffn(const Ent* w1, const Ent* w3, const Ent* w2, const float* h, float* out,
+                    int HID, int INTER, int T) {
+  const Ent* e[3] = { nullptr, nullptr, nullptr }; const Ent* want[3] = { w1, w3, w2 };
+  for (int i = 0; i < 3; i++) for (auto& x : *g_cents) if (&x == want[i] && x.dtype == 1 && x.gq) e[i] = &x;
+  if (!e[0] || !e[1] || !e[2] || HID % 32 || INTER % 32 || INTER < 1024 || HID >= 1024) return false;
+  const int tiles = (T + 11) / 12, TT = tiles * 12;
+  static float *dh = nullptr, *du = nullptr, *dg = nullptr, *dy = nullptr; static size_t cap = 0;
+  if ((size_t)TT * INTER > cap) {
+    if (dh) { cudaFree(dh); cudaFree(du); cudaFree(dg); cudaFree(dy); }
+    cap = (size_t)TT * INTER;
+    if (cudaMalloc(&dh, (size_t)TT * HID * 4) || cudaMalloc(&du, cap * 4) || cudaMalloc(&dg, cap * 4) ||
+        cudaMalloc(&dy, (size_t)TT * HID * 4)) { printf("codec gpu: ffn cudaMalloc\n"); exit(3); }
+  }
+  static std::vector<float> hx; hx.assign((size_t)TT * HID, 0.f);
+  memcpy(hx.data(), h, (size_t)T * HID * 4);
+  cudaMemcpy(dh, hx.data(), (size_t)TT * HID * 4, cudaMemcpyHostToDevice);
+  const dim3 gb((unsigned)((INTER + 255) / 256), (unsigned)tiles);
+  k_q8g<12, 2><<<gb, 128>>>(e[0]->gq, e[0]->gs, dh, du, INTER, HID, 1);
+  k_q8g<12, 2><<<gb, 128>>>(e[1]->gq, e[1]->gs, dh, dg, INTER, HID, 1);
+  const long n = (long)TT * INTER;
+  k_csilu_mul<<<(unsigned)((n + 255) / 256), 256>>>(du, dg, n);
+  k_q8g<12, 1><<<dim3((unsigned)((HID + 127) / 128), (unsigned)tiles), 128>>>(e[2]->gq, e[2]->gs, du, dy, HID, INTER, 1);
+  cudaMemcpy(out, dy, (size_t)T * HID * 4, cudaMemcpyDeviceToHost);
+  cudaError_t ce = cudaGetLastError();
+  if (ce) { printf("codec gpu ffn: %s\n", cudaGetErrorString(ce)); exit(3); }
+  return true;
+}
 static void q8_gemm_tiles(const int8_t* q, const float* s, const float* X, int ldx,
                           float* Y, int ldy, int N, int K, int T) {
   if (g_cgpu && gpu_gemm_tiles(q, s, X, ldx, Y, ldy, N, K, T)) return;
@@ -553,11 +591,14 @@ int main(int argc, char** argv) {
     std::vector<float> U((size_t)T6 * INTER), GA((size_t)T6 * INTER);
     CK(6);
     for (int t = 0; t < T6; t++) rmsnorm(&X[(size_t)t * HID], fn->df, &h[(size_t)t * HID], HID, EPS);
+    static const int cffn = getenv("LFM_CODEC_FFN") ? atoi(getenv("LFM_CODEC_FFN")) : 1;
+    if (!(cffn && g_cgpu && gpu_ffn(w1, w3, w2, h.data(), tmp.data(), HID, INTER, T6))) {
     q8_gemm_tiles(w1->dq, w1->ds, h.data(), HID, U.data(), INTER, INTER, HID, T6);
     q8_gemm_tiles(w3->dq, w3->ds, h.data(), HID, GA.data(), INTER, INTER, HID, T6);
     #pragma omp parallel for schedule(static) if (g_comp)
     for (long i = 0; i < (long)T6 * INTER; i++) U[i] = silu(U[i]) * GA[i];
     q8_gemm_tiles(w2->dq, w2->ds, U.data(), INTER, tmp.data(), HID, HID, INTER, T6);
+    }
     CK(7);
     for (int t = 0; t < T6; t++) {
       rmsnorm(&tmp[(size_t)t * HID], pfn->df, &h[(size_t)t * HID], HID, EPS);
