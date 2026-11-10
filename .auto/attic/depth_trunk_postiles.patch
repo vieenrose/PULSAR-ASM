@@ -1,0 +1,21 @@
+diff --git a/pulsar_arm/asm/lfm3_depth.cu b/pulsar_arm/asm/lfm3_depth.cu
+index f3c2b82..c679202 100644
+--- a/pulsar_arm/asm/lfm3_depth.cu
++++ b/pulsar_arm/asm/lfm3_depth.cu
+@@ -427,7 +427,15 @@ __global__ void k_silu_mul_ip(float* a, const float* b, int n) {    // silu(a) *
+ // device-to-device T=12 GEMM: Y [12][N] = q8(W) X [12][K]
+ static void gpu_gemm_dd(const Ent* e, const float* dX, float* dY, int N, int K, size_t row0 = 0) {
+   const int8_t* gq = e->gq + row0 * K; const float* gs = e->gs + row0 * (K / 32);
+-  if (N >= 1024) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0);
++  // LFM_DEPTH_TT (N >= 1024): positions per thread. 12 = one tile (default); 6 / 4 = the
++  // 12 positions as 2 / 3 tiles (tile_mode 1: grid y advances X/Y by T rows), i.e. 2-3x the
++  // blocks on the one SM. Each output's chain is unchanged. 61/41: same with 1 row/thread.
++  static const int tt = getenv("LFM_DEPTH_TT") ? atoi(getenv("LFM_DEPTH_TT")) : 12;
++  if (N >= 1024 && tt == 6)  k_q8g<6, 2><<<dim3((unsigned)((N + 255) / 256), 2), 128>>>(gq, gs, dX, dY, N, K, 1);
++  else if (N >= 1024 && tt == 4)  k_q8g<4, 2><<<dim3((unsigned)((N + 255) / 256), 3), 128>>>(gq, gs, dX, dY, N, K, 1);
++  else if (N >= 1024 && tt == 61) k_q8g<6, 1><<<dim3((unsigned)((N + 127) / 128), 2), 128>>>(gq, gs, dX, dY, N, K, 1);
++  else if (N >= 1024 && tt == 41) k_q8g<4, 1><<<dim3((unsigned)((N + 127) / 128), 3), 128>>>(gq, gs, dX, dY, N, K, 1);
++  else if (N >= 1024) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0);
+   else if (K % 64 == 0) k_q8g<12, 1, 2><<<(unsigned)((N + 127) / 128), 128>>>(gq, gs, dX, dY, N, K, 0);  // small shapes: 2 Q8 blocks per stage (256x1024 0.131 -> 0.108 ms)
+   else           k_q8g<12, 1><<<(unsigned)((N + 127) / 128), 128>>>(gq, gs, dX, dY, N, K, 0);
+ }
