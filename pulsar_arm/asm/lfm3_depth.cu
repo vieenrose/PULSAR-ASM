@@ -146,58 +146,92 @@ extern "C" void lfm3_q8_gemv1(const int8_t* q, const float* s, const float* x, f
 // activation row g of X and output row g of Y, i.e. one GEMV per group in one launch.
 // Activations are staged k-major (xs[k][t], T padded to a multiple of 4), so the T values
 // of one k arrive as T/4 broadcast LDS.128 instead of T scalar loads.
-template <int T>
+template <int T, int RR = 1>
 __global__ void __launch_bounds__(128) k_q8g(const int8_t* __restrict__ q, const float* __restrict__ s,
                                              const float* __restrict__ X, float* __restrict__ Y,
                                              int N, int K) {
-  constexpr int TP = (T + 3) & ~3;
-  __shared__ int wq[128][9];
-  __shared__ float ws[128];
+  // RR rows per thread (rows r0 + r*128 + tid): the T activations of one k are loaded
+  // once from shared and feed RR*T independent chains; each chain is the contract above.
+  constexpr int TP = (T + 3) & ~3, BR = 128 * RR, NX = (T * 32 + 127) / 128;
+  __shared__ int wq[BR][9];
+  __shared__ float ws[BR];
   __shared__ __align__(16) float xs[32][TP];
   const int nb = K / 32;
   { const int g = blockIdx.y;   // group offsets (0 for the plain GEMM)
     q += (size_t)g * N * K; s += (size_t)g * N * nb; X += (size_t)g * K * T; Y += (size_t)g * N * T; }
-  const int r0 = blockIdx.x * 128, tid = threadIdx.x, n = r0 + tid;
-  float acc[T];
+  const int r0 = blockIdx.x * BR, tid = threadIdx.x;
+  float acc[RR][T];
   #pragma unroll
-  for (int t = 0; t < T; t++) acc[t] = 0.f;
-  for (int b = 0; b < nb; b++) {
+  for (int r = 0; r < RR; r++)
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
+    for (int t = 0; t < T; t++) acc[r][t] = 0.f;
+  for (int b = 0; b < nb; b++) {
+    // staging: loads into registers first (unrolled), then shared stores
+    int pw[8 * RR]; float psc[RR]; float px[NX];
+    #pragma unroll
+    for (int i = 0; i < 8 * RR; i++) {
       const int idx = tid + i * 128, row = idx >> 3, w = idx & 7, gr = r0 + row;
-      wq[row][w] = gr < N ? reinterpret_cast<const int*>(q + (size_t)gr * K + (size_t)b * 32)[w] : 0;
+      pw[i] = gr < N ? reinterpret_cast<const int*>(q + (size_t)gr * K + (size_t)b * 32)[w] : 0;
     }
-    ws[tid] = n < N ? s[(size_t)n * nb + b] : 0.f;
-    for (int i = tid; i < T * 32; i += 128) xs[i & 31][i >> 5] = X[(size_t)(i >> 5) * K + (size_t)b * 32 + (i & 31)];
+    #pragma unroll
+    for (int r = 0; r < RR; r++) { const int n = r0 + r * 128 + tid; psc[r] = n < N ? s[(size_t)n * nb + b] : 0.f; }
+    #pragma unroll
+    for (int ii = 0; ii < NX; ii++) {
+      const int i = tid + ii * 128;
+      px[ii] = i < T * 32 ? X[(size_t)(i >> 5) * K + (size_t)b * 32 + (i & 31)] : 0.f;
+    }
+    #pragma unroll
+    for (int i = 0; i < 8 * RR; i++) { const int idx = tid + i * 128; wq[idx >> 3][idx & 7] = pw[i]; }
+    #pragma unroll
+    for (int r = 0; r < RR; r++) ws[r * 128 + tid] = psc[r];
+    #pragma unroll
+    for (int ii = 0; ii < NX; ii++) { const int i = tid + ii * 128; if (i < T * 32) xs[i & 31][i >> 5] = px[ii]; }
     __syncthreads();
-    const float sc = ws[tid];
+    float sc[RR];
+    #pragma unroll
+    for (int r = 0; r < RR; r++) sc[r] = ws[r * 128 + tid];
     #pragma unroll
     for (int w = 0; w < 8; w++) {
-      const int v = wq[tid][w];
+      int v[RR];
+      #pragma unroll
+      for (int r = 0; r < RR; r++) v[r] = wq[r * 128 + tid][w];
       #pragma unroll
       for (int j = 0; j < 4; j++) {
-        const float wf = __fmul_rn((float)(signed char)(v >> (8 * j)), sc);
+        float wf[RR];
+        #pragma unroll
+        for (int r = 0; r < RR; r++) wf[r] = __fmul_rn((float)(signed char)(v[r] >> (8 * j)), sc[r]);
         const int k = w * 4 + j;
         if (T % 4 == 0) {
           #pragma unroll
           for (int t4 = 0; t4 < T / 4; t4++) {
             const float4 xv = *reinterpret_cast<const float4*>(&xs[k][t4 * 4]);
-            acc[t4 * 4 + 0] = __fmaf_rn(wf, xv.x, acc[t4 * 4 + 0]);
-            acc[t4 * 4 + 1] = __fmaf_rn(wf, xv.y, acc[t4 * 4 + 1]);
-            acc[t4 * 4 + 2] = __fmaf_rn(wf, xv.z, acc[t4 * 4 + 2]);
-            acc[t4 * 4 + 3] = __fmaf_rn(wf, xv.w, acc[t4 * 4 + 3]);
+            #pragma unroll
+            for (int r = 0; r < RR; r++) {
+              acc[r][t4 * 4 + 0] = __fmaf_rn(wf[r], xv.x, acc[r][t4 * 4 + 0]);
+              acc[r][t4 * 4 + 1] = __fmaf_rn(wf[r], xv.y, acc[r][t4 * 4 + 1]);
+              acc[r][t4 * 4 + 2] = __fmaf_rn(wf[r], xv.z, acc[r][t4 * 4 + 2]);
+              acc[r][t4 * 4 + 3] = __fmaf_rn(wf[r], xv.w, acc[r][t4 * 4 + 3]);
+            }
           }
         } else {
           #pragma unroll
-          for (int t = 0; t < T; t++) acc[t] = __fmaf_rn(wf, xs[k][t], acc[t]);
+          for (int t = 0; t < T; t++) {
+            const float xv = xs[k][t];
+            #pragma unroll
+            for (int r = 0; r < RR; r++) acc[r][t] = __fmaf_rn(wf[r], xv, acc[r][t]);
+          }
         }
       }
     }
     __syncthreads();
   }
-  if (n < N) {
-    #pragma unroll
-    for (int t = 0; t < T; t++) Y[(size_t)t * N + n] = acc[t];
+  #pragma unroll
+  for (int r = 0; r < RR; r++) {
+    const int n = r0 + r * 128 + tid;
+    if (n < N) {
+      #pragma unroll
+      for (int t = 0; t < T; t++) Y[(size_t)t * N + n] = acc[r][t];
+    }
   }
 }
 static int g_gpu = 0;
@@ -228,8 +262,24 @@ static void gpu_gemm(const int8_t* q, const float* s, const float* X, int ldx,
   const int8_t* gq = (const int8_t*)dev_of(q, false);
   const float* gs = (const float*)dev_of(s, true);
   const unsigned nbk = (unsigned)((N + 127) / 128);
-  if (T == 12) k_q8g<12><<<nbk, 128>>>(gq, gs, dX, dY, N, K);
-  else         k_q8g<1><<<nbk, 128>>>(gq, gs, dX, dY, N, K);
+  // rows per thread at T=12: 2 when N >= 1024 (bench: 2816x1024 0.914 -> 0.875 ms,
+  // 1024x2816 0.912 -> 0.857, 1024x1024 0.336 -> 0.300), 1 for the small k/v/gate shapes
+  // (256x1024 0.149 vs 0.238 at 2). LFM_DEPTH_RR=1|2 forces one; same bits either way.
+  static const int rr_env = getenv("LFM_DEPTH_RR") ? atoi(getenv("LFM_DEPTH_RR")) : 0;
+  const int mg = rr_env ? rr_env : (N >= 1024 ? 2 : 1);
+  static const int bench = getenv("LFM_DEPTH_BENCH") ? atoi(getenv("LFM_DEPTH_BENCH")) : 0;
+  for (int rep = 0; rep < (bench && T == 12 ? 1 : 1); rep++) {
+    if (T == 12) { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K); }
+    else         { if (mg) k_q8g<1, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K);  else k_q8g<1, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K); }
+  }
+  if (bench && T == 12) {   // timing probe: N back-to-back launches, then the real one
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+    cudaEventRecord(e0);
+    for (int rep = 0; rep < bench; rep++) { if (mg == 2) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K); else k_q8g<12, 1><<<nbk, 128>>>(gq, gs, dX, dY, N, K); }
+    cudaEventRecord(e1); cudaEventSynchronize(e1);
+    float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
+    fprintf(stderr, "DEPTH_BENCH rr=%d N=%d K=%d %.4f ms/launch\n", mg, N, K, ms / bench);
+  }
   cudaMemcpy(hy.data(), dY, (size_t)T * N * 4, cudaMemcpyDeviceToHost);
   cudaError_t e = cudaGetLastError();
   if (e) { printf("depth gpu: %s\n", cudaGetErrorString(e)); exit(3); }
@@ -240,7 +290,7 @@ static void gpu_heads(const int8_t* q, const float* s, const float* X, float* Y,
   static float *dX = nullptr, *dY = nullptr;
   if (!dX && (cudaMalloc(&dX, (size_t)G * K * 4) || cudaMalloc(&dY, (size_t)G * N * 4))) { printf("depth gpu: cudaMalloc failed\n"); exit(3); }
   cudaMemcpy(dX, X, (size_t)G * K * 4, cudaMemcpyHostToDevice);
-  k_q8g<1><<<dim3((unsigned)((N + 127) / 128), (unsigned)G), 128>>>((const int8_t*)dev_of(q, false), (const float*)dev_of(s, true), dX, dY, N, K);
+  k_q8g<1, 1><<<dim3((unsigned)((N + 127) / 128), (unsigned)G), 128>>>((const int8_t*)dev_of(q, false), (const float*)dev_of(s, true), dX, dY, N, K);
   cudaMemcpy(Y, dY, (size_t)G * N * 4, cudaMemcpyDeviceToHost);
   cudaError_t e = cudaGetLastError();
   if (e) { printf("depth gpu: %s\n", cudaGetErrorString(e)); exit(3); }
@@ -272,12 +322,32 @@ static float gelu(float x) {
 // RoPE
 // HF apply_rotary_pos_emb: rotate_half pairs element i with i + HD/2 (NOT 2i with 2i+1).
 // q_embed = q*cos + rotate_half(q)*sin, with cos/sin built from cat(freqs, freqs).
+// cos/sin per (pos, i) cached for the depth trunk's fixed shape (pos < 12, HD 32, theta,
+// partial): the same expressions, evaluated once, so the same values every call.
 static void rope(float* q, float* k, int pos, int HD, float theta, float partial) {
   int angles = (int)(partial * HD) / 2;
   const int half = HD / 2;
+  static float ct[12][64], st[12][64]; static bool have[12] = {false};
+  static int c_hd = -1; static float c_th = 0.f, c_pa = 0.f;
+  const bool cacheable = pos >= 0 && pos < 12 && half <= 64;
+  if (cacheable && (c_hd != HD || c_th != theta || c_pa != partial)) {
+    for (int p = 0; p < 12; p++) have[p] = false;
+    c_hd = HD; c_th = theta; c_pa = partial;
+  }
+  if (cacheable && !have[pos]) {
+    for (int i = 0; i < half; i++) {
+      float freq = (i < angles) ? 1.0f / powf(theta, (float)(2*i) / (float)HD) : 0.0f;
+      ct[pos][i] = cosf(pos * freq); st[pos][i] = sinf(pos * freq);
+    }
+    have[pos] = true;
+  }
   for (int i = 0; i < half; i++) {
-    float freq = (i < angles) ? 1.0f / powf(theta, (float)(2*i) / (float)HD) : 0.0f;
-    float cosv = cosf(pos * freq), sinv = sinf(pos * freq);
+    float cosv, sinv;
+    if (cacheable) { cosv = ct[pos][i]; sinv = st[pos][i]; }
+    else {
+      float freq = (i < angles) ? 1.0f / powf(theta, (float)(2*i) / (float)HD) : 0.0f;
+      cosv = cosf(pos * freq); sinv = sinf(pos * freq);
+    }
     if (q) {
       float a = q[i], b = q[i + half];
       q[i]        = a*cosv - b*sinv;
@@ -374,17 +444,14 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
   Ent* mask_emb = get("mask_embedding");
   // codebook embeddings: depth_embeddings.{i}.embedding.weight [2017, 1024] bf16
   for (int c = 0; c < NCB; c++) {
+    // tensor lookup once per codebook (it ran once per element); same values added
+    const uint16_t* erow = nullptr;
+    if (!masked[c]) {
+      char name[128]; snprintf(name, sizeof name, "depth_embeddings.%d.embedding.weight", c);
+      erow = (const uint16_t*)get(name)->dq + (size_t)codes[c] * DH;
+    }
     for (int d = 0; d < DH; d++) {
-      float ce;
-      if (masked[c]) {
-        ce = mask_emb->df[d];
-      } else {
-        int code = codes[c];
-        Ent* emb = nullptr;
-        char name[128]; snprintf(name, sizeof name, "depth_embeddings.%d.embedding.weight", c);
-        emb = get(name);
-        ce = bf16_to_f32(((uint16_t*)emb->dq)[code * DH + d]);
-      }
+      const float ce = masked[c] ? mask_emb->df[d] : bf16_to_f32(erow[d]);
       depth_in[c * DH + d] += ce;
     }
   }
@@ -419,12 +486,15 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
     q8_gemm(get(wname)->dq, get(wname)->ds, h1, DH, v, NKV*HD, NKV*HD, DH, 12);
     DT_MARK(2);
       // q_norm, k_norm (per head)
+    char qn[256]; snprintf(qn, sizeof qn, "%s.self_attn.q_norm.weight", prefix);
+    const float* qnw = get(qn)->df;
+    char kn[256]; snprintf(kn, sizeof kn, "%s.self_attn.k_norm.weight", prefix);
+    const float* knw = get(kn)->df;
     for (int t = 0; t < 12; t++) {
       for (int h = 0; h < NHEADS; h++) {
-        char qn[256]; snprintf(qn, sizeof qn, "%s.self_attn.q_norm.weight", prefix);
         float tmp[HD];
         for (int d = 0; d < HD; d++) tmp[d] = q[t*NHEADS*HD + h*HD + d];
-        rmsnorm(tmp, get(qn)->df, tmp, HD, 1e-5f);
+        rmsnorm(tmp, qnw, tmp, HD, 1e-5f);
         for (int d = 0; d < HD; d++) q[t*NHEADS*HD + h*HD + d] = tmp[d];
       }
     }
@@ -433,10 +503,9 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
         // placeholder
       }
       for (int h = 0; h < NKV; h++) {
-        char kn[256]; snprintf(kn, sizeof kn, "%s.self_attn.k_norm.weight", prefix);
         float tmp[HD];
         for (int d = 0; d < HD; d++) tmp[d] = k[t*NKV*HD + h*HD + d];
-        rmsnorm(tmp, get(kn)->df, tmp, HD, 1e-5f);
+        rmsnorm(tmp, knw, tmp, HD, 1e-5f);
         for (int d = 0; d < HD; d++) k[t*NKV*HD + h*HD + d] = tmp[d];
       }
     }
