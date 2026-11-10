@@ -33,6 +33,7 @@ struct Ent {
   uint32_t crc;
   int8_t* dq = nullptr; float* ds = nullptr; float* df = nullptr;
   int8_t* gq = nullptr; float* gs = nullptr;   // device copies of a Q8 tensor (GPU path)
+  float* gf = nullptr;                         // device copy of an f32 tensor (GPU trunk)
 };
 
 // (loader copied from lfm3_nanode.cu pattern - simplified)
@@ -129,7 +130,8 @@ static void rmsnorm(const float* x, const float* w, float* y, int D, float eps) 
 // logits are bit-identical to the pre-change engine. Build:
 //   gcc -O2 -fopenmp -c lfm3_depth_neon.c -o lfm3_depth_neon.o
 //   nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O2 -fmad=false -Xptxas -O3,-dlcm=ca \
-//        -Xcompiler -fopenmp -o lfm3_depth lfm3_depth.cu lfm3_depth_neon.o -lgomp
+//        -I../bonsai2 -Xcompiler -fopenmp -o lfm3_depth lfm3_depth.cu lfm3_depth_neon.o -lgomp
+// (glibc_mathf.h comes from pulsar_arm/bonsai2; on the board it sits next to this file.)
 // Keep the HOST side at -O2: an -O3 host build changes the host elementwise numerics
 // (logits differ from the -O2 binary in the low bits), with or without the GPU path.
 extern "C" void lfm3_q8_gemm12_kmajor(const int8_t* q, const float* s, const float* XT,
@@ -298,6 +300,88 @@ static double dt_now() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); 
 static double g_dt[8];
 static const char* g_dtn[8] = {"depth_linear", "embed", "norm+qkv", "qk_norm+rope+attn", "gate+o", "ffn", "final_norm", "head"};
 #define DT_MARK(i) do { double _n = dt_now(); g_dt[i] += _n - _dt_last; _dt_last = _n; } while (0)
+// ---- GPU-resident trunk (LFM_DEPTH_GPUEW, default 1 with LFM_DEPTH_GPU) ------------------
+// Every elementwise op of the host trunk as a device kernel with the host's exact operation
+// order, including the contractions GCC makes at -O2 (-ffp-contract=fast): a product whose
+// only use is an add/sub becomes one fma. expf is glibc 2.27's (gm_expf with the A57
+// libm's unfused z: 0 mismatches over all 2^32 inputs on picard). All f32 ops are explicit
+// _rn intrinsics (the file is built with -fmad=false). One pass uploads the trunk input and
+// downloads the 12 x 2017 logits; nothing else crosses PCIe-equivalent copies.
+#define GM_EXPF_ZFMA 0
+#include "glibc_mathf.h"
+// host rmsnorm: acc = fma(x, x, acc) ascending; r = 1 / sqrtf(acc / D + eps); y = (x * r) * w
+__device__ __forceinline__ void d_rms(const float* x, const float* w, float* y, int D, float eps) {
+  float acc = 0.f;
+  for (int i = 0; i < D; i++) acc = __fmaf_rn(x[i], x[i], acc);
+  const float r = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(acc, (float)D), eps)));
+  for (int i = 0; i < D; i++) y[i] = __fmul_rn(__fmul_rn(x[i], r), w[i]);
+}
+// rows of D (one thread per row); wstride != 0: row r uses weight w + r * wstride
+__global__ void k_rms_rows(const float* x, const float* w, float* y, int rows, int D, int wstride) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r < rows) d_rms(x + (size_t)r * D, w + (size_t)r * wstride, y + (size_t)r * D, D, 1e-5f);
+}
+// per (pos, head): head rmsnorm in place, then RoPE from the host table (cos/sin per pos, i)
+__global__ void k_qknorm_rope(float* q, float* k, const float* qnw, const float* knw,
+                              const float* ct, const float* st, int NQ, int NKV, int HD) {
+  const int id = blockIdx.x * blockDim.x + threadIdx.x;      // [12][NQ + NKV]
+  const int nh = NQ + NKV;
+  if (id >= 12 * nh) return;
+  const int t = id / nh, h = id % nh;
+  float* v = h < NQ ? q + ((size_t)t * NQ + h) * HD : k + ((size_t)t * NKV + (h - NQ)) * HD;
+  float tmp[64];
+  for (int d = 0; d < HD; d++) tmp[d] = v[d];
+  d_rms(tmp, h < NQ ? qnw : knw, tmp, HD, 1e-5f);
+  const int half = HD / 2;
+  for (int i = 0; i < half; i++) {
+    const float c = ct[t * 64 + i], sn = st[t * 64 + i];
+    const float a = tmp[i], b = tmp[i + half];
+    tmp[i]        = __fmaf_rn(a, c, -__fmul_rn(b, sn));   // a*c - b*s
+    tmp[i + half] = __fmaf_rn(b, c, __fmul_rn(a, sn));    // b*c + a*s
+  }
+  for (int d = 0; d < HD; d++) v[d] = tmp[d];
+}
+// per (pos, head): bidirectional attention over the 12 positions, then the sigmoid gate
+__global__ void k_attn_gate(const float* q, const float* k, const float* v, const float* gate,
+                            float* out, int NQ, int NKV, int HD, float scale) {
+  const int id = blockIdx.x * blockDim.x + threadIdx.x;      // [12][NQ]
+  if (id >= 12 * NQ) return;
+  const int t = id / NQ, h = id % NQ, kvh = h / (NQ / NKV);
+  const float* qq = q + ((size_t)t * NQ + h) * HD;
+  float sc[12]; float mx = -1e9f;
+  for (int j = 0; j < 12; j++) {
+    float acc = 0.f;
+    const float* kk = k + ((size_t)j * NKV + kvh) * HD;
+    for (int d = 0; d < HD; d++) acc = __fmaf_rn(qq[d], kk[d], acc);
+    sc[j] = __fmul_rn(acc, scale);
+    if (sc[j] > mx) mx = sc[j];
+  }
+  float sum = 0.f;
+  for (int j = 0; j < 12; j++) { sc[j] = gm_expf(__fsub_rn(sc[j], mx)); sum = __fadd_rn(sum, sc[j]); }
+  for (int j = 0; j < 12; j++) sc[j] = __fdiv_rn(sc[j], sum);
+  const float g = __fdiv_rn(1.0f, __fadd_rn(1.0f, gm_expf(-gate[(size_t)t * NQ + h])));
+  float* o = out + ((size_t)t * NQ + h) * HD;
+  for (int d = 0; d < HD; d++) {
+    float acc = 0.f;
+    for (int j = 0; j < 12; j++) acc = __fmaf_rn(sc[j], v[((size_t)j * NKV + kvh) * HD + d], acc);
+    o[d] = __fmul_rn(acc, g);
+  }
+}
+__global__ void k_add_ip(float* x, const float* y, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] = __fadd_rn(x[i], y[i]);
+}
+__global__ void k_silu_mul_ip(float* a, const float* b, int n) {    // silu(a) * b
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) { const float x = a[i]; a[i] = __fmul_rn(__fdiv_rn(x, __fadd_rn(1.0f, gm_expf(-x))), b[i]); }
+}
+// device-to-device T=12 GEMM: Y [12][N] = q8(W) X [12][K]
+static void gpu_gemm_dd(const Ent* e, const float* dX, float* dY, int N, int K, size_t row0 = 0) {
+  const int8_t* gq = e->gq + row0 * K; const float* gs = e->gs + row0 * (K / 32);
+  if (N >= 1024) k_q8g<12, 2><<<(unsigned)((N + 255) / 256), 128>>>(gq, gs, dX, dY, N, K, 0);
+  else           k_q8g<12, 1><<<(unsigned)((N + 127) / 128), 128>>>(gq, gs, dX, dY, N, K, 0);
+}
+static int g_gpuew = 1;
+
 static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& by,
                       const float* hidden, const int* codes, const unsigned char* masked,
                       float* out_logits) {
@@ -359,6 +443,80 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
   }
 
   DT_MARK(1);
+  if (g_gpu && g_gpuew) {
+    static float *dx, *dh1, *dq, *dk, *dv, *dg, *dat, *dh2, *dh3, *dh4, *dlg, *dct, *dst;
+    if (!dx) {
+      float** bufs[] = { &dx, &dh1, &dq, &dk, &dv, &dg, &dat, &dh2, &dh3, &dh4, &dlg, &dct, &dst };
+      const size_t sz[] = { 12u*DH, 12u*DH, 12u*NHEADS*HD, 12u*NKV*HD, 12u*NKV*HD, 12u*NHEADS, 12u*NHEADS*HD,
+                            12u*INTER, 12u*INTER, 12u*DH, 12u*CBS, 12u*64, 12u*64 };
+      for (int i = 0; i < 13; i++) if (cudaMalloc(bufs[i], sz[i] * 4)) { printf("depth gpu: trunk cudaMalloc\n"); exit(3); }
+      // RoPE table: the host rope()'s own cos/sin (its cache is filled by calling it)
+      float ct[12 * 64] = {0}, st[12 * 64] = {0};
+      for (int t = 0; t < 12; t++) {
+        const int half = HD / 2;
+        for (int i = 0; i < half; i++) {
+          float qv[64] = {0}; qv[i] = 1.f;                       // q = e_i: rope gives (cos, sin) at i, i+half
+          rope(qv, nullptr, t, HD, 1e6f, 1.0f);
+          ct[t * 64 + i] = qv[i]; st[t * 64 + i] = qv[i + half];
+        }
+      }
+      cudaMemcpy(dct, ct, sizeof ct, cudaMemcpyHostToDevice);
+      cudaMemcpy(dst, st, sizeof st, cudaMemcpyHostToDevice);
+    }
+    auto gf = [&](const char* n) -> const float* {
+      Ent* e = get(n); if (!e->gf) { printf("depth gpu: %s has no device copy\n", n); exit(3); } return e->gf; };
+    cudaMemcpy(dx, depth_in, sizeof(float) * 12 * DH, cudaMemcpyHostToDevice);
+    DT_MARK(1);
+    for (int L = 0; L < NLAYERS; L++) {
+      char pf[128], nm[256]; snprintf(pf, sizeof pf, "depthformer.model.layers.%d", L);
+      snprintf(nm, sizeof nm, "%s.operator_norm.weight", pf);
+      k_rms_rows<<<1, 32>>>(dx, gf(nm), dh1, 12, DH, 0);
+      snprintf(nm, sizeof nm, "%s.self_attn.q_proj.weight", pf); gpu_gemm_dd(get(nm), dh1, dq, NHEADS * HD, DH);
+      snprintf(nm, sizeof nm, "%s.self_attn.k_proj.weight", pf); gpu_gemm_dd(get(nm), dh1, dk, NKV * HD, DH);
+      snprintf(nm, sizeof nm, "%s.self_attn.v_proj.weight", pf); gpu_gemm_dd(get(nm), dh1, dv, NKV * HD, DH);
+      snprintf(nm, sizeof nm, "%s.self_attn.gate_proj.weight", pf); gpu_gemm_dd(get(nm), dh1, dg, NHEADS, DH);
+      char qn[256], kn[256];
+      snprintf(qn, sizeof qn, "%s.self_attn.q_norm.weight", pf); snprintf(kn, sizeof kn, "%s.self_attn.k_norm.weight", pf);
+      k_qknorm_rope<<<(12 * (NHEADS + NKV) + 127) / 128, 128>>>(dq, dk, gf(qn), gf(kn), dct, dst, NHEADS, NKV, HD);
+      k_attn_gate<<<(12 * NHEADS + 127) / 128, 128>>>(dq, dk, dv, dg, dat, NHEADS, NKV, HD, 1.0f / sqrtf((float)HD));
+      snprintf(nm, sizeof nm, "%s.self_attn.o_proj.weight", pf); gpu_gemm_dd(get(nm), dat, dh4, DH, NHEADS * HD);
+      k_add_ip<<<(12 * DH + 255) / 256, 256>>>(dx, dh4, 12 * DH);
+      snprintf(nm, sizeof nm, "%s.ffn_norm.weight", pf);
+      k_rms_rows<<<1, 32>>>(dx, gf(nm), dh1, 12, DH, 0);
+      snprintf(nm, sizeof nm, "%s.feed_forward.w1.weight", pf); gpu_gemm_dd(get(nm), dh1, dh2, INTER, DH);
+      snprintf(nm, sizeof nm, "%s.feed_forward.w3.weight", pf); gpu_gemm_dd(get(nm), dh1, dh3, INTER, DH);
+      k_silu_mul_ip<<<(12 * INTER + 255) / 256, 256>>>(dh2, dh3, 12 * INTER);
+      snprintf(nm, sizeof nm, "%s.feed_forward.w2.weight", pf); gpu_gemm_dd(get(nm), dh2, dh4, DH, INTER);
+      k_add_ip<<<(12 * DH + 255) / 256, 256>>>(dx, dh4, 12 * DH);
+    }
+    DT_MARK(5);
+    k_rms_rows<<<1, 32>>>(dx, gf("depthformer.model.embedding_norm.weight"), dh1, 12, DH, 0);   // x = norm(x)
+    // per-codebook embedding_norm (12 weight vectors, uploaded contiguously at load)
+    static float* dcbn = nullptr;
+    if (!dcbn) {
+      std::vector<float> w((size_t)NCB * DH);
+      for (int c = 0; c < NCB; c++) {
+        char en[256]; snprintf(en, sizeof en, "depth_embeddings.%d.embedding_norm.weight", c);
+        memcpy(&w[(size_t)c * DH], get(en)->df, DH * 4);
+      }
+      if (cudaMalloc(&dcbn, w.size() * 4)) { printf("depth gpu: cbn cudaMalloc\n"); exit(3); }
+      cudaMemcpy(dcbn, w.data(), w.size() * 4, cudaMemcpyHostToDevice);
+    }
+    k_rms_rows<<<1, 32>>>(dh1, dcbn, dh4, 12, DH, DH);
+    DT_MARK(6);
+    Ent* head = get("depth_head_stacked.weight");
+    k_q8g<1, 1><<<dim3((unsigned)((CBS + 127) / 128), (unsigned)NCB), 128>>>(head->gq, head->gs, dh4, dlg, CBS, DH, 0);
+    cudaMemcpy(out_logits, dlg, sizeof(float) * NCB * CBS, cudaMemcpyDeviceToHost);
+    cudaError_t ce = cudaGetLastError();
+    if (ce) { printf("depth gpu trunk: %s\n", cudaGetErrorString(ce)); exit(3); }
+    DT_MARK(7);
+    if (getenv("LFM_DEPTH_TIME")) {
+      printf("DEPTH_TIME ms:");
+      for (int i = 0; i < 8; i++) printf(" %s=%.1f", g_dtn[i], g_dt[i]);
+      printf("\n"); fflush(stdout);
+    }
+    return;
+  }
   // reshape to [12, 1024] for the trunk (bidirectional attention over 12 positions)
   // trunk: 3 layers, all full_attention
   float* x = depth_in;  // [12, 1024] in-place
@@ -628,6 +786,11 @@ int main(int argc, char** argv) {
   g_gpu = getenv("LFM_DEPTH_GPU") ? atoi(getenv("LFM_DEPTH_GPU")) : 1;
   if (g_gpu) {
     size_t up = 0;
+    g_gpuew = getenv("LFM_DEPTH_GPUEW") ? atoi(getenv("LFM_DEPTH_GPUEW")) : 1;
+    for (auto& e : ents) if (e.dtype == 2 && e.df && e.nc <= (1u << 20)) {   // norm vectors etc.
+      if (cudaMalloc(&e.gf, e.nc)) { printf("depth gpu: f32 cudaMalloc failed\n"); return 3; }
+      cudaMemcpy(e.gf, e.df, e.nc, cudaMemcpyHostToDevice);
+    }
     for (auto& e : ents) if (e.dtype == 1) {
       if (cudaMalloc(&e.gq, e.nc) || cudaMalloc(&e.gs, e.ns * 4)) { printf("depth gpu: weight cudaMalloc failed\n"); return 3; }
       cudaMemcpy(e.gq, e.dq, e.nc, cudaMemcpyHostToDevice);
