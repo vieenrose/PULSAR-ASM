@@ -249,10 +249,15 @@ __global__ void k_irfft_window(const float* logmag, const float* angle, const fl
 // m = (n*k) % NFFT, so each block builds the 1280-entry (c, s) table with exactly the
 // __sincosf expression above and the tap loop reads it (m advanced by n mod NFFT instead of a
 // modulo per tap). acc's expression and k order are unchanged. LFM_CODEC_IRF2=0 = old kernel.
+/* PAD: twiddle m stored at m + (m >> 5) (33-word rows). Lanes n0..n0+31 read m = c + j k:
+   unpadded that is a gcd(k, 32)-way bank conflict for every even k; the row skew spreads
+   large power-of-two strides over the banks. Same values, same order. */
+#define TWP(m) (PAD ? (m) + ((m) >> 5) : (m))
+template <bool PAD>
 __global__ void k_irfft_window2(const float* logmag, const float* angle, const float* win,
                                 float* frames, int F) {
     int f = blockIdx.x;
-    __shared__ float sa[NBIN], sb[NBIN], tc[NFFT], ts[NFFT];
+    __shared__ float sa[NBIN], sb[NBIN], tc[NFFT + NFFT / 32], ts[NFFT + NFFT / 32];
     for (int k = threadIdx.x; k < NBIN; k += blockDim.x) {
         float m = expf(logmag[(size_t)f * NBIN + k]);
         float c, s;
@@ -263,7 +268,7 @@ __global__ void k_irfft_window2(const float* logmag, const float* angle, const f
     for (int m = threadIdx.x; m < NFFT; m += blockDim.x) {
         float c, s;
         __sincosf(2.0f * 3.14159265358979f * (float)(unsigned)m / NFFT, &s, &c);
-        tc[m] = c; ts[m] = s;
+        tc[TWP(m)] = c; ts[TWP(m)] = s;
     }
     __syncthreads();
     float a0 = sa[0], ah = sa[NFFT / 2];
@@ -271,7 +276,7 @@ __global__ void k_irfft_window2(const float* logmag, const float* angle, const f
         float acc = 0.0f;
         unsigned m = n;                                    /* (n * 1) % NFFT */
         for (int k = 1; k < NFFT / 2; k++) {
-            acc += sa[k] * tc[m] - sb[k] * ts[m];
+            acc += sa[k] * tc[TWP(m)] - sb[k] * ts[TWP(m)];
             m += n; if (m >= NFFT) m -= NFFT;              /* n < NFFT: one subtraction */
         }
         float x = (a0 + ((n & 1) ? -ah : ah) + 2.0f * acc) / NFFT;
@@ -607,8 +612,9 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_win, wv.data(), NFFT * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(d_in, in.data(), in.size() * 4, cudaMemcpyHostToDevice);
     const int thr = 256;
-    static const int irf2 = getenv("LFM_CODEC_IRF2") ? atoi(getenv("LFM_CODEC_IRF2")) : 1;
-    if (irf2) k_irfft_window2<<<T6, thr>>>(d_in, d_in + (size_t)NBIN * T6, d_win, d_frames, T6);
+    static const int irf2 = getenv("LFM_CODEC_IRF2") ? atoi(getenv("LFM_CODEC_IRF2")) : 2;
+    if (irf2 == 2) k_irfft_window2<true><<<T6, thr>>>(d_in, d_in + (size_t)NBIN * T6, d_win, d_frames, T6);
+    else if (irf2) k_irfft_window2<false><<<T6, thr>>>(d_in, d_in + (size_t)NBIN * T6, d_win, d_frames, T6);
     else k_irfft_window<<<T6, thr>>>(d_in, d_in + (size_t)NBIN * T6, d_win, d_frames, T6, 0, nullptr);
     k_fold<<<(int)((L + thr - 1) / thr), thr>>>(d_frames, d_win, d_audio, T6, 0);
     k_fold<<<(int)((L + thr - 1) / thr), thr>>>(d_frames, d_win, d_env, T6, 1);
