@@ -1,0 +1,67 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index 47f820b..332f6ad 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -604,6 +604,7 @@ __global__ void k_attn_head(const bf16* __restrict__ q, const bf16* __restrict__
+ // chunk's last position (sln floats per head) instead of MAXTOK.
+ __constant__ int g_attsm1 = 1;   // LFM_ATT_SM1
+ __constant__ int g_attgsw = 1;   // LFM_ATT_GSW
++__constant__ int g_attqt1 = 1;   // LFM_ATT_QT1
+ template <int G>
+ __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q, const bf16* __restrict__ kc,
+                              const bf16* __restrict__ vc, bf16* __restrict__ out,
+@@ -626,14 +627,16 @@ __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q,
+   for (int g = 0; g < G; g++)
+     #pragma unroll
+     for (int j = 0; j < 4; j++) qv[g][j] = bf2f(q[(size_t)(h0 + g) * HD + lane * 4 + j]);
+-  if (G == 2) {
++  if (G == 2 || (G == 1 && g_attqt1)) {
++    // (G == 1, LFM_ATT_QT1: 16 consecutive positions of the one head, same 16-row form.)
++    constexpr int PW = 16 / G;
+     // Transposed reduce: a warp scores 8 consecutive positions x 2 heads = 16 sums. xor
+     // stages 16, 8, 4, 2 each keep half the rows (lower lane: own + partner, upper lane:
+     // partner + own), then stage 1; every row gets exactly the shfl_down tree's pairings.
+-    for (int p0 = lo + wid * 8; p0 < npos; p0 += 64) {
++    for (int p0 = lo + wid * PW; p0 < npos; p0 += 8 * PW) {
+       float v[16];
+       #pragma unroll
+-      for (int pi = 0; pi < 8; pi++) {
++      for (int pi = 0; pi < PW; pi++) {
+         const int p = p0 + pi;
+         float k0 = 0.f, k1 = 0.f, k2 = 0.f, k3 = 0.f;
+         if (p < npos) {
+@@ -642,13 +645,13 @@ __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q,
+           k2 = __uint_as_float(kw.y << 16); k3 = __uint_as_float(kw.y & 0xffff0000u);
+         }
+         #pragma unroll
+-        for (int g = 0; g < 2; g++) {
++        for (int g = 0; g < G; g++) {
+           float a = 0.f;
+           a = __fadd_rn(a, __fmul_rn(qv[g][0], k0));
+           a = __fadd_rn(a, __fmul_rn(qv[g][1], k1));
+           a = __fadd_rn(a, __fmul_rn(qv[g][2], k2));
+           a = __fadd_rn(a, __fmul_rn(qv[g][3], k3));
+-          v[g * 8 + pi] = a;
++          v[g * PW + pi] = a;
+         }
+       }
+ #define ATT_TSTEP(C, O) { const bool up = (lane & (O)) != 0; \
+@@ -661,8 +664,8 @@ __global__ void __launch_bounds__(256) k_attn_headG(const bf16* __restrict__ q,
+       const float r1 = __shfl_xor_sync(~0u, v[0], 1);
+       const float sc = (lane & 1) ? __fadd_rn(r1, v[0]) : __fadd_rn(v[0], r1);
+       const int row = ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
+-      const int p = p0 + (row & 7);
+-      if (!(lane & 1) && p < npos) sl[(row >> 3) * sln + p] = __fmul_rn(sc, scaling);
++      const int p = p0 + row % PW;
++      if (!(lane & 1) && p < npos) sl[(row / PW) * sln + p] = __fmul_rn(sc, scaling);
+     }
+   } else
+   for (int p = lo + wid; p < npos; p += 8) {
+@@ -4863,6 +4866,7 @@ int main(int argc, char** argv) {
+   if (getenv("LFM_PF_GSW")) { const int v = atoi(getenv("LFM_PF_GSW")); cudaMemcpyToSymbol(g_pfgsw, &v, sizeof v); }
+   if (getenv("LFM_ATT_GSW")) { const int v = atoi(getenv("LFM_ATT_GSW")); cudaMemcpyToSymbol(g_attgsw, &v, sizeof v); }
+   if (getenv("LFM_ATT_SM1")) { const int v = atoi(getenv("LFM_ATT_SM1")); cudaMemcpyToSymbol(g_attsm1, &v, sizeof v); }
++  if (getenv("LFM_ATT_QT1")) { const int v = atoi(getenv("LFM_ATT_QT1")); cudaMemcpyToSymbol(g_attqt1, &v, sizeof v); }
+   if (getenv("LFM_RMSV")) { const int v = atoi(getenv("LFM_RMSV")); cudaMemcpyToSymbol(c_rmsv, &v, sizeof v); }
+   int steps = 8; bool trace = false;
+   int lm_rows_override = 0, emb_mode_req = 0, probe_layer = 0, probe_step = 0;
