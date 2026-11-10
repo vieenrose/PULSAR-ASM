@@ -5,6 +5,12 @@
 // scale; this is the arithmetic shape an exact CPU row share would run. Timing only.
 //   gcc -O3 -mcpu=cortex-a57 -fopenmp -o cpu_tlf_probe tools_cpu_tlf_probe.c   (-O3: 5.08 vs 3.34 GMAC/s at -O2, 3 threads)
 //   ./cpu_tlf_probe <rows> <reps> [threads]
+//
+// CORRECTION (run #206): the "GPU prefill is not slowed by this probe" readings of #204/#205
+// were an artifact: most of each probe run is the rand() initialization, so its compute
+// overlapped the GPU prefill for only ~1-2 s. Wired into the engine (sustained 3-thread rows,
+// .auto/attic/pf_cpu_row_share.patch) the CPU computation slows the GPU by ~1.3 ms/pos, more
+// than the row share saves (~0.4 ms/pos). A CPU share of the prefill does not pay on picard.
 #include <arm_neon.h>
 #include <omp.h>
 #include <stdint.h>

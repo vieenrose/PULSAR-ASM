@@ -1,0 +1,187 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index 04342e6..428140d 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -4429,11 +4429,148 @@ static bool pf_tile(Ent* e, int N, int K) {
+   return true;
+ }
+ 
++// ---- CPU row share of the FFN w1/w3 prefill GEMMs (LFM_PF_CPU, default 0) --------------
++// The TLf grid stops at row N - 512; the last 512 rows (one block of the 15) run on the A57s
++// with TLf's exact per-row order: per leaf k (i = bitrev5(k)) the two blocks i, i + 32 as
++// fp32 fma chains from 0 in code order, leaf = fma(sb, db, fma(sa, da, 0)), the 5-level
++// pairwise tree in k order, then bf16(0 + v) with the device's f2bf. Positions sit in NEON
++// lanes of float[32] arrays with explicit fmaf (one rounding, as __fmaf_rn; gcc -O3 vectorizes). Weights are the
++// tensor's last 16 tiles, copied back from the device once (TLf's tiled layout).
++struct CpuRows { std::vector<int8_t> q; std::vector<float> sc; int N = 0, row0 = 0; };
++static std::map<const Ent*, CpuRows> g_cpurows;
++static inline uint16_t cpu_f2bf(float v) {   // the device f2bf, bit for bit
++  uint32_t u; memcpy(&u, &v, 4);
++  if (((u >> 23) & 0xffu) == 0xffu) return (uint16_t)(u >> 16);
++  return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
++}
++static const CpuRows& cpu_rows(const Ent* e, int nrow) {
++  CpuRows& c = g_cpurows[e];
++  if (c.N == 0) {
++    const int N = e->ne[0], K = e->ne[1], nb = K / 32, row0 = N - nrow;
++    c.N = N; c.row0 = row0;
++    c.q.resize((size_t)nrow * K); c.sc.resize((size_t)nrow * nb);
++    // tile layout: tile t = rows 32t..32t+31: nb*64 int4 of codes then (scales) nb*32 floats
++    cudaMemcpy(c.q.data(), e->dq + (size_t)(row0 / 32) * nb * 64 * 16, c.q.size(), cudaMemcpyDeviceToHost);
++    cudaMemcpy(c.sc.data(), e->ds + (size_t)(row0 / 32) * nb * 32, c.sc.size() * 4, cudaMemcpyDeviceToHost);
++  }
++  return c;
++}
++struct CpuJob { const CpuRows* c; const float* xt; uint16_t* y; int K, Tn, r0, r1, nrow; };
++// xt: [K][32] f32 (positions in lanes, zero beyond Tn); y: [Tn][nrow] bf16 bits
++static void* cpu_rows_run(void* arg) {
++  const CpuJob& J = *(const CpuJob*)arg;
++  const int K = J.K, nb = K / 32;
++  for (int lr = J.r0; lr < J.r1; lr++) {
++    const int tr = lr >> 5, rr = lr & 31;
++    const int8_t* qt = J.c->q.data() + (size_t)tr * nb * 64 * 16;
++    const float* st = J.c->sc.data() + (size_t)tr * nb * 32;
++    float S[5][32], pv[32];
++    for (int k = 0; k < 32; k++) {
++      const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
++      float lf[32];
++      for (int h = 0; h < 2; h++) {
++        const int b = i + 32 * h;
++        float d[32];
++        for (int p = 0; p < 32; p++) d[p] = 0.f;
++        const int8_t* cb = qt + ((size_t)b * 64) * 16 + (size_t)rr * 16;    // codes 0..15
++        const int8_t* cc = qt + ((size_t)b * 64 + 32) * 16 + (size_t)rr * 16; // codes 16..31
++        const float* xb = J.xt + (size_t)b * 32 * 32;
++        for (int j = 0; j < 16; j++) {                     // codes 0..15, in order
++          const float cv = (float)cb[j];
++          for (int p = 0; p < 32; p++) d[p] = fmaf(cv, xb[j * 32 + p], d[p]);
++        }
++        for (int j = 0; j < 16; j++) {                     // codes 16..31, in order
++          const float cv = (float)cc[j];
++          for (int p = 0; p < 32; p++) d[p] = fmaf(cv, xb[(16 + j) * 32 + p], d[p]);
++        }
++        const float sv = st[(size_t)b * 32 + rr];
++        for (int p = 0; p < 32; p++) lf[p] = fmaf(sv, d[p], h ? lf[p] : 0.f);
++      }
++      for (int p = 0; p < 32; p++) pv[p] = lf[p];
++      for (int l = 0; l < 5; l++) {
++        if ((k >> l) & 1) { for (int p = 0; p < 32; p++) pv[p] = S[l][p] + pv[p]; }
++        else { for (int p = 0; p < 32; p++) S[l][p] = pv[p]; break; }
++      }
++    }
++    for (int t = 0; t < J.Tn; t++) J.y[(size_t)t * J.nrow + lr] = cpu_f2bf(0.f + pv[t]);
++  }
++  return nullptr;
++}
++// Step 1, before the GPU launches: a device kernel writes x (bf16 [Tn][K]) as f32 [K][32]
++// (positions in lanes, exact widening, zero beyond Tn) and an event marks it; the D2H of that
++// buffer runs later on a separate non-blocking stream, overlapping the GPU rows.
++__global__ void k_xt32(const bf16* __restrict__ x, float* __restrict__ xt, int Tn, int K) {
++  const int i = blockIdx.x * blockDim.x + threadIdx.x;      // over K * 32
++  if (i >= K * 32) return;
++  const int k = i >> 5, t = i & 31;
++  xt[i] = t < Tn ? __uint_as_float((unsigned)reinterpret_cast<const unsigned short*>(x)[(size_t)t * K + k] << 16) : 0.f;
++}
++static std::vector<float> g_cpu_xt;
++static double g_cpu_t[4]; static long g_cpu_n;   // LFM_PF_CPU_TIME: x fetch, -, rows, H2D (s)
++static double cpu_now() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
++static void cpu_time_dump() {
++  if (g_cpu_n) printf("PF_CPU_TIME calls %ld  x-fetch %.3f s  rows %.3f s  h2d %.3f s\n",
++                      g_cpu_n, g_cpu_t[0], g_cpu_t[2], g_cpu_t[3]);
++}
++static cudaStream_t g_cpu_st; static cudaEvent_t g_cpu_ex, g_cpu_ey;
++static float* g_cpu_dxt;
++static void cpu_share_x(const bf16* dx, int Tn, int K) {
++  static bool reg = false; if (!reg && getenv("LFM_PF_CPU_TIME")) { atexit(cpu_time_dump); reg = true; }
++  if (!g_cpu_st) {
++    cudaStreamCreateWithFlags(&g_cpu_st, cudaStreamNonBlocking);
++    cudaEventCreateWithFlags(&g_cpu_ex, cudaEventDisableTiming); cudaEventCreateWithFlags(&g_cpu_ey, cudaEventDisableTiming);
++    cudaMalloc(&g_cpu_dxt, (size_t)K * 32 * 4);
++    cudaEventRecord(g_cpu_ey, g_cpu_st);   // so the first buffer-reuse wait has an event
++  }
++  k_xt32<<<(K * 32 + 255) / 256, 256, 0, g_launch>>>(dx, g_cpu_dxt, Tn, K);
++  cudaEventRecord(g_cpu_ex, g_launch);
++}
++// Step 1b, after the GPU launches: fetch the f32 x on the side stream (host waits for the
++// copy only; the compute stream keeps running the GPU rows).
++static void cpu_share_fetch(int K) {
++  const double t0 = cpu_now();
++  g_cpu_xt.resize((size_t)K * 32);
++  cudaStreamWaitEvent(g_cpu_st, g_cpu_ex, 0);
++  cudaMemcpyAsync(g_cpu_xt.data(), g_cpu_dxt, (size_t)K * 32 * 4, cudaMemcpyDeviceToHost, g_cpu_st);
++  cudaStreamSynchronize(g_cpu_st);
++  g_cpu_t[0] += cpu_now() - t0;
++}
++// Step 2, after the GPU launches: the last nrow rows of e on the A57s (3 threads), then a
++// 2-D H2D into y's columns [N - nrow, N) of every position, queued behind the GPU rows.
++static void cpu_share_rows(const Ent* e, bf16* y, int Tn, int nrow) {
++  const CpuRows& c = cpu_rows(e, nrow);
++  const int K = e->ne[1], N = e->ne[0];
++  // LFM_PF_CPU_PIN (default 1): the rows go out through pinned host buffers (the H2D is a
++  // real async DMA; a pageable H2D is staged synchronously by the driver).
++  static const int pin = getenv("LFM_PF_CPU_PIN") ? atoi(getenv("LFM_PF_CPU_PIN")) : 1;
++  static uint16_t* hp[2]; static std::vector<uint16_t> hv[2]; static int hyi = 0;
++  uint16_t* hyb;
++  if (pin) { if (!hp[0]) for (int b = 0; b < 2; b++) cudaMallocHost(&hp[b], (size_t)32 * 512 * 2 * 4); hyb = hp[hyi]; }
++  else { hv[hyi].resize((size_t)Tn * nrow); hyb = hv[hyi].data(); }
++  hyi ^= 1;
++  // the H2D of the previous use of this buffer must be done before it is overwritten
++  cudaEventSynchronize(g_cpu_ey);
++  const double t0 = cpu_now();
++  CpuJob J[3]; pthread_t th[2];
++  for (int w = 0; w < 3; w++) J[w] = CpuJob{ &c, g_cpu_xt.data(), hyb, K, Tn, nrow * w / 3 / 32 * 32, w == 2 ? nrow : nrow * (w + 1) / 3 / 32 * 32, nrow };
++  for (int w = 0; w < 2; w++) pthread_create(&th[w], nullptr, cpu_rows_run, &J[w + 1]);
++  cpu_rows_run(&J[0]);
++  for (int w = 0; w < 2; w++) pthread_join(th[w], nullptr);
++  const double t1 = cpu_now();
++  static const int diag = getenv("LFM_PF_CPU_DIAG") ? atoi(getenv("LFM_PF_CPU_DIAG")) : 0;
++  if (diag != 3)   // 3 = timing probe: rows computed, not copied (OUTPUT WRONG)
++  cudaMemcpy2DAsync(y + (N - nrow), (size_t)N * 2, hyb, (size_t)nrow * 2, (size_t)nrow * 2, Tn,
++                    cudaMemcpyHostToDevice, g_cpu_st);
++  cudaEventRecord(g_cpu_ey, g_cpu_st);
++  cudaStreamWaitEvent(g_launch, g_cpu_ey, 0);        // the consumer (silu) waits for the CPU rows
++  g_cpu_t[2] += t1 - t0; g_cpu_t[3] += cpu_now() - t1; g_cpu_n++;
++}
+ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+-                     float* part, int Tn) {
++                     float* part, int Tn, int gN = 0) {
+   Ent* e = T(M, name);
+   if (!e || !(e->dq && e->ds)) { printf("PF4-E2E %s: NOT IN BLOB\n", name.c_str()); return 1; }
+   const int N = e->ne[0], K = e->ne[1];
++  // gN > 0 (CPU row share): the TLf grid covers rows [0, gN) only; the caller computes the rest.
+   // The SHIPPED geometry (pick): same KCHUNK -> same nchunk -> same combine order; R and
+   // TPB only map rows to blocks. Anything the shipped path would reject is rejected here.
+   GemvCfg c = pick(N, K);
+@@ -4499,7 +4636,9 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+     static const int pftlf = getenv("LFM_PF_TLF") ? atoi(getenv("LFM_PF_TLF")) : 4;
+     if (pftlf && tpb == 512 && (size_t)4 * K * 4 <= 48 * 1024) {
+       static const int gswf = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
+-      const dim3 gl = gswf ? dim3((Tn + 3) / 4, (N + tpb - 1) / tpb) : dim3((N + tpb - 1) / tpb, (Tn + 3) / 4);
++      const int gr = gN > 0 ? gN : N;
++      const dim3 gl = gswf ? dim3((Tn + 3) / 4, (gr + tpb - 1) / tpb) : dim3((gr + tpb - 1) / tpb, (Tn + 3) / 4);
++      if (gN > 0 && !(pftlf == 4 && nb == 64 && yb && gN % tpb == 0)) { printf("PF4-E2E %s: CPU share needs TLf<4>, nb 64, fused bf16 out\n", name.c_str()); return 1; }
+       if (pftlf == 4 && nb == 64) q8_partial_TLf<512, 4, 4><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+       else if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+       else            q8_partial_TLf<512, 4, 1><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+@@ -4676,9 +4815,19 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
+   P4("add1", A.xb, H);
+   k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "ffn_norm.weight"), A.h1, NORM_EPS, H);
+   P4("ffn_norm", A.h1, H);
+-  if (pf_gemv_T(M, LN(L, "feed_forward.w1.weight"), A.h1, A.w1, A.part, Tn)) return 1;
++  // LFM_PF_CPU (default 0): 1 = the last 512 rows of w1 on the A57s, 2 = of w1 and w3.
++  static const int pfcpu = getenv("LFM_PF_CPU") ? atoi(getenv("LFM_PF_CPU")) : 0;
++  const int cpuN = pfcpu ? 512 : 0;
++  // LFM_PF_CPU_DIAG (timing probes only): 1 = skip the CPU rows (OUTPUT WRONG), 2 = the GPU
++  // also computes the CPU's rows (CPU work and copies with no GPU saving; output exact).
++  static const int pfdiag = getenv("LFM_PF_CPU_DIAG") ? atoi(getenv("LFM_PF_CPU_DIAG")) : 0;
++  if (pfcpu) cpu_share_x(A.h1, Tn, H);
++  if (pf_gemv_T(M, LN(L, "feed_forward.w1.weight"), A.h1, A.w1, A.part, Tn, cpuN && pfdiag != 2 ? INTER - cpuN : 0)) return 1;
++  if (pf_gemv_T(M, LN(L, "feed_forward.w3.weight"), A.h1, A.w3, A.part, Tn, pfcpu == 2 ? INTER - cpuN : 0)) return 1;
++  if (pfcpu) cpu_share_fetch(H);
++  if (pfcpu && pfdiag != 1) cpu_share_rows(T(M, LN(L, "feed_forward.w1.weight")), A.w1, Tn, cpuN);
++  if (pfcpu == 2) cpu_share_rows(T(M, LN(L, "feed_forward.w3.weight")), A.w3, Tn, cpuN);
+   P4("w1", A.w1, INTER);
+-  if (pf_gemv_T(M, LN(L, "feed_forward.w3.weight"), A.h1, A.w3, A.part, Tn)) return 1;
+   P4("w3", A.w3, INTER);
+   static const int silv = getenv("LFM_PF_SILV") ? atoi(getenv("LFM_PF_SILV")) : 4;
+   if (ewb && silv == 4 && (Tn * INTER) % 4 == 0)
