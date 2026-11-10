@@ -214,6 +214,50 @@ static bool gpu_ffn(const Ent* w1, const Ent* w3, const Ent* w2, const float* h,
   if (ce) { printf("codec gpu ffn: %s\n", cudaGetErrorString(ce)); exit(3); }
   return true;
 }
+// Codec conv block on the device (LFM_CODEC_CONV, default 1): in_proj -> z = B*x ->
+// causal depthwise k=7 -> * C -> out_proj, one upload and one download. The host loop's
+// acc += cw*z is contracted to an fma by gcc -O2 on aarch64 (as in the depth trunk), so
+// the kernel uses __fmaf_rn in the same j order; LFM_CODEC_CONV=2 uses mul+add instead.
+__global__ void k_cconv(const float* proj, const float* cw, float* out, int T, int HID, int fma) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= T * HID) return;
+  const int t = i / HID, c = i % HID;
+  float acc = 0.f;
+  for (int j = 0; j < 7; j++) {
+    const int s = t - 6 + j;
+    if (s >= 0) {
+      const float z = __fmul_rn(proj[(size_t)s * 3 * HID + c], proj[(size_t)s * 3 * HID + 2 * HID + c]);
+      acc = fma ? __fmaf_rn(cw[c * 7 + j], z, acc) : __fadd_rn(acc, __fmul_rn(cw[c * 7 + j], z));
+    }
+  }
+  out[i] = __fmul_rn(acc, proj[(size_t)t * 3 * HID + HID + c]);
+}
+static bool gpu_convblk(const Ent* win, const Ent* wout, const float* cw, const float* h, float* out,
+                        int HID, int T, int mode) {
+  const Ent* e[2] = { nullptr, nullptr };
+  for (auto& x : *g_cents) { if (&x == win && x.dtype == 1 && x.gq) e[0] = &x; if (&x == wout && x.dtype == 1 && x.gq) e[1] = &x; }
+  if (!e[0] || !e[1] || HID % 32 || 3 * HID < 1024 || HID >= 1024) return false;
+  const int tiles = (T + 11) / 12, TT = tiles * 12;
+  static float *dh = nullptr, *dp = nullptr, *dc = nullptr, *dy = nullptr, *dw = nullptr; static size_t cap = 0;
+  if ((size_t)TT * HID > cap) {
+    if (dh) { cudaFree(dh); cudaFree(dp); cudaFree(dc); cudaFree(dy); cudaFree(dw); }
+    cap = (size_t)TT * HID;
+    if (cudaMalloc(&dh, cap * 4) || cudaMalloc(&dp, cap * 3 * 4) || cudaMalloc(&dc, cap * 4) ||
+        cudaMalloc(&dy, cap * 4) || cudaMalloc(&dw, (size_t)HID * 7 * 4)) { printf("codec gpu: conv cudaMalloc\n"); exit(3); }
+    cudaMemset(dc, 0, cap * 4);
+  }
+  static std::vector<float> hx; hx.assign((size_t)TT * HID, 0.f);
+  memcpy(hx.data(), h, (size_t)T * HID * 4);
+  cudaMemcpy(dh, hx.data(), (size_t)TT * HID * 4, cudaMemcpyHostToDevice);
+  cudaMemcpy(dw, cw, (size_t)HID * 7 * 4, cudaMemcpyHostToDevice);
+  k_q8g<12, 2><<<dim3((unsigned)((3 * HID + 255) / 256), (unsigned)tiles), 128>>>(e[0]->gq, e[0]->gs, dh, dp, 3 * HID, HID, 1);
+  k_cconv<<<(unsigned)((T * HID + 255) / 256), 256>>>(dp, dw, dc, T, HID, mode != 2);
+  k_q8g<12, 1><<<dim3((unsigned)((HID + 127) / 128), (unsigned)tiles), 128>>>(e[1]->gq, e[1]->gs, dc, dy, HID, HID, 1);
+  cudaMemcpy(out, dy, (size_t)T * HID * 4, cudaMemcpyDeviceToHost);
+  cudaError_t ce = cudaGetLastError();
+  if (ce) { printf("codec gpu conv: %s\n", cudaGetErrorString(ce)); exit(3); }
+  return true;
+}
 static void q8_gemm_tiles(const int8_t* q, const float* s, const float* X, int ldx,
                           float* Y, int ldy, int N, int K, int T) {
   if (g_cgpu && gpu_gemm_tiles(q, s, X, ldx, Y, ldy, N, K, T)) return;
@@ -554,6 +598,8 @@ int main(int argc, char** argv) {
       Ent* wout = get((P + ".conv.out_proj.weight").c_str());
       Ent* wc = get((P + ".conv.conv.weight").c_str());           // [512,1,7] f32
       const float* cw = wc->df;
+      static const int cconv = getenv("LFM_CODEC_CONV") ? atoi(getenv("LFM_CODEC_CONV")) : 1;
+      if (!(cconv && g_cgpu && gpu_convblk(win_, wout, cw, h.data(), tmp.data(), HID, T6, cconv))) {
       std::vector<float> z((size_t)T6 * HID), conv((size_t)T6 * HID);
       q8_gemm_tiles(win_->dq, win_->ds, h.data(), HID, proj.data(), 3 * HID, 3 * HID, HID, T6);
       for (int t = 0; t < T6; t++) {
@@ -576,6 +622,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < HID; i++) conv[(size_t)t * HID + i] *= Cg[i];
       }
       q8_gemm_tiles(wout->dq, wout->ds, conv.data(), HID, tmp.data(), HID, HID, HID, T6);
+      }
       CK(5);
     }
 
