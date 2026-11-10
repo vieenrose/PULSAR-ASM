@@ -1,0 +1,88 @@
+diff --git a/pulsar_arm/asm/lfm3_enc_gpu.cu b/pulsar_arm/asm/lfm3_enc_gpu.cu
+index 2863efa..6037800 100644
+--- a/pulsar_arm/asm/lfm3_enc_gpu.cu
++++ b/pulsar_arm/asm/lfm3_enc_gpu.cu
+@@ -389,6 +389,70 @@ __global__ void __launch_bounds__(256) k_sgemm8(const float* __restrict__ x, con
+   }
+ }
+ 
++__global__ void __launch_bounds__(256) k_sgemm8p(const float* __restrict__ x, const float* __restrict__ w,
++                                                float* __restrict__ y, int T, int N, int K) {
++  const int t0 = blockIdx.y * 128, n0 = blockIdx.x * 128;
++  __shared__ __align__(16) float sx[16][132];        // [k][t]
++  __shared__ __align__(16) float sw[16][132];        // [k][n]
++  const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4, tid = threadIdx.x;
++  float acc[8][8];
++  #pragma unroll
++  for (int i = 0; i < 8; i++)
++    #pragma unroll
++    for (int j = 0; j < 8; j++) acc[i][j] = 0.f;
++  // LFM_ENC_SG8=2: the next k tile's global loads are issued into registers before this
++  // tile's FMAs (stored after the trailing barrier); every output's chain is unchanged.
++  float px[8], pw[8];
++  #pragma unroll
++  for (int i = 0; i < 8; i++) {
++    const int idx = tid + i * 256, r = idx >> 4, c = idx & 15, t = t0 + r, n = n0 + r;
++    px[i] = (t < T) ? x[(size_t)t * K + c] : 0.f;
++    pw[i] = (n < N) ? w[(size_t)n * K + c] : 0.f;
++  }
++  for (int k0 = 0; k0 < K; k0 += 16) {
++    #pragma unroll
++    for (int i = 0; i < 8; i++) {
++      const int idx = tid + i * 256;                   // 2048 = 128 rows x 16 k
++      const int r = idx >> 4, c = idx & 15;
++      sx[c][r] = px[i];
++      sw[c][r] = pw[i];
++    }
++    __syncthreads();
++    if (k0 + 16 < K) {
++      #pragma unroll
++      for (int i = 0; i < 8; i++) {
++        const int idx = tid + i * 256, r = idx >> 4, c = idx & 15, t = t0 + r, n = n0 + r;
++        px[i] = (t < T) ? x[(size_t)t * K + k0 + 16 + c] : 0.f;
++        pw[i] = (n < N) ? w[(size_t)n * K + k0 + 16 + c] : 0.f;
++      }
++    }
++    #pragma unroll
++    for (int k = 0; k < 16; k++) {
++      const float4 xa = *reinterpret_cast<const float4*>(&sx[k][ty * 4]);
++      const float4 xb = *reinterpret_cast<const float4*>(&sx[k][64 + ty * 4]);
++      const float4 wa = *reinterpret_cast<const float4*>(&sw[k][tx * 4]);
++      const float4 wb = *reinterpret_cast<const float4*>(&sw[k][64 + tx * 4]);
++      const float xv[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
++      const float wv[8] = { wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w };
++      #pragma unroll
++      for (int i = 0; i < 8; i++)
++        #pragma unroll
++        for (int j = 0; j < 8; j++) acc[i][j] = __fmaf_rn(xv[i], wv[j], acc[i][j]);
++    }
++    __syncthreads();
++  }
++  #pragma unroll
++  for (int i = 0; i < 8; i++) {
++    const int t = t0 + (i < 4 ? ty * 4 + i : 64 + ty * 4 + i - 4);
++    if (t >= T) continue;
++    #pragma unroll
++    for (int j = 0; j < 8; j++) {
++      const int n = n0 + (j < 4 ? tx * 4 + j : 64 + tx * 4 + j - 4);
++      if (n < N) y[(size_t)t * N + n] = acc[i][j];
++    }
++  }
++}
++
+ __global__ void k_sgemm_f32(const float* __restrict__ x, const float* __restrict__ w,
+                             float* __restrict__ y, int T, int N, int K) {
+   // 64x64 output tile, 256 threads, 4x4 outputs per thread. Each output accumulates
+@@ -1131,9 +1195,10 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
+   const bool disj = (const char*)(y + (size_t)T * g.N) <= (const char*)x || (const char*)(x + (size_t)T * g.K) <= (const char*)y;
+   const bool fuse = fusec && g.nch == 1 && disj;
+   if (g.wf) {                                        // f32-weight path (no half2 arm)
+-    static const int sg8 = getenv("LFM_ENC_SG8") ? atoi(getenv("LFM_ENC_SG8")) : 1;
++    static const int sg8 = getenv("LFM_ENC_SG8") ? atoi(getenv("LFM_ENC_SG8")) : 2;
+     if (sg8 && g.K % 16 == 0) {
+-      k_sgemm8<<<dim3((g.N + 127) / 128, (T + 127) / 128), 256>>>(x, g.wf, y, T, g.N, g.K);
++      if (sg8 == 2) k_sgemm8p<<<dim3((g.N + 127) / 128, (T + 127) / 128), 256>>>(x, g.wf, y, T, g.N, g.K);
++      else k_sgemm8<<<dim3((g.N + 127) / 128, (T + 127) / 128), 256>>>(x, g.wf, y, T, g.N, g.K);
+     } else {
+     const dim3 grid((g.N + 63) / 64, (T + 63) / 64), block(16, 16);
+     k_sgemm_f32<<<grid, block>>>(x, g.wf, y, T, g.N, g.K);

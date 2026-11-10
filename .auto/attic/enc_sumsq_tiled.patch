@@ -1,0 +1,42 @@
+diff --git a/pulsar_arm/asm/lfm3_enc_gpu.cu b/pulsar_arm/asm/lfm3_enc_gpu.cu
+index 2863efa..4ec5405 100644
+--- a/pulsar_arm/asm/lfm3_enc_gpu.cu
++++ b/pulsar_arm/asm/lfm3_enc_gpu.cu
+@@ -1294,13 +1294,36 @@ __global__ void k_sumsq_rows(const float* __restrict__ x, double* __restrict__ s
+   for (int i = 0; i < D; i++) v += (double)r[i] * r[i];
+   ss[row] = v;
+ }
++// k_sumsq_rows2 (LFM_ENC_SSF, default 1): same per-row ascending fp64 sum, but the rows are
++// read through 128 x 32 shared tiles (each warp load is one row's 128 contiguous bytes;
++// stride 33 makes the per-row reads conflict-free). The one-row-per-lane form issued
++// warp loads touching 32 different lines (~1.5 ms per 1622 x 768 call).
++__global__ void k_sumsq_rows2(const float* __restrict__ x, double* __restrict__ ss, int nrows, int D) {
++  __shared__ float tile[128][33];
++  const int r0 = blockIdx.x * 128, tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
++  const int row = r0 + tid;
++  double v = 0;
++  for (int c0 = 0; c0 < D; c0 += 32) {
++    for (int rr = wid; rr < 128; rr += 4) {
++      const int gr = r0 + rr, c = c0 + lane;
++      tile[rr][lane] = (gr < nrows && c < D) ? x[(size_t)gr * D + c] : 0.f;
++    }
++    __syncthreads();
++    const int nc = D - c0 < 32 ? D - c0 : 32;
++    for (int j = 0; j < nc; j++) { const float a = tile[tid][j]; v += (double)a * a; }
++    __syncthreads();
++  }
++  if (row < nrows) ss[row] = v;
++}
+ static double* g_ss = nullptr;
+ static const int g_encss = getenv("LFM_ENC_SS") ? atoi(getenv("LFM_ENC_SS")) : 1;
+ static const double* sumsq_rows(const float* x, int nrows, int D) {
+   if (!g_encss) return nullptr;
+   static int cap = 0;
+   if (nrows > cap) { if (g_ss) cudaFree(g_ss); cap = nrows; if (cudaMalloc(&g_ss, (size_t)cap * 8)) { printf("ss alloc\n"); exit(3); } }
+-  k_sumsq_rows<<<(nrows + 127) / 128, 128>>>(x, g_ss, nrows, D);
++  static const int ssf = getenv("LFM_ENC_SSF") ? atoi(getenv("LFM_ENC_SSF")) : 1;
++  if (ssf) k_sumsq_rows2<<<(nrows + 127) / 128, 128>>>(x, g_ss, nrows, D);
++  else     k_sumsq_rows<<<(nrows + 127) / 128, 128>>>(x, g_ss, nrows, D);
+   return g_ss;
+ }
+ __global__ void k_rmsnorm_f32(float* __restrict__ x, const float* __restrict__ w, int D,

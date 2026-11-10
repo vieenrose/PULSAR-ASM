@@ -1,0 +1,55 @@
+diff --git a/pulsar_arm/asm/lfm3_enc_gpu.cu b/pulsar_arm/asm/lfm3_enc_gpu.cu
+index 2863efa..ae7c627 100644
+--- a/pulsar_arm/asm/lfm3_enc_gpu.cu
++++ b/pulsar_arm/asm/lfm3_enc_gpu.cu
+@@ -211,6 +211,38 @@ __global__ void k_conv_in_shared2(const float* __restrict__ in, const float* __r
+   }
+ }
+ 
++// k_conv3x3d (LFM_ENC_DW1, default 1): the depthwise 3x3 s2 conv with ONE output per
++// thread, consecutive threads on consecutive x, so every warp store is 32 contiguous
++// floats (k_conv3x3<256> gave a lane 4 consecutive outputs: 4 floats per 16 B sector).
++// Per output the same chain as k_conv3x3: acc = b[o], rows i then taps j, zero-padded
++// taps still added as w * 0, same silu.
++__global__ void k_conv3x3d(const float* __restrict__ in, const float* __restrict__ w,
++                           const float* __restrict__ b, float* __restrict__ out,
++                           int nC, int nH, int nW, int nHo, int nWo, int silu) {
++  const size_t item = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
++  if (item >= (size_t)nC * nHo * nWo) return;
++  const int x = (int)(item % nWo);
++  const int rem = (int)(item / nWo);
++  const int y = rem % nHo, o = rem / nHo;
++  const float* wr = w + (size_t)o * 9;
++  const float* base = in + (size_t)o * nH * nW;
++  float acc = b[o];
++  #pragma unroll
++  for (int i = 0; i < 3; i++) {
++    const int iy = y * 2 + i - 1;
++    const bool rok = (iy >= 0 && iy < nH);
++    const float* xr = base + (size_t)(rok ? iy : 0) * nW;
++    #pragma unroll
++    for (int j = 0; j < 3; j++) {
++      const int ix = x * 2 - 1 + j;
++      const float xv = (rok && ix >= 0 && ix < nW) ? xr[ix] : 0.f;
++      acc = __fadd_rn(acc, __fmul_rn(wr[i * 3 + j], xv));
++    }
++  }
++  if (silu && g_probe_d != 2) acc = __fdiv_rn(acc, __fadd_rn(1.f, expf(-acc)));
++  out[item] = acc;
++}
++
+ static void conv3x3(const float* in, const float* w, const float* b, float* out,
+                     int C, int nH, int nW, int nHo, int nWo, int silu, int in1) {
+   const int items = C * nHo * ((nWo + 3) / 4);
+@@ -224,6 +256,11 @@ static void conv3x3(const float* in, const float* w, const float* b, float* out,
+   } else if (in1) {                                   // flat work-item grid (A/B arm)
+     k_conv3x3<1><<<(C * nHo * ((nWo + 3) / 4) + 255) / 256, 256>>>(in, w, b, out, C, nH, nW, nHo, nWo, silu);
+   } else {
++    static const int dw1 = getenv("LFM_ENC_DW1") ? atoi(getenv("LFM_ENC_DW1")) : 1;
++    if (dw1) {
++      const size_t n = (size_t)C * nHo * nWo;
++      k_conv3x3d<<<(unsigned)((n + 255) / 256), 256>>>(in, w, b, out, C, nH, nW, nHo, nWo, silu);
++    } else
+     k_conv3x3<256><<<(items + TPB - 1) / TPB, TPB>>>(in, w, b, out, C, nH, nW, nHo, nWo, silu);
+   }
+ }
