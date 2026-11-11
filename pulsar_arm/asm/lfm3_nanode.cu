@@ -118,6 +118,7 @@ __device__ __forceinline__ bf16 f2bf(float v) {
 }
 
 // ---------------------------------------------------------------- kernels
+#include "lfm3_qlow.cuh"
 // One row of a Q8 tensor -> bf16. This is the input-embedding lookup: the
 // blob stores the tied embedding as Q8 codes + fp32 scales, so the row is
 // bf16(f32(code) * scale), one round. The first version memcpy'd H*2 raw
@@ -1305,7 +1306,7 @@ static void* load_consume(void* arg) {
       // of `done` that load_wait acquires, so no consumer can see it before the bytes.
       void* p0 = nullptr; void* p1 = nullptr;
       cudaError_t ae = cudaMalloc(&p0, e.nc);
-      if (ae == cudaSuccess && e.dtype == 1) ae = cudaMalloc(&p1, e.ns);
+      if (ae == cudaSuccess && (e.dtype == 1 || e.dtype >= 6)) ae = cudaMalloc(&p1, e.ns);
       if (ae != cudaSuccess) {
         printf("LAZY ALLOC FAIL %s nc=%zu ns=%zu -> %s\n", e.name.c_str(), e.nc, e.ns, cudaGetErrorString(ae));
         ok = false; break;
@@ -1473,9 +1474,17 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
     }
     // Fail loudly on a shape the engine cannot use, rather than deriving
     // K=0 and silently launching an empty grid.
-    if (e.dtype == 1 && (e.nd != 2 || e.ne[0] <= 0 || e.ne[1] <= 0)) {
+    if ((e.dtype == 1 || e.dtype >= 6) && (e.nd != 2 || e.ne[0] <= 0 || e.ne[1] <= 0)) {
       printf("tensor %s: Q8 payload with nd=%d ne=[%d,%d,%d,%d] -- want 2 dims\n",
              e.name.c_str(), e.nd, e.ne[0], e.ne[1], e.ne[2], e.ne[3]);
+      fclose(f); return false;
+    }
+    // dtype 6 / 7: low-bit Q4 / Q5 payload (lfm3_qlow.cuh), pre-tiled by the exporter
+    if (e.dtype >= 6 && (e.dtype > 7 || e.ne[0] % 32 || e.ne[1] % 256 ||
+                         e.nc != (size_t)e.ne[0] * e.ne[1] / 32 * (e.dtype == 6 ? 16 : 20) ||
+                         e.ns != (size_t)e.ne[0] * e.ne[1] / 32 * 4)) {
+      printf("tensor %s: bad low-bit record dtype=%d ne=[%d,%d] nc=%zu ns=%zu\n", e.name.c_str(), e.dtype,
+             e.ne[0], e.ne[1], e.nc, e.ns);
       fclose(f); return false;
     }
     if (e.dtype < 0 || e.file_off == (size_t)-1 || e.nc == (size_t)-1 || e.nd == 0) {
@@ -1487,7 +1496,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
     const bool hostemb = (M.emb_mode == 1) && (e.name == EMBNAME);
     const bool skq = (M.emb_mode == 2) && (e.name != EMBNAME);   // selftest: embedding only
     if (skq) {}
-    else if (e.dtype == 1 || e.dtype == 3) { if (!hostemb) { M.need_q += e.nc; M.need_s += e.ns; } }
+    else if (e.dtype == 1 || e.dtype == 3 || e.dtype >= 6) { if (!hostemb) { M.need_q += e.nc; M.need_s += e.ns; } }
     else M.need_f += e.nc;
     // LFM_DBG_SIZE=1 dumps the per-tensor sizing decisions: the upload loop
     // and this pass MUST agree, and when they don't the failure is an
@@ -1498,7 +1507,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
       printf("SIZE %-56s dtype=%d nc=%zu ns=%zu -> %s\n", e.name.c_str(), e.dtype,
              (size_t)e.nc, (size_t)e.ns, skq ? "skip(selftest)"
                                  : hostemb ? "skip(emb-host)"
-                                 : (e.dtype == 1 || e.dtype == 3) ? "codes" : "f32");
+                                 : (e.dtype == 1 || e.dtype == 3 || e.dtype >= 6) ? "codes" : "f32");
     if (e.name == EMBNAME) M.emb_file_off = base_data + e.file_off;
     M.ents.push_back(e);
     p = e1 + 1;
@@ -1616,7 +1625,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
     J->skip[oi] = skip;
     if (!skip) {
       if (e.dtype == 3) { J->d0[oi] = (char*)(M.dq + oc); e.dq = M.dq + oc; e.ds = nullptr; oc += e.nc; }
-      else if (e.dtype == 1) { J->d0[oi] = (char*)(M.dq + oc); J->d1[oi] = (char*)M.ds + os;
+      else if (e.dtype == 1 || e.dtype >= 6) { J->d0[oi] = (char*)(M.dq + oc); J->d1[oi] = (char*)M.ds + os;
         e.dq = M.dq + oc; e.ds = (float*)((char*)M.ds + os); oc += e.nc; os += e.ns; }
       else {
         // `M.df + of` is float* arithmetic on a BYTE offset: it advanced 4*of,
@@ -1870,9 +1879,23 @@ static void cap_add(const std::string& name, const bf16* xb, const bf16* yb, int
 }
 
 static void tlb_decode(const int8_t* q, const float* s, const bf16* x, bf16* y, int N, int K, float* part);
+// Low-bit (dtype 6 = Q4, 7 = Q5) backbone tensors: one position, k_qlow (lfm3_qlow.cuh).
+// K is split over KS blocks (2 at K = 2048, 4 at K >= 4096: the long-K shape otherwise runs
+// 1-2 blocks per SM because of its staged x); partials go through part and are added in
+// slice order, which also covers the in-place calls (x == y).
+static void qlow_gemv(const Ent* e, const bf16* x, bf16* y, float* part) {
+  const int N = e->ne[0], K = e->ne[1], KS = K >= 4096 ? 4 : 2;
+  const size_t sm = (size_t)(K / KS + K / 32 / KS) * 4;
+  const dim3 gr((unsigned)((N + 255) / 256), (unsigned)KS);
+  const uint4* q = reinterpret_cast<const uint4*>(e->dq); const __half2* sc = reinterpret_cast<const __half2*>(e->ds);
+  if (e->dtype == 6) k_qlow<4, 256, 1><<<gr, 256, sm, g_launch>>>(q, sc, x, part, y, N, K);
+  else               k_qlow<5, 256, 1><<<gr, 256, sm, g_launch>>>(q, sc, x, part, y, N, K);
+  k_qlow_combine<<<(N + 255) / 256, 256, 0, g_launch>>>(part, y, N, KS);
+}
 static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
   Ent* e = T(M, name);
   const int N = e->ne[0], K = e->ne[1];
+  if (e->dtype >= 6) { qlow_gemv(e, xb, yb, M.part); return; }
   if (e->tiled) {                                    // tiled weights: TLb at one position
     tlb_decode(e->dq, e->ds, xb, yb, N, K, M.part);
     if (g_cap_on) cap_add(name, xb, yb, N, K);
@@ -4528,6 +4551,10 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   Ent* e = T(M, name);
   if (!e || !(e->dq && e->ds)) { printf("PF4-E2E %s: NOT IN BLOB\n", name.c_str()); return 1; }
   const int N = e->ne[0], K = e->ne[1];
+  if (e->dtype >= 6) {                                  // low-bit: one position at a time
+    for (int t = 0; t < Tn; t++) qlow_gemv(e, x + (size_t)t * K, y + (size_t)t * N, part);
+    return 0;
+  }
   // The SHIPPED geometry (pick): same KCHUNK -> same nchunk -> same combine order; R and
   // TPB only map rows to blocks. Anything the shipped path would reject is rejected here.
   GemvCfg c = pick(N, K);

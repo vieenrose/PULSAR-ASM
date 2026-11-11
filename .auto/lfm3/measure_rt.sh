@@ -43,7 +43,7 @@ PY
 )
 [ -n "$PROMPT" ] || { echo "prompt build failed"; exit 2; }
 
-scp -o ConnectTimeout=20 -q "$SRC" "$NANO:$DIR/" 2>/dev/null || { echo "scp failed (board down?)"; exit 2; }
+scp -o ConnectTimeout=20 -q "$SRC" pulsar_arm/asm/lfm3_qlow.cuh "$NANO:$DIR/" 2>/dev/null || { echo "scp failed (board down?)"; exit 2; }
 BOUT=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
   "cd $DIR && rm -f $BIN.new && export PATH=/usr/local/cuda/bin:\$PATH && nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o $BIN.new $(basename $SRC) -lz 2>&1; test -x $BIN.new && mv -f $BIN.new $BIN && echo BUILT_OK" 2>/dev/null | grep -vi setlocale)
 echo "$BOUT" | grep -E "error:" | head -12

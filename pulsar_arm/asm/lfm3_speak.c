@@ -334,7 +334,9 @@ int main(int argc, char **argv) {
   if (!is_audio && !is_il && !is_tx) die("mode must be audio, interleaved or text (got %s)", mode);
   if (max_slots < 1 || max_slots > 4096) die("max_slots %d out of range", max_slots);
   char BB[1024], DB[1024], CB[1024];
-  path_of(BB, sizeof BB, "lfm3-audio-2b-q8.lfm3q8");
+  /* LFM_SPK_BB: backbone blob name in DIR (default the Q8 blob; e.g. the GPTQ Q4 / Q5
+     blobs, lfm3-audio-2b-q4g.lfm3q8 / -q5g, which are lossy and gated by KL vs HF) */
+  path_of(BB, sizeof BB, getenv("LFM_SPK_BB") ? getenv("LFM_SPK_BB") : "lfm3-audio-2b-q8.lfm3q8");
   path_of(DB, sizeof DB, "lfm3-audio-2b-depth.lfm3q8");
   path_of(CB, sizeof CB, "lfm3-audio-2b-codec.lfm3q8");
   if (file_size(BB) <= 0) die("missing %s", BB);

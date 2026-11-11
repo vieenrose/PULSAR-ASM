@@ -9,7 +9,7 @@ cd "$(dirname "$0")/../.."
 NANO="${NANO:-picard@100.84.151.116}"
 DIR="${NANO_DIR:-/home/picard/lfm3}"
 BIN="${LFM3_BIN:-lfm3_nanode}"
-scp -o ConnectTimeout=20 -q pulsar_arm/asm/lfm3_nanode.cu "$NANO:$DIR/" 2>/dev/null || { echo "scp failed"; exit 2; }
+scp -o ConnectTimeout=20 -q pulsar_arm/asm/lfm3_nanode.cu pulsar_arm/asm/lfm3_qlow.cuh "$NANO:$DIR/" 2>/dev/null || { echo "scp failed"; exit 2; }
 BOUT=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
   "cd $DIR && rm -f $BIN.new && export PATH=/usr/local/cuda/bin:\$PATH && nvcc -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o $BIN.new lfm3_nanode.cu -lz 2>&1; test -x $BIN.new && mv -f $BIN.new $BIN && echo BUILT_OK" 2>/dev/null | grep -vi setlocale)
 echo "$BOUT" | grep -E "error:" | head -12

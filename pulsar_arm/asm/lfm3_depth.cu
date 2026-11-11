@@ -929,6 +929,17 @@ int main(int argc, char** argv) {
         q8_gemv(it->second->dq, it->second->ds, z.data(), y.data(), 12 * 1024, 2048);
       }
     }
+    /* teacher forcing for the lossy-backbone quality gate (.auto/lfm3/s2s_tf.sh):
+       LFM_DEPTH_FORCE=<codes [12, T] int32, codebook-major (HF's audio_codes.i32)>: each
+       frame's own MaskGIT codes are logged ("maskgit: codes"), then replaced by HF's codes
+       for that frame before the embedding is written, so the backbone walks HF's trajectory.
+       LFM_DEPTH_HDUMP=<file>: append every frame's input hidden row (HF: hidden.<f>.f32). */
+    std::vector<int> force; int force_T = 0, fidx = 0;
+    if (const char* fp = getenv("LFM_DEPTH_FORCE")) {
+      if (!rd(fp, force) || force.empty() || force.size() % 12) { printf("LFM_DEPTH_FORCE: cannot read %s\n", fp); return 2; }
+      force_T = (int)(force.size() / 12);
+    }
+    FILE* hdump = getenv("LFM_DEPTH_HDUMP") ? fopen(getenv("LFM_DEPTH_HDUMP"), "wb") : nullptr;
     printf("DEPTH_READY\n"); fflush(stdout);
     char line[8192];
     while (fgets(line, sizeof line, stdin)) {
@@ -957,6 +968,20 @@ int main(int argc, char** argv) {
         printf("maskgit: codes = [");
         for (int c = 0; c < 12; c++) printf("%d%s", codes[c], c == 11 ? "]" : ",");
         printf("\n");
+      }
+      if (!rc && hdump) { fwrite(hidden, 4, 2048, hdump); fflush(hdump); }
+      if (!rc && force_T) {
+        if (fidx >= force_T) { printf("LFM_DEPTH_FORCE: frame %d beyond %d\n", fidx, force_T); rc = 2; }
+        else {
+          for (int c = 0; c < 12; c++) codes[c] = force[(size_t)c * force_T + fidx];
+          printf("forced: codes = [");
+          for (int c = 0; c < 12; c++) printf("%d%s", codes[c], c == 11 ? "]" : ",");
+          printf("\n");
+          FILE* foc = fopen(cp, "wb");
+          if (!foc || fwrite(codes, 4, 12, foc) != 12) rc = 2;
+          if (foc) fclose(foc);
+          fidx++;
+        }
       }
       const double f2 = dt_now();
       if (!rc) rc = frame_embed_out(by, codes, ep);

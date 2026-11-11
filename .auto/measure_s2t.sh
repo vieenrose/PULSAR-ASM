@@ -12,7 +12,7 @@ NVCC="export PATH=/usr/local/cuda/bin:\$PATH && nvcc -std=c++11 -gencode arch=co
 ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" "cd $DIR && rm -f lfm3_nanode.new lfm3_enc_gpu.new lfm3_wav lfm3_mel mo 2>/dev/null; as -o mo pulsar_arm/asm/lfm3_mel.S && echo ASM_OK" >/dev/null 2>&1
 
 # Simpler: just build nanode and enc on the Nano from the synced sources
-for f in pulsar_arm/asm/lfm3_nanode.cu pulsar_arm/asm/lfm3_enc_gpu.cu pulsar_arm/asm/lfm3_wav.c pulsar_arm/asm/lfm3_mel.c pulsar_arm/asm/lfm3_mel.S pulsar_arm/asm/lfm3_asr.c pulsar_arm/asm/lfm3_tok.c pulsar_arm/asm/lfm3_tok.h; do
+for f in pulsar_arm/asm/lfm3_nanode.cu pulsar_arm/asm/lfm3_qlow.cuh pulsar_arm/asm/lfm3_enc_gpu.cu pulsar_arm/asm/lfm3_wav.c pulsar_arm/asm/lfm3_mel.c pulsar_arm/asm/lfm3_mel.S pulsar_arm/asm/lfm3_asr.c pulsar_arm/asm/lfm3_tok.c pulsar_arm/asm/lfm3_tok.h; do
   scp -q -o ConnectTimeout=20 "$f" "$NANO:$DIR/$(basename $f)" 2>/dev/null
 done
 

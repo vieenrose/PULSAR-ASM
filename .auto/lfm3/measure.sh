@@ -24,7 +24,7 @@ PROMPT="$(python3 -c "import json;print(','.join(map(str,json.load(open('.auto/l
 N="${STEPS:-48}"
 EXTRA="${PQ1_EXTRA:-}"
 
-scp -o ConnectTimeout=20 -q "$SRC" "$NANO:$DIR/" 2>/dev/null || { echo "scp failed (board down?)"; exit 2; }
+scp -o ConnectTimeout=20 -q "$SRC" pulsar_arm/asm/lfm3_qlow.cuh "$NANO:$DIR/" 2>/dev/null || { echo "scp failed (board down?)"; exit 2; }
 
 # Build (the flags are the same set build_lfm3.sh uses -- keep them in sync).
 ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \

@@ -32,7 +32,7 @@ TOK=$(( (Tm + 7) / 8 ))
 H2="${LFM_ENC_H2:-0}"
 REF=".auto/lfm3/enc_ref"
 
-scp -o ConnectTimeout=20 -q pulsar_arm/asm/lfm3_enc_gpu.cu pulsar_arm/asm/lfm3_enc.c pulsar_arm/asm/lfm3_nanode.cu \
+scp -o ConnectTimeout=20 -q pulsar_arm/asm/lfm3_enc_gpu.cu pulsar_arm/asm/lfm3_enc.c pulsar_arm/asm/lfm3_nanode.cu pulsar_arm/asm/lfm3_qlow.cuh \
     .auto/lfm3/enc_ref/cmp_enc.py "$NANO:$DIR/" 2>/dev/null || { echo "scp failed (board down?)"; exit 2; }
 BOUT=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
   "cd $DIR && rm -f lfm3_enc_gpu.new && export PATH=/usr/local/cuda/bin:\$PATH && nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o lfm3_enc_gpu.new lfm3_enc_gpu.cu -lz 2>&1; test -x lfm3_enc_gpu.new && mv -f lfm3_enc_gpu.new lfm3_enc_gpu && gcc -O2 -std=c99 -Wall -Wextra -o lfm3_enc lfm3_enc.c -lm && echo BUILT_OK" 2>/dev/null | grep -vi setlocale)

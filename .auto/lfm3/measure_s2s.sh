@@ -20,10 +20,10 @@ NANO="${NANO:-picard@100.84.151.116}"
 DIR=/home/picard/lfm3
 S=pulsar_arm/asm
 REFMD5=$(cat .auto/lfm3/s2s_ref.wav.md5)
-scp -q $S/lfm3_speak.c $S/lfm3_depth.cu $S/lfm3_depth_neon.c $S/lfm3_codec.cu $S/lfm3_q8g.cuh \
+scp -q $S/lfm3_speak.c $S/lfm3_depth.cu $S/lfm3_depth_neon.c $S/lfm3_codec.cu $S/lfm3_q8g.cuh $S/lfm3_qlow.cuh \
     $S/lfm3_nanode.cu pulsar_arm/bonsai2/glibc_mathf.h "$NANO:/tmp/s2s_src/" 2>/dev/null || {
   ssh "$NANO" 'mkdir -p /tmp/s2s_src' && scp -q $S/lfm3_speak.c $S/lfm3_depth.cu $S/lfm3_depth_neon.c \
-    $S/lfm3_codec.cu $S/lfm3_q8g.cuh $S/lfm3_nanode.cu pulsar_arm/bonsai2/glibc_mathf.h "$NANO:/tmp/s2s_src/"; } || { echo "scp failed"; exit 2; }
+    $S/lfm3_codec.cu $S/lfm3_q8g.cuh $S/lfm3_qlow.cuh $S/lfm3_nanode.cu pulsar_arm/bonsai2/glibc_mathf.h "$NANO:/tmp/s2s_src/"; } || { echo "scp failed"; exit 2; }
 OUT=$(ssh "$NANO" "bash -s" <<EOF 2>&1 | grep -v setlocale
 set -u
 cd /tmp/s2s_src && export PATH=/usr/local/cuda/bin:\$PATH

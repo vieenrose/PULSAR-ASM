@@ -70,7 +70,7 @@ def main():
     steps = int(os.environ.get("ASR_STEPS", str(n_prompt + len(want) + 2)))
 
     print("== build (fresh, on the Nano) ==")
-    for f in ("lfm3_nanode.cu", "lfm3_enc_gpu.cu", "lfm3_wav.c", "lfm3_mel.c", "lfm3_mel.S"):
+    for f in ("lfm3_nanode.cu", "lfm3_qlow.cuh", "lfm3_enc_gpu.cu", "lfm3_wav.c", "lfm3_mel.c", "lfm3_mel.S"):
         sh("scp -q -o ConnectTimeout=20 %s %s:%s/" % (os.path.join(REPO, "pulsar_arm", "asm", f), NANO, NDIR))
     r = ssh("cd %s && as -o mo lfm3_mel.S && %s -o /tmp/nanode_new lfm3_nanode.cu -lz 2>/dev/null; "
             "test -x /tmp/nanode_new && mv -f /tmp/nanode_new lfm3_nanode; "
