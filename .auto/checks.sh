@@ -1,35 +1,43 @@
-#!/usr/bin/env bash
-# .auto/checks.sh -- correctness backpressure for the S2S loop.
+#!/bin/bash
+# .auto/checks.sh -- quality gates for the combined conversation objective
+# (LFM3 S2T + PrimeTTS v2.1 on the Nano). Runs after every passing benchmark; a run that
+# fails here cannot be kept.
 #
-# STRUCTURE (2026-11-11): the autoresearch tool runs this file with a 300 s timeout,
-# but the full gates need ~10-15 min (text gates 7m alone). So this file is a FAST
-# verifier: host gates (seconds) + a stamp check. The SLOW gates run OUTSIDE the tool:
-# after every source change, run `bash .auto/checks.sh FULL=1` manually (or any slow
-# subset); on success it writes .auto/lfm3/.gates_stamp, and this file then passes fast.
-# In-bench gates (L/X slots+text+wav md5, WAV self, codec-on-HF SNR in measure_s2s.sh)
-# still run on EVERY run_experiment, so no bench sample is ever unverified.
-set -euo pipefail
-HERE="/home/louis/PULSAR-ASM/.auto/lfm3"
-PY="/home/louis/venvs/lfm3/bin/python"
-$PY "$HERE/checks_tok.py" >/dev/null 2>&1
-$PY "$HERE/checks_mel.py" >/dev/null 2>&1
-$PY "$HERE/checks_wav.py" >/dev/null 2>&1
-A=/home/louis/PULSAR-ASM/pulsar_arm/asm
-STAMP=$(cat $A/lfm3_qlow.cuh $A/lfm3_nanode.cu $A/lfm3_depth.cu $A/lfm3_depth_neon.c $A/lfm3_codec.cu $A/lfm3_q8g.cuh $A/lfm3_speak.c $A/lfm3_asr.c $A/lfm3_enc_gpu.cu | md5sum | cut -c1-32)
-if [ "${FULL:-}" = 1 ] || [ "$(cat "$HERE/.gates_stamp" 2>/dev/null)" != "$STAMP" ]; then
-  # SLOW PATH. Run manually with FULL=1 (or first run after a source change); under the
-  # tool's 300 s timeout this will time out -- that is the honest signal to go manual.
-  # Backbone text gates (layer matrix, 6-prompt logit gate, greedy streams vs HF): every
-  # GEMV kernel change reaches the text path too, so they run on every source change.
-  bash "$HERE/checks.sh" > /tmp/lfm3_text_gates.log 2>&1 || { tail -20 /tmp/lfm3_text_gates.log; echo "TEXT GATES FAILED"; exit 1; }
-  # Lossy default speech backbone (GPTQ Q5 mix, adopted 2026-11-11): teacher-forced turn
-  # vs HF on every source change; the free-turn ASR WER gate (~10 min) whenever a source
-  # on the speech path or the ASR path changed since its last pass.
-  bash "$HERE/s2s_tf.sh" --gate lfm3-audio-2b-q5c.lfm3q8 > /tmp/lfm3_tf_gate.log 2>&1 || { cat /tmp/lfm3_tf_gate.log; echo "S2S TF GATE FAILED"; exit 1; }
-  if [ "$(cat "$HERE/.intel_stamp" 2>/dev/null)" != "$STAMP" ]; then
-    bash "$HERE/s2s_intel.sh" lfm3-audio-2b-q5c.lfm3q8 > /tmp/lfm3_intel_gate.log 2>&1 || { grep -v Warn /tmp/lfm3_intel_gate.log | tail -14; echo "S2S INTEL GATE FAILED"; exit 1; }
-    echo "$STAMP" > "$HERE/.intel_stamp"
-  fi
-  echo "$STAMP" > "$HERE/.gates_stamp"
-fi
+# Gates:
+#   1. Fixture integrity: the frozen ASR goldens and the two conversation clips are the
+#      bytes this session pinned (md5 sidecar). Changing them is a deliberate act.
+#   2. ASR fidelity: the current lfm3 binary still reproduces the frozen transcript ids for
+#      the zh and en conversation clips (the cold one-shot path; a warm service must be
+#      bit-identical to it, which is what this gate means).
+#   3. TTS fidelity: pt_v21_nano on the reply case is inside the parity envelope
+#      (SNDR >= 60 dB), i.e. the audio is still the validated model, not a shortcut.
+set -uo pipefail
+NANO="${NANO:-picard@100.84.151.116}"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+ADIR="$REPO/.auto/combined"
+LFM_DIR="${LFM_DIR:-/home/picard/lfm3}"
+PT_DIR="${PT_DIR:-/home/picard/primetts}"
+
+fail() { echo "CHECKS FAIL: $1"; exit 1; }
+
+# ---- 1. fixture integrity
+[ -s "$ADIR/fixtures.md5" ] || fail "missing $ADIR/fixtures.md5"
+( cd "$ADIR" && md5sum -c fixtures.md5 --quiet ) || fail "fixtures changed (see $ADIR/fixtures.md5)"
+
+# ---- 2. ASR fidelity on both conversation clips
+scp -q "$ADIR/clip_zh.wav" "$ADIR/clip_en.wav" "$NANO:/tmp/" 2>/dev/null || fail "cannot sync the clips"
+for lang in zh en; do
+  ssh "$NANO" "cd $LFM_DIR && ./lfm3_asr . /tmp/clip_$lang.wav 96 --out-ids /tmp/chk.$lang.i32" >/dev/null 2>&1 \
+    || fail "lfm3_asr failed on clip_$lang"
+  scp -q "$NANO:/tmp/chk.$lang.i32" "/tmp/chk.$lang.i32" 2>/dev/null || fail "no ids for $lang"
+  cmp -s "/tmp/chk.$lang.i32" "$ADIR/golden_$lang.i32" || fail "ASR transcript for $lang differs from the golden"
+  echo "  ASR $lang: ids match golden"
+done
+
+# ---- 3. TTS fidelity
+sndr=$(ssh "$NANO" "cd $PT_DIR && ./build/pt_v21_nano --container build/v21.ptk --case tests/golden_v21/T81" 2>/dev/null \
+       | grep -o "SNDR=[0-9.]*" | tail -1 | cut -d= -f2)
+[ -n "${sndr:-}" ] || fail "TTS parity run produced no SNDR"
+awk -v s="$sndr" 'BEGIN{exit !(s>=60)}' || fail "TTS SNDR ${sndr} dB < 60 dB"
+echo "  TTS: SNDR ${sndr} dB"
 echo "CHECKS OK"

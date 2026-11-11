@@ -1,0 +1,82 @@
+diff --git a/pulsar_arm/asm/lfm3_depth.cu b/pulsar_arm/asm/lfm3_depth.cu
+index c79318a..5865a13 100644
+--- a/pulsar_arm/asm/lfm3_depth.cu
++++ b/pulsar_arm/asm/lfm3_depth.cu
+@@ -507,6 +507,14 @@ __global__ void k_silu_mul_ip(float* a, const float* b, int n) {    // silu(a) *
+ }
+ // device-to-device T=12 GEMM: Y [12][N] = q8(W) X [12][K]
+ // rows r[0..3] of a [*, n] matrix <-> a compact [4, n] matrix (dir 0 gather, 1 scatter)
++// rows r.v[0..grid.y-1] of a [*, n] matrix <-> a compact [grid.y, n] matrix (any row count <= 8)
++struct Rows8 { int v[8]; };
++__global__ void k_rowsN(float* full, float* cmp, Rows8 r, int n, int dir) {
++  const int j = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i >= n) return;
++  if (dir == 0) cmp[(size_t)j * n + i] = full[(size_t)r.v[j] * n + i];
++  else full[(size_t)r.v[j] * n + i] = cmp[(size_t)j * n + i];
++}
+ __global__ void k_rows4(float* full, float* cmp, int4 r, int n, int dir) {
+   const int j = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+   if (i >= n) return;
+@@ -643,6 +651,28 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
+       // position-wise o_proj/FFN of a row depend on that row alone (LFM_DEPTH_LSEL, default 1).
+       // T=4 GEMMs keep each output's chain (k_q8g<4,2>); the other rows are never read.
+       static const int lsel = getenv("LFM_DEPTH_LSEL") ? atoi(getenv("LFM_DEPTH_LSEL")) : 1;
++      if (lsel && L == NLAYERS - 1 && g_head_need && g_head_nneed == 6) {
++        // same block for the 2-pass schedule (LFM_DEPTH_MGK=6): 6 rows, k_q8g<6,2>
++        Rows8 r; for (int j = 0; j < 8; j++) r.v[j] = j < 6 ? g_head_need[j] : 0;
++        static float *cx, *cat, *c1, *c2, *c3, *c4;
++        if (!cx) { cudaMalloc(&cx, 6u*DH*4); cudaMalloc(&cat, 6u*NHEADS*HD*4); cudaMalloc(&c1, 6u*DH*4);
++                   cudaMalloc(&c2, 6u*INTER*4); cudaMalloc(&c3, 6u*INTER*4); cudaMalloc(&c4, 6u*DH*4); }
++        auto g6 = [&](const Ent* e, const float* X, float* Y, int N, int K) {
++          k_q8g<6, 2><<<(unsigned)((N + 255) / 256), 128>>>(e->gq, e->gs, X, Y, N, K, 0); };
++        k_rowsN<<<dim3((DH + 255) / 256, 6), 256>>>(dx, cx, r, DH, 0);
++        k_rowsN<<<dim3((NHEADS * HD + 255) / 256, 6), 256>>>(dat, cat, r, NHEADS * HD, 0);
++        snprintf(nm, sizeof nm, "%s.self_attn.o_proj.weight", pf); g6(get(nm), cat, c4, DH, NHEADS * HD);
++        k_add_ip<<<(6 * DH + 255) / 256, 256>>>(cx, c4, 6 * DH);
++        snprintf(nm, sizeof nm, "%s.ffn_norm.weight", pf);
++        rms_rows(cx, gf(nm), c1, 6, DH, 0);
++        snprintf(nm, sizeof nm, "%s.feed_forward.w1.weight", pf); g6(get(nm), c1, c2, INTER, DH);
++        snprintf(nm, sizeof nm, "%s.feed_forward.w3.weight", pf); g6(get(nm), c1, c3, INTER, DH);
++        k_silu_mul_ip<<<(6 * INTER + 255) / 256, 256>>>(c2, c3, 6 * INTER);
++        snprintf(nm, sizeof nm, "%s.feed_forward.w2.weight", pf); g6(get(nm), c2, c4, DH, INTER);
++        k_add_ip<<<(6 * DH + 255) / 256, 256>>>(cx, c4, 6 * DH);
++        k_rowsN<<<dim3((DH + 255) / 256, 6), 256>>>(dx, cx, r, DH, 1);
++        continue;
++      }
+       if (lsel && L == NLAYERS - 1 && g_head_need && g_head_nneed == 4) {
+         const int4 r = make_int4(g_head_need[0], g_head_need[1], g_head_need[2], g_head_need[3]);
+         static float *cx, *cat, *c1, *c2, *c3, *c4;
+@@ -898,15 +928,19 @@ static int maskgit_frame(std::vector<Ent>& ents, std::map<std::string, Ent*>& by
+     int codes[12] = {0};
+     unsigned char revealed[12] = {0};
+     float logits[12 * 2017];
+-    for (long p = 0; p + 4 <= no; p += 4) {
++    // reveals per pass (LFM_DEPTH_MGK, default 4 = HF's maskgit_steps 3 schedule [4,4,4];
++    // 6 = a 2-pass [6,6] schedule over the same 12-entry order: lossy vs HF, opt-in)
++    static const int G = getenv("LFM_DEPTH_MGK") ? atoi(getenv("LFM_DEPTH_MGK")) : 4;
++    if (G != 4 && G != 6) { printf("LFM_DEPTH_MGK must be 4 or 6\n"); return 2; }
++    for (long p = 0; p + G <= no; p += G) {
+       unsigned char masked[12];
+       for (int c = 0; c < 12; c++) masked[c] = (unsigned char)!revealed[c];
+-      int need[4];
+-      for (int j = 0; j < 4; j++) { need[j] = order[p + j]; if (need[j] < 0 || need[j] >= 12) need[j] = 0; }
+-      g_head_need = need; g_head_nneed = 4;
++      int need[6];
++      for (int j = 0; j < G; j++) { need[j] = order[p + j]; if (need[j] < 0 || need[j] >= 12) need[j] = 0; }
++      g_head_need = need; g_head_nneed = G;
+       depth_forward(ents, by, hidden, codes, masked, logits);
+       g_head_need = nullptr; g_head_nneed = 0;
+-      for (int j = 0; j < 4; j++) {
++      for (int j = 0; j < G; j++) {
+         int idx = order[p + j];
+         if (idx < 0 || idx >= 12) { printf("bad order entry %d\n", idx); return 2; }
+         float s[2017];
+@@ -934,7 +968,7 @@ static int maskgit_frame(std::vector<Ent>& ents, std::map<std::string, Ent*>& by
+         printf("pass %ld codes = [", p);
+         for (int c = 0; c < 12; c++) printf("%d%s", revealed[c] ? codes[c] : -1, c == 11 ? "]" : ",");
+         printf("  order = [");
+-        for (int j = 0; j < 4; j++) printf("%d%s", order[p + j], j == 3 ? "]" : ",");
++        for (int j = 0; j < G; j++) printf("%d%s", order[p + j], j == G - 1 ? "]" : ",");
+         printf("  n_hist=%d\n", n_hist);
+         fflush(stdout);
+       }

@@ -2400,3 +2400,21 @@ Audio slot 138 ms = backbone headless ~90 ms + depth server ~42 ms (read 1.7, ma
 - Exact floor estimate: backbone 77-86 + depth ~12-15 + IPC 0 => ~95-100 ms per audio frame,
   RTF ~1.6-1.7 with the text slots. Realtime (RTF <= 1) needs fewer backbone bytes, i.e. a lossy
   backbone format (excluded by the 2026-11 lossless decision) or a faster bus.
+- [LFM3/Nano S2S] Depth-in-backbone single process (UNRESOLVED, needs a clean measurement
+  first): in-engine the depth server costs 37-39 ms/frame (speak's own STIME per call, 97
+  frames over p3) while the ideal from its kernels is ~28. Codec contention is ruled out
+  (streaming on/off: 3.693 vs 3.552 s over 97 frames = 1.4 ms/frame). The standalone-vs-
+  in-engine comparison is NOT usable: the depth blob (243 MB) load varies 1.2-4.8 s with the
+  page cache (identical 60-frame workload measured 2.89, 3.25 and 6.05 s), which swamps a
+  10 ms/frame effect. Method that would settle it: warm both blobs, then run N=200 frames
+  in one depth process (load amortized to <1%) and compare against the STIME per-call figure
+  from the same session. ANSWERED 2026-11-11: warm two-point slope (100 vs 300 frames, one
+  process, load cancels) = 36.4 ms/frame == the in-engine 37-39. There is NO in-engine penalty,
+  so the merge refactor is CLOSED as unnecessary. Depth's own composition per maskgit pass
+  (nvprof): trunk k_q8g<12,2> 5.5 ms (45%, ~15 GB/s of the 21 GB/s bus), head 1.07, attn_gate
+  0.9, silu 0.31, qknorm 0.22; floor ~17 ms/frame vs 36 measured. The trunk lever is the same
+  one #246 failed at (k_q12t), so treat with care: only an in-engine phase A/B counts.
+  ORIGINAL NOTE: If the gap is real (~-0.35 s/turn, ~-7% RTF), the fix is folding the
+  depth trunk into the backbone process (removes the second GPU context and the per-frame
+  file hand-off); it is a multi-hour refactor of two monolith TUs with gate risk, so only
+  worth it with the gap measured, not assumed.
