@@ -497,7 +497,10 @@ int main(int argc, char** argv) {
   int capT = T;
   if (streammode) { capT = argv[3][6] == ':' ? atoi(argv[3] + 7) : 256; if (capT <= 0) capT = 256; }
   const int cap6 = capT * FSTACK;
-  static const int chunkF = getenv("LFM_CODEC_CHUNK") ? atoi(getenv("LFM_CODEC_CHUNK")) : 4;
+  // Streaming chunk in frames (default 8: chunk-8 interleaving matches batch-at-end
+  // generation time while keeping first audio early; chunk 4 costs ~80 ms/turn in SM
+  // contention with the backbone/depth on the one SM -- measured 3/3 CK8 < CK4, 2026-11-11).
+  static const int chunkF = getenv("LFM_CODEC_CHUNK") ? atoi(getenv("LFM_CODEC_CHUNK")) : 8;
 
   std::vector<int32_t> codes;                       // frame-major [t][12] (converted on read)
   auto read_batch = [&]() -> bool {
