@@ -50,8 +50,10 @@ __device__ __forceinline__ void qlow_group(const uint4 w4, const uint32_t hp, co
 // in smem with per-group sums; KS == 1 writes bf16 y (yb, not in place), else partial
 // sums to part[y][row] and k_qlow_combine adds the slices in order. PD groups per iteration
 // (all loads of the next PD groups issued before this iteration's math).
-template <int B, int TPB, int PD>
-__global__ void __launch_bounds__(TPB, 2048 / TPB) k_qlow(const uint4* __restrict__ q, const __half2* __restrict__ s,
+// MINB resident blocks per SM (launch bounds; default full occupancy = 32 registers, which
+// spills for PD > 1).
+template <int B, int TPB, int PD, int MINB = 2048 / TPB>
+__global__ void __launch_bounds__(TPB, MINB) k_qlow(const uint4* __restrict__ q, const __half2* __restrict__ s,
                                                      const unsigned short* __restrict__ x, float* __restrict__ part,
                                                      unsigned short* __restrict__ yb, int N, int K) {
   extern __shared__ float xs[];                  // [KL] then sx[KL/32]

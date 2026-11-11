@@ -1888,8 +1888,17 @@ static void qlow_gemv(const Ent* e, const bf16* x, bf16* y, float* part) {
   const size_t sm = (size_t)(K / KS + K / 32 / KS) * 4;
   const dim3 gr((unsigned)((N + 255) / 256), (unsigned)KS);
   const uint4* q = reinterpret_cast<const uint4*>(e->dq); const __half2* sc = reinterpret_cast<const __half2*>(e->ds);
-  if (e->dtype == 6) k_qlow<4, 256, 1><<<gr, 256, sm, g_launch>>>(q, sc, x, part, y, N, K);
-  else               k_qlow<5, 256, 1><<<gr, 256, sm, g_launch>>>(q, sc, x, part, y, N, K);
+  // LFM_QLOW_PD (default 2): prefetch depth 2 at 4 blocks/SM (64 registers; the
+  // full-occupancy 32-register bound spilled it); 1 = the old PD 1 / 8-block kernel. Same
+  // per-row arithmetic either way (tools_qlow_bench.cu: 5-7% faster per shape).
+  static const int pd = getenv("LFM_QLOW_PD") ? atoi(getenv("LFM_QLOW_PD")) : 2;
+  if (pd == 1) {
+    if (e->dtype == 6) k_qlow<4, 256, 1><<<gr, 256, sm, g_launch>>>(q, sc, x, part, y, N, K);
+    else               k_qlow<5, 256, 1><<<gr, 256, sm, g_launch>>>(q, sc, x, part, y, N, K);
+  } else {
+    if (e->dtype == 6) k_qlow<4, 256, 2, 4><<<gr, 256, sm, g_launch>>>(q, sc, x, part, y, N, K);
+    else               k_qlow<5, 256, 2, 4><<<gr, 256, sm, g_launch>>>(q, sc, x, part, y, N, K);
+  }
   k_qlow_combine<<<(N + 255) / 256, 256, 0, g_launch>>>(part, y, N, KS);
 }
 static void gemv(Model& M, const std::string& name, const bf16* xb, bf16* yb) {
