@@ -18,3 +18,4 @@ __pycache__/
 # mel front-end fixtures are deterministic from the seed in checks_mel.py; the
 # HF references (mel_ref/) ARE committed so the gate runs without torch.
 .auto/lfm3/mel_fix/
+.auto/lfm3/.intel_stamp

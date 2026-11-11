@@ -8,10 +8,14 @@
 #   hidden : per-frame cosine / relative L2 of the hidden row the depth head receives
 #            vs HF's hidden.<f>.f32 (the backbone's state at that frame)
 #   codes  : fraction of the engine's OWN MaskGIT codes (before forcing) equal to HF's
-# Usage: bash .auto/lfm3/s2s_tf.sh [blob ...]   (default: q8 q4g q5g blobs present)
+# Usage: bash .auto/lfm3/s2s_tf.sh [--gate] [blob ...]   (default: q8 + the shipped q5c)
+# --gate: exit 1 unless text == HF, slots == HF, hidden cos min >= 0.99 and rel-L2 mean
+#         <= 0.05 (q5c at adoption: 0.99615 / 0.0398; exact Q8: 0.99979 / 0.0114)
 set -u
 NANO=${NANO:-picard@100.84.151.116}
-BLOBS=${*:-lfm3-audio-2b-q8.lfm3q8 lfm3-audio-2b-q4g.lfm3q8 lfm3-audio-2b-q5g.lfm3q8}
+GATE=0; [ "${1:-}" = "--gate" ] && { GATE=1; shift; }
+BLOBS=${*:-lfm3-audio-2b-q8.lfm3q8 lfm3-audio-2b-q5c.lfm3q8}
+TFOUT=$(
 ssh "$NANO" "bash -s" <<EOF 2>&1 | grep -v setlocale
 cd /home/picard/lfm3
 for bb in $BLOBS; do
@@ -53,6 +57,11 @@ own = [l for l in open('/tmp/tf.depth.log') if l.startswith('maskgit: codes')] i
 A = np.fromfile(ref + '/audio_codes.i32', np.int32); T = len(A) // 12; A = A.reshape(12, T)
 ag = [np.mean([int(x) for x in l.split('[')[1].split(']')[0].split(',')] == A[:, f]) for f, l in enumerate(own) if f < T]
 print('  codes  own == HF: %.3f over %d frames (frame 0: %.2f)' % (np.mean(ag) if ag else -1, len(ag), ag[0] if ag else -1))
+ok = len(t) == len(r) and first == n and s == open(ref + '/slots.txt').read() and len(cs) > 0 and cs.min() >= 0.99 and rl.mean() <= 0.05
+print('  TF_GATE_%s' % ('OK' if ok else 'FAIL'))
 PY
 done
 EOF
+)
+echo "$TFOUT"
+[ $GATE = 0 ] || ! echo "$TFOUT" | grep -q "TF_GATE_FAIL\|not on the board"

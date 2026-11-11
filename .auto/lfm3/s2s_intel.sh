@@ -6,10 +6,12 @@
 # (lfm3_asr, after a 24 -> 16 kHz resample on the host) and report the word error rate of
 # the transcript against the turn's own text.
 # Usage: bash .auto/lfm3/s2s_intel.sh [blob ...]
+# Exit 1 if any blob's overall WER exceeds INTEL_MAX (default 0.05) or a turn is missing.
 set -u
 NANO=${NANO:-picard@100.84.151.116}
 PY=${PY:-/home/louis/venvs/lfm3/bin/python}
 BLOBS=${*:-lfm3-audio-2b-q8.lfm3q8}
+FAIL=0
 W=/tmp/s2s_intel; rm -rf $W; mkdir -p $W
 HERE=$(cd "$(dirname "$0")" && pwd)
 $PY - "$W" <<'PY'
@@ -42,7 +44,7 @@ PY
   ssh "$NANO" "cd /home/picard/lfm3; for k in 0 1 2 3 4; do [ -s $W/t\${k}_16k.wav ] && timeout 900 ./lfm3_asr . $W/t\${k}_16k.wav 96 --out-ids $W/a\$k.i32 > $W/a\$k.out 2>&1; done" 2>&1 | grep -v setlocale
   scp -q "$NANO:$W/a?.i32" $W/ 2>/dev/null
   echo "== $bb"
-  $PY - "$W" <<'PY'
+  INTEL_MAX=${INTEL_MAX:-0.05} $PY - "$W" <<'PY'
 import sys, os, re, numpy as np
 from transformers import AutoTokenizer
 W = sys.argv[1]
@@ -58,12 +60,18 @@ def wer(r, h):
 tot_e = tot_n = 0
 for k in range(5):
     t, a = "%s/t%d.text.i32" % (W, k), "%s/a%d.i32" % (W, k)
-    if not (os.path.exists(t) and os.path.exists(a)): print("  p%d: missing outputs" % k); continue
+    if not (os.path.exists(t) and os.path.exists(a)): print("  p%d: missing outputs" % k); tot_n = -10**9; continue
     ref = tok.decode(np.fromfile(t, np.int32), skip_special_tokens=True)
     hyp = tok.decode(np.fromfile(a, np.int32), skip_special_tokens=True)
     r, h = norm(ref), norm(hyp); e = wer(r, h)
     tot_e += e * len(r); tot_n += len(r)
     print("  p%d WER %.2f | text: %s\n       heard: %s" % (k, e, " ".join(r)[:90], " ".join(h)[:90]))
-print("  overall WER %.3f over %d words" % (tot_e / max(1, tot_n), tot_n))
+w = tot_e / max(1, tot_n)
+print("  overall WER %.3f over %d words" % (w, tot_n))
+sys.exit(0 if tot_n > 0 and w <= float(os.environ["INTEL_MAX"]) else 1)
 PY
+  [ $? = 0 ] && echo "  INTEL_GATE_OK" || { echo "  INTEL_GATE_FAIL"; FAIL=1; }
+  rm -f $W/t?.wav $W/t?_16k.wav $W/a?.i32 $W/t?.text.i32
+  ssh "$NANO" "rm -f $W/t* $W/a*" 2>/dev/null
 done
+exit $FAIL
