@@ -48,7 +48,7 @@ for spec in $CLIPS; do
   [ -s "$ADIR/golden_$lang.i32" ] || fail "missing $ADIR/golden_$lang.i32 (freeze it with: lfm3_asr --out-ids)"
 done
 
-OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' ASR_MODE='$ASR_MODE' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
+OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' ASR_MODE='$ASR_MODE' PFRUN='${PFRUN:-32}' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
 set -u
 cd "$LFM_DIR" || exit 2
 for spec in $CLIPS; do
@@ -65,13 +65,38 @@ if [ "$ASR_MODE" = warm ]; then
   # session -- and the server reopens the path and waits for the next caller. Its load is
   # reported, never hidden: it is a boot cost, not a per-turn one.
   rm -f $SRV_IN $SRV_LOG; mkfifo $SRV_IN; : > $SRV_LOG
+  # Cold boot, so SERVICELOAD is a real first-invocation number and comparable between arms
+  # (the same posix_fadvise trick the S2T harness uses; a previous run or probe can leave the
+  # 1.946 GB blob cached and make the load look 20 s faster than it is).
+  python3 -c "
+import os
+for p in ['lfm3-audio-2b-q8.lfm3q8','lfm3-audio-2b-enc.lfm3q8','tok.bin','mel.bin']:
+    try:
+        fd=os.open(os.path.realpath(p),os.O_RDONLY); os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED); os.close(fd)
+    except OSError: pass
+" 2>/dev/null
   t0=$(date +%s.%N)
-  ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $SRV_IN > $SRV_LOG 2>&1 &
+  # --prefill-run is the same flag the one-shot path passes (the prompt goes through the
+  # backbone 32 positions at a time, one launch per GEMV sharing each weight load: 34.8 ms per
+  # position against 87.5 ms unbatched, bit-identical per its own note). The service, not the
+  # client, runs the prefill, so it is the service that has to be started with it.
+  ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $SRV_IN ${PFRUN:+--prefill-run $PFRUN} > $SRV_LOG 2>&1 &
   SRV=$!
   i=0; while [ $i -lt 240 ]; do grep -q "CLIP_AWAIT 0" $SRV_LOG 2>/dev/null && break; sleep 0.5; i=$((i+1)); done
   grep -q "CLIP_AWAIT 0" $SRV_LOG 2>/dev/null || { echo "SERVICE_FAIL (see $SRV_LOG)"; kill $SRV 2>/dev/null; exit 1; }
   t1=$(date +%s.%N)
   python3 -c "print('SERVICELOAD %.3f' % ($t1-$t0))"
+  # Untimed warm-up turn. 'Ready to accept a turn' is not the same as 'the backbone is resident':
+  # with --prefill-run the loader parses the blob and defers the upload to the first prefill, so
+  # without this the user's FIRST question absorbs the blob read and the upload. A deployed
+  # service is started and poked before anyone talks to it, so the warm-up is part of boot here
+  # and is reported as WARMUP rather than being hidden.
+  first=${CLIPS%% *}; warmclip=${first#*:}
+  t2=$(date +%s.%N)
+  ./lfm3_asr . "$warmclip" "$ASR_MAXTOK" --out-ids /tmp/cmb.warm.i32 \
+    --serve-in $SRV_IN --serve-log $SRV_LOG > /tmp/cmb.warm.log 2>&1 || echo "SERVICE_FAIL warm-up"
+  t3=$(date +%s.%N)
+  python3 -c "print('WARMUP %.3f' % ($t3-$t2))"
 fi
 for spec in $CLIPS; do
   lang=${spec%%:*}; clip=${spec#*:}
@@ -99,7 +124,7 @@ python3 -c "print('TTS %.3f' % ($t1-$t0))"
 grep -o "SNDR=[0-9.]*" /tmp/cmb.tts.log | tail -1 | cut -d= -f2 | sed 's/^/TTS_SNDRdB /'
 REMOTE
 )
-echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD)" | sed 's/^/  /'
+echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD|WARMUP)" | sed 's/^/  /'
 echo "$OUT" | grep -q "ASR_FAIL\|TTS_FAIL\|SERVICE_FAIL" && { echo "GATE FAIL: a stage failed"; exit 1; }
 
 # ---- quality gates
