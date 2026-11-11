@@ -34,6 +34,7 @@ struct Ent {
   int8_t* dq = nullptr; float* ds = nullptr; float* df = nullptr;
   int8_t* gq = nullptr; float* gs = nullptr;   // device copies of a Q8 tensor (GPU path)
   float* gf = nullptr;                         // device copy of an f32 tensor (GPU trunk)
+  int* tq = nullptr; float* tts = nullptr;     // 32-row tiled device copy (k_q8t1 T=1 path)
 };
 
 // (loader copied from lfm3_nanode.cu pattern - simplified)
@@ -152,6 +153,86 @@ static const void* dev_of(const void* h, bool scales) {
   printf("dev_of: pointer not in any uploaded tensor\n"); exit(3);
 }
 static void q8g_t1(dim3 grid, const int8_t* q, const float* s, const float* X, float* Y, int N, int K);
+
+// ---- k_q8t1: T=1 Q8 GEMV on 32-row tiled weights, lane = row (LFM_DEPTH_T1Q) --------
+// Tile layout per group of 32 codes along K: 8 int slots x 32 rows (slot k holds the 32
+// rows' k-th code-int contiguously: a warp loads 128 coalesced bytes), then 32 scales.
+// Per row: acc = 0; groups ascending; codes ascending:
+//   acc = fmaf(fmul((float)code, scale), x, acc) -- k_q8g's contract exactly
+// (tools_q8t1_bench.cu: bit-identical to k_q8g<1,1,2>, 1.7-1.8x on dl+head shapes).
+template <int PD, int MINB>
+__global__ void __launch_bounds__(256, MINB) k_q8t1(const int* __restrict__ q, const float* __restrict__ s,
+                                                    const float* __restrict__ x, float* __restrict__ y,
+                                                    int row0, int N, int K) {
+  extern __shared__ float xs[];
+  const int G = K / 32, tid = threadIdx.x;
+  for (int i = tid; i < K; i += 256) xs[i] = x[i];
+  __syncthreads();
+  const int row = blockIdx.x * 256 + tid;
+  if (row >= N) return;
+  const size_t grow = (size_t)row0 + row, tile = grow >> 5, lane = grow & 31, tg = tile * (size_t)G;
+  float yv = 0.f;
+  int nw[PD * 8]; float ns[PD];
+  #pragma unroll
+  for (int u = 0; u < PD; u++) {
+    const size_t b = (tg + u) * 256;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) nw[u * 8 + k] = q[b + (size_t)k * 32 + lane];
+    ns[u] = s[(tg + u) * 32 + lane];
+  }
+  for (int g = 0; g < G; g += PD) {
+    int w[PD * 8]; float sc[PD];
+    #pragma unroll
+    for (int u = 0; u < PD; u++) {
+      #pragma unroll
+      for (int k = 0; k < 8; k++) w[u * 8 + k] = nw[u * 8 + k];
+      sc[u] = ns[u];
+    }
+    if (g + PD < G) {
+      #pragma unroll
+      for (int u = 0; u < PD; u++) {
+        const size_t b = (tg + (size_t)g + PD + u) * 256;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) nw[u * 8 + k] = q[b + (size_t)k * 32 + lane];
+        ns[u] = s[(tg + (size_t)g + PD + u) * 32 + lane];
+      }
+    }
+    #pragma unroll
+    for (int u = 0; u < PD; u++) {
+      #pragma unroll
+      for (int k = 0; k < 8; k++) {
+        const int v = w[u * 8 + k];
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const float wf = __fmul_rn((float)(signed char)(v >> (8 * j)), sc[u]);
+          yv = __fmaf_rn(wf, xs[(size_t)(g + u) * 32 + k * 4 + j], yv);
+        }
+      }
+    }
+  }
+  y[row] = yv;
+}
+
+// tile one row-major [N, K] Q8 tensor (codes + per-32 scales) into tq/tts device buffers.
+static void tile_upload_q8t1(Ent* e, int N, int K) {
+  const int G = K / 32;
+  const size_t tiles = ((size_t)N + 31) / 32;
+  std::vector<int> ht(tiles * G * 256, 0);
+  std::vector<float> hs(tiles * G * 32, 0.f);
+  for (int t = 0; t < N; t += 32)
+    for (int g = 0; g < G; g++)
+      for (int r = 0; r < 32 && t + r < N; r++) {
+        const int* src = (const int*)(e->dq + (size_t)(t + r) * K + g * 32);
+        int* d = ht.data() + ((size_t)(t >> 5) * G + g) * 256 + r;
+        for (int k = 0; k < 8; k++) d[k * 32] = src[k];
+        hs[((size_t)(t >> 5) * G + g) * 32 + r] = e->ds[(size_t)(t + r) * G + g];
+      }
+  if (cudaMalloc(&e->tq, ht.size() * 4) || cudaMalloc(&e->tts, hs.size() * 4)) {
+    printf("tile_upload %s: cudaMalloc failed\n", e->name.c_str()); exit(3); }
+  if (cudaMemcpy(e->tq, ht.data(), ht.size() * 4, cudaMemcpyHostToDevice) ||
+      cudaMemcpy(e->tts, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice)) {
+    printf("tile_upload %s: copy failed\n", e->name.c_str()); exit(3); }
+}
 static void gpu_gemm(const int8_t* q, const float* s, const float* X, int ldx,
                      float* Y, int ldy, int N, int K, int T) {
   static float *dX = nullptr, *dY = nullptr;
@@ -480,7 +561,23 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
   // (LFM_DEPTH_DLC, default 1). Same computation, so the same bytes either way.
   static float dl_h[2048], dl_y[12 * 1024]; static bool dl_ok = false;
   static const int dlc = getenv("LFM_DEPTH_DLC") ? atoi(getenv("LFM_DEPTH_DLC")) : 1;
+  static const int t1d = getenv("LFM_DEPTH_T1D") ? atoi(getenv("LFM_DEPTH_T1D")) : 1;
   if (dlc && dl_ok && !memcmp(dl_h, hidden, sizeof dl_h)) memcpy(depth_in, dl_y, sizeof dl_y);
+  else if (t1d && g_gpu && dl->tq) {
+    // depth_linear on the GPU (k_q8t1): same per-output chain as the NEON q8_gemv1,
+    // gated by the turn wav md5 + TF hidden states (NEON vfma is fused, GPU is
+    // fmul+fmaf: bit-identity is empirical, not algebraic).
+    static float *ddh = nullptr, *ddi = nullptr;
+    if (!ddh) {
+      if (cudaMalloc(&ddh, sizeof dl_h) || cudaMalloc(&ddi, sizeof depth_in)) {
+        printf("depth_linear gpu buffers: cudaMalloc failed\n"); exit(3); }
+    }
+    if (cudaMemcpy(ddh, hidden, sizeof dl_h, cudaMemcpyHostToDevice)) exit(3);
+    k_q8t1<2, 4><<<(12 * DH + 255) / 256, 256, (size_t)SH * 4>>>(dl->tq, dl->tts, ddh, ddi, 0, 12 * DH, SH);
+    if (cudaMemcpy(depth_in, ddi, sizeof depth_in, cudaMemcpyDeviceToHost)) exit(3);
+    if (cudaGetLastError() != cudaSuccess) { printf("depth_linear k_q8t1 launch failed\n"); exit(3); }
+    if (dlc) { memcpy(dl_h, hidden, sizeof dl_h); memcpy(dl_y, depth_in, sizeof dl_y); dl_ok = true; }
+  }
   else {
     q8_gemv(dl->dq, dl->ds, hidden, depth_in, 12 * DH, SH);
     if (dlc) { memcpy(dl_h, hidden, sizeof dl_h); memcpy(dl_y, depth_in, sizeof dl_y); dl_ok = true; }
@@ -594,7 +691,18 @@ static void depth_forward(std::vector<Ent>& ents, std::map<std::string, Ent*>& b
     DT_MARK(6);
     Ent* head = get("depth_head_stacked.weight");
     static const int hsel = getenv("LFM_DEPTH_HSEL") ? atoi(getenv("LFM_DEPTH_HSEL")) : 1;
-    if (hsel && g_head_need) {
+    static const int t1h = getenv("LFM_DEPTH_T1H") ? atoi(getenv("LFM_DEPTH_T1H")) : 1;
+    auto head_t1 = [&](int c) {
+      // k_q8t1 on the codebook's slice of the stacked tiled tensor (row0 = c*CBS).
+      // Bit-identical to q8g_t1 (tools_q8t1_bench.cu: maxdiff 0 on CBSxDH).
+      k_q8t1<2, 4><<<(CBS + 255) / 256, 256, (size_t)DH * 4>>>(
+          head->tq, head->tts, dh4 + (size_t)c * DH, dlg + (size_t)c * CBS, c * CBS, CBS, DH);
+    };
+    if (t1h && head->tq && hsel && g_head_need) {
+      for (int j = 0; j < g_head_nneed; j++) head_t1(g_head_need[j]);
+    } else if (t1h && head->tq && !hsel) {
+      for (int c = 0; c < NCB; c++) head_t1(c);
+    } else if (hsel && g_head_need) {
       for (int j = 0; j < g_head_nneed; j++) {
         const int c = g_head_need[j];
         q8g_t1(dim3((unsigned)((CBS + 127) / 128), 1u), head->gq + (size_t)c * CBS * DH,
@@ -903,6 +1011,22 @@ int main(int argc, char** argv) {
     }
     if (cudaGetLastError()) { printf("depth gpu: upload failed\n"); return 3; }
     fprintf(stderr, "depth gpu: %.1f MB of Q8 weights resident\n", up / 1048576.0);
+    // 32-row tiled copies for the k_q8t1 T=1 path (LFM_DEPTH_T1H/T1D): depth_linear
+    // [12288, 2048] and the stacked head [12, 2017, 1024] (one N = 12*2017 tiling;
+    // codebook c is rows [c*2017, c*2017+2017)). Sizes asserted, never assumed.
+    auto tile_one = [&](const char* name, int N, int K) {
+      auto it = by.find(name);
+      if (it == by.end() || !it->second->gq) { printf("tile %s: tensor not uploaded\n", name); exit(3); }
+      Ent* e = it->second;
+      // NOTE: the blob's nscales is BYTES (scales.nbytes), and the loader reads that many
+      // floats, so e.ns is 4x the scale count; the kernels only ever read the first quarter
+      // (the real scales). Assert in the same units the blob uses.
+      if (e->nc != (size_t)N * K || e->ns != (size_t)N * (K / 32) * 4) {
+        printf("tile %s: size mismatch nc=%zu ns=%zu, want N=%d K=%d\n", name, e->nc, e->ns, N, K); exit(3); }
+      tile_upload_q8t1(e, N, K);
+    };
+    tile_one("depth_linear.weight", 12 * 1024, 2048);
+    tile_one("depth_head_stacked.weight", 12 * 2017, 1024);
   }
 
   /* Resident mode: lfm3_depth <blob> --serve. The blob is loaded once; each stdin line
