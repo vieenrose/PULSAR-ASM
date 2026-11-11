@@ -40,6 +40,20 @@ metrics) + X (exact Q8). Outputs METRIC lines. ~4 min bench + ~14 min checks.
 - tools_qlow_bench.cu iterations are bench-only (no gates); engine changes need full harness.
 
 ## What's Been Tried (S2S; S2T history in log runs 1-213)
+- #245 depth T=1 tiled kernel k_q8t1 KEPT (head + depth_linear, exact, kernel 1.7x, turn ~-90ms).
+- Q5 attention DECLINED offline (no board time): RTN-Q5 attention-only = text KL 0.0025 (q8-eng 0.0013)
+  + speech rel-L2 0.044 (q8-eng 0.012); full-Q5 RTN = KL 0.0131 top-1 45/48 + speech 0.093.
+  GPTQ+speech roughly halves RTN error (q5c precedent) -> ~0.007 KL, still worse than q5c's
+  0.0049 with top-1 risk at the logit-gate floors. The ~300MB/step saving is not worth it.
+- T=12 tiled trunk kernel k_q12t MEASURED OUT (reverted, no repo trace): bit-exact (maxdiff 0)
+  and 2.4x faster than k_q8g<12,2> on w1 [2816,1024] in a standalone bench, but 2x SLOWER
+  in-engine (ffn phases 331 vs 158 ms/turn, same-binary A/B; harness 2.01 vs 1.96). RR=1 for
+  N>2048 also slower in-engine (ffn 261 vs 158). The trunk stays on k_q8g<12,2>/<12,1,2>.
+- METHODOLOGY CORRECTION (same root cause as #42): bursty microbenches run below the boost
+  clock and flatter compute-bound kernels -- k_q12t looked 2.4x faster stood alone, 2x slower
+  in the sustained engine. In-engine same-binary phase A/B (LFM_DEPTH_TIME totals, or the
+  harness pair) is the ONLY valid GEMV comparison. Bench ratios are valid only within one
+  binary back-to-back AND at matched clocks; when bench and engine disagree, engine wins.
 - #214 baseline 3.44 (150-slot cap fix + Q8 default). #215 codec early -13.9%. #216 depth KB=2 -4%.
 - #217 depth rms rows2. #220 tmpfs scratch. #222 iSTFT table. #223 codec OpenMP. #226 graphs repaired but slower (reverted default off).
 - #227 skip lm_head on audio slots -7%. #228 depth head-select -2%. #229 depth last-layer row-select -2.9%.
