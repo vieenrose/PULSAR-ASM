@@ -5014,6 +5014,7 @@ int main(int argc, char** argv) {
   const char* audio_emb_file = nullptr;   // --audio-emb (ASR path)
   std::vector<std::string> clip_files;  // --clip SPEC repeated: resident multi-clip ASR
   bool clip_stdin = false;              // --clip-stdin: one SPEC path per turn on stdin (ASR service)
+  const char* clip_fifo = nullptr;      // --clip-fifo PATH: reopen it on EOF (each turn is its own client)
   int stop_id_arg = -1;                 // --stop-id N; a SPEC's line 5 overrides it per clip
   const char* dump_logits = nullptr;
   const char* dump_logits_all = nullptr;   // every decode step, appended (gate: top-k vs HF)
@@ -5042,6 +5043,7 @@ int main(int argc, char** argv) {
     }
     else if (!strcmp(argv[i], "--clip") && i + 1 < argc) clip_files.push_back(argv[++i]);
     else if (!strcmp(argv[i], "--clip-stdin")) clip_stdin = true;
+    else if (!strcmp(argv[i], "--clip-fifo") && i + 1 < argc) { clip_stdin = true; clip_fifo = argv[++i]; }
     else if (!strcmp(argv[i], "--stop-id") && i + 1 < argc) stop_id_arg = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--audio-emb") && i + 1 < argc) {
       audio_emb_file = argv[++i];
@@ -5330,7 +5332,15 @@ int main(int argc, char** argv) {
   if (clip_stdin) {
     char ln[4096];
     printf("CLIP_AWAIT %d\n", cl); fflush(stdout);
-    if (!fgets(ln, sizeof ln, stdin)) break;
+    if (!fgets(ln, sizeof ln, stdin)) {
+      // A service outlives its clients: every ASR turn is its own process, so when the last
+      // writer closes the fifo the read side returns EOF -- that is the end of a TURN's writer,
+      // not of the session. Reopen the same path (open on a fifo for reading blocks until the
+      // next writer arrives) and keep serving. Without a --clip-fifo path there is nothing to
+      // reopen and EOF stays the end of the run, which is what a piped-in batch means.
+      if (clip_fifo && freopen(clip_fifo, "r", stdin)) { printf("CLIP_EOF reopened %s\n", clip_fifo); fflush(stdout); continue; }
+      break;
+    }
     char* nl = strchr(ln, '\n'); if (nl) *nl = 0;
     if (!ln[0] || !strcmp(ln, "Q")) break;
     spec = ln;

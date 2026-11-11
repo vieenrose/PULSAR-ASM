@@ -40,7 +40,7 @@ free_mb=$(ssh -o ConnectTimeout=8 "$NANO" 'free -m | sed -n 2p | tr -s " " | cut
 [ -n "$free_mb" ] || fail "cannot read free RAM on $NANO"
 [ "$free_mb" -ge 60 ] || fail "Nano free RAM ${free_mb} MB < 60 MB guard"
 
-[ "$ASR_MODE" = cold ] || fail "ASR_MODE=$ASR_MODE: the resident ASR service is not built yet (only 'cold' exists)"
+[ "$ASR_MODE" = cold ] || [ "$ASR_MODE" = warm ] || fail "ASR_MODE=$ASR_MODE (cold | warm)"
 
 # ---- fixture checks: goldens must exist and the clips must be the frozen ones
 for spec in $CLIPS; do
@@ -48,22 +48,49 @@ for spec in $CLIPS; do
   [ -s "$ADIR/golden_$lang.i32" ] || fail "missing $ADIR/golden_$lang.i32 (freeze it with: lfm3_asr --out-ids)"
 done
 
-OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
+OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' ASR_MODE='$ASR_MODE' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
 set -u
 cd "$LFM_DIR" || exit 2
 for spec in $CLIPS; do
   lang=${spec%%:*}; clip=${spec#*:}
   python3 -c "import wave,sys; w=wave.open(sys.argv[2]); print('CLIPSEC %s %.3f' % (sys.argv[1], w.getnframes()/w.getframerate()))" "$lang" "$clip"
 done
+SRV_IN=/tmp/cmb.srv.in; SRV_LOG=/tmp/cmb.srv.log
+if [ "$ASR_MODE" = warm ]; then
+  # The resident service: one lfm3_nanode --clip-stdin for the whole session. It pays the
+  # 1.946 GB blob read (21.2 s of eMMC at 92 MB/s, device-bound) plus parse/CRC/upload once, and
+  # prints CLIP_AWAIT n when it is ready for a turn. --clip-fifo (not a redirected stdin) is what
+  # makes it a SERVICE rather than a batch: each ASR turn is its own client process, so when the
+  # last writer closes the fifo the read side sees EOF -- the end of a turn's writer, not of the
+  # session -- and the server reopens the path and waits for the next caller. Its load is
+  # reported, never hidden: it is a boot cost, not a per-turn one.
+  rm -f $SRV_IN $SRV_LOG; mkfifo $SRV_IN; : > $SRV_LOG
+  t0=$(date +%s.%N)
+  ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $SRV_IN > $SRV_LOG 2>&1 &
+  SRV=$!
+  i=0; while [ $i -lt 240 ]; do grep -q "CLIP_AWAIT 0" $SRV_LOG 2>/dev/null && break; sleep 0.5; i=$((i+1)); done
+  grep -q "CLIP_AWAIT 0" $SRV_LOG 2>/dev/null || { echo "SERVICE_FAIL (see $SRV_LOG)"; kill $SRV 2>/dev/null; exit 1; }
+  t1=$(date +%s.%N)
+  python3 -c "print('SERVICELOAD %.3f' % ($t1-$t0))"
+fi
 for spec in $CLIPS; do
   lang=${spec%%:*}; clip=${spec#*:}
   rm -f "/tmp/cmb.$lang.i32" "/tmp/cmb.$lang.log"
   t0=$(date +%s.%N)
-  ./lfm3_asr . "$clip" "$ASR_MAXTOK" --out-ids "/tmp/cmb.$lang.i32" > "/tmp/cmb.$lang.log" 2>&1 || { echo "ASR_FAIL $lang"; continue; }
+  if [ "$ASR_MODE" = warm ]; then
+    ./lfm3_asr . "$clip" "$ASR_MAXTOK" --out-ids "/tmp/cmb.$lang.i32" \
+      --serve-in $SRV_IN --serve-log $SRV_LOG > "/tmp/cmb.$lang.log" 2>&1 || { echo "ASR_FAIL $lang"; continue; }
+  else
+    ./lfm3_asr . "$clip" "$ASR_MAXTOK" --out-ids "/tmp/cmb.$lang.i32" > "/tmp/cmb.$lang.log" 2>&1 || { echo "ASR_FAIL $lang"; continue; }
+  fi
   t1=$(date +%s.%N)
   python3 -c "print('ASR %s %.3f' % ('$lang', $t1-$t0))"
   tail -1 "/tmp/cmb.$lang.log" | grep -q TRANSCRIPT || echo "ASR_NOTE $lang: no transcript line"
 done
+if [ "$ASR_MODE" = warm ]; then
+  for i in $(seq 1 40); do kill -0 $SRV 2>/dev/null || break; echo Q > $SRV_IN 2>/dev/null; sleep 0.25; done
+  kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; rm -f $SRV_IN
+fi
 cd "$PT_DIR" || exit 2
 t0=$(date +%s.%N)
 ./build/pt_v21_nano --container build/v21.ptk --case "tests/golden_v21/$REPLY_CASE" > /tmp/cmb.tts.log 2>&1 || echo "TTS_FAIL"
@@ -72,8 +99,8 @@ python3 -c "print('TTS %.3f' % ($t1-$t0))"
 grep -o "SNDR=[0-9.]*" /tmp/cmb.tts.log | tail -1 | cut -d= -f2 | sed 's/^/TTS_SNDRdB /'
 REMOTE
 )
-echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC)" | sed 's/^/  /'
-echo "$OUT" | grep -q "ASR_FAIL\|TTS_FAIL" && { echo "GATE FAIL: a stage failed"; exit 1; }
+echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD)" | sed 's/^/  /'
+echo "$OUT" | grep -q "ASR_FAIL\|TTS_FAIL\|SERVICE_FAIL" && { echo "GATE FAIL: a stage failed"; exit 1; }
 
 # ---- quality gates
 ok=1

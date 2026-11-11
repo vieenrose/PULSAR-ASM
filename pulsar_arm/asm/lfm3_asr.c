@@ -37,6 +37,8 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <errno.h>
+#include <time.h>
 #include "lfm3_tok.h"
 
 /* ------------------------------------------------------------------ sha256 (FIPS 180-4)
@@ -175,6 +177,11 @@ static void reap_capture(pid_t pid, char *const argv[], const char *out) {
                                                   argv[0], WIFEXITED(st) ? WEXITSTATUS(st) : -1, out);
 }
 static void stage(const char *what) { printf("STAGE %d  %s\n", ++stage_no, what); fflush(stdout); }
+
+static double now_s(void) {
+  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
 static void need_file(const char *p, long min_bytes, const char *what) {
   long n = file_size(p);
   if (n < min_bytes) die("%s produced %ld bytes at %s (expected >= %ld)", what, n, p, min_bytes);
@@ -225,6 +232,19 @@ int main(int argc, char **argv) {
      followed by that one, with no Python in between. */
   const char *out_ids = NULL;
   int tokens_only = 0;
+  /* Resident-backbone service client. --serve-in/--serve-log name the fifo and the log file of
+     a `lfm3_nanode <blob> --clip-stdin` process that is ALREADY running (the harness starts it
+     once). Everything else about the turn is unchanged -- mel, encoder, prompt build, collector,
+     detokenizer all run exactly as in the one-shot path -- so the per-turn ids are the same bits
+     the cold path produces, and the goldens gate the two against each other. It exists because
+     the 1.946 GB backbone costs 21.2 s of eMMC read (92 MB/s at any thread count: device-bound,
+     run #257) plus ~8 s of parse/CRC/upload per process, against ~5 s of actual compute. */
+  const char *srv_in = NULL, *srv_log = NULL;
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--serve-in") && i + 1 < argc) srv_in = argv[++i];
+    else if (!strcmp(argv[i], "--serve-log") && i + 1 < argc) srv_log = argv[++i];
+  }
+  if ((srv_in == NULL) != (srv_log == NULL)) die("--serve-in and --serve-log come as a pair");
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--out-ids") && i + 1 < argc) out_ids = argv[++i];
     else if (!strcmp(argv[i], "--tokens-only")) tokens_only = 1;
@@ -393,14 +413,58 @@ int main(int argc, char **argv) {
   char *av[] = { (char*)"lfm3_nanode", BB, embp, early ? PUB : OUT, ata, atv, pp, idstr, stq, stv,
                  siq, siv,
                  pfrun >= 2 ? pfr : NULL, pfv, NULL };
-  if (early) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
+  if (early && !srv_in) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
   { pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu"); }
   need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
   { long rows = file_size(OUT) / (2048 * 4);
     if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",
                              rows, n_audio); }
   stage("backbone prefill + greedy decode");
-  if (early) {
+  if (srv_in) {
+    /* Resident-backbone arm: hand this clip to the live service and collect its answer.
+       The spec carries emb, ids, audio-at, ngen and the stop id; only its PATH goes down the
+       fifo, then the log is read from the size it had before the write -- the service is blocked
+       in fgets() right now (the previous turn's client consumed its DONE line), so nothing it
+       writes can be missed and nothing from an earlier turn is re-read. Everything downstream
+       (stage 6's collector, the detokenizer, the goldens) is the one-shot path's, unchanged. */
+    char specf[1100]; snprintf(specf, sizeof specf, "/tmp/lfm3_asr.%ld.spec.txt", (long)getpid());
+    unlink(specf);
+    FILE* sf = fopen(specf, "w");
+    if (!sf) die("cannot write %s", specf);
+    fprintf(sf, "%s\n%s\n%ld\n%d\n%s\n", OUT, idstr, audio_at, max_gen,
+            (getenv("LFM_ASR_STOPID") && !atoi(getenv("LFM_ASR_STOPID"))) ? "-1" : siv);
+    fclose(sf);
+    long s0 = file_size(srv_log);
+    int wf = open(srv_in, O_WRONLY | O_NONBLOCK);
+    if (wf < 0) die("--serve-in %s: cannot open for writing (%s) -- is the resident backbone running?", srv_in, strerror(errno));
+    size_t sl = strlen(specf);
+    if (write(wf, specf, sl) != (ssize_t)sl || write(wf, "\n", 1) != 1) die("--serve-in write failed");
+    close(wf);
+    int rf = open(srv_log, O_RDONLY);
+    if (rf < 0) die("cannot open %s", srv_log);
+    if (lseek(rf, (off_t)s0, SEEK_SET) != (off_t)s0) die("--serve-log seek");
+    FILE* ef = fopen(eng, "w");
+    if (!ef) die("cannot write %s", eng);
+    char lb[8192]; size_t lh = 0; int done = 0; double wt0 = now_s();
+    while (!done) {
+      ssize_t got = read(rf, lb + lh, sizeof lb - lh - 1);
+      if (got <= 0) {
+        if (now_s() - wt0 > 900.0) die("the resident backbone produced nothing for 900 s (see %s)", srv_log);
+        struct timespec ts = {0, 20000000}; nanosleep(&ts, NULL);
+        continue;
+      }
+      lh += (size_t)got;
+      char* nl;
+      while ((nl = memchr(lb, '\n', lh))) {
+        *nl = 0;
+        fputs(lb, ef); fputc('\n', ef);
+        if (strncmp(lb, "CLIP ", 5) == 0 && strstr(lb, "DONE steps=")) done = 1;
+        lh -= (size_t)(nl - lb) + 1;
+        memmove(lb, nl + 1, lh);
+      }
+    }
+    fclose(ef); close(rf);
+  } else if (early) {
     if (rename(OUT, PUB) != 0) die("cannot publish %s", PUB);
     snprintf(WORK_OUT, sizeof WORK_OUT, "%s", PUB);
     pid_t bp = g_bb_pid; g_bb_pid = 0; reap_capture(bp, av, eng);
