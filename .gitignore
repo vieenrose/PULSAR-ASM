@@ -19,3 +19,4 @@ __pycache__/
 # HF references (mel_ref/) ARE committed so the gate runs without torch.
 .auto/lfm3/mel_fix/
 .auto/lfm3/.intel_stamp
+.auto/lfm3/.gates_stamp
