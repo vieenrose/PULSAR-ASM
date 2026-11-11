@@ -374,6 +374,14 @@ int main(int argc, char **argv) {
   char pfr[32], pfv[32];
   const int pfrun = getenv("LFM_ASR_PFRUN") ? atoi(getenv("LFM_ASR_PFRUN")) : 32;
   snprintf(pfr, sizeof pfr, "--prefill-run"); snprintf(pfv, sizeof pfv, "%d", pfrun);
+  /* Stop the greedy loop at the transcript's eos. Stage 6 has always broken its collection
+     there, so the steps between the eos and max_gen computed ids that no one read: on the 9 s
+     fixtures max_gen=96 against transcripts of 9 (zh) / 18 (en) ids, ~8-9 s of the turn.
+     LFM_ASR_STOPID=0 sends -1 (run to max_gen, the A/B control arm). */
+  char siq[32], siv[32];
+  snprintf(siq, sizeof siq, "--stop-id");
+  snprintf(siv, sizeof siv, "%ld",
+           (getenv("LFM_ASR_STOPID") && !atoi(getenv("LFM_ASR_STOPID"))) ? -1L : eos);
   /* LFM_ASR_EARLYBB (default 1): the backbone starts now, while the encoder still runs.
      Its CUDA init, blob parse and the upload of layers 0-1 overlap the encoder; it then
      waits (LFM_AEMB_WAIT) for PUB, which appears by rename only after the encoder was
@@ -383,6 +391,7 @@ int main(int argc, char **argv) {
   char PUB[1100]; snprintf(PUB, sizeof PUB, "%s.ready", OUT);
   unlink(PUB);
   char *av[] = { (char*)"lfm3_nanode", BB, embp, early ? PUB : OUT, ata, atv, pp, idstr, stq, stv,
+                 siq, siv,
                  pfrun >= 2 ? pfr : NULL, pfv, NULL };
   if (early) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
   { pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu"); }

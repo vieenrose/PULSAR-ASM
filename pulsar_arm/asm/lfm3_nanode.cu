@@ -1071,6 +1071,13 @@ static const bool g_stream = getenv("LFM_STREAM") != nullptr;
 // overhead to save.
 static const bool g_graphs = getenv("LFM_GRAPHS") != nullptr;
 static int g_serve_nohead = -100;   // serve: step whose lm_head the controller does not need
+// --stop-id N (default -1 = off): stop the greedy loop after a GENERATION step emits token N.
+// The ASR caller has always discarded everything past its eos token (stage 6 breaks on it), so
+// those steps computed ids nobody read: on the 9 s fixtures the transcripts are 9 (zh) and 18
+// (en) ids but the run went to max_gen=96, i.e. ~8-9 s of the turn was thrown away. Off by
+// default, so every existing gate and call site is bit-identical; guarded against
+// --dump-logits-all, which is teacher-forced and needs every step.
+static int g_stop_id = -1;
 // Every kernel launch goes through this stream. It is 0 (the legacy stream)
 // for all normal execution, so enabling graphs is the only thing that changes
 // it: during capture it is set to a real (non-default) stream, which the
@@ -4992,8 +4999,9 @@ static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* em
 int main(int argc, char** argv) {
   if (argc < 2) {
     printf("usage: %s <blob.lfm3q8> [--steps N] [--prompt id,id,...] [--trace]\n", argv[0]);
-    printf("       [--audio-emb F --audio-at P] | [--clip SPEC]... (resident multi-clip; SPEC"
-           " lines: emb|-, ids, audio-at, ngen)\n", argv[0]);
+    printf("       [--audio-emb F --audio-at P] | [--clip SPEC]... | --clip-stdin\n");
+    printf("       (resident multi-clip ASR: SPEC lines are emb|-, ids, audio-at, ngen;\n"
+           "       --clip-stdin reads one SPEC path per turn on stdin until EOF or \"Q\")\n");
     return 1;
   }
   if (getenv("LFM_PF_GSW")) { const int v = atoi(getenv("LFM_PF_GSW")); cudaMemcpyToSymbol(g_pfgsw, &v, sizeof v); }
@@ -5005,6 +5013,8 @@ int main(int argc, char** argv) {
   int chunkT = getenv("LFM_PF_T") ? atoi(getenv("LFM_PF_T")) : 4;   // --prefill-chunk T
   const char* audio_emb_file = nullptr;   // --audio-emb (ASR path)
   std::vector<std::string> clip_files;  // --clip SPEC repeated: resident multi-clip ASR
+  bool clip_stdin = false;              // --clip-stdin: one SPEC path per turn on stdin (ASR service)
+  int stop_id_arg = -1;                 // --stop-id N; a SPEC's line 5 overrides it per clip
   const char* dump_logits = nullptr;
   const char* dump_logits_all = nullptr;   // every decode step, appended (gate: top-k vs HF)
   const char* speak_emb_file = nullptr;  // --speak-emb (speech-out teacher forcing)
@@ -5031,6 +5041,8 @@ int main(int argc, char** argv) {
       while (*s) { prompt.push_back((int)strtol(s, &s, 10)); if (*s == ',') s++; }
     }
     else if (!strcmp(argv[i], "--clip") && i + 1 < argc) clip_files.push_back(argv[++i]);
+    else if (!strcmp(argv[i], "--clip-stdin")) clip_stdin = true;
+    else if (!strcmp(argv[i], "--stop-id") && i + 1 < argc) stop_id_arg = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--audio-emb") && i + 1 < argc) {
       audio_emb_file = argv[++i];
       if (getenv("LFM_AEMB_WAIT") && atoi(getenv("LFM_AEMB_WAIT"))) g_aemb_wait = audio_emb_file;
@@ -5306,11 +5318,29 @@ int main(int argc, char** argv) {
   // A/B used PQ1_GRAPH, which is the Bonsai engine's knob and is ignored here, so both
   // arms ran graphs-off -- see doc section 45's correction.)
   const int nclip = (int)clip_files.size();
-  printf("LFM3_CLIPMODE BUILD=2026-11-03B nclip=%d\n", nclip); fflush(stdout);
-  for (int cl = 0; cl < (nclip ? nclip : 1); cl++) {
-  if (nclip) {
-    FILE* sf = fopen(clip_files[cl].c_str(), "r");
-    if (!sf) { printf("--clip: cannot open %s\n", clip_files[cl].c_str()); return 2; }
+  const int steps_base = steps;   // per-clip ngen rewrites `steps`; an absent line 4 must not leak
+  g_stop_id = stop_id_arg;        // a SPEC's line 5 overrides this per clip
+  printf("LFM3_CLIPMODE BUILD=2026-11-03B nclip=%d%s\n", nclip, clip_stdin ? " stdin" : ""); fflush(stdout);
+  for (int cl = 0; ; cl++) {
+  // Where this pass's spec comes from: --clip files, then (with --clip-stdin) one path per
+  // line read from stdin, which is what makes the process a SERVICE: the client writes a spec
+  // file per turn and hands over its name. No --clip and no stdin = exactly one pass, so the
+  // shipped single-prompt path is byte-identical to before this loop existed.
+  std::string spec;
+  if (clip_stdin) {
+    char ln[4096];
+    printf("CLIP_AWAIT %d\n", cl); fflush(stdout);
+    if (!fgets(ln, sizeof ln, stdin)) break;
+    char* nl = strchr(ln, '\n'); if (nl) *nl = 0;
+    if (!ln[0] || !strcmp(ln, "Q")) break;
+    spec = ln;
+  } else if (cl < nclip) spec = clip_files[cl];
+  else if (cl == 0 && nclip == 0) spec = "";    // the single shipped pass
+  else break;
+  const bool hasspec = !spec.empty();
+  if (hasspec) {
+    FILE* sf = fopen(spec.c_str(), "r");
+    if (!sf) { printf("--clip: cannot open %s\n", spec.c_str()); return 2; }
     // Read the spec as LINES, growing a std::string when a line exceeds the read
     // buffer. The first version used char idsp[8192], and the ASR prompt's id line is
     // ~11 KB (1642 ids), so fgets split it: 150 ids were parsed, the remainder of the
@@ -5333,6 +5363,8 @@ int main(int argc, char** argv) {
     const char* idsp = lines.size() > 1 ? lines[1].c_str() : "";
     int atv = lines.size() > 2 ? atoi(lines[2].c_str()) : -1;
     int ngv = lines.size() > 3 ? atoi(lines[3].c_str()) : -1;
+    g_stop_id = lines.size() > 4 ? atoi(lines[4].c_str()) : stop_id_arg;   // spec line 5 = stop token
+    steps = steps_base;   // reset before a per-clip override (see steps_base)
     prompt.clear();
     std::string idbuf(idsp);            // strtol wants a writable endptr
     for (char* q = &idbuf[0]; *q; ) { prompt.push_back((int)strtol(q, &q, 10)); if (*q == ',') q++; }
@@ -5765,6 +5797,12 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
                printf("wrote logits after step %d (tok %d) to %s\n", s, nt, dump_logits); }
     }
     printf("%4d %7d %9.2f %8.2f\n", s, nt, ms, 1000.0 / ms);
+    if (g_stop_id >= 0 && nt == g_stop_id && s >= nprompt - 1 && !dump_logits_all) {
+      // The caller's collector stops at this token too, so nothing consumed changes; the steps
+      // this skips would have computed ids that are read by no one.
+      printf("STOP_ID after step %d (token %d)\n", s, nt); fflush(stdout);
+      break;
+    }
     fflush(stdout);
     if (s >= 2) { tot += ms; ng++; }
     cudaError_t e2 = cudaGetLastError();
@@ -5830,7 +5868,7 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
   if (g_semb_n)
     printf("SPEAK-EMB fed %ld of %d rows at audio_out token %d\n", g_speak_fed, g_semb_n, g_speak_tok);
   fflush(stdout);
-  if (nclip) { printf("CLIP %d DONE steps=%d\n", cl, ng); fflush(stdout); }
+  if (hasspec) { printf("CLIP %d DONE steps=%d\n", cl, ng); fflush(stdout); }
   }  // resident-process clip loop
   {
     // Peak RSS, from the kernel's own counter. measure.sh needs it and the
