@@ -2384,3 +2384,19 @@ token. This was the last un-re-measured number in the H2 decision table; it is n
 - REJECTED w/o run: overlap encoder (GPU, 33 s) with backbone load (48 s). Encoder peak = ~1.1 GB
   (MemAvailable 3189 -> 2074 MB) + backbone 2.15 GB device + ~0.3 GB host > board. OOM hung picard once (run 281).
   Revisit only if encoder activation memory is cut (e.g. free x1/x2 buffers early, bf16 activations).
+
+## S2S breakthrough search (2026-11-11): no exact breakthrough exists on this board
+Audio slot 138 ms = backbone headless ~90 ms + depth server ~42 ms (read 1.7, maskgit 40, write 0.6) + ~6 ms IPC.
+- Backbone layers stream 1.65 GB Q8 per step: >= 77 ms at the 21.4 GB/s ceiling, i.e. ~96% of the
+  80 ms of audio a frame produces. The chain is strictly serial (step t+1's layer-0 rmsnorm needs the
+  full embedding of frame t's codes, which need all 3 MaskGIT passes over step t's hidden).
+- Lossless weight compression: Q8 code entropy 7.66 bits/code over 1728 M backbone codes
+  (7.61-7.68 per tensor) -> <= 4% fewer bytes at ideal coding. Dead.
+- Depth GEMMs (nvprof, 36 frames): ~34 ms/frame of ~38 ms kernel time. Microbench (warm, exact):
+  k_q8g<12,2,1> reaches 42-45% of FP32 peak on 1024x1024 / 2816x1024 / 1024x2816; register prefetch
+  variant is slower everywhere (25-27%); small k/v/gate run at 2-25% (1-2 blocks). Fusing q|k|v|gate
+  (N 1568: 457 vs 544 us) and w1|w3 (N 5632: 1329 vs 1398 us) is exact but worth ~1.2 ms/frame (<1%).
+  A rewrite to ~65% of peak would save ~11 ms/frame (~8%).
+- Exact floor estimate: backbone 77-86 + depth ~12-15 + IPC 0 => ~95-100 ms per audio frame,
+  RTF ~1.6-1.7 with the text slots. Realtime (RTF <= 1) needs fewer backbone bytes, i.e. a lossy
+  backbone format (excluded by the 2026-11 lossless decision) or a faster bus.
