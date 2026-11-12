@@ -1842,11 +1842,41 @@ int main(int argc, char** argv) {
   fflush(stdout);
   const size_t n1 = (size_t)256 * EH1 * EWo1, n2 = (size_t)256 * EH2 * EWo2, n3 = (size_t)256 * EH3 * EWo3;
   float *feat, *x1, *x2, *x2b, *x3, *x3b, *perm, *flat, *ds, *xb = nullptr;
+  // Memory preflight (LFM_ENC_MEMFLOOR_MB, default 128; 0 = off). The pass's device memory grows
+  // with the clip (~5 MB per audio second: 545 MB for a 110 s clip), this board shares one 3.96 GB pool
+  // between every process and the page cache, and it has hard-hung when that pool ran out (the
+  // allocator squeezes the page cache instead of failing). So before anything is allocated:
+  // estimate what the pass needs beyond what the pool already holds, and refuse (rc = 4, nothing
+  // touched, the service stays up) if granting it would leave less than the floor in
+  // MemAvailable. An estimate, deliberately on the refusing side of the measured sizes.
+  {
+    static const long floor_mb = getenv("LFM_ENC_MEMFLOOR_MB") ? atol(getenv("LFM_ENC_MEMFLOOR_MB")) : 128;
+    const size_t nflat0 = (size_t)Tt * 4096;
+    const bool alias0 = (!getenv("LFM_ENC_ALIAS") || atoi(getenv("LFM_ENC_ALIAS"))) && 2 * n2 + 2 * n3 + nflat0 <= n1;
+    size_t est = 4 * (hfeat.size() + n1 + n2 + (alias0 ? 0 : 2 * n2 + 2 * n3 + nflat0)) + (size_t)Tt * 80 * 1024;
+    size_t held = 0;
+    for (size_t i = 0; i < g_pool.size(); i++) held += g_pool[i].bytes;
+    const long need_mb = est > held ? (long)((est - held) >> 20) : 0;
+    long avail_mb = -1;
+    if (FILE* mf = fopen("/proc/meminfo", "r")) {
+      char ml[256]; long kb;
+      while (fgets(ml, sizeof ml, mf)) if (sscanf(ml, "MemAvailable: %ld kB", &kb) == 1) { avail_mb = kb >> 10; break; }
+      fclose(mf);
+    }
+    if (getenv("LFM_ENC_MEM")) printf("MEM preflight: pass ~%zu MB, pool holds %zu MB, needs ~%ld MB more, MemAvailable %ld MB, floor %ld MB\n",
+                                      est >> 20, held >> 20, need_mb, avail_mb, floor_mb);
+    if (floor_mb > 0 && avail_mb >= 0 && avail_mb - need_mb < floor_mb) {
+      printf("MEMGUARD: this clip (Tm=%d, %.0f s) needs ~%ld MB more device memory; MemAvailable is %ld MB and the floor is %ld MB. "
+             "Refusing the pass (LFM_ENC_MEMFLOOR_MB=0 disables the guard).\n", Tm, Tm / 100.0, need_mb, avail_mb, floor_mb);
+      fflush(stdout);
+      return 4;
+    }
+  }
   feat = dalloc(hfeat.size(), "feat"); cudaMemcpy(feat, &hfeat[0], hfeat.size() * 4, cudaMemcpyHostToDevice);
   // LFM_ENC_ALIAS (default 1; 0 = one buffer each, the control arm). x1 (256 x 64 x Wo1 floats:
-  // 344 MB for a 60 s clip) is read only by conv_mid. Everything the downsampler writes after
+  // 344 MB for a 110 s clip) is read only by conv_mid. Everything the downsampler writes after
   // that -- perm, x2b, x3, x3b, flat, together 11/16 of x1 -- is placed inside x1's memory once
-  // conv_mid has run, instead of in five more buffers (237 MB at 60 s). Same kernels, same
+  // conv_mid has run, instead of in five more buffers (237 MB at 110 s). Same kernels, same
   // arguments apart from the addresses; the region is refilled (zero, or NaN under
   // LFM_ENC_POISON) at that point, which is the fill dalloc gave those buffers. The mode is
   // fixed per process, so the pool's slot sequence is the same every pass.
@@ -2113,9 +2143,9 @@ int main(int argc, char** argv) {
     static size_t mv_cap = 0;
     // GROW-ONLY, not allocate-once. This buffer's size is Tt*16 (16 doubles of mean/variance per
     // audio row), so a resident service that saw a SHORT clip first kept a 1.8 KB buffer and then
-    // wrote 22 KB through it on the 60 s clip -- a device-heap overflow that corrupted the
+    // wrote 22 KB through it on the 110 s clip -- a device-heap overflow that corrupted the
     // neighbouring pooled buffers and came out as proj_out = all zeros with no CUDA error anywhere
-    // (found by generalize.sh's held-out 60 s clip; the one-shot process never hits it because its
+    // (found by generalize.sh's held-out 110 s clip; the one-shot process never hits it because its
     // first request is its only request). Same shape as g_ss above, which does check the cap.
     if (lnm && (size_t)Tt * 16 > mv_cap) {
       if (mv) cudaFree(mv);
@@ -2162,7 +2192,7 @@ int main(int argc, char** argv) {
   if (!g_pool_on) { for (size_t i = 0; i < g_reqallocs.size(); i++) cudaFree(g_reqallocs[i]); }
   g_reqallocs.clear();
   // Pool trim (LFM_ENC_POOL_MAX_MB, default 512; 0 = never trim). The pool is grow-only, so one
-  // long clip (60 s = ~1.25 GB of activations) would pin that much for the rest of the session
+  // long clip (110 s = ~1.25 GB of activations) would pin that much for the rest of the session
   // and leave the board at ~380 MB MemAvailable beside the resident backbone on every later
   // turn. A pass that leaves the pool above the cap gives it all back; the next pass reallocates
   // what it needs. Typical 5-10 s turns stay below the cap and keep their buffers.
@@ -2211,7 +2241,9 @@ int main(int argc, char** argv) {
       else rc = 3;
       g_in_pass = 0;
       printf("ENC_DONE %d rc=%d\n", req, rc); fflush(stdout);
-      if (rc) { printf("ENC service retiring after a failed pass; restart it to serve again\n"); fflush(stdout); return rc; }
+      // rc 4 = the memory preflight refused the request before touching anything: the context is
+      // as it was, so the service keeps serving. Any other failure retires it.
+      if (rc && rc != 4) { printf("ENC service retiring after a failed pass; restart it to serve again\n"); fflush(stdout); return rc; }
     }
     return 0;
   }

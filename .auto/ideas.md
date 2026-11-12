@@ -2640,3 +2640,24 @@ algorithm (fp16 accumulation), both of which change the goldens.
   profiler prints nothing in --serve-fifo mode. Untested and not small: moving the ~100 ms of
   host elementwise ops to a helper thread (3 cores idle in a single-stream turn); the prime-tts
   history says host work overlaps GPU work already, so the gain is unknown, not ~100 ms.
+- [LFM3/Nano S2T] CORRECTION + encoder memory preflight (2026-11-13, run #280, keep).
+  CORRECTION: gate_60s_zh_16k_mono.wav is 110.04 s of audio (16 kHz mono; 11003 mel frames at
+  100/s, 1376 audio rows at 12.5/s), NOT 60 s. Every "60 s clip" in the #272-#279 notes above
+  means this 110 s clip; I took the length from the filename. Measurements are unaffected, the
+  scaling is: encoder device memory ~5 MB per audio second (542 MB at 110 s), not ~9.
+  THREE services resident (what the harness runs since #277) + the 110 s clip, stall.sh TTS=1,
+  5 runs: ids == cold every time, turn 64-70 s, MemAvailable low 252-310 MB, encoder reply
+  6.1-12.2 s (under reclaim again; 5.6 s with two services). TTS straight after the long turn:
+  0.57-0.61 s, the next 0.48 s. (A first reading of 0.99-1.26 s was the script's own 1 s poll
+  letting the GPU clock park, not memory.)
+  So the long-clip margin with three services is ~250 MB and a longer clip would not fit; this
+  board hard-hangs when the pool runs out. Shipped: a preflight in the encoder pass
+  (LFM_ENC_MEMFLOOR_MB, default 128, 0 = off): estimate the pass's device bytes, subtract what
+  the pool already holds, and if MemAvailable minus that is below the floor, refuse BEFORE
+  allocating (rc = 4; the service keeps serving -- it only retires on other failures).
+  guard.sh: default floor -> 110 s clip allowed (pass ~542 MB, needs ~498 more, 762 available),
+  65.1 s, ids == cold. Floor forced to 600 -> service answers ENC_DONE rc=4, the client's one-shot
+  fallback refuses too, lfm3_asr exits 2 in 0.76 s with the MEMGUARD line, the next short turn is
+  served and correct. Limits: the estimate is from sizes measured on this build (reported 542 vs
+  536 MB allocated), MemAvailable is the kernel's own estimate, and the real exhaustion edge was
+  not probed (cannot be, remotely). Rough capacity with three services: ~135 s of audio.
