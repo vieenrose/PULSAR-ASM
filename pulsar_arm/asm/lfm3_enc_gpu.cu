@@ -2139,6 +2139,22 @@ int main(int argc, char** argv) {
   // and the A/B arm. Nothing is ever leaked: the pool is freed when the process exits.
   if (!g_pool_on) { for (size_t i = 0; i < g_reqallocs.size(); i++) cudaFree(g_reqallocs[i]); }
   g_reqallocs.clear();
+  // Pool trim (LFM_ENC_POOL_MAX_MB, default 512; 0 = never trim). The pool is grow-only, so one
+  // long clip (60 s = ~1.25 GB of activations) would pin that much for the rest of the session
+  // and leave the board at ~380 MB MemAvailable beside the resident backbone on every later
+  // turn. A pass that leaves the pool above the cap gives it all back; the next pass reallocates
+  // what it needs. Typical 5-10 s turns stay below the cap and keep their buffers.
+  if (g_pool_on) {
+    static const long cap_mb = getenv("LFM_ENC_POOL_MAX_MB") ? atol(getenv("LFM_ENC_POOL_MAX_MB")) : 512;
+    size_t tot = 0;
+    for (size_t i = 0; i < g_pool.size(); i++) tot += g_pool[i].bytes;
+    if (cap_mb > 0 && tot > (size_t)cap_mb << 20) {
+      cudaDeviceSynchronize();
+      for (size_t i = 0; i < g_pool.size(); i++) cudaFree(g_pool[i].p);
+      g_pool.clear();
+      printf("ENC_POOL trimmed %.1f MB (cap %ld MB)\n", tot / 1048576.0, cap_mb); fflush(stdout);
+    }
+  }
   return 0;
   };
 

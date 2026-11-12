@@ -2555,3 +2555,16 @@ algorithm (fp16 accumulation), both of which change the goldens.
   MemAvailable down to ~340-390 MB beside the 2.15 GB backbone: suspect allocation/page reclaim
   under memory pressure, unmeasured. Until fixed, audio over ~40 s is better served cold.
   New knobs: LFM_SRV_WAIT (backbone reply wait, default 900 s), generalize.sh PFRUN / CLIPS.
+- [LFM3/Nano S2T] Why the resident 60 s turn is slower than cold, and the pool trim (2026-11-12,
+  run #275). enc60.sh, same served 60 s encoder request after one small one: encoder alone 5.93 s
+  (MemAvailable 3175 -> 1921 MB), backbone resident 19.14 s (1069 -> 382 MB). The pass needs
+  ~1.25 GB and only ~1.07 GB is available beside the backbone, so it runs under reclaim: memory
+  pressure, not a code path (GPU time 0.55 vs 0.71 s). Only cutting the encoder's activation
+  memory for long audio fixes the turn itself (not done). Shipped: LFM_ENC_POOL_MAX_MB (default
+  512, 0 = off): a pass that leaves the grow-only pool above the cap frees it (772 MB after a
+  60 s clip), so one long clip no longer pins the board at ~380 MB for the session. Encoder-only
+  sequence small/60 s/small/small, MemAvailable after each: trim 2805/2685/2871/2975 MB, no trim
+  2773/1908/2259/2260 MB; first small request after a trim 0.62 s vs 0.55 s, then 0.54 s.
+  Gate with the 60 s clip FIRST then 4 short clips: 5/5 identical cold vs resident, post-turn
+  MemAvailable low 1078 MB (was ~350; sampled after turns, not inside the 60 s turn). Resident
+  60 s turn in that order: 71.6 s vs cold 64.8 s. 9 s harness turns stay under the cap: 0.5086.
