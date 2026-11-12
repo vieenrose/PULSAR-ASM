@@ -4845,6 +4845,37 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   return 0;
 }
 
+// The part of a layer that later positions (and the decode) can still read, for T positions:
+// an attention layer's K/V cache rows, a conv layer's ring. It is layer_chunk_T's own launches
+// with the same arguments, minus everything that only feeds this layer's OUTPUT (q/gate/
+// attention/o_proj | out_proj, both norms after them, the whole FFN). Used for the LAST layer
+// only: its output at a prompt position other than the final one is read by nothing -- there is
+// no layer above it, and the head runs on the final position alone -- while its K/V rows and
+// ring are read by every later step. The final prompt position still takes layer_chunk_T.
+static int layer_chunk_state_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
+  const int KVDIM = NKV * HD;
+  k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "operator_norm.weight"), A.h1, NORM_EPS, H);
+  if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d operator_norm launch failed\n", L); return 1; }
+  if (is_attn_g[L]) {
+    if (pf_gemv_T(M, LN(L, "self_attn.k_proj.weight"), A.h1, A.k, A.part, Tn)) return 1;
+    if (pf_gemv_T(M, LN(L, "self_attn.v_proj.weight"), A.h1, A.v, A.part, Tn)) return 1;
+    const float* invf = is_slide_g[L] ? M.invf_slide : M.invf_full;
+    const int rot = is_slide_g[L] ? HD : HD / 2;
+    bf16* kbase = M.kc + (size_t)L * MAXTOK * KVDIM;
+    bf16* vbase = M.vc + (size_t)L * MAXTOK * KVDIM;
+    k_headnorm<<<dim3(NKV, Tn), 32, 0, g_launch>>>(A.k, NW(M, L, "self_attn.k_norm.weight"), NORM_EPS, HD);
+    k_rope<<<dim3(NKV, Tn), 64, 0, g_launch>>>(A.k, invf, pos0, HD, rot, nullptr);
+    cudaMemcpyAsync(kbase + (size_t)pos0 * KVDIM, A.k, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
+    cudaMemcpyAsync(vbase + (size_t)pos0 * KVDIM, A.v, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
+  } else {
+    if (pf_gemv_T(M, LN(L, "conv.in_proj.weight"), A.h1, A.bx, A.part, Tn)) return 1;
+    k_conv_chunk<<<(H + 127) / 128, 128, 0, g_launch>>>(M.ring + (size_t)pf4_conv_idx[L] * 7 * H,
+        T(M, LN(L, "conv.conv.weight"))->df, A.bx, A.h2, H, Tn);
+  }
+  if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d state-only launch failed\n", L); return 1; }
+  return 0;
+}
+
 // The lm_head arms as ONE function, conditions copied verbatim from the step loop.
 // The driver needs the identical head on the last prompt position; copying the block
 // would let the two heads drift, and a head that drifts changes the argmax -- the
@@ -5533,6 +5564,24 @@ int main(int argc, char** argv) {
       if (pcP && !pc_hit) pch.push_back(std::make_pair(0, pcP));
       for (int c0 = pcP; c0 < NP; c0 += g_pfChunk)
         pch.push_back(std::make_pair(c0, (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk));
+      // LFM_PF_LASTDEAD (default 1, 0 = A/B control): in the LAST layer only the final prompt
+      // position's output is ever read, so the other positions run the state-only pass
+      // (layer_chunk_state_T). Needs the batched attention/conv forms it copies, and is off
+      // for the teacher-forced logits dump, which is not this driver's path anyway.
+      static const int pf_dead_env = getenv("LFM_PF_LASTDEAD") ? atoi(getenv("LFM_PF_LASTDEAD")) : 1;
+      const bool pf_dead = pf_dead_env && !dump_logits_all && !getenv("LFM_PF4_TRACE") &&
+          !(getenv("LFM_PF_ATTB") && !atoi(getenv("LFM_PF_ATTB"))) &&
+          !(getenv("LFM_PF_CONVB") && !atoi(getenv("LFM_PF_CONVB")));
+      auto run_layer = [&](int L, int c0, int Tn) -> int {
+        if (!(pf_dead && L == NLAYER - 1)) return layer_chunk_T(M, L, c0, Tn, A);
+        const int nd = (c0 + Tn == NP) ? Tn - 1 : Tn;      // positions whose output is dead
+        if (nd > 0 && layer_chunk_state_T(M, L, c0, nd, A)) return 1;
+        if (nd == Tn) return 0;
+        bf16* keep = A.xb; A.xb = keep + (size_t)nd * H;   // the final prompt position, in full
+        const int r = layer_chunk_T(M, L, c0 + nd, 1, A);
+        A.xb = keep;
+        return r;
+      };
       // Snapshot layer L's sequence state right after the prefix chunk went through it (queued
       // on the launch stream, so it is ordered after that chunk's writes and before the next's).
       auto pc_snap = [&](int L) {
@@ -5573,7 +5622,7 @@ int main(int argc, char** argv) {
           for (size_t ci2 = 0; ci2 < pch.size(); ci2++) {
             const int c0 = pch[ci2].first; Tc = pch[ci2].second;
             A.xb = xall + (size_t)c0 * H;
-            if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+            if (run_layer(L, c0, Tc)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
             if (pcP && !pc_hit && c0 == 0) pc_snap(L);
             if (g_pfsync == 3) {     // bounded queue: wait for the chunk recorded K chunks ago
               static cudaEvent_t ev[64]; static int nev = 0; static long ci = 0;
@@ -5601,12 +5650,14 @@ int main(int argc, char** argv) {
         const int c0 = pch[ci2].first; Tc = pch[ci2].second;
         if (pf4_embed_chunk(M, A, prompt, c0, Tc, emb)) { printf("PF4-RUN: embed failed at chunk %d\n", c0); return 1; }
         for (int L = 0; L < NLAYER; L++) {
-          if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+          if (run_layer(L, c0, Tc)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
           if (pcP && !pc_hit && c0 == 0) pc_snap(L);
         }
       }
       { const cudaError_t pe = cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &q1);
         if (pcP && !pc_hit && pe == cudaSuccess) pc_ids.assign(prompt.begin(), prompt.begin() + pcP); }
+      if (pf_dead) printf("PF4-RUN: last layer (%s) state-only for all but the final prompt position\n",
+                          is_attn_g[NLAYER - 1] ? "attention: K/V rows" : "conv: ring");
       if (pcP) printf("PF4-RUN: prefix cache %s, %d positions (%s)\n", pc_hit ? "HIT" : "BUILT", pcP,
                       pc_hit ? "restored K/V rows + conv rings, prefill starts after them"
                              : "ran as its own chunk and snapshotted");
