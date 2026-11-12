@@ -2486,3 +2486,32 @@ algorithm (fp16 accumulation), both of which change the goldens.
   so the same A/B showed a fake -15% turn (4.59 vs 5.43 s) purely because the transcript was 1
   token instead of 9. When a probe changes output, ONLY the stage timer (PF4-RUN prefill ms) is a
   valid read; turn walls track the generated length. Always print the id count/md5 in a probe A/B.
+- [LFM3/Nano S2T] Held-out generalization gate + a real defect in the resident encoder service
+  (2026-11-12, run #272). `.auto/combined/generalize.sh` runs 7 clips (the 2 harness clips, four
+  5 s/9 s TTS-derived clips, and the 60 s real-gate clip = 11003 mel frames / 1376 audio rows)
+  through BOTH process models and requires the same id stream: cold one-shot CLI vs the resident
+  services. Result: all six short clips IDENTICAL (resident is 4.6-8.2x faster per turn), which is
+  the first evidence that the resident architecture (#259-#266) generalizes beyond the two goldens
+  it was certified on.
+  DEFECT FOUND BY IT (still open, root cause unknown): a served encoder pass breaks once the
+  service has history. Repro, no backbone involved: `encorder.sh 0 "big big big"` -> requests 0
+  and 1 answer `nonzero=2818048`, request 2 never answers (no ENC_DONE); LFM_ENC_POOL=0 instead
+  hangs inside the pass; the generalize sequence (6 small clips then the 60 s one) came back with
+  `dump proj_out n=2818048 nonzero=0` and no OOM / LAUNCH ERROR / EXEC ERROR line anywhere. The
+  same 60 s request SUCCEEDS as request 0 of a fresh service (2818048 nonzero, rc=0) and as a
+  one-shot child beside the live backbone service, so it is per-request state in the service, not
+  memory coexistence and not the pool's growth path alone. Suspect the static non-pooled device
+  buffers that a pass frees and reallocates (g_part_buf at lfm3_enc_gpu.cu:1043, g_ss at :1321,
+  the tile768 scratch at :1093/:1116, g_rps at :649) being freed while work from an earlier pass
+  is still queued -- the pass ends with chk_final() but the service loops without a fresh
+  context. Next step for whoever picks this up: `cuda-memcheck --tool memcheck` around a 3-request
+  sequence, or a cudaDeviceSynchronize at the top of run_pass behind an env to test the
+  queued-work theory in one line.
+  SHIPPED NOW (safety net, metric-neutral 0.5076, all four gates green): the service answers a
+  dead pass instead of vanishing (setjmp/longjmp + pass_fail() on the OOM / LAUNCH / EXEC /
+  PLAUSIBILITY paths, then `ENC_DONE n rc=3` and it retires rather than serve on a suspect
+  context), and lfm3_asr falls back to the one-shot encoder for that turn on a missing or rc!=0
+  reply. The client's wait is 180 s (LFM_ENC_WAIT), not the 900 s it used to stall on a dead
+  service. Verified: the 60 s clip through the resident path now returns ids identical to cold
+  (108 s vs cold 64.5 s -- recovery is slower than cold for oversized audio, so a deployment
+  that routinely sees >40 s clips should use the cold arm or fix the service).

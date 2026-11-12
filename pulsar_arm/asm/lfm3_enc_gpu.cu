@@ -306,6 +306,19 @@ static std::map<std::string, long> g_cnt;        // The min is what the per-rep 
                                                  // a served pass's GPU time.
 static std::map<std::string, double> g_last;
 static int g_sync = -2;   // LFM_ENC_SYNC=1 restores per-kernel device syncs (the gate path)
+/* A served request must ANSWER even when its pass dies: the client waits for "ENC_DONE n rc=..",
+   and before this the failure paths inside a pass called exit() straight out of the process, so
+   the ASR turn waited out the client's timeout instead of falling back to the one-shot encoder.
+   g_in_pass is set only around run_pass, so the one-shot path (and every boot-time check) keeps
+   its original exit-on-fault behaviour. */
+#include <setjmp.h>
+static jmp_buf g_pass_jmp;
+static volatile int g_in_pass = 0;
+static void pass_fail(void) {
+  fflush(stdout);
+  if (g_in_pass) longjmp(g_pass_jmp, 1);
+  exit(1);
+}
 static void chk(const char* what) {
   if (g_enctime) {                                      // per-stage: syncs, so read the split
     cudaEventRecord(g_sevb); cudaEventSynchronize(g_sevb);
@@ -317,7 +330,7 @@ static void chk(const char* what) {
     cudaEventRecord(g_seva);
   }
   cudaError_t e = cudaGetLastError();
-  if (e) { printf("LAUNCH ERROR at %s: %s\n", what, cudaGetErrorString(e)); exit(1); }
+  if (e) { printf("LAUNCH ERROR at %s: %s\n", what, cudaGetErrorString(e)); pass_fail(); }
   // The per-kernel cudaDeviceSynchronize is a DEBUG feature and it was the encoder's
   // dominant cost: with ~200 chk() sites per pass, the 129.7 s clip's layer loop took
   // 67.5 s of process wall against 1.63 s of GPU time (measured; pooling the partial
@@ -330,7 +343,7 @@ static void chk(const char* what) {
   if (g_sync) {
     cudaDeviceSynchronize();
     e = cudaGetLastError();
-    if (e) { printf("EXEC ERROR at %s: %s\n", what, cudaGetErrorString(e)); exit(1); }
+    if (e) { printf("EXEC ERROR at %s: %s\n", what, cudaGetErrorString(e)); pass_fail(); }
   }
 }
 // LFM_ENC_TIME=3 additionally keys the table by SHAPE: a stage name that covers 83 launches of
@@ -347,7 +360,7 @@ static const char* gemm_tag(const char* what, int N, int K, int T, int ct, int t
 static void chk_final(const char* what) {
   cudaDeviceSynchronize();
   cudaError_t e = cudaGetLastError();
-  if (e) { printf("EXEC ERROR (final, at %s): %s\n", what, cudaGetErrorString(e)); exit(1); }
+  if (e) { printf("EXEC ERROR (final, at %s): %s\n", what, cudaGetErrorString(e)); pass_fail(); }
 }
 
 // ---------------------------------------------------------------- GEMM
@@ -1608,7 +1621,7 @@ static void* req_alloc(size_t bytes, int zero, const char* what) {
   if (g_pool_on && g_slot < g_pool.size() && g_pool[g_slot].bytes >= bytes) {
     p = g_pool[g_slot].p;                       // reuse: same slot, big enough
   } else {
-    if (cudaMalloc(&p, bytes)) { printf("OOM (%s, %.1f MB)\n", what, bytes / 1e6); exit(2); }
+    if (cudaMalloc(&p, bytes)) { printf("OOM (%s, %.1f MB)\n", what, bytes / 1e6); pass_fail(); }
     if (g_pool_on) {
       if (g_slot < g_pool.size()) { cudaFree(g_pool[g_slot].p); g_pool[g_slot] = { p, bytes }; }
       else g_pool.push_back({ p, bytes });
@@ -1691,7 +1704,7 @@ static void dump(const char* dir, const char* name, const float* dptr, size_t n)
   long nz = 0; double mx = 0;
   for (size_t i = 0; i < n; i++) { nz += (h[i] != 0.f); if (fabs(h[i]) > mx) mx = fabs(h[i]); }
   printf("dump %-12s n=%zu nonzero=%ld max=%.4f\n", name, n, nz, mx);
-  if (nz == 0) { printf("PLAUSIBILITY FAIL: %s is all zeros\n", name); exit(1); }
+  if (nz == 0) { printf("PLAUSIBILITY FAIL: %s is all zeros\n", name); pass_fail(); }
 }
 static Ent* need(Model& M, const char* name) {
   Ent* e = ::T(M, name);
@@ -2139,9 +2152,16 @@ int main(int argc, char** argv) {
       while (*s2 == ' ') s2++;
       size_t sl = strlen(s2); while (sl && (s2[sl-1] == '\n' || s2[sl-1] == '\r')) s2[--sl] = 0;
       const int rq_tm = strcmp(s2, "auto") ? atoi(s2) : 0;
-      const int rc = run_pass(rl, s1, rq_tm);
+      // setjmp/longjmp around the pass: a failure deep inside answers the request instead of
+      // vanishing. The service then RETIRES rather than serve on a context that may have faulted
+      // -- the client's per-turn one-shot fallback covers every later turn.
+      int rc;
+      g_in_pass = 1;
+      if (setjmp(g_pass_jmp) == 0) rc = run_pass(rl, s1, rq_tm);
+      else rc = 3;
+      g_in_pass = 0;
       printf("ENC_DONE %d rc=%d\n", req, rc); fflush(stdout);
-      if (rc) return rc;
+      if (rc) { printf("ENC service retiring after a failed pass; restart it to serve again\n"); fflush(stdout); return rc; }
     }
     return 0;
   }

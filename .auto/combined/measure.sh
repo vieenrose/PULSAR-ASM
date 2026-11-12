@@ -26,7 +26,12 @@ set -uo pipefail
 NANO="${NANO:-picard@100.84.151.116}"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 ADIR="$REPO/.auto/combined"
-ASR_MODE="${ASR_MODE:-cold}"
+# Default is warm, the shipped configuration: the resident services ARE the objective's
+# measurement path since run #259, and an earlier default of cold meant that a bare
+# `bash .auto/measure.sh` silently measured the one-shot CLI and logged 2.36 against a metric
+# whose whole point is the resident path. Pass ASR_MODE=cold explicitly to measure the one-shot
+# arm (it is still a legitimate comparison, just not the default number).
+ASR_MODE="${ASR_MODE:-warm}"
 LFM_DIR="${LFM_DIR:-/home/picard/lfm3}"
 PT_DIR="${PT_DIR:-/home/picard/primetts}"
 REPLY_CASE="${REPLY_CASE:-T81}"

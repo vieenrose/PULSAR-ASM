@@ -212,7 +212,11 @@ static double g_stage_t = -1.0;
 /* Poll a resident-service log from a byte offset until one of its lines starts with `prefix`.
    The services print one flushed line per completed request (ENC_DONE n / CLIP n DONE), and the
    client is a different process each turn, so the log -- not a socket -- is the rendezvous. */
-static int srv_wait(const char *logp, long from, const char *prefix, FILE *sink, double timeout_s) {
+/* `line` (optional) receives the matched reply line, so a caller can read the status the
+   service reported instead of only its presence: a service that answers "rc=1" has NOT
+   completed the request. */
+static int srv_wait(const char *logp, long from, const char *prefix, FILE *sink, double timeout_s,
+                    char *line, size_t line_cap) {
   int rf = open(logp, O_RDONLY);
   if (rf < 0) die("cannot open %s (%s)", logp, strerror(errno));
   if (lseek(rf, (off_t)from, SEEK_SET) != (off_t)from) { close(rf); die("%s seek to %ld", logp, from); }
@@ -230,7 +234,10 @@ static int srv_wait(const char *logp, long from, const char *prefix, FILE *sink,
     while ((nl = memchr(lb, '\n', lh))) {
       *nl = 0;
       if (sink) { fputs(lb, sink); fputc('\n', sink); }
-      if (!strncmp(lb, prefix, strlen(prefix))) hit = 1;
+      if (!strncmp(lb, prefix, strlen(prefix))) {
+        hit = 1;
+        if (line && line_cap) { snprintf(line, line_cap, "%s", lb); }
+      }
       lh -= (size_t)(nl - lb) + 1;
       memmove(lb, nl + 1, lh);
     }
@@ -250,14 +257,29 @@ static void stage(const char *what) {
 
 /* One turn's encoder, either way: a child process reaped, or a request to the resident encoder
    and a wait for its reply line. Both end with TMPD/proj_out.bin written and validated. */
-static void enc_collect(const char *enc_log, long off, long idx) {
+/* Returns 1 when the encoder's proj_out is trustworthy for this turn: the one-shot child exited
+   0, or the resident service answered this request with rc=0. Returns 0 when a served request
+   failed or did not answer within LFM_ENC_WAIT (default 180 s, not the 900 s this used to wait:
+   a service whose context is gone must not stall a turn for 15 minutes), and the caller then
+   runs the one-shot encoder, which is the path the cold CLI has always exercised. */
+static int enc_collect(const char *enc_log, long off, long idx) {
   if (enc_log) {
     char pfx[32]; snprintf(pfx, sizeof pfx, "ENC_DONE %ld ", idx);
-    if (!srv_wait(enc_log, off, pfx, NULL, 900.0))
-      die("the resident encoder never answered request %ld (see %s)", idx, enc_log);
-  } else {
-    pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu");
+    char line[512]; line[0] = 0;
+    const double tmo = getenv("LFM_ENC_WAIT") ? atof(getenv("LFM_ENC_WAIT")) : 180.0;
+    if (!srv_wait(enc_log, off, pfx, NULL, tmo, line, sizeof line)) {
+      printf("ENCODER resident request %ld did not answer within %.0f s (see %s)\n", idx, tmo, enc_log);
+      fflush(stdout);
+      return 0;
+    }
+    if (!strstr(line, "rc=0")) {
+      printf("ENCODER resident request %ld failed: %s\n", idx, line); fflush(stdout);
+      return 0;
+    }
+    return 1;
   }
+  pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu");
+  return 1;
 }
 
 static void need_file(const char *p, long min_bytes, const char *what) {
@@ -573,7 +595,17 @@ int main(int argc, char **argv) {
                  pfrun >= 2 ? pfr : NULL, pfv, NULL };
   if (early && !srv_in) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
   { double t = now_s(); printf("TIME prompt ids ready %.3f s after the encoder request\n", t - g_stage_t); }
-  enc_collect(enc_log, g_enc_off, g_enc_n);
+  if (!enc_collect(enc_log, g_enc_off, g_enc_n)) {
+    /* Recover the turn instead of dying with it. A served pass that fails leaves the service's
+       device context suspect (3 consecutive 60 s requests reproduce it: the third hangs and the
+       earlier ones can come back all-zero), so the fallback is per-turn and every later turn in
+       this session pays the one-shot cost too -- which is exactly why it prints. */
+    printf("ENCODER falling back to the one-shot encoder for this turn (~1.9 s CUDA init + blob load)\n");
+    fflush(stdout);
+    unlink(OUT);
+    char *fav[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, (char*)"auto", TMPD, (char*)"--only", (char*)"proj_out", NULL };
+    reap(spawn(fav), "lfm3_enc_gpu");
+  }
   stage("encoder reply");   // splits the pre-backbone window: request+GPU pass vs everything else
   need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
   { long rows = file_size(OUT) / (2048 * 4);
