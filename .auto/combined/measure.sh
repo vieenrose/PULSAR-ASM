@@ -86,7 +86,7 @@ for spec in $CLIPS; do
   [ -s "$ADIR/golden_$lang.i32" ] || fail "missing $ADIR/golden_$lang.i32 (freeze it with: lfm3_asr --out-ids)"
 done
 
-OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' ASR_MODE='$ASR_MODE' PFRUN='${PFRUN:-32}' LFM_ENC_RESIDENT='${LFM_ENC_RESIDENT:-1}' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
+OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' ASR_MODE='$ASR_MODE' PFRUN='${PFRUN:-32}' LFM_ENC_RESIDENT='${LFM_ENC_RESIDENT:-1}' PT_RESIDENT='${PT_RESIDENT:-1}' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
 set -u
 cd "$LFM_DIR" || exit 2
 for spec in $CLIPS; do
@@ -101,6 +101,7 @@ SRV_IN=/tmp/cmb.srv.in; SRV_LOG=/tmp/cmb.srv.log
   i=0; while [ $i -lt 40 ]; do a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); [ "$a" -ge 1500 ] && break; sleep 0.5; i=$((i+1)); done
   echo "PREFREE $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) MB after killing stale services"
 ENC_IN=/tmp/cmb.enc.in; ENC_LOG=/tmp/cmb.enc.log
+PT_IN=/tmp/cmb.pt.in; PT_LOG=/tmp/cmb.pt.log
 if [ "$ASR_MODE" = warm ]; then
   # The resident service: one lfm3_nanode --clip-stdin for the whole session. It pays the
   # 1.946 GB blob read (21.2 s of eMMC at 92 MB/s, device-bound) plus parse/CRC/upload once, and
@@ -178,6 +179,7 @@ for spec in $CLIPS; do
 done
 if [ "$ASR_MODE" = warm ]; then
   echo "ENCREQ $(grep -c ENC_DONE $ENC_LOG 2>/dev/null)"
+  echo "PTREQ $(grep -c PT_DONE $PT_LOG 2>/dev/null || echo 0)"
   for i in $(seq 1 40); do kill -0 $SRV 2>/dev/null || break; timeout 5 sh -c "echo Q > $SRV_IN" 2>/dev/null; sleep 0.25; done
   kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; rm -f $SRV_IN
   # Opening a fifo for write blocks until a reader exists, so this must be guarded (and timed
@@ -187,15 +189,46 @@ if [ "$ASR_MODE" = warm ]; then
   rm -f $ENC_IN
 fi
 cd "$PT_DIR" || exit 2
-t0=$(date +%s.%N)
-./build/pt_v21_nano --container build/v21.ptk --case "tests/golden_v21/$REPLY_CASE" > /tmp/cmb.tts.log 2>&1 || echo "TTS_FAIL"
-t1=$(date +%s.%N)
-python3 -c "print('TTS %.3f' % ($t1-$t0))"
-grep -o "SNDR=[0-9.]*" /tmp/cmb.tts.log | tail -1 | cut -d= -f2 | sed 's/^/TTS_SNDRdB /'
+# The reference is ALWAYS the one-shot driver, run untimed: it is the thing the SNDR gate has
+# always certified, and it is what the served waveform is compared against byte for byte.
+rm -f /tmp/cmb.ref.npy /tmp/cmb.tts.npy
+./build/pt_v21_nano --container build/v21.ptk --case "tests/golden_v21/$REPLY_CASE" \
+  --out /tmp/cmb.ref.npy > /tmp/cmb.tts_ref.log 2>&1 || echo "TTS_REF_FAIL"
+grep -o "SNDR=[0-9.]*" /tmp/cmb.tts_ref.log | tail -1 | cut -d= -f2 | sed 's/^/TTS_SNDRdB /'
+if [ "${PT_RESIDENT:-1}" = 1 ] && [ "$ASR_MODE" = warm ]; then
+  # Resident TTS: a one-shot process pays ~0.4 s of container record pass + CUDA context + weight
+  # upload + clock ramp before it computes anything, and in a conversation that is per turn. One
+  # server per session, one request line per turn ("<case dir> <out.npy>"), answered by
+  # "PT_DONE n rc=.. sndr=..". Same run_case() as the one-shot, and the waveform is gated against
+  # the reference above byte for byte, so the metric arm and the certified arm cannot drift apart.
+  rm -f $PT_IN $PT_LOG; mkfifo $PT_IN; : > $PT_LOG
+  ./build/pt_v21_nano --container build/v21.ptk --serve-fifo $PT_IN > $PT_LOG 2>&1 &
+  PTS=$!
+  i=0; while [ $i -lt 120 ]; do grep -q "PT_AWAIT 0" $PT_LOG 2>/dev/null && break; sleep 0.5; i=$((i+1)); done
+  grep -q "PT_AWAIT 0" $PT_LOG 2>/dev/null || { echo "PTSERVICE_FAIL (see $PT_LOG)"; kill $PTS 2>/dev/null; exit 1; }
+  # grep -c already prints 0, and a `|| echo 0` there would append a SECOND line to the
+  # substitution: the pattern "PT_DONE <n>\n<m>" then acts as two alternates, one of which is a
+  # bare space that matches every line of the log, so the wait loop returns in 0.017 s and the
+  # TTS time measures nothing. (It did: tts_rtf 0.0047 for 3.6 s of audio.)
+  npt=$(grep -c PT_DONE $PT_LOG 2>/dev/null); [ -n "$npt" ] || npt=0
+  t0=$(date +%s.%N)
+  timeout 60 sh -c "echo 'tests/golden_v21/$REPLY_CASE /tmp/cmb.tts.npy' > $PT_IN" || echo "PT_WRITE_FAIL"
+  i=0; while [ $i -lt 240 ]; do grep -q "PT_DONE $npt " $PT_LOG 2>/dev/null && break; sleep 0.1; i=$((i+1)); done
+  t1=$(date +%s.%N)
+  python3 -c "print('TTS %.3f' % ($t1-$t0))"
+  grep -E "^PT_DONE $npt " $PT_LOG | tail -1 | grep -o "sndr=[0-9.]*" | cut -d= -f2 | sed 's/^/TTS_SNDRdB /'
+  if cmp -s /tmp/cmb.tts.npy /tmp/cmb.ref.npy; then echo "GATE_TTS_SERVE_BYTES_OK"; else echo "GATE_TTS_SERVE_BYTES_FAIL"; fi
+  timeout 5 sh -c "echo Q > $PT_IN" 2>/dev/null; kill $PTS 2>/dev/null; wait $PTS 2>/dev/null; rm -f $PT_IN
+else
+  t0=$(date +%s.%N)
+  ./build/pt_v21_nano --container build/v21.ptk --case "tests/golden_v21/$REPLY_CASE" > /tmp/cmb.tts.log 2>&1 || echo "TTS_FAIL"
+  t1=$(date +%s.%N)
+  python3 -c "print('TTS %.3f' % ($t1-$t0))"
+fi
 REMOTE
 )
-echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD|WARMUP|ENCREQ)" | sed 's/^/  /'
-echo "$OUT" | grep -q "ASR_FAIL\|TTS_FAIL\|SERVICE_FAIL\|ENCSERVICE_FAIL" && { echo "GATE FAIL: a stage failed"; echo "$OUT" | tail -20; exit 1; }
+echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD|WARMUP|ENCREQ|PTREQ|GATE_TTS_SERVE)" | sed 's/^/  /'
+echo "$OUT" | grep -q "ASR_FAIL\|TTS_FAIL\|TTS_REF_FAIL\|PTSERVICE_FAIL\|PT_WRITE_FAIL\|SERVICE_FAIL\|ENCSERVICE_FAIL" && { echo "GATE FAIL: a stage failed"; echo "$OUT" | tail -20; exit 1; }
 
 # ---- quality gates
 ok=1
@@ -208,6 +241,9 @@ for spec in $CLIPS; do
     echo "GATE_ASR_${lang}_FAIL (transcript differs from $ADIR/golden_$lang.i32)"; ok=0
   fi
 done
+if echo "$OUT" | grep -q "GATE_TTS_SERVE_BYTES_FAIL"; then
+  echo "GATE_TTS_SERVE_BYTES_FAIL (the served waveform differs from the one-shot reference)"; ok=0
+elif echo "$OUT" | grep -q "GATE_TTS_SERVE_BYTES_OK"; then echo "GATE_TTS_SERVE_BYTES_OK"; fi
 sndr=$(echo "$OUT" | grep -o "TTS_SNDRdB [0-9.]*" | awk '{print $2}' | tail -1)
 if [ -n "${sndr:-}" ] && awk -v s="$sndr" 'BEGIN{exit !(s>=60)}'; then echo "GATE_TTS_SNDR_OK ($sndr dB)"; else echo "GATE_TTS_SNDR_FAIL (${sndr:-none})"; ok=0; fi
 [ "$ok" = 1 ] || { echo "GATES FAILED"; exit 1; }
