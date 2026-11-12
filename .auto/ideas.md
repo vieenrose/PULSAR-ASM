@@ -2515,3 +2515,27 @@ algorithm (fp16 accumulation), both of which change the goldens.
   service. Verified: the 60 s clip through the resident path now returns ids identical to cold
   (108 s vs cold 64.5 s -- recovery is slower than cold for oversized audio, so a deployment
   that routinely sees >40 s clips should use the cold arm or fix the service).
+- [LFM3/Nano S2T] ROOT CAUSE of the served-encoder zeros, and the rule it teaches (2026-11-12,
+  run #273). `static double* mv` in the projector (lfm3_enc_gpu.cu, LFM_ENC_LNM) was allocated
+  `if (lnm && !mv && cudaMalloc(&mv, (size_t)Tt * 16))` -- sized by the FIRST request. A resident
+  service that had served a 9 s clip (Tt=113 -> 1.8 KB) then served the 60 s clip (Tt=1376 ->
+  22 KB) and wrote 12x past the buffer: a device-heap overflow that corrupted the neighbouring
+  pooled buffers and came out as `dump proj_out nonzero=0` with NO OOM / LAUNCH ERROR / EXEC
+  ERROR line anywhere in the log. Fixed to grow-only with a cap (the pattern g_ss at :1321
+  already used). Proven: `encstage.sh 1` (one small served request, then the 60 s one) goes from
+  nonzero=0/rc=3 to nonzero=2818048 max=1.0471/rc=0, and the value matches a fresh-service run
+  to the digit. The one-shot process could never hit it: its first request is its only request.
+  RULE, worth applying before any new service is trusted: **a resident service turns every
+  "allocate once, size from the first request" static into a latent buffer overflow.** Audit
+  `!ptr && cudaMalloc` and any static sized by a request-dependent length; the same class in the
+  backbone was already caught once (#264, the layer-major xall buffer sized by the first clip).
+  Still OPEN (next iteration): with the encoder fixed, the 60 s clip now fails one stage later --
+  the resident BACKBONE produces nothing for 900 s on a 1396-position clip (generalize.sh:
+  `the resident backbone produced nothing for 900 s`, MEMLOW 346 MB), while the same clip works
+  end-to-end cold (64.8 s, 96 ids) and the encoder answers rc=0 beside it. Suspect the same
+  first-request-sized pattern in lfm3_nanode's service path, or the arena growing past what is
+  left next to 2.15 GB + the encoder's ~800 MB for a long clip. `bash encmix.sh both` isolates
+  it against `enc_only`, and the client's LFM_ENC_WAIT/900 s waits make it slow to probe: lower
+  them while iterating. Also from this run: my first hand-rolled fifo poll loop reported a fake
+  "third request hangs" by racing its own writer -- trust only the real client (lfm3_asr) or a
+  per-request proj_out existence check, and say so in the diagnostic's header.

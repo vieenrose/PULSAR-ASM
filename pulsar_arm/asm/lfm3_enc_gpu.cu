@@ -2086,9 +2086,21 @@ int main(int argc, char** argv) {
     Ent* pw3 = need(M, "mlp.model.3.weight"), *pb3 = need(M, "mlp.model.3.bias");
     wallmark("17 layers");
     // LFM_ENC_LNM (default 1): moments one row per lane (k_moments_rows); 0 = thread 0.
-    static double* mv = nullptr;
     const bool lnm = !getenv("LFM_ENC_LNM") || atoi(getenv("LFM_ENC_LNM"));
-    if (lnm && !mv && cudaMalloc(&mv, (size_t)Tt * 16)) { printf("moments alloc\n"); exit(3); }
+    static double* mv = nullptr;
+    static size_t mv_cap = 0;
+    // GROW-ONLY, not allocate-once. This buffer's size is Tt*16 (16 doubles of mean/variance per
+    // audio row), so a resident service that saw a SHORT clip first kept a 1.8 KB buffer and then
+    // wrote 22 KB through it on the 60 s clip -- a device-heap overflow that corrupted the
+    // neighbouring pooled buffers and came out as proj_out = all zeros with no CUDA error anywhere
+    // (found by generalize.sh's held-out 60 s clip; the one-shot process never hits it because its
+    // first request is its only request). Same shape as g_ss above, which does check the cap.
+    if (lnm && (size_t)Tt * 16 > mv_cap) {
+      if (mv) cudaFree(mv);
+      mv = nullptr; mv_cap = 0;
+      if (cudaMalloc(&mv, (size_t)Tt * 16)) { printf("moments alloc\n"); pass_fail(); }
+      mv_cap = (size_t)Tt * 16;
+    }
     if (lnm) k_moments_rows<<<(Tt + 127) / 128, 128>>>(hn, mv, Tt);
     k_layernorm_f32<<<Tt, 256>>>(hn, pw0->df, pb0->df, hp1, lnm ? mv : nullptr); chk("proj ln");
     gemm_to(pw1, hp1, hp2, Tt, xb2, "proj lin1");
