@@ -2604,3 +2604,23 @@ algorithm (fp16 accumulation), both of which change the goldens.
   the TTS runs on a parked clock and costs 2-3x (1.0-1.7 s). A fix belongs in the product path
   (e.g. the TTS service re-ramping the clock when the reply text starts arriving); an in-process
   keep-warm during ASR is NOT the answer (#43: -35%, one SM). Needs root to pin the governor.
+- [LFM3/Nano S2T] The long-clip backbone stall: not reproducible on the current build, and two
+  earlier readings corrected (2026-11-12, run #278, diagnostic). stall.sh (resident arm only: 7
+  short turns then the 60 s clip; now with BALLOON_MB and PFRUN): 8/8 passes at 62.87-63.90 s,
+  prefill 46.28-46.63 s, ids md5 eca77bbe (= cold), in-turn MemAvailable low 534-540 MB. With
+  touched anonymous memory held during the turn (chunk 32): 150 MB -> low 453, prefill 46.33 s;
+  300 -> 415, 46.34; 450 -> 369, 46.32 s, encoder reply 15.4 s. Chunk 128: no balloon 46.36 s,
+  450 MB balloon 46.37 s (low 371), encoder reply 10.3 s.
+  CORRECTIONS: (1) #274's "chunk 128 prefills at 67 ms/pos on long prompts" was not a chunk
+  effect -- on this build 128 and 32 are equal (33.2 ms/pos). (2) Memory pressure down to ~370 MB
+  slows the ENCODER reply (allocation under reclaim: 5.6 -> 10-15 s) but not the backbone
+  prefill, so "low memory stalls the prefill" is not supported at that level either.
+  What the evidence does say: every slow or stalled long turn (72-154 s, and the 900 s stalls)
+  happened while the encoder pass was 772 MB (before #276's aliasing) or, once, with a second
+  2.15 GB backbone loading beside the resident one (my concurrent harness run). 15 long turns
+  since #276: none slow. Mechanism still not observed directly; stall.sh's capture is armed.
+  The balloon holds anonymous pages, not nvmap memory, so it is not the same pressure as a
+  larger device allocation -- that is the untested difference. Not pushed below ~370 MB: the
+  board hard-hangs at zero and cannot be rebooted remotely.
+  Harness spread under the PT_TURN=1 protocol, 4 samples of unchanged engines: combined_rtf
+  0.5034 / 0.5061 / 0.5065 / 0.5078 (asr 5.868-5.904 s, tts 0.483-0.504 s) -> ~+-0.4%.
