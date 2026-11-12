@@ -2724,3 +2724,23 @@ algorithm (fp16 accumulation), both of which change the goldens.
   Limitation: the mixed arm seeds each clip's reference from its own first pass, so a defect that
   appeared on the FIRST pass of a clip in a session would be missed here -- generalize.sh
   (cold vs resident, frozen goldens) covers that; the two together are the gate.
+- [LFM3+PrimeTTS/Nano] Arrival clock ramp: the TTS no longer runs on a parked GPU clock
+  (2026-11-13, run #285, keep; prime-tts 8e2f025; metric-neutral by construction). #277 found the
+  risk and left it as "needs root": nvhost_podgov parks the GPU at 76.8 MHz within ~2 s of idle,
+  and a T81 request then costs 1.0-1.7 s against 0.48 s at the 921.6 MHz max. Root is not needed:
+  the resident driver can read cur_freq/max_freq (world-readable devfreq sysfs) and, when a
+  request arrives parked, hold the SM busy on the startup ramp's own ALU kernel
+  (pt_v21_cuda_keepwarm, private stream + private sink) until the clock reaches max or
+  PT_V21_RAMP_MS (default 500) expires. When the clock is already at max it returns without
+  launching anything -- so the harness, where TTS follows ASR with no gap, never enters the path
+  (proof: zero "clock parked" lines in /tmp/cmb.pt.log across harness runs, and tts_wall 0.483 s
+  unchanged). Paired order-balanced A/B with 6 s gaps, 3 requests/boot, wall including the ramp
+  (.auto/combined/tts_ramp_ab.sh): ramp on 0.728-0.813 s vs ramp off 1.125-2.259 s (11-26 bursts,
+  192-333 ms each ramp) -> worst case ~2.8x better, median ~1.6x. Back-to-back at max:
+  0.4759/0.4772 (on) vs 0.4926/0.4927 (off), no ramp line. First request after boot with a cold
+  clock: +43 ms (0.631 vs 0.588, one sample each, inside that sample's own spread; the harness
+  pays it in its untimed warm-up turn). Bit-exact by construction and gated: served waveform
+  byte-identical to one-shot, SNDR 70.09, harness 0.5063 (band 0.5034-0.5078). LESSON: the
+  parked-clock penalty is invisible to any benchmark that keeps the GPU busy or measures one
+  request after another -- a per-request latency feature must be A/B'd with idle gaps that
+  reproduce the deployment's dead time, and the ramp's own cost must be inside the timed window.
