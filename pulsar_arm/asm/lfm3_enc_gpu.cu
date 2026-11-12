@@ -1570,23 +1570,44 @@ static void gemm_to(Ent* e, const float* x, float* y, int T, bf16* xb, const cha
 }
 
 // ---------------------------------------------------------------- helpers
-// Per-request device allocations, tracked so a resident (--serve-fifo) pass can hand them back
-// between turns. dalloc is a raw cudaMalloc today, which is free in a one-shot process and a
-// leak in a service; recording the pointers here is the whole difference between the two.
-static std::vector<void*> g_reqallocs;
+// Per-request device allocations. In a one-shot process these are cudaMalloc'd once and
+// reclaimed at exit; a resident service that repeated them per turn both leaked (fixed by
+// tracking and freeing) and paid the allocator every turn: a served request costs ~0.48 s of
+// wall for ~0.12 s of GPU, and the difference is cudaMalloc/cudaFree + the zero fill over the
+// pass's activation set. So the buffers are POOLED by call index and reused across passes
+// (grow-only: a slot is reallocated only when the request needs more bytes than it holds --
+// the same code path with a shorter mel reuses the bigger buffer). LFM_ENC_POOL=0 restores the
+// free-after-pass behaviour (the A/B arm).
+struct ReqAlloc { void* p; size_t bytes; };
+static std::vector<ReqAlloc> g_pool;
+static std::vector<void*> g_reqallocs;   // LFM_ENC_POOL=0 arm: freed at the end of each pass
+static size_t g_slot = 0;
+static int g_pool_on = -1;
+static void* req_alloc(size_t bytes, int zero, const char* what) {
+  if (g_pool_on < 0) g_pool_on = getenv("LFM_ENC_POOL") ? atoi(getenv("LFM_ENC_POOL")) : 1;
+  void* p = nullptr;
+  if (g_pool_on && g_slot < g_pool.size() && g_pool[g_slot].bytes >= bytes) {
+    p = g_pool[g_slot].p;                       // reuse: same slot, big enough
+  } else {
+    if (cudaMalloc(&p, bytes)) { printf("OOM (%s, %.1f MB)\n", what, bytes / 1e6); exit(2); }
+    if (g_pool_on) {
+      if (g_slot < g_pool.size()) { cudaFree(g_pool[g_slot].p); g_pool[g_slot] = { p, bytes }; }
+      else g_pool.push_back({ p, bytes });
+    } else g_reqallocs.push_back(p);
+  }
+  g_slot++;
+  // cudaMalloc hands back stale device memory -- and so does a reused slot. Reading any element
+  // before it is written is therefore run-history dependent: four back-to-back runs of the same
+  // binary agreed with each other to the bit and disagreed with a run that followed a fresh
+  // build (layer_01 max abs 2.9e-06 vs 9.1e-03). Zero every allocation, and LFM_ENC_POISON=1
+  // fills with 0xff bytes = NaN so any such read turns the stage's output non-finite and the
+  // gate's finite check fails LOUDLY.
+  if (zero && cudaMemset(p, g_poison ? 0xff : 0, bytes)) { printf("memset failed (%s)\n", what); exit(2); }
+  return p;
+}
 static float* dalloc(size_t n, const char* what) {
   if (g_poison < 0) g_poison = getenv("LFM_ENC_POISON") ? atoi(getenv("LFM_ENC_POISON")) : 0;
-  float* p = nullptr;
-  if (cudaMalloc(&p, n * 4)) { printf("OOM (%s, %.1f MB)\n", what, n * 4 / 1e6); exit(2); }
-  g_reqallocs.push_back(p);
-  // cudaMalloc hands back stale device memory. Reading any element before it is
-  // written is therefore run-history dependent: four back-to-back runs of the same
-  // binary agreed with each other to the bit and disagreed with a run that followed a
-  // fresh build (layer_01 max abs 2.9e-06 vs 9.1e-03). Zero every allocation, and
-  // LFM_ENC_POISON=1 fills with 0xff bytes = NaN so any such read turns the stage's
-  // output non-finite and the gate's finite check fails LOUDLY.
-  if (cudaMemset(p, g_poison ? 0xff : 0, n * 4)) { printf("memset failed (%s)\n", what); exit(2); }
-  return p;
+  return (float*)req_alloc(n * 4, 1, what);
 }
 // dalloc_w: for buffers that the next kernel writes in full before anything reads them
 // (conv_in -> x1, conv_mid -> x2), the zero fill is skipped (LFM_ENC_NZ, default 1);
@@ -1594,11 +1615,9 @@ static float* dalloc(size_t n, const char* what) {
 static float* dalloc_w(size_t n, const char* what) {
   static const int nz = getenv("LFM_ENC_NZ") ? atoi(getenv("LFM_ENC_NZ")) : 1;
   if (g_poison < 0) g_poison = getenv("LFM_ENC_POISON") ? atoi(getenv("LFM_ENC_POISON")) : 0;
-  if (!nz || g_poison) return dalloc(n, what);
-  float* p = nullptr;
-  if (cudaMalloc(&p, n * 4)) { printf("OOM (%s, %.1f MB)\n", what, n * 4 / 1e6); exit(2); }
-  g_reqallocs.push_back(p);
-  return p;
+  // Both arms take a pool slot, so the slot sequence does not depend on LFM_ENC_NZ.
+  if (!nz || g_poison) return (float*)req_alloc(n * 4, 1, what);
+  return (float*)req_alloc(n * 4, 0, what);
 }
 // LFM_ENC_OVL (default 1): the blob upload continues on the loader thread (the backbone's
 // LFM_PF_OVL machinery: per-chunk stream sync + per-tensor CRC before `done` is published)
@@ -1753,6 +1772,7 @@ int main(int argc, char** argv) {
   int Tm = Tm_in;
   const bool pass_auto = (Tm_in <= 0);
   mkdir(odir_in, 0777);
+  g_slot = 0;                 // the pass's allocations come from the pooled slots, in call order
   g_reqallocs.clear();
   if (pass_auto) {
     struct stat stt; int waited_ms = 0;
@@ -2058,9 +2078,10 @@ int main(int argc, char** argv) {
   chk_final("end of pass");
   fflush(stdout);
   wallmark("layers+projector+dumps");
-  // Hand every device allocation this pass made back to the driver: a one-shot process gets
-  // them reclaimed at exit for free, a service must not accumulate them turn over turn.
-  for (size_t i = 0; i < g_reqallocs.size(); i++) cudaFree(g_reqallocs[i]);
+  // With the pool on, the pass's buffers stay allocated for the next turn (that is the whole
+  // point); with LFM_ENC_POOL=0 they go back to the driver here, which is the pre-pool behaviour
+  // and the A/B arm. Nothing is ever leaked: the pool is freed when the process exits.
+  if (!g_pool_on) { for (size_t i = 0; i < g_reqallocs.size(); i++) cudaFree(g_reqallocs[i]); }
   g_reqallocs.clear();
   return 0;
   };

@@ -163,6 +163,12 @@ for p in ['lfm3-audio-2b-q8.lfm3q8','lfm3-audio-2b-enc.lfm3q8','tok.bin','mel.bi
   t3=$(date +%s.%N)
   python3 -c "print('WARMUP %.3f' % ($t3-$t2))"
 fi
+# MemAvailable low-water watcher: the board hard-hangs when RAM is exhausted (run 281), and three
+# resident GPU processes now coexist with the page cache, so a run that quietly pushes the floor
+# down must be visible in the log rather than discovered by a hang.
+( LOW=/tmp/cmb.lowwater; : > $LOW
+  while :; do awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo >> $LOW; sleep 0.5; done ) &
+WATCH=$!
 for spec in $CLIPS; do
   lang=${spec%%:*}; clip=${spec#*:}
   rm -f "/tmp/cmb.$lang.i32" "/tmp/cmb.$lang.log"
@@ -188,6 +194,8 @@ if [ "$ASR_MODE" = warm ]; then
   if [ "${LFM_ENC_RESIDENT:-1}" = 1 ]; then timeout 5 sh -c "echo Q > $ENC_IN" 2>/dev/null; kill $ENCS 2>/dev/null; wait $ENCS 2>/dev/null; fi
   rm -f $ENC_IN
 fi
+kill $WATCH 2>/dev/null
+echo "LOWWATER_MB $(sort -n /tmp/cmb.lowwater 2>/dev/null | head -1)"
 cd "$PT_DIR" || exit 2
 # The reference is ALWAYS the one-shot driver, run untimed: it is the thing the SNDR gate has
 # always certified, and it is what the served waveform is compared against byte for byte.
@@ -227,7 +235,7 @@ else
 fi
 REMOTE
 )
-echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD|WARMUP|ENCREQ|PTREQ|GATE_TTS_SERVE)" | sed 's/^/  /'
+echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD|WARMUP|ENCREQ|PTREQ|LOWWATER_MB|GATE_TTS_SERVE)" | sed 's/^/  /'
 echo "$OUT" | grep -q "ASR_FAIL\|TTS_FAIL\|TTS_REF_FAIL\|PTSERVICE_FAIL\|PT_WRITE_FAIL\|SERVICE_FAIL\|ENCSERVICE_FAIL" && { echo "GATE FAIL: a stage failed"; echo "$OUT" | tail -20; exit 1; }
 
 # ---- quality gates
