@@ -2744,3 +2744,15 @@ algorithm (fp16 accumulation), both of which change the goldens.
   parked-clock penalty is invisible to any benchmark that keeps the GPU busy or measures one
   request after another -- a per-request latency feature must be A/B'd with idle gaps that
   reproduce the deployment's dead time, and the ramp's own cost must be inside the timed window.
+- [LFM3/Nano S2T] The ASR does NOT need the arrival clock ramp (2026-11-13, run #286, measured out;
+  tool .auto/combined/asr_gap_ab.sh). Extending #285's fix to the ASR turn looked like the bigger
+  prize (5.9 s of GPU work arriving after the user's silence, clock parked at 76.8 MHz). Measured,
+  3 rounds x {10 s gap then turn} vs {turn immediately} in one service session: gap
+  5.510/5.556/5.574 s vs immediate 5.426/5.432/5.434 s = **+0.09 s (1.7%)**, ids GOLDEN in every
+  turn. WHY it differs from the TTS (where the same regime cost 2-3x): the ASR turn begins with
+  ~1.5 s of CPU-only work (WAV decode, mel, prompt ids, tokenizer join) before the encoder's first
+  launch, so the governor is ramped by the time the GPU is needed -- the stage's own front-end
+  pays the ramp. The TTS has no such phase (its first launch is immediate), which is exactly why
+  the ramp belongs there and not here. RULE: a parked-clock penalty is only worth an arrival ramp
+  in a stage whose first GPU launch is immediate; measure the stage's CPU lead time first. Not
+  built; PT_V21_RAMP_MS stays the only ramp. Harness 0.5054, all gates + checks.sh green.
