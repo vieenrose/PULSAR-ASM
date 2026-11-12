@@ -5523,7 +5523,11 @@ int main(int argc, char** argv) {
     g_prefill_phase = (s < 0 || s < nprompt_all - 1) ? 1 : 0;   // S8 arm scope: prompt steps only
     const int tok = s < 0 ? 124894 : toks[s];
     const bf16* lm_head_input = M.x;   // replaced by the embedding_norm output below
-    if (pos >= MAXTOK) break;
+    if (pos >= MAXTOK) {   // the K/V caches are full: say so, the run used to just end here
+      printf("CONTEXT FULL: stopped at position %d of %d requested steps (%d-position context)\n", pos, steps, MAXTOK);
+      fflush(stdout);
+      break;
+    }
     // (Placed at the TOP of step 0, before its embedding and layer body. It used to sit
     // after them, so position 0 went through the 24 layers twice: every conv ring took an
     // extra shift, a chunk-invariant offset of ~2000/2048 cells in the prefill output

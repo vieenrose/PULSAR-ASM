@@ -2686,3 +2686,11 @@ algorithm (fp16 accumulation), both of which change the goldens.
   prompt with max_gen 96: 318 s (two services; with three the encoder memory guard trips first,
   ~135 s). Not covered: prompt + generation crossing 4096 inside the engine still ends the step
   loop silently (the client's check prevents it for lfm3_asr callers).
+- [LFM3/Nano S2T] Context-full is announced; full-context soak; held-out gate on the hardened
+  build (2026-11-13, run #283, keep, robustness only). lfm3_nanode prints "CONTEXT FULL: stopped
+  at position 4096 of N requested steps" where the step loop used to end silently. ctxfull.sh:
+  a 4090-id prompt + 20 requested ids through the resident service (the longest prompt ever run
+  through it; 152 s) stops with that line after 6 ids, service alive, next turn golden,
+  MemAvailable 1229 MB after. generalize.sh on this build (three services): 7/7 ASR identical,
+  7/7 TTS bytes identical, 0 guard trips; 110 s clip 64.1 s resident vs 64.7 s cold this run
+  (68.1 vs 65.0 in #281: the long resident turn varies 63-70 s with three services).
