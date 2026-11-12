@@ -2672,3 +2672,17 @@ algorithm (fp16 accumulation), both of which change the goldens.
   0.47-0.50, T120 0.71 s; T20 right after the 110 s turn 0.50 s (3x its usual: one request after
   a memory-pressure turn is slow, the #280 observation again). MEMLOW 766 MB is sampled after
   turns, not inside them (in-turn low for the 110 s clip is ~250-310 MB, #280).
+- [LFM3/Nano S2T] Backbone context cap enforced; spec parser hardened (2026-11-13, run #282, keep,
+  robustness only). The K/V caches hold MAXTOK = 4096 positions and the batched prefill writes
+  one row per prompt position with no bound: a prompt over 4096 ids would have written past them
+  (device-heap overflow, the #273 class). lfm3_asr already refused n_ids + max_gen > 4096, but
+  only before stage 5, i.e. after the encoder pass; lfm3_nanode itself had no check. Now:
+  (1) lfm3_asr refuses as soon as the mel frame count is known (330 s clip: rc 2 in 1.2 s, no
+  encoder pass); (2) lfm3_nanode refuses a prompt > MAXTOK (service: CONTEXT REFUSED + DONE
+  steps=0 and keeps serving; one-shot: exit 2); (3) a non-numeric id line in a clip spec no
+  longer loops forever pushing ids until bad_alloc kills the service (strtol that consumed
+  nothing; found when my own test spec had its lines swapped): SPEC REFUSED, service stays up.
+  ctxcap.sh proves all three and that the next turn returns the golden ids. Max audio at this
+  prompt with max_gen 96: 318 s (two services; with three the encoder memory guard trips first,
+  ~135 s). Not covered: prompt + generation crossing 4096 inside the engine still ends the step
+  loop silently (the client's check prevents it for lfm3_asr callers).

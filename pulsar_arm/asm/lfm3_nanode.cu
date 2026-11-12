@@ -5408,7 +5408,18 @@ int main(int argc, char** argv) {
     steps = steps_base;   // reset before a per-clip override (see steps_base)
     prompt.clear();
     std::string idbuf(idsp);            // strtol wants a writable endptr
-    for (char* q = &idbuf[0]; *q; ) { prompt.push_back((int)strtol(q, &q, 10)); if (*q == ',') q++; }
+    // strtol that consumes nothing (a non-numeric id line) must end the parse: it used to push
+    // ids forever until bad_alloc took the service down.
+    bool ids_bad = false;
+    for (char* q = &idbuf[0]; *q; ) {
+      char* e; long v = strtol(q, &e, 10);
+      if (e == q) { ids_bad = true; break; }
+      prompt.push_back((int)v); q = e; if (*q == ',') q++;
+    }
+    if (ids_bad || prompt.empty()) {
+      printf("SPEC REFUSED: %s: the id line is not a comma-separated id list\n", spec.c_str());
+      printf("CLIP %d DONE steps=0\n", cl); fflush(stdout); continue;
+    }
     if (atv >= 0) g_aemb_at = atv;
     audio_emb_file = (embp[0] && strcmp(embp, "-")) ? strdup(embp) : nullptr;
     if (g_aemb) { cudaFree(g_aemb); g_aemb = nullptr; }
@@ -5416,6 +5427,12 @@ int main(int argc, char** argv) {
     printf("CLIP %d START ids=%zu emb=%s at=%d ngen=%d\n", cl, prompt.size(),
            audio_emb_file ? audio_emb_file : "-", g_aemb_at, steps - (int)prompt.size());
     fflush(stdout);
+    // Context cap, service side (see the same test below for the single-prompt path): refused
+    // before anything is sized from the prompt length.
+    if ((int)prompt.size() > MAXTOK) {
+      printf("CONTEXT REFUSED: %zu prompt ids exceed the %d-position context\n", prompt.size(), MAXTOK);
+      printf("CLIP %d DONE steps=0\n", cl); fflush(stdout); continue;
+    }
     // Per-clip generation count (spec line 4), so a short clip in a resident batch is
     // not forced to the longest clip's --steps.
     if (ngv >= 0) steps = (int)prompt.size() + ngv;
@@ -5466,6 +5483,15 @@ int main(int argc, char** argv) {
   struct timespec tw0; clock_gettime(CLOCK_MONOTONIC, &tw0);
   int nwarm = 0;
   const int nprompt_all = (int)prompt.size();   // for the S8 arm's prefill scope
+  // Context cap. The K/V caches hold MAXTOK positions per layer and the batched prefill writes
+  // a row per prompt position with no bound of its own, so a longer prompt would write past
+  // them (a device-heap overflow, the #273 class). Refuse it whole: a service answers the turn
+  // with zero steps and stays up, the one-shot process exits.
+  if (nprompt_all > MAXTOK) {
+    printf("CONTEXT REFUSED: %d prompt ids exceed the %d-position context\n", nprompt_all, MAXTOK);
+    if (hasspec) { printf("CLIP %d DONE steps=0\n", cl); fflush(stdout); continue; }
+    fflush(stdout); exit(2);
+  }
   // ---- committed batched-prefill bit-exactness probe ---------------------------------
   // LFM_PF_PROBE=<arm> runs the whole prompt TWICE in this process: pass 0 with the
   // shipped serial arm (ARM=0), pass 1 with the requested batched arm, and compares the

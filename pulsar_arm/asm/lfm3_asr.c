@@ -492,6 +492,13 @@ int main(int argc, char **argv) {
   const long n_text = n_total - n_audio;
   n_audio = (Tm + 7) / 8;
   n_total = n_text + n_audio;
+  /* Context cap, checked as soon as the clip length is known: the same test as the one before
+     stage 5, but before the encoder pass (seconds to minutes, and ~5 MB of device memory per
+     audio second) is spent on a clip the backbone cannot hold. */
+  if (n_total + (long)max_gen > 4096)
+    die("%ld prompt ids + %d generation exceed the engine's 4096-position context "
+        "(%.0f s of audio max at this prompt; this clip is %.0f s)", n_total, max_gen,
+        (4096.0 - max_gen - n_text) * 8 / 100.0, (double)Tm / 100.0);
 
   /* ---- stage 3: encoder tower ------------------------------------------------ */
   stage("audio encoder tower (GPU) -> 2048-d rows");
