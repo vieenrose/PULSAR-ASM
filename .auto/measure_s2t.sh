@@ -23,7 +23,7 @@ BUILD=$(ssh -o ConnectTimeout=25 -o BatchMode=yes "$NANO" \
    nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o lfm3_nanode.new lfm3_nanode.cu -lz 2>&1 && \
    nvcc -std=c++11 -gencode arch=compute_53,code=sm_53 -O3 -fmad=false -Xptxas -O3,-dlcm=ca -o lfm3_enc_gpu.new lfm3_enc_gpu.cu -lz 2>&1 && \
    gcc -O2 -std=c99 -o lfm3_wav lfm3_wav.c 2>&1 && gcc -O2 -std=c99 -o lfm3_mel lfm3_mel.c mo -lm 2>&1 && \
-   rm -f lfm3_asr.new && gcc -O2 -o lfm3_asr.new lfm3_asr.c lfm3_tok.c -lm 2>/dev/null && test -s lfm3_asr.new && mv -f lfm3_asr.new lfm3_asr && \
+   rm -f lfm3_asr.new && gcc -O2 -pthread -o lfm3_asr.new lfm3_asr.c lfm3_tok.c -lm 2>/dev/null && test -s lfm3_asr.new && mv -f lfm3_asr.new lfm3_asr && \
    test -x lfm3_nanode.new && mv -f lfm3_nanode.new lfm3_nanode && \
    test -x lfm3_enc_gpu.new && mv -f lfm3_enc_gpu.new lfm3_enc_gpu && echo BUILT_OK" 2>/dev/null | grep -vi setlocale)
 echo "$BUILD" | grep -i "error:" | head -5

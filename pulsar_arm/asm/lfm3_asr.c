@@ -39,7 +39,34 @@
 #include <signal.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
 #include "lfm3_tok.h"
+
+/* The tokenizer off the turn's critical path. Loading tok.bin (5.4 MB: a malloc per vocab
+   entry plus two sorts) and encoding the prompt text costs 0.85 s on the A57, against 0.45 s
+   for the resident encoder's request that it used to overlap -- so the tokenizer, not the
+   encoder, decided when the backbone could start (measured by the "TIME tokenizer" line). It
+   now runs on a thread started before stage 1. Its two products are needed at different times:
+   the prompt ids before the backbone starts, the vocabulary only for the detokenizer ~5 s
+   later. The ids are a pure function of (prompt text, tok.bin), so they are cached on disk
+   keyed by the prompt's sha256 and tok.bin's size + mtime; a turn that hits the cache does not
+   wait for the thread, and the thread's own encode is compared with the cached ids before the
+   transcript is printed, so a stale cache cannot produce a transcript -- it dies and is
+   removed. LFM_ASR_IDCACHE=0 ignores the cache (the A/B control: join, then use the ids). */
+typedef struct {
+  const char *path; LTok tok; const uint8_t *prompt; size_t pre_len, post_off, post_len;
+  uint32_t *pre, *post; int cap, npre, npost, rc;
+} TokJob;
+static void *tok_job(void *a) {
+  TokJob *j = a;
+  memset(&j->tok, 0, sizeof j->tok);
+  if (ltok_load(&j->tok, j->path) != 0) { j->rc = 1; return NULL; }
+  j->npre = ltok_encode(&j->tok, j->prompt, j->pre_len, j->pre, j->cap);
+  j->npost = ltok_encode(&j->tok, j->prompt + j->post_off, j->post_len, j->post, j->cap);
+  j->rc = (j->npre < 0 || j->npost < 0) ? 2 : 0;
+  return NULL;
+}
+typedef struct { char magic[8]; char sha[72]; int64_t size, mt_s, mt_ns; int32_t npre, npost; } IdCacheHdr;
 
 /* ------------------------------------------------------------------ sha256 (FIPS 180-4)
  * The manifest carries the HF golden's sha256 for the prompt text, so verifying it here
@@ -360,6 +387,14 @@ int main(int argc, char **argv) {
   printf("prompt: %ld bytes, sha256 verified, placeholder at %zu, %ld audio rows at position %ld\n",
          (long)plen, pre_len, n_audio, audio_at);
 
+  /* tokenizer thread: started here so that it overlaps stages 1-3 (see TokJob) */
+  static TokJob tj; pthread_t tok_th;
+  tj.path = TOKB; tj.prompt = prompt; tj.pre_len = pre_len; tj.post_off = post_off; tj.post_len = post_len;
+  tj.cap = (int)(plen * 2 + 16);
+  tj.pre = xmalloc((size_t)tj.cap * 4); tj.post = xmalloc((size_t)tj.cap * 4);
+  if (pthread_create(&tok_th, NULL, tok_job, &tj) != 0) die("cannot start the tokenizer thread");
+  int tok_joined = 0;
+
   /* ---- stage 1: WAV -> PCM ---------------------------------------------------- */
   /* The encoder starts first with Tm = auto: its CUDA init + blob load (~1.9 s) overlap
      stages 1-2, and it waits for MEL, which appears only by rename after lfm3_mel
@@ -430,13 +465,48 @@ int main(int argc, char **argv) {
 
   /* ---- stage 4: prompt ids, built natively ----------------------------------- */
   stage("ASR prompt ids (S1 tokenizer, manifest-expanded audio slot)");
-  LTok tok; memset(&tok, 0, sizeof tok);
-  if (ltok_load(&tok, TOKB) != 0) die("cannot load tokenizer blob %s", TOKB);
-  int cap = (int)(plen * 2 + 16);
+  int cap = tj.cap;
   uint32_t *pre_ids = xmalloc((size_t)cap * 4), *post_ids = xmalloc((size_t)cap * 4);
-  int npre = ltok_encode(&tok, prompt, pre_len, pre_ids, cap);
-  int npost = ltok_encode(&tok, prompt + post_off, post_len, post_ids, cap);
-  if (npre < 0 || npost < 0) die("tokenizer failed on the prompt (pre %d, post %d)", npre, npost);
+  int npre = -1, npost = -1, id_cached = 0;
+  char IDC[1100]; path_of(IDC, sizeof IDC, "asr_prompt.idcache");
+  IdCacheHdr want; memset(&want, 0, sizeof want);
+  { struct stat ts; if (stat(TOKB, &ts) != 0) die("cannot stat %s", TOKB);
+    memcpy(want.magic, "LFMIDC01", 8); snprintf(want.sha, sizeof want.sha, "%s", got_sha);
+    want.size = (int64_t)ts.st_size; want.mt_s = (int64_t)ts.st_mtim.tv_sec; want.mt_ns = (int64_t)ts.st_mtim.tv_nsec; }
+  if (!(getenv("LFM_ASR_IDCACHE") && !atoi(getenv("LFM_ASR_IDCACHE")))) {
+    FILE *cf = fopen(IDC, "rb");
+    if (cf) {
+      IdCacheHdr h;
+      if (fread(&h, sizeof h, 1, cf) == 1 && !memcmp(h.magic, want.magic, 8) && !strcmp(h.sha, want.sha) &&
+          h.size == want.size && h.mt_s == want.mt_s && h.mt_ns == want.mt_ns &&
+          h.npre >= 0 && h.npost >= 0 && h.npre <= cap && h.npost <= cap &&
+          fread(pre_ids, 4, (size_t)h.npre, cf) == (size_t)h.npre &&
+          fread(post_ids, 4, (size_t)h.npost, cf) == (size_t)h.npost) {
+        npre = h.npre; npost = h.npost; id_cached = 1;
+      }
+      fclose(cf);
+    }
+  }
+  if (!id_cached) {
+    pthread_join(tok_th, NULL); tok_joined = 1;
+    if (tj.rc == 1) die("cannot load tokenizer blob %s", TOKB);
+    npre = tj.npre; npost = tj.npost;
+    if (npre < 0 || npost < 0) die("tokenizer failed on the prompt (pre %d, post %d)", npre, npost);
+    memcpy(pre_ids, tj.pre, (size_t)npre * 4); memcpy(post_ids, tj.post, (size_t)npost * 4);
+    /* publish by rename, so a concurrent turn never reads a half-written cache; a model
+       directory that is not writable just means no cache */
+    char tmpc[1200]; snprintf(tmpc, sizeof tmpc, "%s.%ld", IDC, (long)getpid());
+    FILE *cf = fopen(tmpc, "wb");
+    if (cf) {
+      want.npre = npre; want.npost = npost;
+      int okw = fwrite(&want, sizeof want, 1, cf) == 1 &&
+                fwrite(pre_ids, 4, (size_t)npre, cf) == (size_t)npre &&
+                fwrite(post_ids, 4, (size_t)npost, cf) == (size_t)npost;
+      okw = (fclose(cf) == 0) && okw;
+      if (!okw || rename(tmpc, IDC) != 0) unlink(tmpc);
+    }
+  }
+  printf("prompt ids from %s\n", id_cached ? "the id cache (tokenizer still loading; verified before the transcript)" : "the tokenizer");
   long n_ids = (long)npre + n_audio + npost;
   if (n_ids != n_total)
     die("built %ld ids (%d + %ld audio + %d), manifest says %ld -- refusing",
@@ -501,6 +571,7 @@ int main(int argc, char **argv) {
                  siq, siv,
                  pfrun >= 2 ? pfr : NULL, pfv, NULL };
   if (early && !srv_in) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
+  { double t = now_s(); printf("TIME prompt ids ready %.3f s after the encoder request\n", t - g_stage_t); }
   enc_collect(enc_log, g_enc_off, g_enc_n);
   stage("encoder reply");   // splits the pre-backbone window: request+GPU pass vs everything else
   need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
@@ -580,6 +651,15 @@ int main(int argc, char **argv) {
   if (ngen == 0) die("no generated tokens in %s -- refusing to print an empty transcript", eng);
   size_t dcap = (size_t)ngen * 16 + 64;
   uint8_t *txt = xmalloc(dcap);
+  if (!tok_joined) { pthread_join(tok_th, NULL); tok_joined = 1; }
+  if (tj.rc == 1) die("cannot load tokenizer blob %s", TOKB);
+  if (id_cached && (tj.rc != 0 || tj.npre != npre || tj.npost != npost ||
+                    memcmp(tj.pre, pre_ids, (size_t)npre * 4) || memcmp(tj.post, post_ids, (size_t)npost * 4))) {
+    unlink(IDC);
+    die("%s disagreed with the tokenizer's own encode of the prompt -- removed it; no transcript "
+        "is printed from ids the tokenizer did not produce", IDC);
+  }
+  LTok tok = tj.tok;
   int dn = ltok_decode(&tok, gen, (size_t)ngen, txt, dcap);
   if (dn < 0) die("detokenizer failed on %d ids", ngen);
   txt[dn] = 0;

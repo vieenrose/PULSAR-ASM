@@ -54,7 +54,7 @@ export PATH=/usr/local/cuda/bin:$PATH
 ok=1
 # rm -f first: nvcc exits 0 on a link failure and leaves the PREVIOUS binary in place, so a
 # "test -x" after the build proves nothing unless the old one was removed.
-build_cc() { rm -f "$1.new"; gcc -O2 -std=gnu11 -o "$1.new" $2 -I. -lm >"/tmp/bf_$1.log" 2>&1 \
+build_cc() { rm -f "$1.new"; gcc -O2 -std=gnu11 -pthread -o "$1.new" $2 -I. -lm >"/tmp/bf_$1.log" 2>&1 \
     && mv -f "$1.new" "$1" && echo "BUILT $1" \
     || { echo "BUILD_FAIL $1"; grep -E "error" "/tmp/bf_$1.log" | head -4; ok=0; }; }
 build_cu() { rm -f "$1.new"; nvcc $3 -gencode arch=compute_53,code=sm_53 -O3 -fmad=false \
