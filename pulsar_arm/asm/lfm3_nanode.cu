@@ -5484,6 +5484,68 @@ int main(int argc, char** argv) {
       { int c = 0; for (int L = 0; L < NLAYER; L++) { pf4_conv_idx[L] = c; if (!is_attn_g[L]) c++; } }
       int Tc = 0;
       struct timespec q0, q1; clock_gettime(CLOCK_MONOTONIC, &q0);
+      // PREFIX CACHE (LFM_PF_PCACHE, default on in the clip service, 0 = the A/B control).
+      // Every ASR turn's prompt starts with the same template ids (15 of 133: everything
+      // before the first audio row), and a position's state depends only on the ids at and
+      // before it, so those positions are identical from turn to turn. The sequence state
+      // they leave behind is exactly two things: their K/V cache rows in every attention
+      // layer, and each conv layer's 7-slot ring after the last of them. The first clip runs
+      // the prefix as its OWN chunk [0,P) and snapshots both per layer (the chunk boundary at
+      // P is what makes the ring snapshot the state "after position P-1"; per-position
+      // results are chunk-invariant, which is the property --prefill-run already rests on).
+      // A later clip whose first P ids match restores the snapshot and prefills from P.
+      // Keyed on the ids themselves, not on a flag: a different template rebuilds.
+      static const int pc_env = getenv("LFM_PF_PCACHE") ? atoi(getenv("LFM_PF_PCACHE")) : -1;
+      static std::vector<int> pc_ids;
+      static bf16 *pc_ring = nullptr, *pc_k = nullptr, *pc_v = nullptr;
+      static int pc_cap = 0;
+      const int PCKV = NKV * HD;
+      int pcP = 0;
+      if ((pc_env < 0 ? (int)clip_stdin : pc_env) && g_aemb && g_aemb_n > 0 &&
+          g_aemb_at >= 1 && g_aemb_at <= g_pfChunk && g_aemb_at < NP - 1) pcP = g_aemb_at;
+      bool pc_hit = false;
+      if (pcP) {
+        pc_hit = (int)pc_ids.size() == pcP && std::equal(pc_ids.begin(), pc_ids.end(), prompt.begin());
+        if (!pc_hit) {
+          pc_ids.clear();                     // invalid until this build completes
+          if (pc_cap < pcP) {
+            if (pc_k) { cudaFree(pc_k); cudaFree(pc_v); pc_k = pc_v = nullptr; }
+            if (!pc_ring && cudaMalloc(&pc_ring, (size_t)NCONV * 7 * H * 2) != cudaSuccess) pc_ring = nullptr;
+            if (cudaMalloc(&pc_k, (size_t)NLAYER * pcP * PCKV * 2) != cudaSuccess) pc_k = nullptr;
+            if (cudaMalloc(&pc_v, (size_t)NLAYER * pcP * PCKV * 2) != cudaSuccess) pc_v = nullptr;
+            pc_cap = (pc_ring && pc_k && pc_v) ? pcP : 0;
+            if (!pc_cap) { printf("PF4-RUN: prefix cache alloc failed, running uncached\n"); pcP = 0; }
+          }
+        } else {
+          cudaMemcpyAsync(M.ring, pc_ring, (size_t)NCONV * 7 * H * 2, cudaMemcpyDeviceToDevice, g_launch);
+          for (int L = 0; L < NLAYER; L++) if (is_attn_g[L]) {
+            cudaMemcpyAsync(M.kc + (size_t)L * MAXTOK * PCKV, pc_k + (size_t)L * pcP * PCKV,
+                            (size_t)pcP * PCKV * 2, cudaMemcpyDeviceToDevice, g_launch);
+            cudaMemcpyAsync(M.vc + (size_t)L * MAXTOK * PCKV, pc_v + (size_t)L * pcP * PCKV,
+                            (size_t)pcP * PCKV * 2, cudaMemcpyDeviceToDevice, g_launch);
+          }
+          if (cudaGetLastError() != cudaSuccess) { printf("PF4-RUN: prefix cache restore failed\n"); return 1; }
+        }
+      }
+      // The chunk schedule: [0,P) alone when the cache is being built, then P.. in chunks.
+      // With the cache off (pcP = 0) this is the old schedule exactly.
+      std::vector<std::pair<int,int> > pch;
+      if (pcP && !pc_hit) pch.push_back(std::make_pair(0, pcP));
+      for (int c0 = pcP; c0 < NP; c0 += g_pfChunk)
+        pch.push_back(std::make_pair(c0, (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk));
+      // Snapshot layer L's sequence state right after the prefix chunk went through it (queued
+      // on the launch stream, so it is ordered after that chunk's writes and before the next's).
+      auto pc_snap = [&](int L) {
+        if (is_attn_g[L]) {
+          cudaMemcpyAsync(pc_k + (size_t)L * pcP * PCKV, M.kc + (size_t)L * MAXTOK * PCKV,
+                          (size_t)pcP * PCKV * 2, cudaMemcpyDeviceToDevice, g_launch);
+          cudaMemcpyAsync(pc_v + (size_t)L * pcP * PCKV, M.vc + (size_t)L * MAXTOK * PCKV,
+                          (size_t)pcP * PCKV * 2, cudaMemcpyDeviceToDevice, g_launch);
+        } else {
+          const size_t ro = (size_t)pf4_conv_idx[L] * 7 * H;
+          cudaMemcpyAsync(pc_ring + ro, M.ring + ro, (size_t)7 * H * 2, cudaMemcpyDeviceToDevice, g_launch);
+        }
+      };
       // LFM_PF_LM=1: layer-major order. Every chunk's residual lives in its own slice of
       // a [NP][H] buffer (A.xb is the only state layer_chunk_T carries across layers), so
       // layer L runs over all chunks before layer L+1. Per position the arithmetic is the
@@ -5492,20 +5554,27 @@ int main(int argc, char** argv) {
       static const int pf_lm = g_ovl || (getenv("LFM_PF_LM") && atoi(getenv("LFM_PF_LM")));
       bf16* xb0 = A.xb;
       if (pf_lm) {
-        static bf16* xall = nullptr;
-        if (!xall && cudaMalloc(&xall, (size_t)NP * H * 2) != cudaSuccess) { printf("PF4-RUN: xall alloc failed\n"); return 1; }
+        // Grow-only: this buffer used to be sized by the FIRST clip's prompt and reused, so a
+        // longer clip later in a service would have written past it.
+        static bf16* xall = nullptr; static int xall_np = 0;
+        if (xall_np < NP) {
+          if (xall) { cudaDeviceSynchronize(); cudaFree(xall); xall = nullptr; }
+          if (cudaMalloc(&xall, (size_t)NP * H * 2) != cudaSuccess) { printf("PF4-RUN: xall alloc failed\n"); return 1; }
+          xall_np = NP;
+        }
         if (g_lj && !g_embfile && !load_wait(g_lj->need_emb)) { printf("PF4-RUN: weight load failed (embedding)\n"); return 1; }
-        for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
-          Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+        for (size_t ci2 = 0; ci2 < pch.size(); ci2++) {
+          const int c0 = pch[ci2].first; Tc = pch[ci2].second;
           A.xb = xall + (size_t)c0 * H;
           if (pf4_embed_chunk(M, A, prompt, c0, Tc, emb)) { printf("PF4-RUN: embed failed at chunk %d\n", c0); return 1; }
         }
         for (int L = 0; L < NLAYER; L++) {
           if (g_lj && !load_wait(g_lj->need[L])) { printf("PF4-RUN: weight load failed (layer %d)\n", L); return 1; }
-          for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
-            Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+          for (size_t ci2 = 0; ci2 < pch.size(); ci2++) {
+            const int c0 = pch[ci2].first; Tc = pch[ci2].second;
             A.xb = xall + (size_t)c0 * H;
             if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+            if (pcP && !pc_hit && c0 == 0) pc_snap(L);
             if (g_pfsync == 3) {     // bounded queue: wait for the chunk recorded K chunks ago
               static cudaEvent_t ev[64]; static int nev = 0; static long ci = 0;
               static const int K = getenv("LFM_PF_SYNCK") ? atoi(getenv("LFM_PF_SYNCK")) : 4;
@@ -5528,13 +5597,19 @@ int main(int argc, char** argv) {
           g_lj = nullptr;
         }
       } else
-      for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
-        Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+      for (size_t ci2 = 0; ci2 < pch.size(); ci2++) {
+        const int c0 = pch[ci2].first; Tc = pch[ci2].second;
         if (pf4_embed_chunk(M, A, prompt, c0, Tc, emb)) { printf("PF4-RUN: embed failed at chunk %d\n", c0); return 1; }
-        for (int L = 0; L < NLAYER; L++)
+        for (int L = 0; L < NLAYER; L++) {
           if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+          if (pcP && !pc_hit && c0 == 0) pc_snap(L);
+        }
       }
-      cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &q1);
+      { const cudaError_t pe = cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &q1);
+        if (pcP && !pc_hit && pe == cudaSuccess) pc_ids.assign(prompt.begin(), prompt.begin() + pcP); }
+      if (pcP) printf("PF4-RUN: prefix cache %s, %d positions (%s)\n", pc_hit ? "HIT" : "BUILT", pcP,
+                      pc_hit ? "restored K/V rows + conv rings, prefill starts after them"
+                             : "ran as its own chunk and snapshotted");
       printf("PF4-RUN: prompt %d ids in chunks of %d, %.0f ms (%.2f ms/pos)\n",
              NP, g_pfChunk, (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6,
              ((q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6) / NP);

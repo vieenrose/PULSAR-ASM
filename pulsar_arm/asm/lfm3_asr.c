@@ -502,6 +502,7 @@ int main(int argc, char **argv) {
                  pfrun >= 2 ? pfr : NULL, pfv, NULL };
   if (early && !srv_in) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
   enc_collect(enc_log, g_enc_off, g_enc_n);
+  stage("encoder reply");   // splits the pre-backbone window: request+GPU pass vs everything else
   need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
   { long rows = file_size(OUT) / (2048 * 4);
     if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",

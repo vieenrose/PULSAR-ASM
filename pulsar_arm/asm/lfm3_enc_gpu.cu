@@ -287,7 +287,9 @@ __global__ void k_flatten(const float* __restrict__ phw, float* __restrict__ fla
 // Stage-level sync + error read: an async kernel fault surfaces late and points at
 // the wrong launch, so every stage is checked where it is issued (run #297's lesson).
 static cudaEvent_t g_seva, g_sevb;
-static const bool g_enctime = getenv("LFM_ENC_TIME") != nullptr;
+// LFM_ENC_TIME=1 per-stage min (the bench); =2 also prints the SUM and call count per name,
+// which is what attributes a whole pass (a per-layer stage otherwise reports one call only).
+static const int g_enctime = getenv("LFM_ENC_TIME") ? atoi(getenv("LFM_ENC_TIME")) : 0;
 static const int g_reps = getenv("LFM_ENC_REPS") ? atoi(getenv("LFM_ENC_REPS")) : 1;
 // The Nano's GPU clock ramps over seconds (the backbone harness fights the same
 // thing with LFM_WARMMS), so a single pass per stage is not a measurement: stages are
@@ -296,6 +298,12 @@ static const int g_reps = getenv("LFM_ENC_REPS") ? atoi(getenv("LFM_ENC_REPS")) 
 #include <map>
 #include <string>
 static std::map<std::string, double> g_best;
+static std::map<std::string, double> g_sum;      // LFM_ENC_TIME=2: sum and count per stage name.
+static std::map<std::string, long> g_cnt;        // The min is what the per-rep bench wants, but a
+                                                 // stage that runs once per layer reports only its
+                                                 // fastest call, so the table understates a 17-layer
+                                                 // pass by up to 17x -- the sum is what attributes
+                                                 // a served pass's GPU time.
 static std::map<std::string, double> g_last;
 static int g_sync = -2;   // LFM_ENC_SYNC=1 restores per-kernel device syncs (the gate path)
 static void chk(const char* what) {
@@ -304,6 +312,7 @@ static void chk(const char* what) {
     float ms = 0.f; cudaEventElapsedTime(&ms, g_seva, g_sevb);
     std::string k(what);
     if (!g_best.count(k) || ms < g_best[k]) g_best[k] = ms;
+    g_sum[k] += ms; g_cnt[k] += 1;
     g_last[k] = ms;
     cudaEventRecord(g_seva);
   }
@@ -323,6 +332,15 @@ static void chk(const char* what) {
     e = cudaGetLastError();
     if (e) { printf("EXEC ERROR at %s: %s\n", what, cudaGetErrorString(e)); exit(1); }
   }
+}
+// LFM_ENC_TIME=3 additionally keys the table by SHAPE: a stage name that covers 83 launches of
+// 20 different matrices says nothing about which of them cost the time, and this is how the
+// encoder's GEMM budget was attributed.
+static const char* gemm_tag(const char* what, int N, int K, int T, int ct, int tl, int nblk, int tpb) {
+  static char buf[8][160]; static int i = 0;
+  char* p = buf[i++ & 7];
+  snprintf(p, 160, "%s N=%d K=%d T=%d ct=%d tl=%d blk=%d thr=%d", what, N, K, T, ct, tl, nblk, tpb);
+  return p;
 }
 // One sync for the whole process: an async fault that no cudaGetLastError() at launch
 // time could see has to be caught before any number this tool prints is believed.
@@ -1239,7 +1257,8 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
         if (le) { printf("q8_partial_T<%d> launch REFUSED at N=%d K=%d KC=%d nb=%d: %s\n",
                          ct, g.N, g.K, g.KC, g.nb, cudaGetErrorString(le)); exit(3); }
       }
-      chk("gemm fp32 T-wide");
+      chk(g_enctime >= 3 ? gemm_tag("gemm fp32 T-wide", g.N, g.K, T, ct, (int)g.tl, g.nblk, TPB)
+                         : "gemm fp32 T-wide");
       if (!(fuse && g.tl)) k_combine_f<<<(unsigned)((T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, g.nch);
       chk("gemm combine");
       return;
@@ -1774,6 +1793,7 @@ int main(int argc, char** argv) {
   mkdir(odir_in, 0777);
   g_slot = 0;                 // the pass's allocations come from the pooled slots, in call order
   g_reqallocs.clear();
+  g_best.clear(); g_sum.clear(); g_cnt.clear();   // per-pass attribution (see the stage table)
   if (pass_auto) {
     struct stat stt; int waited_ms = 0;
     while (stat(melp, &stt) != 0) {
@@ -2062,18 +2082,29 @@ int main(int argc, char** argv) {
     k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, pb1->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b1");
     wallmark("proj ln + gemms");
     k_gelu_erf<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, (size_t)Tt * EPROJ); chk("gelu");
+    wallmark("p: gelu issued");
     gemm_to(pw3, hp2, hp3, Tt, xb2, "proj lin2");
+    wallmark("p: lin2 issued");
     k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp3, pb3->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b3");
+    wallmark("p: b3 issued");
     dump(OD, "proj_out", hp3, (size_t)Tt * EPROJ);
+    wallmark("p: dumped");
   }
   cudaEventRecord(ev1); cudaEventSynchronize(ev1);
   float m1 = 0; cudaEventElapsedTime(&m1, ev0, ev1);
   if (m1 < best_ms) best_ms = m1;
   }
   ms = best_ms;
+  wallmark("p: gpu drained");
   printf("layers ported: %d of %d\n", nlay_last, ENLAYER);
-  if (g_enctime) for (std::map<std::string,double>::iterator it = g_best.begin(); it != g_best.end(); ++it)
-    printf("  stage %-14s %8.2f ms (min of %d)\n", it->first.c_str(), it->second, nreps);
+  if (g_enctime) for (std::map<std::string,double>::iterator it = g_best.begin(); it != g_best.end(); ++it) {
+    const char* n = it->first.c_str();
+    if (g_enctime >= 2)
+      printf("  stage %-14s %8.2f ms (min of %d)  SUM %8.2f ms in %ld calls\n",
+             n, it->second, nreps, g_sum[n], g_cnt[n]);
+    else
+      printf("  stage %-14s %8.2f ms (min of %d)\n", n, it->second, nreps);
+  }
   printf("FM3_ENC_GPU_DONE Tm=%d Tt=%d\n", Tm, Tt);
   chk_final("end of pass");
   fflush(stdout);
