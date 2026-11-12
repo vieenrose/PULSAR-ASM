@@ -1,0 +1,47 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index 11c3717..0bbb3d5 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -4451,7 +4451,7 @@ __device__ __noinline__ float4 tlg_leaf(const int4* __restrict__ qt, const float
+ template <int XG>
+ __global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restrict__ q, const float* __restrict__ s,
+                                                          const bf16* __restrict__ x, float* __restrict__ part,
+-                                                         int N, int K, int nb, int T, bf16* __restrict__ yb) {
++                                                         int N, int K, int nb, int T, bf16* __restrict__ yb, int mcap) {   // mcap: skip dead staging entries
+   uint32_t* const xs = g_tlg_xs;
+   const int bx = g_pfgsw ? blockIdx.y : blockIdx.x, by = g_pfgsw ? blockIdx.x : blockIdx.y;
+   const int t0 = by * 4, tid = threadIdx.x;
+@@ -4470,6 +4470,13 @@ __global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restric
+         const int kk = k + ls;
+         const int i = ((kk & 1) << 4) | ((kk & 2) << 2) | (kk & 4) | ((kk & 8) >> 2) | ((kk & 16) >> 4);
+         const int b = i + 32 * m, t = t0 + p;
++        // LFM_PF_TLM (default 1): the leaf's m loop runs while i + 32*m < nb, so an entry with
++        // b = i + 32*m >= nb is never READ by any warp -- its zero store is pure waste. For the
++        // K = 2048 tensors (nb = 64) that is half of the staging loop's 8 m-groups; for the
++        // K = 7680 one (nb = 240) almost none. mcap (LFM_PF_TLM, default on) turns the skip
++        // off for the A/B; nothing that is ever read changes value, so the outputs of the two
++        // arms are bit-identical by construction, which is what makes this a free knob.
++        if (mcap && b >= nb) continue;
+         const uint32_t u = (b < nb && t < T) ? reinterpret_cast<const uint32_t*>(x + (size_t)t * K)[b * 16 + jj] : 0u;
+         if (XG == 9) reinterpret_cast<float2*>(g_tlg_xf8)[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+         else if (XG == 8) reinterpret_cast<float2*>(g_tlg_xf)[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+@@ -4598,13 +4605,14 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+   static const int pftg = getenv("LFM_PF_TLG") ? atoi(getenv("LFM_PF_TLG")) : 1;
+   if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
+     static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 9;
++    static const int tlm = getenv("LFM_PF_TLM") ? atoi(getenv("LFM_PF_TLM")) : 1;   // dead staging skip
+     static const int gsw = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
+     const dim3 gg = gsw ? dim3((Tn + 3) / 4, (N + 511) / 512) : dim3((N + 511) / 512, (Tn + 3) / 4);
+-    if (tlgs == 9)      q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+-    else if (tlgs == 8) q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+-    else if (tlgs == 4) q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+-    else if (tlgs == 1) q8_partial_TLg<1><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+-    else                q8_partial_TLg<0><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++    if (tlgs == 9)      q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb, tlm);
++    else if (tlgs == 8) q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb, tlm);
++    else if (tlgs == 4) q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb, tlm);
++    else if (tlgs == 1) q8_partial_TLg<1><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb, tlm);
++    else                q8_partial_TLg<0><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb, tlm);
+     goto launched;
+   }
+   if (pf_ph && nch == 1 && 4 * per > lim && Tn >= 4) {
