@@ -2624,3 +2624,19 @@ algorithm (fp16 accumulation), both of which change the goldens.
   board hard-hangs at zero and cannot be rebooted remotely.
   Harness spread under the PT_TURN=1 protocol, 4 samples of unchanged engines: combined_rtf
   0.5034 / 0.5061 / 0.5065 / 0.5078 (asr 5.868-5.904 s, tts 0.483-0.504 s) -> ~+-0.4%.
+- [PrimeTTS/Nano, single stream] The in-turn TTS is at the runtime's warm floor; three N=1 probes
+  null (2026-11-12, run #279, diagnostic, no code change). Resident service, back-to-back T81
+  requests at full GPU clock: 0.464-0.482 s steady (first request of a fresh idle service 0.58-1.9
+  s: cold clock + first touch). The harness turn reads 0.46-0.52 s, i.e. already there.
+  (1) PT_V21_DEVADD=1 (device residency; closed in prime-tts at N=4 as +261 ms on a saturated
+  GPU) retested at N=1 where the GPU has slack, order 0/1/1/0: 0.465-0.477 vs 0.502-0.524 s =
+  ~+6% SLOWER, waveform byte-identical (md5 e6092967 = one-shot reference). Closed at N=1 too.
+  (2) CPU frequency: all four A57 at 1479 MHz (max) mid-request under schedutil. Not a factor.
+  (3) taskset -c 3: 0.468-0.482 vs 0.464-0.481 unpinned. Null.
+  The service thread is 100% busy for the whole request (user ~350 + sys ~110 ms of 0.47 s wall,
+  2 threads) because it yield-polls the GPU, so CPU accounting cannot split host work from waiting.
+  One-shot PT_V21_EKIND=1 profile (T81, 590 ms total): CONV 408 ms / 124, CONVT 35, ADD 26 / 107,
+  MATMUL 19, TANH 16, EINSUM 10, LEAKYRELU 9, SOFTMAX 8, SIGMOID 7, MUL 6, rest < 5 each; the
+  profiler prints nothing in --serve-fifo mode. Untested and not small: moving the ~100 ms of
+  host elementwise ops to a helper thread (3 cores idle in a single-stream turn); the prime-tts
+  history says host work overlaps GPU work already, so the gain is unknown, not ~100 ms.
