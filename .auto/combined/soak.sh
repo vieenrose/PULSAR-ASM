@@ -32,11 +32,21 @@ echo "BOOT mem=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)MB"
 ./lfm3_asr . /tmp/clip_zh.wav 96 --out-ids /tmp/sk.w.i32 --serve-in $SRV_IN --serve-log $SRV_LOG \
   --enc-in $ENC_IN --enc-log $ENC_LOG > /tmp/sk.w.log 2>&1 || echo "WARMUP_FAIL"
 srvrss() { p=$(pgrep -f "$1" | head -1); if [ -n "$p" ]; then awk '/VmRSS/{print int($2/1024)}' /proc/$p/status; else echo -1; fi; }
+# CLIPS="a.wav b.wav ..." overrides the zh/en alternation, so the same soak can run a mixed
+# length sequence (the 110 s gate clip among short ones): that is what repeatedly hits the
+# encoder pool's trim/regrow path and the alias path, and it is the setting where the
+# still-unexplained long-clip stall of #276 appeared. GOLDENS names the id file to compare each
+# turn against (per-clip goldens need a "clip:golden" list, so the mixed arm compares against
+# the ids of its own first, cold-verified, pass instead).
+read -r -a LIST <<< "${CLIPS:-/tmp/clip_zh.wav /tmp/clip_en.wav}"
+[ "${#LIST[@]}" -gt 0 ] || { echo "SOAK_FAIL no clips"; exit 1; }
 for t in $(seq 1 $N); do
-  if [ $((t % 2)) = 1 ]; then lang=zh; else lang=en; fi
+  wav=${LIST[$(((t - 1) % ${#LIST[@]}))]}
+  [ -f "$wav" ] || { echo "SOAK_FAIL no such clip $wav"; exit 1; }
+  lang=$(basename "$wav" .wav | tr -cd '[:alnum:]_')
   rm -f /tmp/sk.i32
   a=$(date +%s.%N)
-  timeout 400 ./lfm3_asr . /tmp/clip_$lang.wav 96 --out-ids /tmp/sk.i32 \
+  timeout 400 ./lfm3_asr . "$wav" 96 --out-ids /tmp/sk.i32 \
     --serve-in $SRV_IN --serve-log $SRV_LOG --enc-in $ENC_IN --enc-log $ENC_LOG > /tmp/sk.log 2>&1
   rc=$?
   b=$(date +%s.%N)
@@ -46,8 +56,16 @@ for t in $(seq 1 $N); do
   timeout 60 sh -c "echo '$PTD/tests/golden_v21/T81 /tmp/sk.tts.npy' > $PT_IN"
   wait $w
   tb=$(date +%s.%N)
-  ids=MISSING; [ -s /tmp/sk.i32 ] && { cmp -s /tmp/sk.i32 /tmp/gen_golden_$lang.i32 && ids=GOLDEN || ids=MISMATCH; }
-  echo "TURN $t $lang rc=$rc asr=$(python3 -c "print('%.3f'%($b-$a))") tts=$(python3 -c "print('%.3f'%($tb-$ta))") ids=$ids sndr=$(grep "^PT_DONE $npt " $PT_LOG | tail -1 | grep -o 'sndr=[0-9.]*' | cut -d= -f2) mem=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) rss_bb=$(srvrss 'lfm3_nanode.*--clip-fifo') rss_enc=$(srvrss 'lfm3_enc_gpu.*--serve-fifo') rss_tts=$(srvrss 'pt_v21_nano')"
+  [ "$rc" = 0 ] || echo "TURN $t CLIENT_FAIL rc=$rc (see /tmp/sk.log)"
+  ids=MISSING
+  if [ -s /tmp/sk.i32 ]; then
+    ref=/tmp/gen_golden_zh.i32
+    case $wav in *clip_zh*) ref=/tmp/gen_golden_zh.i32;; *clip_en*) ref=/tmp/gen_golden_en.i32;; esac
+    if [ ! -s /tmp/sk.ref.$lang.i32 ]; then cp /tmp/sk.i32 /tmp/sk.ref.$lang.i32; ids=SEED;
+    else cmp -s /tmp/sk.i32 /tmp/sk.ref.$lang.i32 && ids=STABLE || ids=MISMATCH; fi
+    [ "$ref" != none ] && [ -s "$ref" ] && { cmp -s /tmp/sk.i32 "$ref" && ids=$ids,GOLDEN || ids=$ids,nogolden; }
+  fi
+  echo "TURN $t $(basename $wav) rc=$rc asr=$(python3 -c "print('%.3f'%($b-$a))") tts=$(python3 -c "print('%.3f'%($tb-$ta))") ids=$ids sndr=$(grep "^PT_DONE $npt " $PT_LOG | tail -1 | grep -o 'sndr=[0-9.]*' | cut -d= -f2) mem=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) rss_bb=$(srvrss 'lfm3_nanode.*--clip-fifo') rss_enc=$(srvrss 'lfm3_enc_gpu.*--serve-fifo') rss_tts=$(srvrss 'pt_v21_nano')"
 done
 echo "ENC_REQS $(grep -c ENC_DONE $ENC_LOG) PT_REQS $(grep -c PT_DONE $PT_LOG)"
 for f in $SRV_IN $ENC_IN $PT_IN; do timeout 5 sh -c "echo Q > $f" 2>/dev/null; done

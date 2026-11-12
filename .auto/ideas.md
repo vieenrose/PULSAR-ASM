@@ -2707,3 +2707,20 @@ algorithm (fp16 accumulation), both of which change the goldens.
   ~101 ms each, which independently confirms the per-turn cost model. Backbone RSS is 31 MB
   because its 2.15 GB arena is nvmap-accounted, not anonymous: read device residency from
   MemAvailable, not from RSS. Harness on the current tree 0.5053, all gates + checks.sh green.
+- [LFM3/Nano S2T] Mixed-length soak: the trim/regrow path is exact, and a long turn taxes its
+  neighbours (2026-11-13, run #284b, keep, gate extension + findings). soak.sh CLIPS="..." now
+  takes any clip list (bash array; the first version's eval indirection silently produced the
+  literal "${1}" as a filename and every turn exited 2 without being flagged -- a soak that
+  cannot fail is not a gate, so a nonzero client exit now prints CLIENT_FAIL and a missing clip
+  aborts). 2 rounds x the 7-clip held-out set (6 short + the 110 s gate clip) through one service
+  session: every turn rc=0, SNDR 70.09, ids STABLE against the first pass of the same clip and
+  GOLDEN where a frozen golden exists (including the 110 s clip on its second pass -- the pool
+  trim/regrow path of #275 produces identical ids). What a long turn costs its neighbours: the
+  TTS service's RSS drops 243 -> 49 MB across the 110 s turn and stays there (the encoder's
+  ~500 MB pass evicts the TTS's resident pages; its next request is still 0.46-0.48 s, so the
+  fault-back is cheap); the TTS request issued right after a long turn is 0.564-0.576 s vs the
+  usual 0.463-0.485 (+0.09 s); the first short ASR turn after it 5.676 s vs its 5.42-5.44 s
+  steady (+0.25 s, one turn only); encoder RSS 35 -> 46 MB and backbone RSS 31 -> 25 MB.
+  Limitation: the mixed arm seeds each clip's reference from its own first pass, so a defect that
+  appeared on the FIRST pass of a clip in a session would be missed here -- generalize.sh
+  (cold vs resident, frozen goldens) covers that; the two together are the gate.
