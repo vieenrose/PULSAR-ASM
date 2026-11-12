@@ -35,6 +35,44 @@ ASR_MAXTOK="${ASR_MAXTOK:-96}"
 
 fail() { echo "measure: $1" >&2; exit 2; }
 
+# ---- sync + build every binary this harness measures -----------------------------------------
+# A gate is only worth what the binary under test is worth. This harness used to measure whatever
+# happened to be on the board, and a stale lfm3_asr silently ignored the new --enc-in flags and
+# turned a "resident encoder" run into a one-shot run with every gate still green -- #37's lesson
+# (a gate that runs a stale binary is vacuous), re-learned the hard way. LFM_SKIP_BUILD=1 reuses
+# what is there, for a quick repeat of an unchanged tree.
+if [ "${LFM_SKIP_BUILD:-0}" != 1 ]; then
+  SRC="$REPO/pulsar_arm/asm"
+  scp -q "$SRC"/lfm3_asr.c "$SRC"/lfm3_tok.c "$SRC"/lfm3_tok.h "$SRC"/lfm3_mel.c "$SRC"/lfm3_mel.S \
+       "$SRC"/lfm3_wav.c "$SRC"/lfm3_nanode.cu "$SRC"/lfm3_qlow.cuh "$SRC"/lfm3_enc_gpu.cu \
+       "$NANO:$LFM_DIR/" \
+       || fail "cannot sync sources to $NANO"
+  BUILD=$(ssh "$NANO" "LFM_DIR='$LFM_DIR' bash -s" <<'BUILDEOF' 2>&1 | grep -v setlocale
+set -u
+cd "$LFM_DIR" || { echo "BUILD_FAIL no_directory"; exit 1; }
+export PATH=/usr/local/cuda/bin:$PATH
+ok=1
+# rm -f first: nvcc exits 0 on a link failure and leaves the PREVIOUS binary in place, so a
+# "test -x" after the build proves nothing unless the old one was removed.
+build_cc() { rm -f "$1.new"; gcc -O2 -std=gnu11 -o "$1.new" $2 -I. -lm >"/tmp/bf_$1.log" 2>&1 \
+    && mv -f "$1.new" "$1" && echo "BUILT $1" \
+    || { echo "BUILD_FAIL $1"; grep -E "error" "/tmp/bf_$1.log" | head -4; ok=0; }; }
+build_cu() { rm -f "$1.new"; nvcc $3 -gencode arch=compute_53,code=sm_53 -O3 -fmad=false \
+    -Xptxas -O3,-dlcm=ca -o "$1.new" $2 -lz >"/tmp/bf_$1.log" 2>&1 \
+    && mv -f "$1.new" "$1" && echo "BUILT $1" \
+    || { echo "BUILD_FAIL $1"; grep -iE "error" "/tmp/bf_$1.log" | head -4; ok=0; }; }
+build_cc lfm3_asr "lfm3_asr.c lfm3_tok.c"
+build_cc lfm3_mel "lfm3_mel.c lfm3_mel.S"   # the mel primitives are AArch64 asm
+build_cc lfm3_wav lfm3_wav.c
+build_cu lfm3_nanode lfm3_nanode.cu ""
+build_cu lfm3_enc_gpu lfm3_enc_gpu.cu "-std=c++11"
+[ "$ok" = 1 ] && echo BUILD_ALL_OK
+BUILDEOF
+)
+  echo "$BUILD" | grep -q BUILD_ALL_OK || { echo "$BUILD"; fail "the ASR/TTS-side binaries did not build from $REPO" ; }
+  echo "  $BUILD" | tr '\n' ' '; echo
+fi
+
 # ---- Nano memory guard (the board hard-hangs when RAM is exhausted)
 free_mb=$(ssh -o ConnectTimeout=8 "$NANO" 'free -m | sed -n 2p | tr -s " " | cut -d" " -f4' 2>/dev/null)
 [ -n "$free_mb" ] || fail "cannot read free RAM on $NANO"
@@ -48,7 +86,7 @@ for spec in $CLIPS; do
   [ -s "$ADIR/golden_$lang.i32" ] || fail "missing $ADIR/golden_$lang.i32 (freeze it with: lfm3_asr --out-ids)"
 done
 
-OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' ASR_MODE='$ASR_MODE' PFRUN='${PFRUN:-32}' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
+OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' ASR_MODE='$ASR_MODE' PFRUN='${PFRUN:-32}' LFM_ENC_RESIDENT='${LFM_ENC_RESIDENT:-1}' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
 set -u
 cd "$LFM_DIR" || exit 2
 for spec in $CLIPS; do
@@ -56,6 +94,13 @@ for spec in $CLIPS; do
   python3 -c "import wave,sys; w=wave.open(sys.argv[2]); print('CLIPSEC %s %.3f' % (sys.argv[1], w.getnframes()/w.getframerate()))" "$lang" "$clip"
 done
 SRV_IN=/tmp/cmb.srv.in; SRV_LOG=/tmp/cmb.srv.log
+  # A service left behind by a crashed or interrupted run holds its ~2 GB device arena, and the
+  # next boot then waits forever for memory that will never drain. Kill only OUR services (the
+  # flags are specific to this harness) and wait for the arena to actually come back.
+  pkill -f "lfm3_nanode .*--clip-fifo" 2>/dev/null; pkill -f "lfm3_enc_gpu .*--serve-fifo" 2>/dev/null
+  i=0; while [ $i -lt 40 ]; do a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo); [ "$a" -ge 1500 ] && break; sleep 0.5; i=$((i+1)); done
+  echo "PREFREE $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) MB after killing stale services"
+ENC_IN=/tmp/cmb.enc.in; ENC_LOG=/tmp/cmb.enc.log
 if [ "$ASR_MODE" = warm ]; then
   # The resident service: one lfm3_nanode --clip-stdin for the whole session. It pays the
   # 1.946 GB blob read (21.2 s of eMMC at 92 MB/s, device-bound) plus parse/CRC/upload once, and
@@ -86,6 +131,25 @@ for p in ['lfm3-audio-2b-q8.lfm3q8','lfm3-audio-2b-enc.lfm3q8','tok.bin','mel.bi
   grep -q "CLIP_AWAIT 0" $SRV_LOG 2>/dev/null || { echo "SERVICE_FAIL (see $SRV_LOG)"; kill $SRV 2>/dev/null; exit 1; }
   t1=$(date +%s.%N)
   python3 -c "print('SERVICELOAD %.3f' % ($t1-$t0))"
+  # Both services are up before the first turn; the encoder's own load is part of boot too.
+  # The audio encoder resident too, for the same reason one level down: its process costs ~1.9 s
+  # of CUDA init + blob parse/CRC/upload against a ~0.2 s pass (its own ENCODER total line says
+  # 122 ms of GPU for this clip). The server takes one request line per turn
+  # "<mel> <outdir> auto" on the fifo and answers "ENC_DONE n rc=.."; its project outputs are
+  # byte-identical to the one-shot path (verified on proj_out.bin), and the ASR's own per-turn
+  # encoder spawn stays as the ASR_MODE=cold arm.
+  # LFM_ENC_RESIDENT=0 keeps the per-turn encoder spawn: the A/B control arm for the service.
+  # ENCFLAGS must be set here, inside the warm block, and not next to the ENC_IN declaration --
+  # an earlier draft put its `if` before `if [ "$ASR_MODE" = warm ]`, which swallowed that line.
+  ENCFLAGS=""
+  if [ "${LFM_ENC_RESIDENT:-1}" = 1 ]; then ENCFLAGS="--enc-in $ENC_IN --enc-log $ENC_LOG"; fi
+  rm -f $ENC_IN $ENC_LOG; mkfifo $ENC_IN; : > $ENC_LOG
+  if [ "${LFM_ENC_RESIDENT:-1}" = 1 ]; then
+    ./lfm3_enc_gpu lfm3-audio-2b-enc.lfm3q8 - auto - --serve-fifo $ENC_IN --only proj_out > $ENC_LOG 2>&1 &
+    ENCS=$!
+    i=0; while [ $i -lt 240 ]; do grep -q "ENC_AWAIT 0" $ENC_LOG 2>/dev/null && break; sleep 0.5; i=$((i+1)); done
+    grep -q "ENC_AWAIT 0" $ENC_LOG 2>/dev/null || { echo "ENCSERVICE_FAIL (see $ENC_LOG)"; kill $ENCS 2>/dev/null; exit 1; }
+  fi
   # Untimed warm-up turn. 'Ready to accept a turn' is not the same as 'the backbone is resident':
   # with --prefill-run the loader parses the blob and defers the upload to the first prefill, so
   # without this the user's FIRST question absorbs the blob read and the upload. A deployed
@@ -94,7 +158,7 @@ for p in ['lfm3-audio-2b-q8.lfm3q8','lfm3-audio-2b-enc.lfm3q8','tok.bin','mel.bi
   first=${CLIPS%% *}; warmclip=${first#*:}
   t2=$(date +%s.%N)
   ./lfm3_asr . "$warmclip" "$ASR_MAXTOK" --out-ids /tmp/cmb.warm.i32 \
-    --serve-in $SRV_IN --serve-log $SRV_LOG > /tmp/cmb.warm.log 2>&1 || echo "SERVICE_FAIL warm-up"
+    --serve-in $SRV_IN --serve-log $SRV_LOG $ENCFLAGS > /tmp/cmb.warm.log 2>&1 || echo "SERVICE_FAIL warm-up"
   t3=$(date +%s.%N)
   python3 -c "print('WARMUP %.3f' % ($t3-$t2))"
 fi
@@ -104,7 +168,7 @@ for spec in $CLIPS; do
   t0=$(date +%s.%N)
   if [ "$ASR_MODE" = warm ]; then
     ./lfm3_asr . "$clip" "$ASR_MAXTOK" --out-ids "/tmp/cmb.$lang.i32" \
-      --serve-in $SRV_IN --serve-log $SRV_LOG > "/tmp/cmb.$lang.log" 2>&1 || { echo "ASR_FAIL $lang"; continue; }
+      --serve-in $SRV_IN --serve-log $SRV_LOG $ENCFLAGS > "/tmp/cmb.$lang.log" 2>&1 || { echo "ASR_FAIL $lang"; continue; }
   else
     ./lfm3_asr . "$clip" "$ASR_MAXTOK" --out-ids "/tmp/cmb.$lang.i32" > "/tmp/cmb.$lang.log" 2>&1 || { echo "ASR_FAIL $lang"; continue; }
   fi
@@ -113,8 +177,14 @@ for spec in $CLIPS; do
   tail -1 "/tmp/cmb.$lang.log" | grep -q TRANSCRIPT || echo "ASR_NOTE $lang: no transcript line"
 done
 if [ "$ASR_MODE" = warm ]; then
-  for i in $(seq 1 40); do kill -0 $SRV 2>/dev/null || break; echo Q > $SRV_IN 2>/dev/null; sleep 0.25; done
+  echo "ENCREQ $(grep -c ENC_DONE $ENC_LOG 2>/dev/null)"
+  for i in $(seq 1 40); do kill -0 $SRV 2>/dev/null || break; timeout 5 sh -c "echo Q > $SRV_IN" 2>/dev/null; sleep 0.25; done
   kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; rm -f $SRV_IN
+  # Opening a fifo for write blocks until a reader exists, so this must be guarded (and timed
+  # out): in the LFM_ENC_RESIDENT=0 control arm no encoder service is running and a bare
+  # `echo Q > $ENC_IN` hangs the whole run in teardown.
+  if [ "${LFM_ENC_RESIDENT:-1}" = 1 ]; then timeout 5 sh -c "echo Q > $ENC_IN" 2>/dev/null; kill $ENCS 2>/dev/null; wait $ENCS 2>/dev/null; fi
+  rm -f $ENC_IN
 fi
 cd "$PT_DIR" || exit 2
 t0=$(date +%s.%N)
@@ -124,8 +194,8 @@ python3 -c "print('TTS %.3f' % ($t1-$t0))"
 grep -o "SNDR=[0-9.]*" /tmp/cmb.tts.log | tail -1 | cut -d= -f2 | sed 's/^/TTS_SNDRdB /'
 REMOTE
 )
-echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD|WARMUP)" | sed 's/^/  /'
-echo "$OUT" | grep -q "ASR_FAIL\|TTS_FAIL\|SERVICE_FAIL" && { echo "GATE FAIL: a stage failed"; exit 1; }
+echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD|WARMUP|ENCREQ)" | sed 's/^/  /'
+echo "$OUT" | grep -q "ASR_FAIL\|TTS_FAIL\|SERVICE_FAIL\|ENCSERVICE_FAIL" && { echo "GATE FAIL: a stage failed"; echo "$OUT" | tail -20; exit 1; }
 
 # ---- quality gates
 ok=1

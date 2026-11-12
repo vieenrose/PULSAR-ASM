@@ -176,12 +176,63 @@ static void reap_capture(pid_t pid, char *const argv[], const char *out) {
   if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) die("%s failed (exit %d) -- see %s",
                                                   argv[0], WIFEXITED(st) ? WEXITSTATUS(st) : -1, out);
 }
-static void stage(const char *what) { printf("STAGE %d  %s\n", ++stage_no, what); fflush(stdout); }
-
 static double now_s(void) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
+static long g_enc_n = -1, g_enc_off = 0;   // resident-encoder request index and its log offset
+static double g_stage_t = -1.0;
+/* Poll a resident-service log from a byte offset until one of its lines starts with `prefix`.
+   The services print one flushed line per completed request (ENC_DONE n / CLIP n DONE), and the
+   client is a different process each turn, so the log -- not a socket -- is the rendezvous. */
+static int srv_wait(const char *logp, long from, const char *prefix, FILE *sink, double timeout_s) {
+  int rf = open(logp, O_RDONLY);
+  if (rf < 0) die("cannot open %s (%s)", logp, strerror(errno));
+  if (lseek(rf, (off_t)from, SEEK_SET) != (off_t)from) { close(rf); die("%s seek to %ld", logp, from); }
+  char lb[8192]; size_t lh = 0; int hit = 0;
+  double t0 = now_s();
+  for (;;) {
+    ssize_t got = read(rf, lb + lh, sizeof lb - lh - 1);
+    if (got <= 0) {
+      if (now_s() - t0 > timeout_s) break;
+      struct timespec ts = {0, 10000000}; nanosleep(&ts, NULL);
+      continue;
+    }
+    lh += (size_t)got;
+    char *nl;
+    while ((nl = memchr(lb, '\n', lh))) {
+      *nl = 0;
+      if (sink) { fputs(lb, sink); fputc('\n', sink); }
+      if (!strncmp(lb, prefix, strlen(prefix))) hit = 1;
+      lh -= (size_t)(nl - lb) + 1;
+      memmove(lb, nl + 1, lh);
+    }
+    if (hit) break;
+  }
+  close(rf);
+  return hit;
+}
+static void stage(const char *what) {
+  // Per-stage wall, so a turn's cost can be attributed without guessing: the ASR path is now
+  // ~8 s and the question is always "how much of that is the encoder's process start".
+  double t = now_s();
+  double dt = (g_stage_t < 0) ? 0.0 : t - g_stage_t;   // same numbering as before the timer existed
+  printf("STAGE %d  %s  (+%.3f s)\n", ++stage_no, what, dt);
+  g_stage_t = t; fflush(stdout);
+}
+
+/* One turn's encoder, either way: a child process reaped, or a request to the resident encoder
+   and a wait for its reply line. Both end with TMPD/proj_out.bin written and validated. */
+static void enc_collect(const char *enc_log, long off, long idx) {
+  if (enc_log) {
+    char pfx[32]; snprintf(pfx, sizeof pfx, "ENC_DONE %ld ", idx);
+    if (!srv_wait(enc_log, off, pfx, NULL, 900.0))
+      die("the resident encoder never answered request %ld (see %s)", idx, enc_log);
+  } else {
+    pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu");
+  }
+}
+
 static void need_file(const char *p, long min_bytes, const char *what) {
   long n = file_size(p);
   if (n < min_bytes) die("%s produced %ld bytes at %s (expected >= %ld)", what, n, p, min_bytes);
@@ -245,6 +296,16 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--serve-log") && i + 1 < argc) srv_log = argv[++i];
   }
   if ((srv_in == NULL) != (srv_log == NULL)) die("--serve-in and --serve-log come as a pair");
+  /* Same deal for the audio encoder: its process costs ~1.9 s of CUDA init + blob CRC/upload
+     against a ~0.2 s pass, so a session keeps one lfm3_enc_gpu --serve-fifo alive and hands it a
+     request per turn. --enc-req is a file holding the request counter (each turn is its own
+     client process, so the number cannot live in this process's memory). */
+  const char *enc_in = NULL, *enc_log = NULL;
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--enc-in") && i + 1 < argc) enc_in = argv[++i];
+    else if (!strcmp(argv[i], "--enc-log") && i + 1 < argc) enc_log = argv[++i];
+  }
+  if ((enc_in == NULL) != (enc_log == NULL)) die("--enc-in and --enc-log come as a pair");
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--out-ids") && i + 1 < argc) out_ids = argv[++i];
     else if (!strcmp(argv[i], "--tokens-only")) tokens_only = 1;
@@ -304,8 +365,10 @@ int main(int argc, char **argv) {
      stages 1-2, and it waits for MEL, which appears only by rename after lfm3_mel
      succeeded and the frame count was validated below. */
   unlink(MEL);   /* a leftover from a killed run with a recycled pid must not be read as this clip's mel */
-  { char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, (char*)"auto", TMPD, (char*)"--only", (char*)"proj_out", NULL };
-    g_enc_pid = spawn(av); }
+  if (!enc_in) {
+    char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, (char*)"auto", TMPD, (char*)"--only", (char*)"proj_out", NULL };
+    g_enc_pid = spawn(av);
+  }
   char MELP[1100]; snprintf(MELP, sizeof MELP, "%s.part", MEL);   /* MEL was unlinked before the spawn */
   snprintf(WORK_MELP, sizeof WORK_MELP, "%s", MELP);
 
@@ -321,6 +384,30 @@ int main(int argc, char **argv) {
   if (mel_bytes % (128 * 4) != 0)
     die("%s is %ld bytes, not a multiple of the 128-row f32 frame (%ld)", MELP, mel_bytes, (long)(128*4));
   if (rename(MELP, MEL) != 0) die("cannot publish %s", MEL);
+  if (enc_in) {
+    /* Hand the mel to the resident encoder (the one-shot path pays ~1.9 s of CUDA init + blob
+       CRC/upload per turn for a pass that itself takes ~0.2 s). The request index is the number
+       of ENC_DONE lines already in the log: turns are serialised, so that count is this turn's
+       index and waiting for "ENC_DONE <n> " cannot match an earlier turn's reply. */
+    long nenc = 0;
+    { int rf = open(enc_log, O_RDONLY);
+      if (rf >= 0) {
+        char b[4096]; ssize_t g; long prev = 0;
+        while ((g = pread(rf, b, sizeof b, prev)) > 0) {
+          prev += g;
+          for (ssize_t i = 0; i + 9 <= g; i++) if (!memcmp(b + i, "ENC_DONE ", 9)) nenc++;
+        }
+        close(rf);
+      } }
+    g_enc_off = file_size(enc_log);
+    int wf = open(enc_in, O_WRONLY | O_NONBLOCK);
+    if (wf < 0) die("--enc-in %s: cannot open for writing (%s) -- is the resident encoder running?", enc_in, strerror(errno));
+    char rq[2400];
+    int rl = snprintf(rq, sizeof rq, "%s %s auto\n", MEL, TMPD);
+    if (write(wf, rq, (size_t)rl) != rl) die("--enc-in write failed");
+    close(wf);
+    g_enc_n = nenc;
+  }
   long Tm = mel_bytes / (128 * 4);
   printf("mel frames Tm = %ld (%.3f audio seconds; %ld audio tokens = ceil(Tm/8))\n",
          Tm, (double)Tm / 100.0, (Tm + 7) / 8);
@@ -414,7 +501,7 @@ int main(int argc, char **argv) {
                  siq, siv,
                  pfrun >= 2 ? pfr : NULL, pfv, NULL };
   if (early && !srv_in) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
-  { pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu"); }
+  enc_collect(enc_log, g_enc_off, g_enc_n);
   need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
   { long rows = file_size(OUT) / (2048 * 4);
     if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",

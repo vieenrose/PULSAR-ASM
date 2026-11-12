@@ -1570,10 +1570,15 @@ static void gemm_to(Ent* e, const float* x, float* y, int T, bf16* xb, const cha
 }
 
 // ---------------------------------------------------------------- helpers
+// Per-request device allocations, tracked so a resident (--serve-fifo) pass can hand them back
+// between turns. dalloc is a raw cudaMalloc today, which is free in a one-shot process and a
+// leak in a service; recording the pointers here is the whole difference between the two.
+static std::vector<void*> g_reqallocs;
 static float* dalloc(size_t n, const char* what) {
   if (g_poison < 0) g_poison = getenv("LFM_ENC_POISON") ? atoi(getenv("LFM_ENC_POISON")) : 0;
   float* p = nullptr;
   if (cudaMalloc(&p, n * 4)) { printf("OOM (%s, %.1f MB)\n", what, n * 4 / 1e6); exit(2); }
+  g_reqallocs.push_back(p);
   // cudaMalloc hands back stale device memory. Reading any element before it is
   // written is therefore run-history dependent: four back-to-back runs of the same
   // binary agreed with each other to the bit and disagreed with a run that followed a
@@ -1592,6 +1597,7 @@ static float* dalloc_w(size_t n, const char* what) {
   if (!nz || g_poison) return dalloc(n, what);
   float* p = nullptr;
   if (cudaMalloc(&p, n * 4)) { printf("OOM (%s, %.1f MB)\n", what, n * 4 / 1e6); exit(2); }
+  g_reqallocs.push_back(p);
   return p;
 }
 // LFM_ENC_OVL (default 1): the blob upload continues on the loader thread (the backbone's
@@ -1655,9 +1661,56 @@ static Ent* need(Model& M, const char* name) {
   return e;
 }
 
+// Read one request line from the serve fifo without ever blocking on a writer (the same shape
+// as lfm3_nanode's clip_read, which had to solve the identical problem: a per-request client
+// means the read side sees EOF between requests). Returns 0 only when the fifo cannot be opened.
+static int enc_read_request(const char* path, char* out, size_t cap) {
+  int fd = open(path, O_RDONLY | O_NONBLOCK);
+  if (fd < 0) { printf("--serve-fifo: cannot open %s (%s)\n", path, strerror(errno)); return 0; }
+  size_t n = 0; bool got_nl = false; int idle = 0;
+  for (;;) {
+    char c;
+    ssize_t r = read(fd, &c, 1);
+    if (r == 1) {
+      idle = 0;
+      if (c == '\n') { got_nl = true; break; }
+      if (n + 1 < cap) out[n++] = c;
+      continue;
+    }
+    if (r < 0 && errno != EAGAIN && errno != EINTR) { close(fd); return 0; }
+    // Both no-data cases land here: r == 0 (no writer has the fifo open) and EAGAIN (a writer is
+    // open but idle) -- a non-blocking fifo read returns EAGAIN, not 0, while a writer exists, and
+    // the client holds one open between its own write and close.
+    if (got_nl) break;
+    // A line with no newline is accepted only after ~100 ms of silence: the client writes the
+    // whole request in one write() (atomic on a fifo below PIPE_BUF), so an idle read with a
+    // partial buffer means the writer is done, while accepting it immediately would be free to
+    // split a request that is still arriving.
+    if (n && ++idle > 5) break;
+    if (!n) {                                  // writer closed between requests: reopen
+      close(fd);
+      fd = open(path, O_RDONLY | O_NONBLOCK);
+      if (fd < 0) return 0;
+    }
+    struct timespec ts = { 0, 20000000 };   // 20 ms poll; a turn is seconds away
+    nanosleep(&ts, nullptr);
+  }
+  out[n] = 0;
+  close(fd);
+  return 1;
+}
+
 int main(int argc, char** argv) {
+  const char* serve_fifo = nullptr;   // --serve-fifo PATH: resident encoder, one pass per request line
+  // The two optional switches always follow the four positionals, so they are scanned from argv[5]:
+  // in --serve-fifo mode argv[2]/argv[4] are placeholders (the mel path and the output dir arrive
+  // per request), which is why the positional count cannot be validated the same way there.
+  for (int i = 5; i < argc; i++) {
+    if (!strcmp(argv[i], "--serve-fifo") && i + 1 < argc) serve_fifo = argv[++i];
+    else if (!strcmp(argv[i], "--only") && i + 1 < argc) g_only = argv[++i];
+  }
   if (argc == 7 && !strcmp(argv[5], "--only")) g_only = argv[6];
-  else if (argc != 5) { printf("usage: %s <enc blob> <input.bin> <Tm> <outdir> [--only <stage>]\n", argv[0]); return 2; }
+  else if (!serve_fifo && argc != 5) { printf("usage: %s <enc blob> <input.bin> <Tm> <outdir> [--only <stage> | --serve-fifo <fifo> --only <stage>]\n", argv[0]); return 2; }
   g_ench2 = getenv("LFM_ENC_H2") ? atoi(getenv("LFM_ENC_H2")) : 0;
   g_enc_win = getenv("LFM_ENC_WIN") ? atoi(getenv("LFM_ENC_WIN")) : 32;
   printf("ENC-ATTN layers=2,5,8,11,14,15,16 window=%d (encoder.sliding_window, all "
@@ -1676,7 +1729,7 @@ int main(int argc, char** argv) {
   // needs ~215 MB of activation buffers on top of the 130 MB blob -- inside the ~1.9 GB
   // this board leaves free, and the gate below refuses before any kernel runs if not.
   if (Tm < 8 || Tm > 32768) { printf("Tm out of range: %d (8..32768 mel frames = 0.08..327.7 s)\n", Tm); return 2; }
-  mkdir(argv[4], 0777);
+  if (!serve_fifo) mkdir(argv[4], 0777);   // in serve mode the output dir arrives per request
   { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g_tw_all = g_tw_prev = t.tv_sec + 1e-9 * t.tv_nsec; }
   Model M; std::string js;
   { const char* ov = getenv("LFM_ENC_OVL");
@@ -1691,22 +1744,32 @@ int main(int argc, char** argv) {
       printf("poisoned arenas: f32 %.1f MB scales %.1f MB\n", M.need_f / 1e6, M.need_s / 1e6);
     } }
 
-  if (tm_auto) {
+  // ---- one encoder pass ---------------------------------------------------------------
+  // Extracted verbatim from main so a resident process (--serve-fifo) can run it per turn.
+  // The one-shot path calls it exactly once with the argv values, which is the behaviour every
+  // gate has always exercised; nothing in the body changed except where the mel path, the
+  // output dir and Tm come from.
+  auto run_pass = [&](const char* melp, const char* odir_in, int Tm_in) -> int {
+  int Tm = Tm_in;
+  const bool pass_auto = (Tm_in <= 0);
+  mkdir(odir_in, 0777);
+  g_reqallocs.clear();
+  if (pass_auto) {
     struct stat stt; int waited_ms = 0;
-    while (stat(argv[2], &stt) != 0) {
-      if (getppid() == 1) { printf("parent gone while waiting for %s\n", argv[2]); return 2; }
-      if (waited_ms > 600000) { printf("timed out waiting for %s\n", argv[2]); return 2; }
+    while (stat(melp, &stt) != 0) {
+      if (getppid() == 1) { printf("parent gone while waiting for %s\n", melp); return 2; }
+      if (waited_ms > 600000) { printf("timed out waiting for %s\n", melp); return 2; }
       usleep(2000); waited_ms += 2;
     }
-    if (stt.st_size % (128 * 4) != 0) { printf("%s: %ld bytes, not whole 128-row frames\n", argv[2], (long)stt.st_size); return 2; }
+    if (stt.st_size % (128 * 4) != 0) { printf("%s: %ld bytes, not whole 128-row frames\n", melp, (long)stt.st_size); return 2; }
     Tm = (int)(stt.st_size / (128 * 4));
     if (Tm < 8 || Tm > 32768) { printf("Tm out of range: %d\n", Tm); return 2; }
     printf("Tm=auto: %d mel frames (waited %d ms after the blob load)\n", Tm, waited_ms);
     wallmark("mel wait");
   }
   std::vector<float> hfeat((size_t)128 * Tm);
-  int fd = open(argv[2], O_RDONLY);
-  if (fd < 0) { printf("cannot open %s\n", argv[2]); return 2; }
+  int fd = open(melp, O_RDONLY);
+  if (fd < 0) { printf("cannot open %s\n", melp); return 2; }
   if (read(fd, &hfeat[0], hfeat.size() * 4) != (ssize_t)(hfeat.size() * 4)) { printf("input short\n"); return 2; }
   close(fd);
   for (size_t i = 0; i < hfeat.size(); i++) if (!isfinite(hfeat[i])) { printf("input non-finite at %zu\n", i); return 2; }
@@ -1816,7 +1879,7 @@ int main(int argc, char** argv) {
                     + (double)EHID * 4096 * Tt;                // lin_out
   printf("ENCODER total %.2f ms (min of %d) = %.4f s GPU per audio second; downsampler alone %.0f MMAC, %.1f GMAC/s at that rate\n",
          ms, nreps, ms / 1000.0 / (Tm / 100.0), macs / 1e6, macs / (ms * 1e-3) / 1e9);
-  char odir[600]; snprintf(odir, sizeof odir, "%s", argv[4]);
+  char odir[600]; snprintf(odir, sizeof odir, "%s", odir_in);
   const int dumprep = getenv("LFM_ENC_DUMP_REP") ? atoi(getenv("LFM_ENC_DUMP_REP")) : 0;
   char repdir[640];
   for (int rep = 0; rep < nreps; rep++) {
@@ -1995,5 +2058,40 @@ int main(int argc, char** argv) {
   chk_final("end of pass");
   fflush(stdout);
   wallmark("layers+projector+dumps");
+  // Hand every device allocation this pass made back to the driver: a one-shot process gets
+  // them reclaimed at exit for free, a service must not accumulate them turn over turn.
+  for (size_t i = 0; i < g_reqallocs.size(); i++) cudaFree(g_reqallocs[i]);
+  g_reqallocs.clear();
   return 0;
+  };
+
+  if (serve_fifo) {
+    // Resident encoder: the ASR shell starts ONE of these per session, so the ~1.9 s of CUDA
+    // init + blob CRC/upload is paid at boot instead of on every turn (the pass itself is
+    // ~0.2 s of GPU for a 9 s clip). Request = one line "<mel> <outdir> <Tm|auto>"; the reply
+    // is "ENC_DONE <n> rc=..", which is what the client waits for. Errors exit: a service that
+    // has lost its context cannot serve the next turn meaningfully.
+    // The fifo is opened O_RDONLY|O_NONBLOCK and reopened on EOF, exactly as the backbone
+    // service does: each ASR turn is its own client process, so the last writer closing is the
+    // end of a turn's writer, not of the session. Blocking fopen would wait for a writer that
+    // only shows up at the first turn -- after the boot check that waits for us.
+    for (int req = 0; ; req++) {
+      char rl[1400];
+      printf("ENC_AWAIT %d\n", req); fflush(stdout);
+      if (!enc_read_request(serve_fifo, rl, sizeof rl)) break;
+      if (!rl[0]) { req--; continue; }
+      if (!strcmp(rl, "Q")) break;
+      char* s1 = strchr(rl, ' '); if (!s1) { printf("ENC: bad request '%s'\n", rl); return 2; }
+      *s1++ = 0; char* s2 = strchr(s1, ' '); if (!s2) { printf("ENC: bad request '%s'\n", rl); return 2; }
+      *s2++ = 0;
+      while (*s2 == ' ') s2++;
+      size_t sl = strlen(s2); while (sl && (s2[sl-1] == '\n' || s2[sl-1] == '\r')) s2[--sl] = 0;
+      const int rq_tm = strcmp(s2, "auto") ? atoi(s2) : 0;
+      const int rc = run_pass(rl, s1, rq_tm);
+      printf("ENC_DONE %d rc=%d\n", req, rc); fflush(stdout);
+      if (rc) return rc;
+    }
+    return 0;
+  }
+  { int rc = run_pass(argv[2], argv[4], tm_auto ? 0 : Tm); return rc; }
 }
