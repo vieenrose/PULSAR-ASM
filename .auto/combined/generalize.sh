@@ -19,6 +19,9 @@
 # a second one alongside the resident service would hang the board (run 281).
 # PASS = identical id stream per clip, both goldens still exact, no FAIL_*, low water >= 300 MB.
 cd /home/picard/lfm3 || exit 1
+# PFRUN: the cold path uses LFM_ASR_PFRUN=32; the service takes --prefill-run as an arg, so the two
+# arms can be run at different chunk sizes (the 60 s clip failure is being bisected on this knob).
+PFRUN=${PFRUN:-32}
 CLIPS="${CLIPS:-/tmp/clip_zh.wav /tmp/clip_en.wav /home/picard/lfm3/cv_zh5.wav /home/picard/lfm3/cv_zh9.wav /home/picard/lfm3/cv_en5.wav /home/picard/lfm3/cv_en9.wav /home/picard/lfm3/gate_60s_zh_16k_mono.wav}"
 S=/tmp/gen.srv.in; SL=/tmp/gen.srv.log; E=/tmp/gen.enc.in; EL=/tmp/gen.enc.log
 pkill -x lfm3_nanode 2>/dev/null; pkill -x lfm3_enc_gpu 2>/dev/null; sleep 2
@@ -35,7 +38,7 @@ done
 # now the resident pair
 LFM_ENC_TIME=0 ./lfm3_enc_gpu lfm3-audio-2b-enc.lfm3q8 - auto - --serve-fifo $E --only proj_out > $EL 2>&1 &
 EP=$!
-./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $S --prefill-run 128 > $SL 2>&1 &
+./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $S --prefill-run $PFRUN > $SL 2>&1 &
 SP=$!
 i=0; while [ $i -lt 240 ]; do grep -q "CLIP_AWAIT 0" $SL && grep -q "ENC_AWAIT 0" $EL && break; sleep 0.5; i=$((i+1)); done
 grep -q "CLIP_AWAIT 0" $SL || { echo BOOT_FAIL; tail -3 $SL; kill $SP $EP 2>/dev/null; exit 1; }

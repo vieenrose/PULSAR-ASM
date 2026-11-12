@@ -2539,3 +2539,19 @@ algorithm (fp16 accumulation), both of which change the goldens.
   them while iterating. Also from this run: my first hand-rolled fifo poll loop reported a fake
   "third request hangs" by racing its own writer -- trust only the real client (lfm3_asr) or a
   per-request proj_out existence check, and say so in the diagnostic's header.
+- [LFM3/Nano S2T] The 60 s resident failure after #273 was two things, neither a backbone bug
+  (2026-11-12, run #274). (1) generalize.sh booted the backbone service with --prefill-run 128,
+  a chunk the harness never ships (measure.sh: PFRUN=32). At 128 a 1396-id prompt prefills at
+  67.3 ms/pos (94.0 s) against ~33 ms/pos at 32; ids are identical at both. Alone the clip then
+  completes (154 s), so "nothing for 900 s" in the 7-clip order was this slowness plus history,
+  not a wedge; not reproduced once the gate ran at 32. Why 128 is 2x slower only on long prompts
+  is NOT explained (on 133 ids it is +1.3%, #269). (2) A client race: lfm3_asr opened the service
+  fifos O_WRONLY|O_NONBLOCK and died on ENXIO when it arrived between the service's EOF and its
+  reopen. Back-to-back turns hit it (clip_en right after clip_zh); the harness never did because
+  a TTS request sits between ASR turns. Fixed with a bounded ENXIO retry (fifo_open_w,
+  LFM_FIFO_WAIT default 10 s). Result: GENERALIZE OK, 7/7 clips identical cold vs resident.
+  STILL OPEN: the resident 60 s turn is SLOWER than cold (84.6-120 s vs 64.9 s over three runs).
+  The served encoder reply is 31.7 s vs 7.4 s cold while its GPU time is 0.66 s, with
+  MemAvailable down to ~340-390 MB beside the 2.15 GB backbone: suspect allocation/page reclaim
+  under memory pressure, unmeasured. Until fixed, audio over ~40 s is better served cold.
+  New knobs: LFM_SRV_WAIT (backbone reply wait, default 900 s), generalize.sh PFRUN / CLIPS.

@@ -307,6 +307,22 @@ static long man_long(char *man, const char *key) {
   return strtol(b, NULL, 10);
 }
 
+/* Open a resident service's request fifo for writing. The service reads one request, sees EOF
+ * when the client closes, and reopens the fifo; a client that arrives inside that window gets
+ * ENXIO (no reader) from a non-blocking open although the service is alive. Back-to-back turns
+ * hit it (generalize.sh, run #274). Retry ENXIO for LFM_FIFO_WAIT seconds (default 10) so a
+ * service that is really gone is still reported, by the caller, with errno intact. */
+static int fifo_open_w(const char* path) {
+  const double lim = getenv("LFM_FIFO_WAIT") ? atof(getenv("LFM_FIFO_WAIT")) : 10.0;
+  const double t0 = now_s();
+  for (;;) {
+    int fd = open(path, O_WRONLY | O_NONBLOCK);
+    if (fd >= 0 || errno != ENXIO || now_s() - t0 > lim) return fd;
+    struct timespec ts = {0, 5000000}; nanosleep(&ts, NULL);
+    errno = ENXIO;
+  }
+}
+
 int main(int argc, char **argv) {
   const double t_main0 = now_s();
   if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
@@ -458,7 +474,7 @@ int main(int argc, char **argv) {
         close(rf);
       } }
     g_enc_off = file_size(enc_log);
-    int wf = open(enc_in, O_WRONLY | O_NONBLOCK);
+    int wf = fifo_open_w(enc_in);
     if (wf < 0) die("--enc-in %s: cannot open for writing (%s) -- is the resident encoder running?", enc_in, strerror(errno));
     char rq[2400];
     int rl = snprintf(rq, sizeof rq, "%s %s auto\n", MEL, TMPD);
@@ -627,7 +643,7 @@ int main(int argc, char **argv) {
             (getenv("LFM_ASR_STOPID") && !atoi(getenv("LFM_ASR_STOPID"))) ? "-1" : siv);
     fclose(sf);
     long s0 = file_size(srv_log);
-    int wf = open(srv_in, O_WRONLY | O_NONBLOCK);
+    int wf = fifo_open_w(srv_in);
     if (wf < 0) die("--serve-in %s: cannot open for writing (%s) -- is the resident backbone running?", srv_in, strerror(errno));
     size_t sl = strlen(specf);
     if (write(wf, specf, sl) != (ssize_t)sl || write(wf, "\n", 1) != 1) die("--serve-in write failed");
@@ -641,7 +657,12 @@ int main(int argc, char **argv) {
     while (!done) {
       ssize_t got = read(rf, lb + lh, sizeof lb - lh - 1);
       if (got <= 0) {
-        if (now_s() - wt0 > 900.0) die("the resident backbone produced nothing for 900 s (see %s)", srv_log);
+        // LFM_SRV_WAIT (default 900 s): how long to wait for the resident backbone CLIP DONE.
+        // Long enough for a multi-minute prefill on real audio, short enough that a wedged service
+        // is reported rather than hanging the turn forever.
+        const double srv_wait_s = getenv("LFM_SRV_WAIT") ? atof(getenv("LFM_SRV_WAIT")) : 900.0;
+        if (now_s() - wt0 > srv_wait_s)
+          die("the resident backbone produced nothing for %g s (see %s)", srv_wait_s, srv_log);
         struct timespec ts = {0, 20000000}; nanosleep(&ts, NULL);
         continue;
       }
