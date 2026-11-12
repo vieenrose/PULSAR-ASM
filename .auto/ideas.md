@@ -2584,3 +2584,23 @@ algorithm (fp16 accumulation), both of which change the goldens.
   pre-#274 "nothing for 900 s" had the same signature, so treat an intermittent backbone stall
   on long clips as possible until stall.sh has caught one. Also: tts_wall is bimodal across
   harness runs (0.54 / 0.65 s; #273 0.547, #274 0.649, #275 0.541, #276 0.648), untouched code.
+- [LFM3+PrimeTTS/Nano] The TTS number was set by the GPU clock at request time, and the harness
+  was sampling it badly (2026-11-12, run #277). ttsq2.sh (one fresh resident TTS, blocking wait,
+  cur_freq read before each request), wall@MHz: back to back 1.67@537 .71@384 .54@691 .48@844
+  .48@921 .48@921; 2 s gaps .63@460 then 1.14 / 1.22 / 1.05 / 1.34 / 1.01 all @76; 6 s gaps .69@460
+  then 1.24-1.69 @76. So: 0.48 s at full clock, 1.0-1.7 s once nvhost_podgov has parked the GPU
+  (within 2 s of idle). The old harness protocol booted the TTS service after the ASR turns,
+  polled readiness at 0.5 s and the reply at 0.1 s: it caught the clock partway down by an amount
+  set by its own poll phase -> 0.54 / 0.65 s bimodal (#273-#276), and a 5 ms poll loop is worse
+  (grep spawns steal a core: 0.78-0.95 s). PROTOCOL CHANGE, not an engine change: PT_TURN=1
+  (default) keeps the TTS service resident beside the ASR services and issues one request right
+  after each ASR turn with a blocking wait; PT_TURN=0 is the old protocol. Same build, order
+  1/0/1 + the logged run: tts 0.492 / 0.537 / 0.490 / 0.483 s, asr 5.897 / 5.885 / 5.896 / 5.868 s,
+  combined 0.5065 / 0.5090 / 0.5061 / 0.5034; served waveform byte-identical on every turn;
+  MemAvailable low 759 vs 1049 MB (third resident service, ~290 MB). Numbers before #277 used
+  the old protocol: compare across it only with PT_TURN=0.
+  DEPLOYMENT RISK THIS EXPOSES (not in the metric): the reply ids are a fixture here, so TTS
+  follows ASR with no gap. If whatever produces the reply takes > ~1-2 s without using the GPU,
+  the TTS runs on a parked clock and costs 2-3x (1.0-1.7 s). A fix belongs in the product path
+  (e.g. the TTS service re-ramping the clock when the reply text starts arriving); an in-process
+  keep-warm during ASR is NOT the answer (#43: -35%, one SM). Needs root to pin the governor.

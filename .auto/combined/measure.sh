@@ -91,7 +91,7 @@ for spec in $CLIPS; do
   [ -s "$ADIR/golden_$lang.i32" ] || fail "missing $ADIR/golden_$lang.i32 (freeze it with: lfm3_asr --out-ids)"
 done
 
-OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' ASR_MODE='$ASR_MODE' PFRUN='${PFRUN:-32}' LFM_ENC_RESIDENT='${LFM_ENC_RESIDENT:-1}' PT_RESIDENT='${PT_RESIDENT:-1}' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
+OUT=$(ssh "$NANO" "CLIPS='$CLIPS' LFM_DIR='$LFM_DIR' PT_DIR='$PT_DIR' REPLY_CASE='$REPLY_CASE' ASR_MAXTOK='$ASR_MAXTOK' ASR_MODE='$ASR_MODE' PFRUN='${PFRUN:-32}' LFM_ENC_RESIDENT='${LFM_ENC_RESIDENT:-1}' PT_RESIDENT='${PT_RESIDENT:-1}' PT_TURN='${PT_TURN:-1}' bash -s" <<'REMOTE' 2>&1 | grep -v setlocale
 set -u
 cd "$LFM_DIR" || exit 2
 for spec in $CLIPS; do
@@ -167,7 +167,40 @@ for p in ['lfm3-audio-2b-q8.lfm3q8','lfm3-audio-2b-enc.lfm3q8','tok.bin','mel.bi
     --serve-in $SRV_IN --serve-log $SRV_LOG $ENCFLAGS > /tmp/cmb.warm.log 2>&1 || echo "SERVICE_FAIL warm-up"
   t3=$(date +%s.%N)
   python3 -c "print('WARMUP %.3f' % ($t3-$t2))"
+  # PT_TURN=1 (default): the TTS is measured where it happens in a turn -- its service is resident
+  # beside the ASR services and the request is issued directly after the ASR turn, with a blocking
+  # wait. PT_TURN=0 is the previous protocol (service booted after all ASR turns, 0.5 s readiness
+  # poll, one request, 0.1 s reply poll). Why it changed (run #277): the GPU governor parks the
+  # clock within ~2 s of idle (921.6 -> 76.8 MHz) and the same request then costs 1.0-1.7 s
+  # against 0.48 s at full clock; the old protocol caught the clock partway down by an amount set
+  # by its own poll alignment (0.54 / 0.65 s bimodal between runs) and quantized the wall to 0.1 s.
+  if [ "${PT_RESIDENT:-1}" = 1 ] && [ "${PT_TURN:-1}" = 1 ]; then
+    ( cd "$PT_DIR" && rm -f /tmp/cmb.ref.npy /tmp/cmb.tts.npy && \
+      ./build/pt_v21_nano --container build/v21.ptk --case "tests/golden_v21/$REPLY_CASE" \
+        --out /tmp/cmb.ref.npy > /tmp/cmb.tts_ref.log 2>&1 ) || echo "TTS_REF_FAIL"
+    grep -o "SNDR=[0-9.]*" /tmp/cmb.tts_ref.log | tail -1 | cut -d= -f2 | sed 's/^/TTS_SNDRdB /'
+    rm -f $PT_IN $PT_LOG; mkfifo $PT_IN; : > $PT_LOG
+    ( cd "$PT_DIR" && exec ./build/pt_v21_nano --container build/v21.ptk --serve-fifo $PT_IN ) > $PT_LOG 2>&1 &
+    PTS=$!
+    i=0; while [ $i -lt 120 ]; do grep -q "PT_AWAIT 0" $PT_LOG 2>/dev/null && break; sleep 0.5; i=$((i+1)); done
+    grep -q "PT_AWAIT 0" $PT_LOG 2>/dev/null || { echo "PTSERVICE_FAIL (see $PT_LOG)"; kill $PTS 2>/dev/null; exit 1; }
+  fi
 fi
+# One TTS request to the resident service, blocking on its PT_DONE line (tail -f, no poll loop:
+# a poll both quantizes the wall and, at a fine period, steals a core from a CPU-heavy stage).
+pt_request() {  # $1 = label
+  local npt; npt=$(grep -c PT_DONE $PT_LOG 2>/dev/null); [ -n "$npt" ] || npt=0
+  rm -f /tmp/cmb.tts.npy
+  ( timeout 60 tail -n +1 -f $PT_LOG 2>/dev/null | grep -m1 -q "^PT_DONE $npt " ) & local w=$!
+  local a; a=$(date +%s.%N)
+  timeout 60 sh -c "echo '$PT_DIR/tests/golden_v21/$REPLY_CASE /tmp/cmb.tts.npy' > $PT_IN" || echo "PT_WRITE_FAIL"
+  wait $w
+  local b; b=$(date +%s.%N)
+  grep -q "^PT_DONE $npt rc=0" $PT_LOG || echo "TTS_FAIL $1"
+  python3 -c "print('TTSTURN %s %.3f' % ('$1', $b-$a))"
+  grep -E "^PT_DONE $npt " $PT_LOG | tail -1 | grep -o "sndr=[0-9.]*" | cut -d= -f2 | sed 's/^/TTS_SNDRdB /'
+  if cmp -s /tmp/cmb.tts.npy /tmp/cmb.ref.npy; then echo "GATE_TTS_SERVE_BYTES_OK"; else echo "GATE_TTS_SERVE_BYTES_FAIL"; fi
+}
 # MemAvailable low-water watcher: the board hard-hangs when RAM is exhausted (run 281), and three
 # resident GPU processes now coexist with the page cache, so a run that quietly pushes the floor
 # down must be visible in the log rather than discovered by a hang.
@@ -186,6 +219,7 @@ for spec in $CLIPS; do
   fi
   t1=$(date +%s.%N)
   python3 -c "print('ASR %s %.3f' % ('$lang', $t1-$t0))"
+  if [ "$ASR_MODE" = warm ] && [ "${PT_RESIDENT:-1}" = 1 ] && [ "${PT_TURN:-1}" = 1 ]; then pt_request "$lang"; fi
   tail -1 "/tmp/cmb.$lang.log" | grep -q TRANSCRIPT || echo "ASR_NOTE $lang: no transcript line"
 done
 if [ "$ASR_MODE" = warm ]; then
@@ -198,9 +232,13 @@ if [ "$ASR_MODE" = warm ]; then
   # `echo Q > $ENC_IN` hangs the whole run in teardown.
   if [ "${LFM_ENC_RESIDENT:-1}" = 1 ]; then timeout 5 sh -c "echo Q > $ENC_IN" 2>/dev/null; kill $ENCS 2>/dev/null; wait $ENCS 2>/dev/null; fi
   rm -f $ENC_IN
+  if [ "${PT_RESIDENT:-1}" = 1 ] && [ "${PT_TURN:-1}" = 1 ]; then
+    timeout 5 sh -c "echo Q > $PT_IN" 2>/dev/null; kill $PTS 2>/dev/null; wait $PTS 2>/dev/null; rm -f $PT_IN
+  fi
 fi
 kill $WATCH 2>/dev/null
 echo "LOWWATER_MB $(sort -n /tmp/cmb.lowwater 2>/dev/null | head -1)"
+if [ "$ASR_MODE" = warm ] && [ "${PT_RESIDENT:-1}" = 1 ] && [ "${PT_TURN:-1}" = 1 ]; then exit 0; fi
 cd "$PT_DIR" || exit 2
 # The reference is ALWAYS the one-shot driver, run untimed: it is the thing the SNDR gate has
 # always certified, and it is what the served waveform is compared against byte for byte.
@@ -240,7 +278,7 @@ else
 fi
 REMOTE
 )
-echo "$OUT" | grep -E "^(ASR|TTS|CLIPSEC|SERVICELOAD|WARMUP|ENCREQ|PTREQ|LOWWATER_MB|GATE_TTS_SERVE)" | sed 's/^/  /'
+echo "$OUT" | grep -E "^(ASR|TTS|TTSTURN|CLIPSEC|SERVICELOAD|WARMUP|ENCREQ|PTREQ|LOWWATER_MB|GATE_TTS_SERVE)" | sed 's/^/  /'
 echo "$OUT" | grep -q "ASR_FAIL\|TTS_FAIL\|TTS_REF_FAIL\|PTSERVICE_FAIL\|PT_WRITE_FAIL\|SERVICE_FAIL\|ENCSERVICE_FAIL" && { echo "GATE FAIL: a stage failed"; echo "$OUT" | tail -20; exit 1; }
 
 # ---- quality gates
@@ -276,10 +314,18 @@ for l in out.splitlines():
     if len(p) == 3 and p[0] == "ASR":
         asr[p[1]] = float(p[2])
 tts = None
+ttst = {}
 for l in out.splitlines():
     p = l.split()
     if len(p) == 2 and p[0] == "TTS":
         tts = float(p[1])
+    if len(p) == 3 and p[0] == "TTSTURN":
+        ttst[p[1]] = float(p[2])
+if ttst:                       # PT_TURN=1: one TTS request per turn, timed right after its ASR
+    missing = [c.split(":")[0] for c in clips if c.split(":")[0] not in ttst]
+    if missing:
+        print("measure: no TTS timing for turn(s) %s" % missing, file=sys.stderr); sys.exit(2)
+    tts = sum(ttst.values()) / len(ttst)
 AOUT = 3.616  # T81 reply length
 if tts is None or not asr:
     print("measure: no timings", file=sys.stderr); sys.exit(2)
@@ -287,10 +333,11 @@ crs, srs, trs, rrs = [], [], [], []
 for spec in clips:
     lang = spec.split(":")[0]
     a_in = sec[lang]
-    crs.append((asr[lang] + tts) / (a_in + AOUT))
+    t = ttst.get(lang, tts)
+    crs.append((asr[lang] + t) / (a_in + AOUT))
     srs.append(asr[lang] / a_in)
-    trs.append(tts / AOUT)
-    rrs.append((asr[lang] + tts) / a_in)
+    trs.append(t / AOUT)
+    rrs.append((asr[lang] + t) / a_in)
 mean = lambda v: sum(v) / len(v)
 print("METRIC combined_rtf=%.4f" % mean(crs))
 print("METRIC s2t_rtf=%.4f" % mean(srs))
