@@ -1,0 +1,136 @@
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index 11c3717..6b08c9f 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -4502,6 +4502,110 @@ __global__ void __launch_bounds__(512, 2) q8_partial_TLg(const int8_t* __restric
+     if (t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, pv[p])); else part[(size_t)t * N + row] = pv[p]; }
+   }
+ }
++// q8_partial_TLh: the TLg body with CT = 8 positions per block instead of 4 (LFM_PF_TLGS=98).
++// WHY: a block owns 512 rows and reads their whole weight stream itself, so the tensor is read
++// once per CEILING(T/CT) position-tiles. At CT=4 the ASR prefill (118 positions) streams the
++// 1.946 GB Q8 backbone ~30 times = ~57 GB, i.e. a 2.97 s floor at the 19.3 GB/s the decode
++// provably achieves, against 3.89 s measured: the prefill is at 76% of the bus and 44% of the
++// fp32 peak, so the bus is the nearer limit and CT is the knob that moves it. CT has never been
++// varied for this path (grid.y = Tn/4, t0 = by*4, pv[4], the leaf's 4-chain are baked in;
++// LFM_PF_CT only reaches the older non-tiled q8_partial_T). Here the staging holds NS x 8 m x 8
++// p x 16 words as float2 (NS = 4 keeps it at 32 KB), and every weight word of a block is
++// expanded to its 4 code floats ONCE and multiplied against 8 positions instead of 4.
++// Bit-exactness: each position's chain is the shipping leaf's exactly -- dot[p] over m
++// ascending with __fmaf_rn, acc[p] = fmaf(sb, dot[p], acc[p]), and the same 5-bit binary-counter
++// tree over the 32 leaves per position. Positions never mix, and the x values are the same
++// unpacked floats (u << 16 / u & 0xffff0000), so the outputs are bit-identical to TLg.
++template <int NS>
++__global__ void __launch_bounds__(512, 1) q8_partial_TLh(const int8_t* __restrict__ q, const float* __restrict__ s,
++                                                         const bf16* __restrict__ x, float* __restrict__ part,
++                                                         int N, int K, int nb, int T, bf16* __restrict__ yb) {
++  extern __shared__ __align__(16) float2 xf[];      // [(ls*8 + m)*8 + p]*16 + jj
++  const int bx = g_pfgsw ? blockIdx.y : blockIdx.x, by = g_pfgsw ? blockIdx.x : blockIdx.y;
++  const int t0 = by * 8, tid = threadIdx.x;
++  const int row = bx * 512 + tid;
++  const bool live = row < N;
++  const int4* qt = reinterpret_cast<const int4*>(q) + (size_t)(row >> 5) * nb * 64 + (row & 31);
++  const float* sts = s + (size_t)(row >> 5) * nb * 32 + (row & 31);
++  float st[5][8], pv[8];
++  #pragma unroll
++  for (int k = 0; k < 32; k++) {
++    if ((k & (NS - 1)) == 0) {
++      __syncthreads();
++      for (int w = tid; w < NS * 8 * 8 * 16; w += 512) {
++        const int jj = w & 15, p = (w >> 4) & 7, m = (w >> 7) & 7, ls = w >> 10;
++        const int kk = k + ls;
++        const int i = ((kk & 1) << 4) | ((kk & 2) << 2) | (kk & 4) | ((kk & 8) >> 2) | ((kk & 16) >> 4);
++        const int b = i + 32 * m, t = t0 + p;
++        const uint32_t u = (b < nb && t < T) ? reinterpret_cast<const uint32_t*>(x + (size_t)t * K)[b * 16 + jj] : 0u;
++        xf[w] = make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
++      }
++      __syncthreads();
++    }
++    float a[8];
++    if (live) {
++      const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
++      float acc[8];
++      #pragma unroll
++      for (int p = 0; p < 8; p++) acc[p] = 0.f;
++      const int fbase = ((k & (NS - 1)) * 8) * 128;
++      for (int m = 0; i + 32 * m < nb; m++) {
++        const int b = i + 32 * m;
++        const int4 a0 = qt[b * 64], a1 = qt[b * 64 + 32];
++        const unsigned w[8] = { (unsigned)a0.x, (unsigned)a0.y, (unsigned)a0.z, (unsigned)a0.w,
++                                (unsigned)a1.x, (unsigned)a1.y, (unsigned)a1.z, (unsigned)a1.w };
++        const float sb = sts[b * 32];
++        float dot[8];
++        #pragma unroll
++        for (int p = 0; p < 8; p++) dot[p] = 0.f;
++        const float2* const xq = xf + fbase + m * 128;
++        #pragma unroll
++        for (int q = 0; q < 8; q++) {
++          const float c0 = (float)(int)(signed char)(w[q]);
++          const float c1 = (float)(int)(signed char)(w[q] >> 8);
++          const float c2 = (float)(int)(signed char)(w[q] >> 16);
++          const float c3 = (float)(int)(signed char)(w[q] >> 24);
++          #pragma unroll
++          for (int p = 0; p < 8; p++) {
++            const float4 f = *(reinterpret_cast<const float4*>(xq + p * 16 + 2 * q));
++            dot[p] = __fmaf_rn(c0, f.x, dot[p]);
++            dot[p] = __fmaf_rn(c1, f.y, dot[p]);
++            dot[p] = __fmaf_rn(c2, f.z, dot[p]);
++            dot[p] = __fmaf_rn(c3, f.w, dot[p]);
++          }
++        }
++        #pragma unroll
++        for (int p = 0; p < 8; p++) acc[p] = __fmaf_rn(sb, dot[p], acc[p]);
++      }
++      #pragma unroll
++      for (int p = 0; p < 8; p++) a[p] = acc[p];
++    } else {
++      #pragma unroll
++      for (int p = 0; p < 8; p++) a[p] = 0.f;
++    }
++    #pragma unroll
++    for (int p = 0; p < 8; p++) pv[p] = a[p];
++    bool done = false;
++    #pragma unroll
++    for (int l = 0; l < 5; l++) {
++      if (done) continue;
++      if ((k >> l) & 1) {
++        #pragma unroll
++        for (int p = 0; p < 8; p++) pv[p] = __fadd_rn(st[l][p], pv[p]);
++      } else {
++        #pragma unroll
++        for (int p = 0; p < 8; p++) st[l][p] = pv[p];
++        done = true;
++      }
++    }
++  }
++  if (!live) return;
++  #pragma unroll
++  for (int p = 0; p < 8; p++) {
++    const int t = t0 + p;
++    if (t < T) { if (yb) yb[(size_t)t * N + row] = f2bf(__fadd_rn(0.f, pv[p])); else part[(size_t)t * N + row] = pv[p]; }
++  }
++}
+ __global__ void k_tile_q(const int4* __restrict__ src, int4* __restrict__ dst, int N, int nb) {
+   const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;   // (row, b, h)
+   if (i >= (size_t)N * nb * 2) return;
+@@ -4600,7 +4704,19 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
+     static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 9;
+     static const int gsw = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
+     const dim3 gg = gsw ? dim3((Tn + 3) / 4, (N + 511) / 512) : dim3((N + 511) / 512, (Tn + 3) / 4);
+-    if (tlgs == 9)      q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++    static const int tlhh = getenv("LFM_PF_TLHH") ? atoi(getenv("LFM_PF_TLHH")) : 4;
++    if (tlgs == 98) {
++      static bool nh_set = false;
++      if (!nh_set) { cudaFuncSetAttribute((const void*)q8_partial_TLh<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 32768);
++                     cudaFuncSetAttribute((const void*)q8_partial_TLh<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 16384); nh_set = true; }
++      const dim3 gh = g_pfgsw ? dim3((Tn + 7) / 8, (N + 511) / 512) : dim3((N + 511) / 512, (Tn + 7) / 8);
++      if (tlhh == 2) q8_partial_TLh<2><<<gh, 512, 16384, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++      else           q8_partial_TLh<4><<<gh, 512, 32768, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
++      const cudaError_t he = cudaGetLastError();
++      if (he) { printf("TLh launch refused at N=%d K=%d nb=%d: %s\n", N, K, nb, cudaGetErrorString(he)); return 1; }
++      goto launched;
++    }
++    else if (tlgs == 9)      q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     else if (tlgs == 8) q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     else if (tlgs == 4) q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+     else if (tlgs == 1) q8_partial_TLg<1><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);

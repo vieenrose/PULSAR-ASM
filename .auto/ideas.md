@@ -2469,3 +2469,20 @@ algorithm (fp16 accumulation), both of which change the goldens.
   chunk- or conversion-bound; the remaining 44%-of-peak efficiency is the kernel's dependency
   structure, and the only levers past it change the numerics (half2/fp16 accumulation), which
   the lossless decision excludes. Do not re-sweep these knobs or re-try the conversion tricks.
+- [LFM3/Nano S2T] The prefill is NOT weight-bandwidth-bound (2026-11-12, run #271, refutes the
+  last structural hypothesis). q8_partial_TLg reads its whole 512-row weight slab itself, so the
+  tensor is streamed once per ceil(T/CT) position-tiles: at CT=4 the ASR prefill moves
+  1.946 GB x 118/4 ~= 57 GB, which at the 19.3 GB/s the decode demonstrably achieves is a 2.97 s
+  floor against 3.89 s measured -- i.e. 76% bus vs 44% of the fp32 peak, which had been read as
+  "the bus is the nearer limit". Built q8_partial_TLh (CT=8, NS=4, 32 KB dynamic shared, 512
+  threads, LFM_PF_TLGS=98; patch .auto/attic/row271_tlh_ct8_probe.patch): the m-loop and the
+  per-(block,k) weight loads halve while the FMA count is unchanged. Prefill 3879/3879/3880/3882
+  vs 3887/3886/3888/3892 = a wash. CONCLUSION: the ~30 tensor passes are free (the unified-memory
+  path absorbs them or the SM stalls elsewhere); halving the weight stream does nothing, so the
+  44%-of-peak efficiency is a dependency/latency property of the inner chain, not a resource
+  ceiling -- closing bus, issue-op-mix (#267), conversion (#268/#269 SASS), occupancy (#269),
+  chunk size (#269), staging waste (#270) and dead work (#266) as explanations.
+  TRAP THIS RUN ALMOST SET: the CT=8 kernel was not bit-exact (its zh transcript was one EOS id),
+  so the same A/B showed a fake -15% turn (4.59 vs 5.43 s) purely because the transcript was 1
+  token instead of 9. When a probe changes output, ONLY the stage timer (PF4-RUN prefill ms) is a
+  valid read; turn walls track the generated length. Always print the id count/md5 in a probe A/B.
