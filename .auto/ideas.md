@@ -2418,3 +2418,36 @@ Audio slot 138 ms = backbone headless ~90 ms + depth server ~42 ms (read 1.7, ma
   depth trunk into the backbone process (removes the second GPU context and the per-frame
   file hand-off); it is a multi-hour refactor of two monolith TUs with gate risk, so only
   worth it with the gap measured, not assumed.
+
+**The prefill's CVT cost, measured in the engine: a null AND not bit-exact (run #268).** The
+wide-K tensors already build code floats from bits (`tlg_leaf`), but the TL/TLf leaf that
+serves the smaller prefill tensors (`tlb_leaf`, `tlf_leaf`) still did
+`(float)(int)(signed char)b` -- one quarter-rate CVT chain PER CODE, two per fma pair. The
+exact fold: the x staging XORs 0x80 into every byte, so the staged byte is exactly 128+b
+(0..255), `__uint_as_float(0x4B000000 | (128+b))` is that integer as a float with no CVT, and
+`sum (128+b)x = dot - 128*sum x` with both parts exact (the dot is an integer; sum x over a
+block is at most nb*127 integers, so 128*sx is exactly representable). Implemented as
+LFM_PF_TLBC (tlb_leaf + tlf_leaf, `fma(sb, dot - 128*sx, acc)` vs `fma(sb, dot, acc)`), so
+the only change per block is where the +128 bias lands.
+  Result: prefill 3897/3899/3900/3898/3899/3915 (TLBC=1) vs 3900/3902/3900/3902/3916/3920
+  (TLBC=0) -- **null**, and the generated ids md5 (7bdc9104/1bf47b8a) differ from the frozen
+  goldens (049346af/830f6f64), i.e. NOT bit-exact, which would fail the gate regardless.
+  Reverted.
+WHY IT FAILED -- two independent facts, both worth keeping:
+1. **The arithmetic was right but the fold is not bit-exact.** `fma(sb, dot - 128*sx, acc)`
+   rounds `dot - 128*sx` to float BEFORE the scale multiply; the cvt form folds sb into the
+   unrounded dot. `dot` is an exact integer only while |dot| < 2^24 (it is 32 codes x 127 x
+   |x| <= 127, so up to 512k -- usually fine but not always), and `fma(sb, d, acc)` rounds
+   once where `fma(sb, d', acc)` rounds twice. The gate sees the difference. A bit-exact
+   version must fold the bias into `acc` per block with the SAME rounding sequence as the cvt
+   form, which the cvt form does not have (it has no explicit bias term at all).
+2. **The win was never there.** Even if bit-exact, the engine-level A/B says removing the
+   CVTs from the TL path buys <= 0.1% of the turn. The conversion-pipe model was wrong: the
+   prefill's real limiter is not the cvt pipe (the bench said 14% ceiling on that op mix, and
+   the engine shows ~0%), so the "quarter-rate cvt is the wall" story is closed in both
+   directions.
+CONSEQUENCE: the batched prefill is at its floor. 3.89 s = 24 real layers x 118 positions at
+~29 ms/position + the last layer's final position; every knob (geometry, op mix, conversion
+pipe, ILP shape, dead-output elimination) is measured. What remains on the ASR side is lossy
+math (the raw half2 arm, -5.6% TTFT, excluded by the lossless decision) or a different
+algorithm (fp16 accumulation), both of which change the goldens.
