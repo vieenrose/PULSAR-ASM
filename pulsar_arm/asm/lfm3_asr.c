@@ -286,6 +286,7 @@ static long man_long(char *man, const char *key) {
 }
 
 int main(int argc, char **argv) {
+  const double t_main0 = now_s();
   if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
     fprintf(stderr, "usage: %s <dir> <clip.wav> [max_gen] [--out-ids FILE] [--tokens-only]\n", argv[0]);
     fprintf(stderr, "  <dir>         directory with the lfm3 blobs (backbone, enc, depth, codec, tok, mel)\n");
@@ -679,5 +680,6 @@ int main(int argc, char **argv) {
   }
   free(eb); free(txt); free(gen); free(ids); free(pre_ids); free(post_ids);
   free(prompt); free(manb); ltok_free(&tok);
+  printf("TIME client total %.3f s (process start to exit)\n", now_s() - t_main0);
   return 0;
 }

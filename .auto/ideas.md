@@ -2451,3 +2451,21 @@ CONSEQUENCE: the batched prefill is at its floor. 3.89 s = 24 real layers x 118 
 pipe, ILP shape, dead-output elimination) is measured. What remains on the ASR side is lossy
 math (the raw half2 arm, -5.6% TTFT, excluded by the lossless decision) or a different
 algorithm (fp16 accumulation), both of which change the goldens.
+- [LFM3/Nano S2T] ASR prefill CLOSED at the exact floor (2026-11-12, runs #268-#269): the last
+  three untested axes were measured and all three are null or worse. (1) --prefill-run T (the
+  chunk size, the one knob #260 flagged and #267's sweep omitted): T=32 vs 128 prefill 3895/3896
+  vs 3891 ms, turn identical, and both goldens byte-identical at T=128, which independently
+  confirms the chunk-invariance the batched prefill rests on. (2) The int8->float conversion in
+  the TL/TLf leaf: SASS shows nvcc already emits I2F.F32.S8 with BYTE SELECTORS (R2, R4.B1/B2)
+  = one instruction per code, and it is HOISTED across the CT=4 positions (1 I2F per 4 FFMA).
+  Any PRMT/magic-constant rewrite is therefore strictly more instructions, and the bias-folding
+  variant is not bit-exact (double rounding through the scale multiply, #268). (3) Occupancy:
+  q8_partial_TLg<9> runs 64 regs + 32 KB shared = exactly 2 blocks/SM = 32 warps, while its op
+  mix (0.25 I2F + 1 FFMA + 0.25 LDS.128 per MAC) could issue ~66% of the fp32 peak and it
+  measures 44%. Forcing 3 blocks/SM (q8_partial_TLg3<8>, __launch_bounds__(512,3): 32 regs,
+  16 KB shared, STACK 40 -> 144 = spills) is +1.3% SLOWER on the prefill, 4/4 turns both orders
+  (3938-3942 vs 3887-3895 ms). Probe: .auto/attic/row269_tlg3_3block_probe.patch.
+  CONSEQUENCE: the prefill (3.89 s = 61% of the turn) is not issue-, occupancy-, geometry-,
+  chunk- or conversion-bound; the remaining 44%-of-peak efficiency is the kernel's dependency
+  structure, and the only levers past it change the numerics (half2/fp16 accumulation), which
+  the lossless decision excludes. Do not re-sweep these knobs or re-try the conversion tricks.
