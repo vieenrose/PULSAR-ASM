@@ -2694,3 +2694,16 @@ algorithm (fp16 accumulation), both of which change the goldens.
   MemAvailable 1229 MB after. generalize.sh on this build (three services): 7/7 ASR identical,
   7/7 TTS bytes identical, 0 guard trips; 110 s clip 64.1 s resident vs 64.7 s cold this run
   (68.1 vs 65.0 in #281: the long resident turn varies 63-70 s with three services).
+- [LFM3/Nano S2T] Long-conversation soak: 24 turns flat, no leak, no drift (2026-11-13, run #284,
+  keep, gate/tooling only; no engine change). .auto/combined/soak.sh runs N alternating zh/en
+  turns through the three resident services (the configuration the harness measures) and records
+  per turn: ASR wall, TTS wall, transcript-vs-golden, SNDR, MemAvailable, and the three services'
+  VmRSS. It exists because both resident defects found so far (#273's first-request-sized static,
+  #275's pool pinning the board) were turn-count or history dependent and a 2-turn harness cannot
+  see that class. Result at N=24: ids == golden on all 48 transcript checks (24 turns x 2 clips
+  alternating), SNDR 70.09 on all 24 TTS requests, zh asr 5.416-5.439 s (0.4% spread), en
+  6.308-6.372 s (1.0%), tts 0.463-0.482 s, MemAvailable 788-790 MB flat, RSS bb 31 / enc 35-36 /
+  tts 243-244 MB flat. The zh/en gap is 0.92 s = the 9 extra decode steps of the en transcript at
+  ~101 ms each, which independently confirms the per-turn cost model. Backbone RSS is 31 MB
+  because its 2.15 GB arena is nvmap-accounted, not anonymous: read device residency from
+  MemAvailable, not from RSS. Harness on the current tree 0.5053, all gates + checks.sh green.
