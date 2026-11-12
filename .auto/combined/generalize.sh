@@ -35,7 +35,35 @@ for w in $CLIPS; do
   v=$(lw); [ "$v" -lt "$cold_min" ] && cold_min=$v
   printf "COLD  %-28s ids=%s wall=%s\n" "$n" "$(wc -c < /tmp/gen.$n.cold.i32 2>/dev/null | awk '{print $1/4}')" "$(grep -oE 'client total [0-9.]+' /tmp/gen.$n.cold.log | awk '{print $3}')"
 done
-# now the resident pair
+# TTS=1 (default): the gate runs the configuration the combined harness measures since #277 --
+# THREE resident services. One TTS request follows every resident ASR turn, rotating over all five
+# golden reply cases (the harness only ever uses T81), each compared byte for byte with a one-shot
+# reference made here before any service is up. TTS=0 = the old two-service gate.
+TTS=${TTS:-1}; PT=/home/picard/primetts; PI=/tmp/gen.pt.in; PL=/tmp/gen.pt.log; PP=
+TCASES="${TCASES:-T81 T20 T120 T40 sid1_T29}"
+if [ "$TTS" = 1 ]; then
+  pkill -x pt_v21_nano 2>/dev/null
+  for c in $TCASES; do
+    ( cd $PT && ./build/pt_v21_nano --container build/v21.ptk --case tests/golden_v21/$c --out /tmp/gen.ref.$c.npy > /tmp/gen.ref.$c.log 2>&1 ) || echo "FAIL_TTSREF_$c"
+  done
+  mkfifo $PI; : > $PL
+  ( cd $PT && exec ./build/pt_v21_nano --container build/v21.ptk --serve-fifo $PI ) > $PL 2>&1 &
+  PP=$!
+  i=0; while [ $i -lt 120 ]; do grep -q "PT_AWAIT 0" $PL && break; sleep 0.5; i=$((i+1)); done
+  grep -q "PT_AWAIT 0" $PL || { echo TTS_BOOT_FAIL; kill $PP 2>/dev/null; exit 1; }
+fi
+TK=0; TTSBAD=0; TTSN=0
+tts_turn() {   # $1 = label; request goes out with no gap after the ASR turn, blocking wait
+  [ -n "$PP" ] || return 0
+  set -- "$1" $TCASES; local lab=$1; shift; local c; c=$(eval echo \${$(( TK % $# + 1 ))}); TK=$((TK+1))
+  local n; n=$(grep -c "^PT_DONE" $PL); rm -f /tmp/gen.tts.npy
+  ( timeout 120 tail -n +1 -f $PL 2>/dev/null | grep -m1 -q "^PT_DONE $n " ) & local w=$!
+  local a; a=$(date +%s.%N); echo "tests/golden_v21/$c /tmp/gen.tts.npy" > $PI; wait $w
+  local dt; dt=$(echo "$(date +%s.%N) - $a" | bc | cut -c1-5); TTSN=$((TTSN+1))
+  if cmp -s /tmp/gen.tts.npy /tmp/gen.ref.$c.npy; then st=BYTES_OK; else st=BYTES_FAIL; TTSBAD=1; fi
+  printf "TTS   %-28s case=%-9s %s wall=%ss MemAvailable=%sMB\n" "$lab" "$c" "$st" "$dt" "$(( $(lw) / 1024 ))"
+}
+# now the resident services
 LFM_ENC_TIME=0 ./lfm3_enc_gpu lfm3-audio-2b-enc.lfm3q8 - auto - --serve-fifo $E --only proj_out > $EL 2>&1 &
 EP=$!
 ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $S --prefill-run $PFRUN > $SL 2>&1 &
@@ -49,6 +77,7 @@ BAD=0
 for w in $CLIPS; do
   n=$(basename "$w" .wav)
   timeout 1200 ./lfm3_asr . "$w" 96 --out-ids /tmp/gen.$n.warm.i32 --serve-in $S --serve-log $SL --enc-in $E --enc-log $EL > /tmp/gen.$n.warm.log 2>&1 || { echo "FAIL_WARM_$n"; BAD=1; }
+  tts_turn "$n"
   v=$(lw); [ "$v" -lt "$MIN" ] && MIN=$v
   a=$(md5sum < /tmp/gen.$n.cold.i32 2>/dev/null | cut -c1-12); b=$(md5sum < /tmp/gen.$n.warm.i32 2>/dev/null | cut -c1-12)
   wa=$(grep -oE 'client total [0-9.]+' /tmp/gen.$n.cold.log | awk '{print $3}'); wb=$(grep -oE 'client total [0-9.]+' /tmp/gen.$n.warm.log | awk '{print $3}')
@@ -62,6 +91,10 @@ for c in zh en; do
   else echo "GOLDEN_$c SKIPPED (no /tmp/gen_golden_$c.i32)"; fi
 done
 timeout 5 sh -c "echo Q > $S" 2>/dev/null; timeout 5 sh -c "echo Q > $E" 2>/dev/null
+[ -n "$PP" ] && { timeout 5 sh -c "echo Q > $PI" 2>/dev/null; kill $PP 2>/dev/null; rm -f $PI; }
+[ "$TTSBAD" = 0 ] || BAD=1
+[ -n "$PP" ] && echo "TTS_SERVED $TTSN requests, $([ $TTSBAD = 0 ] && echo all byte-identical to one-shot || echo MISMATCH)"
+echo "GUARD_TRIPS $(grep -c MEMGUARD $EL)"
 sleep 1; kill $SP $EP 2>/dev/null; wait 2>/dev/null; rm -f $S $E
 echo "MEMLOW resident=${MIN} cold=${cold_min} (kB)"
 [ "$BAD" = 0 ] && echo "GENERALIZE OK ($(echo $CLIPS | wc -w) clips)" || echo "GENERALIZE FAIL"

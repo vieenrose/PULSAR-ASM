@@ -2661,3 +2661,14 @@ algorithm (fp16 accumulation), both of which change the goldens.
   served and correct. Limits: the estimate is from sizes measured on this build (reported 542 vs
   536 MB allocated), MemAvailable is the kernel's own estimate, and the real exhaustion edge was
   not probed (cannot be, remotely). Rough capacity with three services: ~135 s of audio.
+- [LFM3+PrimeTTS/Nano] Held-out gate now runs the measured configuration (2026-11-13, run #281,
+  keep, gate only). generalize.sh TTS=1 (default): three resident services, one TTS request right
+  after every resident ASR turn, rotating over all five golden reply cases (T81 T20 T120 T40
+  sid1_T29; the harness only ever served T81), each byte-compared with a one-shot reference made
+  before the services boot. Result: 7/7 ASR id streams identical cold vs resident, 7/7 served
+  waveforms byte-identical to one-shot (first evidence the resident TTS is exact on a case other
+  than T81), 0 guard trips, 110 s clip 68.1 s resident vs 65.0 s cold (three services: the
+  encoder pass is under reclaim, #280). Served TTS walls: T20 0.17, T29 0.23, T40 0.27, T81
+  0.47-0.50, T120 0.71 s; T20 right after the 110 s turn 0.50 s (3x its usual: one request after
+  a memory-pressure turn is slow, the #280 observation again). MEMLOW 766 MB is sampled after
+  turns, not inside them (in-turn low for the 110 s clip is ~250-310 MB, #280).
