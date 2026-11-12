@@ -662,6 +662,7 @@ static void* rp_scratch(size_t n) {
     if (g_rps) cudaFree(g_rps);
     if (cudaMalloc(&g_rps, n)) { printf("repack scratch\n"); exit(2); }
     g_rpsz = n;
+    if (getenv("LFM_ENC_MEM")) printf("MEM rps    %8.1f MB\n", n / 1048576.0);
   }
   return g_rps;
 }
@@ -1058,6 +1059,7 @@ static float* part_get(size_t nfloats) {
     printf("gemm part cudaMalloc %.1f MB failed\n", nfloats * 4 / 1e6); exit(2);
   }
   g_part_cap = nfloats;
+  if (getenv("LFM_ENC_MEM")) printf("MEM part   %8.1f MB\n", nfloats * 4 / 1048576.0);
   return g_part_buf;
 }
 static void gemm_release(Gemm& g) { if (g.part && !g.pooled) cudaFree(g.part); g.part = nullptr; }
@@ -1622,6 +1624,7 @@ static void* req_alloc(size_t bytes, int zero, const char* what) {
     p = g_pool[g_slot].p;                       // reuse: same slot, big enough
   } else {
     if (cudaMalloc(&p, bytes)) { printf("OOM (%s, %.1f MB)\n", what, bytes / 1e6); pass_fail(); }
+    if (getenv("LFM_ENC_MEM")) printf("MEM req %-6s %8.1f MB\n", what, bytes / 1048576.0);
     if (g_pool_on) {
       if (g_slot < g_pool.size()) { cudaFree(g_pool[g_slot].p); g_pool[g_slot] = { p, bytes }; }
       else g_pool.push_back({ p, bytes });
@@ -1840,9 +1843,26 @@ int main(int argc, char** argv) {
   const size_t n1 = (size_t)256 * EH1 * EWo1, n2 = (size_t)256 * EH2 * EWo2, n3 = (size_t)256 * EH3 * EWo3;
   float *feat, *x1, *x2, *x2b, *x3, *x3b, *perm, *flat, *ds, *xb = nullptr;
   feat = dalloc(hfeat.size(), "feat"); cudaMemcpy(feat, &hfeat[0], hfeat.size() * 4, cudaMemcpyHostToDevice);
-  x1 = dalloc_w(n1, "x1"); x2 = dalloc_w(n2, "x2"); x2b = dalloc(n2, "x2b");
-  x3 = dalloc(n3, "x3"); x3b = dalloc(n3, "x3b"); perm = dalloc(n2, "perm");
-  flat = dalloc((size_t)Tt * 4096, "flat"); ds = dalloc((size_t)Tt * EHID, "ds");
+  // LFM_ENC_ALIAS (default 1; 0 = one buffer each, the control arm). x1 (256 x 64 x Wo1 floats:
+  // 344 MB for a 60 s clip) is read only by conv_mid. Everything the downsampler writes after
+  // that -- perm, x2b, x3, x3b, flat, together 11/16 of x1 -- is placed inside x1's memory once
+  // conv_mid has run, instead of in five more buffers (237 MB at 60 s). Same kernels, same
+  // arguments apart from the addresses; the region is refilled (zero, or NaN under
+  // LFM_ENC_POISON) at that point, which is the fill dalloc gave those buffers. The mode is
+  // fixed per process, so the pool's slot sequence is the same every pass.
+  static const int alias_env = getenv("LFM_ENC_ALIAS") ? atoi(getenv("LFM_ENC_ALIAS")) : 1;
+  const size_t nflat = (size_t)Tt * 4096;
+  const size_t alias_n = 2 * n2 + 2 * n3 + nflat;
+  const bool alias = alias_env && alias_n <= n1;
+  x1 = dalloc_w(n1, "x1"); x2 = dalloc_w(n2, "x2");
+  if (alias) {
+    perm = x1; x2b = perm + n2; x3 = x2b + n2; x3b = x3 + n3; flat = x3b + n3;
+  } else {
+    x2b = dalloc(n2, "x2b");
+    x3 = dalloc(n3, "x3"); x3b = dalloc(n3, "x3b"); perm = dalloc(n2, "perm");
+    flat = dalloc(nflat, "flat");
+  }
+  ds = dalloc((size_t)Tt * EHID, "ds");
   if (g_ench2) {                                   // the biggest GEMM input in bf16
     size_t xbn = (size_t)EH2 * EWo2 * 256;
     xbn = std::max(xbn, (size_t)EH3 * EWo3 * 256); xbn = std::max(xbn, (size_t)Tt * 4096);
@@ -1880,6 +1900,8 @@ int main(int argc, char** argv) {
   // 2) conv_mid (depthwise)
   conv3x3(x1, w_mid->df, b_mid->df, x2, 256, EH1, EWo1, EH2, EWo2, 0, 0);
   chk("conv_mid");
+  // x1 is dead from here: hand its memory to perm / x2b / x3 / x3b / flat (see LFM_ENC_ALIAS).
+  if (alias && cudaMemset(x1, g_poison > 0 ? 0xff : 0, alias_n * 4)) { printf("alias fill failed\n"); pass_fail(); }
   // 3) lin_mid as a GEMM over P2 = EH2*EWo2 positions, then silu
   { const int P2 = EH2 * EWo2;
     if (g_enctr) transpose(x2, perm, 256, P2);

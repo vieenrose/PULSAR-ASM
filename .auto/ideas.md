@@ -2568,3 +2568,19 @@ algorithm (fp16 accumulation), both of which change the goldens.
   Gate with the 60 s clip FIRST then 4 short clips: 5/5 identical cold vs resident, post-turn
   MemAvailable low 1078 MB (was ~350; sampled after turns, not inside the 60 s turn). Resident
   60 s turn in that order: 71.6 s vs cold 64.8 s. 9 s harness turns stay under the cap: 0.5086.
+- [LFM3/Nano S2T] Encoder downsampler buffers aliased into x1 (2026-11-12, run #276, keep).
+  LFM_ENC_MEM=1 (new) lists a 60 s pass: x1 343.9 MB, x2 / x2b / perm 86.0 each, x3 / x3b / flat
+  21.5 each, all 17 layers + projector ~100 MB; pool 772 MB. x1 is read only by conv_mid, so
+  perm, x2b, x3, x3b, flat (11/16 of x1) now live inside it (LFM_ENC_ALIAS, default 1), refilled
+  with zero / NaN-poison once conv_mid has run: pool 536 MB. proj_out byte-identical alias 0 / 1 /
+  1+POISON on clip_zh, clip_en, cv_en5 and the 60 s clip. Served 60 s encoder reply beside the
+  resident backbone, order 0/1/1/0: 20.4 / 5.6 / 5.5 / 31.8 s (encoder alone: 5.9 s) -- the pass
+  no longer runs under reclaim. Resident 60 s turn 62.9-63.6 s (4 runs) vs cold 64.5-64.9;
+  in-turn MemAvailable low 545 MB. 9 s harness turns: asr_wall 5.877 s, unchanged.
+  OPEN, NOT EXPLAINED: one run of the 7-clip gate stalled on the 60 s clip in the backbone
+  (CLIP START + AUDIO-EMB armed, then no output for 900 s; encoder had replied in 8.8 s). That
+  run overlapped a harness run I started in the same tool call, so it is contaminated; 3 lean
+  repros (stall.sh, captures process state at 150 s) and a clean full gate all passed. The
+  pre-#274 "nothing for 900 s" had the same signature, so treat an intermittent backbone stall
+  on long clips as possible until stall.sh has caught one. Also: tts_wall is bimodal across
+  harness runs (0.54 / 0.65 s; #273 0.547, #274 0.649, #275 0.541, #276 0.648), untouched code.
