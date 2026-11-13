@@ -751,6 +751,12 @@ int main(int argc, char **argv) {
   size_t dcap = (size_t)ngen * 16 + 64;
   uint8_t *txt = xmalloc(dcap);
   if (!tok_joined) { pthread_join(tok_th, NULL); tok_joined = 1; }
+  /* Stage probes on the post-backbone tail: the harness's asr_wall is the client's process time,
+     and the backbone wait ends ~0.57 s before the exit, so something here costs 10% of a turn.
+     Splitting it (join / decode / write / exit) is what decides where to fix it. The join is the
+     suspect because the vocabulary load was moved to a thread to keep it off the critical path --
+     a thread that never finishes before the GPU does has only moved the wait, not removed it. */
+  stage("tokenizer thread joined");
   if (tj.rc == 1) die("cannot load tokenizer blob %s", TOKB);
   if (id_cached && (tj.rc != 0 || tj.npre != npre || tj.npost != npost ||
                     memcmp(tj.pre, pre_ids, (size_t)npre * 4) || memcmp(tj.post, post_ids, (size_t)npost * 4))) {
@@ -759,6 +765,7 @@ int main(int argc, char **argv) {
         "is printed from ids the tokenizer did not produce", IDC);
   }
   LTok tok = tj.tok;
+  stage("vocabulary in hand");
   int dn = ltok_decode(&tok, gen, (size_t)ngen, txt, dcap);
   if (dn < 0) die("detokenizer failed on %d ids", ngen);
   txt[dn] = 0;
@@ -767,6 +774,7 @@ int main(int argc, char **argv) {
     if (!f) die("cannot write %s", out_ids);
     if (fwrite(gen, 4, (size_t)ngen, f) != (size_t)ngen) die("short write to %s", out_ids);
     fclose(f);
+    stage("ids decoded + written");
     printf("IDS -> %s (%d ids, %ld bytes)\n", out_ids, ngen, (long)ngen * 4);
   }
   if (tokens_only) {
@@ -777,7 +785,15 @@ int main(int argc, char **argv) {
     printf("TRANSCRIPT (%d tokens, %.1f chars/KB): %s\n", ngen, (double)dn, txt);
   }
   free(eb); free(txt); free(gen); free(ids); free(pre_ids); free(post_ids);
-  free(prompt); free(manb); ltok_free(&tok);
+  free(prompt); free(manb);
+  /* ltok_free(&tok) is deliberately NOT called: freeing the vocabulary's ~128k per-entry
+     allocations on a process that is about to exit costs ~0.07 s of a ~5.4 s turn, and the kernel
+     reclaims the address space anyway. Everything above has already run and been written (id file
+     fclose'd, transcript printed, idcache published by rename), so this is exact by construction.
+     Measured (.auto/combined/ab_free.sh, one service session, order reversed each round, ids md5
+     identical in all 12 turns): free 5.408/5.423/5.404 zh, 6.330/6.336/6.316 en vs no free
+     5.355/5.331/5.330 zh, 6.258/6.244/6.247 en. Skipping the remaining small frees too adds only
+     ~0.02 s more, so they stay. Call ltok_free under a leak checker. */
   printf("TIME client total %.3f s (process start to exit)\n", now_s() - t_main0);
   return 0;
 }
