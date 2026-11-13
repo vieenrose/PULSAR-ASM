@@ -32,9 +32,13 @@ for t in $(seq 1 $T); do
   pids=""
   for k in $(seq 0 $((C-1))); do
     rm -f /tmp/cc.$t.$k.i32
-    ( timeout 400 ./lfm3_asr . "${CLIPV[$k]}" 96 --out-ids /tmp/cc.$t.$k.i32 \
+    # wall = the client's whole process time: a wall of ~2x a solo turn means this client queued
+    # behind another (the flock serialises resident turns, the right model on one SM). That is the
+    # multi-user latency number for the feature this tool gates.
+    ( S=$(date +%s.%N); timeout 400 ./lfm3_asr . "${CLIPV[$k]}" 96 --out-ids /tmp/cc.$t.$k.i32 \
         --serve-in $SRV_IN --serve-log $SRV_LOG --enc-in $ENC_IN --enc-log $ENC_LOG \
-        > /tmp/cc.$t.$k.log 2>&1; echo $? > /tmp/cc.$t.$k.rc ) &
+        > /tmp/cc.$t.$k.log 2>&1; echo $? > /tmp/cc.$t.$k.rc; \
+        date +%s.%N | awk -v s="$S" '{printf "%.2f\n", $1-s}' > /tmp/cc.$t.$k.t ) &
     pids="$pids $!"
   done
   # wait ONLY the clients: a bare `wait` also waits for the two long-lived services started at the
@@ -49,7 +53,8 @@ for t in $(seq 1 $T); do
       if [ -n "${GOV[$k]}" ]; then cmp -s /tmp/cc.$t.$k.i32 "${GOV[$k]}" && st=GOLDEN || st=MISMATCH
       else st=IDS_$(wc -c < /tmp/cc.$t.$k.i32); fi
     fi
-    line="$line c$k:rc=$rc,$st"
+    w=$(cat /tmp/cc.$t.$k.t 2>/dev/null)
+    line="$line c$k:rc=$rc,$st${w:+,wall=${w}s}"
     { [ "$rc" != 0 ] || [ "$st" = MISMATCH ] || [ "$st" = NOFILE ]; } && fails=$((fails+1))
   done
   echo "$line"

@@ -2800,3 +2800,14 @@ algorithm (fp16 accumulation), both of which change the goldens.
   Harness 0.5060 all gates green; generalize.sh 7/7 identical + 7/7 TTS bytes + 0 guard trips.
   Harness trap while measuring: concasr.sh's bare `wait` also waited for the two long-lived
   services, so the first version looked like a 25-minute hang after the clients had exited.
+- [LFM3/Nano S2T] Multi-user latency with the resident services, measured (2026-11-13, run #289,
+  tool .auto/combined/concasr.sh wall column). Two clients launched together, 3 trials, ids ==
+  frozen golden for both every time: walls 5.46 + 11.68 s, 6.38 + 11.73 s, 5.45 + 11.68 s against
+  solo turns of 5.42 (zh) / 6.34 (en) s. So the second user waits exactly one full turn: aggregate
+  throughput is the single-stream rate split between users, and per-user latency is additive. That
+  matches the batched-decode finding (row 56: N>1 aggregate == N=1) and is now measured for the
+  session/queue path as well, with the correctness gate from #288. Consequence for a deployment:
+  capacity planning is N_users x turn_time <= 1 s of audio budget, and no further concurrency work
+  helps throughput on this board (one SM); the only lever that could is the lossy one.
+  Also checked: the encoder service's request reader needs no equivalent of #288's fifo fix -- it
+  opens O_RDONLY|O_NONBLOCK and never blocks in open(), which is what the backbone's freopen() did.
