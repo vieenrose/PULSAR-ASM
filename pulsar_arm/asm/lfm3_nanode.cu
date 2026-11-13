@@ -4601,7 +4601,8 @@ static inline float cpu_bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float
 // LFM_CPUCHK_NEON=TH: the same check, computed by the NEON kernel the split would run (positions as
 // lanes, 4 per float32x4, x transposed to [k][t]; vfmaq_f32 is a fused IEEE fma and vaddq_f32 a
 // lane-wise IEEE add, so each lane is exactly the scalar chain above), on TH std::threads, timed.
-extern "C" void lfm3_neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out);
+// weak: lfm3_enc_gpu.cu includes this file and does not link lfm3_cpurows.o (null there)
+extern "C" __attribute__((weak)) void lfm3_neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out);
 static void neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out) { lfm3_neon_rows(hq, hs, xT, nb, G, r_lo, r_hi, out); }
 static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf16* y, int N, int K, int nb, int Tn) {
   if (!g_cpuchk || !e->tiled) return;
@@ -4619,6 +4620,7 @@ static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf1
   std::vector<float> xf((size_t)Tn * K);
   for (size_t i = 0; i < xf.size(); i++) xf[i] = cpu_bf2f(hx[i]);
   CpuChk& c = g_cpuchk_tab[name]; c.N = N; c.K = K; c.calls++;
+  if (g_cpuchk_neon && !lfm3_neon_rows) { printf("CPUCHK NEON unavailable (lfm3_cpurows.o not linked)\n"); exit(2); }
   if (g_cpuchk_neon && Tn <= 32) {
     const int G = (Tn + 3) / 4, TH = g_cpuchk_neon;
     std::vector<float> xT((size_t)K * G * 4, 0.f), out((size_t)R * G * 4);
