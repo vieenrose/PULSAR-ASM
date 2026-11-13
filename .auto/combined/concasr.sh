@@ -14,6 +14,9 @@
 cd /home/picard/lfm3 || exit 1
 T=${1:-8}; C=${2:-2}
 CLIPV=(/tmp/clip_zh.wav /tmp/clip_en.wav /home/picard/lfm3/cv_zh9.wav /home/picard/lfm3/cv_en9.wav)
+# CLIPS="a.wav b.wav ..." overrides the list (keep zh, en first: indices 0/1 carry the frozen goldens).
+# Used with the 110 s clip to put a long turn -- and its CPUROWS DROP line -- among concurrent clients.
+[ -n "$CLIPS" ] && read -r -a CLIPV <<< "$CLIPS"
 GOV=(/tmp/gen_golden_zh.i32 /tmp/gen_golden_en.i32 "" "")
 SRV_IN=/tmp/cc.srv.in; SRV_LOG=/tmp/cc.srv.log; ENC_IN=/tmp/cc.enc.in; ENC_LOG=/tmp/cc.enc.log
 pkill -f "lfm3_nanode .*--clip-fifo" 2>/dev/null; pkill -f "lfm3_enc_gpu .*--serve-fifo" 2>/dev/null

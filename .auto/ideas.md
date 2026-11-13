@@ -2974,3 +2974,10 @@ algorithm (fp16 accumulation), both of which change the goldens.
   101-102 MB flat, 6034 splits. No leak or drift from the split. NOT exercised: a long (>30 s)
   turn among concurrent clients, i.e. the CPUROWS DROP line under concurrency (it is sent inside
   the turn lock, so it should serialise, but that is by construction, not measured).
+- [LFM3/Nano S2T] CPUROWS DROP under concurrency (2026-11-13, run #306, tool change only:
+  concasr.sh CLIPS= override). 3 trials x 4 clients launched together (zh, en, the 110 s clip,
+  cv_zh9), backbone + encoder services (no TTS service in this tool): every client rc=0, zh/en
+  GOLDEN, the long clip's ids md5 eca77bbe (= cold) in 3/3, drop acked 3/3, CLIPS_DONE=13
+  ENC_DONE=13. The long turn landed 4th, 2nd and 4th in the queue (walls 78.0 / 68.0 / 78.1 s), so
+  the drop was sent both behind and ahead of short turns; short turns queued behind it waited the
+  full ~62 s (per-user latency is additive, #289).
