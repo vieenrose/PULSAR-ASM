@@ -2811,3 +2811,27 @@ algorithm (fp16 accumulation), both of which change the goldens.
   helps throughput on this board (one SM); the only lever that could is the lossy one.
   Also checked: the encoder service's request reader needs no equivalent of #288's fifo fix -- it
   opens O_RDONLY|O_NONBLOCK and never blocks in open(), which is what the backbone's freopen() did.
+- [LFM3/Nano S2T] CPU share of the batched ASR prefill: the CPU half is priced, the hand-off is the
+  open question (2026-11-13, run #293, diagnostic; .auto/combined/cpu_leaf_bench.c). Context: after
+  #290-#292 every other block of the turn is at a measured floor -- the decode lm_head streams its
+  ~295 MB at ~20 GB/s (14.7 ms/step by the prompt-vs-generated step difference, 85.8 vs 100.5 ms;
+  the old "14 GB/s" note is stale), layers at ~19 GB/s, encoder GEMMs 36-47 GMAC/s (~35% of the 118
+  GMAC/s fp32 peak, family swept in #267), client fully accounted (stage sum == process total within
+  1 ms). The 3.89 s prefill runs ~195 GMAC at ~50 GMAC/s while all four A57s are idle.
+  Bench: the GPU leaf's per-output chain (per 32-code block: dot = sequential fma over the codes from
+  0, then acc = fma(scale, dot, acc)) on NEON with positions as lanes (vfmaq_f32 is a fused IEEE fma),
+  8 positions per code broadcast, x staged transposed. BITWISE equal to a scalar fmaf chain on every
+  output (57344 checked). 1 row/pass: 1.68 GMAC/s on 1 thread, 4.4 on 4 (x re-streamed from L2:
+  64 KB per row at K=2048). 2 rows/pass sharing each x load: 2.06-2.24 on 1 thread, 7.2-7.8 on 4.
+  Bound: (50 + 7.5) / 50 -> prefill -13% (~0.5 s/turn) with zero hand-off cost and no contention;
+  ~-10% with 3 workers (one core left for the launch thread). Not reproduced in the bench: the GPU's
+  pairwise st[] tree across leaves (O(K/32) adds per output, negligible cost, must be matched exactly).
+  Why Bonsai's two attempts do not settle it: #75 was decode (bus-bound; here the CPU share reuses its
+  rows across a 32-position chunk, ~0.3 GB/s of weight reads); #96 was 8-token chunks with ~0.4 ms
+  fixed cost per split vs 2.6 ms GEMVs (here 32 positions, ~4x longer GEMVs). The open cost: ~576
+  split points per turn (24 layers x ~6 GEMVs x 4 chunks; fewer if the q/k/v and w1/w3 groups that
+  share an input split once). At 0.4 ms each that is ~0.23 s, half the prize. NEXT: a CUDA probe of
+  the per-split hand-off on this board (D2H of the chunk's x, CPU rows on 3 workers concurrently with
+  the GPU's rows, H2D of the CPU's y, join) inside the real prefill chunk; build only if it is
+  <~0.15 ms per split. Mapped memory is CPU-uncached on Tegra (Bonsai #53) and managed memory blocks
+  concurrent access, so the hand-off has to be real copies.
