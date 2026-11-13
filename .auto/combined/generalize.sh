@@ -68,7 +68,7 @@ tts_turn() {   # $1 = label; request goes out with no gap after the ASR turn, bl
 # now the resident services
 LFM_ENC_TIME=0 ./lfm3_enc_gpu lfm3-audio-2b-enc.lfm3q8 - auto - --serve-fifo $E --only proj_out > $EL 2>&1 &
 EP=$!
-LFM_CPUSPLIT=${WARM_SPLIT:-0} ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $S --prefill-run $PFRUN > $SL 2>&1 &
+LFM_CPUSPLIT=${WARM_SPLIT:-1} ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $S --prefill-run $PFRUN > $SL 2>&1 &
 SP=$!
 i=0; while [ $i -lt 240 ]; do grep -q "CLIP_AWAIT 0" $SL && grep -q "ENC_AWAIT 0" $EL && break; sleep 0.5; i=$((i+1)); done
 grep -q "CLIP_AWAIT 0" $SL || { echo BOOT_FAIL; tail -3 $SL; kill $SP $EP 2>/dev/null; exit 1; }

@@ -517,6 +517,25 @@ int main(int argc, char **argv) {
         }
         close(rf);
       } }
+    /* #301: a long turn first asks the resident backbone to drop its CPU prefill rows (~70 MB
+       anonymous), so the encoder's long pass is not pushed into reclaim. Waits for the ack (bounded);
+       short turns never send it. */
+    { const double long_s = getenv("LFM_SPLIT_LONG_S") ? atof(getenv("LFM_SPLIT_LONG_S")) : 30.0;
+      const double aud = (double)(mel_bytes / (128 * 4)) / 100.0;
+      if (srv_in && srv_log && long_s > 0 && aud > long_s) {
+        long s0 = file_size(srv_log);
+        int df = fifo_open_w(srv_in);
+        if (df >= 0) {
+          (void)!write(df, "CPUROWS DROP\n", 13); close(df);
+          double t0 = now_s(); int ok = 0;
+          while (!ok && now_s() - t0 < 5.0) {
+            int rf = open(srv_log, O_RDONLY); char b[4096]; ssize_t g;
+            if (rf >= 0) { g = pread(rf, b, sizeof b - 1, s0); close(rf);
+              if (g > 0) { b[g] = 0; ok = strstr(b, "CPUROWS DROPPED") != NULL; } }
+            if (!ok) usleep(2000);
+          }
+          printf("cpu rows drop for a %.1f s turn: %s\n", aud, ok ? "acked" : "NO ACK (continuing)");
+        } } }
     g_enc_off = file_size(enc_log);
     int wf = fifo_open_w(enc_in);
     if (wf < 0) die("--enc-in %s: cannot open for writing (%s) -- is the resident encoder running?", enc_in, strerror(errno));

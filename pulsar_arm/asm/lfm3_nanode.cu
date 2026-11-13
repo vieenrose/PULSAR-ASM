@@ -4692,11 +4692,11 @@ static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf1
 // for an event recorded before the GPU launch (x is ready), copies x to the host, the CPU computes,
 // f2bf, and a 2-D H2D writes the 512 columns into y; g_launch waits for that copy. Exact: every
 // output is either the GPU's or the transcription's, which match bit for bit.
-static int g_cpusplit = getenv("LFM_CPUSPLIT") ? atoi(getenv("LFM_CPUSPLIT")) : 0;   // default OFF since #300 (see ideas.md)
+static int g_cpusplit = getenv("LFM_CPUSPLIT") ? atoi(getenv("LFM_CPUSPLIT")) : 1;   // on again in #301 (long-turn drop)
 struct CpuRows { std::vector<int8_t> q; std::vector<float> s; int R = 0;
   const int8_t* mq = nullptr; const float* ms = nullptr; };   // mq/ms: row-major tail rows mapped from the blob
 static std::string g_cpus_blob; static size_t g_cpus_base = 0;
-static int g_cpus_mmap = getenv("LFM_CPUSPLIT_MMAP") ? atoi(getenv("LFM_CPUSPLIT_MMAP")) : 1;
+static int g_cpus_mmap = getenv("LFM_CPUSPLIT_MMAP") ? atoi(getenv("LFM_CPUSPLIT_MMAP")) : 0;
 static std::map<const Ent*, CpuRows> g_cpurows;
 static cudaStream_t g_cpus = nullptr; static cudaEvent_t g_cpue0 = nullptr, g_cpue1 = nullptr;
 // Mapped CPU-row ranges (page-aligned), re-advised WILLNEED at every clip start (#300): when memory
@@ -4714,6 +4714,18 @@ static void cpusplit_pre() {   // before the GPU launch: x is ready once this ev
   if (!g_cpus) { cudaStreamCreateWithFlags(&g_cpus, cudaStreamNonBlocking); cudaEventCreateWithFlags(&g_cpue0, cudaEventDisableTiming);
     cudaEventCreateWithFlags(&g_cpue1, cudaEventDisableTiming); atexit(cpusplit_dump); }
   cudaEventRecord(g_cpue0, g_launch);
+}
+// "CPUROWS DROP" on the clip fifo (#301): lfm3_asr sends it before the encoder request of a LONG
+// turn (> LFM_SPLIT_LONG_S of audio), so the ~70 MB of anonymous CPU rows are returned to the system
+// while the encoder's long pass runs (with them, the 110 s held-out clip tripped the encoder's memory
+// guard, #300). The rows are rebuilt from the device copy by the next split call.
+#include <malloc.h>
+static void cpusplit_drop() {
+  size_t b = 0;
+  for (auto& kv : g_cpurows) { CpuRows& c = kv.second; b += c.q.capacity() + c.s.capacity() * 4;
+    std::vector<int8_t>().swap(c.q); std::vector<float>().swap(c.s); if (!c.mq) c.R = 0; }
+  malloc_trim(0);
+  printf("CPUROWS DROPPED %.1f MB\n", b / 1048576.0); fflush(stdout);
 }
 static double cpus_now() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
 static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, int Tn, int R) {
@@ -5627,6 +5639,7 @@ int main(int argc, char** argv) {
     }
     char* nl = strchr(ln, '\n'); if (nl) *nl = 0;
     if (!ln[0] || !strcmp(ln, "Q")) break;
+    if (!strcmp(ln, "CPUROWS DROP")) { cpusplit_drop(); continue; }
     spec = ln;
   } else if (cl < nclip) spec = clip_files[cl];
   else if (cl == 0 && nclip == 0) spec = "";    // the single shipped pass
