@@ -3011,3 +3011,15 @@ algorithm (fp16 accumulation), both of which change the goldens.
   with the clip the way the prefill does. English is ~0.1 worse than Chinese at equal length
   (more ids per second of speech). The harness's s2t_rtf 0.63 is therefore a fair figure for ~9 s
   utterances and optimistic by ~5-30% for 5 s ones; quote it with the clip length.
+- [LFM3/Nano S2T] Long-turn drop threshold 30 s -> 75 s (2026-11-13, run #310, LFM_SPLIT_LONG_S).
+  30 s was a guess. Measured with 45 s and 75 s cuts of the 110 s clip, three services, soak.sh
+  (zh, 45, zh, 75, zh), order drop/no/no/drop: 45 s turn 31.25 / 30.39 / 30.50 / 31.07 s, 75 s turn
+  45.36 / 44.94 / 45.10 / 45.96 s -> keeping the rows is 0.6-0.7 s faster (prefill 18.0 vs 18.7 s,
+  30.2 vs 30.9 s: the drop's rebuild from the device copy costs ~0.7 s, more than the split saves
+  on that turn). Whole-session MemAvailable low 322-331 MB without the drop vs 346-377 MB with it,
+  0 guard trips in every arm; ids of both cuts == the cold unsplit one-shot (5fe1c0a9 / 1389fad3).
+  New default 75 s: turns up to 75 s keep the rows (measured), longer ones drop (110 s measured:
+  generalize.sh 7/7, drop acked, 62.58 s resident vs 64.32 cold, 0 trips). 75-110 s without the
+  drop is untested apart from #299's memguard trip at 110 s, so the threshold is not pushed higher.
+  Note the ~0.7 s rebuild: for >75 s turns the drop still costs more time than the split returns;
+  it is there for memory, not speed.

@@ -520,7 +520,7 @@ int main(int argc, char **argv) {
     /* #301: a long turn first asks the resident backbone to drop its CPU prefill rows (~70 MB
        anonymous), so the encoder's long pass is not pushed into reclaim. Waits for the ack (bounded);
        short turns never send it. */
-    { const double long_s = getenv("LFM_SPLIT_LONG_S") ? atof(getenv("LFM_SPLIT_LONG_S")) : 30.0;
+    { const double long_s = getenv("LFM_SPLIT_LONG_S") ? atof(getenv("LFM_SPLIT_LONG_S")) : 75.0;   /* 30 until #310: no drop is faster and fits up to 75 s */
       const double aud = (double)(mel_bytes / (128 * 4)) / 100.0;
       if (srv_in && srv_log && long_s > 0 && aud > long_s) {
         long s0 = file_size(srv_log);
