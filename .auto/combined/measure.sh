@@ -49,7 +49,7 @@ fail() { echo "measure: $1" >&2; exit 2; }
 if [ "${LFM_SKIP_BUILD:-0}" != 1 ]; then
   SRC="$REPO/pulsar_arm/asm"
   scp -q "$SRC"/lfm3_asr.c "$SRC"/lfm3_tok.c "$SRC"/lfm3_tok.h "$SRC"/lfm3_mel.c "$SRC"/lfm3_mel.S \
-       "$SRC"/lfm3_wav.c "$SRC"/lfm3_nanode.cu "$SRC"/lfm3_qlow.cuh "$SRC"/lfm3_enc_gpu.cu \
+       "$SRC"/lfm3_wav.c "$SRC"/lfm3_nanode.cu "$SRC"/lfm3_qlow.cuh "$SRC"/lfm3_enc_gpu.cu "$SRC"/lfm3_cpurows.cpp \
        "$NANO:$LFM_DIR/" \
        || fail "cannot sync sources to $NANO"
   BUILD=$(ssh "$NANO" "LFM_DIR='$LFM_DIR' bash -s" <<'BUILDEOF' 2>&1 | grep -v setlocale
@@ -69,7 +69,9 @@ build_cu() { rm -f "$1.new"; nvcc $3 -gencode arch=compute_53,code=sm_53 -O3 -fm
 build_cc lfm3_asr "lfm3_asr.c lfm3_tok.c"
 build_cc lfm3_mel "lfm3_mel.c lfm3_mel.S"   # the mel primitives are AArch64 asm
 build_cc lfm3_wav lfm3_wav.c
-build_cu lfm3_nanode lfm3_nanode.cu ""
+# lfm3_cpurows.cpp: the NEON prefill rows (nvcc cannot parse arm_neon.h, so its own g++ TU)
+g++ -O3 -mcpu=cortex-a57 -ffp-contract=off -c lfm3_cpurows.cpp -o lfm3_cpurows.o >/tmp/bf_cpurows.log 2>&1 || { echo "BUILD_FAIL cpurows"; ok=0; }
+build_cu lfm3_nanode "lfm3_nanode.cu lfm3_cpurows.o -lpthread" ""
 build_cu lfm3_enc_gpu lfm3_enc_gpu.cu "-std=c++11"
 [ "$ok" = 1 ] && echo BUILD_ALL_OK
 BUILDEOF

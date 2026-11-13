@@ -64,6 +64,7 @@
 #include <vector>
 #include <algorithm>
 #include <map>
+#include <thread>
 #include <time.h>
 #include <zlib.h>
 #include <pthread.h>
@@ -4578,6 +4579,8 @@ static bool pf_tile(Ent* e, int N, int K) {
 static int g_cpuchk = getenv("LFM_CPUCHK") ? atoi(getenv("LFM_CPUCHK")) : 0;
 struct CpuChk { long calls = 0, outs = 0, bad = 0; int N = 0, K = 0; };
 static std::map<std::string, CpuChk> g_cpuchk_tab;
+static int g_cpuchk_neon = getenv("LFM_CPUCHK_NEON") ? atoi(getenv("LFM_CPUCHK_NEON")) : 0;
+static double g_neon_s = 0; static long g_neon_mac = 0;
 static void cpuchk_dump() {
   long tb = 0, to = 0;
   for (auto& kv : g_cpuchk_tab) {
@@ -4586,6 +4589,7 @@ static void cpuchk_dump() {
     tb += kv.second.bad; to += kv.second.outs;
   }
   printf("CPUCHK TOTAL outputs=%ld bitwise_differ=%ld %s\n", to, tb, tb ? "FAIL" : "EXACT");
+  if (g_neon_mac) printf("CPUCHK NEON threads=%d %.3f s %.2f GMAC/s\n", g_cpuchk_neon, g_neon_s, g_neon_mac / g_neon_s * 1e-9);
   fflush(stdout);
 }
 static inline uint16_t cpu_f2bf(float v) {   // the device f2bf, bit for bit
@@ -4594,6 +4598,11 @@ static inline uint16_t cpu_f2bf(float v) {   // the device f2bf, bit for bit
   return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 static inline float cpu_bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
+// LFM_CPUCHK_NEON=TH: the same check, computed by the NEON kernel the split would run (positions as
+// lanes, 4 per float32x4, x transposed to [k][t]; vfmaq_f32 is a fused IEEE fma and vaddq_f32 a
+// lane-wise IEEE add, so each lane is exactly the scalar chain above), on TH std::threads, timed.
+extern "C" void lfm3_neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out);
+static void neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out) { lfm3_neon_rows(hq, hs, xT, nb, G, r_lo, r_hi, out); }
 static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf16* y, int N, int K, int nb, int Tn) {
   if (!g_cpuchk || !e->tiled) return;
   static bool reg = false; if (!reg) { atexit(cpuchk_dump); reg = true; }
@@ -4610,6 +4619,21 @@ static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf1
   std::vector<float> xf((size_t)Tn * K);
   for (size_t i = 0; i < xf.size(); i++) xf[i] = cpu_bf2f(hx[i]);
   CpuChk& c = g_cpuchk_tab[name]; c.N = N; c.K = K; c.calls++;
+  if (g_cpuchk_neon && Tn <= 32) {
+    const int G = (Tn + 3) / 4, TH = g_cpuchk_neon;
+    std::vector<float> xT((size_t)K * G * 4, 0.f), out((size_t)R * G * 4);
+    for (int t = 0; t < Tn; t++) for (int kk = 0; kk < K; kk++) xT[(size_t)kk * G * 4 + t] = xf[(size_t)t * K + kk];
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    std::vector<std::thread> th; const int per = (R / TH + 31) & ~31;   // whole tiles per thread
+    for (int w = 0; w < TH; w++) { const int lo = std::min(R, w * per), hi = std::min(R, lo + per);
+      if (lo < hi) th.emplace_back(neon_rows, hq.data(), hs.data(), xT.data(), nb, G, lo, hi, out.data() + (size_t)lo * G * 4); }
+    for (auto& t : th) t.join();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_neon_s += (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec); g_neon_mac += (long)R * K * Tn;
+    for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) {
+      c.outs++; if (hy[(size_t)t * N + r0 + rr] != cpu_f2bf(0.f + out[(size_t)rr * G * 4 + t])) c.bad++; }
+    return;
+  }
   for (int rr = 0; rr < R; rr++) {
     const int8_t* tq8 = hq.data() + (size_t)(rr >> 5) * tq;          // this row's tile
     const float* tsc = hs.data() + (size_t)(rr >> 5) * nb * 32;

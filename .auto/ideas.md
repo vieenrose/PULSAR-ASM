@@ -2871,3 +2871,17 @@ algorithm (fp16 accumulation), both of which change the goldens.
   the tail rows at load (row-major int8 + scales), NEON kernel in this exact order (2 rows/pass from
   #293, plus the leaf permutation and tree -- the tree is per (row, position) scalar adds, cheap),
   checked against this same CPUCHK reference; (c) wire the split.
+- [LFM3/Nano S2T] CPU prefill share, step (b) first cut: NEON rows bit-exact, but 3.5x too slow
+  (2026-11-13, run #296; lfm3_cpurows.cpp, LFM_CPUCHK_NEON=TH). Positions as lanes (float32x4,
+  x transposed [k][t]), vfmaq_f32 + vaddq_f32 in the TLf/TLg order: one real zh turn, last 1024
+  rows of every tiled prefill GEMV, 15,665,152 outputs, 0 bitwise differences vs the GPU, ids golden,
+  at 3 and 4 threads. Rate on the real shapes: 2.02 GMAC/s (3 thr) / 2.35 (4 thr), vs 7.2-7.8 in
+  cpu_leaf_bench (#293). Differences from the bench: codes read from the 32-row TILED layout (two
+  16-byte pieces per row per block, 512 B apart), one row per pass (x re-streamed per row), a scalar
+  int8 -> float per code broadcast, thread spawn per call, runtime G loop. At 2.35 GMAC/s the share
+  is ~4.5% of the GPU's rate: minus hand-off, ~0.1 s/turn, not worth wiring. NEXT: row-major repack
+  of the CPU rows at load, 2 rows/pass sharing each x vector, codes widened 8 at a time (vmovl),
+  persistent spinning workers; target >= 5 GMAC/s before step (c).
+  BUILD NOTE: nvcc 10.2 cannot parse gcc-8's arm_neon.h (undefined __builtin_aarch64_* in the
+  host pass), so NEON code lives in its own g++ TU linked into lfm3_nanode (measure.sh and
+  measure_s2t.sh build it).
