@@ -2930,3 +2930,20 @@ algorithm (fp16 accumulation), both of which change the goldens.
   resident vs 64.4 s cold, GUARD_TRIPS 0, MEMLOW 800 MB, GENERALIZE OK.
   LESSON: a resident-service speedup that adds anonymous memory must be gated on the long clip with
   three services -- the harness's 9 s turns cannot see the encoder's memory edge.
+- [LFM3/Nano S2T] CPU prefill split: DEFAULT OFF again (2026-11-13, run #300). Three configurations,
+  all bit-exact, none acceptable as a default:
+  (1) anonymous rows (#299): harness asr 5.683 s (best), but generalize.sh FAILS the 110 s clip with
+      three services (encoder MEMGUARD trip; stall.sh turns 72-98 s vs 65-69 s): +70 MB anonymous
+      tips the encoder's long pass into reclaim. Shipping it would buy the 9 s benchmark with a real
+      long-audio regression.
+  (2) rows mmap'd from the blob (clean, reclaimable): generalize.sh OK 7/7 (110 s 66.1 s, 0 trips,
+      MEMLOW 800 MB), equal speed in the 2-service ab_split.sh, but the harness's three-service
+      configuration reclaims the pages between turns: asr 6.633 / 6.572 s (first timed turn prefill
+      5440 vs 3785 ms, 4 KB refaults from eMMC).
+  (3) (2) + madvise(WILLNEED) at clip start: asr 5.950 s, still worse than no split (~5.77): the
+      ~50 MB re-read at ~90 MB/s is ~0.55 s against a ~0.11 s saving.
+  Root constraint: on this 4 GB board with three resident services, the CPU share needs ~50-70 MB
+  that is either unreclaimable (costs long-clip capacity) or reclaimable (re-read per turn). Revisit
+  only if memory frees up (e.g. encoder activation cut for long clips, or two services instead of
+  three) -- then (1) is a measured -2.9% prefill. Code kept behind LFM_CPUSPLIT=1
+  (LFM_CPUSPLIT_MMAP=0|1).

@@ -4692,7 +4692,7 @@ static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf1
 // for an event recorded before the GPU launch (x is ready), copies x to the host, the CPU computes,
 // f2bf, and a 2-D H2D writes the 512 columns into y; g_launch waits for that copy. Exact: every
 // output is either the GPU's or the transcription's, which match bit for bit.
-static int g_cpusplit = getenv("LFM_CPUSPLIT") ? atoi(getenv("LFM_CPUSPLIT")) : 1;   // default on (#299)
+static int g_cpusplit = getenv("LFM_CPUSPLIT") ? atoi(getenv("LFM_CPUSPLIT")) : 0;   // default OFF since #300 (see ideas.md)
 struct CpuRows { std::vector<int8_t> q; std::vector<float> s; int R = 0;
   const int8_t* mq = nullptr; const float* ms = nullptr; };   // mq/ms: row-major tail rows mapped from the blob
 static std::string g_cpus_blob; static size_t g_cpus_base = 0;
