@@ -2857,3 +2857,17 @@ algorithm (fp16 accumulation), both of which change the goldens.
   tail rows, H2D into the same output buffer, the next kernel waits on that copy; share per shape
   from G and the measured rates; only GEMVs with G >> L; (d) gate: ids == goldens + LFM_DUMPX
   last-position residual md5 (70b78a7b zh / 9591fe6c en) + generalize.sh.
+- [LFM3/Nano S2T] CPU prefill share, step (a) DONE: the host transcription of the prefill GEMV is
+  bit-exact on real data (2026-11-13, run #295; lfm3_nanode LFM_CPUCHK=R, default 0). Order, as read
+  from q8_partial_TLf (tlf_leaf2b / tlf_leaf) and q8_partial_TLg (tlg_leaf): per (row, position),
+  leaves k = 0..31 with i = bit-reverse5(k); leaf i walks blocks b = i, i+32, ... < nb with
+  acc = fma(scale_b, dot_b, acc) from 0, dot_b = sequential fma over the block's 32 codes in byte
+  order from 0; leaves combine as a binary counter (bit l of k set: pv = st[l] + pv, else st[l] = pv
+  and stop); y = f2bf(0 + pv) with the device's RN-even. Weights read back from the tiled layout.
+  One real zh turn through the resident backbone (last 640 rows of EVERY tiled single-chunk prefill
+  GEMV, 24 layers, 5 chunks): 10,352,512 outputs, 0 bitwise differences, over w1/w3 (N 7680 K 2048),
+  w2 (N 2048 K 7680, TLg), conv.in_proj (6144), q/o (2048), k/v (512); ids == golden.
+  conv.out_proj is not on the tiled path (not checked, would stay unsplit). NEXT: (b) host repack of
+  the tail rows at load (row-major int8 + scales), NEON kernel in this exact order (2 rows/pass from
+  #293, plus the leaf permutation and tree -- the tree is per (row, position) scalar adds, cheap),
+  checked against this same CPUCHK reference; (c) wire the split.

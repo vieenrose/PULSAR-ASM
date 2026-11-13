@@ -4563,6 +4563,82 @@ static bool pf_tile(Ent* e, int N, int K) {
   return true;
 }
 
+// ---- LFM_CPUCHK=R: CPU transcription of the batched-prefill GEMV, checked bitwise (run #295)
+// Step (a) of the CPU row share (#293/#294): before any CPU rows feed the engine, prove that a host
+// transcription reproduces the GPU's prefill GEMV bit for bit on REAL activations and REAL weights.
+// For the last R rows of every tiled single-chunk prefill GEMV, after the GPU has written y:
+//   per (row, position): leaves k = 0..31 visited with i = bit-reverse5(k); leaf i walks blocks
+//   b = i, i + 32, ... < nb with acc = fma(scale_b, dot_b, acc) from 0, dot_b a sequential fma
+//   over the block's 32 codes in byte order from 0; leaves combine as a binary counter (bit l of k
+//   set: pv = st[l] + pv, else st[l] = pv and stop); y = f2bf(0 + pv) (RN-even).
+// This is q8_partial_TLf (tlf_leaf2b / tlf_leaf) and q8_partial_TLg (tlg_leaf) as read in the
+// source; the GPU's own output is the judge. Weights come back from the tiled device layout:
+// qt[(row>>5)*nb*64 + b*64 + (row&31)] and +32 (two int4 = 32 codes), scale
+// sts[(row>>5)*nb*32 + b*32 + (row&31)]. Diagnostic only: it syncs and copies every call.
+static int g_cpuchk = getenv("LFM_CPUCHK") ? atoi(getenv("LFM_CPUCHK")) : 0;
+struct CpuChk { long calls = 0, outs = 0, bad = 0; int N = 0, K = 0; };
+static std::map<std::string, CpuChk> g_cpuchk_tab;
+static void cpuchk_dump() {
+  long tb = 0, to = 0;
+  for (auto& kv : g_cpuchk_tab) {
+    printf("CPUCHK %-18s N=%-5d K=%-5d calls=%-4ld outputs=%-8ld bitwise_differ=%ld\n", kv.first.c_str(),
+           kv.second.N, kv.second.K, kv.second.calls, kv.second.outs, kv.second.bad);
+    tb += kv.second.bad; to += kv.second.outs;
+  }
+  printf("CPUCHK TOTAL outputs=%ld bitwise_differ=%ld %s\n", to, tb, tb ? "FAIL" : "EXACT");
+  fflush(stdout);
+}
+static inline uint16_t cpu_f2bf(float v) {   // the device f2bf, bit for bit
+  uint32_t u; memcpy(&u, &v, 4);
+  if (((u >> 23) & 0xffu) == 0xffu) return (uint16_t)(u >> 16);
+  return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+static inline float cpu_bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
+static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf16* y, int N, int K, int nb, int Tn) {
+  if (!g_cpuchk || !e->tiled) return;
+  static bool reg = false; if (!reg) { atexit(cpuchk_dump); reg = true; }
+  cudaDeviceSynchronize();
+  const int R = std::min(g_cpuchk, N) & ~31, r0 = N - R;    // whole 32-row tiles from the tail
+  if (R <= 0) return;
+  std::vector<uint16_t> hx((size_t)Tn * K), hy((size_t)Tn * N);
+  cudaMemcpy(hx.data(), x, hx.size() * 2, cudaMemcpyDeviceToHost);
+  cudaMemcpy(hy.data(), y, hy.size() * 2, cudaMemcpyDeviceToHost);
+  const size_t tq = (size_t)nb * 64 * 16, ts = (size_t)nb * 32 * 4;     // bytes per 32-row tile
+  std::vector<int8_t> hq((size_t)(R / 32) * tq); std::vector<float> hs((size_t)(R / 32) * nb * 32);
+  cudaMemcpy(hq.data(), e->dq + (size_t)(r0 / 32) * tq, hq.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(hs.data(), e->ds + (size_t)(r0 / 32) * nb * 32, (size_t)(R / 32) * ts, cudaMemcpyDeviceToHost);
+  std::vector<float> xf((size_t)Tn * K);
+  for (size_t i = 0; i < xf.size(); i++) xf[i] = cpu_bf2f(hx[i]);
+  CpuChk& c = g_cpuchk_tab[name]; c.N = N; c.K = K; c.calls++;
+  for (int rr = 0; rr < R; rr++) {
+    const int8_t* tq8 = hq.data() + (size_t)(rr >> 5) * tq;          // this row's tile
+    const float* tsc = hs.data() + (size_t)(rr >> 5) * nb * 32;
+    for (int t = 0; t < Tn; t++) {
+      const float* xt = xf.data() + (size_t)t * K;
+      float st[5] = {0, 0, 0, 0, 0}, pv = 0.f;
+      for (int k = 0; k < 32; k++) {
+        const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+        float acc = 0.f;
+        for (int b = i; b < nb; b += 32) {
+          // block b of row rr: int4 #(b*64 + lane) holds codes 0..15, int4 #(b*64 + 32 + lane) 16..31
+          const int8_t* c0 = tq8 + ((size_t)b * 64 + (rr & 31)) * 16;
+          const int8_t* c1 = tq8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16;
+          float dot = 0.f;
+          for (int j = 0; j < 32; j++) dot = fmaf((float)(j < 16 ? c0[j] : c1[j - 16]), xt[b * 32 + j], dot);
+          acc = fmaf(tsc[(size_t)b * 32 + (rr & 31)], dot, acc);
+        }
+        pv = acc;
+        for (int l = 0; l < 5; l++) {
+          if ((k >> l) & 1) pv = st[l] + pv;
+          else { st[l] = pv; break; }
+        }
+      }
+      const uint16_t got = hy[(size_t)t * N + r0 + rr], want = cpu_f2bf(0.f + pv);
+      c.outs++; if (got != want) c.bad++;
+    }
+  }
+}
+
 static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
                      float* part, int Tn) {
   Ent* e = T(M, name);
@@ -4680,6 +4756,7 @@ launched:
   if (!yb) k_combine_bf_T<<<g, 256, 0, g_launch>>>(part, y, N, nch, Tn);
   cudaError_t le2 = cudaGetLastError();
   if (le2 != cudaSuccess) { printf("PF4-E2E %s combine: LAUNCH ERROR %s\n", name.c_str(), cudaGetErrorString(le2)); return 1; }
+  if (g_cpuchk && nch == 1 && (const void*)y != (const void*)x) cpuchk_run(name, e, x, y, N, K, nb, Tn);
   return 0;
 }
 
