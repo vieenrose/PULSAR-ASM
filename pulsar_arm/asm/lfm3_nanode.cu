@@ -4792,9 +4792,17 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
     cr.R = R;
     g_cpus_rb += cpus_now() - rb0; g_cpus_nrb++;
   }
-  static std::vector<uint16_t> hx; static std::vector<float> xT, out; static std::vector<uint16_t> hy;
+  static std::vector<uint16_t> hx; static std::vector<float> xT;
+  // #313: out/hy are host buffers read by an ASYNC H2D on g_cpus, and the old single pair let the
+  // next split overwrite them while that copy was still in flight -- safe only because ~6 ms of
+  // NEON sits in between. Rotate two slots and wait on the one being reused (an event that has
+  // never fired queries as complete, so this costs one cudaEventQuery per split in practice).
+  static std::vector<float> out[2]; static std::vector<uint16_t> hy[2];
+  static cudaEvent_t evb[2] = { nullptr, nullptr }; static int bslot = 0;
+  if (!evb[0]) { cudaEventCreateWithFlags(&evb[0], cudaEventDisableTiming); cudaEventCreateWithFlags(&evb[1], cudaEventDisableTiming); }
+  if (cudaEventQuery(evb[bslot]) != cudaSuccess) cudaEventSynchronize(evb[bslot]);
   const int G = (Tn + 3) / 4;
-  hx.resize((size_t)Tn * K); xT.assign((size_t)K * G * 4, 0.f); out.resize((size_t)R * G * 4); hy.resize((size_t)Tn * R);
+  hx.resize((size_t)Tn * K); xT.assign((size_t)K * G * 4, 0.f); out[bslot].resize((size_t)R * G * 4); hy[bslot].resize((size_t)Tn * R);
   const double t0 = cpus_now();
   cudaStreamWaitEvent(g_cpus, g_cpue0, 0);
   cudaMemcpyAsync(hx.data(), x, hx.size() * 2, cudaMemcpyDeviceToHost, g_cpus);
@@ -4808,8 +4816,8 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
   std::thread th[8]; const int per = R / TH / 2 * 2; int lo = 0;
   const int8_t* wq = cr.mq ? cr.mq : cr.q.data(); const float* wsc = cr.ms ? cr.ms : cr.s.data();
   for (int w = 0; w < TH - 1; w++) { const int hi = lo + per;
-    th[w] = std::thread(lfm3_neon_rows2, wq, wsc, xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); lo = hi; }
-  lfm3_neon_rows2(wq, wsc, xT.data(), K, nb, G, lo, R, out.data() + (size_t)lo * G * 4);
+    th[w] = std::thread(lfm3_neon_rows2, wq, wsc, xT.data(), K, nb, G, lo, hi, out[bslot].data() + (size_t)lo * G * 4); lo = hi; }
+  lfm3_neon_rows2(wq, wsc, xT.data(), K, nb, G, lo, R, out[bslot].data() + (size_t)lo * G * 4);
   for (int w = 0; w < TH - 1; w++) th[w].join();
   { const double dt = cpus_now() - tc0, rate = (double)R * K * G * 4 / (dt > 1e-9 ? dt : 1e-9) * 1e-9;
     g_cpus_hist[rate >= 8 ? 15 : (int)(rate * 2)]++;
@@ -4818,8 +4826,10 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
     static int slowrun = 0;
     if (g_cpus_minrate > 0 && rate < g_cpus_minrate) { if (++slowrun >= 2) { g_cpus_skip = g_cpus_backoff; g_cpus_trips++; slowrun = 0; } }
     else slowrun = 0; }
-  for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) hy[(size_t)t * R + rr] = cpu_f2bf(0.f + out[(size_t)rr * G * 4 + t]);
-  cudaMemcpy2DAsync(y + r0, (size_t)N * 2, hy.data(), (size_t)R * 2, (size_t)R * 2, Tn, cudaMemcpyHostToDevice, g_cpus);
+  for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) hy[bslot][(size_t)t * R + rr] = cpu_f2bf(0.f + out[bslot][(size_t)rr * G * 4 + t]);
+  cudaMemcpy2DAsync(y + r0, (size_t)N * 2, hy[bslot].data(), (size_t)R * 2, (size_t)R * 2, Tn, cudaMemcpyHostToDevice, g_cpus);
+  cudaEventRecord(evb[bslot], g_cpus);
+  bslot ^= 1;
   cudaEventRecord(g_cpue1, g_cpus);
   cudaStreamWaitEvent(g_launch, g_cpue1, 0);
   g_cpus_wait += t1 - t0; g_cpus_comp += cpus_now() - t1; g_cpus_n++;

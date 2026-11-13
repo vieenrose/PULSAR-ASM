@@ -3048,3 +3048,24 @@ algorithm (fp16 accumulation), both of which change the goldens.
   100.4 -> 111.7 ms/step (1 thread, 3.4 GB/s) / 118-119 (3 threads, 5.4 GB/s). A co-located
   memory-heavy process (e.g. the text->ids front end, an LLM for the reply) costs the ASR 11-18%
   of decode regardless; the harness cannot see it (nothing else runs on the board).
+- [LFM3/Nano S2T] Twin x-tile reuse across the w1/w3 split pair: MEASURED OUT; the split's host
+  buffers were also unsynchronized (2026-11-13, run #313). w1 and w3 are split back to back on the
+  SAME ffn_norm output (same K, same Tn), so the second call can reuse the first's staged x tile:
+  implemented (one-entry cache keyed on (x,K,Tn) + an explicit cpusplit_twin() adjacency token set
+  between the two calls) and A/B'd same-build, ORDER 1 2 2 1 1 2 x 3 reps x zh/en: prefill 3766-3790
+  ms with 640-658 hits vs 3757-3792 ms with the reuse off -- null, 24/24 turns ids md5 identical.
+  So the D2H of x and the single-threaded bf16->f32 transpose of the whole 32x2048 tile are NOT on
+  the critical path (they hide behind the GPU's own rows); only the NEON part is (#303). Reverted.
+  TWO THINGS KEPT:
+  (1) The rotating host buffers. The old single out/hy pair let the next split overwrite them while
+      the previous call's ASYNC H2D was still reading hy -- safe only because ~6 ms of NEON sits in
+      between, never synchronized. Now out[2]/hy[2] rotate and the slot being reused is waited on
+      (cudaEventQuery on a never-recorded event reports complete, so it costs one query per split).
+  (2) A reusable technique: ship every reuse cache with a debug arm that re-reads the source and
+      memcmps it against the cached copy. Mine fired immediately (stale=2) and found a REAL bug in
+      my own change: the adjacency token was cleared inside the split path, so a w3 call that did
+      NOT split (the #312 back-off, or an ineligible shape) leaked the token to the NEXT split --
+      which can be the next layer's w1, i.e. the same A.h1 pointer, same K, same Tn, stale content
+      -> silently wrong rows. Consuming the token at the pf_gemv_T entry (whether or not that call
+      splits) fixed it: 630 hits, stale=0, ids golden. RULE: any "reuse the previous call's staged
+      input" cache must have its token consumed by the call site, not by the path that uses it.
