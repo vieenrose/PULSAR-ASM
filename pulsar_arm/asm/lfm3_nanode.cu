@@ -4704,10 +4704,22 @@ static cudaStream_t g_cpus = nullptr; static cudaEvent_t g_cpue0 = nullptr, g_cp
 // layers instead of 4 KB faults inside the prefill; when they are resident it is a cheap no-op.
 static std::vector<std::pair<void*, size_t>> g_cpus_maps;
 static void cpusplit_prefetch() { for (auto& m : g_cpus_maps) madvise(m.first, m.second, MADV_WILLNEED); }
+static long g_cpus_trips, g_cpus_skipped;
+static long g_cpus_hist[16];   // NEON share rate per split, 0.5 GMAC/s bins
 static double g_cpus_wait = 0, g_cpus_comp = 0, g_cpus_rb = 0, g_cpus_rbsync = 0; static long g_cpus_n = 0, g_cpus_nrb = 0;
-static void cpusplit_dump() { printf("CPUSPLIT splits=%ld x_wait %.1f ms compute+put %.1f ms; row builds=%ld %.1f ms (of which sync %.1f ms)\n", g_cpus_n, g_cpus_wait * 1e3, g_cpus_comp * 1e3, g_cpus_nrb, g_cpus_rb * 1e3, g_cpus_rbsync * 1e3); fflush(stdout); }
+static void cpusplit_dump() { printf("CPUSPLIT rate histogram (0.5 GMAC/s bins from 0):"); for (int i = 0; i < 16; i++) printf(" %ld", g_cpus_hist[i]); printf("\n"); printf("CPUSPLIT splits=%ld x_wait %.1f ms compute+put %.1f ms; row builds=%ld %.1f ms (of which sync %.1f ms); slow-CPU trips=%ld, GEMVs left on the GPU=%ld\n", g_cpus_n, g_cpus_wait * 1e3, g_cpus_comp * 1e3, g_cpus_nrb, g_cpus_rb * 1e3, g_cpus_rbsync * 1e3, g_cpus_trips, g_cpus_skipped); fflush(stdout); }
+// Back-off under CPU contention (#312). The launch stream waits for the CPU rows, so when another
+// process holds the cores the split becomes the critical path: one busy core made the prefill 26%
+// slower, three doubled it (split off: +1%). Each split times its NEON share; below
+// LFM_CPUSPLIT_MINRATE GMAC/s (default 3.0; 4-6.5 on idle cores, 2.5-3.0 with one core taken) the next
+// LFM_CPUSPLIT_BACKOFF eligible GEMVs (default 32) run entirely on the GPU, then one split probes
+// again. Both paths are bit-identical, so the choice cannot change the output. MINRATE=0 disables.
+static const double g_cpus_minrate = getenv("LFM_CPUSPLIT_MINRATE") ? atof(getenv("LFM_CPUSPLIT_MINRATE")) : 3.0;
+static const int g_cpus_backoff = getenv("LFM_CPUSPLIT_BACKOFF") ? atoi(getenv("LFM_CPUSPLIT_BACKOFF")) : 32;
+static int g_cpus_skip = 0;
 static int cpusplit_rows(Ent* e, int N, int K, int nb, int Tn, const bf16* yb) {
   if (!g_cpusplit || !yb || !e->tiled || N % 512 || N < 4096 || Tn > 32 || Tn < 1 || !lfm3_neon_rows2) return 0;
+  if (g_cpus_skip > 0) { g_cpus_skip--; g_cpus_skipped++; return 0; }
   return 512;
 }
 static void cpusplit_pre() {   // before the GPU launch: x is ready once this event fires
@@ -4792,12 +4804,20 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
   // LFM_CPUSPLIT_TH (default 3): worker count; the calling thread is the last worker (it would
   // only block in join otherwise), so TH threads means TH - 1 spawns.
   static const int TH = std::max(1, std::min(8, getenv("LFM_CPUSPLIT_TH") ? atoi(getenv("LFM_CPUSPLIT_TH")) : 3));
+  const double tc0 = cpus_now();
   std::thread th[8]; const int per = R / TH / 2 * 2; int lo = 0;
   const int8_t* wq = cr.mq ? cr.mq : cr.q.data(); const float* wsc = cr.ms ? cr.ms : cr.s.data();
   for (int w = 0; w < TH - 1; w++) { const int hi = lo + per;
     th[w] = std::thread(lfm3_neon_rows2, wq, wsc, xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); lo = hi; }
   lfm3_neon_rows2(wq, wsc, xT.data(), K, nb, G, lo, R, out.data() + (size_t)lo * G * 4);
   for (int w = 0; w < TH - 1; w++) th[w].join();
+  { const double dt = cpus_now() - tc0, rate = (double)R * K * G * 4 / (dt > 1e-9 ? dt : 1e-9) * 1e-9;
+    g_cpus_hist[rate >= 8 ? 15 : (int)(rate * 2)]++;
+    // Two slow splits in a row trip the back-off: the first split after a back-off period finds the
+    // cores idle-clocked and is slow by itself, which made a single-sample rule re-trip on quiet turns.
+    static int slowrun = 0;
+    if (g_cpus_minrate > 0 && rate < g_cpus_minrate) { if (++slowrun >= 2) { g_cpus_skip = g_cpus_backoff; g_cpus_trips++; slowrun = 0; } }
+    else slowrun = 0; }
   for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) hy[(size_t)t * R + rr] = cpu_f2bf(0.f + out[(size_t)rr * G * 4 + t]);
   cudaMemcpy2DAsync(y + r0, (size_t)N * 2, hy.data(), (size_t)R * 2, (size_t)R * 2, Tn, cudaMemcpyHostToDevice, g_cpus);
   cudaEventRecord(g_cpue1, g_cpus);

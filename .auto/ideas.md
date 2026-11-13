@@ -3032,3 +3032,19 @@ algorithm (fp16 accumulation), both of which change the goldens.
   of the sync is pipeline stall: at most ~0.7 s of a 45-63 s turn (~1%), long turns only. Not built.
   Also retracts #310's hint: skipping the split on the long turn and rebuilding afterwards would
   lose more (the split saves ~1.3 s of a 46 s prefill) than the rebuild costs.
+- [LFM3/Nano S2T] CPU split backs off under CPU contention (2026-11-13, run #312; LFM_CPUSPLIT_MINRATE
+  default 3.0 GMAC/s, LFM_CPUSPLIT_BACKOFF default 32, MINRATE=0 = old). Found with decont.sh
+  (memstream.c: N threads streaming 96 MB buffers during a real resident en turn): the launch stream
+  waits for the CPU rows, so a busy core makes the split the critical path. Prefill ms, quiet ->
+  loaded: split off 3900 -> 3925 (1 thr) / 3945 (3 thr); split on, no back-off 3760 -> 4750-4975 /
+  7326-7461 (the turn 6.07 -> 9.8-10.0 s). Each split now times its NEON share; two consecutive
+  splits below MINRATE send the next 32 eligible GEMVs to the GPU only, then one probes again. Both
+  paths are bit-identical (ids md5 identical in every turn of every arm). After: 4027-4045 (1 thr),
+  4257-4283 (3 thr); quiet 3760-3783 (8 trips / 224 of ~1730 GEMVs skipped over 6 quiet turns, not
+  resolvable in the prefill timer). Rate histogram on idle cores: 4-6.5 GMAC/s, tail down to 1.
+  A single-sample rule at 4.0 re-tripped on quiet turns (prefill 3966-4051): the first split after
+  a back-off is slow by itself. Residual under load (+270 / +500 ms vs split off) is the probes.
+  Also measured: CPU memory streaming slows the bus-bound DECODE step with the split irrelevant:
+  100.4 -> 111.7 ms/step (1 thread, 3.4 GB/s) / 118-119 (3 threads, 5.4 GB/s). A co-located
+  memory-heavy process (e.g. the text->ids front end, an LLM for the reply) costs the ASR 11-18%
+  of decode regardless; the harness cannot see it (nothing else runs on the board).
