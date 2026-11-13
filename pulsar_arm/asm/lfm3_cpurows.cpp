@@ -81,8 +81,68 @@ static void rows2(const int8_t* q, const float* sc, const float* xT, int K, int 
     if (nr == 2) for (int g = 0; g < G; g++) vst1q_f32(out + ((size_t)(r + 1 - r_lo) * G + g) * 4, pb[g]);
   }
 }
+// v4 (run #308): LEAF-major. v2 walks all 32 leaves per row pair, i.e. re-streams the whole x tile
+// (K x 32 floats = 256 KB at K=2048) from L2 for every two rows. Here the outer loop is the leaf:
+// its x blocks (i, i+32, ...: 4 KB each) stay in L1 while every row is visited, a row costs 32 code
+// bytes + 1 scale per block, and the binary-counter tree state st[5] is kept per row in memory.
+// Per (row, position) the leaf chain and the tree are v2's, operation for operation.
+#include <stdlib.h>
+template <int G>
+static void rows4(const int8_t* q, const float* sc, const float* xT, int K, int nb, int r_lo, int r_hi, float* out) {
+  const int R = r_hi - r_lo; if (R <= 0) return;
+  float* st = (float*)aligned_alloc(64, (size_t)R * 5 * G * 4 * sizeof(float));
+  for (int k = 0; k < 32; k++) {
+    const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+    for (int r = r_lo; r < r_hi; r += 2) {
+      const int nr = r + 1 < r_hi ? 2 : 1;
+      const int8_t* qa = q + (size_t)r * K; const int8_t* qb = q + (size_t)(r + nr - 1) * K;
+      const float* sa = sc + (size_t)r * nb; const float* sb = sc + (size_t)(r + nr - 1) * nb;
+      float32x4_t aa[G], ab[G];
+      for (int g = 0; g < G; g++) { aa[g] = vdupq_n_f32(0.f); ab[g] = vdupq_n_f32(0.f); }
+      for (int b = i; b < nb; b += 32) {
+        float32x4_t da[G], db[G];
+        for (int g = 0; g < G; g++) { da[g] = vdupq_n_f32(0.f); db[g] = vdupq_n_f32(0.f); }
+        const float* xb = xT + (size_t)b * 32 * G * 4;
+        for (int j0 = 0; j0 < 32; j0 += 8) {
+          const int16x8_t wa = vmovl_s8(vld1_s8(qa + b * 32 + j0)), wb = vmovl_s8(vld1_s8(qb + b * 32 + j0));
+          const float32x4_t ca0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wa))), ca1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wa)));
+          const float32x4_t cb0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wb))), cb1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wb)));
+#define STEP(J, CA, CB, L) { const float* xj = xb + (size_t)(j0 + J) * G * 4; \
+          for (int g = 0; g < G; g++) { const float32x4_t xv = vld1q_f32(xj + 4 * g); \
+            da[g] = vfmaq_laneq_f32(da[g], xv, CA, L); db[g] = vfmaq_laneq_f32(db[g], xv, CB, L); } }
+          STEP(0, ca0, cb0, 0) STEP(1, ca0, cb0, 1) STEP(2, ca0, cb0, 2) STEP(3, ca0, cb0, 3)
+          STEP(4, ca1, cb1, 0) STEP(5, ca1, cb1, 1) STEP(6, ca1, cb1, 2) STEP(7, ca1, cb1, 3)
+#undef STEP
+        }
+        const float32x4_t va = vdupq_n_f32(sa[b]), vb = vdupq_n_f32(sb[b]);
+        for (int g = 0; g < G; g++) { aa[g] = vfmaq_f32(aa[g], va, da[g]); ab[g] = vfmaq_f32(ab[g], vb, db[g]); }
+      }
+      for (int w = 0; w < nr; w++) {
+        float32x4_t* pv = w ? ab : aa; float* s0 = st + (size_t)(r + w - r_lo) * 5 * G * 4;
+        int l = 0;
+        for (; l < 5; l++) {
+          float* sl = s0 + (size_t)l * G * 4;
+          if ((k >> l) & 1) { for (int g = 0; g < G; g++) pv[g] = vaddq_f32(vld1q_f32(sl + 4 * g), pv[g]); }
+          else { for (int g = 0; g < G; g++) vst1q_f32(sl + 4 * g, pv[g]); break; }
+        }
+        if (l == 5) for (int g = 0; g < G; g++) vst1q_f32(out + ((size_t)(r + w - r_lo) * G + g) * 4, pv[g]);
+      }
+    }
+  }
+  free(st);
+}
+static int g_rows_v = getenv("LFM_CPUROWS_V") ? atoi(getenv("LFM_CPUROWS_V")) : 2;
 extern "C" void lfm3_neon_rows2(const int8_t* q, const float* sc, const float* xT, int K, int nb, int G,
                                 int r_lo, int r_hi, float* out) {
+  if (g_rows_v == 4) { switch (G) {
+    case 8: rows4<8>(q, sc, xT, K, nb, r_lo, r_hi, out); return;
+    case 7: rows4<7>(q, sc, xT, K, nb, r_lo, r_hi, out); return;
+    case 6: rows4<6>(q, sc, xT, K, nb, r_lo, r_hi, out); return;
+    case 5: rows4<5>(q, sc, xT, K, nb, r_lo, r_hi, out); return;
+    case 4: rows4<4>(q, sc, xT, K, nb, r_lo, r_hi, out); return;
+    case 3: rows4<3>(q, sc, xT, K, nb, r_lo, r_hi, out); return;
+    case 2: rows4<2>(q, sc, xT, K, nb, r_lo, r_hi, out); return;
+    default: rows4<1>(q, sc, xT, K, nb, r_lo, r_hi, out); return; } }
   switch (G) {
     case 8: rows2<8>(q, sc, xT, K, nb, r_lo, r_hi, out); break;
     case 7: rows2<7>(q, sc, xT, K, nb, r_lo, r_hi, out); break;

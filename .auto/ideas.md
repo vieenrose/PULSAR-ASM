@@ -2990,3 +2990,13 @@ algorithm (fp16 accumulation), both of which change the goldens.
   the long turn's encoder reply 10.1 / 13.6 / 5.4 s (under reclaim in 2 of 3, as in #280), long
   turn 78-81 s when queued behind short ones. The ~250 MB margin on a 110 s clip is the board's
   limit with three services, not something the split changed.
+- [LFM3/Nano S2T] NEON CPU rows v4, leaf-major (2026-11-13, run #308; LFM_CPUROWS_V=4, default 2).
+  Outer loop = leaf, so a leaf's x blocks stay in L1 while all rows are visited; per-row tree state
+  st[5] in memory. Bit-exact: LFM_CPUCHK=1024 over every tiled prefill GEMV of a zh + en turn,
+  57,361,408 outputs, 0 bitwise differences vs the GPU. Check-harness rate (all shapes incl.
+  K=7680) 5.19 GMAC/s on 3 threads vs v2's 4.22 (#297, other session). In the shipped split
+  (w1/w3 only, K=2048), order V 2/4/4/2: prefill 3749-3757 / 3750-3760 / 3757-3761 / 3759-3769 ms
+  = null; compute+put 10.29 / 9.79 / 10.20 / 10.43 s per 1493 splits (~-3%). So at K=2048 the x
+  re-stream was not v2's limit (agrees with #298), and a ~3% faster CPU side does not move the
+  prefill: with #303's thread sweep, the split's end time is not set by the NEON kernel's speed
+  alone. v4's gain is at K=7680 (w2), which is not split. Kept opt-in, default unchanged.
