@@ -2756,3 +2756,21 @@ algorithm (fp16 accumulation), both of which change the goldens.
   the ramp belongs there and not here. RULE: a parked-clock penalty is only worth an arrival ramp
   in a stage whose first GPU launch is immediate; measure the stage's CPU lead time first. Not
   built; PT_V21_RAMP_MS stays the only ramp. Harness 0.5054, all gates + checks.sh green.
+- [PrimeTTS/Nano, resident] The TTS service no longer dies on a bad request (2026-11-13, run #287,
+  keep; prime-tts f7001bc). It was the last resident stage with no recovery: the --serve-fifo loop
+  did `if (sndr < 0.0) break;`, so ONE unloadable case dir ended the speech stage for the rest of
+  the session (encoder: answers rc=3 + client fallback, #272; backbone: refuses and keeps serving,
+  #282). Now rc distinguishes the failure classes -- 0 rendered and matches the case golden, 1
+  rendered but SNDR < 60 dB (engine/context problem), 2 the case could not be loaded or the run
+  failed (a bad request) -- and a bad request is answered so the session continues. Safe to
+  continue because each request self-checks SNDR >= 60 dB against its own golden, so a corrupt
+  context surfaces as rc=1 rather than as silence; PT_V21_SERVE_MAXFAIL (default 3, <=0 = never)
+  ends a service that fails that many in a row. ttsrecovery.sh: badpath rc=2 alive, T81 rc=0
+  byte-identical to a one-shot reference made before boot, empty case dir rc=2 alive, T81 again OK,
+  3 bad in a row exits with its reason. Also published run_case's feeds as they load (ownership
+  hygiene; the claimed "partial-load leak" is NOT real -- 20 partial failures moved VmRSS < 1 MB in
+  both the fixed and pre-fix binaries, the buffers before the failing one are a few KB). Two
+  harness traps hit while measuring it: the leak arm needed the give-up cap disabled (the new binary
+  exited at request 3 of 20), and pgrep on the fifo path matched the `timeout sh -c` request writers,
+  so the RSS was read from an exited pid (delta printed as -216). Harness 0.5058, all four gates +
+  checks.sh green; the metric is untouched by design (a good request never enters this path).
