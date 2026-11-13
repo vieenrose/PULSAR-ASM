@@ -27,6 +27,19 @@ i=0; while [ $i -lt 300 ]; do grep -q "CLIP_AWAIT 0" $SRV_LOG 2>/dev/null && bre
 ./lfm3_enc_gpu lfm3-audio-2b-enc.lfm3q8 - auto - --serve-fifo $ENC_IN --only proj_out > $ENC_LOG 2>&1 & ENC=$!
 i=0; while [ $i -lt 240 ]; do grep -q "ENC_AWAIT 0" $ENC_LOG 2>/dev/null && break; sleep 0.5; i=$((i+1)); done
 [ $i -ge 240 ] && { echo "BOOT_FAIL"; exit 1; }
+# TTS=1: the TTS service is resident too (the harness's three-service configuration, the tightest
+# memory case for a long turn), with one request served so its memory is really in use. A watcher
+# records the MemAvailable low water over the trials.
+PT_IN=/tmp/cc.pt.in; PT_LOG=/tmp/cc.pt.log; PTD=/home/picard/primetts; PT=""
+if [ "${TTS:-0}" = 1 ]; then
+  pkill -x pt_v21_nano 2>/dev/null; rm -f $PT_IN $PT_LOG; mkfifo $PT_IN; : > $PT_LOG
+  ( cd $PTD && exec ./build/pt_v21_nano --container build/v21.ptk --serve-fifo $PT_IN ) > $PT_LOG 2>&1 & PT=$!
+  i=0; while [ $i -lt 120 ]; do grep -q "PT_AWAIT 0" $PT_LOG 2>/dev/null && break; sleep 0.5; i=$((i+1)); done
+  timeout 60 sh -c "echo '$PTD/tests/golden_v21/T81 /tmp/cc.tts.npy' > $PT_IN"
+  i=0; while [ $i -lt 120 ]; do grep -q "^PT_DONE 0 " $PT_LOG 2>/dev/null && break; sleep 0.5; i=$((i+1)); done
+  echo "TTS resident: $(grep "^PT_DONE 0 " $PT_LOG | cut -c1-80)"
+fi
+( m=99999999; while :; do a=$(awk '/MemAvailable/{print $2}' /proc/meminfo); [ "$a" -lt "$m" ] && { m=$a; echo $m > /tmp/cc.memlow; }; sleep 0.2; done ) & WATCH=$!
 # one untimed turn so both services are past their first-request paths
 ./lfm3_asr . /tmp/clip_zh.wav 96 --out-ids /tmp/cc.w.i32 --serve-in $SRV_IN --serve-log $SRV_LOG \
   --enc-in $ENC_IN --enc-log $ENC_LOG > /tmp/cc.w.log 2>&1
@@ -63,6 +76,14 @@ for t in $(seq 1 $T); do
   echo "$line"
 done
 echo "CONCURRENCY $([ $fails = 0 ] && echo OK || echo "FAILS=$fails") ($T trials x $C clients)"
+kill $WATCH 2>/dev/null; wait $WATCH 2>/dev/null
+echo "MEMLOW $(( $(cat /tmp/cc.memlow) / 1024 )) MB  GUARD_TRIPS $(grep -c MEMGUARD $ENC_LOG)"
+if [ -n "$PT" ]; then   # the TTS service must still serve correctly after the trials
+  timeout 60 sh -c "echo '$PTD/tests/golden_v21/T81 /tmp/cc.tts.npy' > $PT_IN"
+  i=0; while [ $i -lt 120 ]; do grep -q "^PT_DONE 1 " $PT_LOG 2>/dev/null && break; sleep 0.5; i=$((i+1)); done
+  echo "TTS after: $(grep "^PT_DONE 1 " $PT_LOG | cut -c1-80)"
+  timeout 5 sh -c "echo Q > $PT_IN" 2>/dev/null; sleep 0.5; kill $PT 2>/dev/null; rm -f $PT_IN
+fi
 echo "CLIPS_DONE=$(grep -c 'DONE steps=' $SRV_LOG) ENC_DONE=$(grep -c ENC_DONE $ENC_LOG)"
 for f in $SRV_IN $ENC_IN; do timeout 5 sh -c "echo Q > $f" 2>/dev/null; done
 sleep 1; kill $SRV $ENC 2>/dev/null; rm -f $SRV_IN $ENC_IN

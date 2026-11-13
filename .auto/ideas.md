@@ -2981,3 +2981,12 @@ algorithm (fp16 accumulation), both of which change the goldens.
   ENC_DONE=13. The long turn landed 4th, 2nd and 4th in the queue (walls 78.0 / 68.0 / 78.1 s), so
   the drop was sent both behind and ahead of short turns; short turns queued behind it waited the
   full ~62 s (per-user latency is additive, #289).
+- [LFM3/Nano S2T] Long turn among concurrent clients with THREE services resident (2026-11-13,
+  run #307, tool only: concasr.sh TTS=1 + MemAvailable watcher). 3 trials x 4 clients (zh, en,
+  110 s clip, cv_zh9), TTS service resident with one request served before and one after: every
+  client rc=0, zh/en GOLDEN, long ids eca77bbe (= cold) 3/3, drop acked 3/3, GUARD_TRIPS 0,
+  CLIPS_DONE=13 ENC_DONE=13, TTS after rc=0 SNDR 70.09. In-turn MemAvailable low 265 MB (same
+  250-310 MB margin as the unsplit build in #280, i.e. the drop gives the split's memory back);
+  the long turn's encoder reply 10.1 / 13.6 / 5.4 s (under reclaim in 2 of 3, as in #280), long
+  turn 78-81 s when queued behind short ones. The ~250 MB margin on a 110 s clip is the board's
+  limit with three services, not something the split changed.
