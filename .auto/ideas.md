@@ -3069,3 +3069,25 @@ algorithm (fp16 accumulation), both of which change the goldens.
       -> silently wrong rows. Consuming the token at the pf_gemv_T entry (whether or not that call
       splits) fixed it: 630 hits, stale=0, ids golden. RULE: any "reuse the previous call's staged
       input" cache must have its token consumed by the call site, not by the path that uses it.
+- [LFM3+PrimeTTS/Nano] The TTS's device footprint does NOT limit the long turn (2026-11-13, run
+  #314, measured out, reverted). Hypothesis: with three resident services the 110 s clip's encoder
+  pass runs under reclaim because the TTS holds the largest device side after the backbone (110 MB
+  of pooled weights + its activation arena), so release it for the long turn (the same protocol as
+  the CPUROWS DROP) and take it back on the next request. Built: pt_v21_nano --serve-fifo answers a
+  "FREE" line by pt_v21_close(c) and re-opens via pt_v21_open() on the next request; lfm3_asr sends
+  it with the long-turn drop when given --tts-in. Result, 2x2 A/B (soak.sh CLIPS=zh,110s,en,75s x
+  LFM_TTS_FREE 1/0/1/0): long turn asr 62.86 / 62.60 (free) vs 62.78 / 62.82 s (no free), 75 s turn
+  44.80 / 44.54 vs 44.50 / 44.58, post-turn MemAvailable 692-732 vs 698-738 MB -- NULL in every
+  column, ids and SNDR unchanged, and the served waveform after the FREE was byte-identical.
+  AND the implementation cost is disqualifying: closing and re-opening the ctx makes EVERY later
+  request pay ~27 s (27.42 / 26.98 / 27.07 s for what costs 0.46 s warm, TTS RSS 49 -> 152 MB), not
+  the ~0.3 s of a weight re-upload -- the per-request cost persists across requests, so whatever
+  pt_v21_open() rebuilds is being rebuilt every time. If anyone revisits a device-release protocol,
+  it must free only the device side through the existing weights_release()/arena path and keep the
+  host-side ctx (container records, graph tables) alive; a full close+reopen is 60x too slow.
+  CONSEQUENCE: the long-turn memory pressure is not the third service. What is left on the board
+  besides the encoder's own pass (#276 cut it 772 -> 536 MB) is the backbone's 2.15 GB arena, whose
+  size trades against RSS rather than adding to it (Bonsai #23, row 50: MemAvailable is unchanged
+  by arena size, pages just move between anon RSS and nvmap). So long-clip capacity now needs the
+  encoder's activation memory cut (time-windowed downsampler), which is the only remaining option
+  in that direction and is a project, not an iteration.
