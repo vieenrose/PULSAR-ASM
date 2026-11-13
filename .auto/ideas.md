@@ -2885,3 +2885,15 @@ algorithm (fp16 accumulation), both of which change the goldens.
   BUILD NOTE: nvcc 10.2 cannot parse gcc-8's arm_neon.h (undefined __builtin_aarch64_* in the
   host pass), so NEON code lives in its own g++ TU linked into lfm3_nanode (measure.sh and
   measure_s2t.sh build it).
+- [LFM3/Nano S2T] CPU prefill share, step (b) v2: 4.22 GMAC/s (3 thr) / 4.37 (4 thr), still bit-exact
+  (2026-11-13, run #297; LFM_CPUCHK_V2=1). Row-major repack (load-time in a real split, untimed here),
+  2 rows per pass sharing each x vector, codes widened 8 at a time (vmovl_s8/s16 + vcvtq), products by
+  vfmaq_laneq_f32 (one fused fma each: same chain per lane). Real zh turn, last 1024 rows of every
+  tiled prefill GEMV: 15,665,152 outputs, 0 bitwise differences, ids golden. 2.1x over v1 (2.02/2.35).
+  3 -> 4 threads adds only 4%: the x tile is K x 32 floats (256 KB at K=2048, 960 KB at K=7680),
+  re-streamed per 2-row pass, so it is cache/bandwidth-limited, and the timer includes per-call thread
+  spawn. Revised split estimate with the #294 contention factor (-14% -> ~3.6 GMAC/s, r ~ 14) and
+  L = 1.06 ms on every split: (3890 - 576 x 1.06)/15 ~ 0.22 s/turn. Remaining kernel levers: 4 rows
+  per pass (halves x traffic, 32 accumulators -> needs G<=4 halves), x blocked so a block's 32 x 32
+  floats (4 KB) are reused across many rows (loop rows inside blocks: needs the per-row leaf/tree
+  state kept in memory), persistent workers.

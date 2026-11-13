@@ -4603,6 +4603,8 @@ static inline float cpu_bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float
 // lane-wise IEEE add, so each lane is exactly the scalar chain above), on TH std::threads, timed.
 // weak: lfm3_enc_gpu.cu includes this file and does not link lfm3_cpurows.o (null there)
 extern "C" __attribute__((weak)) void lfm3_neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out);
+extern "C" __attribute__((weak)) void lfm3_neon_rows2(const int8_t* q, const float* sc, const float* xT, int K, int nb, int G, int r_lo, int r_hi, float* out);
+static int g_cpuchk_v2 = getenv("LFM_CPUCHK_V2") ? atoi(getenv("LFM_CPUCHK_V2")) : 0;
 static void neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out) { lfm3_neon_rows(hq, hs, xT, nb, G, r_lo, r_hi, out); }
 static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf16* y, int N, int K, int nb, int Tn) {
   if (!g_cpuchk || !e->tiled) return;
@@ -4625,8 +4627,22 @@ static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf1
     const int G = (Tn + 3) / 4, TH = g_cpuchk_neon;
     std::vector<float> xT((size_t)K * G * 4, 0.f), out((size_t)R * G * 4);
     for (int t = 0; t < Tn; t++) for (int kk = 0; kk < K; kk++) xT[(size_t)kk * G * 4 + t] = xf[(size_t)t * K + kk];
+    // v2: row-major repack, done at load in a real split -> outside the timed window
+    std::vector<int8_t> qrm; std::vector<float> srm;
+    if (g_cpuchk_v2) {
+      qrm.resize((size_t)R * K); srm.resize((size_t)R * nb);
+      for (int rr = 0; rr < R; rr++) for (int b = 0; b < nb; b++) {
+        const int8_t* t8 = hq.data() + (size_t)(rr >> 5) * tq;
+        memcpy(&qrm[(size_t)rr * K + b * 32], t8 + ((size_t)b * 64 + (rr & 31)) * 16, 16);
+        memcpy(&qrm[(size_t)rr * K + b * 32 + 16], t8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16, 16);
+        srm[(size_t)rr * nb + b] = hs[(size_t)(rr >> 5) * nb * 32 + (size_t)b * 32 + (rr & 31)];
+      }
+    }
     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
     std::vector<std::thread> th; const int per = (R / TH + 31) & ~31;   // whole tiles per thread
+    if (g_cpuchk_v2) for (int w = 0; w < TH; w++) { const int lo = std::min(R, w * per), hi = std::min(R, lo + per);
+      if (lo < hi) th.emplace_back(lfm3_neon_rows2, qrm.data(), srm.data(), xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); }
+    else
     for (int w = 0; w < TH; w++) { const int lo = std::min(R, w * per), hi = std::min(R, lo + per);
       if (lo < hi) th.emplace_back(neon_rows, hq.data(), hs.data(), xT.data(), nb, G, lo, hi, out.data() + (size_t)lo * G * 4); }
     for (auto& t : th) t.join();
