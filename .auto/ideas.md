@@ -3000,3 +3000,14 @@ algorithm (fp16 accumulation), both of which change the goldens.
   re-stream was not v2's limit (agrees with #298), and a ~3% faster CPU side does not move the
   prefill: with #303's thread sweep, the split's end time is not set by the NEON kernel's speed
   alone. v4's gain is at K=7680 (w2), which is not split. Kept opt-in, default unchanged.
+- [LFM3/Nano S2T] Is the harness number representative? Speed on held-out audio (2026-11-13, run
+  #309, analysis of #304's generalize.sh walls on the same engine code; no code change). Resident
+  ASR wall / audio length: harness clips zh 5.180/9.00 = 0.576, en 6.100/9.00 = 0.678 (mean 0.627);
+  held-out cv_zh9 0.576, cv_en9 0.676, cv_zh5 3.308/5.00 = 0.662, cv_en5 4.113/5.00 = 0.823,
+  110 s clip 63.66/110.04 = 0.579; the four held-out short clips pooled 0.668. So the 9 s numbers
+  transfer exactly to unseen 9 s audio, long audio is no worse per second (while it fits memory),
+  and SHORT utterances are worse per second (5 s: 0.66-0.82): the turn has ~0.6 s of fixed cost
+  (encoder reply ~0.45 s + client) and the transcript's decode steps (~100 ms each) do not shrink
+  with the clip the way the prefill does. English is ~0.1 worse than Chinese at equal length
+  (more ids per second of speech). The harness's s2t_rtf 0.63 is therefore a fair figure for ~9 s
+  utterances and optimistic by ~5-30% for 5 s ones; quote it with the clip length.
