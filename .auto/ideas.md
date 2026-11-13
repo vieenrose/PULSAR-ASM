@@ -2897,3 +2897,10 @@ algorithm (fp16 accumulation), both of which change the goldens.
   per pass (halves x traffic, 32 accumulators -> needs G<=4 halves), x blocked so a block's 32 x 32
   floats (4 KB) are reused across many rows (loop rows inside blocks: needs the per-row leaf/tree
   state kept in memory), persistent workers.
+- [LFM3/Nano S2T] CPU prefill share, v3 (4 rows/pass over 16-position halves, x traffic per row
+  halved): bit-exact (15.7M outputs, 0 differ) but SLOWER: 3.91 / 3.84 GMAC/s vs v2 4.16 in the
+  same session (3 threads, order v3/v2/v3). So the x re-stream is NOT v2's limit (refutes #297's
+  reading); the extra passes over the codes and stack-held leaf/tree state cost more. v2 runs ~24%
+  of the 3-core fp32 FMLA peak (~17.7 GFMA/s at 1479 MHz) with 16 independent chains: the next
+  suspects are the per-call thread spawn (k/v calls are tiny) and the vcvt/vmovl issue share.
+  Patch: .auto/attic/row298_neon_rows4_probe.patch (reverted, 2026-11-13, run #298).

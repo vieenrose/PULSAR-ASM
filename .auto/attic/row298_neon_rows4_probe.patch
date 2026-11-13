@@ -1,0 +1,76 @@
+diff --git a/pulsar_arm/asm/lfm3_cpurows.cpp b/pulsar_arm/asm/lfm3_cpurows.cpp
+index c0e8aed..0210565 100644
+--- a/pulsar_arm/asm/lfm3_cpurows.cpp
++++ b/pulsar_arm/asm/lfm3_cpurows.cpp
+@@ -94,3 +94,50 @@ extern "C" void lfm3_neon_rows2(const int8_t* q, const float* sc, const float* x
+     default: rows2<1>(q, sc, xT, K, nb, r_lo, r_hi, out); break;
+   }
+ }
++
++// v3 (run #298): 4 rows per pass over a 16-position half of the chunk (4 float32x4), so each x
++// vector feeds 4 rows (half v2's x traffic per row) and 16 dot accumulators stay in registers.
++// Leaf accumulators and the tree state live in small stack arrays (touched once per block / leaf).
++// Same per-lane chain: dot = fused fma over codes in order, acc = fma(scale, dot, acc), tree adds.
++static void rows4(const int8_t* q, const float* sc, const float* xT, int K, int nb, int G, int r_lo, int r_hi, float* out) {
++  for (int r = r_lo; r + 4 <= r_hi; r += 4)
++  for (int gh = 0; gh < G; gh += 4) {
++    const int8_t* qr[4]; const float* sr[4];
++    for (int u = 0; u < 4; u++) { qr[u] = q + (size_t)(r + u) * K; sr[u] = sc + (size_t)(r + u) * nb; }
++    float32x4_t st[5][4][4], pv[4][4];
++    for (int k = 0; k < 32; k++) {
++      const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
++      float32x4_t acc[4][4];
++      for (int u = 0; u < 4; u++) for (int g = 0; g < 4; g++) acc[u][g] = vdupq_n_f32(0.f);
++      for (int b = i; b < nb; b += 32) {
++        float32x4_t d[4][4];
++        for (int u = 0; u < 4; u++) for (int g = 0; g < 4; g++) d[u][g] = vdupq_n_f32(0.f);
++        const float* xb = xT + (size_t)b * 32 * G * 4 + gh * 4;
++        for (int j0 = 0; j0 < 32; j0 += 4) {
++          float32x4_t c[4];
++          for (int u = 0; u < 4; u++)
++            c[u] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vld1_s8(qr[u] + b * 32 + j0)))));
++#define STEP(J, L) { const float* xj = xb + (size_t)(j0 + J) * G * 4; \
++          for (int g = 0; g < 4; g++) { const float32x4_t xv = vld1q_f32(xj + 4 * g); \
++            for (int u = 0; u < 4; u++) d[u][g] = vfmaq_laneq_f32(d[u][g], xv, c[u], L); } }
++          STEP(0, 0) STEP(1, 1) STEP(2, 2) STEP(3, 3)
++#undef STEP
++        }
++        for (int u = 0; u < 4; u++) { const float32x4_t s = vdupq_n_f32(sr[u][b]);
++          for (int g = 0; g < 4; g++) acc[u][g] = vfmaq_f32(acc[u][g], s, d[u][g]); }
++      }
++      for (int u = 0; u < 4; u++) for (int g = 0; g < 4; g++) pv[u][g] = acc[u][g];
++      for (int l = 0; l < 5; l++) {
++        if ((k >> l) & 1) { for (int u = 0; u < 4; u++) for (int g = 0; g < 4; g++) pv[u][g] = vaddq_f32(st[l][u][g], pv[u][g]); }
++        else { for (int u = 0; u < 4; u++) for (int g = 0; g < 4; g++) st[l][u][g] = pv[u][g]; break; }
++      }
++    }
++    for (int u = 0; u < 4; u++) for (int g = 0; g < 4; g++)
++      vst1q_f32(out + ((size_t)(r + u - r_lo) * G + gh + g) * 4, pv[u][g]);
++  }
++}
++extern "C" void lfm3_neon_rows3(const int8_t* q, const float* sc, const float* xT, int K, int nb, int G,
++                                int r_lo, int r_hi, float* out) {
++  if (G % 4 == 0 && (r_hi - r_lo) % 4 == 0) rows4(q, sc, xT, K, nb, G, r_lo, r_hi, out);
++  else lfm3_neon_rows2(q, sc, xT, K, nb, G, r_lo, r_hi, out);
++}
+diff --git a/pulsar_arm/asm/lfm3_nanode.cu b/pulsar_arm/asm/lfm3_nanode.cu
+index db7ee9b..6a6884f 100644
+--- a/pulsar_arm/asm/lfm3_nanode.cu
++++ b/pulsar_arm/asm/lfm3_nanode.cu
+@@ -4604,6 +4604,7 @@ static inline float cpu_bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float
+ // weak: lfm3_enc_gpu.cu includes this file and does not link lfm3_cpurows.o (null there)
+ extern "C" __attribute__((weak)) void lfm3_neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out);
+ extern "C" __attribute__((weak)) void lfm3_neon_rows2(const int8_t* q, const float* sc, const float* xT, int K, int nb, int G, int r_lo, int r_hi, float* out);
++extern "C" __attribute__((weak)) void lfm3_neon_rows3(const int8_t* q, const float* sc, const float* xT, int K, int nb, int G, int r_lo, int r_hi, float* out);
+ static int g_cpuchk_v2 = getenv("LFM_CPUCHK_V2") ? atoi(getenv("LFM_CPUCHK_V2")) : 0;
+ static void neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out) { lfm3_neon_rows(hq, hs, xT, nb, G, r_lo, r_hi, out); }
+ static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf16* y, int N, int K, int nb, int Tn) {
+@@ -4641,7 +4642,7 @@ static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf1
+     struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+     std::vector<std::thread> th; const int per = (R / TH + 31) & ~31;   // whole tiles per thread
+     if (g_cpuchk_v2) for (int w = 0; w < TH; w++) { const int lo = std::min(R, w * per), hi = std::min(R, lo + per);
+-      if (lo < hi) th.emplace_back(lfm3_neon_rows2, qrm.data(), srm.data(), xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); }
++      if (lo < hi) th.emplace_back(g_cpuchk_v2 >= 3 ? lfm3_neon_rows3 : lfm3_neon_rows2, qrm.data(), srm.data(), xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); }
+     else
+     for (int w = 0; w < TH; w++) { const int lo = std::min(R, w * per), hi = std::min(R, lo + per);
+       if (lo < hi) th.emplace_back(neon_rows, hq.data(), hs.data(), xT.data(), nb, G, lo, hi, out.data() + (size_t)lo * G * 4); }
