@@ -3091,3 +3091,19 @@ algorithm (fp16 accumulation), both of which change the goldens.
   by arena size, pages just move between anon RSS and nvmap). So long-clip capacity now needs the
   encoder's activation memory cut (time-windowed downsampler), which is the only remaining option
   in that direction and is a project, not an iteration.
+- [LFM3/Nano S2T] Long-clip encoder reply: cause relocated (2026-11-13, run #315). The served 110 s
+  encoder reply is 5.4-6.6 s with TWO services (12 turns, one session, ids eca77bbe, 0 guard trips)
+  and 15-18 s with THREE -- so the slow mode is memory pressure from the third resident stage, not
+  the CPUROWS DROP timing (end-of-turn vs pre-encoder drop: equal, A/B'd 3 order alternations).
+  #314 already refuted "release the TTS's device side". Next candidate for that 9 s: the third
+  service's HOST side (243 MB RSS, evicted by the pass per #284b) -- i.e. general reclaim, fixable
+  only by the encoder's own footprint: the time-windowed downsampler (x1 344 MB at 110 s; conv
+  locality in time means a window of x2 rows [s0,s1) needs x1 rows [2s0-1, 2s1+1] -> ~32 MB per
+  512-row window, peak 536 -> ~220 MB, exact by construction IF no time-axis reduction sits between
+  the two convs (verify before building).
+  HARNESS TRAPS from this iteration (both cost a whole A/B): (1) an 'A/B' whose binary failed to
+  compile silently measured the stale board binary -- fail the run on ANY compiler diagnostic; an
+  `echo BUILT` after a pipe hides gcc's exit status, and a helper inserted before its callees'
+  definitions builds only with implicit declarations (wrong widths). (2) A stage-time grep with the
+  delta on the wrong side of the name returned nothing; '?' in a results column is a parse failure,
+  not a free stage.
