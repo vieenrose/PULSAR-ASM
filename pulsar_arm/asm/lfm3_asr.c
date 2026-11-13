@@ -246,6 +246,14 @@ static double g_stage_t = -1.0;
 /* `line` (optional) receives the matched reply line, so a caller can read the status the
    service reported instead of only its presence: a service that answers "rc=1" has NOT
    completed the request. */
+/* Reply-wait poll interval. A turn hands off four times (request fifo -> service, service log ->
+   client, for both services), and each polling side loses half an interval on average; at the old
+   10-20 ms that was ~35 ms per turn. LFM_POLL_US overrides (default 2000 us). */
+static void poll_sleep(void) {
+  static long us = -1;
+  if (us < 0) { const char* e = getenv("LFM_POLL_US"); us = e ? atol(e) : 2000; if (us < 100) us = 100; }
+  struct timespec ts = { us / 1000000, (us % 1000000) * 1000 }; nanosleep(&ts, NULL);
+}
 static int srv_wait(const char *logp, long from, const char *prefix, FILE *sink, double timeout_s,
                     char *line, size_t line_cap) {
   int rf = open(logp, O_RDONLY);
@@ -257,7 +265,7 @@ static int srv_wait(const char *logp, long from, const char *prefix, FILE *sink,
     ssize_t got = read(rf, lb + lh, sizeof lb - lh - 1);
     if (got <= 0) {
       if (now_s() - t0 > timeout_s) break;
-      struct timespec ts = {0, 10000000}; nanosleep(&ts, NULL);
+      poll_sleep();
       continue;
     }
     lh += (size_t)got;
@@ -707,7 +715,7 @@ int main(int argc, char **argv) {
         const double srv_wait_s = getenv("LFM_SRV_WAIT") ? atof(getenv("LFM_SRV_WAIT")) : 900.0;
         if (now_s() - wt0 > srv_wait_s)
           die("the resident backbone produced nothing for %g s (see %s)", srv_wait_s, srv_log);
-        struct timespec ts = {0, 20000000}; nanosleep(&ts, NULL);
+        poll_sleep();
         continue;
       }
       lh += (size_t)got;

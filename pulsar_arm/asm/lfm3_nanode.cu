@@ -5367,6 +5367,11 @@ int main(int argc, char** argv) {
   if (clip_fifo) {
     int fd = open(clip_fifo, O_RDWR | O_NONBLOCK);
     if (fd < 0) { printf("--clip-fifo: cannot open %s (%s)\n", clip_fifo, strerror(errno)); fflush(stdout); return 2; }
+    // Now that a writer always exists (this fd), a BLOCKING read never sees EOF and simply waits
+    // for the next request line: no poll interval on the turn's critical path (the 20 ms poll cost
+    // ~10 ms per turn on average). The open itself stays non-blocking, which is what avoids the
+    // stranding deadlock; only the reads block.
+    if (!getenv("LFM_FIFO_POLL")) { int fl = fcntl(fd, F_GETFL); if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK); }
     fifo_in = fdopen(fd, "r+");
     if (!fifo_in) { printf("--clip-fifo: fdopen(%s) failed\n", clip_fifo); fflush(stdout); close(fd); return 2; }
   }

@@ -1740,13 +1740,16 @@ static int enc_read_request(const char* path, char* out, size_t cap) {
     // whole request in one write() (atomic on a fifo below PIPE_BUF), so an idle read with a
     // partial buffer means the writer is done, while accepting it immediately would be free to
     // split a request that is still arriving.
-    if (n && ++idle > 5) break;
+    if (n && ++idle > 50) break;           // ~100 ms of silence at the 2 ms poll below
     if (!n) {                                  // writer closed between requests: reopen
       close(fd);
       fd = open(path, O_RDONLY | O_NONBLOCK);
       if (fd < 0) return 0;
     }
-    struct timespec ts = { 0, 20000000 };   // 20 ms poll; a turn is seconds away
+    // 2 ms poll (was 20 ms): this wait is on the turn's critical path, half an interval per
+    // request on average. LFM_ENC_POLL_US overrides.
+    static long pus = -1; if (pus < 0) { const char* e = getenv("LFM_ENC_POLL_US"); pus = e ? atol(e) : 2000; }
+    struct timespec ts = { 0, pus * 1000 };
     nanosleep(&ts, nullptr);
   }
   out[n] = 0;
