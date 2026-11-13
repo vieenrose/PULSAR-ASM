@@ -2966,3 +2966,11 @@ algorithm (fp16 accumulation), both of which change the goldens.
   nothing: the kernel is memory-bound past 3), so the split sits at its balance point. A larger
   share needs a faster CPU kernel, not more rows; sub-512 shares for w2 / in_proj would need a
   kernel row bound and a block's time does not shrink with fewer live rows (est. < 25 ms).
+- [LFM3/Nano S2T] Split build: concurrency + 24-turn soak (2026-11-13, run #305, no source change).
+  concasr.sh 3 trials x 4 clients: every client rc=0, golden where one exists, CLIPS_DONE=13
+  ENC_DONE=13 (one per request). soak.sh 24 alternating zh/en turns, three services: all ids
+  GOLDEN, SNDR 70.09, zh 5.181-5.199 s (was 5.416-5.439 unsplit in #284), en 6.088-6.109 s (was
+  6.308-6.372), tts 0.458-0.470 s, MemAvailable 725-728 MB flat (788-790 unsplit), backbone RSS
+  101-102 MB flat, 6034 splits. No leak or drift from the split. NOT exercised: a long (>30 s)
+  turn among concurrent clients, i.e. the CPUROWS DROP line under concurrency (it is sent inside
+  the turn lock, so it should serialise, but that is by construction, not measured).
