@@ -10,8 +10,8 @@ pf() { grep "PF4-RUN: prompt" $SRV_LOG | tail -1 | grep -oE "[0-9]+ ms \(" | gre
 for A in $ORDER; do
   pkill -f "[l]fm3_nanode .*--clip-fifo"; pkill -f "[l]fm3_enc_gpu .*--serve-fifo"; pkill -f "[p]t_v21_nano .*--serve-fifo"; sleep 1
   rm -f $SRV_IN $ENC_IN; mkfifo $SRV_IN $ENC_IN; : > $SRV_LOG; : > $ENC_LOG
-  SP=1; XC=1; case $A in 0) SP=0;; 2) SP=1; XC=0;; esac   # arm 2 = split on, twin reuse off
-  LFM_CPUSPLIT=$SP LFM_CPUSPLIT_XCACHE=$XC ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $SRV_IN --prefill-run 32 > $SRV_LOG 2>&1 & SRV=$!
+  SP=1; XC=1; RT=1; case $A in 0) SP=0;; 2) SP=1; XC=0;; 3) SP=1; RT=0;; esac   # 2 = twin reuse off, 3 = buffer rotation off
+  LFM_CPUSPLIT=$SP LFM_CPUSPLIT_XCACHE=$XC LFM_CPUSPLIT_ROT=$RT ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $SRV_IN --prefill-run 32 > $SRV_LOG 2>&1 & SRV=$!
   i=0; while [ $i -lt 300 ]; do grep -q "CLIP_AWAIT 0" $SRV_LOG && break; kill -0 $SRV || break; sleep 0.5; i=$((i+1)); done
   ./lfm3_enc_gpu lfm3-audio-2b-enc.lfm3q8 - auto - --serve-fifo $ENC_IN --only proj_out > $ENC_LOG 2>&1 & ENC=$!
   i=0; while [ $i -lt 240 ]; do grep -q "ENC_AWAIT 0" $ENC_LOG && break; sleep 0.5; i=$((i+1)); done

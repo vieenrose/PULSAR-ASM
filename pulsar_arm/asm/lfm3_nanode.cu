@@ -4799,8 +4799,11 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
   // never fired queries as complete, so this costs one cudaEventQuery per split in practice).
   static std::vector<float> out[2]; static std::vector<uint16_t> hy[2];
   static cudaEvent_t evb[2] = { nullptr, nullptr }; static int bslot = 0;
-  if (!evb[0]) { cudaEventCreateWithFlags(&evb[0], cudaEventDisableTiming); cudaEventCreateWithFlags(&evb[1], cudaEventDisableTiming); }
-  if (cudaEventQuery(evb[bslot]) != cudaSuccess) cudaEventSynchronize(evb[bslot]);
+  static const int rot = getenv("LFM_CPUSPLIT_ROT") ? atoi(getenv("LFM_CPUSPLIT_ROT")) : 1;   // 0 = the old single pair, for A/B
+  if (rot) {
+    if (!evb[0]) { cudaEventCreateWithFlags(&evb[0], cudaEventDisableTiming); cudaEventCreateWithFlags(&evb[1], cudaEventDisableTiming); }
+    if (cudaEventQuery(evb[bslot]) != cudaSuccess) cudaEventSynchronize(evb[bslot]);
+  } else bslot = 0;
   const int G = (Tn + 3) / 4;
   hx.resize((size_t)Tn * K); xT.assign((size_t)K * G * 4, 0.f); out[bslot].resize((size_t)R * G * 4); hy[bslot].resize((size_t)Tn * R);
   const double t0 = cpus_now();
@@ -4828,8 +4831,7 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
     else slowrun = 0; }
   for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) hy[bslot][(size_t)t * R + rr] = cpu_f2bf(0.f + out[bslot][(size_t)rr * G * 4 + t]);
   cudaMemcpy2DAsync(y + r0, (size_t)N * 2, hy[bslot].data(), (size_t)R * 2, (size_t)R * 2, Tn, cudaMemcpyHostToDevice, g_cpus);
-  cudaEventRecord(evb[bslot], g_cpus);
-  bslot ^= 1;
+  if (rot) { cudaEventRecord(evb[bslot], g_cpus); bslot ^= 1; }
   cudaEventRecord(g_cpue1, g_cpus);
   cudaStreamWaitEvent(g_launch, g_cpue1, 0);
   g_cpus_wait += t1 - t0; g_cpus_comp += cpus_now() - t1; g_cpus_n++;
