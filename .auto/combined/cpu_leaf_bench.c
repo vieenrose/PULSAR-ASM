@@ -125,6 +125,17 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < (size_t)N * nb; i++) S[i] = ldexpf((float)(rand() % 1000 + 1), -17);
   for (size_t i = 0; i < (size_t)T * K; i++) X[i] = ((float)rand() / RAND_MAX - 0.5f) * 4.f;
   stage_x();
+  // Load mode (contention test, run #294): argv[5] = seconds, argv[6] = threads. No check: run the
+  // 2-rows/pass kernel back to back for that long and report the achieved rate, so it can sit beside
+  // a real resident ASR turn and show what each side does to the other.
+  if (argc > 5) {
+    const double secs = atof(argv[5]); const int nth = argc > 6 ? atoi(argv[6]) : 3;
+    g_two = 1; long n = 0; const double t0 = now();
+    while (now() - t0 < secs) { run(nth); n++; }
+    const double t = now() - t0;
+    printf("LOAD threads=%d runs=%ld %.2f s  %.2f GMAC/s\n", nth, n, t, (double)N * K * T * n / t * 1e-9);
+    return 0;
+  }
   run(4);
   long bad = 0;
   for (int r = 0; r < N; r++)

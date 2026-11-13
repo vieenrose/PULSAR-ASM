@@ -2835,3 +2835,25 @@ algorithm (fp16 accumulation), both of which change the goldens.
   the GPU's rows, H2D of the CPU's y, join) inside the real prefill chunk; build only if it is
   <~0.15 ms per split. Mapped memory is CPU-uncached on Tegra (Bonsai #53) and managed memory blocks
   concurrent access, so the hand-off has to be real copies.
+- [LFM3/Nano S2T] CPU share of the prefill: the hand-off and the contention are measured, both
+  favourable -> BUILD (2026-11-13, run #294, diagnostic; handoff_probe.cu, contend.sh).
+  (1) Hand-off latency L (handoff_probe.cu, real chunk sizes: x 32x2048 fp32 D2H pinned, host sees it,
+  y 32x640 fp32 H2D, consumer kernel; median of 200, two runs): GPU idle 0.277-0.323 ms; with a spin
+  kernel occupying the SM on another stream 1.056-1.062 ms. A split GEMV of unsplit GPU time G whose
+  CPU share is balanced to finish with the GPU's rows saves (G - L)/(1 + r), r = GPU/CPU rate, so L
+  costs only L/(1+r) per split: it does not halve the prize as I estimated in #293.
+  (2) Contention (contend.sh, real resident zh turns, cpu_leaf_bench loading 3 cores for the whole
+  turn): GPU prefill 3895/3894/3898 ms quiet vs 3902/3905/3908 loaded (+0.25%), ids identical; the
+  CPU kernel 6.06 GMAC/s alone vs 5.15-5.24 beside the prefill (-14%). Opposite of Bonsai #75: this
+  prefill is compute-bound, and the CPU share reuses its rows across the 32 positions.
+  Revised bound, 3 workers at 5.2 GMAC/s vs GPU ~50 (r ~ 9.6), L = 1.06 ms on all 576 splits:
+  (3890 - 576 x 1.06)/10.6 ~ 0.31 s/turn (~5% of asr_wall); more if short GEMVs are not split.
+  BUILD PLAN (exactness first): (a) reproduce the GPU leaf's EXACT order for the split rows -- the
+  per-32-block dot + fma(scale) chain is matched bitwise already (#293); the cross-leaf pairwise st[]
+  tree of q8_partial_TLg (k-order permutation + __fadd_rn tree) must be transcribed and checked on
+  real rows against the GPU's own output (bitwise, every row and position of a chunk) before any
+  timing; (b) weights for the CPU rows repacked row-major int8 + f32 scales at load (host RAM, ~share
+  x 1.95 GB); (c) split per GEMV: GPU runs rows [0, N-n_cpu), D2H of x, 3 spinning workers run the
+  tail rows, H2D into the same output buffer, the next kernel waits on that copy; share per shape
+  from G and the measured rates; only GEMVs with G >> L; (d) gate: ids == goldens + LFM_DUMPX
+  last-position residual md5 (70b78a7b zh / 9591fe6c en) + generalize.sh.
