@@ -57,6 +57,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>
 #include <cstdint>
 #include <cmath>
 #include <string>
@@ -5354,6 +5355,21 @@ int main(int argc, char** argv) {
   const int steps_base = steps;   // per-clip ngen rewrites `steps`; an absent line 4 must not leak
   g_stop_id = stop_id_arg;        // a SPEC's line 5 overrides this per clip
   printf("LFM3_CLIPMODE BUILD=2026-11-03B nclip=%d%s\n", nclip, clip_stdin ? " stdin" : ""); fflush(stdout);
+  // The service keeps ONE read end of the request fifo open for its whole life, opened O_RDWR so
+  // that a writer is always present: a client's O_WRONLY open can then never see ENXIO, and this
+  // side never sees EOF. The first version closed the fd at EOF and reopened it, which deadlocks
+  // with a client that writes its spec path and closes before the service returns to the fifo: the
+  // line sits in the pipe while the service blocks in open() waiting for a writer that has already
+  // gone. With two concurrent ASR clients that is a 400 s wait for a CLIP DONE that never comes
+  // (measured; .auto/combined/concasr.sh). O_NONBLOCK so the read side never blocks in open()
+  // either; the fifo path is only used as a service, so a piped-in batch keeps stdin semantics.
+  FILE* fifo_in = nullptr;
+  if (clip_fifo) {
+    int fd = open(clip_fifo, O_RDWR | O_NONBLOCK);
+    if (fd < 0) { printf("--clip-fifo: cannot open %s (%s)\n", clip_fifo, strerror(errno)); fflush(stdout); return 2; }
+    fifo_in = fdopen(fd, "r+");
+    if (!fifo_in) { printf("--clip-fifo: fdopen(%s) failed\n", clip_fifo); fflush(stdout); close(fd); return 2; }
+  }
   for (int cl = 0; ; cl++) {
   // Where this pass's spec comes from: --clip files, then (with --clip-stdin) one path per
   // line read from stdin, which is what makes the process a SERVICE: the client writes a spec
@@ -5363,14 +5379,14 @@ int main(int argc, char** argv) {
   if (clip_stdin) {
     char ln[4096];
     printf("CLIP_AWAIT %d\n", cl); fflush(stdout);
-    if (!fgets(ln, sizeof ln, stdin)) {
+    if (!fgets(ln, sizeof ln, fifo_in ? fifo_in : stdin)) {
+      if (fifo_in) { clearerr(fifo_in); struct timespec ts = {0, 20000000}; nanosleep(&ts, nullptr); continue; }
       // A service outlives its clients: every ASR turn is its own process, so when the last
       // writer closes the fifo the read side returns EOF -- that is the end of a TURN's writer,
       // not of the session. Reopen the same path (open on a fifo for reading blocks until the
       // next writer arrives) and keep serving. Without a --clip-fifo path there is nothing to
       // reopen and EOF stays the end of the run, which is what a piped-in batch means.
-      if (clip_fifo && freopen(clip_fifo, "r", stdin)) { printf("CLIP_EOF reopened %s\n", clip_fifo); fflush(stdout); continue; }
-      break;
+      break;   // a piped-in batch: EOF is the end of the run
     }
     char* nl = strchr(ln, '\n'); if (nl) *nl = 0;
     if (!ln[0] || !strcmp(ln, "Q")) break;

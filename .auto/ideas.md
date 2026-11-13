@@ -2774,3 +2774,29 @@ algorithm (fp16 accumulation), both of which change the goldens.
   exited at request 3 of 20), and pgrep on the fifo path matched the `timeout sh -c` request writers,
   so the RSS was read from an exited pid (delta printed as -216). Harness 0.5058, all four gates +
   checks.sh green; the metric is untouched by design (a good request never enters this path).
+- [LFM3/Nano S2T] Concurrent ASR clients were broken two ways; both fixed (2026-11-13, run #288,
+  keep; .auto/combined/concasr.sh). Nobody had ever run two lfm3_asr clients against the resident
+  services -- the harness runs one turn at a time -- and the N>1 case is on the feature backlog.
+  Both service clients assume serialised traffic in code: the encoder client derives its request
+  index by COUNTING the ENC_DONE lines already in the log ("turns are serialised, so that count is
+  this turn's index"), and the backbone client waits for the first "CLIP n DONE steps=" after the
+  log offset it noted before writing its spec. Measured with 2 concurrent clients: the loser
+  returned on the winner's reply and read a proj_out.bin that did not exist
+  ("lfm3_enc_gpu produced -1 bytes at /tmp/lfm3_asr.<pid>.d/proj_out.bin (expected >= 925696)",
+  rc=2), 3 of 4 trials failing. FIX 1 (client): turn_lock()/turn_unlock(), an advisory flock on
+  /tmp/lfm3_asr.turn.lock held from the first service touch (the encoder request WRITE, which
+  happens in stage 1 because the pass overlaps the CPU work -- a lock taken where the reply is
+  awaited is too late, the first attempt failed 3/4 exactly that way) until the backbone clip is
+  done; the kernel drops it on exit so no error path unwinds it; LFM_ASR_SERIALIZE=0 control,
+  LFM_ASR_LOCK moves the file. FIX 2 (service, found after fix 1 left one 400 s hang): the clip
+  fifo's read end was closed at EOF and reopened with freopen(), which deadlocks when a client
+  writes and closes while the service is busy -- the line sits in the pipe while the service
+  blocks in open() waiting for a writer that has already left. Now opened ONCE O_RDWR|O_NONBLOCK
+  for the life of the service (a writer always exists, so clients never get ENXIO and the service
+  never sees EOF), with clearerr+20 ms on an empty read; a piped-in batch keeps stdin/EOF
+  semantics. Result: 4 trials x 2 clients and 3 trials x 4 clients, every client rc=0 with its own
+  frozen golden, and CLIPS_DONE/ENC_DONE exactly one per request (9 and 13) -- no lost or doubled
+  specs. Queueing is the right model here anyway: one SM, and the backbone serialises clips itself.
+  Harness 0.5060 all gates green; generalize.sh 7/7 identical + 7/7 TTS bytes + 0 guard trips.
+  Harness trap while measuring: concasr.sh's bare `wait` also waited for the two long-lived
+  services, so the first version looked like a 25-minute hang after the clients had exited.

@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/file.h>   /* flock: serialise resident service turns (see turn_lock) */
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
@@ -126,6 +127,36 @@ static int stage_no = 0;
 
 static char WORK_MEL[1100], WORK_OUT[1100], WORK_MELP[1100];
 static pid_t g_bb_pid = 0;    /* backbone child (started early), killed the same way */
+/* Resident turns must not overlap. Both service clients assume serialised traffic -- the encoder
+   client derives its request index by COUNTING the ENC_DONE lines already in the log ("turns are
+   serialised, so that count is this turn's index"), and the backbone client waits for the first
+   "CLIP n DONE steps=" after the log offset it noted before writing its spec. Two clients arriving
+   together therefore both wait for the FIRST completion: the loser returns before its own pass ran
+   and reads a proj_out.bin that does not exist yet (measured on the board: one client died with
+   "lfm3_enc_gpu produced -1 bytes at /tmp/lfm3_asr.<pid>.d/proj_out.bin (expected >= 925696)" while
+   the other finished normally). Serialize the resident request on an advisory lock: a second user's
+   turn queues behind the first, which is what the hardware does anyway (one SM, and the backbone
+   serialises its clips itself). flock is dropped by the kernel when this process exits, so no error
+   path has to unwind it; LFM_ASR_SERIALIZE=0 is the control arm. LFM_ASR_LOCK moves the lock file
+   (per-service-instance testing). */
+static int g_turn_fd = -1;
+static void turn_lock(void) {
+  if (g_turn_fd >= 0) return;
+  if (getenv("LFM_ASR_SERIALIZE") && !atoi(getenv("LFM_ASR_SERIALIZE"))) return;
+  const char* lp = getenv("LFM_ASR_LOCK");
+  if (!lp || !*lp) lp = "/tmp/lfm3_asr.turn.lock";
+  int fd = open(lp, O_RDWR | O_CREAT, 0644);
+  if (fd < 0) return;                       /* cannot create it: run unsynchronised, do not fail */
+  if (flock(fd, LOCK_EX) != 0) { close(fd); return; }
+  g_turn_fd = fd;
+}
+static void turn_unlock(void) {
+  if (g_turn_fd < 0) return;
+  flock(g_turn_fd, LOCK_UN);
+  close(g_turn_fd);
+  g_turn_fd = -1;
+}
+
 static pid_t g_enc_pid = 0;   /* encoder child, killed if this shell dies before reaping it */
 /* atexit: remove the per-run work files (PCM, mel, proj_out and its dir). Each run left
    ~115 MB under /tmp and 132 of them filled picard's root fs. The engine log (2 KB) stays.
@@ -459,6 +490,11 @@ int main(int argc, char **argv) {
     die("%s is %ld bytes, not a multiple of the 128-row f32 frame (%ld)", MELP, mel_bytes, (long)(128*4));
   if (rename(MELP, MEL) != 0) die("cannot publish %s", MEL);
   if (enc_in) {
+    /* This request write is the first touch of a shared service, so the serialising lock starts
+       HERE, not in stage 3 where the reply is awaited: the encoder is deliberately requested early
+       (its pass overlaps stages 1-2), and a lock taken after the write lets two clients queue
+       behind each other's replies anyway. The lock is then held until the backbone clip is done. */
+    turn_lock();
     /* Hand the mel to the resident encoder (the one-shot path pays ~1.9 s of CUDA init + blob
        CRC/upload per turn for a pass that itself takes ~0.2 s). The request index is the number
        of ENC_DONE lines already in the log: turns are serialised, so that count is this turn's
@@ -649,6 +685,7 @@ int main(int argc, char **argv) {
     fprintf(sf, "%s\n%s\n%ld\n%d\n%s\n", OUT, idstr, audio_at, max_gen,
             (getenv("LFM_ASR_STOPID") && !atoi(getenv("LFM_ASR_STOPID"))) ? "-1" : siv);
     fclose(sf);
+    turn_lock();   /* idempotent; covers a client that uses the backbone service only */
     long s0 = file_size(srv_log);
     int wf = fifo_open_w(srv_in);
     if (wf < 0) die("--serve-in %s: cannot open for writing (%s) -- is the resident backbone running?", srv_in, strerror(errno));
@@ -684,6 +721,7 @@ int main(int argc, char **argv) {
       }
     }
     fclose(ef); close(rf);
+    turn_unlock();   /* the services are done with this turn; detokenizing needs neither */
   } else if (early) {
     if (rename(OUT, PUB) != 0) die("cannot publish %s", PUB);
     snprintf(WORK_OUT, sizeof WORK_OUT, "%s", PUB);
