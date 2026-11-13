@@ -2904,3 +2904,14 @@ algorithm (fp16 accumulation), both of which change the goldens.
   of the 3-core fp32 FMLA peak (~17.7 GFMA/s at 1479 MHz) with 16 independent chains: the next
   suspects are the per-call thread spawn (k/v calls are tiny) and the vcvt/vmovl issue share.
   Patch: .auto/attic/row298_neon_rows4_probe.patch (reverted, 2026-11-13, run #298).
+- [LFM3/Nano S2T] CPU row share of the batched prefill SHIPPED (2026-11-13, run #299, LFM_CPUSPLIT
+  default 1, 0 = control). w1/w3 (N 7680 = 15 x 512): the GPU kernel launches one 512-row block
+  fewer (kernel unchanged), 3 std::threads run the last 512 rows with lfm3_neon_rows2 (row-major
+  repack of the tail at first use, ~50 MB host), hand-off via a second stream (event before the GPU
+  launch -> D2H x, CPU, f2bf, 2-D H2D into y, g_launch waits). ab_split.sh ABBA x 3 reps x zh/en,
+  one build: prefill 3895-3904 (off) vs 3777-3793 ms (on) = -113 ms (-2.9%), turn -0.11 s, every
+  pair separated, ids identical; LFM_DUMPX=132 residual md5 70b78a7b / 9591fe6c in both arms
+  (= #264's). Per split: x wait 7.8 ms (preceding GPU work), CPU compute+put 7.4 ms.
+  Levers left on it: persistent workers, also w2 / in_proj (need a non-512 share or a kernel row
+  bound), q/k/v grouping; the share (6.7%) is ~ balanced with the rate ratio, so a faster CPU kernel
+  is what moves it further.

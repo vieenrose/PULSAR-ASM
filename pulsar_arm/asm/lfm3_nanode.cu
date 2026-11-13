@@ -4681,6 +4681,68 @@ static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf1
   }
 }
 
+// ---- LFM_CPUSPLIT=1: CPU row share of the batched prefill (run #299), step (c).
+// For the 512-row-block tiled GEMVs with N % 512 == 0 and N >= 4096 (w1 / w3, N 7680), the GPU
+// kernel is launched over N - 512 rows (the grid simply has one row block fewer: the kernel itself
+// is unchanged) and the last 512 rows are computed by 3 CPU threads with lfm3_neon_rows2, the
+// bitwise-checked transcription of the same leaf order (#295-#297). Hand-off: a second stream waits
+// for an event recorded before the GPU launch (x is ready), copies x to the host, the CPU computes,
+// f2bf, and a 2-D H2D writes the 512 columns into y; g_launch waits for that copy. Exact: every
+// output is either the GPU's or the transcription's, which match bit for bit.
+static int g_cpusplit = getenv("LFM_CPUSPLIT") ? atoi(getenv("LFM_CPUSPLIT")) : 1;   // default on (#299)
+struct CpuRows { std::vector<int8_t> q; std::vector<float> s; int R = 0; };
+static std::map<const Ent*, CpuRows> g_cpurows;
+static cudaStream_t g_cpus = nullptr; static cudaEvent_t g_cpue0 = nullptr, g_cpue1 = nullptr;
+static double g_cpus_wait = 0, g_cpus_comp = 0; static long g_cpus_n = 0;
+static void cpusplit_dump() { printf("CPUSPLIT splits=%ld x_wait %.1f ms compute+put %.1f ms\n", g_cpus_n, g_cpus_wait * 1e3, g_cpus_comp * 1e3); fflush(stdout); }
+static int cpusplit_rows(Ent* e, int N, int K, int nb, int Tn, const bf16* yb) {
+  if (!g_cpusplit || !yb || !e->tiled || N % 512 || N < 4096 || Tn > 32 || Tn < 1 || !lfm3_neon_rows2) return 0;
+  return 512;
+}
+static void cpusplit_pre() {   // before the GPU launch: x is ready once this event fires
+  if (!g_cpus) { cudaStreamCreateWithFlags(&g_cpus, cudaStreamNonBlocking); cudaEventCreateWithFlags(&g_cpue0, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&g_cpue1, cudaEventDisableTiming); atexit(cpusplit_dump); }
+  cudaEventRecord(g_cpue0, g_launch);
+}
+static double cpus_now() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, int Tn, int R) {
+  CpuRows& cr = g_cpurows[e];
+  const int r0 = N - R;
+  if (cr.R != R) {   // first use: read the tail rows back from the tiled layout, repack row-major
+    const size_t tq = (size_t)nb * 64 * 16;
+    std::vector<int8_t> hq((size_t)(R / 32) * tq); std::vector<float> hs((size_t)(R / 32) * nb * 32);
+    cudaDeviceSynchronize();
+    cudaMemcpy(hq.data(), e->dq + (size_t)(r0 / 32) * tq, hq.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hs.data(), e->ds + (size_t)(r0 / 32) * nb * 32, hs.size() * 4, cudaMemcpyDeviceToHost);
+    cr.q.resize((size_t)R * K); cr.s.resize((size_t)R * nb);
+    for (int rr = 0; rr < R; rr++) for (int b = 0; b < nb; b++) {
+      const int8_t* t8 = hq.data() + (size_t)(rr >> 5) * tq;
+      memcpy(&cr.q[(size_t)rr * K + b * 32], t8 + ((size_t)b * 64 + (rr & 31)) * 16, 16);
+      memcpy(&cr.q[(size_t)rr * K + b * 32 + 16], t8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16, 16);
+      cr.s[(size_t)rr * nb + b] = hs[(size_t)(rr >> 5) * nb * 32 + (size_t)b * 32 + (rr & 31)];
+    }
+    cr.R = R;
+  }
+  static std::vector<uint16_t> hx; static std::vector<float> xT, out; static std::vector<uint16_t> hy;
+  const int G = (Tn + 3) / 4;
+  hx.resize((size_t)Tn * K); xT.assign((size_t)K * G * 4, 0.f); out.resize((size_t)R * G * 4); hy.resize((size_t)Tn * R);
+  const double t0 = cpus_now();
+  cudaStreamWaitEvent(g_cpus, g_cpue0, 0);
+  cudaMemcpyAsync(hx.data(), x, hx.size() * 2, cudaMemcpyDeviceToHost, g_cpus);
+  cudaStreamSynchronize(g_cpus);
+  const double t1 = cpus_now();
+  for (int t = 0; t < Tn; t++) for (int kk = 0; kk < K; kk++) xT[(size_t)kk * G * 4 + t] = cpu_bf2f(hx[(size_t)t * K + kk]);
+  std::thread th[3]; const int per = R / 3 / 2 * 2; int lo = 0;
+  for (int w = 0; w < 3; w++) { const int hi = w == 2 ? R : lo + per;
+    th[w] = std::thread(lfm3_neon_rows2, cr.q.data(), cr.s.data(), xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); lo = hi; }
+  for (auto& t : th) t.join();
+  for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) hy[(size_t)t * R + rr] = cpu_f2bf(0.f + out[(size_t)rr * G * 4 + t]);
+  cudaMemcpy2DAsync(y + r0, (size_t)N * 2, hy.data(), (size_t)R * 2, (size_t)R * 2, Tn, cudaMemcpyHostToDevice, g_cpus);
+  cudaEventRecord(g_cpue1, g_cpus);
+  cudaStreamWaitEvent(g_launch, g_cpue1, 0);
+  g_cpus_wait += t1 - t0; g_cpus_comp += cpus_now() - t1; g_cpus_n++;
+}
+
 static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
                      float* part, int Tn) {
   Ent* e = T(M, name);
@@ -4718,12 +4780,16 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
     static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 9;
     static const int gsw = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
-    const dim3 gg = gsw ? dim3((Tn + 3) / 4, (N + 511) / 512) : dim3((N + 511) / 512, (Tn + 3) / 4);
+    const int csr = cpusplit_rows(e, N, K, nb, Tn, yb);
+    if (csr) cpusplit_pre();
+    const int Ng = N - csr;
+    const dim3 gg = gsw ? dim3((Tn + 3) / 4, (Ng + 511) / 512) : dim3((Ng + 511) / 512, (Tn + 3) / 4);
     if (tlgs == 9)      q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 8) q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 4) q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 1) q8_partial_TLg<1><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else                q8_partial_TLg<0><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+    if (csr) cpusplit_run(e, x, y, N, K, nb, Tn, csr);
     goto launched;
   }
   if (pf_ph && nch == 1 && 4 * per > lim && Tn >= 4) {
@@ -4755,7 +4821,10 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
     static const int pftlf = getenv("LFM_PF_TLF") ? atoi(getenv("LFM_PF_TLF")) : 4;
     if (pftlf && tpb == 512 && (size_t)4 * K * 4 <= 48 * 1024) {
       static const int gswf = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
-      const dim3 gl = gswf ? dim3((Tn + 3) / 4, (N + tpb - 1) / tpb) : dim3((N + tpb - 1) / tpb, (Tn + 3) / 4);
+      const int csr = cpusplit_rows(e, N, K, nb, Tn, yb);
+      if (csr) cpusplit_pre();
+      const int Ng = N - csr;
+      const dim3 gl = gswf ? dim3((Tn + 3) / 4, (Ng + tpb - 1) / tpb) : dim3((Ng + tpb - 1) / tpb, (Tn + 3) / 4);
       static const bool rng = getenv("LFM_TLF_RANGE") != nullptr;
       if (rng && nb == 64) { static bool r = false; if (!r) { atexit(tlf_range_dump); r = true; }
         k_tlf_range<<<64, 256, 0, g_launch>>>(x, (long)Tn * K); }
@@ -4765,6 +4834,7 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
       else if (pftlf == 4 && nb == 64) q8_partial_TLf<512, 4, 4><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else            q8_partial_TLf<512, 4, 1><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+      if (csr) cpusplit_run(e, x, y, N, K, nb, Tn, csr);
       goto launched;
     }
     if (tpb == 512) q8_partial_TLb<512><<<gl, 512, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
