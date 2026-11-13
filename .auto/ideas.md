@@ -2947,3 +2947,13 @@ algorithm (fp16 accumulation), both of which change the goldens.
   only if memory frees up (e.g. encoder activation cut for long clips, or two services instead of
   three) -- then (1) is a measured -2.9% prefill. Code kept behind LFM_CPUSPLIT=1
   (LFM_CPUSPLIT_MMAP=0|1).
+- [LFM3/Nano S2T] CPU split + long-turn drop, mixed-length soak (2026-11-13, run #302, no engine
+  change). soak.sh 12 turns, CLIPS = zh zh 110s zh zh zh (x2), three services, LFM_CPUSPLIT 1 vs 0
+  in separate sessions: every turn rc=0, ids STABLE/GOLDEN, SNDR 70.09, 2 drops acked in the split
+  arm. Short steady turns 5.212-5.230 s (split) vs 5.324-5.356 s (off) = -0.12 s (-2.3%); prefill
+  3774-3802 vs 3903-3927 ms. First short turn after a long one: 5.447 / 5.488 (split) vs 5.580 /
+  5.553 (off), i.e. the same +0.22-0.27 s post-long tax in both arms (#284b): the row rebuild is not
+  visible there, because it happens inside the long turn's own prefill (first split call after the
+  encoder pass). Long turn 63.77 / 62.92 s (split) vs 63.31 / 64.58 s (off), prefill 46.19-46.29 vs
+  46.40-46.67 s: no regression, gain only ~0.2-0.4 s (the rebuild is paid there). Cost: MemAvailable
+  701-745 MB (split) vs 767-806 MB (off), backbone RSS 89-102 vs 28-31 MB.
