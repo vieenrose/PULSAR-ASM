@@ -4704,8 +4704,8 @@ static cudaStream_t g_cpus = nullptr; static cudaEvent_t g_cpue0 = nullptr, g_cp
 // layers instead of 4 KB faults inside the prefill; when they are resident it is a cheap no-op.
 static std::vector<std::pair<void*, size_t>> g_cpus_maps;
 static void cpusplit_prefetch() { for (auto& m : g_cpus_maps) madvise(m.first, m.second, MADV_WILLNEED); }
-static double g_cpus_wait = 0, g_cpus_comp = 0; static long g_cpus_n = 0;
-static void cpusplit_dump() { printf("CPUSPLIT splits=%ld x_wait %.1f ms compute+put %.1f ms\n", g_cpus_n, g_cpus_wait * 1e3, g_cpus_comp * 1e3); fflush(stdout); }
+static double g_cpus_wait = 0, g_cpus_comp = 0, g_cpus_rb = 0, g_cpus_rbsync = 0; static long g_cpus_n = 0, g_cpus_nrb = 0;
+static void cpusplit_dump() { printf("CPUSPLIT splits=%ld x_wait %.1f ms compute+put %.1f ms; row builds=%ld %.1f ms (of which sync %.1f ms)\n", g_cpus_n, g_cpus_wait * 1e3, g_cpus_comp * 1e3, g_cpus_nrb, g_cpus_rb * 1e3, g_cpus_rbsync * 1e3); fflush(stdout); }
 static int cpusplit_rows(Ent* e, int N, int K, int nb, int Tn, const bf16* yb) {
   if (!g_cpusplit || !yb || !e->tiled || N % 512 || N < 4096 || Tn > 32 || Tn < 1 || !lfm3_neon_rows2) return 0;
   return 512;
@@ -4733,8 +4733,10 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
   const int r0 = N - R;
   if (cr.R != R) {   // first use: read the tail rows back from the tiled layout, repack row-major
     const size_t tq = (size_t)nb * 64 * 16;
+    const double rb0 = cpus_now();
     std::vector<int8_t> hq((size_t)(R / 32) * tq); std::vector<float> hs((size_t)(R / 32) * nb * 32);
     cudaDeviceSynchronize();
+    g_cpus_rbsync += cpus_now() - rb0;
     cudaMemcpy(hq.data(), e->dq + (size_t)(r0 / 32) * tq, hq.size(), cudaMemcpyDeviceToHost);
     cudaMemcpy(hs.data(), e->ds + (size_t)(r0 / 32) * nb * 32, hs.size() * 4, cudaMemcpyDeviceToHost);
     // #300: the blob stores each tensor as nc row-major code bytes then ns scale bytes ([N][nb]
@@ -4776,6 +4778,7 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
       cr.s[(size_t)rr * nb + b] = hs[(size_t)(rr >> 5) * nb * 32 + (size_t)b * 32 + (rr & 31)];
     }
     cr.R = R;
+    g_cpus_rb += cpus_now() - rb0; g_cpus_nrb++;
   }
   static std::vector<uint16_t> hx; static std::vector<float> xT, out; static std::vector<uint16_t> hy;
   const int G = (Tn + 3) / 4;

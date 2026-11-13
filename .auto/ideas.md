@@ -3023,3 +3023,12 @@ algorithm (fp16 accumulation), both of which change the goldens.
   drop is untested apart from #299's memguard trip at 110 s, so the threshold is not pushed higher.
   Note the ~0.7 s rebuild: for >75 s turns the drop still costs more time than the split returns;
   it is there for memory, not speed.
+- [LFM3/Nano S2T] CPU-row rebuild priced (2026-11-13, run #311; timer added to the CPUSPLIT exit
+  line, no behaviour change). 61 tensors are split (68.6 MB of rows). One build of all 61: boot
+  622 ms, of which 400 ms is the cudaDeviceSynchronize before each read-back (queued GPU work that
+  has to run anyway) and ~220 ms the D2H + repack; after a long-turn drop 1751 - 622 = ~1130 ms
+  accounted (sync ~890 ms, repack ~240 ms) inside a 30.8 s prefill that is ~0.7 s slower than the
+  no-drop arm (#310). So the recoverable part for a > 75 s turn is the ~0.24 s repack plus whatever
+  of the sync is pipeline stall: at most ~0.7 s of a 45-63 s turn (~1%), long turns only. Not built.
+  Also retracts #310's hint: skipping the split on the long turn and rebuilding afterwards would
+  lose more (the split saves ~1.3 s of a 46 s prefill) than the rebuild costs.
