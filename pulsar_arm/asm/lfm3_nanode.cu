@@ -4786,10 +4786,15 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
   cudaStreamSynchronize(g_cpus);
   const double t1 = cpus_now();
   for (int t = 0; t < Tn; t++) for (int kk = 0; kk < K; kk++) xT[(size_t)kk * G * 4 + t] = cpu_bf2f(hx[(size_t)t * K + kk]);
-  std::thread th[3]; const int per = R / 3 / 2 * 2; int lo = 0;
-  for (int w = 0; w < 3; w++) { const int hi = w == 2 ? R : lo + per;
-    th[w] = std::thread(lfm3_neon_rows2, cr.mq ? cr.mq : cr.q.data(), cr.ms ? cr.ms : cr.s.data(), xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); lo = hi; }
-  for (auto& t : th) t.join();
+  // LFM_CPUSPLIT_TH (default 3): worker count; the calling thread is the last worker (it would
+  // only block in join otherwise), so TH threads means TH - 1 spawns.
+  static const int TH = std::max(1, std::min(8, getenv("LFM_CPUSPLIT_TH") ? atoi(getenv("LFM_CPUSPLIT_TH")) : 3));
+  std::thread th[8]; const int per = R / TH / 2 * 2; int lo = 0;
+  const int8_t* wq = cr.mq ? cr.mq : cr.q.data(); const float* wsc = cr.ms ? cr.ms : cr.s.data();
+  for (int w = 0; w < TH - 1; w++) { const int hi = lo + per;
+    th[w] = std::thread(lfm3_neon_rows2, wq, wsc, xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); lo = hi; }
+  lfm3_neon_rows2(wq, wsc, xT.data(), K, nb, G, lo, R, out.data() + (size_t)lo * G * 4);
+  for (int w = 0; w < TH - 1; w++) th[w].join();
   for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) hy[(size_t)t * R + rr] = cpu_f2bf(0.f + out[(size_t)rr * G * 4 + t]);
   cudaMemcpy2DAsync(y + r0, (size_t)N * 2, hy.data(), (size_t)R * 2, (size_t)R * 2, Tn, cudaMemcpyHostToDevice, g_cpus);
   cudaEventRecord(g_cpue1, g_cpus);

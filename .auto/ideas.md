@@ -2957,3 +2957,12 @@ algorithm (fp16 accumulation), both of which change the goldens.
   encoder pass). Long turn 63.77 / 62.92 s (split) vs 63.31 / 64.58 s (off), prefill 46.19-46.29 vs
   46.40-46.67 s: no regression, gain only ~0.2-0.4 s (the rebuild is paid there). Cost: MemAvailable
   701-745 MB (split) vs 767-806 MB (off), backbone RSS 89-102 vs 28-31 MB.
+- [LFM3/Nano S2T] CPU split thread sweep; the caller is now a worker (2026-11-13, run #303,
+  LFM_CPUSPLIT_TH default 3 = 2 spawned threads + the launching thread, which only blocked in join
+  before). ab_split.sh split-on sessions, 2 zh + 2 en turns each, order 3/4/2/1/4/3, prefill ms:
+  TH=3 3747-3763 and 3753-3767; TH=4 3759-3762 and 3760-3763; TH=2 3795-3819; TH=1 4958-5206.
+  Before (3 spawned, caller idle): 3777-3793 -> about -25 ms; ids identical in every turn. Reading:
+  the CPU side is marginally the critical path at 512 rows (2 threads lose 45 ms, a 4th gains
+  nothing: the kernel is memory-bound past 3), so the split sits at its balance point. A larger
+  share needs a faster CPU kernel, not more rows; sub-512 shares for w2 / in_proj would need a
+  kernel row bound and a block's time does not shrink with fewer live rows (est. < 25 ms).
