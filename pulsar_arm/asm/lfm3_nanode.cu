@@ -4699,6 +4699,11 @@ static std::string g_cpus_blob; static size_t g_cpus_base = 0;
 static int g_cpus_mmap = getenv("LFM_CPUSPLIT_MMAP") ? atoi(getenv("LFM_CPUSPLIT_MMAP")) : 1;
 static std::map<const Ent*, CpuRows> g_cpurows;
 static cudaStream_t g_cpus = nullptr; static cudaEvent_t g_cpue0 = nullptr, g_cpue1 = nullptr;
+// Mapped CPU-row ranges (page-aligned), re-advised WILLNEED at every clip start (#300): when memory
+// pressure between turns has dropped them, this is one sequential readahead overlapping the first
+// layers instead of 4 KB faults inside the prefill; when they are resident it is a cheap no-op.
+static std::vector<std::pair<void*, size_t>> g_cpus_maps;
+static void cpusplit_prefetch() { for (auto& m : g_cpus_maps) madvise(m.first, m.second, MADV_WILLNEED); }
 static double g_cpus_wait = 0, g_cpus_comp = 0; static long g_cpus_n = 0;
 static void cpusplit_dump() { printf("CPUSPLIT splits=%ld x_wait %.1f ms compute+put %.1f ms\n", g_cpus_n, g_cpus_wait * 1e3, g_cpus_comp * 1e3); fflush(stdout); }
 static int cpusplit_rows(Ent* e, int N, int K, int nb, int Tn, const bf16* yb) {
@@ -4744,7 +4749,8 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
             diff += memcmp(mq + (size_t)rr * K + b * 32 + 16, t8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16, 16) != 0;
             diff += memcmp(&ms[(size_t)rr * nb + b], &hs[(size_t)(rr >> 5) * nb * 32 + (size_t)b * 32 + (rr & 31)], 4) != 0;
           }
-          if (!diff) { cr.mq = mq; cr.ms = ms; mapped = true; }
+          if (!diff) { cr.mq = mq; cr.ms = ms; mapped = true;
+            g_cpus_maps.push_back({pq, cq - aq + (size_t)R * K}); g_cpus_maps.push_back({ps, cs - as + (size_t)R * nb * 4}); }
           else { printf("CPUSPLIT %s: blob rows differ from the device copy -> anonymous repack\n", e->name.c_str());
                  munmap(pq, cq - aq + (size_t)R * K); munmap(ps, cs - as + (size_t)R * nb * 4); }
         }
@@ -5671,6 +5677,7 @@ int main(int argc, char** argv) {
     audio_emb_file = (embp[0] && strcmp(embp, "-")) ? strdup(embp) : nullptr;
     if (g_aemb) { cudaFree(g_aemb); g_aemb = nullptr; }
     g_aemb_n = 0; g_aemb_fed = 0;
+    cpusplit_prefetch();
     printf("CLIP %d START ids=%zu emb=%s at=%d ngen=%d\n", cl, prompt.size(),
            audio_emb_file ? audio_emb_file : "-", g_aemb_at, steps - (int)prompt.size());
     fflush(stdout);
