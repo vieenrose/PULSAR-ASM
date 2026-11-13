@@ -55,6 +55,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <cstring>
 #include <cerrno>
@@ -1173,6 +1174,7 @@ struct Model {
   HostEmb hemb;
   std::string path;
   size_t emb_file_off = 0;
+  std::string blob_path; size_t blob_base = 0;   // for the CPU prefill share's mmap (#300)
   bf16 *x, *h1, *h2, *h3, *h4, *q, *k, *v, *attn, *gate, *bx, *cy, *ring;
   bf16* hgu = nullptr;   // 2*INTER: merged gate/up GEMV output (LFM_MERGE)
   // Graph mode step state. dpos holds {pos, pos+1} on the device; the graph's
@@ -1433,6 +1435,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   if (fread(&js[0], 1, n, f) != n) { fclose(f); return false; }
   js[n] = 0;
   const size_t base_data = 8 + 4 + (size_t)n;
+  M.blob_path = path; M.blob_base = base_data;
 
   // The header table is JSON and the engine is dependency-free, so records
   // are scanned by hand. A record that fails to parse ABORTS: the name is the
@@ -4690,7 +4693,10 @@ static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf1
 // f2bf, and a 2-D H2D writes the 512 columns into y; g_launch waits for that copy. Exact: every
 // output is either the GPU's or the transcription's, which match bit for bit.
 static int g_cpusplit = getenv("LFM_CPUSPLIT") ? atoi(getenv("LFM_CPUSPLIT")) : 1;   // default on (#299)
-struct CpuRows { std::vector<int8_t> q; std::vector<float> s; int R = 0; };
+struct CpuRows { std::vector<int8_t> q; std::vector<float> s; int R = 0;
+  const int8_t* mq = nullptr; const float* ms = nullptr; };   // mq/ms: row-major tail rows mapped from the blob
+static std::string g_cpus_blob; static size_t g_cpus_base = 0;
+static int g_cpus_mmap = getenv("LFM_CPUSPLIT_MMAP") ? atoi(getenv("LFM_CPUSPLIT_MMAP")) : 1;
 static std::map<const Ent*, CpuRows> g_cpurows;
 static cudaStream_t g_cpus = nullptr; static cudaEvent_t g_cpue0 = nullptr, g_cpue1 = nullptr;
 static double g_cpus_wait = 0, g_cpus_comp = 0; static long g_cpus_n = 0;
@@ -4714,8 +4720,38 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
     cudaDeviceSynchronize();
     cudaMemcpy(hq.data(), e->dq + (size_t)(r0 / 32) * tq, hq.size(), cudaMemcpyDeviceToHost);
     cudaMemcpy(hs.data(), e->ds + (size_t)(r0 / 32) * nb * 32, hs.size() * 4, cudaMemcpyDeviceToHost);
-    cr.q.resize((size_t)R * K); cr.s.resize((size_t)R * nb);
-    for (int rr = 0; rr < R; rr++) for (int b = 0; b < nb; b++) {
+    // #300: the blob stores each tensor as nc row-major code bytes then ns scale bytes ([N][nb]
+    // f32). Map the tail rows read-only from the file instead of keeping an anonymous copy: clean
+    // page-cache pages count as MemAvailable and are dropped under pressure (the anonymous 70 MB
+    // pushed the 110 s clip's encoder pass into reclaim). Verified once against the device copy;
+    // any difference falls back to the anonymous repack below.
+    bool mapped = false;
+    if (g_cpus_mmap && !g_cpus_blob.empty() && e->nc == (size_t)N * K && e->ns == (size_t)N * nb * 4) {
+      const long pg = sysconf(_SC_PAGESIZE);
+      const size_t cq = g_cpus_base + e->file_off + (size_t)r0 * K, cs = g_cpus_base + e->file_off + e->nc + (size_t)r0 * nb * 4;
+      const int fd = open(g_cpus_blob.c_str(), O_RDONLY);
+      if (fd >= 0) {
+        const size_t aq = cq & ~(size_t)(pg - 1), as = cs & ~(size_t)(pg - 1);
+        void* pq = mmap(nullptr, cq - aq + (size_t)R * K, PROT_READ, MAP_SHARED, fd, (off_t)aq);
+        void* ps = mmap(nullptr, cs - as + (size_t)R * nb * 4, PROT_READ, MAP_SHARED, fd, (off_t)as);
+        close(fd);
+        if (pq != MAP_FAILED && ps != MAP_FAILED) {
+          const int8_t* mq = (const int8_t*)pq + (cq - aq); const float* ms = (const float*)((const char*)ps + (cs - as));
+          long diff = 0;
+          for (int rr = 0; rr < R && !diff; rr++) for (int b = 0; b < nb; b++) {
+            const int8_t* t8 = hq.data() + (size_t)(rr >> 5) * tq;
+            diff += memcmp(mq + (size_t)rr * K + b * 32, t8 + ((size_t)b * 64 + (rr & 31)) * 16, 16) != 0;
+            diff += memcmp(mq + (size_t)rr * K + b * 32 + 16, t8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16, 16) != 0;
+            diff += memcmp(&ms[(size_t)rr * nb + b], &hs[(size_t)(rr >> 5) * nb * 32 + (size_t)b * 32 + (rr & 31)], 4) != 0;
+          }
+          if (!diff) { cr.mq = mq; cr.ms = ms; mapped = true; }
+          else { printf("CPUSPLIT %s: blob rows differ from the device copy -> anonymous repack\n", e->name.c_str());
+                 munmap(pq, cq - aq + (size_t)R * K); munmap(ps, cs - as + (size_t)R * nb * 4); }
+        }
+      }
+    }
+    if (!mapped) cr.q.resize((size_t)R * K), cr.s.resize((size_t)R * nb);
+    if (!mapped) for (int rr = 0; rr < R; rr++) for (int b = 0; b < nb; b++) {
       const int8_t* t8 = hq.data() + (size_t)(rr >> 5) * tq;
       memcpy(&cr.q[(size_t)rr * K + b * 32], t8 + ((size_t)b * 64 + (rr & 31)) * 16, 16);
       memcpy(&cr.q[(size_t)rr * K + b * 32 + 16], t8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16, 16);
@@ -4734,7 +4770,7 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
   for (int t = 0; t < Tn; t++) for (int kk = 0; kk < K; kk++) xT[(size_t)kk * G * 4 + t] = cpu_bf2f(hx[(size_t)t * K + kk]);
   std::thread th[3]; const int per = R / 3 / 2 * 2; int lo = 0;
   for (int w = 0; w < 3; w++) { const int hi = w == 2 ? R : lo + per;
-    th[w] = std::thread(lfm3_neon_rows2, cr.q.data(), cr.s.data(), xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); lo = hi; }
+    th[w] = std::thread(lfm3_neon_rows2, cr.mq ? cr.mq : cr.q.data(), cr.ms ? cr.ms : cr.s.data(), xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); lo = hi; }
   for (auto& t : th) t.join();
   for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) hy[(size_t)t * R + rr] = cpu_f2bf(0.f + out[(size_t)rr * G * 4 + t]);
   cudaMemcpy2DAsync(y + r0, (size_t)N * 2, hy.data(), (size_t)R * 2, (size_t)R * 2, Tn, cudaMemcpyHostToDevice, g_cpus);
@@ -4745,6 +4781,7 @@ static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, i
 
 static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
                      float* part, int Tn) {
+  if (g_cpusplit && g_cpus_blob.empty()) { g_cpus_blob = M.blob_path; g_cpus_base = M.blob_base; }
   Ent* e = T(M, name);
   if (!e || !(e->dq && e->ds)) { printf("PF4-E2E %s: NOT IN BLOB\n", name.c_str()); return 1; }
   const int N = e->ne[0], K = e->ne[1];

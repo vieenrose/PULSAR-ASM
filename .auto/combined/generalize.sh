@@ -14,6 +14,8 @@
 #
 # Method: each clip runs twice, in the two process models that must agree.
 #   COLD     ./lfm3_asr . <wav> 96 --out-ids X                 (the path the frozen goldens came from)
+# Since #299 the cold arm runs LFM_CPUSPLIT=0 (COLD_SPLIT) and the resident one the shipped split
+# (WARM_SPLIT=1), so the gate compares the GPU-only prefill against the CPU-row-share prefill.
 #   RESIDENT the same command + --serve-in/--enc-in             (both services live)
 # Cold runs happen BEFORE any service is booted: a cold nanode allocates its own 2.15 GB arena and
 # a second one alongside the resident service would hang the board (run 281).
@@ -31,7 +33,7 @@ MIN=$(lw); MAXT=0
 cold_min=$MIN
 for w in $CLIPS; do
   n=$(basename "$w" .wav)
-  timeout 1200 ./lfm3_asr . "$w" 96 --out-ids /tmp/gen.$n.cold.i32 > /tmp/gen.$n.cold.log 2>&1 || echo "FAIL_COLD_$n"
+  LFM_CPUSPLIT=${COLD_SPLIT:-0} timeout 1200 ./lfm3_asr . "$w" 96 --out-ids /tmp/gen.$n.cold.i32 > /tmp/gen.$n.cold.log 2>&1 || echo "FAIL_COLD_$n"
   v=$(lw); [ "$v" -lt "$cold_min" ] && cold_min=$v
   printf "COLD  %-28s ids=%s wall=%s\n" "$n" "$(wc -c < /tmp/gen.$n.cold.i32 2>/dev/null | awk '{print $1/4}')" "$(grep -oE 'client total [0-9.]+' /tmp/gen.$n.cold.log | awk '{print $3}')"
 done
@@ -66,7 +68,7 @@ tts_turn() {   # $1 = label; request goes out with no gap after the ASR turn, bl
 # now the resident services
 LFM_ENC_TIME=0 ./lfm3_enc_gpu lfm3-audio-2b-enc.lfm3q8 - auto - --serve-fifo $E --only proj_out > $EL 2>&1 &
 EP=$!
-./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $S --prefill-run $PFRUN > $SL 2>&1 &
+LFM_CPUSPLIT=${WARM_SPLIT:-1} ./lfm3_nanode lfm3-audio-2b-q8.lfm3q8 --clip-fifo $S --prefill-run $PFRUN > $SL 2>&1 &
 SP=$!
 i=0; while [ $i -lt 240 ]; do grep -q "CLIP_AWAIT 0" $SL && grep -q "ENC_AWAIT 0" $EL && break; sleep 0.5; i=$((i+1)); done
 grep -q "CLIP_AWAIT 0" $SL || { echo BOOT_FAIL; tail -3 $SL; kill $SP $EP 2>/dev/null; exit 1; }

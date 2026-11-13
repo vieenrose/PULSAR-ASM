@@ -2915,3 +2915,18 @@ algorithm (fp16 accumulation), both of which change the goldens.
   Levers left on it: persistent workers, also w2 / in_proj (need a non-512 share or a kernel row
   bound), q/k/v grouping; the share (6.7%) is ~ balanced with the rate ratio, so a faster CPU kernel
   is what moves it further.
+- [LFM3/Nano S2T] #299's CPU split broke the held-out gate on the 110 s clip; fixed by mapping the
+  CPU rows from the blob (2026-11-13, run #300). generalize.sh (cold arm now pinned LFM_CPUSPLIT=0,
+  resident 1) on #299's build: 6 short clips IDENTICAL, 7/7 TTS bytes OK, but the 110 s clip's
+  resident turn FAILED with an encoder MEMGUARD trip (post-turn MemAvailable ~560 MB vs ~770 before).
+  stall.sh TTS=1, 110 s clip, 3 reps: split off encoder reply 6.8-10.7 s / turn 65-69 s; split on
+  14.8-39.5 s / 72-98 s, ids eca77bbe every time -- the split's ~70 MB of ANONYMOUS repacked rows
+  pushes the encoder pass into reclaim. Fix: the blob already stores each tensor as row-major codes
+  then [N][nb] f32 scales, so the tail rows are mmap'd read-only from it (LFM_CPUSPLIT_MMAP default 1;
+  verified once per tensor against the tiled device copy, any difference -> anonymous repack +
+  printed line; 0 fallbacks). Clean file pages count as MemAvailable and are dropped under pressure.
+  RssAnon with split: 85.8 MB (repack) -> 15.4 MB (= split off), RssFile 91 MB; ids + LFM_DUMPX md5
+  exact. generalize.sh after: 7/7 IDENTICAL (unsplit cold vs split resident), 110 s clip 66.1 s
+  resident vs 64.4 s cold, GUARD_TRIPS 0, MEMLOW 800 MB, GENERALIZE OK.
+  LESSON: a resident-service speedup that adds anonymous memory must be gated on the long clip with
+  three services -- the harness's 9 s turns cannot see the encoder's memory edge.
