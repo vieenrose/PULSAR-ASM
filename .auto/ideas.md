@@ -3107,3 +3107,18 @@ algorithm (fp16 accumulation), both of which change the goldens.
   definitions builds only with implicit declarations (wrong widths). (2) A stage-time grep with the
   delta on the wrong side of the name returned nothing; '?' in a results column is a parse failure,
   not a free stage.
+- [PrimeTTS/Nano] Payload release REFUTED, and a metric-facing lead opened (2026-11-13, run #317).
+  Protecting the TTS's 111 MB fp32 host payload arena PROT_NONE faults, and releasing every arena
+  page that the first served request did not touch frees 110.9 MB but makes EVERY later request
+  garbage (SNDR sentinel 1e9, wrong output lengths for all 5 golden cases) -- the arena is live
+  memory. The PROT_NONE backtrace (sigsegv_trace <- op_gather <- pt_v21_run_graph) named only
+  op_gather because gather is the FIRST host read in graph order; a fault site is the first reader,
+  not the only one (my tracker at the dispatch sites said 302/336 records, and it was right).
+  THE LEAD THIS OPENS (metric-facing, unlike everything else left): the host runner reads the
+  weights of essentially every conv/convT/layernorm node once per request. If the CUDA conv is
+  re-deriving something from those host bytes per request (a repack, a layout conversion, a lazy
+  upload), that is ~110 MB of CPU traffic per request on the critical path -- at the A57's ~2 GB/s
+  that is ~55 ms of the 470 ms served request (~11% of tts_wall, ~5% of combined_rtf). Test: count
+  bytes the CUDA conv path reads from host weights per request, and check whether a repacked device
+  copy could be built once at open (cf. PT_V21_DEVADD, measured ~6% SLOWER at N=1 in #279, which is
+  evidence against a naive variant of this but not against a per-call repack existing).
