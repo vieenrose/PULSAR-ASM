@@ -287,7 +287,9 @@ __global__ void k_flatten(const float* __restrict__ phw, float* __restrict__ fla
 // Stage-level sync + error read: an async kernel fault surfaces late and points at
 // the wrong launch, so every stage is checked where it is issued (run #297's lesson).
 static cudaEvent_t g_seva, g_sevb;
-static const bool g_enctime = getenv("LFM_ENC_TIME") != nullptr;
+// LFM_ENC_TIME=1 per-stage min (the bench); =2 also prints the SUM and call count per name,
+// which is what attributes a whole pass (a per-layer stage otherwise reports one call only).
+static const int g_enctime = getenv("LFM_ENC_TIME") ? atoi(getenv("LFM_ENC_TIME")) : 0;
 static const int g_reps = getenv("LFM_ENC_REPS") ? atoi(getenv("LFM_ENC_REPS")) : 1;
 // The Nano's GPU clock ramps over seconds (the backbone harness fights the same
 // thing with LFM_WARMMS), so a single pass per stage is not a measurement: stages are
@@ -296,19 +298,39 @@ static const int g_reps = getenv("LFM_ENC_REPS") ? atoi(getenv("LFM_ENC_REPS")) 
 #include <map>
 #include <string>
 static std::map<std::string, double> g_best;
+static std::map<std::string, double> g_sum;      // LFM_ENC_TIME=2: sum and count per stage name.
+static std::map<std::string, long> g_cnt;        // The min is what the per-rep bench wants, but a
+                                                 // stage that runs once per layer reports only its
+                                                 // fastest call, so the table understates a 17-layer
+                                                 // pass by up to 17x -- the sum is what attributes
+                                                 // a served pass's GPU time.
 static std::map<std::string, double> g_last;
 static int g_sync = -2;   // LFM_ENC_SYNC=1 restores per-kernel device syncs (the gate path)
+/* A served request must ANSWER even when its pass dies: the client waits for "ENC_DONE n rc=..",
+   and before this the failure paths inside a pass called exit() straight out of the process, so
+   the ASR turn waited out the client's timeout instead of falling back to the one-shot encoder.
+   g_in_pass is set only around run_pass, so the one-shot path (and every boot-time check) keeps
+   its original exit-on-fault behaviour. */
+#include <setjmp.h>
+static jmp_buf g_pass_jmp;
+static volatile int g_in_pass = 0;
+static void pass_fail(void) {
+  fflush(stdout);
+  if (g_in_pass) longjmp(g_pass_jmp, 1);
+  exit(1);
+}
 static void chk(const char* what) {
   if (g_enctime) {                                      // per-stage: syncs, so read the split
     cudaEventRecord(g_sevb); cudaEventSynchronize(g_sevb);
     float ms = 0.f; cudaEventElapsedTime(&ms, g_seva, g_sevb);
     std::string k(what);
     if (!g_best.count(k) || ms < g_best[k]) g_best[k] = ms;
+    g_sum[k] += ms; g_cnt[k] += 1;
     g_last[k] = ms;
     cudaEventRecord(g_seva);
   }
   cudaError_t e = cudaGetLastError();
-  if (e) { printf("LAUNCH ERROR at %s: %s\n", what, cudaGetErrorString(e)); exit(1); }
+  if (e) { printf("LAUNCH ERROR at %s: %s\n", what, cudaGetErrorString(e)); pass_fail(); }
   // The per-kernel cudaDeviceSynchronize is a DEBUG feature and it was the encoder's
   // dominant cost: with ~200 chk() sites per pass, the 129.7 s clip's layer loop took
   // 67.5 s of process wall against 1.63 s of GPU time (measured; pooling the partial
@@ -321,15 +343,24 @@ static void chk(const char* what) {
   if (g_sync) {
     cudaDeviceSynchronize();
     e = cudaGetLastError();
-    if (e) { printf("EXEC ERROR at %s: %s\n", what, cudaGetErrorString(e)); exit(1); }
+    if (e) { printf("EXEC ERROR at %s: %s\n", what, cudaGetErrorString(e)); pass_fail(); }
   }
+}
+// LFM_ENC_TIME=3 additionally keys the table by SHAPE: a stage name that covers 83 launches of
+// 20 different matrices says nothing about which of them cost the time, and this is how the
+// encoder's GEMM budget was attributed.
+static const char* gemm_tag(const char* what, int N, int K, int T, int ct, int tl, int nblk, int tpb) {
+  static char buf[8][160]; static int i = 0;
+  char* p = buf[i++ & 7];
+  snprintf(p, 160, "%s N=%d K=%d T=%d ct=%d tl=%d blk=%d thr=%d", what, N, K, T, ct, tl, nblk, tpb);
+  return p;
 }
 // One sync for the whole process: an async fault that no cudaGetLastError() at launch
 // time could see has to be caught before any number this tool prints is believed.
 static void chk_final(const char* what) {
   cudaDeviceSynchronize();
   cudaError_t e = cudaGetLastError();
-  if (e) { printf("EXEC ERROR (final, at %s): %s\n", what, cudaGetErrorString(e)); exit(1); }
+  if (e) { printf("EXEC ERROR (final, at %s): %s\n", what, cudaGetErrorString(e)); pass_fail(); }
 }
 
 // ---------------------------------------------------------------- GEMM
@@ -631,6 +662,7 @@ static void* rp_scratch(size_t n) {
     if (g_rps) cudaFree(g_rps);
     if (cudaMalloc(&g_rps, n)) { printf("repack scratch\n"); exit(2); }
     g_rpsz = n;
+    if (getenv("LFM_ENC_MEM")) printf("MEM rps    %8.1f MB\n", n / 1048576.0);
   }
   return g_rps;
 }
@@ -1027,6 +1059,7 @@ static float* part_get(size_t nfloats) {
     printf("gemm part cudaMalloc %.1f MB failed\n", nfloats * 4 / 1e6); exit(2);
   }
   g_part_cap = nfloats;
+  if (getenv("LFM_ENC_MEM")) printf("MEM part   %8.1f MB\n", nfloats * 4 / 1048576.0);
   return g_part_buf;
 }
 static void gemm_release(Gemm& g) { if (g.part && !g.pooled) cudaFree(g.part); g.part = nullptr; }
@@ -1239,7 +1272,8 @@ static void gemm_run(Gemm& g, const float* x, float* y, int T, bf16* xb) {
         if (le) { printf("q8_partial_T<%d> launch REFUSED at N=%d K=%d KC=%d nb=%d: %s\n",
                          ct, g.N, g.K, g.KC, g.nb, cudaGetErrorString(le)); exit(3); }
       }
-      chk("gemm fp32 T-wide");
+      chk(g_enctime >= 3 ? gemm_tag("gemm fp32 T-wide", g.N, g.K, T, ct, (int)g.tl, g.nblk, TPB)
+                         : "gemm fp32 T-wide");
       if (!(fuse && g.tl)) k_combine_f<<<(unsigned)((T * g.N + 255) / 256), 256>>>(g.part, y, T * g.N, g.nch);
       chk("gemm combine");
       return;
@@ -1570,18 +1604,45 @@ static void gemm_to(Ent* e, const float* x, float* y, int T, bf16* xb, const cha
 }
 
 // ---------------------------------------------------------------- helpers
+// Per-request device allocations. In a one-shot process these are cudaMalloc'd once and
+// reclaimed at exit; a resident service that repeated them per turn both leaked (fixed by
+// tracking and freeing) and paid the allocator every turn: a served request costs ~0.48 s of
+// wall for ~0.12 s of GPU, and the difference is cudaMalloc/cudaFree + the zero fill over the
+// pass's activation set. So the buffers are POOLED by call index and reused across passes
+// (grow-only: a slot is reallocated only when the request needs more bytes than it holds --
+// the same code path with a shorter mel reuses the bigger buffer). LFM_ENC_POOL=0 restores the
+// free-after-pass behaviour (the A/B arm).
+struct ReqAlloc { void* p; size_t bytes; };
+static std::vector<ReqAlloc> g_pool;
+static std::vector<void*> g_reqallocs;   // LFM_ENC_POOL=0 arm: freed at the end of each pass
+static size_t g_slot = 0;
+static int g_pool_on = -1;
+static void* req_alloc(size_t bytes, int zero, const char* what) {
+  if (g_pool_on < 0) g_pool_on = getenv("LFM_ENC_POOL") ? atoi(getenv("LFM_ENC_POOL")) : 1;
+  void* p = nullptr;
+  if (g_pool_on && g_slot < g_pool.size() && g_pool[g_slot].bytes >= bytes) {
+    p = g_pool[g_slot].p;                       // reuse: same slot, big enough
+  } else {
+    if (cudaMalloc(&p, bytes)) { printf("OOM (%s, %.1f MB)\n", what, bytes / 1e6); pass_fail(); }
+    if (getenv("LFM_ENC_MEM")) printf("MEM req %-6s %8.1f MB\n", what, bytes / 1048576.0);
+    if (g_pool_on) {
+      if (g_slot < g_pool.size()) { cudaFree(g_pool[g_slot].p); g_pool[g_slot] = { p, bytes }; }
+      else g_pool.push_back({ p, bytes });
+    } else g_reqallocs.push_back(p);
+  }
+  g_slot++;
+  // cudaMalloc hands back stale device memory -- and so does a reused slot. Reading any element
+  // before it is written is therefore run-history dependent: four back-to-back runs of the same
+  // binary agreed with each other to the bit and disagreed with a run that followed a fresh
+  // build (layer_01 max abs 2.9e-06 vs 9.1e-03). Zero every allocation, and LFM_ENC_POISON=1
+  // fills with 0xff bytes = NaN so any such read turns the stage's output non-finite and the
+  // gate's finite check fails LOUDLY.
+  if (zero && cudaMemset(p, g_poison ? 0xff : 0, bytes)) { printf("memset failed (%s)\n", what); exit(2); }
+  return p;
+}
 static float* dalloc(size_t n, const char* what) {
   if (g_poison < 0) g_poison = getenv("LFM_ENC_POISON") ? atoi(getenv("LFM_ENC_POISON")) : 0;
-  float* p = nullptr;
-  if (cudaMalloc(&p, n * 4)) { printf("OOM (%s, %.1f MB)\n", what, n * 4 / 1e6); exit(2); }
-  // cudaMalloc hands back stale device memory. Reading any element before it is
-  // written is therefore run-history dependent: four back-to-back runs of the same
-  // binary agreed with each other to the bit and disagreed with a run that followed a
-  // fresh build (layer_01 max abs 2.9e-06 vs 9.1e-03). Zero every allocation, and
-  // LFM_ENC_POISON=1 fills with 0xff bytes = NaN so any such read turns the stage's
-  // output non-finite and the gate's finite check fails LOUDLY.
-  if (cudaMemset(p, g_poison ? 0xff : 0, n * 4)) { printf("memset failed (%s)\n", what); exit(2); }
-  return p;
+  return (float*)req_alloc(n * 4, 1, what);
 }
 // dalloc_w: for buffers that the next kernel writes in full before anything reads them
 // (conv_in -> x1, conv_mid -> x2), the zero fill is skipped (LFM_ENC_NZ, default 1);
@@ -1589,10 +1650,9 @@ static float* dalloc(size_t n, const char* what) {
 static float* dalloc_w(size_t n, const char* what) {
   static const int nz = getenv("LFM_ENC_NZ") ? atoi(getenv("LFM_ENC_NZ")) : 1;
   if (g_poison < 0) g_poison = getenv("LFM_ENC_POISON") ? atoi(getenv("LFM_ENC_POISON")) : 0;
-  if (!nz || g_poison) return dalloc(n, what);
-  float* p = nullptr;
-  if (cudaMalloc(&p, n * 4)) { printf("OOM (%s, %.1f MB)\n", what, n * 4 / 1e6); exit(2); }
-  return p;
+  // Both arms take a pool slot, so the slot sequence does not depend on LFM_ENC_NZ.
+  if (!nz || g_poison) return (float*)req_alloc(n * 4, 1, what);
+  return (float*)req_alloc(n * 4, 0, what);
 }
 // LFM_ENC_OVL (default 1): the blob upload continues on the loader thread (the backbone's
 // LFM_PF_OVL machinery: per-chunk stream sync + per-tensor CRC before `done` is published)
@@ -1647,7 +1707,7 @@ static void dump(const char* dir, const char* name, const float* dptr, size_t n)
   long nz = 0; double mx = 0;
   for (size_t i = 0; i < n; i++) { nz += (h[i] != 0.f); if (fabs(h[i]) > mx) mx = fabs(h[i]); }
   printf("dump %-12s n=%zu nonzero=%ld max=%.4f\n", name, n, nz, mx);
-  if (nz == 0) { printf("PLAUSIBILITY FAIL: %s is all zeros\n", name); exit(1); }
+  if (nz == 0) { printf("PLAUSIBILITY FAIL: %s is all zeros\n", name); pass_fail(); }
 }
 static Ent* need(Model& M, const char* name) {
   Ent* e = ::T(M, name);
@@ -1655,9 +1715,59 @@ static Ent* need(Model& M, const char* name) {
   return e;
 }
 
+// Read one request line from the serve fifo without ever blocking on a writer (the same shape
+// as lfm3_nanode's clip_read, which had to solve the identical problem: a per-request client
+// means the read side sees EOF between requests). Returns 0 only when the fifo cannot be opened.
+static int enc_read_request(const char* path, char* out, size_t cap) {
+  int fd = open(path, O_RDONLY | O_NONBLOCK);
+  if (fd < 0) { printf("--serve-fifo: cannot open %s (%s)\n", path, strerror(errno)); return 0; }
+  size_t n = 0; bool got_nl = false; int idle = 0;
+  for (;;) {
+    char c;
+    ssize_t r = read(fd, &c, 1);
+    if (r == 1) {
+      idle = 0;
+      if (c == '\n') { got_nl = true; break; }
+      if (n + 1 < cap) out[n++] = c;
+      continue;
+    }
+    if (r < 0 && errno != EAGAIN && errno != EINTR) { close(fd); return 0; }
+    // Both no-data cases land here: r == 0 (no writer has the fifo open) and EAGAIN (a writer is
+    // open but idle) -- a non-blocking fifo read returns EAGAIN, not 0, while a writer exists, and
+    // the client holds one open between its own write and close.
+    if (got_nl) break;
+    // A line with no newline is accepted only after ~100 ms of silence: the client writes the
+    // whole request in one write() (atomic on a fifo below PIPE_BUF), so an idle read with a
+    // partial buffer means the writer is done, while accepting it immediately would be free to
+    // split a request that is still arriving.
+    if (n && ++idle > 50) break;           // ~100 ms of silence at the 2 ms poll below
+    if (!n) {                                  // writer closed between requests: reopen
+      close(fd);
+      fd = open(path, O_RDONLY | O_NONBLOCK);
+      if (fd < 0) return 0;
+    }
+    // 2 ms poll (was 20 ms): this wait is on the turn's critical path, half an interval per
+    // request on average. LFM_ENC_POLL_US overrides.
+    static long pus = -1; if (pus < 0) { const char* e = getenv("LFM_ENC_POLL_US"); pus = e ? atol(e) : 2000; }
+    struct timespec ts = { 0, pus * 1000 };
+    nanosleep(&ts, nullptr);
+  }
+  out[n] = 0;
+  close(fd);
+  return 1;
+}
+
 int main(int argc, char** argv) {
+  const char* serve_fifo = nullptr;   // --serve-fifo PATH: resident encoder, one pass per request line
+  // The two optional switches always follow the four positionals, so they are scanned from argv[5]:
+  // in --serve-fifo mode argv[2]/argv[4] are placeholders (the mel path and the output dir arrive
+  // per request), which is why the positional count cannot be validated the same way there.
+  for (int i = 5; i < argc; i++) {
+    if (!strcmp(argv[i], "--serve-fifo") && i + 1 < argc) serve_fifo = argv[++i];
+    else if (!strcmp(argv[i], "--only") && i + 1 < argc) g_only = argv[++i];
+  }
   if (argc == 7 && !strcmp(argv[5], "--only")) g_only = argv[6];
-  else if (argc != 5) { printf("usage: %s <enc blob> <input.bin> <Tm> <outdir> [--only <stage>]\n", argv[0]); return 2; }
+  else if (!serve_fifo && argc != 5) { printf("usage: %s <enc blob> <input.bin> <Tm> <outdir> [--only <stage> | --serve-fifo <fifo> --only <stage>]\n", argv[0]); return 2; }
   g_ench2 = getenv("LFM_ENC_H2") ? atoi(getenv("LFM_ENC_H2")) : 0;
   g_enc_win = getenv("LFM_ENC_WIN") ? atoi(getenv("LFM_ENC_WIN")) : 32;
   printf("ENC-ATTN layers=2,5,8,11,14,15,16 window=%d (encoder.sliding_window, all "
@@ -1676,7 +1786,7 @@ int main(int argc, char** argv) {
   // needs ~215 MB of activation buffers on top of the 130 MB blob -- inside the ~1.9 GB
   // this board leaves free, and the gate below refuses before any kernel runs if not.
   if (Tm < 8 || Tm > 32768) { printf("Tm out of range: %d (8..32768 mel frames = 0.08..327.7 s)\n", Tm); return 2; }
-  mkdir(argv[4], 0777);
+  if (!serve_fifo) mkdir(argv[4], 0777);   // in serve mode the output dir arrives per request
   { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g_tw_all = g_tw_prev = t.tv_sec + 1e-9 * t.tv_nsec; }
   Model M; std::string js;
   { const char* ov = getenv("LFM_ENC_OVL");
@@ -1691,22 +1801,34 @@ int main(int argc, char** argv) {
       printf("poisoned arenas: f32 %.1f MB scales %.1f MB\n", M.need_f / 1e6, M.need_s / 1e6);
     } }
 
-  if (tm_auto) {
+  // ---- one encoder pass ---------------------------------------------------------------
+  // Extracted verbatim from main so a resident process (--serve-fifo) can run it per turn.
+  // The one-shot path calls it exactly once with the argv values, which is the behaviour every
+  // gate has always exercised; nothing in the body changed except where the mel path, the
+  // output dir and Tm come from.
+  auto run_pass = [&](const char* melp, const char* odir_in, int Tm_in) -> int {
+  int Tm = Tm_in;
+  const bool pass_auto = (Tm_in <= 0);
+  mkdir(odir_in, 0777);
+  g_slot = 0;                 // the pass's allocations come from the pooled slots, in call order
+  g_reqallocs.clear();
+  g_best.clear(); g_sum.clear(); g_cnt.clear();   // per-pass attribution (see the stage table)
+  if (pass_auto) {
     struct stat stt; int waited_ms = 0;
-    while (stat(argv[2], &stt) != 0) {
-      if (getppid() == 1) { printf("parent gone while waiting for %s\n", argv[2]); return 2; }
-      if (waited_ms > 600000) { printf("timed out waiting for %s\n", argv[2]); return 2; }
+    while (stat(melp, &stt) != 0) {
+      if (getppid() == 1) { printf("parent gone while waiting for %s\n", melp); return 2; }
+      if (waited_ms > 600000) { printf("timed out waiting for %s\n", melp); return 2; }
       usleep(2000); waited_ms += 2;
     }
-    if (stt.st_size % (128 * 4) != 0) { printf("%s: %ld bytes, not whole 128-row frames\n", argv[2], (long)stt.st_size); return 2; }
+    if (stt.st_size % (128 * 4) != 0) { printf("%s: %ld bytes, not whole 128-row frames\n", melp, (long)stt.st_size); return 2; }
     Tm = (int)(stt.st_size / (128 * 4));
     if (Tm < 8 || Tm > 32768) { printf("Tm out of range: %d\n", Tm); return 2; }
     printf("Tm=auto: %d mel frames (waited %d ms after the blob load)\n", Tm, waited_ms);
     wallmark("mel wait");
   }
   std::vector<float> hfeat((size_t)128 * Tm);
-  int fd = open(argv[2], O_RDONLY);
-  if (fd < 0) { printf("cannot open %s\n", argv[2]); return 2; }
+  int fd = open(melp, O_RDONLY);
+  if (fd < 0) { printf("cannot open %s\n", melp); return 2; }
   if (read(fd, &hfeat[0], hfeat.size() * 4) != (ssize_t)(hfeat.size() * 4)) { printf("input short\n"); return 2; }
   close(fd);
   for (size_t i = 0; i < hfeat.size(); i++) if (!isfinite(hfeat[i])) { printf("input non-finite at %zu\n", i); return 2; }
@@ -1723,10 +1845,57 @@ int main(int argc, char** argv) {
   fflush(stdout);
   const size_t n1 = (size_t)256 * EH1 * EWo1, n2 = (size_t)256 * EH2 * EWo2, n3 = (size_t)256 * EH3 * EWo3;
   float *feat, *x1, *x2, *x2b, *x3, *x3b, *perm, *flat, *ds, *xb = nullptr;
+  // Memory preflight (LFM_ENC_MEMFLOOR_MB, default 128; 0 = off). The pass's device memory grows
+  // with the clip (~5 MB per audio second: 545 MB for a 110 s clip), this board shares one 3.96 GB pool
+  // between every process and the page cache, and it has hard-hung when that pool ran out (the
+  // allocator squeezes the page cache instead of failing). So before anything is allocated:
+  // estimate what the pass needs beyond what the pool already holds, and refuse (rc = 4, nothing
+  // touched, the service stays up) if granting it would leave less than the floor in
+  // MemAvailable. An estimate, deliberately on the refusing side of the measured sizes.
+  {
+    static const long floor_mb = getenv("LFM_ENC_MEMFLOOR_MB") ? atol(getenv("LFM_ENC_MEMFLOOR_MB")) : 128;
+    const size_t nflat0 = (size_t)Tt * 4096;
+    const bool alias0 = (!getenv("LFM_ENC_ALIAS") || atoi(getenv("LFM_ENC_ALIAS"))) && 2 * n2 + 2 * n3 + nflat0 <= n1;
+    size_t est = 4 * (hfeat.size() + n1 + n2 + (alias0 ? 0 : 2 * n2 + 2 * n3 + nflat0)) + (size_t)Tt * 80 * 1024;
+    size_t held = 0;
+    for (size_t i = 0; i < g_pool.size(); i++) held += g_pool[i].bytes;
+    const long need_mb = est > held ? (long)((est - held) >> 20) : 0;
+    long avail_mb = -1;
+    if (FILE* mf = fopen("/proc/meminfo", "r")) {
+      char ml[256]; long kb;
+      while (fgets(ml, sizeof ml, mf)) if (sscanf(ml, "MemAvailable: %ld kB", &kb) == 1) { avail_mb = kb >> 10; break; }
+      fclose(mf);
+    }
+    if (getenv("LFM_ENC_MEM")) printf("MEM preflight: pass ~%zu MB, pool holds %zu MB, needs ~%ld MB more, MemAvailable %ld MB, floor %ld MB\n",
+                                      est >> 20, held >> 20, need_mb, avail_mb, floor_mb);
+    if (floor_mb > 0 && avail_mb >= 0 && avail_mb - need_mb < floor_mb) {
+      printf("MEMGUARD: this clip (Tm=%d, %.0f s) needs ~%ld MB more device memory; MemAvailable is %ld MB and the floor is %ld MB. "
+             "Refusing the pass (LFM_ENC_MEMFLOOR_MB=0 disables the guard).\n", Tm, Tm / 100.0, need_mb, avail_mb, floor_mb);
+      fflush(stdout);
+      return 4;
+    }
+  }
   feat = dalloc(hfeat.size(), "feat"); cudaMemcpy(feat, &hfeat[0], hfeat.size() * 4, cudaMemcpyHostToDevice);
-  x1 = dalloc_w(n1, "x1"); x2 = dalloc_w(n2, "x2"); x2b = dalloc(n2, "x2b");
-  x3 = dalloc(n3, "x3"); x3b = dalloc(n3, "x3b"); perm = dalloc(n2, "perm");
-  flat = dalloc((size_t)Tt * 4096, "flat"); ds = dalloc((size_t)Tt * EHID, "ds");
+  // LFM_ENC_ALIAS (default 1; 0 = one buffer each, the control arm). x1 (256 x 64 x Wo1 floats:
+  // 344 MB for a 110 s clip) is read only by conv_mid. Everything the downsampler writes after
+  // that -- perm, x2b, x3, x3b, flat, together 11/16 of x1 -- is placed inside x1's memory once
+  // conv_mid has run, instead of in five more buffers (237 MB at 110 s). Same kernels, same
+  // arguments apart from the addresses; the region is refilled (zero, or NaN under
+  // LFM_ENC_POISON) at that point, which is the fill dalloc gave those buffers. The mode is
+  // fixed per process, so the pool's slot sequence is the same every pass.
+  static const int alias_env = getenv("LFM_ENC_ALIAS") ? atoi(getenv("LFM_ENC_ALIAS")) : 1;
+  const size_t nflat = (size_t)Tt * 4096;
+  const size_t alias_n = 2 * n2 + 2 * n3 + nflat;
+  const bool alias = alias_env && alias_n <= n1;
+  x1 = dalloc_w(n1, "x1"); x2 = dalloc_w(n2, "x2");
+  if (alias) {
+    perm = x1; x2b = perm + n2; x3 = x2b + n2; x3b = x3 + n3; flat = x3b + n3;
+  } else {
+    x2b = dalloc(n2, "x2b");
+    x3 = dalloc(n3, "x3"); x3b = dalloc(n3, "x3b"); perm = dalloc(n2, "perm");
+    flat = dalloc(nflat, "flat");
+  }
+  ds = dalloc((size_t)Tt * EHID, "ds");
   if (g_ench2) {                                   // the biggest GEMM input in bf16
     size_t xbn = (size_t)EH2 * EWo2 * 256;
     xbn = std::max(xbn, (size_t)EH3 * EWo3 * 256); xbn = std::max(xbn, (size_t)Tt * 4096);
@@ -1764,6 +1933,8 @@ int main(int argc, char** argv) {
   // 2) conv_mid (depthwise)
   conv3x3(x1, w_mid->df, b_mid->df, x2, 256, EH1, EWo1, EH2, EWo2, 0, 0);
   chk("conv_mid");
+  // x1 is dead from here: hand its memory to perm / x2b / x3 / x3b / flat (see LFM_ENC_ALIAS).
+  if (alias && cudaMemset(x1, g_poison > 0 ? 0xff : 0, alias_n * 4)) { printf("alias fill failed\n"); pass_fail(); }
   // 3) lin_mid as a GEMM over P2 = EH2*EWo2 positions, then silu
   { const int P2 = EH2 * EWo2;
     if (g_enctr) transpose(x2, perm, 256, P2);
@@ -1816,7 +1987,7 @@ int main(int argc, char** argv) {
                     + (double)EHID * 4096 * Tt;                // lin_out
   printf("ENCODER total %.2f ms (min of %d) = %.4f s GPU per audio second; downsampler alone %.0f MMAC, %.1f GMAC/s at that rate\n",
          ms, nreps, ms / 1000.0 / (Tm / 100.0), macs / 1e6, macs / (ms * 1e-3) / 1e9);
-  char odir[600]; snprintf(odir, sizeof odir, "%s", argv[4]);
+  char odir[600]; snprintf(odir, sizeof odir, "%s", odir_in);
   const int dumprep = getenv("LFM_ENC_DUMP_REP") ? atoi(getenv("LFM_ENC_DUMP_REP")) : 0;
   char repdir[640];
   for (int rep = 0; rep < nreps; rep++) {
@@ -1970,30 +2141,114 @@ int main(int argc, char** argv) {
     Ent* pw3 = need(M, "mlp.model.3.weight"), *pb3 = need(M, "mlp.model.3.bias");
     wallmark("17 layers");
     // LFM_ENC_LNM (default 1): moments one row per lane (k_moments_rows); 0 = thread 0.
-    static double* mv = nullptr;
     const bool lnm = !getenv("LFM_ENC_LNM") || atoi(getenv("LFM_ENC_LNM"));
-    if (lnm && !mv && cudaMalloc(&mv, (size_t)Tt * 16)) { printf("moments alloc\n"); exit(3); }
+    static double* mv = nullptr;
+    static size_t mv_cap = 0;
+    // GROW-ONLY, not allocate-once. This buffer's size is Tt*16 (16 doubles of mean/variance per
+    // audio row), so a resident service that saw a SHORT clip first kept a 1.8 KB buffer and then
+    // wrote 22 KB through it on the 110 s clip -- a device-heap overflow that corrupted the
+    // neighbouring pooled buffers and came out as proj_out = all zeros with no CUDA error anywhere
+    // (found by generalize.sh's held-out 110 s clip; the one-shot process never hits it because its
+    // first request is its only request). Same shape as g_ss above, which does check the cap.
+    if (lnm && (size_t)Tt * 16 > mv_cap) {
+      if (mv) cudaFree(mv);
+      mv = nullptr; mv_cap = 0;
+      if (cudaMalloc(&mv, (size_t)Tt * 16)) { printf("moments alloc\n"); pass_fail(); }
+      mv_cap = (size_t)Tt * 16;
+    }
     if (lnm) k_moments_rows<<<(Tt + 127) / 128, 128>>>(hn, mv, Tt);
     k_layernorm_f32<<<Tt, 256>>>(hn, pw0->df, pb0->df, hp1, lnm ? mv : nullptr); chk("proj ln");
     gemm_to(pw1, hp1, hp2, Tt, xb2, "proj lin1");
     k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, pb1->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b1");
     wallmark("proj ln + gemms");
     k_gelu_erf<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp2, (size_t)Tt * EPROJ); chk("gelu");
+    wallmark("p: gelu issued");
     gemm_to(pw3, hp2, hp3, Tt, xb2, "proj lin2");
+    wallmark("p: lin2 issued");
     k_bias_silu<<<(unsigned)((Tt * EPROJ + 255) / 256), 256>>>(hp3, pb3->df, (size_t)Tt * EPROJ, EPROJ, 0); chk("proj b3");
+    wallmark("p: b3 issued");
     dump(OD, "proj_out", hp3, (size_t)Tt * EPROJ);
+    wallmark("p: dumped");
   }
   cudaEventRecord(ev1); cudaEventSynchronize(ev1);
   float m1 = 0; cudaEventElapsedTime(&m1, ev0, ev1);
   if (m1 < best_ms) best_ms = m1;
   }
   ms = best_ms;
+  wallmark("p: gpu drained");
   printf("layers ported: %d of %d\n", nlay_last, ENLAYER);
-  if (g_enctime) for (std::map<std::string,double>::iterator it = g_best.begin(); it != g_best.end(); ++it)
-    printf("  stage %-14s %8.2f ms (min of %d)\n", it->first.c_str(), it->second, nreps);
+  if (g_enctime) for (std::map<std::string,double>::iterator it = g_best.begin(); it != g_best.end(); ++it) {
+    const char* n = it->first.c_str();
+    if (g_enctime >= 2)
+      printf("  stage %-14s %8.2f ms (min of %d)  SUM %8.2f ms in %ld calls\n",
+             n, it->second, nreps, g_sum[n], g_cnt[n]);
+    else
+      printf("  stage %-14s %8.2f ms (min of %d)\n", n, it->second, nreps);
+  }
   printf("FM3_ENC_GPU_DONE Tm=%d Tt=%d\n", Tm, Tt);
   chk_final("end of pass");
   fflush(stdout);
   wallmark("layers+projector+dumps");
+  // With the pool on, the pass's buffers stay allocated for the next turn (that is the whole
+  // point); with LFM_ENC_POOL=0 they go back to the driver here, which is the pre-pool behaviour
+  // and the A/B arm. Nothing is ever leaked: the pool is freed when the process exits.
+  if (!g_pool_on) { for (size_t i = 0; i < g_reqallocs.size(); i++) cudaFree(g_reqallocs[i]); }
+  g_reqallocs.clear();
+  // Pool trim (LFM_ENC_POOL_MAX_MB, default 512; 0 = never trim). The pool is grow-only, so one
+  // long clip (110 s = ~1.25 GB of activations) would pin that much for the rest of the session
+  // and leave the board at ~380 MB MemAvailable beside the resident backbone on every later
+  // turn. A pass that leaves the pool above the cap gives it all back; the next pass reallocates
+  // what it needs. Typical 5-10 s turns stay below the cap and keep their buffers.
+  if (g_pool_on) {
+    static const long cap_mb = getenv("LFM_ENC_POOL_MAX_MB") ? atol(getenv("LFM_ENC_POOL_MAX_MB")) : 512;
+    size_t tot = 0;
+    for (size_t i = 0; i < g_pool.size(); i++) tot += g_pool[i].bytes;
+    if (cap_mb > 0 && tot > (size_t)cap_mb << 20) {
+      cudaDeviceSynchronize();
+      for (size_t i = 0; i < g_pool.size(); i++) cudaFree(g_pool[i].p);
+      g_pool.clear();
+      printf("ENC_POOL trimmed %.1f MB (cap %ld MB)\n", tot / 1048576.0, cap_mb); fflush(stdout);
+    }
+  }
   return 0;
+  };
+
+  if (serve_fifo) {
+    // Resident encoder: the ASR shell starts ONE of these per session, so the ~1.9 s of CUDA
+    // init + blob CRC/upload is paid at boot instead of on every turn (the pass itself is
+    // ~0.2 s of GPU for a 9 s clip). Request = one line "<mel> <outdir> <Tm|auto>"; the reply
+    // is "ENC_DONE <n> rc=..", which is what the client waits for. Errors exit: a service that
+    // has lost its context cannot serve the next turn meaningfully.
+    // The fifo is opened O_RDONLY|O_NONBLOCK and reopened on EOF, exactly as the backbone
+    // service does: each ASR turn is its own client process, so the last writer closing is the
+    // end of a turn's writer, not of the session. Blocking fopen would wait for a writer that
+    // only shows up at the first turn -- after the boot check that waits for us.
+    for (int req = 0; ; req++) {
+      char rl[1400];
+      printf("ENC_AWAIT %d\n", req); fflush(stdout);
+      if (!enc_read_request(serve_fifo, rl, sizeof rl)) break;
+      if (!rl[0]) { req--; continue; }
+      if (!strcmp(rl, "Q")) break;
+      char* s1 = strchr(rl, ' '); if (!s1) { printf("ENC: bad request '%s'\n", rl); return 2; }
+      *s1++ = 0; char* s2 = strchr(s1, ' '); if (!s2) { printf("ENC: bad request '%s'\n", rl); return 2; }
+      *s2++ = 0;
+      while (*s2 == ' ') s2++;
+      size_t sl = strlen(s2); while (sl && (s2[sl-1] == '\n' || s2[sl-1] == '\r')) s2[--sl] = 0;
+      const int rq_tm = strcmp(s2, "auto") ? atoi(s2) : 0;
+      // setjmp/longjmp around the pass: a failure deep inside answers the request instead of
+      // vanishing. The service then RETIRES rather than serve on a context that may have faulted
+      // -- the client's per-turn one-shot fallback covers every later turn.
+      int rc;
+      g_in_pass = 1;
+      if (setjmp(g_pass_jmp) == 0) rc = run_pass(rl, s1, rq_tm);
+      else rc = 3;
+      g_in_pass = 0;
+      printf("ENC_DONE %d rc=%d\n", req, rc); fflush(stdout);
+      // rc 4 = the memory preflight refused the request before touching anything: the context is
+      // as it was, so the service keeps serving. Any other failure retires it.
+      if (rc && rc != 4) { printf("ENC service retiring after a failed pass; restart it to serve again\n"); fflush(stdout); return rc; }
+    }
+    return 0;
+  }
+  { int rc = run_pass(argv[2], argv[4], tm_auto ? 0 : Tm); return rc; }
 }

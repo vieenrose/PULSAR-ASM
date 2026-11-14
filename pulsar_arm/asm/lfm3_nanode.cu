@@ -55,14 +55,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <cstring>
+#include <cerrno>
 #include <cstdint>
 #include <cmath>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <map>
+#include <thread>
 #include <time.h>
 #include <zlib.h>
 #include <pthread.h>
@@ -1071,6 +1074,13 @@ static const bool g_stream = getenv("LFM_STREAM") != nullptr;
 // overhead to save.
 static const bool g_graphs = getenv("LFM_GRAPHS") != nullptr;
 static int g_serve_nohead = -100;   // serve: step whose lm_head the controller does not need
+// --stop-id N (default -1 = off): stop the greedy loop after a GENERATION step emits token N.
+// The ASR caller has always discarded everything past its eos token (stage 6 breaks on it), so
+// those steps computed ids nobody read: on the 9 s fixtures the transcripts are 9 (zh) and 18
+// (en) ids but the run went to max_gen=96, i.e. ~8-9 s of the turn was thrown away. Off by
+// default, so every existing gate and call site is bit-identical; guarded against
+// --dump-logits-all, which is teacher-forced and needs every step.
+static int g_stop_id = -1;
 // Every kernel launch goes through this stream. It is 0 (the legacy stream)
 // for all normal execution, so enabling graphs is the only thing that changes
 // it: during capture it is set to a real (non-default) stream, which the
@@ -1164,6 +1174,7 @@ struct Model {
   HostEmb hemb;
   std::string path;
   size_t emb_file_off = 0;
+  std::string blob_path; size_t blob_base = 0;   // for the CPU prefill share's mmap (#300)
   bf16 *x, *h1, *h2, *h3, *h4, *q, *k, *v, *attn, *gate, *bx, *cy, *ring;
   bf16* hgu = nullptr;   // 2*INTER: merged gate/up GEMV output (LFM_MERGE)
   // Graph mode step state. dpos holds {pos, pos+1} on the device; the graph's
@@ -1424,6 +1435,7 @@ static bool load_blob(const char* path, Model& M, std::string& js) {
   if (fread(&js[0], 1, n, f) != n) { fclose(f); return false; }
   js[n] = 0;
   const size_t base_data = 8 + 4 + (size_t)n;
+  M.blob_path = path; M.blob_base = base_data;
 
   // The header table is JSON and the engine is dependency-free, so records
   // are scanned by hand. A record that fails to parse ABORTS: the name is the
@@ -4555,8 +4567,279 @@ static bool pf_tile(Ent* e, int N, int K) {
   return true;
 }
 
+// ---- LFM_CPUCHK=R: CPU transcription of the batched-prefill GEMV, checked bitwise (run #295)
+// Step (a) of the CPU row share (#293/#294): before any CPU rows feed the engine, prove that a host
+// transcription reproduces the GPU's prefill GEMV bit for bit on REAL activations and REAL weights.
+// For the last R rows of every tiled single-chunk prefill GEMV, after the GPU has written y:
+//   per (row, position): leaves k = 0..31 visited with i = bit-reverse5(k); leaf i walks blocks
+//   b = i, i + 32, ... < nb with acc = fma(scale_b, dot_b, acc) from 0, dot_b a sequential fma
+//   over the block's 32 codes in byte order from 0; leaves combine as a binary counter (bit l of k
+//   set: pv = st[l] + pv, else st[l] = pv and stop); y = f2bf(0 + pv) (RN-even).
+// This is q8_partial_TLf (tlf_leaf2b / tlf_leaf) and q8_partial_TLg (tlg_leaf) as read in the
+// source; the GPU's own output is the judge. Weights come back from the tiled device layout:
+// qt[(row>>5)*nb*64 + b*64 + (row&31)] and +32 (two int4 = 32 codes), scale
+// sts[(row>>5)*nb*32 + b*32 + (row&31)]. Diagnostic only: it syncs and copies every call.
+static int g_cpuchk = getenv("LFM_CPUCHK") ? atoi(getenv("LFM_CPUCHK")) : 0;
+struct CpuChk { long calls = 0, outs = 0, bad = 0; int N = 0, K = 0; };
+static std::map<std::string, CpuChk> g_cpuchk_tab;
+static int g_cpuchk_neon = getenv("LFM_CPUCHK_NEON") ? atoi(getenv("LFM_CPUCHK_NEON")) : 0;
+static double g_neon_s = 0; static long g_neon_mac = 0;
+static void cpuchk_dump() {
+  long tb = 0, to = 0;
+  for (auto& kv : g_cpuchk_tab) {
+    printf("CPUCHK %-18s N=%-5d K=%-5d calls=%-4ld outputs=%-8ld bitwise_differ=%ld\n", kv.first.c_str(),
+           kv.second.N, kv.second.K, kv.second.calls, kv.second.outs, kv.second.bad);
+    tb += kv.second.bad; to += kv.second.outs;
+  }
+  printf("CPUCHK TOTAL outputs=%ld bitwise_differ=%ld %s\n", to, tb, tb ? "FAIL" : "EXACT");
+  if (g_neon_mac) printf("CPUCHK NEON threads=%d %.3f s %.2f GMAC/s\n", g_cpuchk_neon, g_neon_s, g_neon_mac / g_neon_s * 1e-9);
+  fflush(stdout);
+}
+static inline uint16_t cpu_f2bf(float v) {   // the device f2bf, bit for bit
+  uint32_t u; memcpy(&u, &v, 4);
+  if (((u >> 23) & 0xffu) == 0xffu) return (uint16_t)(u >> 16);
+  return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+static inline float cpu_bf2f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
+// LFM_CPUCHK_NEON=TH: the same check, computed by the NEON kernel the split would run (positions as
+// lanes, 4 per float32x4, x transposed to [k][t]; vfmaq_f32 is a fused IEEE fma and vaddq_f32 a
+// lane-wise IEEE add, so each lane is exactly the scalar chain above), on TH std::threads, timed.
+// weak: lfm3_enc_gpu.cu includes this file and does not link lfm3_cpurows.o (null there)
+extern "C" __attribute__((weak)) void lfm3_neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out);
+extern "C" __attribute__((weak)) void lfm3_neon_rows2(const int8_t* q, const float* sc, const float* xT, int K, int nb, int G, int r_lo, int r_hi, float* out);
+static int g_cpuchk_v2 = getenv("LFM_CPUCHK_V2") ? atoi(getenv("LFM_CPUCHK_V2")) : 0;
+static void neon_rows(const int8_t* hq, const float* hs, const float* xT, int nb, int G, int r_lo, int r_hi, float* out) { lfm3_neon_rows(hq, hs, xT, nb, G, r_lo, r_hi, out); }
+static void cpuchk_run(const std::string& name, Ent* e, const bf16* x, const bf16* y, int N, int K, int nb, int Tn) {
+  if (!g_cpuchk || !e->tiled) return;
+  static bool reg = false; if (!reg) { atexit(cpuchk_dump); reg = true; }
+  cudaDeviceSynchronize();
+  const int R = std::min(g_cpuchk, N) & ~31, r0 = N - R;    // whole 32-row tiles from the tail
+  if (R <= 0) return;
+  std::vector<uint16_t> hx((size_t)Tn * K), hy((size_t)Tn * N);
+  cudaMemcpy(hx.data(), x, hx.size() * 2, cudaMemcpyDeviceToHost);
+  cudaMemcpy(hy.data(), y, hy.size() * 2, cudaMemcpyDeviceToHost);
+  const size_t tq = (size_t)nb * 64 * 16, ts = (size_t)nb * 32 * 4;     // bytes per 32-row tile
+  std::vector<int8_t> hq((size_t)(R / 32) * tq); std::vector<float> hs((size_t)(R / 32) * nb * 32);
+  cudaMemcpy(hq.data(), e->dq + (size_t)(r0 / 32) * tq, hq.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(hs.data(), e->ds + (size_t)(r0 / 32) * nb * 32, (size_t)(R / 32) * ts, cudaMemcpyDeviceToHost);
+  std::vector<float> xf((size_t)Tn * K);
+  for (size_t i = 0; i < xf.size(); i++) xf[i] = cpu_bf2f(hx[i]);
+  CpuChk& c = g_cpuchk_tab[name]; c.N = N; c.K = K; c.calls++;
+  if (g_cpuchk_neon && !lfm3_neon_rows) { printf("CPUCHK NEON unavailable (lfm3_cpurows.o not linked)\n"); exit(2); }
+  if (g_cpuchk_neon && Tn <= 32) {
+    const int G = (Tn + 3) / 4, TH = g_cpuchk_neon;
+    std::vector<float> xT((size_t)K * G * 4, 0.f), out((size_t)R * G * 4);
+    for (int t = 0; t < Tn; t++) for (int kk = 0; kk < K; kk++) xT[(size_t)kk * G * 4 + t] = xf[(size_t)t * K + kk];
+    // v2: row-major repack, done at load in a real split -> outside the timed window
+    std::vector<int8_t> qrm; std::vector<float> srm;
+    if (g_cpuchk_v2) {
+      qrm.resize((size_t)R * K); srm.resize((size_t)R * nb);
+      for (int rr = 0; rr < R; rr++) for (int b = 0; b < nb; b++) {
+        const int8_t* t8 = hq.data() + (size_t)(rr >> 5) * tq;
+        memcpy(&qrm[(size_t)rr * K + b * 32], t8 + ((size_t)b * 64 + (rr & 31)) * 16, 16);
+        memcpy(&qrm[(size_t)rr * K + b * 32 + 16], t8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16, 16);
+        srm[(size_t)rr * nb + b] = hs[(size_t)(rr >> 5) * nb * 32 + (size_t)b * 32 + (rr & 31)];
+      }
+    }
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    std::vector<std::thread> th; const int per = (R / TH + 31) & ~31;   // whole tiles per thread
+    if (g_cpuchk_v2) for (int w = 0; w < TH; w++) { const int lo = std::min(R, w * per), hi = std::min(R, lo + per);
+      if (lo < hi) th.emplace_back(lfm3_neon_rows2, qrm.data(), srm.data(), xT.data(), K, nb, G, lo, hi, out.data() + (size_t)lo * G * 4); }
+    else
+    for (int w = 0; w < TH; w++) { const int lo = std::min(R, w * per), hi = std::min(R, lo + per);
+      if (lo < hi) th.emplace_back(neon_rows, hq.data(), hs.data(), xT.data(), nb, G, lo, hi, out.data() + (size_t)lo * G * 4); }
+    for (auto& t : th) t.join();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    g_neon_s += (t1.tv_sec - t0.tv_sec) + 1e-9 * (t1.tv_nsec - t0.tv_nsec); g_neon_mac += (long)R * K * Tn;
+    for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) {
+      c.outs++; if (hy[(size_t)t * N + r0 + rr] != cpu_f2bf(0.f + out[(size_t)rr * G * 4 + t])) c.bad++; }
+    return;
+  }
+  for (int rr = 0; rr < R; rr++) {
+    const int8_t* tq8 = hq.data() + (size_t)(rr >> 5) * tq;          // this row's tile
+    const float* tsc = hs.data() + (size_t)(rr >> 5) * nb * 32;
+    for (int t = 0; t < Tn; t++) {
+      const float* xt = xf.data() + (size_t)t * K;
+      float st[5] = {0, 0, 0, 0, 0}, pv = 0.f;
+      for (int k = 0; k < 32; k++) {
+        const int i = ((k & 1) << 4) | ((k & 2) << 2) | (k & 4) | ((k & 8) >> 2) | ((k & 16) >> 4);
+        float acc = 0.f;
+        for (int b = i; b < nb; b += 32) {
+          // block b of row rr: int4 #(b*64 + lane) holds codes 0..15, int4 #(b*64 + 32 + lane) 16..31
+          const int8_t* c0 = tq8 + ((size_t)b * 64 + (rr & 31)) * 16;
+          const int8_t* c1 = tq8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16;
+          float dot = 0.f;
+          for (int j = 0; j < 32; j++) dot = fmaf((float)(j < 16 ? c0[j] : c1[j - 16]), xt[b * 32 + j], dot);
+          acc = fmaf(tsc[(size_t)b * 32 + (rr & 31)], dot, acc);
+        }
+        pv = acc;
+        for (int l = 0; l < 5; l++) {
+          if ((k >> l) & 1) pv = st[l] + pv;
+          else { st[l] = pv; break; }
+        }
+      }
+      const uint16_t got = hy[(size_t)t * N + r0 + rr], want = cpu_f2bf(0.f + pv);
+      c.outs++; if (got != want) c.bad++;
+    }
+  }
+}
+
+// ---- LFM_CPUSPLIT=1: CPU row share of the batched prefill (run #299), step (c).
+// For the 512-row-block tiled GEMVs with N % 512 == 0 and N >= 4096 (w1 / w3, N 7680), the GPU
+// kernel is launched over N - 512 rows (the grid simply has one row block fewer: the kernel itself
+// is unchanged) and the last 512 rows are computed by 3 CPU threads with lfm3_neon_rows2, the
+// bitwise-checked transcription of the same leaf order (#295-#297). Hand-off: a second stream waits
+// for an event recorded before the GPU launch (x is ready), copies x to the host, the CPU computes,
+// f2bf, and a 2-D H2D writes the 512 columns into y; g_launch waits for that copy. Exact: every
+// output is either the GPU's or the transcription's, which match bit for bit.
+static int g_cpusplit = getenv("LFM_CPUSPLIT") ? atoi(getenv("LFM_CPUSPLIT")) : 1;   // on again in #301 (long-turn drop)
+struct CpuRows { std::vector<int8_t> q; std::vector<float> s; int R = 0;
+  const int8_t* mq = nullptr; const float* ms = nullptr; };   // mq/ms: row-major tail rows mapped from the blob
+static std::string g_cpus_blob; static size_t g_cpus_base = 0;
+static int g_cpus_mmap = getenv("LFM_CPUSPLIT_MMAP") ? atoi(getenv("LFM_CPUSPLIT_MMAP")) : 0;
+static std::map<const Ent*, CpuRows> g_cpurows;
+static cudaStream_t g_cpus = nullptr; static cudaEvent_t g_cpue0 = nullptr, g_cpue1 = nullptr;
+// Mapped CPU-row ranges (page-aligned), re-advised WILLNEED at every clip start (#300): when memory
+// pressure between turns has dropped them, this is one sequential readahead overlapping the first
+// layers instead of 4 KB faults inside the prefill; when they are resident it is a cheap no-op.
+static std::vector<std::pair<void*, size_t>> g_cpus_maps;
+static void cpusplit_prefetch() { for (auto& m : g_cpus_maps) madvise(m.first, m.second, MADV_WILLNEED); }
+static long g_cpus_trips, g_cpus_skipped;
+static long g_cpus_hist[16];   // NEON share rate per split, 0.5 GMAC/s bins
+static double g_cpus_wait = 0, g_cpus_comp = 0, g_cpus_rb = 0, g_cpus_rbsync = 0; static long g_cpus_n = 0, g_cpus_nrb = 0;
+static void cpusplit_dump() { printf("CPUSPLIT rate histogram (0.5 GMAC/s bins from 0):"); for (int i = 0; i < 16; i++) printf(" %ld", g_cpus_hist[i]); printf("\n"); printf("CPUSPLIT splits=%ld x_wait %.1f ms compute+put %.1f ms; row builds=%ld %.1f ms (of which sync %.1f ms); slow-CPU trips=%ld, GEMVs left on the GPU=%ld\n", g_cpus_n, g_cpus_wait * 1e3, g_cpus_comp * 1e3, g_cpus_nrb, g_cpus_rb * 1e3, g_cpus_rbsync * 1e3, g_cpus_trips, g_cpus_skipped); fflush(stdout); }
+// Back-off under CPU contention (#312). The launch stream waits for the CPU rows, so when another
+// process holds the cores the split becomes the critical path: one busy core made the prefill 26%
+// slower, three doubled it (split off: +1%). Each split times its NEON share; below
+// LFM_CPUSPLIT_MINRATE GMAC/s (default 3.0; 4-6.5 on idle cores, 2.5-3.0 with one core taken) the next
+// LFM_CPUSPLIT_BACKOFF eligible GEMVs (default 32) run entirely on the GPU, then one split probes
+// again. Both paths are bit-identical, so the choice cannot change the output. MINRATE=0 disables.
+static const double g_cpus_minrate = getenv("LFM_CPUSPLIT_MINRATE") ? atof(getenv("LFM_CPUSPLIT_MINRATE")) : 3.0;
+static const int g_cpus_backoff = getenv("LFM_CPUSPLIT_BACKOFF") ? atoi(getenv("LFM_CPUSPLIT_BACKOFF")) : 32;
+static int g_cpus_skip = 0;
+static int cpusplit_rows(Ent* e, int N, int K, int nb, int Tn, const bf16* yb) {
+  if (!g_cpusplit || !yb || !e->tiled || N % 512 || N < 4096 || Tn > 32 || Tn < 1 || !lfm3_neon_rows2) return 0;
+  if (g_cpus_skip > 0) { g_cpus_skip--; g_cpus_skipped++; return 0; }
+  return 512;
+}
+static void cpusplit_pre() {   // before the GPU launch: x is ready once this event fires
+  if (!g_cpus) { cudaStreamCreateWithFlags(&g_cpus, cudaStreamNonBlocking); cudaEventCreateWithFlags(&g_cpue0, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&g_cpue1, cudaEventDisableTiming); atexit(cpusplit_dump); }
+  cudaEventRecord(g_cpue0, g_launch);
+}
+// "CPUROWS DROP" on the clip fifo (#301): lfm3_asr sends it before the encoder request of a LONG
+// turn (> LFM_SPLIT_LONG_S of audio), so the ~70 MB of anonymous CPU rows are returned to the system
+// while the encoder's long pass runs (with them, the 110 s held-out clip tripped the encoder's memory
+// guard, #300). The rows are rebuilt from the device copy by the next split call.
+#include <malloc.h>
+static void cpusplit_drop() {
+  size_t b = 0;
+  for (auto& kv : g_cpurows) { CpuRows& c = kv.second; b += c.q.capacity() + c.s.capacity() * 4;
+    std::vector<int8_t>().swap(c.q); std::vector<float>().swap(c.s); if (!c.mq) c.R = 0; }
+  malloc_trim(0);
+  printf("CPUROWS DROPPED %.1f MB\n", b / 1048576.0); fflush(stdout);
+}
+static double cpus_now() { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + 1e-9 * t.tv_nsec; }
+static void cpusplit_run(Ent* e, const bf16* x, bf16* y, int N, int K, int nb, int Tn, int R) {
+  CpuRows& cr = g_cpurows[e];
+  const int r0 = N - R;
+  if (cr.R != R) {   // first use: read the tail rows back from the tiled layout, repack row-major
+    const size_t tq = (size_t)nb * 64 * 16;
+    const double rb0 = cpus_now();
+    std::vector<int8_t> hq((size_t)(R / 32) * tq); std::vector<float> hs((size_t)(R / 32) * nb * 32);
+    cudaDeviceSynchronize();
+    g_cpus_rbsync += cpus_now() - rb0;
+    cudaMemcpy(hq.data(), e->dq + (size_t)(r0 / 32) * tq, hq.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hs.data(), e->ds + (size_t)(r0 / 32) * nb * 32, hs.size() * 4, cudaMemcpyDeviceToHost);
+    // #300: the blob stores each tensor as nc row-major code bytes then ns scale bytes ([N][nb]
+    // f32). Map the tail rows read-only from the file instead of keeping an anonymous copy: clean
+    // page-cache pages count as MemAvailable and are dropped under pressure (the anonymous 70 MB
+    // pushed the 110 s clip's encoder pass into reclaim). Verified once against the device copy;
+    // any difference falls back to the anonymous repack below.
+    bool mapped = false;
+    if (g_cpus_mmap && !g_cpus_blob.empty() && e->nc == (size_t)N * K && e->ns == (size_t)N * nb * 4) {
+      const long pg = sysconf(_SC_PAGESIZE);
+      const size_t cq = g_cpus_base + e->file_off + (size_t)r0 * K, cs = g_cpus_base + e->file_off + e->nc + (size_t)r0 * nb * 4;
+      const int fd = open(g_cpus_blob.c_str(), O_RDONLY);
+      if (fd >= 0) {
+        const size_t aq = cq & ~(size_t)(pg - 1), as = cs & ~(size_t)(pg - 1);
+        void* pq = mmap(nullptr, cq - aq + (size_t)R * K, PROT_READ, MAP_SHARED, fd, (off_t)aq);
+        void* ps = mmap(nullptr, cs - as + (size_t)R * nb * 4, PROT_READ, MAP_SHARED, fd, (off_t)as);
+        close(fd);
+        if (pq != MAP_FAILED && ps != MAP_FAILED) {
+          const int8_t* mq = (const int8_t*)pq + (cq - aq); const float* ms = (const float*)((const char*)ps + (cs - as));
+          long diff = 0;
+          for (int rr = 0; rr < R && !diff; rr++) for (int b = 0; b < nb; b++) {
+            const int8_t* t8 = hq.data() + (size_t)(rr >> 5) * tq;
+            diff += memcmp(mq + (size_t)rr * K + b * 32, t8 + ((size_t)b * 64 + (rr & 31)) * 16, 16) != 0;
+            diff += memcmp(mq + (size_t)rr * K + b * 32 + 16, t8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16, 16) != 0;
+            diff += memcmp(&ms[(size_t)rr * nb + b], &hs[(size_t)(rr >> 5) * nb * 32 + (size_t)b * 32 + (rr & 31)], 4) != 0;
+          }
+          if (!diff) { cr.mq = mq; cr.ms = ms; mapped = true;
+            g_cpus_maps.push_back({pq, cq - aq + (size_t)R * K}); g_cpus_maps.push_back({ps, cs - as + (size_t)R * nb * 4}); }
+          else { printf("CPUSPLIT %s: blob rows differ from the device copy -> anonymous repack\n", e->name.c_str());
+                 munmap(pq, cq - aq + (size_t)R * K); munmap(ps, cs - as + (size_t)R * nb * 4); }
+        }
+      }
+    }
+    if (!mapped) cr.q.resize((size_t)R * K), cr.s.resize((size_t)R * nb);
+    if (!mapped) for (int rr = 0; rr < R; rr++) for (int b = 0; b < nb; b++) {
+      const int8_t* t8 = hq.data() + (size_t)(rr >> 5) * tq;
+      memcpy(&cr.q[(size_t)rr * K + b * 32], t8 + ((size_t)b * 64 + (rr & 31)) * 16, 16);
+      memcpy(&cr.q[(size_t)rr * K + b * 32 + 16], t8 + ((size_t)b * 64 + 32 + (rr & 31)) * 16, 16);
+      cr.s[(size_t)rr * nb + b] = hs[(size_t)(rr >> 5) * nb * 32 + (size_t)b * 32 + (rr & 31)];
+    }
+    cr.R = R;
+    g_cpus_rb += cpus_now() - rb0; g_cpus_nrb++;
+  }
+  static std::vector<uint16_t> hx; static std::vector<float> xT;
+  // #313: out/hy are host buffers read by an ASYNC H2D on g_cpus, and the old single pair let the
+  // next split overwrite them while that copy was still in flight -- safe only because ~6 ms of
+  // NEON sits in between. Rotate two slots and wait on the one being reused (an event that has
+  // never fired queries as complete, so this costs one cudaEventQuery per split in practice).
+  static std::vector<float> out[2]; static std::vector<uint16_t> hy[2];
+  static cudaEvent_t evb[2] = { nullptr, nullptr }; static int bslot = 0;
+  static const int rot = getenv("LFM_CPUSPLIT_ROT") ? atoi(getenv("LFM_CPUSPLIT_ROT")) : 1;   // 0 = the old single pair, for A/B
+  if (rot) {
+    if (!evb[0]) { cudaEventCreateWithFlags(&evb[0], cudaEventDisableTiming); cudaEventCreateWithFlags(&evb[1], cudaEventDisableTiming); }
+    if (cudaEventQuery(evb[bslot]) != cudaSuccess) cudaEventSynchronize(evb[bslot]);
+  } else bslot = 0;
+  const int G = (Tn + 3) / 4;
+  hx.resize((size_t)Tn * K); xT.assign((size_t)K * G * 4, 0.f); out[bslot].resize((size_t)R * G * 4); hy[bslot].resize((size_t)Tn * R);
+  const double t0 = cpus_now();
+  cudaStreamWaitEvent(g_cpus, g_cpue0, 0);
+  cudaMemcpyAsync(hx.data(), x, hx.size() * 2, cudaMemcpyDeviceToHost, g_cpus);
+  cudaStreamSynchronize(g_cpus);
+  const double t1 = cpus_now();
+  for (int t = 0; t < Tn; t++) for (int kk = 0; kk < K; kk++) xT[(size_t)kk * G * 4 + t] = cpu_bf2f(hx[(size_t)t * K + kk]);
+  // LFM_CPUSPLIT_TH (default 3): worker count; the calling thread is the last worker (it would
+  // only block in join otherwise), so TH threads means TH - 1 spawns.
+  static const int TH = std::max(1, std::min(8, getenv("LFM_CPUSPLIT_TH") ? atoi(getenv("LFM_CPUSPLIT_TH")) : 3));
+  const double tc0 = cpus_now();
+  std::thread th[8]; const int per = R / TH / 2 * 2; int lo = 0;
+  const int8_t* wq = cr.mq ? cr.mq : cr.q.data(); const float* wsc = cr.ms ? cr.ms : cr.s.data();
+  for (int w = 0; w < TH - 1; w++) { const int hi = lo + per;
+    th[w] = std::thread(lfm3_neon_rows2, wq, wsc, xT.data(), K, nb, G, lo, hi, out[bslot].data() + (size_t)lo * G * 4); lo = hi; }
+  lfm3_neon_rows2(wq, wsc, xT.data(), K, nb, G, lo, R, out[bslot].data() + (size_t)lo * G * 4);
+  for (int w = 0; w < TH - 1; w++) th[w].join();
+  { const double dt = cpus_now() - tc0, rate = (double)R * K * G * 4 / (dt > 1e-9 ? dt : 1e-9) * 1e-9;
+    g_cpus_hist[rate >= 8 ? 15 : (int)(rate * 2)]++;
+    // Two slow splits in a row trip the back-off: the first split after a back-off period finds the
+    // cores idle-clocked and is slow by itself, which made a single-sample rule re-trip on quiet turns.
+    static int slowrun = 0;
+    if (g_cpus_minrate > 0 && rate < g_cpus_minrate) { if (++slowrun >= 2) { g_cpus_skip = g_cpus_backoff; g_cpus_trips++; slowrun = 0; } }
+    else slowrun = 0; }
+  for (int rr = 0; rr < R; rr++) for (int t = 0; t < Tn; t++) hy[bslot][(size_t)t * R + rr] = cpu_f2bf(0.f + out[bslot][(size_t)rr * G * 4 + t]);
+  cudaMemcpy2DAsync(y + r0, (size_t)N * 2, hy[bslot].data(), (size_t)R * 2, (size_t)R * 2, Tn, cudaMemcpyHostToDevice, g_cpus);
+  if (rot) { cudaEventRecord(evb[bslot], g_cpus); bslot ^= 1; }
+  cudaEventRecord(g_cpue1, g_cpus);
+  cudaStreamWaitEvent(g_launch, g_cpue1, 0);
+  g_cpus_wait += t1 - t0; g_cpus_comp += cpus_now() - t1; g_cpus_n++;
+}
+
 static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
                      float* part, int Tn) {
+  if (g_cpusplit && g_cpus_blob.empty()) { g_cpus_blob = M.blob_path; g_cpus_base = M.blob_base; }
   Ent* e = T(M, name);
   if (!e || !(e->dq && e->ds)) { printf("PF4-E2E %s: NOT IN BLOB\n", name.c_str()); return 1; }
   const int N = e->ne[0], K = e->ne[1];
@@ -4592,12 +4875,16 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
   if ((e->tiled && 4 * per > lim) || (pftg && pf_ph && nch == 1 && 4 * per > lim && Tn >= 4 && N % 32 == 0 && nb <= 256 && pf_tile(e, N, K))) {
     static const int tlgs = getenv("LFM_PF_TLGS") ? atoi(getenv("LFM_PF_TLGS")) : 9;
     static const int gsw = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
-    const dim3 gg = gsw ? dim3((Tn + 3) / 4, (N + 511) / 512) : dim3((N + 511) / 512, (Tn + 3) / 4);
+    const int csr = cpusplit_rows(e, N, K, nb, Tn, yb);
+    if (csr) cpusplit_pre();
+    const int Ng = N - csr;
+    const dim3 gg = gsw ? dim3((Tn + 3) / 4, (Ng + 511) / 512) : dim3((Ng + 511) / 512, (Tn + 3) / 4);
     if (tlgs == 9)      q8_partial_TLg<9><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 8) q8_partial_TLg<8><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 4) q8_partial_TLg<4><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else if (tlgs == 1) q8_partial_TLg<1><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
     else                q8_partial_TLg<0><<<gg, 512, 0, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+    if (csr) cpusplit_run(e, x, y, N, K, nb, Tn, csr);
     goto launched;
   }
   if (pf_ph && nch == 1 && 4 * per > lim && Tn >= 4) {
@@ -4629,7 +4916,10 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
     static const int pftlf = getenv("LFM_PF_TLF") ? atoi(getenv("LFM_PF_TLF")) : 4;
     if (pftlf && tpb == 512 && (size_t)4 * K * 4 <= 48 * 1024) {
       static const int gswf = getenv("LFM_PF_GSW") ? atoi(getenv("LFM_PF_GSW")) : 1;
-      const dim3 gl = gswf ? dim3((Tn + 3) / 4, (N + tpb - 1) / tpb) : dim3((N + tpb - 1) / tpb, (Tn + 3) / 4);
+      const int csr = cpusplit_rows(e, N, K, nb, Tn, yb);
+      if (csr) cpusplit_pre();
+      const int Ng = N - csr;
+      const dim3 gl = gswf ? dim3((Tn + 3) / 4, (Ng + tpb - 1) / tpb) : dim3((Ng + tpb - 1) / tpb, (Tn + 3) / 4);
       static const bool rng = getenv("LFM_TLF_RANGE") != nullptr;
       if (rng && nb == 64) { static bool r = false; if (!r) { atexit(tlf_range_dump); r = true; }
         k_tlf_range<<<64, 256, 0, g_launch>>>(x, (long)Tn * K); }
@@ -4639,6 +4929,7 @@ static int pf_gemv_T(Model& M, const std::string& name, const bf16* x, bf16* y,
       else if (pftlf == 4 && nb == 64) q8_partial_TLf<512, 4, 4><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else if (pftlf == 2) q8_partial_TLf<512, 4, 0><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
       else            q8_partial_TLf<512, 4, 1><<<gl, 512, (size_t)4 * K * 4, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
+      if (csr) cpusplit_run(e, x, y, N, K, nb, Tn, csr);
       goto launched;
     }
     if (tpb == 512) q8_partial_TLb<512><<<gl, 512, 4 * per, g_launch>>>(e->dq, e->ds, x, part, N, K, nb, Tn, yb);
@@ -4672,6 +4963,7 @@ launched:
   if (!yb) k_combine_bf_T<<<g, 256, 0, g_launch>>>(part, y, N, nch, Tn);
   cudaError_t le2 = cudaGetLastError();
   if (le2 != cudaSuccess) { printf("PF4-E2E %s combine: LAUNCH ERROR %s\n", name.c_str(), cudaGetErrorString(le2)); return 1; }
+  if (g_cpuchk && nch == 1 && (const void*)y != (const void*)x) cpuchk_run(name, e, x, y, N, K, nb, Tn);
   return 0;
 }
 
@@ -4838,6 +5130,37 @@ static int layer_chunk_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
   return 0;
 }
 
+// The part of a layer that later positions (and the decode) can still read, for T positions:
+// an attention layer's K/V cache rows, a conv layer's ring. It is layer_chunk_T's own launches
+// with the same arguments, minus everything that only feeds this layer's OUTPUT (q/gate/
+// attention/o_proj | out_proj, both norms after them, the whole FFN). Used for the LAST layer
+// only: its output at a prompt position other than the final one is read by nothing -- there is
+// no layer above it, and the head runs on the final position alone -- while its K/V rows and
+// ring are read by every later step. The final prompt position still takes layer_chunk_T.
+static int layer_chunk_state_T(Model& M, int L, int pos0, int Tn, PF4Arena& A) {
+  const int KVDIM = NKV * HD;
+  k_rmsnorm_T<<<Tn, 256, 0, g_launch>>>(A.xb, NW(M, L, "operator_norm.weight"), A.h1, NORM_EPS, H);
+  if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d operator_norm launch failed\n", L); return 1; }
+  if (is_attn_g[L]) {
+    if (pf_gemv_T(M, LN(L, "self_attn.k_proj.weight"), A.h1, A.k, A.part, Tn)) return 1;
+    if (pf_gemv_T(M, LN(L, "self_attn.v_proj.weight"), A.h1, A.v, A.part, Tn)) return 1;
+    const float* invf = is_slide_g[L] ? M.invf_slide : M.invf_full;
+    const int rot = is_slide_g[L] ? HD : HD / 2;
+    bf16* kbase = M.kc + (size_t)L * MAXTOK * KVDIM;
+    bf16* vbase = M.vc + (size_t)L * MAXTOK * KVDIM;
+    k_headnorm<<<dim3(NKV, Tn), 32, 0, g_launch>>>(A.k, NW(M, L, "self_attn.k_norm.weight"), NORM_EPS, HD);
+    k_rope<<<dim3(NKV, Tn), 64, 0, g_launch>>>(A.k, invf, pos0, HD, rot, nullptr);
+    cudaMemcpyAsync(kbase + (size_t)pos0 * KVDIM, A.k, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
+    cudaMemcpyAsync(vbase + (size_t)pos0 * KVDIM, A.v, (size_t)Tn * KVDIM * 2, cudaMemcpyDeviceToDevice, g_launch);
+  } else {
+    if (pf_gemv_T(M, LN(L, "conv.in_proj.weight"), A.h1, A.bx, A.part, Tn)) return 1;
+    k_conv_chunk<<<(H + 127) / 128, 128, 0, g_launch>>>(M.ring + (size_t)pf4_conv_idx[L] * 7 * H,
+        T(M, LN(L, "conv.conv.weight"))->df, A.bx, A.h2, H, Tn);
+  }
+  if (cudaGetLastError() != cudaSuccess) { printf("PF4-E2E L%d state-only launch failed\n", L); return 1; }
+  return 0;
+}
+
 // The lm_head arms as ONE function, conditions copied verbatim from the step loop.
 // The driver needs the identical head on the last prompt position; copying the block
 // would let the two heads drift, and a head that drifts changes the argmax -- the
@@ -4992,8 +5315,9 @@ static int prefill_e2e(Model& M, int Tn, const std::vector<int>& prompt, Ent* em
 int main(int argc, char** argv) {
   if (argc < 2) {
     printf("usage: %s <blob.lfm3q8> [--steps N] [--prompt id,id,...] [--trace]\n", argv[0]);
-    printf("       [--audio-emb F --audio-at P] | [--clip SPEC]... (resident multi-clip; SPEC"
-           " lines: emb|-, ids, audio-at, ngen)\n", argv[0]);
+    printf("       [--audio-emb F --audio-at P] | [--clip SPEC]... | --clip-stdin\n");
+    printf("       (resident multi-clip ASR: SPEC lines are emb|-, ids, audio-at, ngen;\n"
+           "       --clip-stdin reads one SPEC path per turn on stdin until EOF or \"Q\")\n");
     return 1;
   }
   if (getenv("LFM_PF_GSW")) { const int v = atoi(getenv("LFM_PF_GSW")); cudaMemcpyToSymbol(g_pfgsw, &v, sizeof v); }
@@ -5005,6 +5329,9 @@ int main(int argc, char** argv) {
   int chunkT = getenv("LFM_PF_T") ? atoi(getenv("LFM_PF_T")) : 4;   // --prefill-chunk T
   const char* audio_emb_file = nullptr;   // --audio-emb (ASR path)
   std::vector<std::string> clip_files;  // --clip SPEC repeated: resident multi-clip ASR
+  bool clip_stdin = false;              // --clip-stdin: one SPEC path per turn on stdin (ASR service)
+  const char* clip_fifo = nullptr;      // --clip-fifo PATH: reopen it on EOF (each turn is its own client)
+  int stop_id_arg = -1;                 // --stop-id N; a SPEC's line 5 overrides it per clip
   const char* dump_logits = nullptr;
   const char* dump_logits_all = nullptr;   // every decode step, appended (gate: top-k vs HF)
   const char* speak_emb_file = nullptr;  // --speak-emb (speech-out teacher forcing)
@@ -5031,6 +5358,9 @@ int main(int argc, char** argv) {
       while (*s) { prompt.push_back((int)strtol(s, &s, 10)); if (*s == ',') s++; }
     }
     else if (!strcmp(argv[i], "--clip") && i + 1 < argc) clip_files.push_back(argv[++i]);
+    else if (!strcmp(argv[i], "--clip-stdin")) clip_stdin = true;
+    else if (!strcmp(argv[i], "--clip-fifo") && i + 1 < argc) { clip_stdin = true; clip_fifo = argv[++i]; }
+    else if (!strcmp(argv[i], "--stop-id") && i + 1 < argc) stop_id_arg = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--audio-emb") && i + 1 < argc) {
       audio_emb_file = argv[++i];
       if (getenv("LFM_AEMB_WAIT") && atoi(getenv("LFM_AEMB_WAIT"))) g_aemb_wait = audio_emb_file;
@@ -5306,11 +5636,58 @@ int main(int argc, char** argv) {
   // A/B used PQ1_GRAPH, which is the Bonsai engine's knob and is ignored here, so both
   // arms ran graphs-off -- see doc section 45's correction.)
   const int nclip = (int)clip_files.size();
-  printf("LFM3_CLIPMODE BUILD=2026-11-03B nclip=%d\n", nclip); fflush(stdout);
-  for (int cl = 0; cl < (nclip ? nclip : 1); cl++) {
-  if (nclip) {
-    FILE* sf = fopen(clip_files[cl].c_str(), "r");
-    if (!sf) { printf("--clip: cannot open %s\n", clip_files[cl].c_str()); return 2; }
+  const int steps_base = steps;   // per-clip ngen rewrites `steps`; an absent line 4 must not leak
+  g_stop_id = stop_id_arg;        // a SPEC's line 5 overrides this per clip
+  printf("LFM3_CLIPMODE BUILD=2026-11-03B nclip=%d%s\n", nclip, clip_stdin ? " stdin" : ""); fflush(stdout);
+  // The service keeps ONE read end of the request fifo open for its whole life, opened O_RDWR so
+  // that a writer is always present: a client's O_WRONLY open can then never see ENXIO, and this
+  // side never sees EOF. The first version closed the fd at EOF and reopened it, which deadlocks
+  // with a client that writes its spec path and closes before the service returns to the fifo: the
+  // line sits in the pipe while the service blocks in open() waiting for a writer that has already
+  // gone. With two concurrent ASR clients that is a 400 s wait for a CLIP DONE that never comes
+  // (measured; .auto/combined/concasr.sh). O_NONBLOCK so the read side never blocks in open()
+  // either; the fifo path is only used as a service, so a piped-in batch keeps stdin semantics.
+  FILE* fifo_in = nullptr;
+  if (clip_fifo) {
+    int fd = open(clip_fifo, O_RDWR | O_NONBLOCK);
+    if (fd < 0) { printf("--clip-fifo: cannot open %s (%s)\n", clip_fifo, strerror(errno)); fflush(stdout); return 2; }
+    // Now that a writer always exists (this fd), a BLOCKING read never sees EOF and simply waits
+    // for the next request line: no poll interval on the turn's critical path (the 20 ms poll cost
+    // ~10 ms per turn on average). The open itself stays non-blocking, which is what avoids the
+    // stranding deadlock; only the reads block.
+    if (!getenv("LFM_FIFO_POLL")) { int fl = fcntl(fd, F_GETFL); if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK); }
+    fifo_in = fdopen(fd, "r+");
+    if (!fifo_in) { printf("--clip-fifo: fdopen(%s) failed\n", clip_fifo); fflush(stdout); close(fd); return 2; }
+  }
+  for (int cl = 0; ; cl++) {
+  // Where this pass's spec comes from: --clip files, then (with --clip-stdin) one path per
+  // line read from stdin, which is what makes the process a SERVICE: the client writes a spec
+  // file per turn and hands over its name. No --clip and no stdin = exactly one pass, so the
+  // shipped single-prompt path is byte-identical to before this loop existed.
+  std::string spec;
+  if (clip_stdin) {
+    char ln[4096];
+    printf("CLIP_AWAIT %d\n", cl); fflush(stdout);
+    if (!fgets(ln, sizeof ln, fifo_in ? fifo_in : stdin)) {
+      if (fifo_in) { clearerr(fifo_in); struct timespec ts = {0, 20000000}; nanosleep(&ts, nullptr); continue; }
+      // A service outlives its clients: every ASR turn is its own process, so when the last
+      // writer closes the fifo the read side returns EOF -- that is the end of a TURN's writer,
+      // not of the session. Reopen the same path (open on a fifo for reading blocks until the
+      // next writer arrives) and keep serving. Without a --clip-fifo path there is nothing to
+      // reopen and EOF stays the end of the run, which is what a piped-in batch means.
+      break;   // a piped-in batch: EOF is the end of the run
+    }
+    char* nl = strchr(ln, '\n'); if (nl) *nl = 0;
+    if (!ln[0] || !strcmp(ln, "Q")) break;
+    if (!strcmp(ln, "CPUROWS DROP")) { cpusplit_drop(); continue; }
+    spec = ln;
+  } else if (cl < nclip) spec = clip_files[cl];
+  else if (cl == 0 && nclip == 0) spec = "";    // the single shipped pass
+  else break;
+  const bool hasspec = !spec.empty();
+  if (hasspec) {
+    FILE* sf = fopen(spec.c_str(), "r");
+    if (!sf) { printf("--clip: cannot open %s\n", spec.c_str()); return 2; }
     // Read the spec as LINES, growing a std::string when a line exceeds the read
     // buffer. The first version used char idsp[8192], and the ASR prompt's id line is
     // ~11 KB (1642 ids), so fgets split it: 150 ids were parsed, the remainder of the
@@ -5333,16 +5710,36 @@ int main(int argc, char** argv) {
     const char* idsp = lines.size() > 1 ? lines[1].c_str() : "";
     int atv = lines.size() > 2 ? atoi(lines[2].c_str()) : -1;
     int ngv = lines.size() > 3 ? atoi(lines[3].c_str()) : -1;
+    g_stop_id = lines.size() > 4 ? atoi(lines[4].c_str()) : stop_id_arg;   // spec line 5 = stop token
+    steps = steps_base;   // reset before a per-clip override (see steps_base)
     prompt.clear();
     std::string idbuf(idsp);            // strtol wants a writable endptr
-    for (char* q = &idbuf[0]; *q; ) { prompt.push_back((int)strtol(q, &q, 10)); if (*q == ',') q++; }
+    // strtol that consumes nothing (a non-numeric id line) must end the parse: it used to push
+    // ids forever until bad_alloc took the service down.
+    bool ids_bad = false;
+    for (char* q = &idbuf[0]; *q; ) {
+      char* e; long v = strtol(q, &e, 10);
+      if (e == q) { ids_bad = true; break; }
+      prompt.push_back((int)v); q = e; if (*q == ',') q++;
+    }
+    if (ids_bad || prompt.empty()) {
+      printf("SPEC REFUSED: %s: the id line is not a comma-separated id list\n", spec.c_str());
+      printf("CLIP %d DONE steps=0\n", cl); fflush(stdout); continue;
+    }
     if (atv >= 0) g_aemb_at = atv;
     audio_emb_file = (embp[0] && strcmp(embp, "-")) ? strdup(embp) : nullptr;
     if (g_aemb) { cudaFree(g_aemb); g_aemb = nullptr; }
     g_aemb_n = 0; g_aemb_fed = 0;
+    cpusplit_prefetch();
     printf("CLIP %d START ids=%zu emb=%s at=%d ngen=%d\n", cl, prompt.size(),
            audio_emb_file ? audio_emb_file : "-", g_aemb_at, steps - (int)prompt.size());
     fflush(stdout);
+    // Context cap, service side (see the same test below for the single-prompt path): refused
+    // before anything is sized from the prompt length.
+    if ((int)prompt.size() > MAXTOK) {
+      printf("CONTEXT REFUSED: %zu prompt ids exceed the %d-position context\n", prompt.size(), MAXTOK);
+      printf("CLIP %d DONE steps=0\n", cl); fflush(stdout); continue;
+    }
     // Per-clip generation count (spec line 4), so a short clip in a resident batch is
     // not forced to the longest clip's --steps.
     if (ngv >= 0) steps = (int)prompt.size() + ngv;
@@ -5393,6 +5790,15 @@ int main(int argc, char** argv) {
   struct timespec tw0; clock_gettime(CLOCK_MONOTONIC, &tw0);
   int nwarm = 0;
   const int nprompt_all = (int)prompt.size();   // for the S8 arm's prefill scope
+  // Context cap. The K/V caches hold MAXTOK positions per layer and the batched prefill writes
+  // a row per prompt position with no bound of its own, so a longer prompt would write past
+  // them (a device-heap overflow, the #273 class). Refuse it whole: a service answers the turn
+  // with zero steps and stays up, the one-shot process exits.
+  if (nprompt_all > MAXTOK) {
+    printf("CONTEXT REFUSED: %d prompt ids exceed the %d-position context\n", nprompt_all, MAXTOK);
+    if (hasspec) { printf("CLIP %d DONE steps=0\n", cl); fflush(stdout); continue; }
+    fflush(stdout); exit(2);
+  }
   // ---- committed batched-prefill bit-exactness probe ---------------------------------
   // LFM_PF_PROBE=<arm> runs the whole prompt TWICE in this process: pass 0 with the
   // shipped serial arm (ARM=0), pass 1 with the requested batched arm, and compares the
@@ -5424,7 +5830,11 @@ int main(int argc, char** argv) {
     g_prefill_phase = (s < 0 || s < nprompt_all - 1) ? 1 : 0;   // S8 arm scope: prompt steps only
     const int tok = s < 0 ? 124894 : toks[s];
     const bf16* lm_head_input = M.x;   // replaced by the embedding_norm output below
-    if (pos >= MAXTOK) break;
+    if (pos >= MAXTOK) {   // the K/V caches are full: say so, the run used to just end here
+      printf("CONTEXT FULL: stopped at position %d of %d requested steps (%d-position context)\n", pos, steps, MAXTOK);
+      fflush(stdout);
+      break;
+    }
     // (Placed at the TOP of step 0, before its embedding and layer body. It used to sit
     // after them, so position 0 went through the 24 layers twice: every conv ring took an
     // extra shift, a chunk-invariant offset of ~2000/2048 cells in the prefill output
@@ -5442,6 +5852,86 @@ int main(int argc, char** argv) {
       { int c = 0; for (int L = 0; L < NLAYER; L++) { pf4_conv_idx[L] = c; if (!is_attn_g[L]) c++; } }
       int Tc = 0;
       struct timespec q0, q1; clock_gettime(CLOCK_MONOTONIC, &q0);
+      // PREFIX CACHE (LFM_PF_PCACHE, default on in the clip service, 0 = the A/B control).
+      // Every ASR turn's prompt starts with the same template ids (15 of 133: everything
+      // before the first audio row), and a position's state depends only on the ids at and
+      // before it, so those positions are identical from turn to turn. The sequence state
+      // they leave behind is exactly two things: their K/V cache rows in every attention
+      // layer, and each conv layer's 7-slot ring after the last of them. The first clip runs
+      // the prefix as its OWN chunk [0,P) and snapshots both per layer (the chunk boundary at
+      // P is what makes the ring snapshot the state "after position P-1"; per-position
+      // results are chunk-invariant, which is the property --prefill-run already rests on).
+      // A later clip whose first P ids match restores the snapshot and prefills from P.
+      // Keyed on the ids themselves, not on a flag: a different template rebuilds.
+      static const int pc_env = getenv("LFM_PF_PCACHE") ? atoi(getenv("LFM_PF_PCACHE")) : -1;
+      static std::vector<int> pc_ids;
+      static bf16 *pc_ring = nullptr, *pc_k = nullptr, *pc_v = nullptr;
+      static int pc_cap = 0;
+      const int PCKV = NKV * HD;
+      int pcP = 0;
+      if ((pc_env < 0 ? (int)clip_stdin : pc_env) && g_aemb && g_aemb_n > 0 &&
+          g_aemb_at >= 1 && g_aemb_at <= g_pfChunk && g_aemb_at < NP - 1) pcP = g_aemb_at;
+      bool pc_hit = false;
+      if (pcP) {
+        pc_hit = (int)pc_ids.size() == pcP && std::equal(pc_ids.begin(), pc_ids.end(), prompt.begin());
+        if (!pc_hit) {
+          pc_ids.clear();                     // invalid until this build completes
+          if (pc_cap < pcP) {
+            if (pc_k) { cudaFree(pc_k); cudaFree(pc_v); pc_k = pc_v = nullptr; }
+            if (!pc_ring && cudaMalloc(&pc_ring, (size_t)NCONV * 7 * H * 2) != cudaSuccess) pc_ring = nullptr;
+            if (cudaMalloc(&pc_k, (size_t)NLAYER * pcP * PCKV * 2) != cudaSuccess) pc_k = nullptr;
+            if (cudaMalloc(&pc_v, (size_t)NLAYER * pcP * PCKV * 2) != cudaSuccess) pc_v = nullptr;
+            pc_cap = (pc_ring && pc_k && pc_v) ? pcP : 0;
+            if (!pc_cap) { printf("PF4-RUN: prefix cache alloc failed, running uncached\n"); pcP = 0; }
+          }
+        } else {
+          cudaMemcpyAsync(M.ring, pc_ring, (size_t)NCONV * 7 * H * 2, cudaMemcpyDeviceToDevice, g_launch);
+          for (int L = 0; L < NLAYER; L++) if (is_attn_g[L]) {
+            cudaMemcpyAsync(M.kc + (size_t)L * MAXTOK * PCKV, pc_k + (size_t)L * pcP * PCKV,
+                            (size_t)pcP * PCKV * 2, cudaMemcpyDeviceToDevice, g_launch);
+            cudaMemcpyAsync(M.vc + (size_t)L * MAXTOK * PCKV, pc_v + (size_t)L * pcP * PCKV,
+                            (size_t)pcP * PCKV * 2, cudaMemcpyDeviceToDevice, g_launch);
+          }
+          if (cudaGetLastError() != cudaSuccess) { printf("PF4-RUN: prefix cache restore failed\n"); return 1; }
+        }
+      }
+      // The chunk schedule: [0,P) alone when the cache is being built, then P.. in chunks.
+      // With the cache off (pcP = 0) this is the old schedule exactly.
+      std::vector<std::pair<int,int> > pch;
+      if (pcP && !pc_hit) pch.push_back(std::make_pair(0, pcP));
+      for (int c0 = pcP; c0 < NP; c0 += g_pfChunk)
+        pch.push_back(std::make_pair(c0, (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk));
+      // LFM_PF_LASTDEAD (default 1, 0 = A/B control): in the LAST layer only the final prompt
+      // position's output is ever read, so the other positions run the state-only pass
+      // (layer_chunk_state_T). Needs the batched attention/conv forms it copies, and is off
+      // for the teacher-forced logits dump, which is not this driver's path anyway.
+      static const int pf_dead_env = getenv("LFM_PF_LASTDEAD") ? atoi(getenv("LFM_PF_LASTDEAD")) : 1;
+      const bool pf_dead = pf_dead_env && !dump_logits_all && !getenv("LFM_PF4_TRACE") &&
+          !(getenv("LFM_PF_ATTB") && !atoi(getenv("LFM_PF_ATTB"))) &&
+          !(getenv("LFM_PF_CONVB") && !atoi(getenv("LFM_PF_CONVB")));
+      auto run_layer = [&](int L, int c0, int Tn) -> int {
+        if (!(pf_dead && L == NLAYER - 1)) return layer_chunk_T(M, L, c0, Tn, A);
+        const int nd = (c0 + Tn == NP) ? Tn - 1 : Tn;      // positions whose output is dead
+        if (nd > 0 && layer_chunk_state_T(M, L, c0, nd, A)) return 1;
+        if (nd == Tn) return 0;
+        bf16* keep = A.xb; A.xb = keep + (size_t)nd * H;   // the final prompt position, in full
+        const int r = layer_chunk_T(M, L, c0 + nd, 1, A);
+        A.xb = keep;
+        return r;
+      };
+      // Snapshot layer L's sequence state right after the prefix chunk went through it (queued
+      // on the launch stream, so it is ordered after that chunk's writes and before the next's).
+      auto pc_snap = [&](int L) {
+        if (is_attn_g[L]) {
+          cudaMemcpyAsync(pc_k + (size_t)L * pcP * PCKV, M.kc + (size_t)L * MAXTOK * PCKV,
+                          (size_t)pcP * PCKV * 2, cudaMemcpyDeviceToDevice, g_launch);
+          cudaMemcpyAsync(pc_v + (size_t)L * pcP * PCKV, M.vc + (size_t)L * MAXTOK * PCKV,
+                          (size_t)pcP * PCKV * 2, cudaMemcpyDeviceToDevice, g_launch);
+        } else {
+          const size_t ro = (size_t)pf4_conv_idx[L] * 7 * H;
+          cudaMemcpyAsync(pc_ring + ro, M.ring + ro, (size_t)7 * H * 2, cudaMemcpyDeviceToDevice, g_launch);
+        }
+      };
       // LFM_PF_LM=1: layer-major order. Every chunk's residual lives in its own slice of
       // a [NP][H] buffer (A.xb is the only state layer_chunk_T carries across layers), so
       // layer L runs over all chunks before layer L+1. Per position the arithmetic is the
@@ -5450,20 +5940,27 @@ int main(int argc, char** argv) {
       static const int pf_lm = g_ovl || (getenv("LFM_PF_LM") && atoi(getenv("LFM_PF_LM")));
       bf16* xb0 = A.xb;
       if (pf_lm) {
-        static bf16* xall = nullptr;
-        if (!xall && cudaMalloc(&xall, (size_t)NP * H * 2) != cudaSuccess) { printf("PF4-RUN: xall alloc failed\n"); return 1; }
+        // Grow-only: this buffer used to be sized by the FIRST clip's prompt and reused, so a
+        // longer clip later in a service would have written past it.
+        static bf16* xall = nullptr; static int xall_np = 0;
+        if (xall_np < NP) {
+          if (xall) { cudaDeviceSynchronize(); cudaFree(xall); xall = nullptr; }
+          if (cudaMalloc(&xall, (size_t)NP * H * 2) != cudaSuccess) { printf("PF4-RUN: xall alloc failed\n"); return 1; }
+          xall_np = NP;
+        }
         if (g_lj && !g_embfile && !load_wait(g_lj->need_emb)) { printf("PF4-RUN: weight load failed (embedding)\n"); return 1; }
-        for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
-          Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+        for (size_t ci2 = 0; ci2 < pch.size(); ci2++) {
+          const int c0 = pch[ci2].first; Tc = pch[ci2].second;
           A.xb = xall + (size_t)c0 * H;
           if (pf4_embed_chunk(M, A, prompt, c0, Tc, emb)) { printf("PF4-RUN: embed failed at chunk %d\n", c0); return 1; }
         }
         for (int L = 0; L < NLAYER; L++) {
           if (g_lj && !load_wait(g_lj->need[L])) { printf("PF4-RUN: weight load failed (layer %d)\n", L); return 1; }
-          for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
-            Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+          for (size_t ci2 = 0; ci2 < pch.size(); ci2++) {
+            const int c0 = pch[ci2].first; Tc = pch[ci2].second;
             A.xb = xall + (size_t)c0 * H;
-            if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+            if (run_layer(L, c0, Tc)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+            if (pcP && !pc_hit && c0 == 0) pc_snap(L);
             if (g_pfsync == 3) {     // bounded queue: wait for the chunk recorded K chunks ago
               static cudaEvent_t ev[64]; static int nev = 0; static long ci = 0;
               static const int K = getenv("LFM_PF_SYNCK") ? atoi(getenv("LFM_PF_SYNCK")) : 4;
@@ -5486,13 +5983,21 @@ int main(int argc, char** argv) {
           g_lj = nullptr;
         }
       } else
-      for (int c0 = 0; c0 < NP; c0 += g_pfChunk) {
-        Tc = (NP - c0 < g_pfChunk) ? NP - c0 : g_pfChunk;
+      for (size_t ci2 = 0; ci2 < pch.size(); ci2++) {
+        const int c0 = pch[ci2].first; Tc = pch[ci2].second;
         if (pf4_embed_chunk(M, A, prompt, c0, Tc, emb)) { printf("PF4-RUN: embed failed at chunk %d\n", c0); return 1; }
-        for (int L = 0; L < NLAYER; L++)
-          if (layer_chunk_T(M, L, c0, Tc, A)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+        for (int L = 0; L < NLAYER; L++) {
+          if (run_layer(L, c0, Tc)) { printf("PF4-RUN: layer %d failed at chunk %d\n", L, c0); return 1; }
+          if (pcP && !pc_hit && c0 == 0) pc_snap(L);
+        }
       }
-      cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &q1);
+      { const cudaError_t pe = cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &q1);
+        if (pcP && !pc_hit && pe == cudaSuccess) pc_ids.assign(prompt.begin(), prompt.begin() + pcP); }
+      if (pf_dead) printf("PF4-RUN: last layer (%s) state-only for all but the final prompt position\n",
+                          is_attn_g[NLAYER - 1] ? "attention: K/V rows" : "conv: ring");
+      if (pcP) printf("PF4-RUN: prefix cache %s, %d positions (%s)\n", pc_hit ? "HIT" : "BUILT", pcP,
+                      pc_hit ? "restored K/V rows + conv rings, prefill starts after them"
+                             : "ran as its own chunk and snapshotted");
       printf("PF4-RUN: prompt %d ids in chunks of %d, %.0f ms (%.2f ms/pos)\n",
              NP, g_pfChunk, (q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6,
              ((q1.tv_sec - q0.tv_sec) * 1e3 + (q1.tv_nsec - q0.tv_nsec) * 1e-6) / NP);
@@ -5765,6 +6270,12 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
                printf("wrote logits after step %d (tok %d) to %s\n", s, nt, dump_logits); }
     }
     printf("%4d %7d %9.2f %8.2f\n", s, nt, ms, 1000.0 / ms);
+    if (g_stop_id >= 0 && nt == g_stop_id && s >= nprompt - 1 && !dump_logits_all) {
+      // The caller's collector stops at this token too, so nothing consumed changes; the steps
+      // this skips would have computed ids that are read by no one.
+      printf("STOP_ID after step %d (token %d)\n", s, nt); fflush(stdout);
+      break;
+    }
     fflush(stdout);
     if (s >= 2) { tot += ms; ng++; }
     cudaError_t e2 = cudaGetLastError();
@@ -5830,7 +6341,7 @@ if (g_time && !g_graphs) { if (phase) phEnd(*phase); phBegin(); phase = is_attn[
   if (g_semb_n)
     printf("SPEAK-EMB fed %ld of %d rows at audio_out token %d\n", g_speak_fed, g_semb_n, g_speak_tok);
   fflush(stdout);
-  if (nclip) { printf("CLIP %d DONE steps=%d\n", cl, ng); fflush(stdout); }
+  if (hasspec) { printf("CLIP %d DONE steps=%d\n", cl, ng); fflush(stdout); }
   }  // resident-process clip loop
   {
     // Peak RSS, from the kernel's own counter. measure.sh needs it and the

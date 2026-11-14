@@ -33,11 +33,41 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/file.h>   /* flock: serialise resident service turns (see turn_lock) */
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <errno.h>
+#include <time.h>
+#include <pthread.h>
 #include "lfm3_tok.h"
+
+/* The tokenizer off the turn's critical path. Loading tok.bin (5.4 MB: a malloc per vocab
+   entry plus two sorts) and encoding the prompt text costs 0.85 s on the A57, against 0.45 s
+   for the resident encoder's request that it used to overlap -- so the tokenizer, not the
+   encoder, decided when the backbone could start (measured by the "TIME tokenizer" line). It
+   now runs on a thread started before stage 1. Its two products are needed at different times:
+   the prompt ids before the backbone starts, the vocabulary only for the detokenizer ~5 s
+   later. The ids are a pure function of (prompt text, tok.bin), so they are cached on disk
+   keyed by the prompt's sha256 and tok.bin's size + mtime; a turn that hits the cache does not
+   wait for the thread, and the thread's own encode is compared with the cached ids before the
+   transcript is printed, so a stale cache cannot produce a transcript -- it dies and is
+   removed. LFM_ASR_IDCACHE=0 ignores the cache (the A/B control: join, then use the ids). */
+typedef struct {
+  const char *path; LTok tok; const uint8_t *prompt; size_t pre_len, post_off, post_len;
+  uint32_t *pre, *post; int cap, npre, npost, rc;
+} TokJob;
+static void *tok_job(void *a) {
+  TokJob *j = a;
+  memset(&j->tok, 0, sizeof j->tok);
+  if (ltok_load(&j->tok, j->path) != 0) { j->rc = 1; return NULL; }
+  j->npre = ltok_encode(&j->tok, j->prompt, j->pre_len, j->pre, j->cap);
+  j->npost = ltok_encode(&j->tok, j->prompt + j->post_off, j->post_len, j->post, j->cap);
+  j->rc = (j->npre < 0 || j->npost < 0) ? 2 : 0;
+  return NULL;
+}
+typedef struct { char magic[8]; char sha[72]; int64_t size, mt_s, mt_ns; int32_t npre, npost; } IdCacheHdr;
 
 /* ------------------------------------------------------------------ sha256 (FIPS 180-4)
  * The manifest carries the HF golden's sha256 for the prompt text, so verifying it here
@@ -97,6 +127,36 @@ static int stage_no = 0;
 
 static char WORK_MEL[1100], WORK_OUT[1100], WORK_MELP[1100];
 static pid_t g_bb_pid = 0;    /* backbone child (started early), killed the same way */
+/* Resident turns must not overlap. Both service clients assume serialised traffic -- the encoder
+   client derives its request index by COUNTING the ENC_DONE lines already in the log ("turns are
+   serialised, so that count is this turn's index"), and the backbone client waits for the first
+   "CLIP n DONE steps=" after the log offset it noted before writing its spec. Two clients arriving
+   together therefore both wait for the FIRST completion: the loser returns before its own pass ran
+   and reads a proj_out.bin that does not exist yet (measured on the board: one client died with
+   "lfm3_enc_gpu produced -1 bytes at /tmp/lfm3_asr.<pid>.d/proj_out.bin (expected >= 925696)" while
+   the other finished normally). Serialize the resident request on an advisory lock: a second user's
+   turn queues behind the first, which is what the hardware does anyway (one SM, and the backbone
+   serialises its clips itself). flock is dropped by the kernel when this process exits, so no error
+   path has to unwind it; LFM_ASR_SERIALIZE=0 is the control arm. LFM_ASR_LOCK moves the lock file
+   (per-service-instance testing). */
+static int g_turn_fd = -1;
+static void turn_lock(void) {
+  if (g_turn_fd >= 0) return;
+  if (getenv("LFM_ASR_SERIALIZE") && !atoi(getenv("LFM_ASR_SERIALIZE"))) return;
+  const char* lp = getenv("LFM_ASR_LOCK");
+  if (!lp || !*lp) lp = "/tmp/lfm3_asr.turn.lock";
+  int fd = open(lp, O_RDWR | O_CREAT, 0644);
+  if (fd < 0) return;                       /* cannot create it: run unsynchronised, do not fail */
+  if (flock(fd, LOCK_EX) != 0) { close(fd); return; }
+  g_turn_fd = fd;
+}
+static void turn_unlock(void) {
+  if (g_turn_fd < 0) return;
+  flock(g_turn_fd, LOCK_UN);
+  close(g_turn_fd);
+  g_turn_fd = -1;
+}
+
 static pid_t g_enc_pid = 0;   /* encoder child, killed if this shell dies before reaping it */
 /* atexit: remove the per-run work files (PCM, mel, proj_out and its dir). Each run left
    ~115 MB under /tmp and 132 of them filled picard's root fs. The engine log (2 KB) stays.
@@ -174,7 +234,93 @@ static void reap_capture(pid_t pid, char *const argv[], const char *out) {
   if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) die("%s failed (exit %d) -- see %s",
                                                   argv[0], WIFEXITED(st) ? WEXITSTATUS(st) : -1, out);
 }
-static void stage(const char *what) { printf("STAGE %d  %s\n", ++stage_no, what); fflush(stdout); }
+static double now_s(void) {
+  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+static long g_enc_n = -1, g_enc_off = 0;   // resident-encoder request index and its log offset
+static double g_stage_t = -1.0;
+/* Poll a resident-service log from a byte offset until one of its lines starts with `prefix`.
+   The services print one flushed line per completed request (ENC_DONE n / CLIP n DONE), and the
+   client is a different process each turn, so the log -- not a socket -- is the rendezvous. */
+/* `line` (optional) receives the matched reply line, so a caller can read the status the
+   service reported instead of only its presence: a service that answers "rc=1" has NOT
+   completed the request. */
+/* Reply-wait poll interval. A turn hands off four times (request fifo -> service, service log ->
+   client, for both services), and each polling side loses half an interval on average; at the old
+   10-20 ms that was ~35 ms per turn. LFM_POLL_US overrides (default 2000 us). */
+static void poll_sleep(void) {
+  static long us = -1;
+  if (us < 0) { const char* e = getenv("LFM_POLL_US"); us = e ? atol(e) : 2000; if (us < 100) us = 100; }
+  struct timespec ts = { us / 1000000, (us % 1000000) * 1000 }; nanosleep(&ts, NULL);
+}
+static int srv_wait(const char *logp, long from, const char *prefix, FILE *sink, double timeout_s,
+                    char *line, size_t line_cap) {
+  int rf = open(logp, O_RDONLY);
+  if (rf < 0) die("cannot open %s (%s)", logp, strerror(errno));
+  if (lseek(rf, (off_t)from, SEEK_SET) != (off_t)from) { close(rf); die("%s seek to %ld", logp, from); }
+  char lb[8192]; size_t lh = 0; int hit = 0;
+  double t0 = now_s();
+  for (;;) {
+    ssize_t got = read(rf, lb + lh, sizeof lb - lh - 1);
+    if (got <= 0) {
+      if (now_s() - t0 > timeout_s) break;
+      poll_sleep();
+      continue;
+    }
+    lh += (size_t)got;
+    char *nl;
+    while ((nl = memchr(lb, '\n', lh))) {
+      *nl = 0;
+      if (sink) { fputs(lb, sink); fputc('\n', sink); }
+      if (!strncmp(lb, prefix, strlen(prefix))) {
+        hit = 1;
+        if (line && line_cap) { snprintf(line, line_cap, "%s", lb); }
+      }
+      lh -= (size_t)(nl - lb) + 1;
+      memmove(lb, nl + 1, lh);
+    }
+    if (hit) break;
+  }
+  close(rf);
+  return hit;
+}
+static void stage(const char *what) {
+  // Per-stage wall, so a turn's cost can be attributed without guessing: the ASR path is now
+  // ~8 s and the question is always "how much of that is the encoder's process start".
+  double t = now_s();
+  double dt = (g_stage_t < 0) ? 0.0 : t - g_stage_t;   // same numbering as before the timer existed
+  printf("STAGE %d  %s  (+%.3f s)\n", ++stage_no, what, dt);
+  g_stage_t = t; fflush(stdout);
+}
+
+/* One turn's encoder, either way: a child process reaped, or a request to the resident encoder
+   and a wait for its reply line. Both end with TMPD/proj_out.bin written and validated. */
+/* Returns 1 when the encoder's proj_out is trustworthy for this turn: the one-shot child exited
+   0, or the resident service answered this request with rc=0. Returns 0 when a served request
+   failed or did not answer within LFM_ENC_WAIT (default 180 s, not the 900 s this used to wait:
+   a service whose context is gone must not stall a turn for 15 minutes), and the caller then
+   runs the one-shot encoder, which is the path the cold CLI has always exercised. */
+static int enc_collect(const char *enc_log, long off, long idx) {
+  if (enc_log) {
+    char pfx[32]; snprintf(pfx, sizeof pfx, "ENC_DONE %ld ", idx);
+    char line[512]; line[0] = 0;
+    const double tmo = getenv("LFM_ENC_WAIT") ? atof(getenv("LFM_ENC_WAIT")) : 180.0;
+    if (!srv_wait(enc_log, off, pfx, NULL, tmo, line, sizeof line)) {
+      printf("ENCODER resident request %ld did not answer within %.0f s (see %s)\n", idx, tmo, enc_log);
+      fflush(stdout);
+      return 0;
+    }
+    if (!strstr(line, "rc=0")) {
+      printf("ENCODER resident request %ld failed: %s\n", idx, line); fflush(stdout);
+      return 0;
+    }
+    return 1;
+  }
+  pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu");
+  return 1;
+}
+
 static void need_file(const char *p, long min_bytes, const char *what) {
   long n = file_size(p);
   if (n < min_bytes) die("%s produced %ld bytes at %s (expected >= %ld)", what, n, p, min_bytes);
@@ -200,7 +346,24 @@ static long man_long(char *man, const char *key) {
   return strtol(b, NULL, 10);
 }
 
+/* Open a resident service's request fifo for writing. The service reads one request, sees EOF
+ * when the client closes, and reopens the fifo; a client that arrives inside that window gets
+ * ENXIO (no reader) from a non-blocking open although the service is alive. Back-to-back turns
+ * hit it (generalize.sh, run #274). Retry ENXIO for LFM_FIFO_WAIT seconds (default 10) so a
+ * service that is really gone is still reported, by the caller, with errno intact. */
+static int fifo_open_w(const char* path) {
+  const double lim = getenv("LFM_FIFO_WAIT") ? atof(getenv("LFM_FIFO_WAIT")) : 10.0;
+  const double t0 = now_s();
+  for (;;) {
+    int fd = open(path, O_WRONLY | O_NONBLOCK);
+    if (fd >= 0 || errno != ENXIO || now_s() - t0 > lim) return fd;
+    struct timespec ts = {0, 5000000}; nanosleep(&ts, NULL);
+    errno = ENXIO;
+  }
+}
+
 int main(int argc, char **argv) {
+  const double t_main0 = now_s();
   if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
     fprintf(stderr, "usage: %s <dir> <clip.wav> [max_gen] [--out-ids FILE] [--tokens-only]\n", argv[0]);
     fprintf(stderr, "  <dir>         directory with the lfm3 blobs (backbone, enc, depth, codec, tok, mel)\n");
@@ -225,6 +388,29 @@ int main(int argc, char **argv) {
      followed by that one, with no Python in between. */
   const char *out_ids = NULL;
   int tokens_only = 0;
+  /* Resident-backbone service client. --serve-in/--serve-log name the fifo and the log file of
+     a `lfm3_nanode <blob> --clip-stdin` process that is ALREADY running (the harness starts it
+     once). Everything else about the turn is unchanged -- mel, encoder, prompt build, collector,
+     detokenizer all run exactly as in the one-shot path -- so the per-turn ids are the same bits
+     the cold path produces, and the goldens gate the two against each other. It exists because
+     the 1.946 GB backbone costs 21.2 s of eMMC read (92 MB/s at any thread count: device-bound,
+     run #257) plus ~8 s of parse/CRC/upload per process, against ~5 s of actual compute. */
+  const char *srv_in = NULL, *srv_log = NULL;
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--serve-in") && i + 1 < argc) srv_in = argv[++i];
+    else if (!strcmp(argv[i], "--serve-log") && i + 1 < argc) srv_log = argv[++i];
+  }
+  if ((srv_in == NULL) != (srv_log == NULL)) die("--serve-in and --serve-log come as a pair");
+  /* Same deal for the audio encoder: its process costs ~1.9 s of CUDA init + blob CRC/upload
+     against a ~0.2 s pass, so a session keeps one lfm3_enc_gpu --serve-fifo alive and hands it a
+     request per turn. --enc-req is a file holding the request counter (each turn is its own
+     client process, so the number cannot live in this process's memory). */
+  const char *enc_in = NULL, *enc_log = NULL;
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--enc-in") && i + 1 < argc) enc_in = argv[++i];
+    else if (!strcmp(argv[i], "--enc-log") && i + 1 < argc) enc_log = argv[++i];
+  }
+  if ((enc_in == NULL) != (enc_log == NULL)) die("--enc-in and --enc-log come as a pair");
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--out-ids") && i + 1 < argc) out_ids = argv[++i];
     else if (!strcmp(argv[i], "--tokens-only")) tokens_only = 1;
@@ -279,13 +465,23 @@ int main(int argc, char **argv) {
   printf("prompt: %ld bytes, sha256 verified, placeholder at %zu, %ld audio rows at position %ld\n",
          (long)plen, pre_len, n_audio, audio_at);
 
+  /* tokenizer thread: started here so that it overlaps stages 1-3 (see TokJob) */
+  static TokJob tj; pthread_t tok_th;
+  tj.path = TOKB; tj.prompt = prompt; tj.pre_len = pre_len; tj.post_off = post_off; tj.post_len = post_len;
+  tj.cap = (int)(plen * 2 + 16);
+  tj.pre = xmalloc((size_t)tj.cap * 4); tj.post = xmalloc((size_t)tj.cap * 4);
+  if (pthread_create(&tok_th, NULL, tok_job, &tj) != 0) die("cannot start the tokenizer thread");
+  int tok_joined = 0;
+
   /* ---- stage 1: WAV -> PCM ---------------------------------------------------- */
   /* The encoder starts first with Tm = auto: its CUDA init + blob load (~1.9 s) overlap
      stages 1-2, and it waits for MEL, which appears only by rename after lfm3_mel
      succeeded and the frame count was validated below. */
   unlink(MEL);   /* a leftover from a killed run with a recycled pid must not be read as this clip's mel */
-  { char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, (char*)"auto", TMPD, (char*)"--only", (char*)"proj_out", NULL };
-    g_enc_pid = spawn(av); }
+  if (!enc_in) {
+    char *av[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, (char*)"auto", TMPD, (char*)"--only", (char*)"proj_out", NULL };
+    g_enc_pid = spawn(av);
+  }
   char MELP[1100]; snprintf(MELP, sizeof MELP, "%s.part", MEL);   /* MEL was unlinked before the spawn */
   snprintf(WORK_MELP, sizeof WORK_MELP, "%s", MELP);
 
@@ -301,6 +497,54 @@ int main(int argc, char **argv) {
   if (mel_bytes % (128 * 4) != 0)
     die("%s is %ld bytes, not a multiple of the 128-row f32 frame (%ld)", MELP, mel_bytes, (long)(128*4));
   if (rename(MELP, MEL) != 0) die("cannot publish %s", MEL);
+  if (enc_in) {
+    /* This request write is the first touch of a shared service, so the serialising lock starts
+       HERE, not in stage 3 where the reply is awaited: the encoder is deliberately requested early
+       (its pass overlaps stages 1-2), and a lock taken after the write lets two clients queue
+       behind each other's replies anyway. The lock is then held until the backbone clip is done. */
+    turn_lock();
+    /* Hand the mel to the resident encoder (the one-shot path pays ~1.9 s of CUDA init + blob
+       CRC/upload per turn for a pass that itself takes ~0.2 s). The request index is the number
+       of ENC_DONE lines already in the log: turns are serialised, so that count is this turn's
+       index and waiting for "ENC_DONE <n> " cannot match an earlier turn's reply. */
+    long nenc = 0;
+    { int rf = open(enc_log, O_RDONLY);
+      if (rf >= 0) {
+        char b[4096]; ssize_t g; long prev = 0;
+        while ((g = pread(rf, b, sizeof b, prev)) > 0) {
+          prev += g;
+          for (ssize_t i = 0; i + 9 <= g; i++) if (!memcmp(b + i, "ENC_DONE ", 9)) nenc++;
+        }
+        close(rf);
+      } }
+    /* #301: a long turn first asks the resident backbone to drop its CPU prefill rows (~70 MB
+       anonymous), so the encoder's long pass is not pushed into reclaim. Waits for the ack (bounded);
+       short turns never send it. */
+    { const double long_s = getenv("LFM_SPLIT_LONG_S") ? atof(getenv("LFM_SPLIT_LONG_S")) : 75.0;   /* 30 until #310: no drop is faster and fits up to 75 s */
+      const double aud = (double)(mel_bytes / (128 * 4)) / 100.0;
+      if (srv_in && srv_log && long_s > 0 && aud > long_s) {
+        long s0 = file_size(srv_log);
+        int df = fifo_open_w(srv_in);
+        if (df >= 0) {
+          (void)!write(df, "CPUROWS DROP\n", 13); close(df);
+          double t0 = now_s(); int ok = 0;
+          while (!ok && now_s() - t0 < 5.0) {
+            int rf = open(srv_log, O_RDONLY); char b[4096]; ssize_t g;
+            if (rf >= 0) { g = pread(rf, b, sizeof b - 1, s0); close(rf);
+              if (g > 0) { b[g] = 0; ok = strstr(b, "CPUROWS DROPPED") != NULL; } }
+            if (!ok) usleep(2000);
+          }
+          printf("cpu rows drop for a %.1f s turn: %s\n", aud, ok ? "acked" : "NO ACK (continuing)");
+        } } }
+    g_enc_off = file_size(enc_log);
+    int wf = fifo_open_w(enc_in);
+    if (wf < 0) die("--enc-in %s: cannot open for writing (%s) -- is the resident encoder running?", enc_in, strerror(errno));
+    char rq[2400];
+    int rl = snprintf(rq, sizeof rq, "%s %s auto\n", MEL, TMPD);
+    if (write(wf, rq, (size_t)rl) != rl) die("--enc-in write failed");
+    close(wf);
+    g_enc_n = nenc;
+  }
   long Tm = mel_bytes / (128 * 4);
   printf("mel frames Tm = %ld (%.3f audio seconds; %ld audio tokens = ceil(Tm/8))\n",
          Tm, (double)Tm / 100.0, (Tm + 7) / 8);
@@ -311,6 +555,13 @@ int main(int argc, char **argv) {
   const long n_text = n_total - n_audio;
   n_audio = (Tm + 7) / 8;
   n_total = n_text + n_audio;
+  /* Context cap, checked as soon as the clip length is known: the same test as the one before
+     stage 5, but before the encoder pass (seconds to minutes, and ~5 MB of device memory per
+     audio second) is spent on a clip the backbone cannot hold. */
+  if (n_total + (long)max_gen > 4096)
+    die("%ld prompt ids + %d generation exceed the engine's 4096-position context "
+        "(%.0f s of audio max at this prompt; this clip is %.0f s)", n_total, max_gen,
+        (4096.0 - max_gen - n_text) * 8 / 100.0, (double)Tm / 100.0);
 
   /* ---- stage 3: encoder tower ------------------------------------------------ */
   stage("audio encoder tower (GPU) -> 2048-d rows");
@@ -323,13 +574,48 @@ int main(int argc, char **argv) {
 
   /* ---- stage 4: prompt ids, built natively ----------------------------------- */
   stage("ASR prompt ids (S1 tokenizer, manifest-expanded audio slot)");
-  LTok tok; memset(&tok, 0, sizeof tok);
-  if (ltok_load(&tok, TOKB) != 0) die("cannot load tokenizer blob %s", TOKB);
-  int cap = (int)(plen * 2 + 16);
+  int cap = tj.cap;
   uint32_t *pre_ids = xmalloc((size_t)cap * 4), *post_ids = xmalloc((size_t)cap * 4);
-  int npre = ltok_encode(&tok, prompt, pre_len, pre_ids, cap);
-  int npost = ltok_encode(&tok, prompt + post_off, post_len, post_ids, cap);
-  if (npre < 0 || npost < 0) die("tokenizer failed on the prompt (pre %d, post %d)", npre, npost);
+  int npre = -1, npost = -1, id_cached = 0;
+  char IDC[1100]; path_of(IDC, sizeof IDC, "asr_prompt.idcache");
+  IdCacheHdr want; memset(&want, 0, sizeof want);
+  { struct stat ts; if (stat(TOKB, &ts) != 0) die("cannot stat %s", TOKB);
+    memcpy(want.magic, "LFMIDC01", 8); snprintf(want.sha, sizeof want.sha, "%s", got_sha);
+    want.size = (int64_t)ts.st_size; want.mt_s = (int64_t)ts.st_mtim.tv_sec; want.mt_ns = (int64_t)ts.st_mtim.tv_nsec; }
+  if (!(getenv("LFM_ASR_IDCACHE") && !atoi(getenv("LFM_ASR_IDCACHE")))) {
+    FILE *cf = fopen(IDC, "rb");
+    if (cf) {
+      IdCacheHdr h;
+      if (fread(&h, sizeof h, 1, cf) == 1 && !memcmp(h.magic, want.magic, 8) && !strcmp(h.sha, want.sha) &&
+          h.size == want.size && h.mt_s == want.mt_s && h.mt_ns == want.mt_ns &&
+          h.npre >= 0 && h.npost >= 0 && h.npre <= cap && h.npost <= cap &&
+          fread(pre_ids, 4, (size_t)h.npre, cf) == (size_t)h.npre &&
+          fread(post_ids, 4, (size_t)h.npost, cf) == (size_t)h.npost) {
+        npre = h.npre; npost = h.npost; id_cached = 1;
+      }
+      fclose(cf);
+    }
+  }
+  if (!id_cached) {
+    pthread_join(tok_th, NULL); tok_joined = 1;
+    if (tj.rc == 1) die("cannot load tokenizer blob %s", TOKB);
+    npre = tj.npre; npost = tj.npost;
+    if (npre < 0 || npost < 0) die("tokenizer failed on the prompt (pre %d, post %d)", npre, npost);
+    memcpy(pre_ids, tj.pre, (size_t)npre * 4); memcpy(post_ids, tj.post, (size_t)npost * 4);
+    /* publish by rename, so a concurrent turn never reads a half-written cache; a model
+       directory that is not writable just means no cache */
+    char tmpc[1200]; snprintf(tmpc, sizeof tmpc, "%s.%ld", IDC, (long)getpid());
+    FILE *cf = fopen(tmpc, "wb");
+    if (cf) {
+      want.npre = npre; want.npost = npost;
+      int okw = fwrite(&want, sizeof want, 1, cf) == 1 &&
+                fwrite(pre_ids, 4, (size_t)npre, cf) == (size_t)npre &&
+                fwrite(post_ids, 4, (size_t)npost, cf) == (size_t)npost;
+      okw = (fclose(cf) == 0) && okw;
+      if (!okw || rename(tmpc, IDC) != 0) unlink(tmpc);
+    }
+  }
+  printf("prompt ids from %s\n", id_cached ? "the id cache (tokenizer still loading; verified before the transcript)" : "the tokenizer");
   long n_ids = (long)npre + n_audio + npost;
   if (n_ids != n_total)
     die("built %ld ids (%d + %ld audio + %d), manifest says %ld -- refusing",
@@ -374,6 +660,14 @@ int main(int argc, char **argv) {
   char pfr[32], pfv[32];
   const int pfrun = getenv("LFM_ASR_PFRUN") ? atoi(getenv("LFM_ASR_PFRUN")) : 32;
   snprintf(pfr, sizeof pfr, "--prefill-run"); snprintf(pfv, sizeof pfv, "%d", pfrun);
+  /* Stop the greedy loop at the transcript's eos. Stage 6 has always broken its collection
+     there, so the steps between the eos and max_gen computed ids that no one read: on the 9 s
+     fixtures max_gen=96 against transcripts of 9 (zh) / 18 (en) ids, ~8-9 s of the turn.
+     LFM_ASR_STOPID=0 sends -1 (run to max_gen, the A/B control arm). */
+  char siq[32], siv[32];
+  snprintf(siq, sizeof siq, "--stop-id");
+  snprintf(siv, sizeof siv, "%ld",
+           (getenv("LFM_ASR_STOPID") && !atoi(getenv("LFM_ASR_STOPID"))) ? -1L : eos);
   /* LFM_ASR_EARLYBB (default 1): the backbone starts now, while the encoder still runs.
      Its CUDA init, blob parse and the upload of layers 0-1 overlap the encoder; it then
      waits (LFM_AEMB_WAIT) for PUB, which appears by rename only after the encoder was
@@ -383,15 +677,79 @@ int main(int argc, char **argv) {
   char PUB[1100]; snprintf(PUB, sizeof PUB, "%s.ready", OUT);
   unlink(PUB);
   char *av[] = { (char*)"lfm3_nanode", BB, embp, early ? PUB : OUT, ata, atv, pp, idstr, stq, stv,
+                 siq, siv,
                  pfrun >= 2 ? pfr : NULL, pfv, NULL };
-  if (early) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
-  { pid_t ep = g_enc_pid; g_enc_pid = 0; reap(ep, "lfm3_enc_gpu"); }
+  if (early && !srv_in) { setenv("LFM_AEMB_WAIT", "1", 1); g_bb_pid = spawn_capture(av, eng); unsetenv("LFM_AEMB_WAIT"); }
+  { double t = now_s(); printf("TIME prompt ids ready %.3f s after the encoder request\n", t - g_stage_t); }
+  if (!enc_collect(enc_log, g_enc_off, g_enc_n)) {
+    /* Recover the turn instead of dying with it. A served pass that fails leaves the service's
+       device context suspect (3 consecutive 60 s requests reproduce it: the third hangs and the
+       earlier ones can come back all-zero), so the fallback is per-turn and every later turn in
+       this session pays the one-shot cost too -- which is exactly why it prints. */
+    printf("ENCODER falling back to the one-shot encoder for this turn (~1.9 s CUDA init + blob load)\n");
+    fflush(stdout);
+    unlink(OUT);
+    char *fav[] = { (char*)"lfm3_enc_gpu", ENCB, MEL, (char*)"auto", TMPD, (char*)"--only", (char*)"proj_out", NULL };
+    reap(spawn(fav), "lfm3_enc_gpu");
+  }
+  stage("encoder reply");   // splits the pre-backbone window: request+GPU pass vs everything else
   need_file(OUT, n_audio * 2048 * 4, "lfm3_enc_gpu");
   { long rows = file_size(OUT) / (2048 * 4);
     if (rows != n_audio) die("encoder produced %ld rows, the prompt expands the placeholder %ld times",
                              rows, n_audio); }
   stage("backbone prefill + greedy decode");
-  if (early) {
+  if (srv_in) {
+    /* Resident-backbone arm: hand this clip to the live service and collect its answer.
+       The spec carries emb, ids, audio-at, ngen and the stop id; only its PATH goes down the
+       fifo, then the log is read from the size it had before the write -- the service is blocked
+       in fgets() right now (the previous turn's client consumed its DONE line), so nothing it
+       writes can be missed and nothing from an earlier turn is re-read. Everything downstream
+       (stage 6's collector, the detokenizer, the goldens) is the one-shot path's, unchanged. */
+    char specf[1100]; snprintf(specf, sizeof specf, "/tmp/lfm3_asr.%ld.spec.txt", (long)getpid());
+    unlink(specf);
+    FILE* sf = fopen(specf, "w");
+    if (!sf) die("cannot write %s", specf);
+    fprintf(sf, "%s\n%s\n%ld\n%d\n%s\n", OUT, idstr, audio_at, max_gen,
+            (getenv("LFM_ASR_STOPID") && !atoi(getenv("LFM_ASR_STOPID"))) ? "-1" : siv);
+    fclose(sf);
+    turn_lock();   /* idempotent; covers a client that uses the backbone service only */
+    long s0 = file_size(srv_log);
+    int wf = fifo_open_w(srv_in);
+    if (wf < 0) die("--serve-in %s: cannot open for writing (%s) -- is the resident backbone running?", srv_in, strerror(errno));
+    size_t sl = strlen(specf);
+    if (write(wf, specf, sl) != (ssize_t)sl || write(wf, "\n", 1) != 1) die("--serve-in write failed");
+    close(wf);
+    int rf = open(srv_log, O_RDONLY);
+    if (rf < 0) die("cannot open %s", srv_log);
+    if (lseek(rf, (off_t)s0, SEEK_SET) != (off_t)s0) die("--serve-log seek");
+    FILE* ef = fopen(eng, "w");
+    if (!ef) die("cannot write %s", eng);
+    char lb[8192]; size_t lh = 0; int done = 0; double wt0 = now_s();
+    while (!done) {
+      ssize_t got = read(rf, lb + lh, sizeof lb - lh - 1);
+      if (got <= 0) {
+        // LFM_SRV_WAIT (default 900 s): how long to wait for the resident backbone CLIP DONE.
+        // Long enough for a multi-minute prefill on real audio, short enough that a wedged service
+        // is reported rather than hanging the turn forever.
+        const double srv_wait_s = getenv("LFM_SRV_WAIT") ? atof(getenv("LFM_SRV_WAIT")) : 900.0;
+        if (now_s() - wt0 > srv_wait_s)
+          die("the resident backbone produced nothing for %g s (see %s)", srv_wait_s, srv_log);
+        poll_sleep();
+        continue;
+      }
+      lh += (size_t)got;
+      char* nl;
+      while ((nl = memchr(lb, '\n', lh))) {
+        *nl = 0;
+        fputs(lb, ef); fputc('\n', ef);
+        if (strncmp(lb, "CLIP ", 5) == 0 && strstr(lb, "DONE steps=")) done = 1;
+        lh -= (size_t)(nl - lb) + 1;
+        memmove(lb, nl + 1, lh);
+      }
+    }
+    fclose(ef); close(rf);
+    turn_unlock();   /* the services are done with this turn; detokenizing needs neither */
+  } else if (early) {
     if (rename(OUT, PUB) != 0) die("cannot publish %s", PUB);
     snprintf(WORK_OUT, sizeof WORK_OUT, "%s", PUB);
     pid_t bp = g_bb_pid; g_bb_pid = 0; reap_capture(bp, av, eng);
@@ -419,6 +777,22 @@ int main(int argc, char **argv) {
   if (ngen == 0) die("no generated tokens in %s -- refusing to print an empty transcript", eng);
   size_t dcap = (size_t)ngen * 16 + 64;
   uint8_t *txt = xmalloc(dcap);
+  if (!tok_joined) { pthread_join(tok_th, NULL); tok_joined = 1; }
+  /* Stage probes on the post-backbone tail: the harness's asr_wall is the client's process time,
+     and the backbone wait ends ~0.57 s before the exit, so something here costs 10% of a turn.
+     Splitting it (join / decode / write / exit) is what decides where to fix it. The join is the
+     suspect because the vocabulary load was moved to a thread to keep it off the critical path --
+     a thread that never finishes before the GPU does has only moved the wait, not removed it. */
+  stage("tokenizer thread joined");
+  if (tj.rc == 1) die("cannot load tokenizer blob %s", TOKB);
+  if (id_cached && (tj.rc != 0 || tj.npre != npre || tj.npost != npost ||
+                    memcmp(tj.pre, pre_ids, (size_t)npre * 4) || memcmp(tj.post, post_ids, (size_t)npost * 4))) {
+    unlink(IDC);
+    die("%s disagreed with the tokenizer's own encode of the prompt -- removed it; no transcript "
+        "is printed from ids the tokenizer did not produce", IDC);
+  }
+  LTok tok = tj.tok;
+  stage("vocabulary in hand");
   int dn = ltok_decode(&tok, gen, (size_t)ngen, txt, dcap);
   if (dn < 0) die("detokenizer failed on %d ids", ngen);
   txt[dn] = 0;
@@ -427,6 +801,7 @@ int main(int argc, char **argv) {
     if (!f) die("cannot write %s", out_ids);
     if (fwrite(gen, 4, (size_t)ngen, f) != (size_t)ngen) die("short write to %s", out_ids);
     fclose(f);
+    stage("ids decoded + written");
     printf("IDS -> %s (%d ids, %ld bytes)\n", out_ids, ngen, (long)ngen * 4);
   }
   if (tokens_only) {
@@ -437,6 +812,15 @@ int main(int argc, char **argv) {
     printf("TRANSCRIPT (%d tokens, %.1f chars/KB): %s\n", ngen, (double)dn, txt);
   }
   free(eb); free(txt); free(gen); free(ids); free(pre_ids); free(post_ids);
-  free(prompt); free(manb); ltok_free(&tok);
+  free(prompt); free(manb);
+  /* ltok_free(&tok) is deliberately NOT called: freeing the vocabulary's ~128k per-entry
+     allocations on a process that is about to exit costs ~0.07 s of a ~5.4 s turn, and the kernel
+     reclaims the address space anyway. Everything above has already run and been written (id file
+     fclose'd, transcript printed, idcache published by rename), so this is exact by construction.
+     Measured (.auto/combined/ab_free.sh, one service session, order reversed each round, ids md5
+     identical in all 12 turns): free 5.408/5.423/5.404 zh, 6.330/6.336/6.316 en vs no free
+     5.355/5.331/5.330 zh, 6.258/6.244/6.247 en. Skipping the remaining small frees too adds only
+     ~0.02 s more, so they stay. Call ltok_free under a leak checker. */
+  printf("TIME client total %.3f s (process start to exit)\n", now_s() - t_main0);
   return 0;
 }
